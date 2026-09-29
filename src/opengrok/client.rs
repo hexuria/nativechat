@@ -1623,6 +1623,65 @@ impl OpenGrokClient {
         Self::json_or_error(response).await
     }
 
+    /// `GET /coworkers/{id}/skills` — every skill of the account's library this bot's owner may
+    /// use, and which of them are attached to it (opengrok-server#270). Owner only, as the
+    /// ceiling is: anybody else is answered 404, `{"error": "no such coworker"}`, which a server
+    /// without the route never writes (its 404 is empty), and an owner whose grant was withdrawn
+    /// is answered 403 in words. Given [`CEILING_TIMEOUT`], for the ceiling's reason: a switch on
+    /// the Skills card holds every other one until it is answered.
+    pub async fn coworker_skills(
+        &self,
+        coworker_id: &str,
+    ) -> Result<CoworkerSkills, OpenGrokError> {
+        self.skills_within(reqwest::Method::GET, coworker_id, None, CEILING_TIMEOUT)
+            .await
+    }
+
+    /// `PUT /coworkers/{id}/skills` with `{"attached": [ids], "version": n}` — the whole attached
+    /// set, replaced by exactly these, answered with the body `GET` gives (opengrok-server#270).
+    /// An empty list is allowed and attaches nothing.
+    ///
+    /// `version` is the one the rows the change was built from came with, and it is left out
+    /// when they came with none. A set somebody changed since is refused with 409 and the code
+    /// `skills-changed` ([`OpenGrokError::is_skills_changed`]); an id that is not one of the rows
+    /// with 422 (`no skill …`), and a set past the server's cap of 20 with 422 and its sentence.
+    /// Nothing is written on any of them. A skill switched off is still one of the rows, so naming
+    /// it keeps it attached and leaving it out detaches it. Given [`CEILING_TIMEOUT`].
+    pub async fn set_coworker_skills(
+        &self,
+        coworker_id: &str,
+        attached: &[String],
+        version: Option<i64>,
+    ) -> Result<CoworkerSkills, OpenGrokError> {
+        let mut body = json!({ "attached": attached });
+        if let Some(version) = version {
+            body["version"] = json!(version);
+        }
+        self.skills_within(
+            reqwest::Method::PUT,
+            coworker_id,
+            Some(&body),
+            CEILING_TIMEOUT,
+        )
+        .await
+    }
+
+    /// A read or a write of a bot's skills, given `timeout` to answer in. Apart from the two
+    /// routes so a test can hold one to a deadline it can wait out.
+    pub(crate) async fn skills_within(
+        &self,
+        method: reqwest::Method,
+        coworker_id: &str,
+        body: Option<&Value>,
+        timeout: std::time::Duration,
+    ) -> Result<CoworkerSkills, OpenGrokError> {
+        let path = format!("/coworkers/{}/skills", path_segment(coworker_id));
+        let response = self
+            .send_json_within(method, &path, body, Some(timeout), None)
+            .await?;
+        Self::json_or_error(response).await
+    }
+
     /// `POST /artifacts` for a file the person attaches to a message (#90): the bytes go up first,
     /// and the message then names the returned `art_` id. `threadId` is the conversation's own
     /// thread, the one `POST /ag-ui` sends. Transcribed from opengrok-server `artifacts.rs`
@@ -3028,6 +3087,65 @@ pub enum CeilingKind {
     /// server's own, as the Tools listing files one ([`CoworkerTool::is_builtin`]).
     #[serde(other)]
     Plugin,
+}
+
+/// A bot's skills: every skill of the account's library its owner may use, and which of them are
+/// attached to it, as `GET /coworkers/{id}/skills` gives it and `PUT` answers with.
+///
+/// Transcribed from the shape agreed with the opengrok-server session for #270 (the server half
+/// of this app's #2) before that code was written, so there is no route in the server's checkout
+/// to hold it to yet: `{"skills": [row…], "version": n}`, the array always there and possibly
+/// empty. The skills are the ones `/skills` makes (opengrok-server `skills.rs`, whose `may` says
+/// who may use which); a plugin's are not among them. An attached skill that is switched on is named, with its description, in the
+/// bot's standing system message on every turn, and the bot reads its body through the builtin
+/// [`super::gen_ui::USE_SKILL`] when it needs it. A person's `/name` goes on working for any
+/// skill they may use, attached or not. No `#[serde(default)]` on the array: a body without one
+/// is not a bot with no skills.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct CoworkerSkills {
+    pub skills: Vec<BotSkillRow>,
+    /// Which change of the attached set these rows are, for a `PUT` built from them to send back:
+    /// the server refuses one whose version is not its own any more ([`SKILLS_CHANGED`]), so a
+    /// switch made from rows somebody has since changed cannot undo that change. A body without
+    /// one is read all the same, and a `PUT` built from it sends none.
+    #[serde(default)]
+    pub version: Option<i64>,
+}
+
+/// The code of the 409 a `PUT` of a bot's skills is refused with when its `version` is not the
+/// server's any more, beside the sentence "the skills changed since you looked"
+/// (opengrok-server#270). Nothing was written.
+pub const SKILLS_CHANGED: &str = "skills-changed";
+
+/// One skill a bot's owner may attach to it: one of their own, or one of their organization's.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct BotSkillRow {
+    /// The skill's id (`sk_…`), which a `PUT` names it by.
+    pub id: String,
+    /// What a person types after a slash to use it.
+    pub name: String,
+    /// What the skill is for, which is what the bot reads to decide whether to read the body.
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub description: String,
+    pub scope: BotSkillScope,
+    /// Attached to this bot now.
+    pub attached: bool,
+    /// The skill itself is switched on, in Settings → Skills. One switched off stays listed, and
+    /// may stay attached, but is offered to no turn.
+    pub enabled: bool,
+}
+
+/// Whose skill a row is: the bot owner's own, or a colleague's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BotSkillScope {
+    /// The owner's own, which they can change and switch off.
+    Mine,
+    /// A colleague's, shared with the owner's organization, which its author can change or
+    /// switch off. A word this app has no name for yet is filed here rather than claimed as the
+    /// owner's own.
+    #[serde(other)]
+    Org,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -7612,6 +7730,262 @@ mod tests {
                 && CEILING_TIMEOUT <= std::time::Duration::from_secs(30),
             "long enough for a slow server, short enough that a lost answer frees the card"
         );
+    }
+
+    /// A bot's skills in the shape agreed for opengrok-server#270: two of the owner's own, one
+    /// attached and one not, a colleague's attached, and one of the owner's that is switched off
+    /// in Settings → Skills and still attached; and the version these rows are.
+    fn some_skills() -> Value {
+        json!({"skills": [
+            {"id": "sk_triage", "name": "triage", "description": "Sort the inbox.\nThen reply.",
+                "scope": "mine", "attached": true, "enabled": true},
+            {"id": "sk_draft", "name": "draft", "description": "Write a first draft.",
+                "scope": "mine", "attached": false, "enabled": true},
+            {"id": "sk_review", "name": "review", "description": "The team's review checklist.",
+                "scope": "org", "attached": true, "enabled": true},
+            {"id": "sk_old", "name": "old-notes", "description": "Last year's notes.",
+                "scope": "mine", "attached": true, "enabled": false}
+        ], "version": 4})
+    }
+
+    #[tokio::test]
+    async fn a_bots_skills_are_read_as_the_server_gives_them() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/coworkers/cw_1/skills"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(some_skills()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        let skills = client.coworker_skills("cw_1").await.unwrap();
+        let ids: Vec<&str> = skills.skills.iter().map(|row| row.id.as_str()).collect();
+        assert_eq!(ids, ["sk_triage", "sk_draft", "sk_review", "sk_old"]);
+        assert_eq!(skills.version, Some(4));
+        let triage = &skills.skills[0];
+        assert_eq!(
+            (triage.name.as_str(), triage.description.as_str()),
+            ("triage", "Sort the inbox.\nThen reply.")
+        );
+        assert!(triage.attached && triage.enabled && triage.scope == BotSkillScope::Mine);
+        assert!(!skills.skills[1].attached);
+        let review = &skills.skills[2];
+        assert_eq!(review.scope, BotSkillScope::Org, "a colleague's");
+        let old = &skills.skills[3];
+        assert!(
+            old.attached && !old.enabled,
+            "switched off, still listed and still attached"
+        );
+    }
+
+    /// An empty list is a bot with no skills to attach; a body with no list at all is not one,
+    /// and a row that does not say whether it is attached, whether it is switched on, or whose it
+    /// is cannot be drawn or sent back as it stands. A scope the app does not know is filed with
+    /// the organization's rather than claimed as the owner's, a `null` description is none, and a
+    /// body with no version is read all the same.
+    #[test]
+    fn a_bots_skills_read_only_in_their_own_shape() {
+        let read = |body: Value| serde_json::from_value::<CoworkerSkills>(body);
+        let row = |drop: &str| {
+            let mut row = json!({"id": "sk_1", "name": "triage", "description": "",
+                "scope": "mine", "attached": true, "enabled": true});
+            row.as_object_mut().unwrap().remove(drop);
+            json!({ "skills": [row] })
+        };
+        assert_eq!(read(json!({"skills": []})).unwrap().skills, Vec::new());
+        assert!(read(json!({})).is_err(), "no skills array");
+        for field in ["id", "name", "scope", "attached", "enabled"] {
+            assert!(read(row(field)).is_err(), "a row with no {field}");
+        }
+        assert_eq!(
+            read(row("description")).unwrap().skills[0].description,
+            "",
+            "a row with no description has no words"
+        );
+        let later = read(json!({"skills": [
+            {"id": "sk_1", "name": "triage", "description": null, "scope": "shared",
+                "attached": false, "enabled": true}
+        ]}))
+        .unwrap();
+        assert_eq!(later.skills[0].scope, BotSkillScope::Org);
+        assert_eq!(later.skills[0].description, "");
+        assert_eq!(later.version, None, "versionless");
+        assert_eq!(
+            read(json!({"skills": [], "version": 0})).unwrap().version,
+            Some(0)
+        );
+    }
+
+    /// A switch sends every id the set should hold once it is taken, with the version of the rows
+    /// it was built from, and takes what the server answers, which is the whole set again. `[]` is
+    /// sent as a list, since it means no skills at all, and rows that came with no version are
+    /// sent back with none: the body carries no `version` at all rather than a `null`.
+    #[tokio::test]
+    async fn setting_a_bots_skills_sends_every_id_and_its_version() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/coworkers/cw_1/skills"))
+            .and(body_json(
+                json!({"attached": ["sk_triage", "sk_review", "sk_old"], "version": 4}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json({
+                let mut answer = some_skills();
+                answer["version"] = json!(5);
+                answer
+            }))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/coworkers/cw_1/skills"))
+            .and(body_json(json!({"attached": []})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"skills": [
+                {"id": "sk_triage", "name": "triage", "description": "", "scope": "mine",
+                    "attached": false, "enabled": true}
+            ]})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        let sent: Vec<String> = ["sk_triage", "sk_review", "sk_old"]
+            .map(String::from)
+            .to_vec();
+        let answer = client
+            .set_coworker_skills("cw_1", &sent, Some(4))
+            .await
+            .unwrap();
+        assert_eq!(answer.skills.len(), 4);
+        assert_eq!(answer.version, Some(5), "the answer is the next version");
+        let nothing = client.set_coworker_skills("cw_1", &[], None).await.unwrap();
+        assert!(!nothing.skills[0].attached);
+        assert_eq!(nothing.version, None, "a versionless answer is read");
+    }
+
+    /// Every refusal keeps the server's words: an id the rows do not list and a set past the cap
+    /// (422), a stale version with its code (409), a withdrawn grant (403), and a bot the person
+    /// does not own, a 404 in the server's shape to a read and to a write alike. A server without
+    /// the route answers 404 too, with nothing in it, and that is not the server saying anything
+    /// about the bot.
+    #[tokio::test]
+    async fn a_refused_skills_change_keeps_the_servers_words() {
+        let server = MockServer::start().await;
+        let refuse = |status: u16, body: Value| ResponseTemplate::new(status).set_body_json(body);
+        for (id, answer) in [
+            ("cw_1", refuse(422, json!({"error": "no skill sk_gone"}))),
+            (
+                "cw_2",
+                refuse(
+                    422,
+                    json!({"error": "a coworker can have at most 20 skills attached"}),
+                ),
+            ),
+            (
+                "cw_3",
+                refuse(
+                    409,
+                    json!({"error": "the skills changed since you looked", "code": "skills-changed"}),
+                ),
+            ),
+            (
+                "cw_4",
+                refuse(
+                    403,
+                    json!({"error": "your grant to this coworker was withdrawn"}),
+                ),
+            ),
+        ] {
+            Mock::given(method("PUT"))
+                .and(path(format!("/coworkers/{id}/skills")))
+                .respond_with(answer)
+                .mount(&server)
+                .await;
+        }
+        for verb in ["GET", "PUT"] {
+            Mock::given(method(verb))
+                .and(path("/coworkers/cw_5/skills"))
+                .respond_with(refuse(404, json!({"error": "no such coworker"})))
+                .mount(&server)
+                .await;
+            Mock::given(method(verb))
+                .and(path("/coworkers/cw_6/skills"))
+                .respond_with(ResponseTemplate::new(404))
+                .mount(&server)
+                .await;
+        }
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        let put = |id: &'static str| {
+            let client = client.clone();
+            async move {
+                client
+                    .set_coworker_skills(id, &["sk_triage".to_string()], Some(4))
+                    .await
+                    .unwrap_err()
+            }
+        };
+
+        let gone = put("cw_1").await;
+        assert_eq!(
+            (gone.status, gone.message.as_str()),
+            (Some(422), "no skill sk_gone")
+        );
+        assert_eq!(gone.failure(), Failure::Verdict);
+        let full = put("cw_2").await;
+        assert_eq!(
+            (full.status, full.message.as_str()),
+            (Some(422), "a coworker can have at most 20 skills attached")
+        );
+        let changed = put("cw_3").await;
+        assert!(changed.is_skills_changed());
+        assert_eq!(changed.message, "the skills changed since you looked");
+        let withdrawn = put("cw_4").await;
+        assert_eq!(
+            (withdrawn.status, withdrawn.message.as_str()),
+            (Some(403), "your grant to this coworker was withdrawn")
+        );
+
+        let read = client.coworker_skills("cw_5").await.unwrap_err();
+        for refused in [read, put("cw_5").await] {
+            assert_eq!(refused.status, Some(404));
+            assert_eq!(refused.message, "no such coworker");
+            assert_eq!(refused.failure(), Failure::Verdict);
+            assert!(refused.written_by_opengrok());
+        }
+        let read = client.coworker_skills("cw_6").await.unwrap_err();
+        for missing in [read, put("cw_6").await] {
+            assert_eq!(missing.status, Some(404));
+            assert!(
+                !missing.written_by_opengrok(),
+                "an empty 404 is a route this server does not have"
+            );
+        }
+    }
+
+    /// A read or a write of a bot's skills that is not answered in time is a request nobody knows
+    /// the answer to, like one that never reached the server, and not a verdict with a status.
+    #[tokio::test]
+    async fn a_skills_request_out_of_time_is_out_of_reach() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/coworkers/cw_1/skills"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(some_skills())
+                    .set_delay(std::time::Duration::from_secs(2)),
+            )
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        let late = client
+            .skills_within(
+                reqwest::Method::PUT,
+                "cw_1",
+                Some(&json!({"attached": ["sk_triage"], "version": 4})),
+                std::time::Duration::from_millis(100),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(late.status, None);
+        assert_eq!(late.unreachable(), Some(Unreachable::Server));
     }
 
     /// A type with parameters or capitals is sent as the plain lowercase type the server reads.

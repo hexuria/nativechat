@@ -175,6 +175,12 @@ fn deed_from_tool(name: &str, args: Option<&str>) -> Option<String> {
             "ran a shell command".into()
         }
         super::gen_ui::USER_MACHINE_SHELL => "ran a command on your computer".into(),
+        super::gen_ui::USE_SKILL => field("name")
+            .as_deref()
+            .map(short_command)
+            .filter(|name| !name.is_empty())
+            .map(|name| format!("read the {name} skill"))
+            .unwrap_or_else(|| "read a skill".into()),
         "run_recipe" => "ran a recipe".into(),
         "Computer" | "Screenshot" | "computerUseToolCall" => {
             "took a screenshot of my screen".into()
@@ -334,6 +340,17 @@ pub(crate) fn describe_tool(name: &str, args: Option<&str>) -> String {
         super::gen_ui::USER_MACHINE_SHELL => command
             .map(|c| format!("On your machine: {}", short_command(c)))
             .unwrap_or_else(|| "On your machine".into()),
+        // A bot reading one of its attached skills (opengrok-server#270), by the skill's name,
+        // which is what a person types after a slash for the same skill. Kept to a line, as a
+        // command is: the model writes the name, and nothing holds it to the server's rules
+        // until the server looks it up.
+        super::gen_ui::USE_SKILL => parsed
+            .as_ref()
+            .and_then(|v| v.get("name").and_then(Value::as_str))
+            .map(short_command)
+            .filter(|name| !name.is_empty())
+            .map(|name| format!("Reading the {name} skill"))
+            .unwrap_or_else(|| "Reading a skill".into()),
         "Computer" | "Screenshot" | "computerUseToolCall" => "On its computer".into(),
         "computer" => match parsed
             .as_ref()
@@ -363,10 +380,10 @@ pub(crate) fn describe_tool(name: &str, args: Option<&str>) -> String {
 }
 
 /// A call's arguments as its opened step row shows them, by the tools [`describe_tool`] names:
-/// a shell's command and a file tool's path, which are what those calls mean, and any other
-/// call's arguments as JSON laid out to be read. Arguments that do not parse — cut at the cap,
-/// or never JSON — are shown as they came. Nothing is decoded: typed text the server has
-/// already kept off the wire reads `«redacted»` here as it does there.
+/// a shell's command, a file tool's path and the skill a `use_skill` call reads, which are what
+/// those calls mean, and any other call's arguments as JSON laid out to be read. Arguments that
+/// do not parse — cut at the cap, or never JSON — are shown as they came. Nothing is decoded:
+/// typed text the server has already kept off the wire reads `«redacted»` here as it does there.
 pub(crate) fn describe_arguments(name: &str, args: &str) -> Option<String> {
     if args.trim().is_empty() {
         return None;
@@ -378,6 +395,7 @@ pub(crate) fn describe_arguments(name: &str, args: &str) -> Option<String> {
     let said = match name {
         "shell" | "Shell" | "BoxShell" | "shellToolCall" | "ExternalShell" => field("command"),
         super::gen_ui::USER_MACHINE_SHELL => field("command"),
+        super::gen_ui::USE_SKILL => field("name"),
         "Read" | "ExternalRead" | "BoxRead" | "readToolCall" | "read_file" | "write_file" => {
             field("path")
         }
@@ -433,6 +451,50 @@ mod tests {
         for name in ["shell", "read_file", "write_file"] {
             assert!(!label(name, None).starts_with("Using "), "{name}");
         }
+    }
+
+    /// A bot reading one of its attached skills (opengrok-server#270) says which, in the status
+    /// line and on its step, and a turn that did nothing else leaves that behind, not "Using
+    /// use_skill". Before the name is in, or with none, it reads a skill; a name the model spread
+    /// over lines or past the width of a line is kept to one.
+    #[test]
+    fn use_skill_says_which_skill_is_being_read() {
+        let label = |args: Option<&str>| describe_tool("use_skill", args);
+        assert_eq!(
+            label(Some(r#"{"name":"triage"}"#)),
+            "Reading the triage skill"
+        );
+        assert_eq!(label(None), "Reading a skill");
+        assert_eq!(label(Some(r#"{"name":"  "}"#)), "Reading a skill");
+        assert_eq!(label(Some(r#"{"skill":"triage"}"#)), "Reading a skill");
+        let long = "x".repeat(80);
+        let cut = label(Some(
+            &json!({ "name": format!("{long}\nmore") }).to_string(),
+        ));
+        assert!(
+            cut.starts_with("Reading the x") && cut.ends_with("… skill") && cut.len() < 80,
+            "{cut}"
+        );
+        assert_eq!(
+            describe_arguments("use_skill", r#"{"name":"triage"}"#).as_deref(),
+            Some("triage"),
+            "the opened step shows the skill, not the JSON around it"
+        );
+
+        let mut tracker = ToolCallTracker::default();
+        tracker
+            .tick(&json!({"type":"TOOL_CALL_START","toolCallId":"c1","toolCallName":"use_skill"}));
+        tracker.tick(
+            &json!({"type":"TOOL_CALL_ARGS","toolCallId":"c1","delta":r#"{"name":"triage"}"#}),
+        );
+        assert_eq!(
+            tool_standin(&tracker.deeds()),
+            Some("[read the triage skill]".into())
+        );
+        assert_eq!(
+            deed_from_tool("use_skill", None).as_deref(),
+            Some("read a skill")
+        );
     }
 
     /// The same, from the frames the server sent for one shell call: the start and the

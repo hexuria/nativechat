@@ -2,8 +2,10 @@ use gpui_agent::prelude::*;
 use gpui_agent::{DispatchResult, virtual_unavailable};
 
 use crate::components::agent_settings::{
-    CeilingCardLine, ShownCeilingRow, ceiling_card_lines, ceiling_line, effort_choices,
-    effort_label, offered_without_switches, shown_ceiling_rows, tools_summary,
+    CeilingCardLine, SHARED_BOT_READS_SKILLS, SWITCHED_OFF_IN_SETTINGS, ShownCeilingRow,
+    ShownSkillRow, SkillsCardLine, ceiling_card_lines, ceiling_line, effort_choices, effort_label,
+    offered_without_switches, shown_ceiling_rows, shown_skill_rows, skills_card_lines,
+    skills_summary, tools_summary,
 };
 use crate::components::app_settings::{
     NO_LOCAL_RULES, not_in_effect_line, remove_label, rule_list_title,
@@ -31,9 +33,9 @@ use crate::opengrok::{
 };
 use crate::site_login::{SiteLoginRecord, grouped_logins, login_title};
 use crate::state::{
-    ActiveRecipe, AfterRefusal, AppSettingsTab, AppState, CeilingCard, ConnectionList,
-    LocalRuleRow, LocalRules, RuleKind, SWITCH_IN_FLIGHT, SkillScope, TaughtSkill, ToolCeiling,
-    ToolList, WRITING_A_LESSON,
+    ActiveRecipe, AfterRefusal, AppSettingsTab, AppState, BotSkills, CeilingCard, ConnectionList,
+    LocalRuleRow, LocalRules, RuleKind, SWITCH_IN_FLIGHT, SkillScope, SkillsCard, TaughtSkill,
+    ToolCeiling, ToolList, WRITING_A_LESSON,
 };
 
 pub mod ids {
@@ -439,6 +441,65 @@ pub mod ids {
     pub fn offered_tool(name: &str) -> String {
         format!("agent-tool-{name}")
     }
+
+    /// The Skills card in a Bot's settings (opengrok-server#270): its value is the card's line,
+    /// how many skills are attached, or why there are no switches.
+    pub const AGENT_SKILLS: &str = "agent-skills";
+    /// Show / Hide on the Skills card, while it has skills to show.
+    pub const AGENT_SKILLS_TOGGLE: &str = "agent-skills-toggle";
+    /// Why every skill switch is dead for good: the server's words for a 403.
+    pub const AGENT_SKILLS_READ_ONLY: &str = "agent-skills-read-only";
+    /// Why every skill switch is dead for now: another Bot's skill switch, or a read of this Bot's
+    /// skills, is with the server.
+    pub const AGENT_SKILLS_WAIT: &str = "agent-skills-wait";
+    /// What the server said about the last skill switch, when no row on the card is the one it is
+    /// about: a stale version, or the cap on attached skills.
+    pub const AGENT_SKILLS_NOTE: &str = "agent-skills-note";
+    /// On a shared Bot's card: the people who use it can read its attached skills.
+    pub const AGENT_SKILLS_SHARED: &str = "agent-skills-shared";
+
+    /// Every id under a skill on the card is `agent-skills-` and one of these words, then the
+    /// skill's id, and none of the card's own ids has one of them there. So no id a skill can have
+    /// (`toggle`, `off-x`, `switch-x`) makes one id another's, and an id is read back into its
+    /// skill by cutting the prefix off. The skill's id and never its name: one of the person's
+    /// own skills and a colleague's can share a name.
+    const SKILL_SWITCH: &str = "agent-skills-switch-";
+    const SKILL_ROW_LINES: [&str; 2] = ["agent-skills-off-", "agent-skills-error-"];
+
+    /// One skill's switch on the Skills card, by the skill's id, which is what a `PUT` of the
+    /// Bot's skills names it by.
+    pub fn skill_switch(id: &str) -> String {
+        format!("{SKILL_SWITCH}{id}")
+    }
+
+    /// The skill a switch's id is for.
+    pub fn skill_switch_row(id: &str) -> Option<&str> {
+        id.strip_prefix(SKILL_SWITCH)
+    }
+
+    /// Under a skill switched off in Settings → Skills: that it is.
+    pub fn skill_off(id: &str) -> String {
+        format!("{}{id}", SKILL_ROW_LINES[0])
+    }
+
+    /// Under a skill: what the card says about its last switch.
+    pub fn skill_error(id: &str) -> String {
+        format!("{}{id}", SKILL_ROW_LINES[1])
+    }
+
+    /// A line on the Skills card rather than a switch: one of the card's own, or one under a
+    /// skill.
+    pub fn is_skills_line(id: &str) -> bool {
+        [
+            AGENT_SKILLS,
+            AGENT_SKILLS_READ_ONLY,
+            AGENT_SKILLS_WAIT,
+            AGENT_SKILLS_NOTE,
+            AGENT_SKILLS_SHARED,
+        ]
+        .contains(&id)
+            || SKILL_ROW_LINES.iter().any(|prefix| id.starts_with(prefix))
+    }
 }
 
 /// A value the driver hands the app that must not show up in any `{:?}` of a command.
@@ -621,6 +682,13 @@ pub enum Command {
     PickEffort(String),
     /// The bot settings' Save.
     SaveAgentSettings,
+    ToggleAgentSkills,
+    /// A switch on the Skills card: one skill attached to the open Bot or detached from it, by
+    /// the skill's id, sent at once.
+    SetBotSkill {
+        skill_id: String,
+        attached: bool,
+    },
     /// Attach a file to the draft by path, as the + would (#90).
     AttachFile(std::path::PathBuf),
     /// Take a file off the draft by its place, as its ✕ would.
@@ -856,6 +924,10 @@ impl Command {
             Self::SetCeilingTool { name, enabled } => state.switch_ceiling_tool(name, enabled, cx),
             Self::PickEffort(word) => state.pick_effort(word, cx),
             Self::SaveAgentSettings => state.request_agent_save(cx),
+            Self::ToggleAgentSkills => state.toggle_agent_skills(cx),
+            Self::SetBotSkill { skill_id, attached } => {
+                state.switch_bot_skill(skill_id, attached, cx)
+            }
             Self::AttachFile(path) => state.request_attach(path, cx),
             Self::DetachFile(index) => state.request_detach(index, cx),
             Self::UserFormDismiss { card_key } => {
@@ -1720,6 +1792,74 @@ fn ceiling_switch_node(row: &ShownCeilingRow) -> UiNode {
     node
 }
 
+/// `agent-skills` (value = the Skills card's line: `2 attached · 1 switched off`, `Asking the
+/// server…`, or why there are no switches), with `agent-skills-toggle` while the card has skills
+/// to show, and under it, visible while the card is open:
+///
+/// - the card's own lines, as on screen above the switches: `agent-skills-read-only` (the
+///   server's words for a 403), `agent-skills-wait` (another Bot's skill switch, or a read of this
+///   one's skills, is with the server) and `agent-skills-note` (the server's words about the last
+///   switch when no skill is the one they are about);
+/// - one `agent-skills-switch-{id}` per skill, by the skill's id. A skill's node is its switch:
+///   named by the skill's name, value `mine` / `org`, `checked` where it stands (where it was
+///   asked to go while that is with the server), enabled only while a click would send it, with
+///   the states `switching` and `switched-off`. Under it, as under the row on screen:
+///   `agent-skills-off-{id}` and `agent-skills-error-{id}`;
+/// - on a Bot the roster says is shared, `agent-skills-shared`.
+///
+/// Every one of them is made from what the screen draws ([`shown_skill_rows`],
+/// [`skills_card_lines`], [`SkillsCard::shared`]), so the two cannot disagree.
+fn agent_skills_node(card: &SkillsCard, open: bool) -> UiNode {
+    let mut node = UiNode::new(ids::AGENT_SKILLS, "list", "Skills")
+        .with_value(skills_summary(&card.skills, card.pending.as_ref()));
+    let rows = shown_skill_rows(card);
+    if rows.is_empty() {
+        return node;
+    }
+    node = node.with_child(UiNode::button(
+        ids::AGENT_SKILLS_TOGGLE,
+        if open { "Hide" } else { "Show" },
+    ));
+    for line in skills_card_lines(card) {
+        let (id, words) = match line {
+            SkillsCardLine::ReadOnly(words) => (ids::AGENT_SKILLS_READ_ONLY, words),
+            SkillsCardLine::Wait(words) => (ids::AGENT_SKILLS_WAIT, words),
+            SkillsCardLine::Note(words) => (ids::AGENT_SKILLS_NOTE, words),
+        };
+        node = node.with_child(UiNode::status(id, words).with_visible(open));
+    }
+    for row in &rows {
+        node = node.with_child(skill_switch_node(row).with_visible_deep(open));
+    }
+    if card.shared {
+        node = node.with_child(
+            UiNode::status(ids::AGENT_SKILLS_SHARED, SHARED_BOT_READS_SKILLS).with_visible(open),
+        );
+    }
+    node
+}
+
+fn skill_switch_node(row: &ShownSkillRow) -> UiNode {
+    let mut node = UiNode::new(ids::skill_switch(&row.id), "switch", row.title.clone())
+        .with_value(if row.mine { "mine" } else { "org" })
+        .with_checked(row.on)
+        .with_enabled(row.live);
+    if row.switching {
+        node.states.push("switching".to_string());
+    }
+    if row.switched_off {
+        node.states.push("switched-off".to_string());
+        node = node.with_child(UiNode::status(
+            ids::skill_off(&row.id),
+            SWITCHED_OFF_IN_SETTINGS,
+        ));
+    }
+    if let Some(words) = &row.note {
+        node = node.with_child(UiNode::status(ids::skill_error(&row.id), words.clone()));
+    }
+    node
+}
+
 fn user_form_node(form: &UserFormSnap) -> UiNode {
     let key = &form.card_key;
     let mut card = UiNode::dialog(user_form_card_id(key), form.title.clone());
@@ -2224,6 +2364,9 @@ pub struct NativeChatHost {
     agent_tools: Option<crate::state::ToolList>,
     /// The open Bot's ceiling as its Tools card draws it: see [`AppState::ceiling_card`].
     agent_ceiling: Option<CeilingCard>,
+    /// The open Bot's skills as its Skills card draws them: see [`AppState::skills_card`].
+    agent_skills: Option<SkillsCard>,
+    agent_skills_open: bool,
     /// The open bot's usage this month, as its settings' Usage card shows it (#138).
     agent_usage: Option<crate::state::UsageReport>,
     agent_usage_open: bool,
@@ -2431,6 +2574,8 @@ impl NativeChatHost {
                 .filter(|(owner, _)| state.active_coworker_id.as_deref() == Some(owner.as_str()))
                 .map(|(_, list)| list.clone()),
             agent_ceiling: state.ceiling_card(),
+            agent_skills: state.skills_card(),
+            agent_skills_open: state.agent_skills_open,
             agent_tools_open: state.agent_tools_open,
             agent_usage_open: state.agent_usage_open,
             agent_usage: state
@@ -3202,6 +3347,9 @@ impl NativeChatHost {
                 ceiling: self.agent_ceiling.as_ref(),
                 open: self.agent_tools_open,
             }));
+        }
+        if let Some(card) = &self.agent_skills {
+            settings = settings.with_child(agent_skills_node(card, self.agent_skills_open));
         }
         if let Some(usage) = &self.agent_usage {
             // `agent-usage` (value = the card's second line), with `agent-usage-toggle` while
@@ -4703,6 +4851,76 @@ impl NativeChatHost {
         })
     }
 
+    /// Whether the Skills card has any skill to show when it is opened.
+    fn skills_card_has_rows(&self) -> bool {
+        self.agent_skills
+            .as_ref()
+            .is_some_and(|card| !shown_skill_rows(card).is_empty())
+    }
+
+    /// A click on `agent-skills-switch-{id}`: that skill attached or detached, the other way from
+    /// where its switch stands, which is what a person's click does. Only where a person could
+    /// click it — the settings open, the card open to its skills — and only while the screen draws
+    /// it live: not while the card is blocked (a skill switch with the server, whichever Bot's; a
+    /// read of this Bot's skills; the server's 403), and never to attach a skill switched off in
+    /// Settings → Skills, which can only be detached. Each of those says which it was, and a card
+    /// with no switches says why it has none.
+    fn skills_command(&self, target: &str) -> Result<Command, String> {
+        if !self.agent_settings_open {
+            return Err(format!(
+                "`{target}` is in the bot's settings, which are closed"
+            ));
+        }
+        let Some(skill_id) = ids::skill_switch_row(target) else {
+            return Err(if ids::is_skills_line(target) {
+                format!("`{target}` is a line on the Skills card, not a switch")
+            } else {
+                format!("no switch `{target}` on this Bot's Skills card")
+            });
+        };
+        let Some(card) = &self.agent_skills else {
+            return Err(format!(
+                "`{target}` is not on screen: this Bot's skills have not been asked for"
+            ));
+        };
+        let read = match &card.skills {
+            BotSkills::Read(read) => read,
+            BotSkills::Loading => {
+                return Err(format!(
+                    "`{target}` is not on screen yet: this Bot's skills are still being read"
+                ));
+            }
+            BotSkills::Unavailable(why) => {
+                return Err(format!(
+                    "`{target}` is not on screen: the Skills card has no switches, because: {why}"
+                ));
+            }
+        };
+        let rows = shown_skill_rows(card);
+        let Some(row) = rows.iter().find(|row| row.id == skill_id) else {
+            return Err(format!("no switch `{target}` on this Bot's Skills card"));
+        };
+        if !self.agent_skills_open {
+            return Err(format!(
+                "`{target}` is on the Skills card, which is shut: open it with \
+                 `{}`",
+                ids::AGENT_SKILLS_TOGGLE
+            ));
+        }
+        let attached = !row.on;
+        read.may_switch(&row.id, attached, card.blocked.as_ref())
+            .map_err(|why| {
+                format!(
+                    "`{target}` cannot be {}: {why}",
+                    if attached { "attached" } else { "detached" }
+                )
+            })?;
+        Ok(Command::SetBotSkill {
+            skill_id: row.id.clone(),
+            attached,
+        })
+    }
+
     fn click(&mut self, target: &str) -> Result<DispatchResult, String> {
         let cmd = if target == ids::NAV_NEW_CHAT || target == "create-first-bot" {
             Command::NewChat
@@ -4733,6 +4951,20 @@ impl NativeChatHost {
             Command::ToggleAgentTools
         } else if target.starts_with(ids::AGENT_CEILING) {
             self.ceiling_command(target)?
+        } else if target == ids::AGENT_SKILLS_TOGGLE {
+            if !self.agent_settings_open {
+                return Err(format!(
+                    "`{target}` is in the bot's settings, which are closed"
+                ));
+            }
+            if !self.skills_card_has_rows() {
+                return Err(format!(
+                    "`{target}` is only there while the Bot has skills to show"
+                ));
+            }
+            Command::ToggleAgentSkills
+        } else if target.starts_with(ids::AGENT_SKILLS) {
+            self.skills_command(target)?
         } else if target == "agent-usage-toggle" {
             if !self.agent_settings_open {
                 return Err(
@@ -10293,6 +10525,420 @@ mod tests {
         assert_eq!(
             host.snapshot().find("agent-settings-error").unwrap().name,
             said
+        );
+    }
+
+    /// A bot's skills as the server gives them (opengrok-server#270): the owner's `triage`
+    /// attached and `draft` not, a colleague's `review` attached, and two of the owner's switched
+    /// off in Settings → Skills, `old-notes` still attached and `archive` not.
+    fn some_skills() -> crate::state::SkillsRead {
+        crate::state::SkillsRead {
+            rows: serde_json::from_value(serde_json::json!([
+                {"id": "sk_triage", "name": "triage", "description": "Sort the inbox.",
+                    "scope": "mine", "attached": true, "enabled": true},
+                {"id": "sk_draft", "name": "draft", "description": "",
+                    "scope": "mine", "attached": false, "enabled": true},
+                {"id": "sk_review", "name": "review", "description": "",
+                    "scope": "org", "attached": true, "enabled": true},
+                {"id": "sk_old", "name": "old-notes", "description": "",
+                    "scope": "mine", "attached": true, "enabled": false},
+                {"id": "sk_archive", "name": "archive", "description": "",
+                    "scope": "mine", "attached": false, "enabled": false}
+            ]))
+            .unwrap(),
+            version: Some(4),
+        }
+    }
+
+    /// The Skills card for `skills`, with nothing with the server, nothing said, and a Bot the
+    /// roster does not say is shared.
+    fn skills_card(skills: BotSkills) -> SkillsCard {
+        SkillsCard {
+            skills,
+            pending: None,
+            blocked: None,
+            note: None,
+            shared: false,
+        }
+    }
+
+    fn skill_switched(host: &mut NativeChatHost, target: &str) -> (String, bool) {
+        host.dispatch(&Op::click(target)).unwrap();
+        match host.take_command() {
+            Some(Command::SetBotSkill { skill_id, attached }) => (skill_id, attached),
+            other => panic!("expected a skill switch from {target}, got {other:?}"),
+        }
+    }
+
+    /// The Skills card is on the tree as the settings draw it: its line always, the switches only
+    /// while the card is open, the toggle only while there are skills to show, and the line about
+    /// who can read what is attached only on a Bot the roster says is shared.
+    #[test]
+    fn a_bots_skills_are_on_the_tree_and_open_from_it() {
+        let mut host = host();
+        host.agent_settings_open = true;
+        host.agent_skills = Some(skills_card(BotSkills::Loading));
+        let tree = host.snapshot();
+        assert_eq!(
+            tree.find(ids::AGENT_SKILLS).unwrap().value.as_deref(),
+            Some("Asking the server…")
+        );
+        assert!(tree.find(ids::AGENT_SKILLS_TOGGLE).is_none());
+        assert!(host.dispatch(&Op::click(ids::AGENT_SKILLS_TOGGLE)).is_err());
+
+        host.agent_skills = Some(skills_card(BotSkills::Read(some_skills())));
+        let tree = host.snapshot();
+        assert_eq!(
+            tree.find(ids::AGENT_SKILLS).unwrap().value.as_deref(),
+            Some("3 attached · 1 switched off")
+        );
+        let triage = tree.find("agent-skills-switch-sk_triage").unwrap();
+        assert_eq!(
+            (
+                triage.role.as_str(),
+                triage.name.as_str(),
+                triage.value.as_deref(),
+                triage.checked
+            ),
+            ("switch", "triage", Some("mine"), Some(true))
+        );
+        assert!(
+            !triage.visible,
+            "closed card: the switches are not on screen"
+        );
+        let review = tree.find("agent-skills-switch-sk_review").unwrap();
+        assert_eq!(review.value.as_deref(), Some("org"));
+        let old = tree.find("agent-skills-switch-sk_old").unwrap();
+        assert!(
+            old.states.contains(&"switched-off".to_string()) && old.enabled,
+            "switched off and attached: it can be detached"
+        );
+        assert_eq!(
+            tree.find("agent-skills-off-sk_old").unwrap().name,
+            "Switched off in Settings → Skills"
+        );
+        let archive = tree.find("agent-skills-switch-sk_archive").unwrap();
+        assert!(
+            !archive.enabled,
+            "switched off and not attached: never attached"
+        );
+        assert!(tree.find(ids::AGENT_SKILLS_SHARED).is_none(), "not shared");
+        assert!(tree.ids_are_unique());
+
+        host.dispatch(&Op::click(ids::AGENT_SKILLS_TOGGLE)).unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::ToggleAgentSkills)
+        ));
+        host.agent_skills_open = true;
+        assert!(
+            host.snapshot()
+                .find("agent-skills-switch-sk_triage")
+                .unwrap()
+                .visible
+        );
+
+        host.agent_skills = Some(SkillsCard {
+            shared: true,
+            ..skills_card(BotSkills::Read(some_skills()))
+        });
+        let shared = host.snapshot();
+        let line = shared.find(ids::AGENT_SKILLS_SHARED).unwrap();
+        assert_eq!(
+            (line.name.as_str(), line.visible),
+            (
+                "People who use this Bot can read its attached skills.",
+                true
+            )
+        );
+
+        // With the settings closed, the toggle is not on screen to click.
+        host.agent_settings_open = false;
+        assert!(host.dispatch(&Op::click(ids::AGENT_SKILLS_TOGGLE)).is_err());
+
+        // Skills the server would not give: the card's line says why, and there is nothing to
+        // open.
+        host.agent_settings_open = true;
+        host.agent_skills = Some(skills_card(BotSkills::Unavailable(
+            crate::state::NOT_THE_SKILLS_OWNER.into(),
+        )));
+        let tree = host.snapshot();
+        assert_eq!(
+            tree.find(ids::AGENT_SKILLS).unwrap().value.as_deref(),
+            Some(crate::state::NOT_THE_SKILLS_OWNER)
+        );
+        assert!(tree.find("agent-skills-switch-sk_triage").is_none());
+        assert!(host.dispatch(&Op::click(ids::AGENT_SKILLS_TOGGLE)).is_err());
+    }
+
+    /// A skill switch is clicked as a person clicks it — the other way from where it stands — and
+    /// only where a person could: the settings open, the card open to its skills, and the switch
+    /// live. A skill switched off in Settings → Skills can be detached and not attached. A card
+    /// with no switches says why it has none.
+    #[test]
+    fn a_skill_switch_is_clicked_only_where_a_person_could() {
+        let mut host = host();
+        host.agent_skills = Some(skills_card(BotSkills::Read(some_skills())));
+        assert!(
+            host.dispatch(&Op::click("agent-skills-switch-sk_triage"))
+                .unwrap_err()
+                .contains("settings, which are closed")
+        );
+        host.agent_settings_open = true;
+        assert!(
+            host.dispatch(&Op::click("agent-skills-switch-sk_triage"))
+                .unwrap_err()
+                .contains(ids::AGENT_SKILLS_TOGGLE),
+            "the card is shut, so its switches are not on screen"
+        );
+        host.agent_skills_open = true;
+
+        assert_eq!(
+            skill_switched(&mut host, "agent-skills-switch-sk_triage"),
+            ("sk_triage".into(), false)
+        );
+        assert_eq!(
+            skill_switched(&mut host, "agent-skills-switch-sk_draft"),
+            ("sk_draft".into(), true)
+        );
+        assert_eq!(
+            skill_switched(&mut host, "agent-skills-switch-sk_old"),
+            ("sk_old".into(), false),
+            "a skill switched off in Settings can still be detached"
+        );
+        let refused = host
+            .dispatch(&Op::click("agent-skills-switch-sk_archive"))
+            .unwrap_err();
+        assert!(
+            refused.contains("cannot be attached")
+                && refused.contains(crate::state::SWITCHED_OFF_STAYS_DETACHED),
+            "{refused}"
+        );
+
+        for line in [
+            ids::AGENT_SKILLS,
+            ids::AGENT_SKILLS_NOTE,
+            ids::AGENT_SKILLS_SHARED,
+            "agent-skills-off-sk_old",
+            "agent-skills-error-sk_draft",
+        ] {
+            assert!(
+                host.dispatch(&Op::click(line))
+                    .unwrap_err()
+                    .contains("not a switch"),
+                "{line}"
+            );
+        }
+        assert!(
+            host.dispatch(&Op::click("agent-skills-switch-sk_nope"))
+                .unwrap_err()
+                .contains("no switch")
+        );
+        assert!(
+            host.dispatch(&Op::click("agent-skills-switch-triage"))
+                .unwrap_err()
+                .contains("no switch"),
+            "a skill is switched by its id, not its name"
+        );
+
+        host.agent_skills = Some(skills_card(BotSkills::Unavailable(
+            crate::state::NOT_THE_SKILLS_OWNER.into(),
+        )));
+        let none = host
+            .dispatch(&Op::click("agent-skills-switch-sk_triage"))
+            .unwrap_err();
+        assert!(none.contains(crate::state::NOT_THE_SKILLS_OWNER), "{none}");
+        host.agent_skills = Some(skills_card(BotSkills::Loading));
+        assert!(
+            host.dispatch(&Op::click("agent-skills-switch-sk_triage"))
+                .unwrap_err()
+                .contains("still being read")
+        );
+        host.agent_skills = None;
+        assert!(
+            host.dispatch(&Op::click("agent-skills-switch-sk_triage"))
+                .unwrap_err()
+                .contains("have not been asked for")
+        );
+    }
+
+    /// While a skill switch is with the server its row shows where it was asked to go, and nothing
+    /// on the card can be clicked, whichever Bot the switch is for. The server's words are under
+    /// their skill, a card note is above the switches, and a card the server has made read-only is
+    /// dead with its words on it.
+    #[test]
+    fn a_blocked_skills_card_is_dead_and_says_why() {
+        use crate::state::{SkillNote, SkillNotePlace, SkillSwitch, SkillsBlock};
+        let mut host = host();
+        host.agent_settings_open = true;
+        host.agent_skills_open = true;
+        host.agent_skills = Some(SkillsCard {
+            pending: Some(SkillSwitch {
+                coworker_id: "bot-1".into(),
+                skill_id: "sk_draft".into(),
+                attached: true,
+                token: 1,
+            }),
+            blocked: Some(SkillsBlock::Switching),
+            ..skills_card(BotSkills::Read(some_skills()))
+        });
+        let tree = host.snapshot();
+        let asked = tree.find("agent-skills-switch-sk_draft").unwrap();
+        assert_eq!(asked.checked, Some(true));
+        assert!(asked.states.contains(&"switching".to_string()) && !asked.enabled);
+        assert!(!tree.find("agent-skills-switch-sk_triage").unwrap().enabled);
+        assert!(
+            tree.find(ids::AGENT_SKILLS_WAIT).is_none(),
+            "its row says it"
+        );
+        assert_eq!(
+            tree.find(ids::AGENT_SKILLS).unwrap().value.as_deref(),
+            Some("4 attached · 1 switched off")
+        );
+        let busy = host
+            .dispatch(&Op::click("agent-skills-switch-sk_triage"))
+            .unwrap_err();
+        assert!(
+            busy.contains(crate::state::CEILING_SWITCH_IN_FLIGHT),
+            "{busy}"
+        );
+
+        for (blocked, why) in [
+            (
+                SkillsBlock::AnotherBot,
+                crate::state::ANOTHER_BOTS_SKILL_SWITCH,
+            ),
+            (SkillsBlock::Reading, crate::state::SKILLS_BEING_READ),
+        ] {
+            host.agent_skills = Some(SkillsCard {
+                blocked: Some(blocked),
+                ..skills_card(BotSkills::Read(some_skills()))
+            });
+            let tree = host.snapshot();
+            assert_eq!(tree.find(ids::AGENT_SKILLS_WAIT).unwrap().name, why);
+            let waiting = host
+                .dispatch(&Op::click("agent-skills-switch-sk_triage"))
+                .unwrap_err();
+            assert!(waiting.contains(why), "{waiting}");
+        }
+
+        let said = |words: &str, place: SkillNotePlace| {
+            Some(SkillNote {
+                coworker_id: "bot-1".into(),
+                words: words.into(),
+                place,
+            })
+        };
+        host.agent_skills = Some(SkillsCard {
+            note: said("no skill sk_draft", SkillNotePlace::Row("sk_draft".into())),
+            ..skills_card(BotSkills::Read(some_skills()))
+        });
+        let tree = host.snapshot();
+        assert_eq!(
+            tree.find("agent-skills-error-sk_draft").unwrap().name,
+            "no skill sk_draft"
+        );
+        assert!(tree.find(ids::AGENT_SKILLS_NOTE).is_none());
+
+        host.agent_skills = Some(SkillsCard {
+            note: said(
+                "a coworker can have at most 20 skills attached",
+                SkillNotePlace::Card,
+            ),
+            ..skills_card(BotSkills::Read(some_skills()))
+        });
+        assert_eq!(
+            host.snapshot().find(ids::AGENT_SKILLS_NOTE).unwrap().name,
+            "a coworker can have at most 20 skills attached"
+        );
+
+        host.agent_skills = Some(SkillsCard {
+            blocked: Some(SkillsBlock::ReadOnly("your grant was withdrawn".into())),
+            note: said("your grant was withdrawn", SkillNotePlace::ReadOnly),
+            ..skills_card(BotSkills::Read(some_skills()))
+        });
+        let tree = host.snapshot();
+        assert_eq!(
+            tree.find(ids::AGENT_SKILLS_READ_ONLY).unwrap().name,
+            "your grant was withdrawn"
+        );
+        assert!(tree.find(ids::AGENT_SKILLS_NOTE).is_none(), "said once");
+        assert!(!tree.find("agent-skills-switch-sk_old").unwrap().enabled);
+        let theirs = host
+            .dispatch(&Op::click("agent-skills-switch-sk_old"))
+            .unwrap_err();
+        assert!(theirs.contains("your grant was withdrawn"), "{theirs}");
+    }
+
+    /// No id a skill can have makes one of the Skills card's ids another's, nor one of the Tools
+    /// card's: a skill whose id is `toggle`, `note`, `off-x`, `error-x` or `switch-x` is its own
+    /// switch, every id on the tree is one node's, and a line is never read as a switch.
+    #[test]
+    fn no_skill_id_makes_one_skills_id_another() {
+        let skill_ids = [
+            "x",
+            "toggle",
+            "read-only",
+            "note",
+            "wait",
+            "shared",
+            "row-x",
+            "off-x",
+            "error-x",
+            "switch-x",
+        ];
+        let rows: Vec<serde_json::Value> = skill_ids
+            .iter()
+            .map(|id| {
+                serde_json::json!({"id": id, "name": id, "description": "", "scope": "mine",
+                    "attached": true, "enabled": false})
+            })
+            .collect();
+        let read = crate::state::SkillsRead {
+            rows: serde_json::from_value(serde_json::Value::Array(rows)).unwrap(),
+            version: None,
+        };
+        let mut host = host();
+        host.agent_settings_open = true;
+        host.agent_skills_open = true;
+        host.agent_tools_open = true;
+        host.agent_ceiling = Some(ceiling_card(ToolCeiling::Read(a_ceiling())));
+        host.agent_skills = Some(SkillsCard {
+            note: Some(crate::state::SkillNote {
+                coworker_id: "bot-1".into(),
+                words: "the skills changed since you looked".into(),
+                place: crate::state::SkillNotePlace::Card,
+            }),
+            shared: true,
+            ..skills_card(BotSkills::Read(read))
+        });
+        let tree = host.snapshot();
+        assert!(tree.ids_are_unique());
+        for id in skill_ids {
+            assert_eq!(
+                skill_switched(&mut host, &ids::skill_switch(id)),
+                (id.to_string(), false),
+                "{id}"
+            );
+        }
+        for line in [
+            ids::AGENT_SKILLS_NOTE,
+            ids::AGENT_SKILLS_SHARED,
+            "agent-skills-off-x",
+            "agent-skills-off-off-x",
+            "agent-skills-error-switch-x",
+        ] {
+            assert!(
+                host.dispatch(&Op::click(line))
+                    .unwrap_err()
+                    .contains("not a switch"),
+                "{line}"
+            );
+        }
+        // The Tools card's switches are still the Tools card's.
+        assert_eq!(
+            switched(&mut host, "agent-ceiling-switch-shell"),
+            ("shell".into(), false)
         );
     }
 }

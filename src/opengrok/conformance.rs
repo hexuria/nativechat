@@ -47,18 +47,19 @@ use super::activity::{
     activity_from_replay,
 };
 use super::client::{
-    AnswerReply, AsyncRunResponse, BoxShareScope, ConnectLink, ConnectionOwner, ConnectionView,
-    Connector, CoworkerCeiling, CoworkerComputer, CoworkerUsage, DaemonEnrol, DaemonList,
-    LocalExecMode, LocalExecPolicy, OpenGrokClient, QueuedApproval, RecipeDetail, RecipeList,
-    RecipeParameterKind, RecipeRunResult, RunCause, RunReplay, ScheduleKind, ScheduleRow,
-    ScheduleRun, ScheduleRunStarted, ScheduleRunStatus, SkillDetail, SkillSummary, SkillVersion,
-    StopReply, ThreadReplay, ToolListing, host_egress_tunnel_available, host_egress_tunnel_flag,
+    AnswerReply, AsyncRunResponse, BotSkillScope, BoxShareScope, ConnectLink, ConnectionOwner,
+    ConnectionView, Connector, CoworkerCeiling, CoworkerComputer, CoworkerSkills, CoworkerUsage,
+    DaemonEnrol, DaemonList, LocalExecMode, LocalExecPolicy, OpenGrokClient, QueuedApproval,
+    RecipeDetail, RecipeList, RecipeParameterKind, RecipeRunResult, RunCause, RunReplay,
+    ScheduleKind, ScheduleRow, ScheduleRun, ScheduleRunStarted, ScheduleRunStatus, SkillDetail,
+    SkillSummary, SkillVersion, StopReply, ThreadReplay, ToolListing, host_egress_tunnel_available,
+    host_egress_tunnel_flag,
 };
 use super::credential::{CREDENTIAL_OFFER_SAVE, SaveLoginSpec};
 use super::error::{Failure, Unreachable, reads_as_gateway_unreachable};
 use super::gen_ui::{
     BAR_CHART_NAMES, ChatPart, EGRESS_TUNNEL_ASK_REASON, FORM_NAMES, REVIEW_AN_ACTION_REASONS,
-    RUN_AWAITING_APPROVAL, ScreenshotSpec, StepSpec, TurnAssembler, UI_CUSTOM_NAME,
+    RUN_AWAITING_APPROVAL, ScreenshotSpec, StepSpec, TurnAssembler, UI_CUSTOM_NAME, USE_SKILL,
     USER_MACHINE_SHELL, approval_from_event, approval_summary, capped, command_from_replay_events,
     is_ui_tool,
 };
@@ -1127,7 +1128,8 @@ const WITHHELD_ARGUMENTS: &[(&str, &str, Withheld)] = &[
 ];
 
 /// The server's own tools, which withhold only what [`WITHHELD_ARGUMENTS`] names. Any other tool
-/// is a plugin's.
+/// is a plugin's. `use_skill` is the one a bot reads an attached skill through (#270), not
+/// recorded yet: its `name` is kept as sent, which the plugin rule would not do for a long one.
 const SERVERS_TOOLS: &[&str] = &[
     "shell",
     USER_MACHINE_SHELL,
@@ -1136,6 +1138,7 @@ const SERVERS_TOOLS: &[&str] = &[
     "computer",
     "open_url",
     "run_recipe",
+    USE_SKILL,
 ];
 
 /// The keys a plugin's card leaves off, which the server fills in itself (`redact_value`).
@@ -2061,6 +2064,8 @@ const REST_ROUTES: &[(&str, RestCheck)] = &[
     ("GET__coworkers__coworker_id__tools", coworker_tools),
     ("GET__coworkers__coworker_id__ceiling", coworker_ceiling),
     ("PUT__coworkers__coworker_id__ceiling", coworker_ceiling),
+    ("GET__coworkers__coworker_id__skills", coworker_skills),
+    ("PUT__coworkers__coworker_id__skills", coworker_skills),
     ("GET__connections", connections_listed),
     ("POST__connections__id__lend", connection_changed),
     ("POST__connections__id__revoke", connection_changed),
@@ -2122,6 +2127,8 @@ const REFUSALS: &[(&str, RestCheck)] = &[
     ("GET__coworkers__coworker_id__tools", tools_refused),
     ("GET__coworkers__coworker_id__ceiling", tools_refused),
     ("PUT__coworkers__coworker_id__ceiling", tools_refused),
+    ("GET__coworkers__coworker_id__skills", skills_refused),
+    ("PUT__coworkers__coworker_id__skills", skills_refused),
     ("POST__ag-ui_user-form_submit", form_refused),
     ("POST__ag-ui_user-form_dismiss", form_refused),
     ("POST__ag-ui_box-handoff_resolve", handoff_refused),
@@ -2398,6 +2405,17 @@ fn tools_refused(status: u16, body: &Value) -> Check {
     must!(
         body.get("tools").is_none(),
         "a refused listing should not carry tools: {body}"
+    );
+    refusal(status, body)
+}
+
+/// A refused read or write of a bot's skills is the server's sentence, and the app reads it as a
+/// refusal (a 404 is "not this person's bot"; a 422 names an id it does not list or says the set
+/// is past its cap; a 409 is a stale version), so one must never read as a list of skills.
+fn skills_refused(status: u16, body: &Value) -> Check {
+    must!(
+        body.get("skills").is_none(),
+        "a refused read of a bot's skills should not carry skills: {body}"
     );
     refusal(status, body)
 }
@@ -3194,7 +3212,9 @@ fn coworker_matches(coworker: &Coworker, raw: &Value) -> Check {
             // none: a server that keeps no effort, whose bots run on `inherit`. Once it is sent,
             // the word is kept as sent, one this app has not heard of included.
             && coworker.effort.as_deref() == opt_str(raw, "effort")
-            && coworker.effort() == opt_str(raw, "effort").unwrap_or(EFFORT_INHERIT),
+            && coworker.effort() == opt_str(raw, "effort").unwrap_or(EFFORT_INHERIT)
+            && coworker.visibility.as_deref() == opt_str(raw, "visibility")
+            && coworker.is_shared() == (opt_str(raw, "visibility") == Some("org")),
         "a coworker came through changed: {coworker:?}"
     );
     Ok(())
@@ -3411,6 +3431,43 @@ fn coworker_ceiling(_: u16, body: &Value) -> Check {
                 && row.description.as_deref() == opt_str(raw, "description")
                 && row.connector.as_deref() == opt_str(raw, "connector"),
             "each row should come through as sent: {row:?} from {raw}"
+        );
+    }
+    Ok(())
+}
+
+/// A bot's skills (opengrok-server#270), read or as a write's answer: every skill comes through
+/// by the id a `PUT` names it by, with its name, its words, whose it is, whether it is attached
+/// and whether it is switched on; and the version a switch sends back, exactly, or none. A row
+/// that does not say whether it is attached or switched on cannot be drawn or sent back as it
+/// stands, so the parse refuses it; a scope in a word this app does not know is caught here
+/// rather than filed with the organization's.
+fn coworker_skills(_: u16, body: &Value) -> Check {
+    let skills: CoworkerSkills = parse(body)?;
+    must!(
+        skills.version == body["version"].as_i64(),
+        "the version should come through as sent: {:?} from {}",
+        skills.version,
+        body["version"]
+    );
+    let raw = body["skills"]
+        .as_array()
+        .ok_or("a bot's skills should carry a skills array")?;
+    same_len(&skills.skills, raw)?;
+    for (row, raw) in skills.skills.iter().zip(raw) {
+        let scope = str_at(raw, "scope");
+        must!(
+            matches!(scope, "mine" | "org"),
+            "each skill should say whose it is, mine or org, not {scope:?}: {raw}"
+        );
+        must!(
+            row.id == str_at(raw, "id")
+                && row.name == str_at(raw, "name")
+                && row.description == opt_str(raw, "description").unwrap_or_default()
+                && (row.scope == BotSkillScope::Mine) == (scope == "mine")
+                && Some(row.attached) == raw["attached"].as_bool()
+                && Some(row.enabled) == raw["enabled"].as_bool(),
+            "each skill should come through as sent: {row:?} from {raw}"
         );
     }
     Ok(())
@@ -4739,4 +4796,130 @@ fn a_coworker_rows_effort_has_a_reading_in_the_ledger() {
         }),
     )
     .unwrap();
+}
+
+/// A bot's skills' reading, fed bodies in the shape agreed for opengrok-server#270 until the
+/// server's own are recorded, for the read and for the write's answer alike: skills of both
+/// scopes, attached and not, one switched off and still attached, at a version and at none, an
+/// empty list, the refusals (not the owner's, a withdrawn grant, an id the server does not list,
+/// the cap, a version it has moved on from), and the ways a body could go wrong.
+#[test]
+fn a_bots_skills_have_a_reading_in_the_ledger() {
+    use serde_json::json;
+    for (route, verb) in [
+        ("GET__coworkers__coworker_id__skills", "GET"),
+        ("PUT__coworkers__coworker_id__skills", "PUT"),
+    ] {
+        let read = |status: u16, body: Value| {
+            read_fixture(
+                route,
+                &json!({
+                    "method": verb, "path": "/coworkers/cw_1/skills", "status": status, "body": body
+                }),
+            )
+        };
+        let skills = json!({"skills": [
+            {"id": "sk_triage", "name": "triage", "description": "Sort the inbox.",
+                "scope": "mine", "attached": true, "enabled": true},
+            {"id": "sk_draft", "name": "draft", "description": "",
+                "scope": "mine", "attached": false, "enabled": true},
+            {"id": "sk_review", "name": "review", "description": "The team's checklist.",
+                "scope": "org", "attached": true, "enabled": true},
+            {"id": "sk_old", "name": "old-notes", "description": "Last year's notes.",
+                "scope": "mine", "attached": true, "enabled": false}
+        ], "version": 4});
+        read(200, skills.clone()).unwrap_or_else(|why| panic!("{verb}: {why}"));
+        read(200, json!({"skills": []})).unwrap_or_else(|why| panic!("{verb}: {why}"));
+        read(200, json!({"skills": [], "version": 0}))
+            .unwrap_or_else(|why| panic!("{verb}: {why}"));
+        read(404, json!({"error": "no such coworker"}))
+            .unwrap_or_else(|why| panic!("{verb}: {why}"));
+        read(
+            403,
+            json!({"error": "your grant to this coworker was withdrawn"}),
+        )
+        .unwrap_or_else(|why| panic!("{verb}: {why}"));
+        read(422, json!({"error": "no skill sk_gone"}))
+            .unwrap_or_else(|why| panic!("{verb}: {why}"));
+        read(
+            422,
+            json!({"error": "a coworker can have at most 20 skills attached"}),
+        )
+        .unwrap_or_else(|why| panic!("{verb}: {why}"));
+        read(
+            409,
+            json!({"error": "the skills changed since you looked", "code": "skills-changed"}),
+        )
+        .unwrap_or_else(|why| panic!("{verb}: {why}"));
+        assert!(
+            read(404, skills).is_err(),
+            "{verb}: a refusal carrying skills"
+        );
+        assert!(read(200, json!({})).is_err(), "{verb}: no skills array");
+        for (dropped, why) in [
+            (
+                "attached",
+                "a skill that does not say whether it is attached",
+            ),
+            (
+                "enabled",
+                "a skill that does not say whether it is switched on",
+            ),
+            ("scope", "a skill that does not say whose it is"),
+        ] {
+            let mut row = json!({"id": "sk_1", "name": "triage", "description": "",
+                "scope": "mine", "attached": true, "enabled": true});
+            row.as_object_mut().unwrap().remove(dropped);
+            assert!(
+                read(200, json!({ "skills": [row] })).is_err(),
+                "{verb}: {why}"
+            );
+        }
+        assert!(
+            read(
+                200,
+                json!({"skills": [{"id": "sk_1", "name": "triage", "description": "",
+                    "scope": "shared", "attached": false, "enabled": true}]})
+            )
+            .is_err(),
+            "{verb}: a scope in a word the app does not know"
+        );
+    }
+}
+
+/// `use_skill` (#270) is not recorded yet, and a recording of it is to read as the server's own
+/// tool the day it arrives: the call says which skill is being read rather than "Using
+/// use_skill", the turn that only read one says what it did, and the step keeps the skill's name
+/// as sent, by the rule for the server's own tools — a long name, which reads as a key to the
+/// plugin rule, included.
+#[test]
+fn use_skill_reads_as_the_servers_own_tool() {
+    use serde_json::json;
+    let start =
+        json!({"type": "TOOL_CALL_START", "toolCallId": "call_1", "toolCallName": USE_SKILL});
+    tool_call_start(&start).unwrap();
+    let name = "finance-team.quarterly-report-checklist-v2";
+    let sent = json!({ "name": name });
+    let args = json!({"type": "TOOL_CALL_ARGS", "toolCallId": "call_1", "delta": sent.to_string()});
+    let end = json!({"type": "TOOL_CALL_END", "toolCallId": "call_1"});
+    let mut tracker = ToolCallTracker::default();
+    tracker.tick(&start);
+    assert_eq!(
+        tracker.tick(&args),
+        label(&format!("Reading the {name} skill"))
+    );
+    assert_eq!(tracker.deeds(), [format!("read the {name} skill")]);
+
+    let (_, parts) = assembled(&[&start, &args, &end]).snapshot();
+    let step = parts
+        .iter()
+        .find_map(|part| match part {
+            ChatPart::Step(step) if step.call_id == "call_1" => Some(step),
+            _ => None,
+        })
+        .expect("a use_skill call is a step");
+    let kept: Value = serde_json::from_str(&step.arguments).expect("kept arguments read back");
+    kept_as_the_card_allows(USE_SKILL, &sent, &kept).unwrap();
+    assert_eq!(kept, sent);
+    assert_eq!(step.shown_arguments().as_deref(), Some(name));
 }

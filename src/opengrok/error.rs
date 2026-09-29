@@ -279,6 +279,14 @@ impl OpenGrokError {
         self.status == Some(409) && self.code() == Some(super::client::CEILING_CHANGED)
     }
 
+    /// `PUT /coworkers/{id}/skills` named a version of the bot's attached skills that is not the
+    /// server's any more: somebody changed them after the rows the switch was built from were
+    /// read, and nothing was changed (opengrok-server#270). Read off the code; the sentence beside
+    /// it ("the skills changed since you looked") is what the person is shown.
+    pub fn is_skills_changed(&self) -> bool {
+        self.status == Some(409) && self.code() == Some(super::client::SKILLS_CHANGED)
+    }
+
     /// `POST /pending` lost the race the server describes as "another writer got there
     /// first; retry". The insert collided and the winning row was gone before it could be
     /// read, so the same POST is worth one more try. Any other 409 is a decision.
@@ -509,6 +517,21 @@ mod tests {
             .with_code(Some("ceiling-changed".to_string()));
         assert!(changed.is_ceiling_changed());
         assert!(!coded("stale-pending-message", "changed").is_ceiling_changed());
+        assert!(
+            !changed.is_skills_changed(),
+            "the ceiling's code says nothing about skills"
+        );
+
+        let skills = OpenGrokError::from_opengrok(409, "the skills changed since you looked")
+            .with_code(Some("skills-changed".to_string()));
+        assert!(skills.is_skills_changed() && !skills.is_ceiling_changed());
+        let not_a_conflict =
+            OpenGrokError::from_opengrok(422, "the skills changed since you looked")
+                .with_code(Some("skills-changed".to_string()));
+        assert!(
+            !not_a_conflict.is_skills_changed(),
+            "only a 409 says the rows are old"
+        );
     }
 
     #[test]

@@ -352,6 +352,13 @@ pub struct ApprovalSpec {
 /// app's local-exec daemon. Every other tool runs on the coworker's box.
 pub const USER_MACHINE_SHELL: &str = "user_machine_shell";
 
+/// The builtin a bot reads one of its attached skills through: `{"name": …}` in, the skill's
+/// `SKILL.md` body out as the call's result, with the skill's files copied onto its box
+/// (opengrok-server#270, as agreed with the server session before that code). It is offered
+/// exactly when the bot has an attached skill that is switched on and the turn's person may use,
+/// and it is no row of the tool ceiling: `GET /coworkers/{id}/tools` lists it while it is offered.
+pub const USE_SKILL: &str = "use_skill";
+
 /// The CUSTOM `name` of a run parked on a card: a tool waiting on a yes, or a form waiting on the
 /// person (opengrok-harness `projection.rs` `awaiting_approval`).
 pub(crate) const RUN_AWAITING_APPROVAL: &str = "run-awaiting-approval";
@@ -1737,6 +1744,14 @@ pub fn approval_summary(tool: &str, arguments: &Value) -> String {
             "Play the recipe \"{}\" on the agent's own computer",
             clip(string_arg(arguments, "recipe").unwrap_or("(unnamed)"), 80)
         ),
+        // The server's own builtin for reading an attached skill (#270), named by the skill as a
+        // recipe is. Its `summary_for` has no arm for it yet, and would call it a plugin's tool
+        // with its arguments; a skill's name is 64 characters of letters, digits, dots and dashes
+        // at most, and a long one reads as a key to the plugin rule, which would hide it.
+        USE_SKILL => format!(
+            "Read the skill \"{}\"",
+            clip(string_arg(arguments, "name").unwrap_or("(unnamed)"), 80)
+        ),
         other => format!(
             "{other} — a plugin tool this agent wants to call, with {}",
             clip(&redacted_arguments(arguments), 160)
@@ -1746,10 +1761,11 @@ pub fn approval_summary(tool: &str, arguments: &Value) -> String {
 
 /// A call's arguments as its step keeps them, with what the approval card for the same call
 /// keeps off it kept off here too, by the card's own rules (see [`approval_summary`]): a
-/// shell's command as it is; a file named and what is written into it only counted; typed
-/// text and keys that look like secrets as `«redacted»`; a page without its query or
-/// fragment; a recipe without its `values`, since a login recipe is handed a password; and a
-/// plugin call with its identity keys dropped and its secrets redacted.
+/// shell's command, and the skill a `use_skill` call reads, as they are; a file named and what
+/// is written into it only counted; typed text and keys that look like secrets as
+/// `«redacted»`; a page without its query or fragment; a recipe without its `values`, since a
+/// login recipe is handed a password; and a plugin call with its identity keys dropped and its
+/// secrets redacted.
 ///
 /// A step is on screen, opened and written to disk long after its card would have been
 /// answered, and it is shown for every call, card or none, so it is held to at least the
@@ -1765,7 +1781,9 @@ pub(crate) fn step_arguments(tool: &str, arguments: &Value) -> Value {
     }
     let mut kept = arguments.clone();
     match tool {
-        USER_MACHINE_SHELL | "shell" | "read_file" => {}
+        // A skill's name is what a `use_skill` call means, and it is kept as sent: the plugin
+        // rule would read a long one as a key.
+        USER_MACHINE_SHELL | "shell" | "read_file" | USE_SKILL => {}
         "write_file" => {
             if let Some(content) = string_arg(arguments, "content") {
                 kept["content"] = Value::from(content.len());
@@ -4462,6 +4480,49 @@ mod tests {
         assert_eq!(steps[2].label(), "Typing on its computer");
         assert!(steps[3].arguments.contains("bo@example.com"));
         assert!(steps[3].arguments.contains(REDACTED));
+    }
+
+    /// `use_skill` is the server's own tool (opengrok-server#270), and reads as one: its card
+    /// names the skill rather than calling it a plugin's tool, and its step keeps the name as it
+    /// was sent. A skill's name may run to 64 letters, digits, dots and dashes, and a long one is
+    /// shaped like a key to the plugin rule, which would show the step as «redacted».
+    #[test]
+    fn use_skill_reads_as_the_servers_own_tool_and_keeps_the_skills_name() {
+        let name = "finance-team.quarterly-report-checklist-v2";
+        let arguments = json!({ "name": name });
+        assert!(
+            looks_like_a_secret(name),
+            "the name the plugin rule would hide"
+        );
+        let summary = approval_summary(USE_SKILL, &arguments);
+        assert_eq!(summary, format!("Read the skill \"{name}\""));
+        assert!(!summary.contains("plugin"), "{summary}");
+        assert_eq!(
+            approval_summary(USE_SKILL, &json!({})),
+            "Read the skill \"(unnamed)\""
+        );
+        assert_eq!(step_arguments(USE_SKILL, &arguments), arguments);
+
+        let (_, parts) = assembled(&[
+            json!({"type":"TOOL_CALL_START","toolCallId":"c1","toolCallName":"use_skill"}),
+            json!({"type":"TOOL_CALL_ARGS","toolCallId":"c1","delta": arguments.to_string()}),
+            json!({"type":"TOOL_CALL_END","toolCallId":"c1"}),
+            json!({"type":"TOOL_CALL_RESULT","toolCallId":"c1",
+                "content":"---\nname: finance-team.quarterly-report-checklist-v2\n---\nCheck the totals.",
+                "ok":true}),
+        ])
+        .snapshot();
+        let [ChatPart::Step(step)] = parts.as_slice() else {
+            panic!("a use_skill call is a step: {parts:?}");
+        };
+        assert_eq!(step.label(), format!("Reading the {name} skill"));
+        assert_eq!(step.shown_arguments().as_deref(), Some(name));
+        assert!(
+            step.result
+                .as_deref()
+                .is_some_and(|body| body.contains("Check the totals.")),
+            "the skill's body is the call's result"
+        );
     }
 
     /// Words of one message on either side of a tool's result are one run of words, not two.

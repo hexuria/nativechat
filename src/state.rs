@@ -651,6 +651,326 @@ impl EffortControl {
     }
 }
 
+/// The open Bot's skills, as far as its settings know them: every skill of the account's library
+/// its owner may attach to it, and which of them are, which is what the Skills card's switches
+/// change (opengrok-server#270).
+#[derive(Debug, Clone, PartialEq)]
+pub enum BotSkills {
+    Loading,
+    Read(SkillsRead),
+    /// The server would not give them, in its words or the app's.
+    Unavailable(String),
+}
+
+/// A Bot's skills the server gave, as the Skills card holds them.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SkillsRead {
+    /// The rows as the server last sent them, from a read or from its answer to the last switch.
+    /// As with the ceiling's ([`CeilingRead::rows`]), nothing the app decided is ever written
+    /// here: a switch is drawn where it was asked to go from [`SkillSwitch`] while the server is
+    /// asked, so one the server did not take has nothing to be rolled back from.
+    pub rows: Vec<crate::opengrok::BotSkillRow>,
+    /// The version these rows came with, which a switch built from them sends back so the server
+    /// can refuse it if somebody changed the set since; `None` when they came with none, and then
+    /// the switch sends none either.
+    pub version: Option<i64>,
+}
+
+impl From<crate::opengrok::CoworkerSkills> for SkillsRead {
+    fn from(skills: crate::opengrok::CoworkerSkills) -> Self {
+        Self {
+            rows: skills.skills,
+            version: skills.version,
+        }
+    }
+}
+
+/// A skill switch that is with the server: which Bot, which skill, whether it was asked to be
+/// attached, and which switch it is. Its answer is settled by `token` and by nothing else, as a
+/// ceiling switch's is ([`CeilingSwitch`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkillSwitch {
+    pub coworker_id: String,
+    /// The skill's id, which is what its switch is known by: one of the person's own skills and a
+    /// colleague's can share a name, and never an id.
+    pub skill_id: String,
+    pub attached: bool,
+    pub token: u64,
+}
+
+/// What a skill switch sends: the Bot, the id of every skill that should be attached once it is
+/// taken, and the version of the rows that was built from. `token` is the switch its answer
+/// settles.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SkillsPut {
+    pub token: u64,
+    pub coworker_id: String,
+    pub attached: Vec<String>,
+    pub version: Option<i64>,
+}
+
+/// What became of a skill switch, for what the card says and what is asked next
+/// ([`after_skill_switch`]): the cases a ceiling switch has ([`CeilingAnswer`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SkillAnswer {
+    /// The server took it, and its answer is on the card.
+    Taken,
+    /// Nobody knows whether it was taken: nothing came back in time, what came back was from
+    /// something in front of the server that could not reach it (a proxy's 502, 503 or 504), or
+    /// the server answered with a body that is not a Bot's skills.
+    Unknown,
+    /// The set the switch asked for would not do, and nothing was changed: somebody changed the
+    /// skills since they were read (409 `skills-changed`), an id on the rows is one the server
+    /// does not list any more, or the set is past the server's cap on attached skills (422).
+    Outdated,
+    /// The server does not know who is asking (401).
+    SignedOut,
+    /// The server will not let this person change this Bot's skills (403): the card is read-only.
+    ReadOnly,
+    /// Any other refusal: the server's words, or a 404, which a read of the skills tells apart as
+    /// a Bot this person does not own or a server with no such route.
+    Refused,
+    /// About a Bot the card is not showing, or to a switch that is not the one with the server
+    /// any more: nothing on screen is about it.
+    Elsewhere,
+}
+
+/// How the answer to a skill switch reads, from the answer alone, by the rules a ceiling switch's
+/// is read by ([`ceiling_answer`]): out of reach and without a status are the same fact, no
+/// answer from the server about this switch.
+pub(crate) fn skill_answer(
+    result: &Result<crate::opengrok::CoworkerSkills, OpenGrokError>,
+) -> SkillAnswer {
+    let Err(error) = result else {
+        return SkillAnswer::Taken;
+    };
+    if error.unreachable().is_some() || error.status.is_none() {
+        return SkillAnswer::Unknown;
+    }
+    match error.status {
+        Some(401) => SkillAnswer::SignedOut,
+        Some(403) => SkillAnswer::ReadOnly,
+        Some(422) => SkillAnswer::Outdated,
+        Some(409) if error.is_skills_changed() => SkillAnswer::Outdated,
+        _ => SkillAnswer::Refused,
+    }
+}
+
+/// What is asked of the server once a skill switch has settled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AfterSkillSwitch {
+    /// Nothing: a read would not change what the card says.
+    Nothing,
+    /// `GET /coworkers/{id}/tools`: the card holds the server's answer, and `use_skill` may have
+    /// come or gone with it, since the next turn is offered it exactly while an attached skill is
+    /// switched on.
+    ReadTools,
+    /// The Bot's skills, and its tools with them: the rows on the card may not be the server's.
+    ReadSkills,
+}
+
+/// What is asked after a skill switch settled as `answer`, worked out as
+/// [`after_ceiling_switch`] works it out for the Tools card. Taken, the rows on the card are the
+/// server's own answer, and only what the next turn is offered is left to ask. In doubt, outdated
+/// or refused for a reason a read can explain, the skills are read again with the tools, and the
+/// person clicks again on the rows that come back; a 422 over the cap keeps its words on the card
+/// through the read. Signed out, read-only, or about a Bot not on screen: nothing a read would
+/// change.
+pub(crate) fn after_skill_switch(answer: SkillAnswer) -> AfterSkillSwitch {
+    match answer {
+        SkillAnswer::Taken => AfterSkillSwitch::ReadTools,
+        SkillAnswer::Unknown | SkillAnswer::Outdated | SkillAnswer::Refused => {
+            AfterSkillSwitch::ReadSkills
+        }
+        SkillAnswer::SignedOut | SkillAnswer::ReadOnly | SkillAnswer::Elsewhere => {
+            AfterSkillSwitch::Nothing
+        }
+    }
+}
+
+/// What the Skills card says about the last switch that did not go as it was asked to. Held
+/// beside the rows and by Bot for the reasons a [`CeilingNote`] is, and gone at the same moments:
+/// the Bot or its settings opened again, the next switch sent, the session over.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkillNote {
+    pub coworker_id: String,
+    pub words: String,
+    pub place: SkillNotePlace,
+}
+
+/// Where a [`SkillNote`] is said, and what it does there.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SkillNotePlace {
+    /// Under the skill it is about, by its id, while that skill is on the card; on the card while
+    /// it is not.
+    Row(String),
+    /// Under a skill whose switch got no answer, which asked it to be `attached` or not. Nobody
+    /// knows whether it was taken, so the skills are read again, and a read that has the skill
+    /// where the switch asked says it was: the note goes then, since it is no longer true.
+    Unanswered { skill_id: String, attached: bool },
+    /// On the card: about the attached set as a whole, as a stale version or the cap is.
+    Card,
+    /// On the card above every switch, and every switch is dead: the server refused a switch
+    /// with 403, and would refuse any other.
+    ReadOnly,
+}
+
+impl SkillNote {
+    /// The skill the note is said under, when it is said under one.
+    pub fn row(&self) -> Option<&str> {
+        match &self.place {
+            SkillNotePlace::Row(id) | SkillNotePlace::Unanswered { skill_id: id, .. } => Some(id),
+            SkillNotePlace::Card | SkillNotePlace::ReadOnly => None,
+        }
+    }
+}
+
+/// Why no switch on the open Bot's Skills card can be sent now, when none can: the reasons a
+/// [`CeilingBlock`] has, for the Skills card's own switch and read. The two cards' switches are
+/// apart — a `PUT` of the skills sends nothing of the ceiling, and one of the ceiling nothing of
+/// the skills — so neither card waits on the other.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SkillsBlock {
+    /// The server refused a switch with 403, in these words.
+    ReadOnly(String),
+    /// This Bot's skill switch is with the server.
+    Switching,
+    /// Another Bot's is. One at a time, whichever Bot: the switch with the server is one slot,
+    /// freed only by its own answer.
+    AnotherBot,
+    /// A read of this Bot's skills is still out. The rows on the card are about to be replaced,
+    /// and a switch built from them could undo a change the read is bringing.
+    Reading,
+}
+
+impl SkillsBlock {
+    /// Why, in words for the card and for a click that came anyway.
+    pub fn why(&self) -> &str {
+        match self {
+            Self::ReadOnly(words) => words,
+            // The Tools card's words, which are about whichever card they are on.
+            Self::Switching => CEILING_SWITCH_IN_FLIGHT,
+            Self::AnotherBot => ANOTHER_BOTS_SKILL_SWITCH,
+            Self::Reading => SKILLS_BEING_READ,
+        }
+    }
+}
+
+/// The open Bot's skills as its Skills card draws them, and as the driver is told they are drawn.
+/// Made in one place, [`AppState::skills_card`], as a [`CeilingCard`] is, so the screen, the
+/// driver and the tests read the same switch as this Bot's, the same reason for every switch
+/// being dead, and the same note.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SkillsCard {
+    pub skills: BotSkills,
+    /// This Bot's switch with the server, if it has one: its row is drawn where it was asked to
+    /// go. Another Bot's is drawn on nothing here, and blocks every switch all the same.
+    pub pending: Option<SkillSwitch>,
+    /// Why no switch can be sent now, when none can.
+    pub blocked: Option<SkillsBlock>,
+    pub note: Option<SkillNote>,
+    /// The roster says the Bot is shared with the owner's organization
+    /// ([`crate::opengrok::Coworker::is_shared`]). The people who use it can read the skills
+    /// attached to it (opengrok-server#270), and the card says so. False when it is the owner's
+    /// alone, and when the roster does not say, since the app does not claim what it cannot know.
+    pub shared: bool,
+}
+
+/// What the Skills card says to somebody who is not the Bot's owner: the server answers a read of
+/// a Bot's skills with `{"error": "no such coworker"}` for anybody else.
+pub const NOT_THE_SKILLS_OWNER: &str = "Only this Bot's owner can change its skills.";
+
+/// What the card says when the server has no route for a Bot's skills at all: it answers 404
+/// with nothing in it, which is not the server saying anything about the Bot.
+pub const SKILLS_NOT_ON_SERVER: &str = "This server can't give a Bot skills yet.";
+
+/// Why every skill switch is dead while another Bot's skill switch is with the server.
+pub const ANOTHER_BOTS_SKILL_SWITCH: &str =
+    "Another Bot's skills are being switched. These can be switched once that is done.";
+
+/// Why every skill switch is dead while the Bot's skills are being read again.
+pub const SKILLS_BEING_READ: &str = "Checking this Bot's skills with the server…";
+
+/// What a skill switched off in Settings → Skills is told when it is asked to be attached. It may
+/// stay attached and be detached, and that is all: attached, it would be named to no turn.
+pub const SWITCHED_OFF_STAYS_DETACHED: &str =
+    "This skill is switched off in Settings → Skills, so it cannot be attached.";
+
+/// What a skill switch or a read of the skills is told when the server does not know who is
+/// asking.
+pub const SIGN_IN_FOR_SKILLS: &str = "Sign in again to change this Bot's skills.";
+
+impl SkillsRead {
+    /// Whether a row is attached on screen: as the server has it, or as it was asked to be while
+    /// `pending`, this Bot's switch with the server, is about this row.
+    pub fn shown_attached(
+        &self,
+        row: &crate::opengrok::BotSkillRow,
+        pending: Option<&SkillSwitch>,
+    ) -> bool {
+        pending
+            .filter(|switch| switch.skill_id == row.id)
+            .map_or(row.attached, |switch| switch.attached)
+    }
+
+    /// How many skills the switches show attached, and how many of those are switched off in
+    /// Settings → Skills, which no turn is offered.
+    pub fn attached(&self, pending: Option<&SkillSwitch>) -> (usize, usize) {
+        self.rows
+            .iter()
+            .filter(|row| self.shown_attached(row, pending))
+            .fold((0, 0), |(attached, off), row| {
+                (attached + 1, off + usize::from(!row.enabled))
+            })
+    }
+
+    /// Whether the skill `skill_id` may be switched to `attached` now, and why not when it may
+    /// not. `blocked` is why no switch on the card may be sent now ([`SkillsCard::blocked`]): a
+    /// switch sends the whole attached set, built from these rows, so one sent while another is
+    /// with the server, or while a read is about to replace them, would be built without a change
+    /// the server has.
+    pub fn may_switch(
+        &self,
+        skill_id: &str,
+        attached: bool,
+        blocked: Option<&SkillsBlock>,
+    ) -> Result<&crate::opengrok::BotSkillRow, String> {
+        if let Some(blocked) = blocked {
+            return Err(blocked.why().to_string());
+        }
+        let row = self
+            .rows
+            .iter()
+            .find(|row| row.id == skill_id)
+            .ok_or_else(|| format!("This Bot's skills have no `{skill_id}`."))?;
+        // A skill switched off in Settings → Skills stays listed, and may stay attached: it is
+        // named to keep it and left out to detach it, so a detach always goes. Attaching one would
+        // name to the Bot a skill no turn is offered, so it is never newly attached; the way to it
+        // is switching it back on where it was switched off.
+        if attached && !row.attached && !row.enabled {
+            return Err(SWITCHED_OFF_STAYS_DETACHED.to_string());
+        }
+        Ok(row)
+    }
+
+    /// The ids a `PUT` moving `skill_id` to `attached` sends: every skill the server has attached,
+    /// with this one changed, in the server's order. One switched off and still attached is named
+    /// to keep it: the `PUT` replaces the whole set, and leaving it out would detach it.
+    pub fn attached_after(&self, skill_id: &str, attached: bool) -> Vec<String> {
+        self.rows
+            .iter()
+            .filter(|row| {
+                if row.id == skill_id {
+                    attached
+                } else {
+                    row.attached
+                }
+            })
+            .map(|row| row.id.clone())
+            .collect()
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Message {
     pub id: String,
@@ -1330,8 +1650,9 @@ fn ceiling_unavailable(error: &OpenGrokError) -> String {
 
 /// Whether the server's words for a refused switch name the row `name`. Its refusal of a name it
 /// does not list ends with the name (`no tool or plugin named {name}`, opengrok-server
-/// `agui/ceiling.rs`), and a name inside another does not count: `shell` is not named by "no tool
-/// or plugin named user_machine_shell".
+/// `agui/ceiling.rs`), as its refusal of a skill id does (`no skill {id}`, agreed for #270), and a
+/// name inside another does not count: `shell` is not named by "no tool or plugin named
+/// user_machine_shell".
 fn words_name_row(words: &str, name: &str) -> bool {
     let words = words.trim_end().trim_end_matches(['.', '"', '\'', '`']);
     words
@@ -1380,6 +1701,69 @@ fn ceiling_switch_note(
         _ => (error.message.clone(), row()),
     };
     CeilingNote {
+        coworker_id: switch.coworker_id.clone(),
+        words,
+        place,
+    }
+}
+
+/// Why the open Bot's skills have no switches, in words for its Skills card, by the rules the
+/// Tools card's are said by ([`ceiling_unavailable`]): a 404 in the server's own shape is a Bot
+/// this person does not own, an empty one a server with no route for skills at all, and nothing
+/// from something in front of the server is shown as the server's words.
+fn skills_unavailable(error: &OpenGrokError) -> String {
+    if error.unreachable().is_some() {
+        return "Could not reach the server to read this Bot's skills.".to_string();
+    }
+    match error.status {
+        None => "The server's answer about this Bot's skills could not be read.".to_string(),
+        Some(404) if error.written_by_opengrok() => NOT_THE_SKILLS_OWNER.to_string(),
+        Some(404) => SKILLS_NOT_ON_SERVER.to_string(),
+        Some(401) => SIGN_IN_FOR_SKILLS.to_string(),
+        Some(403) => error.message.clone(),
+        Some(_) => format!("Could not read this Bot's skills: {}", error.message),
+    }
+}
+
+/// What the Skills card says after a switch that did not go as asked, and where it says it, by
+/// the rules [`ceiling_switch_note`] follows. A 422 that names the skill switched (`no skill
+/// {id}`: it is gone from the server since the rows were read) is said under it; any other 422,
+/// the cap on attached skills among them, and a stale version are about the set as a whole, and
+/// said on the card. A 403 makes the card read-only in the server's words, and nothing is shown
+/// as the server's words that it did not write.
+fn skill_switch_note(
+    switch: &SkillSwitch,
+    error: &OpenGrokError,
+    answer: SkillAnswer,
+) -> SkillNote {
+    let row = || SkillNotePlace::Row(switch.skill_id.clone());
+    let (words, place) = match answer {
+        SkillAnswer::Unknown => (
+            if error.unreachable().is_some() {
+                SWITCH_UNANSWERED
+            } else {
+                SWITCH_ANSWER_UNREADABLE
+            }
+            .to_string(),
+            SkillNotePlace::Unanswered {
+                skill_id: switch.skill_id.clone(),
+                attached: switch.attached,
+            },
+        ),
+        SkillAnswer::SignedOut => (SIGN_IN_FOR_SKILLS.to_string(), row()),
+        SkillAnswer::ReadOnly => (error.message.clone(), SkillNotePlace::ReadOnly),
+        SkillAnswer::Outdated
+            if !error.is_skills_changed() && words_name_row(&error.message, &switch.skill_id) =>
+        {
+            (error.message.clone(), row())
+        }
+        SkillAnswer::Outdated => (error.message.clone(), SkillNotePlace::Card),
+        _ if error.is_not_found() && !error.written_by_opengrok() => {
+            (SKILLS_NOT_ON_SERVER.to_string(), row())
+        }
+        _ => (error.message.clone(), row()),
+    };
+    SkillNote {
         coworker_id: switch.coworker_id.clone(),
         words,
         place,
@@ -3700,6 +4084,27 @@ pub struct AppState {
     /// A driver pressed the bot settings' Save. The button is the pane's, and so are the fields
     /// it sends, so the pane takes this and saves as the button would.
     agent_save_requested: bool,
+    /// Every skill the open Bot's owner may attach to it and which of them are, as its Skills
+    /// card's switches show them (opengrok-server#270): the Bot's id and the answer, like
+    /// [`Self::coworker_tools`]. Drawn through [`Self::skills_card`].
+    pub coworker_skills: Option<(String, BotSkills)>,
+    /// Counts the reads of a Bot's skills asked for, so only the newest answer is shown. A switch
+    /// the server took counts one too, so a read asked before its answer cannot land after it and
+    /// put back what the answer replaced.
+    skills_generation: u64,
+    /// The newest read of the skills, by its generation, while it is out. No skill switch is sent
+    /// meanwhile, since a switch built from rows about to be replaced could undo whatever change
+    /// the read is bringing.
+    skills_reading: Option<u64>,
+    /// The one skill switch with the server, whichever Bot it is for: see
+    /// [`Self::switch_bot_skill`].
+    skill_switch: Option<SkillSwitch>,
+    /// Counts the skill switches sent, for the token each is settled by.
+    skill_switches: u64,
+    /// What the Skills card says about the last switch that did not go as asked.
+    skill_note: Option<SkillNote>,
+    /// The bot settings' Skills card is open to its rows.
+    pub agent_skills_open: bool,
     /// `egressTunnelAvailable` on `GET /ag-ui/host-settings`: host intent AND the open
     /// coworker's box advertising the tunnel.
     pub host_egress_tunnel_available: bool,
@@ -4233,6 +4638,13 @@ impl AppState {
             ceiling_note: None,
             effort_pick: None,
             agent_save_requested: false,
+            coworker_skills: None,
+            skills_generation: 0,
+            skills_reading: None,
+            skill_switch: None,
+            skill_switches: 0,
+            skill_note: None,
+            agent_skills_open: false,
             host_egress_tunnel_available: false,
             egress_policy_pending: None,
             network_policy_open: false,
@@ -5287,6 +5699,8 @@ impl AppState {
         // A tool switch still with the server holds every switch until it answers, and it was
         // this account's: the next account's switches must not wait on it.
         self.forget_ceilings();
+        // The same for a skill switch, and the skills card was this account's library.
+        self.forget_bot_skills();
         // The open recipe and the runs the page was waiting on were this account's. Closing the
         // recipe drops its follower too, which would otherwise read on without a session.
         self.recipe_runs_in_flight.clear();
@@ -5600,9 +6014,11 @@ impl AppState {
             self.refresh_coworker_computer_quietly(cx);
             self.refresh_coworker_tools(cx);
             // What the Tools card said about a switch was said while it was last open; the read
-            // asked now is what it says from here.
+            // asked now is what it says from here. The Skills card's the same.
             self.ceiling_note = None;
             self.refresh_coworker_ceiling(cx);
+            self.skill_note = None;
+            self.refresh_coworker_skills(cx);
             self.refresh_coworker_usage(cx);
             // The Connections card lends the person's connections to this bot, so it is drawn
             // from what the server says now rather than from whenever the list was last read.
@@ -5982,6 +6398,286 @@ impl AppState {
         self.ceiling_note = None;
         self.ceiling_reading = None;
         self.ceiling_generation += 1;
+    }
+
+    /// Ask the server which skills the open Bot's owner may attach to it, and which are. Asked
+    /// each time its settings open and when another Bot is opened while they are, and after a
+    /// switch whose answer leaves the rows on the card in doubt ([`after_skill_switch`]). No skill
+    /// switch is sent until it lands.
+    pub fn refresh_coworker_skills(&mut self, cx: &mut Context<Self>) {
+        let (Some(client), Some(coworker_id)) =
+            (self.opengrok.clone(), self.active_coworker_id.clone())
+        else {
+            self.coworker_skills = None;
+            return;
+        };
+        // The switches read for this Bot stay on screen while it is asked again, so they do not
+        // blink out every time the pane opens. They are dead until the read lands.
+        let read = matches!(
+            &self.coworker_skills,
+            Some((id, BotSkills::Read(_))) if *id == coworker_id
+        );
+        if !read {
+            self.coworker_skills = Some((coworker_id.clone(), BotSkills::Loading));
+        }
+        let generation = self.ask_skills_read();
+        cx.spawn(async move |this, cx| {
+            let result = client.coworker_skills(&coworker_id).await;
+            let _ = this.update(cx, |state, cx| {
+                if state.settle_coworker_skills(generation, coworker_id, result) {
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Count a read of the skills asked for, and hold every skill switch until it lands.
+    fn ask_skills_read(&mut self) -> u64 {
+        self.skills_generation += 1;
+        self.skills_reading = Some(self.skills_generation);
+        self.skills_generation
+    }
+
+    /// Put a read of a Bot's skills on its card, unless it is no longer the one wanted: a newer
+    /// read was asked for since, a switch has answered since, or the person has moved to another
+    /// Bot. The card's note stays, as the Tools card's does ([`Self::settle_coworker_ceiling`]),
+    /// except the note on a switch nobody heard the answer to, which the read settles.
+    pub(crate) fn settle_coworker_skills(
+        &mut self,
+        generation: u64,
+        coworker_id: String,
+        result: Result<crate::opengrok::CoworkerSkills, OpenGrokError>,
+    ) -> bool {
+        if self.skills_generation != generation {
+            return false;
+        }
+        // The newest read is in, so none is out, whichever Bot it was for.
+        self.skills_reading = None;
+        if self.active_coworker_id.as_deref() != Some(coworker_id.as_str()) {
+            return false;
+        }
+        let skills = match result {
+            Ok(skills) => {
+                // A skill the server does not list is not attached.
+                let took = |skill_id: &str, attached: bool| {
+                    skills
+                        .skills
+                        .iter()
+                        .find(|row| row.id == skill_id)
+                        .is_some_and(|row| row.attached)
+                        == attached
+                };
+                if let Some(SkillNote {
+                    coworker_id: about,
+                    place: SkillNotePlace::Unanswered { skill_id, attached },
+                    ..
+                }) = &self.skill_note
+                    && *about == coworker_id
+                    && took(skill_id, *attached)
+                {
+                    self.skill_note = None;
+                }
+                BotSkills::Read(skills.into())
+            }
+            Err(error) => BotSkills::Unavailable(skills_unavailable(&error)),
+        };
+        self.coworker_skills = Some((coworker_id, skills));
+        true
+    }
+
+    /// The open Bot's Skills card, or nothing while nothing has been asked for it. The one place
+    /// the skill switch with the server is sorted into this Bot's or another's, the reason every
+    /// switch is dead worked out, and whether the Bot is shared read off the roster, for the
+    /// screen, the driver and the tests alike. See [`SkillsCard`].
+    pub fn skills_card(&self) -> Option<SkillsCard> {
+        let (coworker_id, skills) = self
+            .coworker_skills
+            .as_ref()
+            .filter(|(id, _)| self.active_coworker_id.as_deref() == Some(id.as_str()))?;
+        let note = self
+            .skill_note
+            .clone()
+            .filter(|note| note.coworker_id == *coworker_id);
+        let blocked = match (&note, &self.skill_switch) {
+            (
+                Some(SkillNote {
+                    words,
+                    place: SkillNotePlace::ReadOnly,
+                    ..
+                }),
+                _,
+            ) => Some(SkillsBlock::ReadOnly(words.clone())),
+            (_, Some(switch)) if switch.coworker_id == *coworker_id => Some(SkillsBlock::Switching),
+            (_, Some(_)) => Some(SkillsBlock::AnotherBot),
+            (_, None) if self.skills_reading.is_some() => Some(SkillsBlock::Reading),
+            (_, None) => None,
+        };
+        Some(SkillsCard {
+            skills: skills.clone(),
+            pending: self
+                .skill_switch
+                .clone()
+                .filter(|switch| switch.coworker_id == *coworker_id),
+            blocked,
+            note,
+            shared: self
+                .coworkers
+                .iter()
+                .find(|coworker| coworker.id == *coworker_id)
+                .is_some_and(Coworker::is_shared),
+        })
+    }
+
+    /// A switch on the Skills card: the skill `skill_id` attached to the open Bot or detached
+    /// from it, sent at once.
+    ///
+    /// As a ceiling switch is ([`Self::switch_ceiling_tool`]): the `PUT` carries the whole set —
+    /// the server's last rows with this one change — and the version of those rows; only one is
+    /// ever with the server, until it answers or its deadline runs out; the row shows where it
+    /// was asked to go meanwhile, and the rows are only ever written with what the server sends.
+    /// What is asked next is [`after_skill_switch`].
+    pub fn switch_bot_skill(&mut self, skill_id: String, attached: bool, cx: &mut Context<Self>) {
+        let Some(client) = self.opengrok.clone() else {
+            return;
+        };
+        let put = match self.begin_skill_switch(&skill_id, attached) {
+            Ok(put) => put,
+            Err(why) => {
+                // Not silence, for the ceiling's reason: whatever reached here came from somewhere
+                // the screen cannot stop, the driver or a click already on its way, and a switch
+                // that did nothing and said nothing reads as one that was taken.
+                self.note_skill_refusal(&skill_id, why);
+                cx.notify();
+                return;
+            }
+        };
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = client
+                .set_coworker_skills(&put.coworker_id, &put.attached, put.version)
+                .await;
+            let _ = this.update(cx, |state, cx| {
+                match after_skill_switch(state.settle_skill_switch(put.token, result)) {
+                    AfterSkillSwitch::Nothing => {}
+                    // `use_skill` is offered exactly while an attached skill is switched on, so
+                    // the Tools card's first line may have changed with the set. It says what the
+                    // server lists, read again, not what the app works out from the switches.
+                    AfterSkillSwitch::ReadTools => state.refresh_coworker_tools(cx),
+                    AfterSkillSwitch::ReadSkills => {
+                        state.refresh_coworker_skills(cx);
+                        state.refresh_coworker_tools(cx);
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Start a skill switch: what it sends, or why it may not be sent. The rows are not touched —
+    /// the switch in flight is what the row is drawn from until the server answers.
+    pub(crate) fn begin_skill_switch(
+        &mut self,
+        skill_id: &str,
+        attached: bool,
+    ) -> Result<SkillsPut, String> {
+        let (Some(coworker_id), Some(card)) = (self.active_coworker_id.clone(), self.skills_card())
+        else {
+            return Err("This Bot's skills have not been read yet.".to_string());
+        };
+        let read = match &card.skills {
+            BotSkills::Read(read) => read,
+            BotSkills::Loading => return Err(SKILLS_BEING_READ.to_string()),
+            BotSkills::Unavailable(why) => return Err(why.clone()),
+        };
+        read.may_switch(skill_id, attached, card.blocked.as_ref())?;
+        self.skill_switches += 1;
+        let token = self.skill_switches;
+        // A note is about the switch it was said of, and this is another one.
+        self.skill_note = None;
+        self.skill_switch = Some(SkillSwitch {
+            coworker_id: coworker_id.clone(),
+            skill_id: skill_id.to_string(),
+            attached,
+            token,
+        });
+        Ok(SkillsPut {
+            token,
+            coworker_id,
+            attached: read.attached_after(skill_id, attached),
+            version: read.version,
+        })
+    }
+
+    /// Say under a skill why its switch was not sent, where the skill is on screen. Not while the
+    /// card is blocked: it says why already, and words under the row clicked would outlive the
+    /// wait they were about.
+    fn note_skill_refusal(&mut self, skill_id: &str, why: String) {
+        let (Some(coworker_id), Some(card)) = (self.active_coworker_id.clone(), self.skills_card())
+        else {
+            return;
+        };
+        if !matches!(card.skills, BotSkills::Read(_)) || card.blocked.is_some() {
+            return;
+        }
+        self.skill_note = Some(SkillNote {
+            coworker_id,
+            words: why,
+            place: SkillNotePlace::Row(skill_id.to_string()),
+        });
+    }
+
+    /// Take the server's answer to the skill switch that was with it, and say what it was, as
+    /// [`Self::settle_ceiling_switch`] does for the Tools card: only the switch it answers is
+    /// settled, by its token; the switch is over whatever the answer and whichever Bot is open;
+    /// and the answer lands only on the Bot it was about while that Bot is open. Taken, the answer
+    /// IS the Bot's skills, and a read asked before it is dropped when it lands. Otherwise the rows
+    /// are left as the server last gave them, and the card says why ([`skill_switch_note`]).
+    pub(crate) fn settle_skill_switch(
+        &mut self,
+        token: u64,
+        result: Result<crate::opengrok::CoworkerSkills, OpenGrokError>,
+    ) -> SkillAnswer {
+        let Some(switch) = self.skill_switch.take_if(|switch| switch.token == token) else {
+            return SkillAnswer::Elsewhere;
+        };
+        let open = self.active_coworker_id.as_deref() == Some(switch.coworker_id.as_str())
+            && self
+                .coworker_skills
+                .as_ref()
+                .is_some_and(|(id, _)| *id == switch.coworker_id);
+        if !open {
+            return SkillAnswer::Elsewhere;
+        }
+        let answer = skill_answer(&result);
+        match result {
+            Ok(skills) => {
+                self.skills_generation += 1;
+                self.skills_reading = None;
+                self.skill_note = None;
+                self.coworker_skills = Some((switch.coworker_id, BotSkills::Read(skills.into())));
+            }
+            Err(error) => self.skill_note = Some(skill_switch_note(&switch, &error, answer)),
+        }
+        answer
+    }
+
+    /// Everything about a Bot's skills goes with the session that asked for it: the switch with
+    /// the server, whose answer carries a token nothing matches any more; a read still out, which
+    /// lands on nothing; and the card, what it says, and whether it was open.
+    fn forget_bot_skills(&mut self) {
+        self.coworker_skills = None;
+        self.skill_switch = None;
+        self.skill_note = None;
+        self.skills_reading = None;
+        self.skills_generation += 1;
+        self.agent_skills_open = false;
+    }
+
+    pub fn toggle_agent_skills(&mut self, cx: &mut Context<Self>) {
+        self.agent_skills_open = !self.agent_skills_open;
+        cx.notify();
     }
 
     pub fn toggle_agent_tools(&mut self, cx: &mut Context<Self>) {
@@ -9852,18 +10548,23 @@ impl AppState {
         self.last_box_shot = None;
         self.computer_confirm = None;
         self.computer_action_error = None;
-        // The last bot's tools and usage must not be shown under this one's name. A switch still
-        // with the server stays with it: it is about the last bot, and lands on nothing here,
-        // unless this is that bot opened again, where its answer is still this card's to show.
+        // The last bot's tools, skills and usage must not be shown under this one's name. A switch
+        // still with the server stays with it: it is about the last bot, and lands on nothing
+        // here, unless this is that bot opened again, where its answer is still this card's to
+        // show.
         self.coworker_tools = None;
         self.coworker_ceiling = None;
         self.ceiling_note = None;
+        self.coworker_skills = None;
+        self.skill_note = None;
         self.coworker_usage = None;
         self.agent_tools_open = false;
+        self.agent_skills_open = false;
         self.agent_usage_open = false;
         if self.right_pane == RightPane::Settings {
             self.refresh_coworker_tools(cx);
             self.refresh_coworker_ceiling(cx);
+            self.refresh_coworker_skills(cx);
             self.refresh_coworker_usage(cx);
         }
         if !self.conversations.iter().any(|c| c.id == id) {
@@ -20757,6 +21458,7 @@ mod tests {
             hidden_from_sidebar: false,
             box_id: None,
             effort: Some("high".to_string()),
+            visibility: Some("private".to_string()),
         }
     }
 
@@ -20844,6 +21546,7 @@ mod tests {
             hidden_from_sidebar: false,
             box_id: None,
             effort: None,
+            visibility: None,
         };
         settle_patch(&mut roster, &patch, Some(&echo), &before);
         assert_eq!(roster.model, "xai/grok-4.7@sub");
@@ -27364,6 +28067,908 @@ mod tests {
             ceiling_unavailable(&OpenGrokError::message("error decoding response body")),
             "The server's answer about this Bot's tools could not be read."
         );
+    }
+
+    // ---- A Bot's skills, and the Skills card's switches (opengrok-server#270) ----------------
+
+    use super::{
+        ANOTHER_BOTS_SKILL_SWITCH, AfterSkillSwitch, BotSkills,
+        CEILING_SWITCH_IN_FLIGHT as SKILL_IN_FLIGHT, NOT_THE_SKILLS_OWNER, SIGN_IN_FOR_SKILLS,
+        SKILLS_BEING_READ, SKILLS_NOT_ON_SERVER, SWITCHED_OFF_STAYS_DETACHED, SkillAnswer,
+        SkillNotePlace, SkillsBlock, SkillsCard, SkillsPut, SkillsRead, after_skill_switch,
+        skill_answer, skills_unavailable,
+    };
+    use crate::components::agent_settings::{SkillsCardLine, shown_skill_rows, skills_card_lines};
+    use crate::opengrok::CoworkerSkills;
+
+    /// A bot's skills at `version`, or at none.
+    fn skills_at(version: Option<i64>, rows: serde_json::Value) -> CoworkerSkills {
+        serde_json::from_value(json!({ "skills": rows, "version": version })).expect("skills")
+    }
+
+    /// The rows of [`served_skills`]: the owner's `triage` attached and `draft` not, a
+    /// colleague's `review` attached, and two of the owner's switched off in Settings → Skills,
+    /// `old-notes` still attached and `archive` not.
+    fn skill_rows() -> serde_json::Value {
+        json!([
+            {"id": "sk_triage", "name": "triage", "description": "Sort the inbox.",
+                "scope": "mine", "attached": true, "enabled": true},
+            {"id": "sk_draft", "name": "draft", "description": "Write a first draft.",
+                "scope": "mine", "attached": false, "enabled": true},
+            {"id": "sk_review", "name": "review", "description": "The team's checklist.",
+                "scope": "org", "attached": true, "enabled": true},
+            {"id": "sk_old", "name": "old-notes", "description": "",
+                "scope": "mine", "attached": true, "enabled": false},
+            {"id": "sk_archive", "name": "archive", "description": "",
+                "scope": "mine", "attached": false, "enabled": false}
+        ])
+    }
+
+    /// A bot's skills as the server gives them, at version 4.
+    fn served_skills() -> CoworkerSkills {
+        skills_at(Some(4), skill_rows())
+    }
+
+    /// `coworker` open, with its skills read.
+    fn with_skills_read(coworker: &str) -> AppState {
+        let mut state = AppState::new();
+        state.active_coworker_id = Some(coworker.into());
+        let generation = state.ask_skills_read();
+        assert!(state.settle_coworker_skills(generation, coworker.into(), Ok(served_skills())));
+        state
+    }
+
+    fn skill_card(state: &AppState) -> SkillsCard {
+        state.skills_card().expect("the open Bot's Skills card")
+    }
+
+    fn skills_read(state: &AppState) -> SkillsRead {
+        match skill_card(state).skills {
+            BotSkills::Read(read) => read,
+            other => panic!("no skills read: {other:?}"),
+        }
+    }
+
+    /// The skills the card shows attached, by id, in the server's order.
+    fn attached_shown(state: &AppState) -> Vec<String> {
+        shown_skill_rows(&skill_card(state))
+            .into_iter()
+            .filter(|row| row.on)
+            .map(|row| row.id)
+            .collect()
+    }
+
+    /// The words under each skill that has any, as the card draws them.
+    fn skill_notes(state: &AppState) -> Vec<(String, String)> {
+        shown_skill_rows(&skill_card(state))
+            .into_iter()
+            .filter_map(|row| Some((row.id, row.note?)))
+            .collect()
+    }
+
+    fn skill_ids(ids: &[&str]) -> Vec<String> {
+        ids.iter().map(|id| id.to_string()).collect()
+    }
+
+    /// Send `put` as `switch_bot_skill` does, to `server`, and settle what comes back.
+    async fn send_skill_switch(
+        state: &mut AppState,
+        server: &wiremock::MockServer,
+        put: SkillsPut,
+    ) -> SkillAnswer {
+        let client = OpenGrokClient::new(&server.uri()).expect("a URL that parses");
+        let result = client
+            .set_coworker_skills(&put.coworker_id, &put.attached, put.version)
+            .await;
+        state.settle_skill_switch(put.token, result)
+    }
+
+    /// The server answers every `PUT` of cw_1's skills with `answer`.
+    async fn skills_put_answered(answer: wiremock::ResponseTemplate) -> wiremock::MockServer {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .and(wiremock::matchers::path("/coworkers/cw_1/skills"))
+            .respond_with(answer)
+            .mount(&server)
+            .await;
+        server
+    }
+
+    /// What comes after a skill switch is worked out from its answer alone: taken, the tools are
+    /// read again, since `use_skill` may have come or gone; in doubt, outdated or refused, the
+    /// skills are read again with the tools; signed out, read-only or about another Bot, nothing
+    /// is asked. And each answer reads as what it is.
+    #[test]
+    fn what_follows_a_skill_switch_is_its_answers_to_say() {
+        use AfterSkillSwitch::{Nothing, ReadSkills, ReadTools};
+        use SkillAnswer::{Elsewhere, Outdated, ReadOnly, Refused, SignedOut, Taken, Unknown};
+        for (answer, after) in [
+            (Taken, ReadTools),
+            (Unknown, ReadSkills),
+            (Outdated, ReadSkills),
+            (Refused, ReadSkills),
+            (SignedOut, Nothing),
+            (ReadOnly, Nothing),
+            (Elsewhere, Nothing),
+        ] {
+            assert_eq!(after_skill_switch(answer), after, "{answer:?}");
+        }
+        let read = |error: OpenGrokError| skill_answer(&Err(error));
+        assert_eq!(skill_answer(&Ok(served_skills())), Taken);
+        assert_eq!(
+            read(OpenGrokError::message("error decoding response body")),
+            Unknown,
+            "an answer with no status"
+        );
+        assert_eq!(
+            read(OpenGrokError::from_server(Some(504), "Gateway Timeout")),
+            Unknown
+        );
+        assert_eq!(read(OpenGrokError::signed_out("sign in first")), SignedOut);
+        assert_eq!(
+            read(OpenGrokError::from_opengrok(
+                403,
+                "your grant was withdrawn"
+            )),
+            ReadOnly
+        );
+        for words in [
+            "no skill sk_gone",
+            "a coworker can have at most 20 skills attached",
+        ] {
+            assert_eq!(
+                read(OpenGrokError::from_opengrok(422, words)),
+                Outdated,
+                "{words}"
+            );
+        }
+        // The 409 with the skills' own code is read as outdated on the wire, in
+        // `a_changed_skill_set_is_read_again_with_the_servers_words_on_the_card`.
+        assert_eq!(
+            read(OpenGrokError::from_opengrok(409, "a conflict with no code")),
+            Refused,
+            "only the server's skills-changed code says the rows are old"
+        );
+        assert_eq!(
+            read(OpenGrokError::from_opengrok(404, "no such coworker")),
+            Refused
+        );
+        assert_eq!(
+            read(OpenGrokError::from_opengrok(
+                503,
+                "this coworker's skills could not be read or saved now"
+            )),
+            Refused,
+            "a 503 the server wrote is its word"
+        );
+    }
+
+    /// A read lands only while it is the one wanted: an older read answering after a newer one,
+    /// and a read for a Bot the person has since left, are dropped rather than drawn over the
+    /// newer answer or under the wrong Bot's name.
+    #[test]
+    fn a_late_skills_read_is_dropped() {
+        let mut state = AppState::new();
+        state.active_coworker_id = Some("cw_1".into());
+        let only_triage = || {
+            Ok(skills_at(
+                Some(1),
+                json!([{"id": "sk_triage", "name": "triage", "description": "",
+                    "scope": "mine", "attached": true, "enabled": true}]),
+            ))
+        };
+        let older = state.ask_skills_read();
+        let newer = state.ask_skills_read();
+        assert!(state.settle_coworker_skills(newer, "cw_1".into(), Ok(served_skills())));
+        assert!(
+            !state.settle_coworker_skills(older, "cw_1".into(), only_triage()),
+            "an older read answering late"
+        );
+        assert_eq!(skills_read(&state).rows.len(), 5);
+
+        let for_the_first = state.ask_skills_read();
+        state.active_coworker_id = Some("cw_2".into());
+        state.coworker_skills = Some(("cw_2".into(), BotSkills::Loading));
+        assert!(!state.settle_coworker_skills(for_the_first, "cw_1".into(), only_triage()));
+        assert_eq!(
+            state.coworker_skills,
+            Some(("cw_2".into(), BotSkills::Loading)),
+            "the first Bot's skills are not drawn under the second's name"
+        );
+        assert_eq!(state.skills_reading, None, "and nothing waits on it");
+    }
+
+    /// A switch sends every skill the server has attached with this one changed, and the version
+    /// the rows came with — a skill switched off and still attached is named to keep it, and one
+    /// not attached is not named — and the row shows where it was asked to go while the rows
+    /// themselves stay as the server gave them. The next switch is built from the answer.
+    #[test]
+    fn a_skill_switch_sends_the_servers_rows_with_one_change() {
+        let mut state = with_skills_read("cw_1");
+        let put = state.begin_skill_switch("sk_draft", true).unwrap();
+        assert_eq!(put.coworker_id, "cw_1");
+        assert_eq!(
+            put.attached,
+            ["sk_triage", "sk_draft", "sk_review", "sk_old"]
+        );
+        assert_eq!(put.version, Some(4));
+        assert_eq!(
+            attached_shown(&state),
+            skill_ids(&["sk_triage", "sk_draft", "sk_review", "sk_old"])
+        );
+        assert!(
+            !skills_read(&state).rows[1].attached,
+            "the rows are the server's until it answers"
+        );
+        let first = put.token;
+        assert_eq!(
+            state.settle_skill_switch(first, Ok(skills_at(Some(5), skill_rows()))),
+            SkillAnswer::Taken
+        );
+
+        let put = state.begin_skill_switch("sk_triage", false).unwrap();
+        assert_eq!(put.attached, ["sk_review", "sk_old"]);
+        assert_eq!(
+            put.version,
+            Some(5),
+            "built from the answer, so at its version"
+        );
+        assert_ne!(put.token, first, "a switch is its own");
+    }
+
+    /// Rows that came with no version are switched without one.
+    #[test]
+    fn skills_with_no_version_are_switched_without_one() {
+        let mut state = AppState::new();
+        state.active_coworker_id = Some("cw_1".into());
+        let generation = state.ask_skills_read();
+        assert!(state.settle_coworker_skills(
+            generation,
+            "cw_1".into(),
+            Ok(skills_at(None, skill_rows()))
+        ));
+        let put = state.begin_skill_switch("sk_draft", true).unwrap();
+        assert_eq!(put.version, None);
+    }
+
+    /// A skill switched off in Settings → Skills is dimmed on the card and never newly attached:
+    /// no turn would be offered it. One still attached can be detached, which always goes, and
+    /// switching any other skill names it so it stays attached. Once detached it cannot be
+    /// attached again from here.
+    #[test]
+    fn a_switched_off_skill_can_be_detached_but_never_attached() {
+        let mut state = with_skills_read("cw_1");
+        let rows = shown_skill_rows(&skill_card(&state));
+        let row = |id: &str| rows.iter().find(|row| row.id == id).unwrap().clone();
+        assert!(row("sk_old").switched_off && row("sk_old").on && row("sk_old").live);
+        assert!(
+            row("sk_archive").switched_off && !row("sk_archive").on && !row("sk_archive").live,
+            "drawn dead: a click would attach it"
+        );
+        assert!(!row("sk_draft").switched_off && row("sk_draft").live);
+
+        assert_eq!(
+            state.begin_skill_switch("sk_archive", true),
+            Err(SWITCHED_OFF_STAYS_DETACHED.to_string())
+        );
+        assert_eq!(state.skill_switch, None, "nothing was sent");
+        // A click that came anyway says why under the row.
+        state.note_skill_refusal("sk_archive", SWITCHED_OFF_STAYS_DETACHED.to_string());
+        assert_eq!(
+            skill_notes(&state),
+            [(
+                "sk_archive".to_string(),
+                SWITCHED_OFF_STAYS_DETACHED.to_string()
+            )]
+        );
+
+        let put = state.begin_skill_switch("sk_old", false).unwrap();
+        assert_eq!(put.attached, ["sk_triage", "sk_review"], "detached");
+        assert_eq!(
+            skill_card(&state).note,
+            None,
+            "another switch clears the note"
+        );
+        let mut answer = skill_rows();
+        answer[3]["attached"] = json!(false);
+        assert_eq!(
+            state.settle_skill_switch(put.token, Ok(skills_at(Some(5), answer))),
+            SkillAnswer::Taken
+        );
+        assert_eq!(
+            state.begin_skill_switch("sk_old", true),
+            Err(SWITCHED_OFF_STAYS_DETACHED.to_string()),
+            "detached, it is a switched-off skill like any other"
+        );
+    }
+
+    /// One switch at a time: the second is built from rows without the first's change in them,
+    /// and would undo it. It is refused whichever skill and whichever Bot until the first has
+    /// answered, and the card says which it is waiting on.
+    #[test]
+    fn a_skill_switch_in_flight_blocks_a_second() {
+        let mut state = with_skills_read("cw_1");
+        let first = state.begin_skill_switch("sk_draft", true).unwrap();
+        assert_eq!(skill_card(&state).blocked, Some(SkillsBlock::Switching));
+        assert_eq!(
+            state.begin_skill_switch("sk_triage", false),
+            Err(SKILL_IN_FLIGHT.to_string())
+        );
+        assert!(
+            shown_skill_rows(&skill_card(&state))
+                .iter()
+                .all(|row| !row.live)
+        );
+        assert!(
+            skills_card_lines(&skill_card(&state)).is_empty(),
+            "the row itself says it is saving"
+        );
+        assert!(
+            shown_skill_rows(&skill_card(&state))
+                .iter()
+                .any(|row| row.id == "sk_draft" && row.switching && row.on)
+        );
+
+        // Another Bot opened meanwhile, and its skills read: its switches wait too.
+        state.active_coworker_id = Some("cw_2".into());
+        let generation = state.ask_skills_read();
+        assert!(state.settle_coworker_skills(generation, "cw_2".into(), Ok(served_skills())));
+        assert_eq!(
+            attached_shown(&state),
+            skill_ids(&["sk_triage", "sk_review", "sk_old"]),
+            "the first Bot's switch is not drawn on the second's rows"
+        );
+        assert_eq!(skill_card(&state).blocked, Some(SkillsBlock::AnotherBot));
+        assert_eq!(
+            skills_card_lines(&skill_card(&state)),
+            [SkillsCardLine::Wait(ANOTHER_BOTS_SKILL_SWITCH.to_string())]
+        );
+        assert_eq!(
+            state.begin_skill_switch("sk_triage", false),
+            Err(ANOTHER_BOTS_SKILL_SWITCH.to_string())
+        );
+
+        // The first Bot's answer lands on nothing here, and frees the next switch.
+        assert_eq!(
+            state.settle_skill_switch(first.token, Ok(served_skills())),
+            SkillAnswer::Elsewhere
+        );
+        assert_eq!(state.skill_switch, None);
+        assert_eq!(skill_card(&state).blocked, None);
+        assert!(state.begin_skill_switch("sk_triage", false).is_ok());
+    }
+
+    /// The Tools card's switch and the Skills card's are apart: neither sends anything the other
+    /// holds, so a ceiling switch with the server does not hold a skill switch, nor the other way.
+    #[test]
+    fn a_ceiling_switch_does_not_hold_a_skill_switch() {
+        let mut state = with_skills_read("cw_1");
+        let generation = state.ask_ceiling_read();
+        assert!(state.settle_coworker_ceiling(generation, "cw_1".into(), Ok(served_ceiling())));
+        state.begin_ceiling_switch("read_file", true).unwrap();
+        assert!(state.begin_skill_switch("sk_draft", true).is_ok());
+        assert_eq!(card(&state).blocked, Some(super::CeilingBlock::Switching));
+        assert_eq!(skill_card(&state).blocked, Some(SkillsBlock::Switching));
+    }
+
+    /// The settings opened again on rows read a while ago: the rows stay on screen and every
+    /// switch is dead until the fresh read lands. An older read landing frees nothing.
+    #[test]
+    fn a_click_while_the_skills_are_read_again_is_refused() {
+        let mut state = with_skills_read("cw_1");
+        let older = state.ask_skills_read();
+        let newest = state.ask_skills_read();
+        assert_eq!(skill_card(&state).blocked, Some(SkillsBlock::Reading));
+        assert_eq!(
+            attached_shown(&state),
+            skill_ids(&["sk_triage", "sk_review", "sk_old"])
+        );
+        assert!(
+            shown_skill_rows(&skill_card(&state))
+                .iter()
+                .all(|row| !row.live)
+        );
+        assert_eq!(
+            skills_card_lines(&skill_card(&state)),
+            [SkillsCardLine::Wait(SKILLS_BEING_READ.to_string())]
+        );
+        assert_eq!(
+            state.begin_skill_switch("sk_draft", true),
+            Err(SKILLS_BEING_READ.to_string())
+        );
+        assert_eq!(state.skill_switch, None, "nothing was sent");
+        state.note_skill_refusal("sk_draft", SKILLS_BEING_READ.to_string());
+        assert_eq!(skill_card(&state).note, None, "the card's own line says it");
+
+        assert!(!state.settle_coworker_skills(older, "cw_1".into(), Ok(served_skills())));
+        assert_eq!(skill_card(&state).blocked, Some(SkillsBlock::Reading));
+        assert!(state.settle_coworker_skills(
+            newest,
+            "cw_1".into(),
+            Ok(skills_at(Some(6), skill_rows()))
+        ));
+        assert_eq!(skill_card(&state).blocked, None);
+        let put = state.begin_skill_switch("sk_draft", true).unwrap();
+        assert_eq!(put.version, Some(6), "built from the fresh rows");
+    }
+
+    /// Taken, the server's answer is the Bot's skills, whatever it says; a read asked before the
+    /// answer landed is older than it, and cannot put back what the answer replaced.
+    #[test]
+    fn a_taken_skill_switch_is_what_the_server_answered() {
+        let mut state = with_skills_read("cw_1");
+        let put = state.begin_skill_switch("sk_draft", true).unwrap();
+        let read_before = state.ask_skills_read();
+        let answer = skills_at(
+            Some(5),
+            json!([
+                {"id": "sk_triage", "name": "triage", "description": "", "scope": "mine",
+                    "attached": true, "enabled": true},
+                {"id": "sk_draft", "name": "draft", "description": "", "scope": "mine",
+                    "attached": true, "enabled": true}
+            ]),
+        );
+        assert_eq!(
+            state.settle_skill_switch(put.token, Ok(answer.clone())),
+            SkillAnswer::Taken
+        );
+        assert_eq!(skills_read(&state).rows, answer.skills);
+        assert_eq!(skills_read(&state).version, Some(5));
+        assert_eq!(state.skill_switch, None);
+        assert_eq!(skill_card(&state).blocked, None);
+        assert!(
+            !state.settle_coworker_skills(read_before, "cw_1".into(), Ok(served_skills())),
+            "a read from before the answer"
+        );
+        assert_eq!(skills_read(&state).rows, answer.skills);
+    }
+
+    /// A switch built from a version the server has moved on from is refused with 409 and its
+    /// code, and nothing is changed: the version went in the body, the skills are read again, and
+    /// the server's words are a line on the card, since they are about the set.
+    #[tokio::test]
+    async fn a_changed_skill_set_is_read_again_with_the_servers_words_on_the_card() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .and(wiremock::matchers::path("/coworkers/cw_1/skills"))
+            .and(wiremock::matchers::body_json(json!({
+                "attached": ["sk_triage", "sk_draft", "sk_review", "sk_old"],
+                "version": 4
+            })))
+            .respond_with(wiremock::ResponseTemplate::new(409).set_body_json(json!({
+                "error": "the skills changed since you looked",
+                "code": "skills-changed"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut state = with_skills_read("cw_1");
+        let put = state.begin_skill_switch("sk_draft", true).unwrap();
+        let answer = send_skill_switch(&mut state, &server, put).await;
+        assert_eq!(answer, SkillAnswer::Outdated);
+        assert_eq!(after_skill_switch(answer), AfterSkillSwitch::ReadSkills);
+        assert_eq!(
+            attached_shown(&state),
+            skill_ids(&["sk_triage", "sk_review", "sk_old"])
+        );
+        assert!(skill_notes(&state).is_empty());
+        assert_eq!(
+            skills_card_lines(&skill_card(&state)),
+            [SkillsCardLine::Note(
+                "the skills changed since you looked".to_string()
+            )]
+        );
+        assert_eq!(
+            skill_card(&state).blocked,
+            None,
+            "the person can click again"
+        );
+    }
+
+    /// Past the server's cap on attached skills, the server's words go on the card, the skills
+    /// are read again, and a read does not take the words away, since it does not answer them;
+    /// the next switch does.
+    #[tokio::test]
+    async fn the_cap_on_attached_skills_is_said_on_the_card() {
+        let said = "a coworker can have at most 20 skills attached";
+        let server = skills_put_answered(
+            wiremock::ResponseTemplate::new(422).set_body_json(json!({ "error": said })),
+        )
+        .await;
+        let mut state = with_skills_read("cw_1");
+        let put = state.begin_skill_switch("sk_draft", true).unwrap();
+        let answer = send_skill_switch(&mut state, &server, put).await;
+        assert_eq!(answer, SkillAnswer::Outdated);
+        assert_eq!(after_skill_switch(answer), AfterSkillSwitch::ReadSkills);
+        assert!(
+            skill_notes(&state).is_empty(),
+            "not under the skill clicked"
+        );
+        assert_eq!(
+            skills_card_lines(&skill_card(&state)),
+            [SkillsCardLine::Note(said.to_string())]
+        );
+
+        let generation = state.ask_skills_read();
+        assert!(state.settle_coworker_skills(generation, "cw_1".into(), Ok(served_skills())));
+        assert_eq!(
+            skills_card_lines(&skill_card(&state)),
+            [SkillsCardLine::Note(said.to_string())],
+            "a read does not answer them"
+        );
+        state.begin_skill_switch("sk_triage", false).unwrap();
+        assert_eq!(skill_card(&state).note, None, "another switch does");
+    }
+
+    /// A 422 naming the skill clicked is the server saying it no longer lists it (deleted since the
+    /// rows were read, say): its words are under the skill, the skills are read again, and once the
+    /// read no longer has the skill they are said on the card.
+    #[test]
+    fn a_refusal_naming_a_skill_the_server_no_longer_lists_is_said_under_it() {
+        let mut state = with_skills_read("cw_1");
+        let put = state.begin_skill_switch("sk_draft", true).unwrap();
+        let gone = OpenGrokError::from_opengrok(422, "no skill sk_draft");
+        let answer = state.settle_skill_switch(put.token, Err(gone));
+        assert_eq!(answer, SkillAnswer::Outdated);
+        assert_eq!(after_skill_switch(answer), AfterSkillSwitch::ReadSkills);
+        assert_eq!(
+            skill_notes(&state),
+            [("sk_draft".to_string(), "no skill sk_draft".to_string())]
+        );
+        let generation = state.ask_skills_read();
+        assert!(state.settle_coworker_skills(
+            generation,
+            "cw_1".into(),
+            Ok(skills_at(
+                Some(5),
+                json!([{"id": "sk_triage", "name": "triage", "description": "",
+                    "scope": "mine", "attached": true, "enabled": true}])
+            ))
+        ));
+        assert_eq!(
+            skills_card_lines(&skill_card(&state)),
+            [SkillsCardLine::Note("no skill sk_draft".to_string())]
+        );
+
+        // Words that name another skill than the one clicked are about the set, on the card.
+        let mut state = with_skills_read("cw_1");
+        let put = state.begin_skill_switch("sk_draft", true).unwrap();
+        state.settle_skill_switch(
+            put.token,
+            Err(OpenGrokError::from_opengrok(422, "no skill sk_old")),
+        );
+        assert!(skill_notes(&state).is_empty());
+        assert_eq!(
+            skills_card_lines(&skill_card(&state)),
+            [SkillsCardLine::Note("no skill sk_old".to_string())]
+        );
+    }
+
+    /// Something in front of the server answering 502, 503 or 504 is not the server's word on the
+    /// switch: nobody knows whether it was taken, so the skills are read again, and the row says
+    /// so. A 503 the server wrote itself is its word. A switch whose answer never came in time is
+    /// the same as one nobody heard.
+    #[tokio::test]
+    async fn a_skill_switch_nobody_heard_the_answer_to_is_read_again() {
+        for status in [502, 503, 504] {
+            let server = skills_put_answered(
+                wiremock::ResponseTemplate::new(status)
+                    .set_body_string("<html><body><h1>Bad Gateway</h1></body></html>"),
+            )
+            .await;
+            let mut state = with_skills_read("cw_1");
+            let put = state.begin_skill_switch("sk_draft", true).unwrap();
+            let answer = send_skill_switch(&mut state, &server, put).await;
+            assert_eq!(answer, SkillAnswer::Unknown, "{status}");
+            assert_eq!(after_skill_switch(answer), AfterSkillSwitch::ReadSkills);
+            assert_eq!(
+                skill_notes(&state),
+                [("sk_draft".to_string(), SWITCH_UNANSWERED.to_string())],
+                "{status}"
+            );
+            assert_eq!(state.skill_switch, None, "{status}: the card is free again");
+        }
+        let server = skills_put_answered(wiremock::ResponseTemplate::new(503).set_body_json(
+            json!({ "error": "this coworker's skills could not be read or saved now" }),
+        ))
+        .await;
+        let mut state = with_skills_read("cw_1");
+        let put = state.begin_skill_switch("sk_draft", true).unwrap();
+        assert_eq!(
+            send_skill_switch(&mut state, &server, put).await,
+            SkillAnswer::Refused
+        );
+
+        let server = skills_put_answered(
+            wiremock::ResponseTemplate::new(200)
+                .set_body_json(json!({ "skills": skill_rows(), "version": 5 }))
+                .set_delay(Duration::from_secs(2)),
+        )
+        .await;
+        let mut state = with_skills_read("cw_1");
+        let put = state.begin_skill_switch("sk_triage", false).unwrap();
+        let client = OpenGrokClient::new(&server.uri()).expect("a URL that parses");
+        let result = client
+            .skills_within(
+                reqwest::Method::PUT,
+                &put.coworker_id,
+                Some(&json!({ "attached": put.attached, "version": put.version })),
+                Duration::from_millis(100),
+            )
+            .await;
+        assert_eq!(
+            state.settle_skill_switch(put.token, result),
+            SkillAnswer::Unknown
+        );
+        assert_eq!(skill_card(&state).blocked, None);
+        assert_eq!(
+            skill_notes(&state),
+            [("sk_triage".to_string(), SWITCH_UNANSWERED.to_string())]
+        );
+
+        // A 2xx that is not a Bot's skills is no word on the switch either.
+        let server = skills_put_answered(
+            wiremock::ResponseTemplate::new(200).set_body_json(json!({"skills": "all of them"})),
+        )
+        .await;
+        let mut state = with_skills_read("cw_1");
+        let put = state.begin_skill_switch("sk_draft", true).unwrap();
+        assert_eq!(
+            send_skill_switch(&mut state, &server, put).await,
+            SkillAnswer::Unknown
+        );
+        assert_eq!(
+            skill_notes(&state),
+            [("sk_draft".to_string(), SWITCH_ANSWER_UNREADABLE.to_string())]
+        );
+    }
+
+    /// A switch that got no answer may or may not have been taken. A read that has the skill
+    /// where the switch asked says it was, and the note goes; one that does not leaves it, since
+    /// it is still true. A skill the read does not list is not attached.
+    #[test]
+    fn a_skill_switch_with_no_answer_is_settled_by_the_next_read() {
+        let mut state = with_skills_read("cw_1");
+        let put = state.begin_skill_switch("sk_triage", false).unwrap();
+        let dropped = OpenGrokError::from_server(Some(504), "Gateway Timeout");
+        assert_eq!(
+            state.settle_skill_switch(put.token, Err(dropped)),
+            SkillAnswer::Unknown
+        );
+        assert_eq!(
+            skill_card(&state).note.map(|note| note.place),
+            Some(SkillNotePlace::Unanswered {
+                skill_id: "sk_triage".into(),
+                attached: false
+            })
+        );
+        let generation = state.ask_skills_read();
+        assert!(state.settle_coworker_skills(generation, "cw_1".into(), Ok(served_skills())));
+        assert_eq!(
+            skill_notes(&state),
+            [("sk_triage".to_string(), SWITCH_UNANSWERED.to_string())],
+            "not taken: the note is still true"
+        );
+        let generation = state.ask_skills_read();
+        let mut taken = skill_rows();
+        taken[0]["attached"] = json!(false);
+        assert!(state.settle_coworker_skills(
+            generation,
+            "cw_1".into(),
+            Ok(skills_at(Some(5), taken))
+        ));
+        assert_eq!(skill_card(&state).note, None, "taken after all");
+
+        let mut state = with_skills_read("cw_1");
+        let put = state.begin_skill_switch("sk_triage", false).unwrap();
+        state.settle_skill_switch(put.token, Err(OpenGrokError::message("connection reset")));
+        let generation = state.ask_skills_read();
+        assert!(state.settle_coworker_skills(
+            generation,
+            "cw_1".into(),
+            Ok(skills_at(Some(5), json!([])))
+        ));
+        assert_eq!(skill_card(&state).note, None, "gone is not attached");
+    }
+
+    /// Signing out frees the skill switch with the server: the next account's switches do not
+    /// wait on it, and when its answer comes, it settles nothing. A read still out lands on
+    /// nothing too, and the card is gone.
+    #[test]
+    fn signing_out_frees_the_skill_switch_and_its_late_answer_lands_on_nothing() {
+        let mut state = with_skills_read("cw_1");
+        state.agent_skills_open = true;
+        let before = state.begin_skill_switch("sk_draft", true).unwrap();
+        let read_out = state.ask_skills_read();
+        state.forget_bot_skills();
+        assert_eq!(state.skill_switch, None);
+        assert_eq!(state.skills_card(), None);
+        assert!(
+            !state.agent_skills_open,
+            "the next account's card starts shut"
+        );
+        assert!(!state.settle_coworker_skills(read_out, "cw_1".into(), Ok(served_skills())));
+
+        let generation = state.ask_skills_read();
+        assert!(state.settle_coworker_skills(generation, "cw_1".into(), Ok(served_skills())));
+        let after = state
+            .begin_skill_switch("sk_triage", false)
+            .expect("nothing is held by the switch from before");
+        assert_eq!(
+            state.settle_skill_switch(before.token, Ok(served_skills())),
+            SkillAnswer::Elsewhere
+        );
+        assert_eq!(
+            state.skill_switch.as_ref().map(|switch| switch.token),
+            Some(after.token),
+            "the switch with the server is still the new one"
+        );
+        assert_eq!(
+            state.settle_skill_switch(after.token, Ok(served_skills())),
+            SkillAnswer::Taken
+        );
+    }
+
+    /// A 404 to a switch after the skills were read is not taken as the server saying the person
+    /// is not the owner: the skills are read again, and the read says what the 404 was. A server
+    /// without the route answers an empty 404, which says nothing about the Bot.
+    #[test]
+    fn a_skill_switch_refused_with_404_is_read_again() {
+        let mut state = with_skills_read("cw_1");
+        let put = state.begin_skill_switch("sk_draft", true).unwrap();
+        let answer = state.settle_skill_switch(
+            put.token,
+            Err(OpenGrokError::from_opengrok(404, "no such coworker")),
+        );
+        assert_eq!(answer, SkillAnswer::Refused);
+        assert_eq!(after_skill_switch(answer), AfterSkillSwitch::ReadSkills);
+        assert_eq!(skill_card(&state).blocked, None, "not made read-only");
+        let generation = state.ask_skills_read();
+        assert!(state.settle_coworker_skills(
+            generation,
+            "cw_1".into(),
+            Err(OpenGrokError::from_opengrok(404, "no such coworker"))
+        ));
+        assert_eq!(
+            skill_card(&state).skills,
+            BotSkills::Unavailable(NOT_THE_SKILLS_OWNER.to_string())
+        );
+
+        let mut state = with_skills_read("cw_1");
+        let put = state.begin_skill_switch("sk_draft", true).unwrap();
+        state.settle_skill_switch(
+            put.token,
+            Err(OpenGrokError::from_server(Some(404), "request failed")),
+        );
+        assert_eq!(
+            skill_notes(&state),
+            [("sk_draft".to_string(), SKILLS_NOT_ON_SERVER.to_string())]
+        );
+    }
+
+    /// A 403 to a switch is the server refusing this person any change to the Bot's skills: the
+    /// card is read-only in the server's words, every switch is dead, and nothing is read again.
+    #[test]
+    fn a_skill_switch_refused_with_403_leaves_the_card_read_only_in_the_servers_words() {
+        let mut state = with_skills_read("cw_1");
+        let put = state.begin_skill_switch("sk_draft", true).unwrap();
+        let answer = state.settle_skill_switch(
+            put.token,
+            Err(OpenGrokError::from_opengrok(
+                403,
+                "your grant was withdrawn",
+            )),
+        );
+        assert_eq!(answer, SkillAnswer::ReadOnly);
+        assert_eq!(after_skill_switch(answer), AfterSkillSwitch::Nothing);
+        assert_eq!(
+            skill_card(&state).blocked,
+            Some(SkillsBlock::ReadOnly("your grant was withdrawn".into()))
+        );
+        assert_eq!(
+            skills_card_lines(&skill_card(&state)),
+            [SkillsCardLine::ReadOnly(
+                "your grant was withdrawn".to_string()
+            )]
+        );
+        assert!(
+            shown_skill_rows(&skill_card(&state))
+                .iter()
+                .all(|row| !row.live)
+        );
+        assert_eq!(
+            state.begin_skill_switch("sk_old", false),
+            Err("your grant was withdrawn".to_string()),
+            "not even a detach"
+        );
+    }
+
+    /// The answer to a switch can land while the same Bot's card is being read afresh (it was
+    /// opened again meanwhile). What it says is kept for the rows the read brings.
+    #[test]
+    fn a_skill_refusal_that_lands_while_the_card_is_read_afresh_is_kept() {
+        for (refused, expected) in [
+            (
+                OpenGrokError::from_opengrok(422, "no skill sk_draft"),
+                SkillNotePlace::Row("sk_draft".into()),
+            ),
+            (
+                OpenGrokError::from_opengrok(403, "your grant was withdrawn"),
+                SkillNotePlace::ReadOnly,
+            ),
+        ] {
+            let mut state = with_skills_read("cw_1");
+            let put = state.begin_skill_switch("sk_draft", true).unwrap();
+            state.coworker_skills = Some(("cw_1".into(), BotSkills::Loading));
+            state.skill_note = None;
+            let reading = state.ask_skills_read();
+            state.settle_skill_switch(put.token, Err(refused));
+            assert!(state.settle_coworker_skills(reading, "cw_1".into(), Ok(served_skills())));
+            assert_eq!(
+                skill_card(&state).note.map(|note| note.place),
+                Some(expected)
+            );
+        }
+    }
+
+    /// Why a Bot's skills have no switches, in the words the card uses: a 404 the server wrote is
+    /// a Bot this person does not own, an empty one a server without the route, a 403 the
+    /// server's own words, and out of reach and an unreadable answer said as that.
+    #[test]
+    fn skills_the_server_will_not_give_say_why() {
+        assert_eq!(
+            skills_unavailable(&OpenGrokError::from_opengrok(404, "no such coworker")),
+            NOT_THE_SKILLS_OWNER
+        );
+        assert_eq!(
+            skills_unavailable(&OpenGrokError::from_server(Some(404), "request failed")),
+            SKILLS_NOT_ON_SERVER
+        );
+        assert_eq!(
+            skills_unavailable(&OpenGrokError::signed_out("sign in first")),
+            SIGN_IN_FOR_SKILLS
+        );
+        assert_eq!(
+            skills_unavailable(&OpenGrokError::from_opengrok(
+                403,
+                "your grant was withdrawn"
+            )),
+            "your grant was withdrawn"
+        );
+        assert_eq!(
+            skills_unavailable(&OpenGrokError::from_opengrok(503, "busy")),
+            "Could not read this Bot's skills: busy"
+        );
+        assert_eq!(
+            skills_unavailable(&OpenGrokError::from_server(
+                Some(502),
+                "<html>Bad Gateway</html>"
+            )),
+            "Could not reach the server to read this Bot's skills."
+        );
+        assert_eq!(
+            skills_unavailable(&OpenGrokError::message("error decoding response body")),
+            "The server's answer about this Bot's skills could not be read."
+        );
+    }
+
+    /// The card says who can read what is attached only where the roster says the Bot is shared
+    /// with the owner's organization: not on a private Bot, and not on one whose row does not say.
+    #[test]
+    fn the_skills_card_says_the_bot_is_shared_only_when_the_roster_says_so() {
+        let mut state = with_skills_read("cw_1");
+        assert!(!skill_card(&state).shared, "not on the roster at all");
+        for (visibility, shared) in [
+            (json!("org"), true),
+            (json!("private"), false),
+            (json!(null), false),
+            (json!("everyone"), false),
+        ] {
+            state.coworkers = vec![
+                serde_json::from_value(json!({"id": "cw_1", "visibility": visibility})).unwrap(),
+            ];
+            assert_eq!(skill_card(&state).shared, shared, "{visibility}");
+        }
     }
 
     /// A walk, start to landing, the way `sync_server_threads` makes one.
