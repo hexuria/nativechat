@@ -594,7 +594,8 @@ const REST_NOT_RECORDED_YET: &[(&str, &str, &str)] = &[
     (
         "PUT__coworkers__coworker_id__ceiling",
         "/coworkers/{coworker_id}/ceiling",
-        "A switch on the Tools card, which sends the whole ceiling; see GET.",
+        "A switch on the Tools card, which sends the whole ceiling with the version it was read \
+         at; see GET.",
     ),
 ];
 
@@ -3248,11 +3249,18 @@ fn coworker_tools(_: u16, body: &Value) -> Check {
 
 /// A bot's tool ceiling (opengrok-server#268), read or as a write's answer: every row comes
 /// through by the name a `PUT` names it by, with its kind, whether it is enabled and whether it is
-/// available, and the words, label and connector the Tools card draws. A row that does not say
-/// whether it is enabled cannot be sent back as it stands, so the parse refuses it; one that drops
-/// its kind is caught here rather than filed with the plugins.
+/// available, and the words, label and connector the Tools card draws; and the version a switch
+/// sends back, exactly, or none from a server older than it. A row that does not say whether it is
+/// enabled cannot be sent back as it stands, so the parse refuses it; one that drops its kind is
+/// caught here rather than filed with the plugins.
 fn coworker_ceiling(_: u16, body: &Value) -> Check {
     let ceiling: CoworkerCeiling = parse(body)?;
+    must!(
+        ceiling.version == body["version"].as_i64(),
+        "the version should come through as sent: {:?} from {}",
+        ceiling.version,
+        body["version"]
+    );
     let raw = body["tools"]
         .as_array()
         .ok_or("a ceiling should carry a tools array")?;
@@ -4407,7 +4415,9 @@ fn a_route_asked_before_it_is_recorded_is_on_its_way() {
 /// The ceiling's reading, fed bodies in the shape agreed for opengrok-server#268 until the
 /// server's own are recorded, for the read and for the write's answer alike: builtins and a
 /// plugin, `user_machine_shell` unavailable and a plugin the server no longer loads with nothing
-/// but its name, an empty ceiling, the two refusals, and the ways a body could go wrong.
+/// but its name, at a version and at none, an empty ceiling, the refusals (not the owner's, a
+/// name it does not list, a version it has moved on from, no grant to change), and the ways a
+/// body could go wrong.
 #[test]
 fn a_bots_ceiling_has_a_reading_in_the_ledger() {
     use serde_json::json;
@@ -4431,12 +4441,20 @@ fn a_bots_ceiling_has_a_reading_in_the_ledger() {
                 "description": "Read and send mail.", "connector": "gmail"
             },
             {"name": "old_crm", "kind": "plugin", "enabled": true, "available": false}
-        ]});
+        ], "version": 7});
         read(200, ceiling.clone()).unwrap_or_else(|why| panic!("{verb}: {why}"));
         read(200, json!({"tools": []})).unwrap_or_else(|why| panic!("{verb}: {why}"));
+        read(200, json!({"tools": [], "version": 0})).unwrap_or_else(|why| panic!("{verb}: {why}"));
         read(404, json!({"error": "no such coworker"}))
             .unwrap_or_else(|why| panic!("{verb}: {why}"));
         read(422, json!({"error": "no tool or plugin named nope"}))
+            .unwrap_or_else(|why| panic!("{verb}: {why}"));
+        read(
+            409,
+            json!({"error": "the tools changed since you looked", "code": "ceiling-changed"}),
+        )
+        .unwrap_or_else(|why| panic!("{verb}: {why}"));
+        read(403, json!({"error": "no grant to change"}))
             .unwrap_or_else(|why| panic!("{verb}: {why}"));
         assert!(
             read(404, ceiling).is_err(),

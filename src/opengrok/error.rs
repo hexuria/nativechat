@@ -75,6 +75,8 @@ pub struct OpenGrokError {
     history_missed: bool,
     /// The server's code word for the refusal, when its body named one: see [`Self::code`].
     code: Option<String>,
+    /// OpenGrok wrote this refusal itself: see [`Self::written_by_opengrok`].
+    by_opengrok: bool,
 }
 
 impl OpenGrokError {
@@ -86,6 +88,7 @@ impl OpenGrokError {
             pending_event: None,
             history_missed: false,
             code: None,
+            by_opengrok: false,
         }
     }
 
@@ -97,6 +100,7 @@ impl OpenGrokError {
             pending_event: None,
             history_missed: false,
             code: None,
+            by_opengrok: false,
         }
     }
 
@@ -114,6 +118,7 @@ impl OpenGrokError {
             pending_event: None,
             history_missed: false,
             code: None,
+            by_opengrok: false,
         }
     }
 
@@ -137,6 +142,7 @@ impl OpenGrokError {
             pending_event: None,
             history_missed: false,
             code: None,
+            by_opengrok: false,
         }
     }
 
@@ -163,6 +169,7 @@ impl OpenGrokError {
             pending_event: None,
             history_missed: false,
             code: None,
+            by_opengrok: false,
         }
     }
 
@@ -186,6 +193,7 @@ impl OpenGrokError {
             pending_event: None,
             history_missed: false,
             code: None,
+            by_opengrok: true,
         }
     }
 
@@ -222,6 +230,16 @@ impl OpenGrokError {
         self.status == Some(404)
     }
 
+    /// OpenGrok wrote this refusal itself, as its body shows (a JSON object with its sentence
+    /// under `error`), or the route it answers reads every answer as the server's own.
+    ///
+    /// What tells a `404` the server wrote about a thing it has, or will not show this person,
+    /// from a `404` because there is no such route at all: a server older than a route answers
+    /// it with an empty body, and nothing in front of the server writes the server's shape.
+    pub fn written_by_opengrok(&self) -> bool {
+        self.by_opengrok
+    }
+
     /// The server's code word for this refusal: the body's `code`, or its `error` when that is a
     /// bare code word (`already-consumed`, `stale-pending-message`). It is what a caller branches
     /// on. The person is shown [`Self::message`], which is the sentence the server wrote beside
@@ -251,6 +269,14 @@ impl OpenGrokError {
     /// the person is shown.
     pub fn is_stale_pending(&self) -> bool {
         self.status == Some(409) && self.code() == Some("stale-pending-message")
+    }
+
+    /// `PUT /coworkers/{id}/ceiling` named a version of the ceiling that is not the server's
+    /// any more: somebody changed it after the rows the switch was built from were read, and
+    /// nothing was changed (opengrok-server#268). Read off the code; the sentence beside it ("the
+    /// tools changed since you looked") is what the person is shown.
+    pub fn is_ceiling_changed(&self) -> bool {
+        self.status == Some(409) && self.code() == Some(super::client::CEILING_CHANGED)
     }
 
     /// `POST /pending` lost the race the server describes as "another writer got there
@@ -467,6 +493,22 @@ mod tests {
             "one retry, then the conflict is a decision"
         );
         assert!(!crate::opengrok::retry_enqueue(&consumed, 1));
+    }
+
+    /// Only a refusal in the server's own shape is marked as the server's: a `404` with nothing in
+    /// it is a route this server does not have, not the server saying anything.
+    #[test]
+    fn a_refusal_the_server_wrote_is_told_from_one_it_did_not() {
+        let said = OpenGrokError::from_opengrok(404, "no such coworker");
+        assert!(said.written_by_opengrok());
+        let bare = OpenGrokError::from_server(Some(404), "request failed");
+        assert!(!bare.written_by_opengrok());
+        assert!(!OpenGrokError::status(404, "no such coworker").written_by_opengrok());
+
+        let changed = OpenGrokError::from_opengrok(409, "the tools changed since you looked")
+            .with_code(Some("ceiling-changed".to_string()));
+        assert!(changed.is_ceiling_changed());
+        assert!(!coded("stale-pending-message", "changed").is_ceiling_changed());
     }
 
     #[test]
