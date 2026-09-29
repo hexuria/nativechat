@@ -108,6 +108,15 @@
 //! `plugin`; visible while the card is open). Read-only: what the server's
 //! `GET /coworkers/{id}/tools` says the bot is offered on its next turn.
 //!
+//! In the bot's settings: `agent-effort` (a menu; value = the effort word it shows, state
+//! `unsaved` while that is a pick Save has not sent; disabled and reading `inherit` from a server
+//! that keeps no effort, one from before opengrok-server#271) with one `agent-effort-{word}` per
+//! choice (`inherit`, `low`, `medium`, `high`, `max`, and the word the bot already has when it is
+//! none of those, e.g. `xhigh`; label as the menu reads it, state `selected` on the one shown). A
+//! click on a choice picks it, as the menu does, and `agent-save` sends it with the rest of the
+//! pane, as the Save button does. `agent-settings-error` is the pane's red line over Save: a
+//! refused Save, in the server's words.
+//!
 //! Named invokes (parity / gpui-agent): `UserFormContinue`, `UserFormDismiss`,
 //! `UserFormOpenScreen`, `UserFormUseSaved`, `UserFormClearSaved` (also kebab
 //! `user-form.continue` / `user-form.dismiss` / `user-form.screen` /

@@ -68,6 +68,31 @@ pub struct Coworker {
     pub hidden_from_sidebar: bool,
     #[serde(default, alias = "boxId", alias = "box_id")]
     pub box_id: Option<String>,
+    /// How hard it thinks before it answers: one of [`EFFORT_WORDS`], or a word this app has not
+    /// heard of, kept as the server sent it so the settings never show a value the server does
+    /// not hold. Missing is a server from before opengrok-server#271, which keeps no effort and
+    /// sends none on a turn: that reads as `inherit` ([`Self::effort`]), and nothing offers to
+    /// change what that server has nowhere to keep.
+    #[serde(default)]
+    pub effort: Option<String>,
+}
+
+/// How hard a coworker thinks before it answers, in the server's words and in its order.
+/// Transcribed from opengrok-server#271, the shape agreed with the server before it landed:
+/// every roster row carries one of these under `effort`, and `PATCH /coworkers/{id}` takes one.
+/// `inherit` is a coworker with none set, whose turns send the gateway no effort, so the model's
+/// route decides; any other word goes to the gateway as the turn's `reasoning_effort`, taken when
+/// the run starts. Some models ignore it, and the server cannot know which.
+pub const EFFORT_WORDS: [&str; 7] = ["inherit", "none", "low", "medium", "high", "xhigh", "max"];
+
+/// The effort of a coworker with none set, and of every coworker on a server that keeps none.
+pub const EFFORT_INHERIT: &str = "inherit";
+
+impl Coworker {
+    /// The effort its turns run with, in the server's word: `inherit` where the server keeps none.
+    pub fn effort(&self) -> &str {
+        self.effort.as_deref().unwrap_or(EFFORT_INHERIT)
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -90,6 +115,13 @@ pub struct CoworkerPatch {
     // client keeps that setting on the machine, and NativeChat has nowhere to keep it yet.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hidden_from_sidebar: Option<bool>,
+    /// One of [`EFFORT_WORDS`], sent only when the person changed it: absent leaves the stored
+    /// effort alone, and `inherit` clears it (opengrok-server#271, which reads `null` the same
+    /// way). The server refuses a word it does not know with a 400 and changes nothing, and
+    /// refuses it on a coworker shared with the caller with a 403, as it does every change there
+    /// but the sidebar flag.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
 }
 
 impl CoworkerPatch {
@@ -101,6 +133,7 @@ impl CoworkerPatch {
             && self.avatar_shape.is_none()
             && self.avatar_color.is_none()
             && self.hidden_from_sidebar.is_none()
+            && self.effort.is_none()
     }
 }
 
@@ -409,8 +442,8 @@ mod tests {
 
     /// Every key a coworker patch can carry is one the server's patch route reads
     /// (opengrok-server `agui/routes.rs`: name, model, role, visibility, hiddenFromSidebar, and
-    /// title/avatarShape/avatarColor). A key it reads nowhere is a setting that looks saved and
-    /// is not, and a patch of only that is refused.
+    /// title/avatarShape/avatarColor; `effort` from opengrok-server#271). A key it reads nowhere
+    /// is a setting that looks saved and is not, and a patch of only that is refused.
     #[test]
     fn a_coworker_patch_names_only_what_the_server_keeps() {
         let full = CoworkerPatch {
@@ -421,6 +454,7 @@ mod tests {
             avatar_shape: Some("s".into()),
             avatar_color: Some("c".into()),
             hidden_from_sidebar: Some(true),
+            effort: Some("high".into()),
         };
         let wire = serde_json::to_value(&full).unwrap();
         let mut keys: Vec<&str> = wire
@@ -433,6 +467,7 @@ mod tests {
         let read = [
             "avatarColor",
             "avatarShape",
+            "effort",
             "hiddenFromSidebar",
             "model",
             "name",
@@ -443,7 +478,58 @@ mod tests {
         for key in &keys {
             assert!(read.contains(key), "the server reads no {key:?}");
         }
-        assert_eq!(keys.len(), 7, "every field is on the wire: {keys:?}");
+        assert_eq!(keys.len(), 8, "every field is on the wire: {keys:?}");
+    }
+
+    /// A roster from a server before opengrok-server#271 has no `effort` on its rows, and every
+    /// row still parses: it is a server that keeps none, so its bots run on `inherit`. A word
+    /// this app has not heard of is kept as the server sent it rather than failing the roster,
+    /// or being read as another word the server does not hold.
+    #[test]
+    fn a_rows_effort_reads_as_sent_and_a_missing_one_as_inherit() {
+        let roster: Vec<Coworker> = serde_json::from_value(serde_json::json!([
+            {"id": "cw_old", "name": "Old", "model": "oag/cheap"},
+            {"id": "cw_new", "name": "New", "model": "oag/cheap", "effort": "ultra"},
+            {"id": "cw_set", "name": "Set", "model": "oag/cheap", "effort": "xhigh"},
+            {"id": "cw_unset", "name": "Unset", "model": "oag/cheap", "effort": "inherit"}
+        ]))
+        .expect("one row's effort never fails the roster");
+        let efforts: Vec<(Option<&str>, &str)> = roster
+            .iter()
+            .map(|coworker| (coworker.effort.as_deref(), coworker.effort()))
+            .collect();
+        assert_eq!(
+            efforts,
+            vec![
+                (None, "inherit"),
+                (Some("ultra"), "ultra"),
+                (Some("xhigh"), "xhigh"),
+                (Some("inherit"), "inherit"),
+            ]
+        );
+    }
+
+    /// The effort rides a patch only when it is set, so a Save that did not touch it leaves the
+    /// body a server before opengrok-server#271 already reads.
+    #[test]
+    fn a_patch_without_an_effort_leaves_the_key_off() {
+        let patch = CoworkerPatch {
+            name: Some("Bob".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            serde_json::to_value(&patch).unwrap(),
+            serde_json::json!({"name": "Bob"})
+        );
+        let effort = CoworkerPatch {
+            effort: Some("inherit".into()),
+            ..Default::default()
+        };
+        assert!(!effort.is_empty(), "an effort alone is a change to send");
+        assert_eq!(
+            serde_json::to_value(&effort).unwrap(),
+            serde_json::json!({"effort": "inherit"})
+        );
     }
 
     /// The field is new: a server that has never heard of it must still see the array it saw

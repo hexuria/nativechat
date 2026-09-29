@@ -65,7 +65,8 @@ use super::pending::{
 };
 use super::timing::{RUN_TIMING_CUSTOM, TURN_TIMELINE_CUSTOM, TurnTiming};
 use super::types::{
-    Account, ArtifactListing, Attachment, Coworker, ThreadListing, assistant_text_from_sse,
+    Account, ArtifactListing, Attachment, Coworker, EFFORT_INHERIT, ThreadListing,
+    assistant_text_from_sse,
 };
 use super::user_form::{
     BoxHandoffReply, COMPUTER_HANDOFF_NAMES, ComputerHandoffStatus, FORM_ENTRY_MISSING,
@@ -3120,7 +3121,12 @@ fn coworker_matches(coworker: &Coworker, raw: &Value) -> Check {
             && Some(coworker.updated_at_ms) == raw.get("updatedAtMs").and_then(Value::as_i64)
             && Some(coworker.hidden_from_sidebar)
                 == raw.get("hiddenFromSidebar").and_then(Value::as_bool)
-            && coworker.box_id.as_deref() == opt_str(raw, "boxId"),
+            && coworker.box_id.as_deref() == opt_str(raw, "boxId")
+            // `effort` arrives with opengrok-server#271, and every recording from before it has
+            // none: a server that keeps no effort, whose bots run on `inherit`. Once it is sent,
+            // the word is kept as sent, one this app has not heard of included.
+            && coworker.effort.as_deref() == opt_str(raw, "effort")
+            && coworker.effort() == opt_str(raw, "effort").unwrap_or(EFFORT_INHERIT),
         "a coworker came through changed: {coworker:?}"
     );
     Ok(())
@@ -4292,4 +4298,70 @@ fn a_bots_tool_listing_has_a_reading_in_the_ledger() {
         .is_err(),
         "a tool that drops its kind"
     );
+}
+
+/// A coworker row's `effort` (opengrok-server#271) has a reading in the ledger before any
+/// recording carries one. A row without it is today's corpus and reads as inherit; a row with it
+/// comes through as sent, a word this app has not heard of included; an effort that is not a word
+/// is caught; and the patch route's two refusals of an effort read as the server's sentences.
+#[test]
+fn a_coworker_rows_effort_has_a_reading_in_the_ledger() {
+    let read = |route: &str, status: u16, body: Value| {
+        read_fixture(
+            route,
+            &serde_json::json!({
+                "method": "PATCH", "path": "/coworkers/cw_1", "status": status, "body": body
+            }),
+        )
+    };
+    let row = |effort: Option<&str>| {
+        let mut row = serde_json::json!({
+            "id": "cw_1", "name": "Bob", "model": "oag/cheap", "role": null, "title": null,
+            "avatarShape": null, "avatarColor": null, "visibility": "private",
+            "hiddenFromSidebar": false, "updatedAtMs": 1_790_000_000_000_i64, "boxId": null
+        });
+        if let Some(effort) = effort {
+            row["effort"] = effort.into();
+        }
+        row
+    };
+    let patched = "PATCH__coworkers__coworker_id_";
+    for effort in [
+        None,
+        Some("inherit"),
+        Some("high"),
+        Some("xhigh"),
+        Some("ultra"),
+    ] {
+        read(patched, 200, row(effort)).unwrap();
+    }
+    read(
+        "GET__coworkers",
+        200,
+        serde_json::json!([row(None), row(Some("max"))]),
+    )
+    .unwrap();
+    let mut numbered = row(None);
+    numbered["effort"] = 3.into();
+    assert!(
+        read(patched, 200, numbered).is_err(),
+        "an effort that is not a word"
+    );
+    read(
+        patched,
+        400,
+        serde_json::json!({
+            "error": "effort must be one of inherit, none, low, medium, high, xhigh, max"
+        }),
+    )
+    .unwrap();
+    read(
+        patched,
+        403,
+        serde_json::json!({
+            "error": "only the person who hired this coworker can change it; you can hide it \
+                      from your own sidebar"
+        }),
+    )
+    .unwrap();
 }
