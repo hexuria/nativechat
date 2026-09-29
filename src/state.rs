@@ -50,6 +50,15 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
+/// The open bot's usage this month, as far as the settings pane knows it.
+#[derive(Debug, Clone, PartialEq)]
+pub enum UsageReport {
+    Loading,
+    Read(crate::opengrok::CoworkerUsage),
+    /// The server would not say, in its words or the app's.
+    Unavailable(String),
+}
+
 /// The open bot's tools, as far as the settings pane knows them.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ToolList {
@@ -674,6 +683,15 @@ fn carries_choice_card(message: &Message) -> bool {
         .parts
         .iter()
         .any(|part| matches!(part, ChatPart::Ui(crate::opengrok::UiSpec::Form(_))))
+}
+
+/// Why the open bot's usage is not shown, in words for its settings.
+fn usage_unavailable(error: &OpenGrokError) -> String {
+    match error.status {
+        Some(404) => "Only this bot's owner can see its usage.".to_string(),
+        Some(401) => "Sign in again to see this bot's usage.".to_string(),
+        _ => format!("Could not load this bot's usage: {}", error.message),
+    }
 }
 
 /// Why the open bot's tools are not listed, in words for its settings. A 404 is the server
@@ -2945,6 +2963,11 @@ pub struct AppState {
     /// and the answer, so a late answer for a bot the person has left is never shown as this
     /// one's.
     pub coworker_tools: Option<(String, ToolList)>,
+    /// What the open bot used this month, as its settings' Usage card shows it (#138): the
+    /// bot's id and the answer, like [`Self::coworker_tools`].
+    pub coworker_usage: Option<(String, UsageReport)>,
+    /// Counts usage reports asked for, so only the newest answer is shown.
+    usage_generation: u64,
     /// The bot settings' Tools card is open to its list.
     pub agent_tools_open: bool,
     /// Counts the tool listings asked for, so only the newest answer is shown: two asks for the
@@ -3466,6 +3489,8 @@ impl AppState {
             local_rules_epoch: 0,
             coworker_computer: None,
             coworker_tools: None,
+            coworker_usage: None,
+            usage_generation: 0,
             agent_tools_open: false,
             tools_generation: 0,
             host_egress_tunnel_available: false,
@@ -4815,7 +4840,46 @@ impl AppState {
             // record; opening the sidebar is the moment to make sure it is this bot's and fresh.
             self.refresh_coworker_computer_quietly(cx);
             self.refresh_coworker_tools(cx);
+            self.refresh_coworker_usage(cx);
         }
+    }
+
+    /// Ask the server what the open bot used this month. Asked each time its settings open and on
+    /// a switch while they are open; the last answer for the same bot stays up while it is asked
+    /// again, and a late answer for a bot the person has left, or an older ask, is dropped.
+    pub fn refresh_coworker_usage(&mut self, cx: &mut Context<Self>) {
+        let (Some(client), Some(coworker_id)) =
+            (self.opengrok.clone(), self.active_coworker_id.clone())
+        else {
+            self.coworker_usage = None;
+            return;
+        };
+        let read = matches!(
+            &self.coworker_usage,
+            Some((id, UsageReport::Read(_))) if *id == coworker_id
+        );
+        if !read {
+            self.coworker_usage = Some((coworker_id.clone(), UsageReport::Loading));
+        }
+        self.usage_generation += 1;
+        let generation = self.usage_generation;
+        cx.spawn(async move |this, cx| {
+            let result = client.coworker_usage(&coworker_id).await;
+            let _ = this.update(cx, |state, cx| {
+                if state.usage_generation != generation
+                    || state.active_coworker_id.as_deref() != Some(coworker_id.as_str())
+                {
+                    return;
+                }
+                let report = match result {
+                    Ok(usage) => UsageReport::Read(usage),
+                    Err(error) => UsageReport::Unavailable(usage_unavailable(&error)),
+                };
+                state.coworker_usage = Some((coworker_id, report));
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// Ask the server what the open bot is offered on a turn. Asked each time its settings
@@ -8241,11 +8305,13 @@ impl AppState {
         self.last_box_shot = None;
         self.computer_confirm = None;
         self.computer_action_error = None;
-        // The last bot's tools must not be listed under this one's name.
+        // The last bot's tools and usage must not be shown under this one's name.
         self.coworker_tools = None;
+        self.coworker_usage = None;
         self.agent_tools_open = false;
         if self.right_pane == RightPane::Settings {
             self.refresh_coworker_tools(cx);
+            self.refresh_coworker_usage(cx);
         }
         if !self.conversations.iter().any(|c| c.id == id) {
             self.conversations.insert(

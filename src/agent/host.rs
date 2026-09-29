@@ -1973,6 +1973,8 @@ pub struct NativeChatHost {
     agent_settings_open: bool,
     /// The open bot's tools as its settings list them, and whether the card is open to them.
     agent_tools: Option<crate::state::ToolList>,
+    /// The open bot's usage this month, as its settings' Usage card shows it (#138).
+    agent_usage: Option<crate::state::UsageReport>,
     agent_tools_open: bool,
     model_picker_open: bool,
     avatar_editor_open: bool,
@@ -2170,6 +2172,11 @@ impl NativeChatHost {
                 .filter(|(owner, _)| state.active_coworker_id.as_deref() == Some(owner.as_str()))
                 .map(|(_, list)| list.clone()),
             agent_tools_open: state.agent_tools_open,
+            agent_usage: state
+                .coworker_usage
+                .as_ref()
+                .filter(|(owner, _)| state.active_coworker_id.as_deref() == Some(owner.as_str()))
+                .map(|(_, report)| report.clone()),
             model_picker_open: state.model_picker_open,
             avatar_editor_open: state.avatar_editor_open,
             approvals: state
@@ -2924,6 +2931,21 @@ impl NativeChatHost {
             );
         if let Some(tools) = &self.agent_tools {
             settings = settings.with_child(agent_tools_node(tools, self.agent_tools_open));
+        }
+        if let Some(usage) = &self.agent_usage {
+            // `agent-usage` (value = the card's second line) with one `agent-usage-model-{i}` per
+            // model the server reported, label = that model's line (#138).
+            let mut node = UiNode::new("agent-usage", "status", "Usage")
+                .with_value(crate::components::agent_settings::usage_summary(usage));
+            if let crate::state::UsageReport::Read(read) = usage {
+                for (i, model) in read.models.iter().enumerate() {
+                    node = node.with_child(UiNode::listitem(
+                        format!("agent-usage-model-{i}"),
+                        crate::components::agent_settings::model_line(model),
+                    ));
+                }
+            }
+            settings = settings.with_child(node);
         }
         if let Some(note) = &self.model_note {
             // The server's word about why the list is not fuller, under the field, exactly where
@@ -8629,6 +8651,41 @@ mod tests {
         assert!(
             host.invoke("composer.detach", &serde_json::json!({"index": "5"}))
                 .is_err()
+        );
+    }
+
+    /// The Usage card is on the tree with what the server said the bot used (#138).
+    #[test]
+    fn a_bots_usage_is_on_the_tree() {
+        use crate::opengrok::{CoworkerUsage, ModelUsage, UsageTotals};
+        let mut host = host();
+        host.agent_settings_open = true;
+        host.agent_usage = Some(crate::state::UsageReport::Read(CoworkerUsage {
+            metered: true,
+            note: None,
+            window: "month".into(),
+            models: vec![ModelUsage {
+                model_id: "oag/cheap".into(),
+                requests: 2,
+                input_tokens: 20,
+                output_tokens: 10,
+                cost_usd: "2.000000".into(),
+            }],
+            totals: UsageTotals {
+                requests: Some(2),
+                input_tokens: Some(20),
+                output_tokens: Some(10),
+                cost_usd: Some("2.000000".into()),
+            },
+        }));
+        let tree = host.snapshot();
+        assert_eq!(
+            tree.find("agent-usage").unwrap().value.as_deref(),
+            Some("2 requests this month · 30 tokens · $2.00")
+        );
+        assert_eq!(
+            tree.find("agent-usage-model-0").unwrap().name,
+            "oag/cheap · 2 requests · 30 tokens · $2.00"
         );
     }
 }

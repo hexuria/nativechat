@@ -5,7 +5,7 @@ use crate::chrome::{
 use crate::components::fields::field_input;
 use crate::components::persona::PersonaMark;
 use crate::opengrok::{CoworkerPatch, CoworkerTool, ModelEntry};
-use crate::state::{AppState, ToolList};
+use crate::state::{AppState, ToolList, UsageReport};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{
     IndentInline, Input, InputEvent, InputState, MoveDown, MoveUp, OutdentInline, Textarea,
@@ -496,6 +496,23 @@ impl Render for AgentSettings {
                 .filter(|(owner, _)| state.active_coworker_id.as_deref() == Some(owner.as_str()))
                 .map(|(_, list)| list.clone())
         };
+        let usage = {
+            let state = self.state.read(cx);
+            state
+                .coworker_usage
+                .as_ref()
+                .filter(|(owner, _)| state.active_coworker_id.as_deref() == Some(owner.as_str()))
+                .map(|(_, report)| report.clone())
+        };
+        let usage_line = usage
+            .as_ref()
+            .map_or_else(|| "Asking the server…".to_string(), usage_summary);
+        let usage_rows: Vec<String> = match &usage {
+            Some(UsageReport::Read(read)) if usage_open => {
+                read.models.iter().map(model_line).collect()
+            }
+            _ => Vec::new(),
+        };
         let auto_review_mode = self.auto_review_mode;
         let has_custom = shape.is_some() || color.is_some();
         let app = self.state.clone();
@@ -801,12 +818,17 @@ impl Render for AgentSettings {
                                                                 div()
                                                                     .text_xs()
                                                                     .text_color(muted)
-                                                                    .child(if usage_open {
-                                                                        "No requests this month"
-                                                                    } else {
-                                                                        "No usage this month"
-                                                                    }),
-                                                            ),
+                                                                    // What the server says the bot used,
+                                                                    // not a word the app made up (#138).
+                                                                    .child(usage_line),
+                                                            )
+                                                            .children(usage_rows.into_iter().enumerate().map(|(i, line)| {
+                                                                div()
+                                                                    .id(SharedString::from(format!("agent-usage-model-{i}")))
+                                                                    .text_xs()
+                                                                    .text_color(muted)
+                                                                    .child(line)
+                                                            })),
                                                     )
                                                     .child(
                                                         div()
@@ -1540,6 +1562,80 @@ mod tests {
     }
 }
 
+/// The Usage card's second line: what the bot used this month, or why the app cannot say.
+pub(crate) fn usage_summary(report: &UsageReport) -> String {
+    match report {
+        UsageReport::Loading => "Asking the server…".to_string(),
+        UsageReport::Unavailable(why) => why.clone(),
+        UsageReport::Read(usage) if !usage.metered => usage
+            .note
+            .clone()
+            .unwrap_or_else(|| "This bot's use is not measured.".to_string()),
+        UsageReport::Read(usage) => match usage.totals.requests.unwrap_or(0) {
+            0 => "No requests this month".to_string(),
+            requests => {
+                let tokens = usage.totals.input_tokens.unwrap_or(0)
+                    + usage.totals.output_tokens.unwrap_or(0);
+                let mut line = format!(
+                    "{} this month · {} tokens",
+                    plural(requests, "request"),
+                    grouped(tokens)
+                );
+                if let Some(cost) = usage.totals.cost_usd.as_deref().and_then(dollars) {
+                    line.push_str(&format!(" · {cost}"));
+                }
+                line
+            }
+        },
+    }
+}
+
+/// One model's line once the card is open.
+pub(crate) fn model_line(model: &crate::opengrok::ModelUsage) -> String {
+    let mut line = format!(
+        "{} · {} · {} tokens",
+        model.model_id,
+        plural(model.requests, "request"),
+        grouped(model.input_tokens + model.output_tokens)
+    );
+    if let Some(cost) = dollars(&model.cost_usd) {
+        line.push_str(&format!(" · {cost}"));
+    }
+    line
+}
+
+fn plural(n: i64, word: &str) -> String {
+    if n == 1 {
+        format!("1 {word}")
+    } else {
+        format!("{} {word}s", grouped(n))
+    }
+}
+
+/// A count with thousands separated, the way a person reads a big number.
+fn grouped(n: i64) -> String {
+    let digits = n.unsigned_abs().to_string();
+    let mut out = String::new();
+    for (i, ch) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    if n < 0 { format!("-{out}") } else { out }
+}
+
+/// The server's six-decimal dollars as a person reads them, to the cent; a sum under a cent that
+/// is not zero reads as "under $0.01" rather than as nothing spent.
+fn dollars(six: &str) -> Option<String> {
+    let value: f64 = six.parse().ok()?;
+    Some(if value > 0.0 && value < 0.005 {
+        "under $0.01".to_string()
+    } else {
+        format!("${value:.2}")
+    })
+}
+
 /// The Tools card's second line: how many the bot is offered, and from where, or why the app
 /// cannot say.
 pub(crate) fn tools_summary(list: &ToolList) -> String {
@@ -1618,7 +1714,7 @@ fn tools_body(all: &[CoworkerTool], muted: Hsla) -> impl IntoElement {
 
 #[cfg(test)]
 mod tools_tests {
-    use super::{first_line_of, tools_summary};
+    use super::{first_line_of, model_line, tools_summary, usage_summary};
     use crate::opengrok::CoworkerTool;
     use crate::state::ToolList;
 
@@ -1677,5 +1773,63 @@ mod tools_tests {
             161,
             "no spaces: cut on a char"
         );
+    }
+
+    /// The Usage card says what the server says the bot used, and never "no usage" for a bot that
+    /// used some, nor for one the server does not measure (#138).
+    #[test]
+    fn the_usage_card_says_what_the_server_measured() {
+        use crate::opengrok::{CoworkerUsage, ModelUsage};
+        use crate::state::UsageReport;
+        let used = CoworkerUsage {
+            metered: true,
+            note: None,
+            window: "month".into(),
+            models: vec![ModelUsage {
+                model_id: "oag/cheap".into(),
+                requests: 1234,
+                input_tokens: 20000,
+                output_tokens: 1000,
+                cost_usd: "2.000000".into(),
+            }],
+            totals: crate::opengrok::UsageTotals {
+                requests: Some(1234),
+                input_tokens: Some(20000),
+                output_tokens: Some(1000),
+                cost_usd: Some("2.000000".into()),
+            },
+        };
+        assert_eq!(
+            usage_summary(&UsageReport::Read(used.clone())),
+            "1,234 requests this month · 21,000 tokens · $2.00"
+        );
+        assert_eq!(
+            model_line(&used.models[0]),
+            "oag/cheap · 1,234 requests · 21,000 tokens · $2.00"
+        );
+        let idle = CoworkerUsage {
+            models: Vec::new(),
+            totals: crate::opengrok::UsageTotals {
+                requests: Some(0),
+                ..Default::default()
+            },
+            ..used.clone()
+        };
+        assert_eq!(
+            usage_summary(&UsageReport::Read(idle)),
+            "No requests this month"
+        );
+        let unmetered = CoworkerUsage {
+            metered: false,
+            note: Some("this coworker's key cannot serve".into()),
+            models: Vec::new(),
+            totals: Default::default(),
+            ..used
+        };
+        assert_eq!(
+            usage_summary(&UsageReport::Read(unmetered)),
+            "this coworker's key cannot serve"
+        );
+        assert_eq!(usage_summary(&UsageReport::Loading), "Asking the server…");
     }
 }
