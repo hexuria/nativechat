@@ -1713,12 +1713,30 @@ fn awaiting(frame: &Value) -> Check {
         let objects: Vec<&Value> = std::iter::once(frame).chain(entry).collect();
         let words: Vec<FormResolution> = objects.iter().copied().filter_map(word).collect();
         let escalated = words.contains(&FormResolution::Escalated);
+        // How an escalation's hand-off ended, stamped on the form's entry once it settles
+        // (#143): any word at all ends it, and none means the computer still needs the person.
+        let handed_off = escalated
+            && objects.iter().any(|object| {
+                object
+                    .get("boxResolution")
+                    .and_then(Value::as_str)
+                    .is_some_and(|word| !word.trim().is_empty())
+            });
         let dismissed = !escalated && objects.iter().copied().any(flag);
-        let settled = !escalated && (!words.is_empty() || dismissed);
+        let settled = handed_off || (!escalated && (!words.is_empty() || dismissed));
         if escalated {
+            let computer = spec.computer_handoff;
             must!(
-                spec.computer_handoff == Some(ComputerHandoffStatus::ActionNeeded),
-                "an escalated form hands the page to the computer: {spec:?}"
+                if handed_off {
+                    matches!(
+                        computer,
+                        Some(ComputerHandoffStatus::Done | ComputerHandoffStatus::Skipped)
+                    )
+                } else {
+                    computer == Some(ComputerHandoffStatus::ActionNeeded)
+                },
+                "an escalated form hands the page to the computer until the hand-off ends: \
+                 {spec:?}"
             );
         }
         must!(
@@ -1902,9 +1920,32 @@ fn settled_form(frame: &Value) -> Check {
     let word = str_at(frame, "formResolution");
     let resolution = FormResolution::parse(word);
     if resolution == FormResolution::Escalated {
+        // Once the hand-off ends, the server stamps the form's entry with the box's word
+        // (opengrok-server #277, #143), read the way the live answer paints it; until then the
+        // Computer card beside the form is live.
+        let ended = [
+            frame.get("boxResolution"),
+            frame.pointer("/value/boxResolution"),
+        ]
+        .into_iter()
+        .flatten()
+        .find_map(Value::as_str)
+        .filter(|word| !word.trim().is_empty());
+        let expected = match ended {
+            None => (None, ComputerHandoffStatus::ActionNeeded),
+            Some("handed_back") => (Some(FormResolution::Dismissed), ComputerHandoffStatus::Done),
+            Some("declined" | "timed_out") => (
+                Some(FormResolution::Skipped),
+                ComputerHandoffStatus::Skipped,
+            ),
+            Some(_) => (
+                Some(FormResolution::Dismissed),
+                ComputerHandoffStatus::Skipped,
+            ),
+        };
         must!(
-            spec.computer_handoff == Some(ComputerHandoffStatus::ActionNeeded),
-            "escalated is a live Computer card beside the form: {spec:?}"
+            (spec.effective_resolution(), spec.computer_handoff) == (expected.0, Some(expected.1)),
+            "escalated, then {ended:?}, should read as {expected:?}: {spec:?}"
         );
     } else {
         must!(
@@ -3687,6 +3728,17 @@ fn the_ledger_reads_a_park_settlement_as_the_client_does() {
         park(Value::Null, Value::Null),
         // Another spelling of the escalation, as the client's parse reads it.
         park(Value::from("Escalated"), serde_json::json!({"id": "e_1"})),
+        // The hand-off ended (#143): stamped on the entry, and on the frame beside it.
+        park(
+            Value::from("escalated"),
+            serde_json::json!({"id": "e_1", "formResolution": "escalated",
+                "widgetDismissed": true, "boxResolution": "handed_back"}),
+        ),
+        park(
+            Value::from("escalated"),
+            serde_json::json!({"id": "e_1", "formResolution": "escalated",
+                "boxResolution": "declined"}),
+        ),
         // Another card's entry, matched by title and fields: it settles nothing here.
         park(
             Value::Null,
@@ -3699,6 +3751,64 @@ fn the_ledger_reads_a_park_settlement_as_the_client_does() {
     ] {
         awaiting(&frame).unwrap_or_else(|problem| panic!("{problem}: {frame}"));
     }
+}
+
+/// #143 against the server's own recordings: every recorded replay whose form frames carry how
+/// the hand-off ended (handed back, declined, timed out; on the park alone for a form escalated
+/// after its run stopped; read from the run's answer for one settled before the server stamped
+/// forms) leaves nothing waiting on the person. A replay taken while the hand-off was still live
+/// carries no word and is left to the other checks.
+#[test]
+fn a_replayed_hand_off_that_ended_leaves_nothing_waiting() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/wire/rest");
+    let mut ended = BTreeSet::new();
+    for route in ["GET__ag-ui_runs__run_id_", "GET__ag-ui_threads__thread_id_"] {
+        let Ok(files) = std::fs::read_dir(root.join(route)) else {
+            continue;
+        };
+        for file in files.flatten() {
+            let text = std::fs::read_to_string(file.path()).expect("a recording");
+            let fixture: Value = serde_json::from_str(&text).expect("a recording");
+            let body = &fixture["body"];
+            let runs: Vec<&Value> = match body.get("runs").and_then(Value::as_array) {
+                Some(runs) => runs.iter().collect(),
+                None => vec![body],
+            };
+            for run in runs {
+                let events: Vec<&Value> = run["events"]
+                    .as_array()
+                    .map(|events| events.iter().collect())
+                    .unwrap_or_default();
+                let said = events.iter().any(|frame| {
+                    [
+                        frame.get("boxResolution"),
+                        frame.pointer("/value/boxResolution"),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .any(|word| word.as_str().is_some_and(|word| !word.is_empty()))
+                });
+                if !said {
+                    continue;
+                }
+                let assembler = assembled(&events);
+                let (_, parts) = assembler.snapshot();
+                let name = file.file_name().to_string_lossy().into_owned();
+                assert!(
+                    !assembler.waiting_user_form(),
+                    "{route}/{name}: a hand-off that ended leaves nothing waiting: {parts:?}"
+                );
+                ended.insert(name);
+            }
+        }
+    }
+    // The recordings of opengrok-server #277: hand-back, declined, timed out, the park-only case
+    // and the backfill (a form settled before the stamp, its end read from its run's answer).
+    // Fewer means the corpus lost the case this test is about.
+    assert!(
+        ended.len() >= 5,
+        "the recorded hand-offs that ended: {ended:?}"
+    );
 }
 
 /// Every frame goes through the code that handles its type and name, and comes out the way this

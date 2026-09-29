@@ -3512,6 +3512,94 @@ mod tests {
         }
     }
 
+    /// #143: once the person hands the computer back (or declines, or it times out), the server
+    /// stamps the escalated form's entry with the box's own `boxResolution`, and a replay carries
+    /// it on the form's frames. The form is then settled the way the live answer paints it, and
+    /// nothing is waiting: before, a replay showed "Action needed" for ever and parked the
+    /// finished run. A word this app does not know still ends the handoff.
+    #[test]
+    fn a_replayed_escalation_that_was_handed_back_is_settled() {
+        use crate::opengrok::{ComputerHandoffStatus, FormResolution};
+        let park = |entry: Value| {
+            json!({
+                "type": "CUSTOM", "name": "run-awaiting-approval", "reason": "user-form",
+                "tool": "request_user_form", "runId": "run-1", "callId": "call-9",
+                "entryId": "entry-1",
+                "arguments": {"title": "Google account",
+                    "fields": [{"id": "email", "label": "Email", "type": "email"}]},
+                "formResolution": "escalated",
+                "boxResolution": entry.get("boxResolution").cloned().unwrap_or(Value::Null),
+                "value": entry,
+            })
+        };
+        let form_frame = |entry: Value| {
+            json!({
+                "type": "CUSTOM", "name": "user-form", "runId": "run-1", "callId": "call-9",
+                "entryId": "entry-1", "value": entry,
+            })
+        };
+        let entry = |word: Option<&str>| {
+            let mut entry = json!({
+                "id": "entry-1", "callId": "call-9", "formResolution": "escalated",
+                "widgetDismissed": true,
+                "message": {"type": "user-form", "formRequest": {"title": "Google account",
+                    "fields": [{"id": "email", "label": "Email", "type": "email"}]}},
+            });
+            if let Some(word) = word {
+                entry["boxResolution"] = json!(word);
+            }
+            entry
+        };
+        for (word, form, computer) in [
+            (
+                "handed_back",
+                FormResolution::Dismissed,
+                ComputerHandoffStatus::Done,
+            ),
+            (
+                "timed_out",
+                FormResolution::Skipped,
+                ComputerHandoffStatus::Skipped,
+            ),
+            (
+                "declined",
+                FormResolution::Skipped,
+                ComputerHandoffStatus::Skipped,
+            ),
+            (
+                "a_word_from_later",
+                FormResolution::Dismissed,
+                ComputerHandoffStatus::Skipped,
+            ),
+        ] {
+            for frame in [park(entry(Some(word))), form_frame(entry(Some(word)))] {
+                let mut turn = TurnAssembler::default();
+                turn.push_event(&frame);
+                let (_, parts) = turn.snapshot();
+                match parts.as_slice() {
+                    [ChatPart::UserForm(spec)] => {
+                        assert_eq!(spec.effective_resolution(), Some(form), "{word}: {spec:?}");
+                        assert_eq!(spec.computer_handoff, Some(computer), "{word}");
+                    }
+                    other => panic!("{word}: expected the card, got {other:?}"),
+                }
+                assert!(!turn.waiting_user_form(), "{word}: nothing is waiting");
+            }
+        }
+        // No word yet: the handoff is still live, and the person is still asked.
+        for frame in [park(entry(None)), form_frame(entry(None))] {
+            let mut turn = TurnAssembler::default();
+            turn.push_event(&frame);
+            let (_, parts) = turn.snapshot();
+            assert!(matches!(
+                parts.as_slice(),
+                [ChatPart::UserForm(spec)]
+                    if spec.computer_handoff == Some(ComputerHandoffStatus::ActionNeeded)
+            ));
+            assert!(turn.waiting_user_form());
+        }
+    }
+
     #[test]
     fn live_awaiting_user_form_is_not_an_approval_card() {
         let mut turn = TurnAssembler::default();
