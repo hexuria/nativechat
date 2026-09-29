@@ -6405,22 +6405,14 @@ impl AppState {
     /// switch whose answer leaves the rows on the card in doubt ([`after_skill_switch`]). No skill
     /// switch is sent until it lands.
     pub fn refresh_coworker_skills(&mut self, cx: &mut Context<Self>) {
-        let (Some(client), Some(coworker_id)) =
-            (self.opengrok.clone(), self.active_coworker_id.clone())
-        else {
+        let Some(client) = self.opengrok.clone() else {
             self.coworker_skills = None;
             return;
         };
-        // The switches read for this Bot stay on screen while it is asked again, so they do not
-        // blink out every time the pane opens. They are dead until the read lands.
-        let read = matches!(
-            &self.coworker_skills,
-            Some((id, BotSkills::Read(_))) if *id == coworker_id
-        );
-        if !read {
-            self.coworker_skills = Some((coworker_id.clone(), BotSkills::Loading));
-        }
-        let generation = self.ask_skills_read();
+        let Some((coworker_id, generation)) = self.begin_coworker_skills_read() else {
+            self.coworker_skills = None;
+            return;
+        };
         cx.spawn(async move |this, cx| {
             let result = client.coworker_skills(&coworker_id).await;
             let _ = this.update(cx, |state, cx| {
@@ -6430,6 +6422,31 @@ impl AppState {
             });
         })
         .detach();
+    }
+
+    /// The open Bot and the read to ask for its skills, with every skill switch held until it
+    /// lands. The switches read for this Bot stay on screen while it is asked again, so they do
+    /// not blink out every time the pane opens; they are dead until the read lands.
+    fn begin_coworker_skills_read(&mut self) -> Option<(String, u64)> {
+        let coworker_id = self.active_coworker_id.clone()?;
+        let read = matches!(
+            &self.coworker_skills,
+            Some((id, BotSkills::Read(_))) if *id == coworker_id
+        );
+        if !read {
+            self.coworker_skills = Some((coworker_id.clone(), BotSkills::Loading));
+        }
+        Some((coworker_id, self.ask_skills_read()))
+    }
+
+    /// A skill in the account's library was switched on or off, or deleted, in Settings →
+    /// Skills. The open Bot's Skills card holds that skill's row as the server last sent it, so
+    /// until it is read again it could offer to attach a skill now switched off: its switches are
+    /// held and it is read again, whenever a Bot's skills were read at all.
+    fn library_skill_changed(&mut self, cx: &mut Context<Self>) {
+        if self.coworker_skills.is_some() {
+            self.refresh_coworker_skills(cx);
+        }
     }
 
     /// Count a read of the skills asked for, and hold every skill switch until it lands.
@@ -8814,6 +8831,7 @@ impl AppState {
                             state.close_skill(cx);
                         }
                         state.refresh_skills(cx);
+                        state.library_skill_changed(cx);
                     }
                     Err(error) => state.skills_error = Some(error.message),
                 }
@@ -8865,6 +8883,7 @@ impl AppState {
                     Ok(detail) => {
                         state.take_switch_answer(&id, enabled, &detail.skill);
                         state.refresh_skills(cx);
+                        state.library_skill_changed(cx);
                     }
                     Err(error) => state.take_switch_refusal(&id, was, error.message),
                 }
@@ -28116,6 +28135,29 @@ mod tests {
         let generation = state.ask_skills_read();
         assert!(state.settle_coworker_skills(generation, coworker.into(), Ok(served_skills())));
         state
+    }
+
+    /// Switching a skill off (or deleting it) in Settings → Skills leaves the open Bot's card
+    /// holding that skill's old row, which would still offer to attach it. The card is read again
+    /// and its switches are held until the read lands, so a skill switched off there cannot be
+    /// newly attached from the card on stale rows.
+    #[test]
+    fn a_skill_switched_off_in_the_library_is_not_attachable_from_stale_rows() {
+        let mut state = with_skills_read("cw_1");
+        assert!(
+            state.begin_skill_switch("sk_draft", true).is_ok(),
+            "on the rows as read, `draft` is on in the library and may be attached"
+        );
+        let mut state = with_skills_read("cw_1");
+        // What `library_skill_changed` asks for when the library's switch or delete lands.
+        let (coworker, _) = state
+            .begin_coworker_skills_read()
+            .expect("the open Bot's skills are read again");
+        assert_eq!(coworker, "cw_1");
+        assert!(
+            state.begin_skill_switch("sk_draft", true).is_err(),
+            "held until the fresh rows land"
+        );
     }
 
     fn skill_card(state: &AppState) -> SkillsCard {
