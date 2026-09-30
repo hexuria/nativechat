@@ -828,6 +828,24 @@ pub struct RelayMac {
     pub report: Option<RelayReport>,
 }
 
+/// Why the relay did not start: this Mac's enrolment could not be read back from the file it
+/// wrote.
+const RELAY_NO_CREDENTIAL: &str =
+    "This Mac's enrolment could not be read. Sign out and in again to enrol it.";
+
+/// Why the relay did not start: the address saved for opencodex is not one on this Mac.
+const RELAY_ADDRESS_UNREADABLE: &str =
+    "The address saved for opencodex isn't one on this Mac. Give it again and save.";
+
+/// A relay that could not start, and why, as its status line says it.
+fn relay_cannot_start(why: &str) -> RelayReport {
+    RelayReport {
+        status: RelayStatus::Error(why.to_string()),
+        in_flight: 0,
+        halted: true,
+    }
+}
+
 /// Answer with this Mac's status line ([`AppState::relay_line`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RelayLine {
@@ -8327,10 +8345,14 @@ impl AppState {
         let (Some(client), Some(config)) = (self.opengrok.clone(), self.config.clone()) else {
             return;
         };
+        // What would keep it from starting is said where the relay's status is, rather than a
+        // switch that is on and a line that only says it is not connected.
         let Some(machine) = stored_machine(&config.data_dir) else {
+            self.relay_mac.report = Some(relay_cannot_start(RELAY_NO_CREDENTIAL));
             return;
         };
         let Some(address) = self.relay_address() else {
+            self.relay_mac.report = Some(relay_cannot_start(RELAY_ADDRESS_UNREADABLE));
             return;
         };
         self.relay_generation += 1;
@@ -8579,6 +8601,8 @@ impl AppState {
             if let (Some(worker), Some(address)) = (&self.relay_worker, self.relay_address()) {
                 worker.readdress(address);
             }
+            // A relay that could not start for an address it could not read can start now.
+            self.ensure_relay(cx);
         }
         let Some(key) = here.key else {
             return;
