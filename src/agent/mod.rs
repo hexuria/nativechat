@@ -172,15 +172,20 @@
 //! answers and `fast` where the list holds its fast twin; a click puts the Bot on it, fast where
 //! ⚡ is on and it has a twin, and goes back to the controls), `model-plan` (on a server whose
 //! rows carry no `source`, while the account is on the person's plan: the account's plan model,
-//! which answers for every Bot there; a line, not a row) and `model-note` (the server's word on
-//! why the list is not fuller). `model-error` is the server's words for the last change it
-//! refused. Every change is saved on the Bot at once, `source`, `model` and `effort` on
-//! `PATCH /coworkers/{id}` (opengrok-server `bot-model-source`, confirmed 2026-09-30, not yet
-//! recorded). The card's parts are the chip's with `agent-` before them: `agent-model-pop`,
-//! `agent-model-fast`, `agent-model-effort`, `agent-model-open-list`, `agent-model-reset`,
-//! `agent-model-list`, `agent-model-row-{source}-{id}`, `agent-model-plan`, `agent-model-note`
-//! and `agent-model-error`. Invoke `model.picker`, `model.picker.open` and `model.picker.close`
-//! work the card's popover, and a click on `agent-model-dismiss` shuts whichever is open.
+//! which answers for every Bot there; a line, not a row), `model-routines` (on a Bot whose own
+//! door is the person's plan and whose model, ⚡ aside, is not among the gateway's models the
+//! list holds: the line saying its routines, which run on the server's paid keys whatever its
+//! door (opengrok-server #294), will fail, and to pick a Server model for a Bot that runs them;
+//! a line, not a row) and `model-note` (the server's word on why the list is not fuller).
+//! `model-error` is the server's words for the last change it refused. Every change is saved on
+//! the Bot at once, `source`, `model` and `effort` on `PATCH /coworkers/{id}` (opengrok-server
+//! `bot-model-source`, confirmed 2026-09-30, not yet recorded). The card's parts are the chip's
+//! with `agent-` before them: `agent-model-pop`, `agent-model-fast`, `agent-model-effort`,
+//! `agent-model-open-list`, `agent-model-reset`, `agent-model-list`,
+//! `agent-model-row-{source}-{id}`, `agent-model-plan`, `agent-model-routines`,
+//! `agent-model-note` and `agent-model-error`. Invoke `model.picker`, `model.picker.open` and
+//! `model.picker.close` work the card's popover, and a click on `agent-model-dismiss` shuts
+//! whichever is open.
 //!
 //! In the bot's settings: `agent-settings-error` is the pane's red line over Save: a refused Save
 //! or pick, in the server's words.

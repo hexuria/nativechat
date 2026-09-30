@@ -40,6 +40,9 @@ pub(crate) const ROW: &str = "model-row-";
 pub(crate) const PLAN: &str = "model-plan";
 /// In the list: the server's word about why it lists no more, as `GET /models` gives it.
 pub(crate) const NOTE: &str = "model-note";
+/// In the list, on a Bot whose own door is the person's plan and whose pin the gateway does not
+/// list: its routines, which run on the server's paid keys, will fail (`ModelPick::routines`).
+pub(crate) const ROUTINES: &str = "model-routines";
 /// Under the controls: the server's words for the last change that did not go through.
 pub(crate) const ERROR: &str = "model-error";
 
@@ -612,6 +615,17 @@ impl Panel {
                             .text_sm()
                             .text_color(muted)
                             .child(NO_MODELS),
+                    )
+                })
+                // Under the rows it is about, where a Server model to pick instead is in view.
+                .when_some(pick.routines.clone(), |this, line| {
+                    this.child(
+                        div()
+                            .id(SharedString::from(part_id(place, ROUTINES)))
+                            .px(px(8.))
+                            .text_xs()
+                            .text_color(muted)
+                            .child(line),
                     )
                 })
                 .when_some(self.catalogue_note.clone(), |this, note| {
