@@ -241,9 +241,10 @@ pub struct MessageInput {
     /// button. Cached off [`AppState`] like the rest, so the composer draws without reading the
     /// state on every frame.
     turn_in_flight: bool,
-    /// The chip that picks which door the next turns go through, the server's paid keys or the
-    /// person's plan, while there is a choice to make. Cached off [`AppState`] like the rest.
-    turn_source: Option<crate::state::TurnSourceChip>,
+    /// The open Bot's model picker as the composer's chip: its model, fast tier and effort, and
+    /// the door they are served through, each saved on the Bot the moment it is picked. A view
+    /// of its own, which follows the state itself.
+    model_picker: Entity<crate::components::model_picker::ModelPicker>,
 }
 
 impl MessageInput {
@@ -265,7 +266,13 @@ impl MessageInput {
         let reply_to = app_state.reply_to.clone();
         let coworker_name = composer_bot_name(app_state);
         let turn_in_flight = app_state.is_turn_in_flight();
-        let turn_source = app_state.composer_turn_source();
+        let model_picker = cx.new(|cx| {
+            crate::components::model_picker::ModelPicker::new(
+                state.clone(),
+                crate::state::PickerPlace::Composer,
+                cx,
+            )
+        });
 
         let this = Self {
             state: state.clone(),
@@ -291,7 +298,7 @@ impl MessageInput {
             notice: None,
             dismissed_at: None,
             turn_in_flight,
-            turn_source,
+            model_picker,
         };
 
         // Subscribe to state changes to update cached values and notify only when relevant
@@ -339,11 +346,6 @@ impl MessageInput {
                 let running = state.is_turn_in_flight();
                 if this.turn_in_flight != running {
                     this.turn_in_flight = running;
-                    changed = true;
-                }
-                let turn_source = state.composer_turn_source();
-                if this.turn_source != turn_source {
-                    this.turn_source = turn_source;
                     changed = true;
                 }
             }
@@ -655,9 +657,8 @@ impl MessageInput {
         cx.notify();
     }
 
-    /// The reply-source chip gives its place to the dictation's buttons, and the state is told:
-    /// a chip that is not drawn is not in a driver's tree, and a turn sent meanwhile names the
-    /// account's own door rather than a pick nobody can see (`AppState::turn_source_for_send`).
+    /// The model picker's chip gives its place to the dictation's buttons, and the state is told:
+    /// a chip that is not drawn is not in a driver's tree either.
     fn tell_state_dictating(&self, cx: &mut Context<Self>) {
         let dictating = self.voice_mode;
         self.state
@@ -2478,19 +2479,11 @@ impl Render for MessageInput {
                                         confirm_btn
                                     })
                                 })
-                                // Which door the next turns go through, beside the button that
-                                // sends them. Only while there is a choice: see
-                                // `AppState::composer_turn_source`.
-                                .when_some(
-                                    self.turn_source.clone().filter(|_| !self.voice_mode),
-                                    |this, chip| {
-                                        this.child(crate::components::reply_source::composer_chip(
-                                            &chip,
-                                            state_model.clone(),
-                                            &theme,
-                                        ))
-                                    },
-                                )
+                                // The open Bot's model, fast tier and effort, beside the button
+                                // that sends to it. It draws nothing with no Bot open.
+                                .when(!self.voice_mode, |this| {
+                                    this.child(self.model_picker.clone())
+                                })
                                 .when(!self.voice_mode, |this| {
                                     // Text Mode: Mic and Send/Headphone
                                     this.child({

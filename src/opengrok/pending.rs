@@ -49,9 +49,9 @@ pub struct PendingUserMessage {
     pub drained_at_ms: Option<i64>,
     #[serde(default)]
     pub drained_run_id: Option<String>,
-    /// The door the send was queued with, `gateway` or `local_proxy`: what the composer's chip
-    /// showed when it was held. Present only when the send named one; absent, the account's
-    /// setting decides, which is not the row's to say. The server keeps it from the write that
+    /// The door the send was queued with, `gateway` or `local_proxy`: the Bot's own when it was
+    /// held. Present only when the send named one; absent, the server goes by the Bot's door or
+    /// the account's, which is not the row's to say. The server keeps it from the write that
     /// queued the send (`inferenceSource`, the word `forwardedProps.inferenceSource` is on a live
     /// turn) and honours it with the turn's precedence when the row drains, here or on another
     /// machine. Agreed with opengrok-server 2026-09-30 and built in its #294 (`message_json`,
@@ -244,13 +244,13 @@ pub struct PendingWrite {
     pub recipe_values: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub skill_id: Option<String>,
-    /// The door the send was queued with, as the composer's chip showed it: the row's
+    /// The door the send was queued with, the Bot's own as it was sent: the row's
     /// `inferenceSource` (opengrok-server #294: `WriteBody.inference_source` in
     /// `crates/opengrok-server/src/agui/pending.rs`), the bare word or, naming a way to the plan,
     /// `{"kind", "via"}` (#292: server main cad36fd (#303, after #298), pin 47a5d6b). An edit
-    /// carries it too, so the row matches the hold whichever machine queued it. Left out when no
-    /// chip was drawn: the account's setting decides then, and an edit that leaves it out keeps
-    /// the row's.
+    /// carries it too, so the row matches the hold whichever machine queued it. Left out for a
+    /// Bot that follows the account's door: the server decides then, and an edit that leaves it
+    /// out keeps the row's.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub inference_source: Option<TurnSource>,
 }
@@ -406,7 +406,7 @@ mod tests {
         assert!(body.get("inferenceSource").is_none(), "{body}");
     }
 
-    /// A send queued while the composer's chip showed a door carries it to the server as a live
+    /// A send queued while the Bot had a door of its own carries it to the server as a live
     /// turn names it, so a machine that drains the row asks through that door: the bare word,
     /// or with the relay `{"kind", "via"}`. An edit carries the hold's door; one with none
     /// leaves it out, and the server keeps the row's.
