@@ -3,10 +3,10 @@
 //! This app transcribes the server's wire by hand, and nothing else checks that the two still
 //! agree. `fixtures/wire/` is the server's side of that, recorded by the server itself: every
 //! AG-UI frame and REST body its own tests drove, teed off its router by the recorder of
-//! opengrok-server#258 and written out by its `examples/wire_corpus.rs`. It is vendored whole
-//! from the server's `tests/fixtures/wire/` at opengrok-server PR #298, branch mac-relay 5359e34,
-//! recorded at 07a951b, not yet on main: the Mac relay's server half (#292), on top of its main
-//! e55a8c8. The layout is
+//! opengrok-server#258 and written out by its `examples/wire_corpus.rs`. It is vendored whole from
+//! the server's `tests/fixtures/wire/` at server main cad36fd (#303, after #298, the Mac relay's
+//! server half, #292), pin 47a5d6b, the commit its `MANIFEST.json` names as the one it was recorded
+//! at. The layout is
 //! opengrok-server#255's: `agui/<type>/<slug>.json`, a CUSTOM under `agui/custom/<name>/`, and
 //! `rest/<METHOD>_<route>/<status>-<slug>.json` holding `{method, path, status, body}`, one file
 //! per distinct shape, named after the first test that produced it; and since the relay, the
@@ -991,8 +991,8 @@ fn run_ended(corpus: &Corpus, frame: &Value) -> Check {
 }
 
 /// The codes a `RUN_ERROR` carries beside its sentence, which are the Mac relay's and nobody
-/// else's (opengrok-server PR #298, branch mac-relay 5359e34, recorded at 07a951b, not yet on
-/// main): `ModelError::Relay` in `crates/opengrok-harness/src/relay.rs`, stamped on the frame by
+/// else's (opengrok-server main cad36fd (#303, after #298), pin 47a5d6b): `ModelError::Relay` in
+/// `crates/opengrok-harness/src/relay.rs`, stamped on the frame by
 /// `Projection::failing_with`. No Mac held the relay, the Mac started no answer or went quiet for
 /// the door's clock, or the Mac answered with a failure in its own words. A refusal of the Mac's
 /// own making, such as one Mac carrying all the calls it may at once, is `ModelError::Proxy`,
@@ -1740,8 +1740,8 @@ fn inference_source_frame(frame: &Value) -> Check {
         source.kind.word() == str_at(value, "kind") && source.model.as_deref() == model,
         "the badge should be the frame's kind and model as sent: {source:?} from {value}"
     );
-    // The way the plan was reached (`via`), from a server with the Mac relay (opengrok-server
-    // PR #298, branch mac-relay 5359e34, recorded at 07a951b, not yet on main): as sent on the
+    // The way the plan was reached (`via`), from a server with the Mac relay (opengrok-server main
+    // cad36fd (#303, after #298), pin 47a5d6b): as sent on the
     // plan's badge, when it is one this app can name.
     let via = opt_str(value, "via")
         .and_then(Via::from_word)
@@ -2037,8 +2037,7 @@ fn held_as_sent(message: &PendingUserMessage, raw: &Value) -> Check {
     );
     // The door it was queued with, on the row only when the send named one (opengrok-server
     // #294: `message_json` in `crates/opengrok-server/src/agui/pending.rs`): the bare word, or
-    // with the Mac relay `{"kind", "via"}` (PR #298, branch mac-relay 5359e34, recorded at
-    // 07a951b, not yet on main).
+    // with the Mac relay `{"kind", "via"}` (server main cad36fd (#303, after #298), pin 47a5d6b).
     must!(
         message.inference_source() == raw.get("inferenceSource").and_then(TurnSource::from_value),
         "the send's door should come through as sent: {message:?}"
@@ -2722,8 +2721,8 @@ fn turn_stream(status: u16, body: &Value) -> Check {
     Ok(())
 }
 
-/// A turn answered 202 (opengrok-server PR #298, branch mac-relay 5359e34, recorded at 07a951b,
-/// not yet on main: `consume_for_turn` in `crates/opengrok-server/src/agui/pending.rs`): the
+/// A turn answered 202 (opengrok-server main cad36fd (#303, after #298), pin 47a5d6b:
+/// `consume_for_turn` in `crates/opengrok-server/src/agui/pending.rs`): the
 /// queued send it fired is held for the person's Mac, and no run started. `run_turn` reads it as
 /// the turn not starting, never as a stream: held for the Mac by its status and its word, with
 /// the server's sentence, and with the row as it now stands for the queue to put back, still
@@ -3633,8 +3632,8 @@ fn inference_source(_: u16, body: &Value) -> Check {
             && Some(read.has_api_key) == body["hasApiKey"].as_bool(),
         "the reply source should come through as sent: {read:?} from {body}"
     );
-    // From a server with the Mac relay (opengrok-server PR #298, branch mac-relay 5359e34,
-    // recorded at 07a951b, not yet on main: `described` in the same file): the account's way as
+    // From a server with the Mac relay (opengrok-server main cad36fd (#303, after #298), pin
+    // 47a5d6b: `described` in the same file): the account's way as
     // sent, and where the relay stands, field for field, nulls and all when no Mac holds it. A
     // server before the relay sends neither, and the relay is not offered.
     must!(
@@ -3698,8 +3697,8 @@ fn models_listed(_: u16, body: &Value) -> Check {
         "opencodex's health should come through as sent: {:?} from {body}",
         catalogue.local_proxy
     );
-    // With the Mac relay (opengrok-server PR #298, branch mac-relay 5359e34, recorded at
-    // 07a951b, not yet on main: `listed` in `crates/opengrok-harness/src/local_proxy.rs`): each
+    // With the Mac relay (opengrok-server main cad36fd (#303, after #298), pin 47a5d6b: `listed` in
+    // `crates/opengrok-harness/src/local_proxy.rs`): each
     // of the plan's models by the way the server reaches it, none named being the server's own
     // machine, and whether a Mac holds the relay.
     for (entry, raw) in catalogue.models.iter().zip(raw) {
@@ -3770,8 +3769,8 @@ fn relay_stream_refused(status: u16, body: &Value) -> Check {
 }
 
 /// What the server made of one of this Mac's answers, as `answer_inference_relay` reads it off
-/// the status alone (opengrok-server PR #298, branch mac-relay 5359e34, recorded at 07a951b, not
-/// yet on main: `relay_response` in `crates/opengrok-server/src/inference.rs`), stated here
+/// the status alone (opengrok-server main cad36fd (#303, after #298), pin 47a5d6b: `relay_response`
+/// in `crates/opengrok-server/src/inference.rs`), stated here
 /// status by status: taken; a call nothing waits on any more, which is as good as cancelled; one
 /// answered already; this Mac turned away, which stops the relay (the server says so of a bad
 /// token and of a call sent to another machine, and this Mac answers only the calls its own
@@ -3815,8 +3814,8 @@ fn relay_answer_refused(status: u16, body: &Value) -> Check {
 
 /// A frame off the Mac relay's stream, read by the relay's own reader (`RelayFrame::from_value`)
 /// as the frame it is, with every field the relay goes on to use as sent: the frame's own words
-/// as the server writes them (opengrok-server PR #298, branch mac-relay 5359e34, recorded at
-/// 07a951b, not yet on main: `RelayFrame` in `crates/opengrok-wire/src/relay.rs`), stated here
+/// as the server writes them (opengrok-server main cad36fd (#303, after #298), pin 47a5d6b:
+/// `RelayFrame` in `crates/opengrok-wire/src/relay.rs`), stated here
 /// case by case. A call is one the Mac carries: its model, the frame's and the body's, is one the
 /// Mac may ask the person's subscription for, so the relay asks opencodex rather than refusing
 /// it, and it asks for the stream the relay passes on as it comes.

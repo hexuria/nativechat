@@ -932,8 +932,8 @@ impl OpenGrokClient {
     /// 2026-09-30, built in opengrok-server #294: `named` in
     /// `crates/opengrok-server/src/inference.rs`,
     /// `route` in `crates/opengrok-harness/src/local_proxy.rs`). It is the bare word, or with a
-    /// way to the plan named `{"kind", "via"}` (#292: PR #298, branch mac-relay 5359e34, recorded
-    /// at 07a951b, not yet on main; see [`TurnSource`]). Absent, with no chip drawn, the
+    /// way to the plan named `{"kind", "via"}` (#292: server main cad36fd (#303, after #298), pin
+    /// 47a5d6b; see [`TurnSource`]). Absent, with no chip drawn, the
     /// account's setting decides, and the turn is the one sent before reply sources existed.
     ///
     /// The run id is the caller's. The server keeps every frame a run emits under it and will
@@ -1059,8 +1059,8 @@ impl OpenGrokClient {
     /// and the server ended it badly, and the sentence it ends with is the only thing that says
     /// whether the model refused or the gateway was never reached. A run through the person's Mac
     /// names why it ended beside the sentence (`relay_offline`, `relay_timeout`, `relay_failed`:
-    /// opengrok-server #292, PR #298, branch mac-relay 5359e34, recorded at 07a951b, not yet on
-    /// main), and that code is what offers the turn again on the server's keys. Apart from the
+    /// opengrok-server #292, server main cad36fd (#303, after #298), pin 47a5d6b), and that code is
+    /// what offers the turn again on the server's keys. Apart from the
     /// stream so the wire conformance tests read a recorded frame with this very code.
     pub(super) fn run_ended_badly(frame: &Value) -> OpenGrokError {
         let message = frame
@@ -1076,8 +1076,8 @@ impl OpenGrokClient {
 
     /// `POST /ag-ui`'s 202, `{v, id, heldFor, message, event}`: the queued send this turn fired
     /// is one the person's Mac would carry, and no Mac holds the relay, so the server left it
-    /// queued and started no run (opengrok-server PR #298, branch mac-relay 5359e34, recorded at
-    /// 07a951b, not yet on main: `consume_for_turn` in
+    /// queued and started no run (opengrok-server main cad36fd (#303, after #298), pin 47a5d6b:
+    /// `consume_for_turn` in
     /// `crates/opengrok-server/src/agui/pending.rs`). It sends the send itself when a Mac opens
     /// the relay. Read as the turn not starting: the server's sentence, its `heldFor` word as the
     /// code ([`OpenGrokError::is_held_for_mac`]), and the row as it now stands as the queue's
@@ -2595,8 +2595,8 @@ impl OpenGrokClient {
         }
     }
 
-    /// `GET /inference-relay/requests`: the Mac relay's stream (opengrok-server #292: PR #298,
-    /// branch mac-relay 5359e34, recorded at 07a951b, not yet on main), opened with this Mac's
+    /// `GET /inference-relay/requests`: the Mac relay's stream (opengrok-server #292: server main
+    /// cad36fd (#303, after #298), pin 47a5d6b), opened with this Mac's
     /// machine token as the local-exec stream is. Answered with the response as it opens, for the
     /// relay to read its frames off as they come ([`super::relay`]); a refusal is read as every
     /// other, and a `401` is the server no longer taking the token, which the relay stops for.
