@@ -13,18 +13,18 @@ pub use crate::cron_spec::{
 use crate::opengrok::{
     Account, ActivityTick, AguiMessage, ApprovalSpec, BotActivity, BoxHandoffReply,
     BoxHandoffResolution, BoxShareScope, ChatPart, ChoiceCard, ComputerHandoffStatus,
-    ConnectedComputer, Coworker, CoworkerComputer, CoworkerPatch, EFFORT_INHERIT, Enrolment,
-    Failure, FormResolution, FormSpec, ImageVisibility, InferenceKind, InferenceSource,
+    ConnectedComputer, Coworker, CoworkerComputer, CoworkerPatch, CoworkerSource, EFFORT_INHERIT,
+    Enrolment, Failure, FormResolution, FormSpec, ImageVisibility, InferenceKind, InferenceSource,
     InferenceSourceUpdate, LocalExecMode, LocalExecPolicy, LocalExecResolution, ModelCatalogue,
-    ModelEntry, NewSchedule, NewSkill, OpenGrokClient, OpenGrokError, PendingCustom, PendingOp,
-    PendingUserMessage, PendingWrite, ProfileUpdate, ProxyKey, QueuedApproval, RecipeDetail,
-    RecipeKind, RecipeParameter, RecipeRun, RecipeRunResult, RecipeShareTarget, RecipeStep,
-    RecipeSummary, RelayErrorCode, RelayHandle, RelayKey, RelayReport, RelayStatus, RelayTarget,
-    RelayTimings, RelayUpdate, ReplyQuote, ReplySource, RunCause, RunRecipeResponse, RunReplay,
-    SKILL_BODY_CHARS, SKILL_BUNDLE_FILES, SKILL_BUNDLE_LIMIT, SaveLoginSpec, ScheduleEdit,
-    ScheduleKind, ScheduleRow, ScheduleRun, ScheduleRunStatus, ScreenshotSpec, SkillDetail,
-    SkillFile, SkillPatch, SkillSource, SkillSummary, ThreadListing, ThreadReplay, ThreadRun,
-    ToolCallTracker, TurnAssembler, TurnRecipe, TurnSource, TurnTiming,
+    ModelEntry, ModelPick, NewSchedule, NewSkill, OpenGrokClient, OpenGrokError, PendingCustom,
+    PendingOp, PendingUserMessage, PendingWrite, ProfileUpdate, ProxyKey, QueuedApproval,
+    RecipeDetail, RecipeKind, RecipeParameter, RecipeRun, RecipeRunResult, RecipeShareTarget,
+    RecipeStep, RecipeSummary, RelayErrorCode, RelayHandle, RelayKey, RelayReport, RelayStatus,
+    RelayTarget, RelayTimings, RelayUpdate, ReplyQuote, ReplySource, RunCause, RunRecipeResponse,
+    RunReplay, SKILL_BODY_CHARS, SKILL_BUNDLE_FILES, SKILL_BUNDLE_LIMIT, SaveLoginSpec,
+    ScheduleEdit, ScheduleKind, ScheduleRow, ScheduleRun, ScheduleRunStatus, ScreenshotSpec,
+    SkillDetail, SkillFile, SkillPatch, SkillSource, SkillSummary, ThreadListing, ThreadReplay,
+    ThreadRun, ToolCallTracker, TurnAssembler, TurnRecipe, TurnSource, TurnTiming,
     USER_FORM_SERVER_FILL_AVAILABLE, Unreachable, UserFormDismissMode, UserFormHttpSettle,
     UserFormValues, UserFormVerb, Via, WAITING_FOR_YOU, activity_from_replay, approval_summary,
     box_handoff_resolve_entry_id, collapse_computer_roster, command_from_args,
@@ -1301,6 +1301,16 @@ impl EffortControl {
     pub fn unsaved(&self) -> bool {
         self.shown != self.kept_word()
     }
+}
+
+/// The Bot's model picker's two presentations (`components::model_picker`), each with a popover
+/// of its own over the same Bot's setting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PickerPlace {
+    /// The chip in the composer, beside the button that sends.
+    Composer,
+    /// The Model card in the Bot's settings.
+    Card,
 }
 
 /// The open Bot's skills, as far as its settings know them: every skill of the account's library
@@ -4798,6 +4808,15 @@ pub struct AppState {
     /// because an answer for one must leave another's half-typed fields alone.
     routine_resyncs: HashMap<String, u64>,
     pub model_picker_open: bool,
+    /// Where the Bot's model picker has its popover open, if anywhere: over the composer's chip,
+    /// or under the Model card in the Bot's settings. One at a time, since both are the open
+    /// Bot's (`components::model_picker`).
+    pub model_picker: Option<PickerPlace>,
+    /// The open popover shows its list of models, grouped by door, instead of its controls.
+    pub model_list_open: bool,
+    /// The server's words for the last change the picker made that did not go through, with the
+    /// Bot it was for. The popover says it under its controls until the next change is sent.
+    pub model_pick_note: Option<(String, String)>,
     pub avatar_editor_open: bool,
     pub hiring: bool,
     pub pinned_coworker_ids: HashSet<String>,
@@ -5488,6 +5507,9 @@ impl AppState {
             routine_latest_edit: HashMap::new(),
             routine_resyncs: HashMap::new(),
             model_picker_open: false,
+            model_picker: None,
+            model_list_open: false,
+            model_pick_note: None,
             avatar_editor_open: false,
             hiring: false,
             pinned_coworker_ids: HashSet::new(),
@@ -6628,6 +6650,10 @@ impl AppState {
         self.reply_source_page_shown = false;
         self.reply_source_generation += 1;
         self.turn_source_pick = None;
+        // The picker was open on one of their Bots, and what it last said was about theirs.
+        self.model_picker = None;
+        self.model_list_open = false;
+        self.model_pick_note = None;
         // The relay answered for them, and stops with every call it was answering; the switch was
         // theirs, and is read again for whoever signs in next.
         self.stop_relay();
@@ -12191,6 +12217,129 @@ impl AppState {
             }
         })
         .detach();
+    }
+
+    // ---- The Bot's model picker: its door, model, fast tier and effort ----------------------------
+
+    /// The open Bot's picker, as both of its presentations draw it and a driver reads it: `None`
+    /// with no Bot open.
+    pub fn model_pick(&self) -> Option<ModelPick> {
+        let id = self.active_coworker_id.as_deref()?;
+        let bot = self.coworkers.iter().find(|bot| bot.id == id)?;
+        Some(crate::opengrok::bot_pick(
+            bot,
+            self.reply_source.kept_source(),
+            &self.model_catalogue,
+            |via| self.plan_models(via),
+        ))
+    }
+
+    /// Open the picker's popover in one place, or shut it. Opening one shuts the other, and the
+    /// avatar editor, which shares the settings pane with the card; and a popover opens on its
+    /// controls, not on the list it was last left at.
+    pub fn set_model_picker(&mut self, place: Option<PickerPlace>, cx: &mut Context<Self>) {
+        if self.model_picker == place {
+            return;
+        }
+        self.model_picker = place;
+        self.model_list_open = false;
+        if place.is_some() {
+            self.avatar_editor_open = false;
+        }
+        cx.notify();
+    }
+
+    /// Shut the popover in `place` if it is the one open. A popover hears a click outside it
+    /// after the click has opened the other one as often as before, and must not shut that one.
+    pub fn close_model_picker(&mut self, place: PickerPlace, cx: &mut Context<Self>) {
+        if self.model_picker == Some(place) {
+            self.set_model_picker(None, cx);
+        }
+    }
+
+    /// A click on the chip, or on the card.
+    pub fn toggle_model_picker(&mut self, place: PickerPlace, cx: &mut Context<Self>) {
+        let next = (self.model_picker != Some(place)).then_some(place);
+        self.set_model_picker(next, cx);
+    }
+
+    /// The model's name in the popover opens its list; the list's heading goes back.
+    pub fn toggle_model_list(&mut self, cx: &mut Context<Self>) {
+        if self.model_picker.is_some() {
+            self.model_list_open = !self.model_list_open;
+            cx.notify();
+        }
+    }
+
+    /// A row of the list picked: the Bot goes onto its model at once, with its door, and the
+    /// popover goes back to its controls, where that model's effort and ⚡ are.
+    pub fn pick_model(&mut self, source: InferenceKind, base_id: &str, cx: &mut Context<Self>) {
+        let patch = self
+            .model_pick()
+            .and_then(|pick| pick.pick_patch(source, base_id).ok().flatten());
+        self.model_list_open = false;
+        match patch {
+            Some(patch) => self.save_model_pick(patch, cx),
+            None => cx.notify(),
+        }
+    }
+
+    /// ⚡ switched: the pin moves to the model's fast twin, or back.
+    pub fn set_model_fast(&mut self, on: bool, cx: &mut Context<Self>) {
+        if let Some(patch) = self
+            .model_pick()
+            .and_then(|pick| pick.fast_patch(on).ok().flatten())
+        {
+            self.save_model_pick(patch, cx);
+        }
+    }
+
+    /// A stop of the slider, by the server's word for it.
+    pub fn pick_model_effort(&mut self, word: &str, cx: &mut Context<Self>) {
+        if let Some(patch) = self
+            .model_pick()
+            .and_then(|pick| pick.effort_patch(word).ok().flatten())
+        {
+            self.save_model_pick(patch, cx);
+        }
+    }
+
+    /// ↺: the effort back to Default and ⚡ off, the model left where it is.
+    pub fn reset_model_pick(&mut self, cx: &mut Context<Self>) {
+        if let Some(patch) = self.model_pick().and_then(|pick| pick.reset_patch()) {
+            self.save_model_pick(patch, cx);
+        }
+    }
+
+    /// Send a change the picker made, at once, as a pick from the old model list always was: the
+    /// roster takes it before the server answers so both presentations follow the click, and a
+    /// refusal puts the roster back ([`Self::patch_active_agent_then`]) and is said in the popover
+    /// in the server's words, as well as on the settings pane's red line.
+    fn save_model_pick(&mut self, patch: CoworkerPatch, cx: &mut Context<Self>) {
+        let Some(bot) = self.active_coworker_id.clone() else {
+            return;
+        };
+        self.model_pick_note = None;
+        let this = cx.entity().downgrade();
+        self.patch_active_agent_then(
+            patch,
+            Some(Box::new(move |error, cx| {
+                let Some(error) = error else {
+                    return;
+                };
+                let _ = this.update(cx, |state, cx| {
+                    state.model_pick_note = Some((bot, error));
+                    cx.notify();
+                });
+            })),
+            cx,
+        );
+    }
+
+    /// What the popover says about the open Bot's last change that did not go through.
+    pub fn picker_note(&self) -> Option<&str> {
+        let (bot, said) = self.model_pick_note.as_ref()?;
+        (self.active_coworker_id.as_deref() == Some(bot.as_str())).then_some(said.as_str())
     }
 
     /// A patch that never left the app. The settings pane paints the reason, and whoever is
@@ -20312,6 +20461,9 @@ fn apply_patch(coworker: &mut Coworker, patch: &CoworkerPatch) {
     if let Some(effort) = patch.effort.as_ref() {
         coworker.effort = Some(effort.clone());
     }
+    if let Some(kind) = patch.source {
+        coworker.source = CoworkerSource::Kind(kind);
+    }
 }
 
 /// The roster's copy of a coworker once the server has answered, for the fields the patch
@@ -20374,6 +20526,11 @@ fn settle_patch(
     // without one, and the settings must go back to saying so rather than keep the pick.
     if patch.effort.is_some() {
         coworker.effort = echo.map_or_else(|| before.effort.clone(), |c| c.effort.clone());
+    }
+    // The door too: the echo's, which is the server's word on it even where it is not the one
+    // sent, and what the roster held before where the patch was refused.
+    if patch.source.is_some() {
+        coworker.source = echo.map_or_else(|| before.source.clone(), |c| c.source.clone());
     }
 }
 
@@ -23857,7 +24014,9 @@ mod tests {
 
     // The patch reconciliation, apart from the app: what the roster holds for a coworker once
     // the server has answered.
-    use super::{Coworker, CoworkerPatch, EffortControl, apply_patch, settle_patch};
+    use super::{
+        Coworker, CoworkerPatch, CoworkerSource, EffortControl, apply_patch, settle_patch,
+    };
 
     fn bob() -> Coworker {
         Coworker {
@@ -23873,6 +24032,7 @@ mod tests {
             box_id: None,
             effort: Some("high".to_string()),
             visibility: Some("private".to_string()),
+            source: CoworkerSource::NotKept,
         }
     }
 
@@ -23961,6 +24121,7 @@ mod tests {
             box_id: None,
             effort: None,
             visibility: None,
+            source: CoworkerSource::NotKept,
         };
         settle_patch(&mut roster, &patch, Some(&echo), &before);
         assert_eq!(roster.model, "xai/grok-4.7@sub");
@@ -33776,6 +33937,83 @@ mod tests {
                 relay_connected: false,
             }),
         };
+    }
+
+    /// The open Bot's picker is its row read with the account's door as last read and the lists
+    /// `/models` gave: the plan's models through the account's way, held to the allowlist, and the
+    /// gateway's routes less the seats; and nothing of the plan for a Bot on a server that keeps
+    /// no door per Bot, where the account's plan model answers.
+    #[test]
+    fn the_open_bots_picker_is_its_row_the_accounts_door_and_the_lists() {
+        use crate::opengrok::{CoworkerSource, FAST_ACCOUNT_PLAN, PLAN_GROUP, SERVER_GROUP};
+        let mut state = signed_in_state();
+        assert!(state.model_pick().is_none(), "no Bot open");
+        state.coworkers = vec![
+            serde_json::from_value(json!({
+                "id": "cw_1", "name": "Ada", "model": "gpt-6-luna--fast",
+                "effort": "high", "source": "local_proxy"
+            }))
+            .expect("a row"),
+        ];
+        state.active_coworker_id = Some("cw_1".into());
+        read_as(
+            &mut state,
+            kept(InferenceKind::LocalProxy, Some("gpt-5-codex")),
+        );
+        let entry = |id: &str, source: &str| ModelEntry {
+            id: id.into(),
+            source: Some(source.into()),
+            via: None,
+        };
+        state.model_catalogue = ModelCatalogue {
+            models: vec![
+                entry("oag/cheap", "gateway"),
+                entry("xai/grok-4.6@sub", "gateway"),
+                entry("gpt-6-luna", "local_proxy"),
+                entry("gpt-6-luna--fast", "local_proxy"),
+                entry("claude-opus", "local_proxy"),
+            ],
+            note: None,
+            local_proxy: Some(crate::opengrok::LocalProxyStatus {
+                healthy: true,
+                relay_connected: false,
+            }),
+        };
+        let pick = state.model_pick().expect("a Bot is open");
+        assert_eq!(pick.chip_label(), "GPT-6 Luna · High ⚡");
+        let groups: Vec<(&str, Vec<&str>)> = pick
+            .groups
+            .iter()
+            .map(|group| {
+                (
+                    group.title(),
+                    group.rows.iter().map(|row| row.base_id.as_str()).collect(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            groups,
+            vec![
+                (PLAN_GROUP, vec!["gpt-6-luna"]),
+                (SERVER_GROUP, vec!["oag/cheap"]),
+            ]
+        );
+        assert_eq!(pick.fast_blocked, None);
+
+        // The same Bot on a server that keeps no door per Bot: no plan rows for it, and the
+        // account's plan model is what answers.
+        state.coworkers[0].source = CoworkerSource::NotKept;
+        let pick = state.model_pick().expect("a Bot is open");
+        assert_eq!(pick.chip_label(), "GPT-5 Codex · High");
+        assert_eq!(
+            pick.groups
+                .iter()
+                .map(|group| group.title())
+                .collect::<Vec<_>>(),
+            [SERVER_GROUP]
+        );
+        assert_eq!(pick.fast_blocked, Some(FAST_ACCOUNT_PLAN));
+        assert!(pick.account_plan.is_some());
     }
 
     // ---- Answer with this Mac: the relay's half of the page -------------------------------------

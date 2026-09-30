@@ -81,6 +81,49 @@ pub struct Coworker {
     /// app reads it through [`Self::is_shared`].
     #[serde(default)]
     pub visibility: Option<String>,
+    /// Which door the Bot's replies go through ([`CoworkerSource`]), read from `source`, which
+    /// may be missing, `null` or a word, and each of the three says something different.
+    #[serde(default, deserialize_with = "coworker_source")]
+    pub source: CoworkerSource,
+}
+
+/// Which door a Bot's replies go through, as its row says it: `"source": "gateway" |
+/// "local_proxy" | null`, and `PATCH /coworkers/{id}` takes the same word (opengrok-server
+/// contract proposed 2026-09-30 (Part A), not yet recorded). A server with per-Bot doors writes
+/// the key on every row: `null` is a Bot that follows the account's setting, Settings → Reply
+/// source. A server from before it writes no key at all, and every Bot there goes where the
+/// account's setting says, answering on the person's plan with the account's plan model whatever
+/// the Bot is pinned to. The two are told apart here because the picker offers a Bot its own plan
+/// model only where the server would keep one.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum CoworkerSource {
+    /// The row carries no `source`: a server from before per-Bot doors.
+    #[default]
+    NotKept,
+    /// `null`: the account's own door.
+    AccountDefault,
+    /// The Bot's own door.
+    Kind(super::InferenceKind),
+    /// A word this app has not heard of, kept as the server sent it: a door this app cannot name
+    /// is not claimed to be either of the two it can, and the server goes by its own word.
+    Unknown(String),
+}
+
+/// `source` as a row brings it. The key is there (the field's default covers a row without it),
+/// so `null` is the account's door; anything but a known word is kept as sent rather than failing
+/// the roster, as one row's `effort` never does.
+fn coworker_source<'de, D>(deserializer: D) -> Result<CoworkerSource, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(
+        match Option::<serde_json::Value>::deserialize(deserializer)? {
+            None => CoworkerSource::AccountDefault,
+            Some(serde_json::Value::String(word)) => super::InferenceKind::from_word(&word)
+                .map_or(CoworkerSource::Unknown(word), CoworkerSource::Kind),
+            Some(other) => CoworkerSource::Unknown(other.to_string()),
+        },
+    )
 }
 
 /// How hard a coworker thinks before it answers, in the server's words and in its order.
@@ -109,7 +152,7 @@ impl Coworker {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CoworkerPatch {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -136,6 +179,13 @@ pub struct CoworkerPatch {
     /// but the sidebar flag.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
+    /// The Bot's own door, sent with the model the model picker put it on, and only to a server
+    /// whose rows carry `source` (opengrok-server contract proposed 2026-09-30 (Part A), not yet
+    /// recorded): absent leaves the door alone. The server refuses with a 400 in its own words a
+    /// patch that leaves the Bot on `local_proxy` with a model its subscription allowlist does not
+    /// take, the rule it holds the account's plan model to, and changes nothing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<super::InferenceKind>,
 }
 
 impl CoworkerPatch {
@@ -148,6 +198,7 @@ impl CoworkerPatch {
             && self.avatar_color.is_none()
             && self.hidden_from_sidebar.is_none()
             && self.effort.is_none()
+            && self.source.is_none()
     }
 }
 
@@ -536,8 +587,9 @@ mod tests {
 
     /// Every key a coworker patch can carry is one the server's patch route reads
     /// (opengrok-server `agui/routes.rs`: name, model, role, visibility, hiddenFromSidebar, and
-    /// title/avatarShape/avatarColor; `effort` from opengrok-server#271). A key it reads nowhere
-    /// is a setting that looks saved and is not, and a patch of only that is refused.
+    /// title/avatarShape/avatarColor; `effort` from opengrok-server#271; `source` from the
+    /// contract proposed 2026-09-30 (Part A), not yet recorded). A key it reads nowhere is a
+    /// setting that looks saved and is not, and a patch of only that is refused.
     #[test]
     fn a_coworker_patch_names_only_what_the_server_keeps() {
         let full = CoworkerPatch {
@@ -549,6 +601,7 @@ mod tests {
             avatar_color: Some("c".into()),
             hidden_from_sidebar: Some(true),
             effort: Some("high".into()),
+            source: Some(super::super::InferenceKind::LocalProxy),
         };
         let wire = serde_json::to_value(&full).unwrap();
         let mut keys: Vec<&str> = wire
@@ -566,13 +619,45 @@ mod tests {
             "model",
             "name",
             "role",
+            "source",
             "title",
             "visibility",
         ];
         for key in &keys {
             assert!(read.contains(key), "the server reads no {key:?}");
         }
-        assert_eq!(keys.len(), 8, "every field is on the wire: {keys:?}");
+        assert_eq!(keys.len(), 9, "every field is on the wire: {keys:?}");
+        assert_eq!(wire["source"], "local_proxy", "the door goes as its word");
+    }
+
+    /// A row's `source` says three different things by being missing, `null` or a word: a server
+    /// from before per-Bot doors, a Bot that follows the account's door, and the Bot's own door
+    /// (the contract proposed 2026-09-30, Part A, not yet recorded). A word this app has not heard
+    /// of is kept as sent, and no row's door ever fails the roster.
+    #[test]
+    fn a_rows_door_is_missing_null_or_its_word() {
+        use super::super::InferenceKind;
+        let roster: Vec<Coworker> = serde_json::from_value(serde_json::json!([
+            {"id": "cw_old", "name": "Old", "model": "oag/cheap"},
+            {"id": "cw_default", "name": "Default", "model": "oag/cheap", "source": null},
+            {"id": "cw_plan", "name": "Plan", "model": "gpt-6-luna", "source": "local_proxy"},
+            {"id": "cw_keys", "name": "Keys", "model": "oag/cheap", "source": "gateway"},
+            {"id": "cw_odd", "name": "Odd", "model": "oag/cheap", "source": "byok"},
+            {"id": "cw_worse", "name": "Worse", "model": "oag/cheap", "source": 7}
+        ]))
+        .expect("one row's door never fails the roster");
+        let doors: Vec<CoworkerSource> = roster.into_iter().map(|bot| bot.source).collect();
+        assert_eq!(
+            doors,
+            vec![
+                CoworkerSource::NotKept,
+                CoworkerSource::AccountDefault,
+                CoworkerSource::Kind(InferenceKind::LocalProxy),
+                CoworkerSource::Kind(InferenceKind::Gateway),
+                CoworkerSource::Unknown("byok".into()),
+                CoworkerSource::Unknown("7".into()),
+            ]
+        );
     }
 
     /// A roster from a server before opengrok-server#271 has no `effort` on its rows, and every

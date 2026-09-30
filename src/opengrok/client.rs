@@ -7245,6 +7245,79 @@ mod tests {
         }
     }
 
+    /// A change in the model picker goes as one PATCH carrying the Bot's door, its model and its
+    /// effort, each only when it changed (the contract proposed 2026-09-30, Part A, not yet
+    /// recorded), and the answer is the row as the server now keeps it, door and all. A Bot left
+    /// on the person's plan with a model the allowlist does not take is refused with a 400 in the
+    /// server's words, which is what the person is shown.
+    #[tokio::test]
+    async fn a_picks_patch_carries_the_door_the_model_and_the_effort() {
+        use crate::opengrok::{CoworkerSource, InferenceKind};
+        let refused = "model: \"oag/cheap\" is not a model this server knows to be OpenAI's or \
+                       xAI's, and only theirs may use your own subscription";
+        let server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .and(path("/coworkers/cw_1"))
+            .and(body_json(json!({
+                "source": "local_proxy",
+                "model": "gpt-6-luna--fast",
+                "effort": "max"
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "cw_1",
+                "name": "Ada",
+                "model": "gpt-6-luna--fast",
+                "effort": "max",
+                "source": "local_proxy",
+                "visibility": "private"
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path("/coworkers/cw_1"))
+            .and(body_json(
+                json!({"source": "local_proxy", "model": "oag/cheap"}),
+            ))
+            .respond_with(ResponseTemplate::new(400).set_body_json(json!({"error": refused})))
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        let kept = client
+            .patch_coworker(
+                "cw_1",
+                &CoworkerPatch {
+                    source: Some(InferenceKind::LocalProxy),
+                    model: Some("gpt-6-luna--fast".into()),
+                    effort: Some("max".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            (kept.source, kept.model.as_str(), kept.effort.as_deref()),
+            (
+                CoworkerSource::Kind(InferenceKind::LocalProxy),
+                "gpt-6-luna--fast",
+                Some("max")
+            )
+        );
+        let error = client
+            .patch_coworker(
+                "cw_1",
+                &CoworkerPatch {
+                    source: Some(InferenceKind::LocalProxy),
+                    model: Some("oag/cheap".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("the server refused it");
+        assert_eq!(error.status, Some(400));
+        assert_eq!(error.message, refused);
+        assert_eq!(error.failure(), Failure::Verdict);
+    }
+
     #[tokio::test]
     async fn answer_run_posts_call_id_and_approved() {
         let server = MockServer::start().await;
