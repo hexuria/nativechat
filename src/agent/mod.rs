@@ -230,14 +230,39 @@
 //! is read, and while a Save is out; Save is refused while a read is out too, and says what it
 //! waits for; and the plan's controls are refused where the server is not on this Mac.
 //!
+//! The Mac relay (hexuria/nativechat #156, opengrok-server #292), from a server that knows it
+//! (its setting carries `relay`); a server before it draws none of this. The radio gains
+//! `settings-reply-source-via-mac` (label `My subscription, through my Mac`, checked while the
+//! plan through the person's Mac is shown; the radio then has state `via-mac`, and so does the
+//! section while it is the account's kept door; `settings-reply-source-kind-local_proxy` is then
+//! the plan on the server's own machine). A click picks it and it waits for Save; it is live
+//! wherever the server runs. Then `settings-relay`, Answer with this Mac: `settings-relay-switch`
+//! (a switch, checked while on; it acts at once and waits on no Save, off always, on once this
+//! Mac is enrolled; after another Mac took the relay, turning it off and on takes it back),
+//! `settings-relay-unavailable` (why the card takes no change: this Mac not enrolled),
+//! `settings-relay-status` (label the line, value `answering` / `another-mac` / `connecting` /
+//! `not-connected`), `settings-relay-detail` (under it: why this Mac is not connected, state
+//! `trouble`, or how to take the relay back), `settings-relay-addr` (value = opencodex's address
+//! on this Mac; `set_value` and `type` write it; an address not on this Mac is refused by Save
+//! with a hint, an emptied one goes back to the default), `settings-relay-model` (a menu, value
+//! = the relay's model shown, state `empty` while no Mac lists one) with
+//! `settings-relay-no-model` and a `settings-relay-model-{id}` per model a Mac lists,
+//! `settings-relay-models-note`, `settings-relay-key` (never valued: states `set` while this
+//! Mac's Keychain holds a key, `typed` while one waits for Save, `retype` when one typed was
+//! dropped with the page; `set_value` writes the whole key) and `settings-relay-key-remove`
+//! (while a key is kept: `Remove key`, or `Keep key` with state `picked`). The address and key are
+//! kept on this Mac by Save, the key in the Keychain, and never sent to the server.
+//!
 //! `composer-reply-source` is the composer's chip, in the tree only while there is a choice of
-//! door and the composer is not dictating (label `Server` / `My plan`, value = the door the next
-//! turns go through, which each of them names; state `picked` while that is the person's pick
-//! and not the account's own door). Unlike the composer's panel and chips it is clicked, as a
-//! person clicks it: a click switches the door, which then goes with every turn until it is
+//! door and the composer is not dictating (label `Server` / `My plan` / `My plan · via Mac`,
+//! value = the door the next turns go through, which each of them names; state `picked` while
+//! that is the person's pick and not the account's own door, `via-mac` on the Mac's). Unlike the
+//! composer's panel and chips it is clicked, as a person clicks it: a click moves to the next
+//! door, round to the first after the last, which then goes with every turn until it is
 //! switched back, and is gone with a sign-out or a relaunch. `reply-source-{messageId}` is the
 //! badge of each reply in the open thread that wears one, as the feed draws it (label `paid key`
-//! / `your plan`, value = the door), holding `reply-source-model-{messageId}` (label = the model
+//! / `your plan` / `your plan · Mac`, value = the door, state `via-mac` on one the person's Mac
+//! answered), holding `reply-source-model-{messageId}` (label = the model
 //! the server named, which the badge shows on hover) when it named one. In the bot's settings,
 //! while the account's door or the chip is on the person's plan, `agent-model-plan` (under the
 //! Model field: the plan's model answers, not the pin) and `agent-usage-plan` (the Usage card

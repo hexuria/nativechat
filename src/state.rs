@@ -19,20 +19,23 @@ use crate::opengrok::{
     ModelEntry, NewSchedule, NewSkill, OpenGrokClient, OpenGrokError, PendingCustom, PendingOp,
     PendingUserMessage, PendingWrite, ProfileUpdate, ProxyKey, QueuedApproval, RecipeDetail,
     RecipeKind, RecipeParameter, RecipeRun, RecipeRunResult, RecipeShareTarget, RecipeStep,
-    RecipeSummary, ReplyQuote, ReplySource, RunCause, RunRecipeResponse, RunReplay,
-    SKILL_BODY_CHARS, SKILL_BUNDLE_FILES, SKILL_BUNDLE_LIMIT, SaveLoginSpec, ScheduleEdit,
-    ScheduleKind, ScheduleRow, ScheduleRun, ScheduleRunStatus, ScreenshotSpec, SkillDetail,
-    SkillFile, SkillPatch, SkillSource, SkillSummary, ThreadListing, ThreadReplay, ThreadRun,
-    ToolCallTracker, TurnAssembler, TurnRecipe, TurnSource, TurnTiming,
-    USER_FORM_SERVER_FILL_AVAILABLE, Unreachable, UserFormDismissMode, UserFormHttpSettle,
-    UserFormValues, UserFormVerb, Via, WAITING_FOR_YOU, activity_from_replay, approval_summary,
-    box_handoff_resolve_entry_id, collapse_computer_roster, command_from_args,
-    command_from_replay_events, deeds_from_replay, enrol_this_machine, env_egress_tunnel_enabled,
-    host_egress_tunnel_available, host_egress_tunnel_flag, keep_local_save_offer, persons_messages,
+    RecipeSummary, RelayHandle, RelayKey, RelayReport, RelayStatus, RelayTarget, RelayTimings,
+    RelayUpdate, ReplyQuote, ReplySource, RunCause, RunRecipeResponse, RunReplay, SKILL_BODY_CHARS,
+    SKILL_BUNDLE_FILES, SKILL_BUNDLE_LIMIT, SaveLoginSpec, ScheduleEdit, ScheduleKind, ScheduleRow,
+    ScheduleRun, ScheduleRunStatus, ScreenshotSpec, SkillDetail, SkillFile, SkillPatch,
+    SkillSource, SkillSummary, ThreadListing, ThreadReplay, ThreadRun, ToolCallTracker,
+    TurnAssembler, TurnRecipe, TurnSource, TurnTiming, USER_FORM_SERVER_FILL_AVAILABLE,
+    Unreachable, UserFormDismissMode, UserFormHttpSettle, UserFormValues, UserFormVerb, Via,
+    WAITING_FOR_YOU, activity_from_replay, approval_summary, box_handoff_resolve_entry_id,
+    collapse_computer_roster, command_from_args, command_from_replay_events, deeds_from_replay,
+    enrol_this_machine, env_egress_tunnel_enabled, host_egress_tunnel_available,
+    host_egress_tunnel_flag, keep_local_save_offer, persons_messages,
     place_hitl_cards_in_document_order, policy_answer, reads_as_gateway_unreachable, retry_enqueue,
-    save_login_from_local, serve_local_exec, stamp_duration, stored_machine_id, tool_standin,
+    save_login_from_local, serve_local_exec, stamp_duration, start_relay, stored_machine,
+    stored_machine_id, tool_standin,
 };
 use crate::reachability::Reachability;
+use crate::relay_key::RelayKeyStore;
 use crate::send_policy::{Busy, OnSend, SendPlan, plan_send};
 use crate::services::database::{
     ChatMessage, ChatSession, DatabaseService, MessagePart, ReplyRef, SaveStamp,
@@ -360,6 +363,26 @@ pub struct ReplySourceSettings {
     pub saving: Option<u64>,
     /// What the page says about the last thing that did not go as asked, under Save.
     pub note: Option<ReplySourceNote>,
+    /// The way to the person's plan picked on the page and not saved: through the person's Mac,
+    /// or on the server's own machine. `None` shows the kept one. Picked with the plan's row it
+    /// belongs to, and sent only to a server that knows the relay.
+    pub via_pick: Option<Via>,
+    /// The model a turn through a Mac runs on, picked and not saved, as `model_pick` is the
+    /// plan's: `Some(None)` takes the kept one away.
+    pub relay_model_pick: Option<Option<String>>,
+    /// This Mac's opencodex address as typed and not saved; `None` shows the one kept on this
+    /// Mac. An emptied field goes back to where opencodex listens by default.
+    pub relay_address_draft: Option<String>,
+    /// A key for this Mac's opencodex, typed and not kept. Save puts it in the Keychain and it
+    /// leaves the page then, or when the page is left or the person signs out before a Save.
+    /// Never on disk but the Keychain, never sent to the server, never in a driver's tree, never
+    /// printed, never cloned.
+    pub relay_key_draft: Option<RelayKey>,
+    /// Remove key was pressed for this Mac's opencodex key: Save takes it out of the Keychain.
+    pub relay_remove_key: bool,
+    /// A key for this Mac's opencodex typed here went when the page was left before a Save, and
+    /// the page asks for it again, until one is typed or kept.
+    pub relay_retype_key: bool,
 }
 
 /// What Settings → Reply source says, under Save, about the last thing that did not go as asked.
@@ -375,13 +398,16 @@ pub enum ReplySourceNote {
     /// A read failed while an earlier one's answer is still on the page, and why. The next read
     /// that lands clears it.
     ReadFailed(String),
+    /// The Keychain would not keep, or forget, the key for this Mac's opencodex, in its words.
+    /// It stays until the next Save.
+    KeyNotKept(String),
 }
 
 impl ReplySourceNote {
     /// The line the page shows.
     pub fn line(&self) -> &str {
         match self {
-            Self::Refused(said) | Self::ReadFailed(said) => said,
+            Self::Refused(said) | Self::ReadFailed(said) | Self::KeyNotKept(said) => said,
             Self::Unknown => REPLY_SOURCE_SAVE_UNKNOWN,
         }
     }
@@ -430,6 +456,17 @@ pub(crate) const REPLY_SOURCE_PICK_MODEL: &str = "Pick a model from your plan fi
 /// Why Save will not send My subscription with the address taken away: the server would keep it
 /// and then turn every reply away until one was set.
 pub(crate) const REPLY_SOURCE_NEEDS_ADDRESS: &str = "Give the proxy's address first.";
+
+/// Why Save will not send My subscription through a Mac with no model for it while a Mac lists
+/// some: the server would keep it and then turn every reply through the Mac away.
+pub(crate) const REPLY_SOURCE_PICK_RELAY_MODEL: &str = "Pick a model for your Mac first.";
+
+/// Why it will not while no Mac lists any: a Mac answering is what lists them.
+pub(crate) const REPLY_SOURCE_NO_RELAY_MODELS: &str =
+    "No Mac lists your plan's models yet. Turn on Answer with this Mac, then pick one.";
+
+/// Why Save will not keep an opencodex address that is not on this Mac, beside why not.
+pub(crate) const RELAY_ADDRESS_NOT_HERE: &str = "Give opencodex's address on this Mac first.";
 
 /// What Save does with My subscription picked while the server lists no model of the plan yet:
 /// it keeps the address, which is what lets the server list them, and leaves the door on the
@@ -493,6 +530,61 @@ impl ReplySourceSettings {
         (wanted != kept.base_url).then_some(wanted)
     }
 
+    /// The way to the plan the page shows: the person's unsaved pick, or the kept one. `None` for
+    /// a way this app cannot name, which no row shows picked.
+    pub fn shown_via(&self) -> Option<Via> {
+        self.via_pick
+            .or_else(|| self.kept_source().and_then(InferenceSource::default_via))
+    }
+
+    /// The page shows the person's plan reached through their Mac.
+    pub fn shows_mac(&self) -> bool {
+        self.shown_kind() == Some(InferenceKind::LocalProxy) && self.shown_via() == Some(Via::Mac)
+    }
+
+    /// The server knows the Mac relay, so the page offers it.
+    pub fn knows_relay(&self) -> bool {
+        self.kept_source().is_some_and(InferenceSource::knows_relay)
+    }
+
+    /// The relay's model the picker shows: the person's unsaved pick, none when they took it
+    /// away, or the kept one.
+    pub fn shown_relay_model(&self) -> Option<&str> {
+        match &self.relay_model_pick {
+            Some(pick) => pick.as_deref(),
+            None => self.kept_source().and_then(InferenceSource::relay_model),
+        }
+    }
+
+    /// What Save asks of the way to the plan: a pick that differs from the kept way, and only of
+    /// a server that knows the relay.
+    fn via_change(&self) -> Option<Via> {
+        let kept = self.kept_source()?;
+        if !kept.knows_relay() {
+            return None;
+        }
+        self.via_pick
+            .filter(|pick| Some(*pick) != kept.default_via())
+    }
+
+    /// What Save asks of the relay's model, as [`Self::model_change`] does of the plan's.
+    fn relay_model_change(&self) -> Option<Option<String>> {
+        let kept = self.kept_source()?;
+        if !kept.knows_relay() {
+            return None;
+        }
+        let pick = self.relay_model_pick.as_ref()?;
+        (pick.as_deref() != kept.relay_model()).then(|| pick.clone())
+    }
+
+    /// Something on the page that this Mac keeps rather than the server: opencodex's address,
+    /// or its key typed or taken away.
+    fn changes_here(&self) -> bool {
+        self.relay_address_draft.is_some()
+            || self.relay_key_draft.is_some()
+            || self.relay_remove_key
+    }
+
     /// What Save asks of the model, as [`Self::url_change`] does of the URL.
     fn model_change(&self) -> Option<Option<String>> {
         if !self.server_on_this_mac {
@@ -513,6 +605,9 @@ impl ReplySourceSettings {
             || self.model_change().is_some()
             || self.key_draft.is_some()
             || self.remove_key
+            || self.via_change().is_some()
+            || self.relay_model_change().is_some()
+            || self.changes_here()
     }
 
     /// The page's controls take a change: the setting has been read, and no Save is with the
@@ -533,10 +628,42 @@ impl ReplySourceSettings {
         self.plan_editable() && !self.remove_key
     }
 
+    /// Answer with this Mac's half of the page takes a change: the page does, and the server
+    /// knows the relay. Unlike the plan's own fields it is live wherever the server runs: the
+    /// relay is what lets a Mac that is not the server's answer for the person.
+    pub fn relay_editable(&self) -> bool {
+        self.can_edit() && self.knows_relay()
+    }
+
+    /// The field for this Mac's opencodex key takes typing, as [`Self::key_editable`] for the
+    /// plan's.
+    pub fn relay_key_editable(&self) -> bool {
+        self.relay_editable() && !self.relay_remove_key
+    }
+
     /// Why Save will not send the page as it shows it: My subscription without what a turn on it
-    /// needs, an address, or a model while `plan_models` says the server lists some to pick from.
-    /// The server would keep either, and then turn every reply away until the gap was filled.
-    pub fn blocker(&self, plan_models: bool) -> Option<&'static str> {
+    /// needs, an address, or a model while `plan_models` says the server lists some to pick from;
+    /// through a Mac, a model for it (`relay_models`: a Mac lists some); and this Mac's opencodex
+    /// address somewhere that is not this Mac. The server would keep any of the first, and then
+    /// turn every reply away until the gap was filled.
+    pub fn blocker(&self, plan_models: bool, relay_models: bool) -> Option<&'static str> {
+        let address = self
+            .relay_address_draft
+            .as_deref()
+            .filter(|typed| !typed.trim().is_empty());
+        if address.is_some_and(|typed| crate::opengrok::OpencodexAddress::parse(typed).is_err()) {
+            return Some(RELAY_ADDRESS_NOT_HERE);
+        }
+        if self.shows_mac() {
+            return self
+                .shown_relay_model()
+                .is_none()
+                .then_some(if relay_models {
+                    REPLY_SOURCE_PICK_RELAY_MODEL
+                } else {
+                    REPLY_SOURCE_NO_RELAY_MODELS
+                });
+        }
         if self.shown_kind()? != InferenceKind::LocalProxy || !self.server_on_this_mac {
             return None;
         }
@@ -552,6 +679,7 @@ impl ReplySourceSettings {
     /// plan without a model.
     pub fn holds_gateway(&self, plan_models: bool) -> bool {
         self.server_on_this_mac
+            && !self.shows_mac()
             && self.shown_kind() == Some(InferenceKind::LocalProxy)
             && self.shown_model().is_none()
             && !plan_models
@@ -559,8 +687,8 @@ impl ReplySourceSettings {
     }
 
     /// The line beside Save about what it will or will not do with the page as it stands.
-    pub fn hint(&self, plan_models: bool) -> Option<&'static str> {
-        self.blocker(plan_models).or_else(|| {
+    pub fn hint(&self, plan_models: bool, relay_models: bool) -> Option<&'static str> {
+        self.blocker(plan_models, relay_models).or_else(|| {
             (self.holds_gateway(plan_models) && self.is_unsaved())
                 .then_some(REPLY_SOURCE_HOLDS_GATEWAY)
         })
@@ -575,22 +703,28 @@ impl ReplySourceSettings {
         self.shown_kind()
     }
 
-    /// Save would send something: a change the server would keep has been made, nothing stands
-    /// in its way, and nothing is with the server.
-    pub fn can_save(&self, plan_models: bool) -> bool {
+    /// Something a `PUT` would carry: a change the server keeps rather than this Mac.
+    fn changes_for_server(&self, plan_models: bool) -> bool {
         let Some(kept) = self.kept_source() else {
             return false;
         };
-        let changes = self.saved_kind(plan_models) != Some(kept.kind)
+        self.saved_kind(plan_models) != Some(kept.kind)
             || self.url_change().is_some()
             || self.model_change().is_some()
             || self.key_draft.is_some()
-            || self.remove_key;
+            || self.remove_key
+            || self.via_change().is_some()
+            || self.relay_model_change().is_some()
+    }
+
+    /// Save would do something: a change the server or this Mac would keep has been made,
+    /// nothing stands in its way, and nothing is with the server.
+    pub fn can_save(&self, plan_models: bool, relay_models: bool) -> bool {
         self.can_edit()
             && self.reading.is_none()
             && self.is_unsaved()
-            && self.blocker(plan_models).is_none()
-            && changes
+            && self.blocker(plan_models, relay_models).is_none()
+            && (self.changes_for_server(plan_models) || self.changes_here())
     }
 
     /// The `PUT` a Save sends: the door it keeps, and each field the page changed. The typed key
@@ -607,9 +741,28 @@ impl ReplySourceSettings {
             base_url: self.url_change(),
             local_model: self.model_change(),
             api_key,
-            via: None,
-            relay: None,
+            via: self.via_change(),
+            relay: self.relay_model_change().map(|model| RelayUpdate {
+                local_model: Some(model),
+            }),
         })
+    }
+
+    /// What a Save keeps on this Mac rather than the server: opencodex's address, and its key
+    /// typed or taken away. Taken off the page, the key with it.
+    fn take_changes_here(&mut self) -> RelayChangesHere {
+        let key = match (self.relay_key_draft.take(), self.relay_remove_key) {
+            (Some(key), _) => Some(Some(key)),
+            (None, true) => Some(None),
+            (None, false) => None,
+        };
+        self.relay_remove_key = false;
+        let address = self.relay_address_draft.take().map(|typed| {
+            crate::opengrok::OpencodexAddress::parse(&typed)
+                .ok()
+                .map(|address| address.as_str().to_string())
+        });
+        RelayChangesHere { address, key }
     }
 
     /// Put the page back to what the server keeps: every unsaved pick goes.
@@ -619,6 +772,11 @@ impl ReplySourceSettings {
         self.model_pick = None;
         self.key_draft = None;
         self.remove_key = false;
+        self.via_pick = None;
+        self.relay_model_pick = None;
+        self.relay_address_draft = None;
+        self.relay_key_draft = None;
+        self.relay_remove_key = false;
     }
 
     /// Everything but the typed key, for the gpui-agent tree, which says only that one waits.
@@ -635,7 +793,60 @@ impl ReplySourceSettings {
             reading: self.reading,
             saving: self.saving,
             note: self.note.clone(),
+            via_pick: self.via_pick,
+            relay_model_pick: self.relay_model_pick.clone(),
+            relay_address_draft: self.relay_address_draft.clone(),
+            relay_key_draft: None,
+            relay_remove_key: self.relay_remove_key,
+            relay_retype_key: self.relay_retype_key,
         }
+    }
+}
+
+/// What a Save keeps on this Mac ([`ReplySourceSettings::take_changes_here`]): opencodex's
+/// address, `Some(None)` back to its default, and its key, `Some(None)` to forget it.
+#[derive(Debug, Default)]
+struct RelayChangesHere {
+    address: Option<Option<String>>,
+    key: Option<Option<RelayKey>>,
+}
+
+/// This Mac's side of the Mac relay (opengrok-server #292): whether Answer with this Mac is
+/// switched on for the account signed in, where this Mac's opencodex listens and whether the
+/// Keychain holds a key for it, and the running relay's word on itself. The switch and the
+/// address are this Mac's prefs; the key never leaves the Keychain but for the relay.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RelayMac {
+    /// Switched on for the account signed in. Off until they switch it on: enrolling never makes
+    /// a Mac the relay.
+    pub on: bool,
+    /// opencodex's address as saved on this Mac, or `None` for where it listens by default.
+    pub address: Option<String>,
+    /// The Keychain holds a key for this Mac's opencodex.
+    pub has_key: bool,
+    /// The running relay's word on itself; `None` while it does not run.
+    pub report: Option<RelayReport>,
+}
+
+/// Answer with this Mac's status line ([`AppState::relay_line`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RelayLine {
+    /// This Mac holds the relay, answering this many calls right now.
+    Answering { in_flight: usize },
+    /// Another Mac holds it, by its name when the server gave one.
+    Another { label: Option<String> },
+    /// Opening the stream.
+    Connecting,
+    /// Nobody's Mac holds it, or this one cannot: and why, when the relay said.
+    NotConnected { why: Option<String> },
+}
+
+impl RelayMac {
+    /// The address the relay calls, and the field shows while nothing is typed.
+    pub fn shown_address(&self) -> String {
+        self.address
+            .clone()
+            .unwrap_or_else(|| crate::opengrok::DEFAULT_PROXY_URL.to_string())
     }
 }
 
@@ -721,11 +932,14 @@ struct SentSave {
     held: Option<InferenceKind>,
 }
 
-/// A Save of the reply source that has begun: what to send, and what it carried.
+/// A Save of the reply source that has begun: what to send, and what it carried; and what it
+/// keeps on this Mac rather than the server.
 struct ReplySourceSave {
     client: OpenGrokClient,
     sent: SentSave,
-    update: InferenceSourceUpdate,
+    /// The `PUT`, when anything the server keeps changed.
+    update: Option<InferenceSourceUpdate>,
+    here: RelayChangesHere,
 }
 
 /// The open Bot's tool ceiling, as far as its settings know it: everything it could be offered
@@ -4691,6 +4905,20 @@ pub struct AppState {
     /// Settings → Reply source was on screen when Settings last changed what it shows, so its
     /// arrival and its leaving are each told once ([`Self::settle_reply_source_page`]).
     reply_source_page_shown: bool,
+    /// Answer with this Mac: the switch, this Mac's opencodex, and the running relay's word on
+    /// itself (hexuria/nativechat #156, opengrok-server #292).
+    pub relay_mac: RelayMac,
+    /// The relay, while it runs, or once it has stopped for good and says why. Dropping it stops
+    /// it, with every call it was answering: switched off, signed out, or the app quitting.
+    relay_worker: Option<RelayHandle>,
+    /// A start of the relay reading its key, by its number, so a second is not begun meanwhile.
+    relay_starting: Option<u64>,
+    /// Numbers the relay's starts, so a start, or a report from a relay stopped since, is
+    /// dropped.
+    relay_generation: u64,
+    /// Where the key for this Mac's opencodex is kept: the Keychain, once the app is configured,
+    /// and memory before that and in tests.
+    relay_keys: Arc<dyn RelayKeyStore>,
     /// Everything the open Bot could be offered and which of it it may be, as its Tools card's
     /// switches show it (opengrok-server#268): the Bot's id and the answer, like
     /// [`Self::coworker_tools`]. Drawn through [`Self::ceiling_card`].
@@ -5271,6 +5499,11 @@ impl AppState {
             composer_dictating: false,
             models_generation: 0,
             reply_source_page_shown: false,
+            relay_mac: RelayMac::default(),
+            relay_worker: None,
+            relay_starting: None,
+            relay_generation: 0,
+            relay_keys: Arc::new(crate::relay_key::MemoryKeyStore::default()),
             coworker_ceiling: None,
             ceiling_generation: 0,
             ceiling_reading: None,
@@ -5357,6 +5590,7 @@ impl AppState {
         }
         self.config = Some(config);
         self.ensure_site_login_vault(cx);
+        self.open_relay_mac(cx);
         cx.notify();
     }
 
@@ -5395,6 +5629,7 @@ impl AppState {
                         state.auth_status = AuthStatus::SignedIn;
                         state.auth_error = None;
                         state.note_server_answered(cx);
+                        state.load_relay_switch();
                         state.start_local_exec(cx);
                         state.refresh_coworkers(cx);
                         state.sync_server_threads(cx);
@@ -6260,6 +6495,7 @@ impl AppState {
                         state.site_login_notice = None;
                         state.reload_site_logins(cx);
                         state.note_server_answered(cx);
+                        state.load_relay_switch();
                         state.start_local_exec(cx);
                         state.refresh_coworkers(cx);
                         state.sync_server_threads(cx);
@@ -6340,6 +6576,10 @@ impl AppState {
         self.reply_source_page_shown = false;
         self.reply_source_generation += 1;
         self.turn_source_pick = None;
+        // The relay answered for them, and stops with every call it was answering; the switch was
+        // theirs, and is read again for whoever signs in next.
+        self.stop_relay();
+        self.relay_mac.on = false;
         self.composer_dictating = false;
         // And any list of models still being asked for was asked as them, and the plan's models
         // listed were their plan's: the gateway's routes are the deployment's and stay.
@@ -7412,6 +7652,9 @@ impl AppState {
             let read = client.inference_source().await;
             let _ = this.update(cx, |state, cx| {
                 if state.settle_reply_source_read(generation, read) {
+                    // Whether the server knows the relay is in what it said, and so is whether
+                    // Answer with this Mac runs.
+                    state.ensure_relay(cx);
                     cx.notify();
                 }
             });
@@ -7480,6 +7723,10 @@ impl AppState {
     /// dead until the server answers, and what it answers is what the page shows after. A
     /// refusal leaves the kept setting as it was and the picks where they were, with the
     /// server's words under Save.
+    ///
+    /// What the page keeps on this Mac rather than the server, opencodex's address and its key
+    /// for Answer with this Mac, is kept at once ([`Self::keep_changes_here`]); a Save of nothing
+    /// else sends no `PUT`.
     pub fn save_reply_source(&mut self, cx: &mut Context<Self>) {
         let Some(save) = self.begin_reply_source_save() else {
             return;
@@ -7488,7 +7735,13 @@ impl AppState {
             client,
             sent,
             update,
+            here,
         } = save;
+        self.keep_changes_here(here, cx);
+        let Some(update) = update else {
+            cx.notify();
+            return;
+        };
         cx.spawn(async move |this, cx| {
             let answer = client.set_inference_source(&update).await;
             // The key, if one went, goes no further than this request.
@@ -7499,6 +7752,7 @@ impl AppState {
                     Some(AfterReplySourceSave::ReadModels) => state.refresh_models(cx),
                     Some(AfterReplySourceSave::ReadAgain) => state.read_reply_source(cx),
                 }
+                state.ensure_relay(cx);
                 cx.notify();
             });
         })
@@ -7511,17 +7765,33 @@ impl AppState {
     /// page for good.
     fn begin_reply_source_save(&mut self) -> Option<ReplySourceSave> {
         let plan_models = self.plan_models_listed();
-        if !self.reply_source.can_save(plan_models) {
+        if !self
+            .reply_source
+            .can_save(plan_models, self.relay_models_listed())
+        {
             return None;
         }
         let client = self.opengrok.clone()?;
+        let here = self.reply_source.take_changes_here();
+        self.reply_source.note = None;
+        if !self.reply_source.changes_for_server(plan_models) {
+            return Some(ReplySourceSave {
+                client,
+                sent: SentSave {
+                    generation: self.reply_source_generation,
+                    key_sent: false,
+                    held: None,
+                },
+                update: None,
+                here,
+            });
+        }
         let held = self
             .reply_source
             .holds_gateway(plan_models)
             .then_some(InferenceKind::LocalProxy);
         let update = self.reply_source.take_update(plan_models)?;
         let key_sent = matches!(update.api_key, Some(Some(_)));
-        self.reply_source.note = None;
         self.reply_source_generation += 1;
         self.reply_source.saving = Some(self.reply_source_generation);
         Some(ReplySourceSave {
@@ -7531,7 +7801,8 @@ impl AppState {
                 key_sent,
                 held,
             },
-            update,
+            update: Some(update),
+            here,
         })
     }
 
@@ -7600,6 +7871,41 @@ impl AppState {
         }
         let kept = settings.kept_source().map(|source| source.kind);
         settings.kind_pick = (Some(kind) != kept).then_some(kind);
+        // My subscription's row is the plan on the server's own machine: to a server that knows
+        // the relay, that is a way of its own, and picking the row picks it. The server's keys
+        // leave the way where it is.
+        settings.via_pick = match kind {
+            InferenceKind::LocalProxy if settings.knows_relay() => {
+                let kept = settings
+                    .kept_source()
+                    .and_then(InferenceSource::default_via);
+                (kept != Some(Via::Loopback)).then_some(Via::Loopback)
+            }
+            _ => None,
+        };
+        true
+    }
+
+    /// Settings → Reply source's third row: the person's plan through their Mac. It waits for
+    /// Save like every row, and is offered only by a server that knows the relay.
+    pub fn pick_reply_source_mac(&mut self, cx: &mut Context<Self>) {
+        if self.note_reply_source_mac() {
+            cx.notify();
+        }
+    }
+
+    fn note_reply_source_mac(&mut self) -> bool {
+        let settings = &mut self.reply_source;
+        if !settings.relay_editable() {
+            return false;
+        }
+        let Some(kept) = settings.kept_source() else {
+            return false;
+        };
+        let (kind, via) = (kept.kind, kept.default_via());
+        settings.kind_pick =
+            (kind != InferenceKind::LocalProxy).then_some(InferenceKind::LocalProxy);
+        settings.via_pick = (via != Some(Via::Mac)).then_some(Via::Mac);
         true
     }
 
@@ -7717,6 +8023,10 @@ impl AppState {
         if !shown && self.reply_source.key_draft.take().is_some() {
             self.reply_source.retype_key = true;
         }
+        // The key for this Mac's opencodex too: nothing keeps a key the person walked away from.
+        if !shown && self.reply_source.relay_key_draft.take().is_some() {
+            self.reply_source.relay_retype_key = true;
+        }
         arrived
     }
 
@@ -7725,14 +8035,21 @@ impl AppState {
         !self.subscription_models().is_empty()
     }
 
+    /// A Mac lists models of the person's plan to pick from for the relay.
+    fn relay_models_listed(&self) -> bool {
+        !self.relay_models().is_empty()
+    }
+
     /// Save would send something ([`ReplySourceSettings::can_save`]).
     pub fn reply_source_can_save(&self) -> bool {
-        self.reply_source.can_save(self.plan_models_listed())
+        self.reply_source
+            .can_save(self.plan_models_listed(), self.relay_models_listed())
     }
 
     /// The line beside Save about what it will or will not do ([`ReplySourceSettings::hint`]).
     pub fn reply_source_hint(&self) -> Option<&'static str> {
-        self.reply_source.hint(self.plan_models_listed())
+        self.reply_source
+            .hint(self.plan_models_listed(), self.relay_models_listed())
     }
 
     /// Whether opencodex answers the server, for the page's health line: no address kept is its
@@ -7903,6 +8220,408 @@ impl AppState {
             .is_some_and(|pick| pick == kept.door() || !turn_doors(kept).contains(&pick));
         if self.turn_source_chip().is_none() || stale {
             self.turn_source_pick = None;
+        }
+    }
+
+    // ---- Answer with this Mac: the relay (hexuria/nativechat #156, opengrok-server #292) -----
+
+    /// Answer with this Mac's own half, as this Mac keeps it: the Keychain for opencodex's key,
+    /// asked only whether it holds one, and the address from the prefs. The switch is the
+    /// account's, read once somebody signs in. The relay stops when the app quits, with every
+    /// call it was answering.
+    fn open_relay_mac(&mut self, cx: &mut Context<Self>) {
+        self.relay_keys = crate::relay_key::open_store();
+        self.relay_mac.has_key = self.relay_keys.holds_key();
+        if let Some(config) = &self.config {
+            self.relay_mac.address = crate::prefs::load_relay(&config.data_dir).address;
+        }
+        cx.on_app_quit(|state, _| {
+            state.stop_relay();
+            async {}
+        })
+        .detach();
+    }
+
+    /// The switch as this Mac keeps it for the account now signed in: on only if they switched
+    /// it on here.
+    fn load_relay_switch(&mut self) {
+        let account = self.account.as_ref().map(|account| account.id.clone());
+        self.relay_mac.on = match (&self.config, account) {
+            (Some(config), Some(account)) => {
+                crate::prefs::load_relay(&config.data_dir).on_for.as_deref()
+                    == Some(account.as_str())
+            }
+            _ => false,
+        };
+    }
+
+    /// This Mac is enrolled with the server, so it has the machine token the relay opens its
+    /// stream with. Enrolling happens at sign-in; it never makes the Mac the relay by itself.
+    pub fn relay_enrolled(&self) -> bool {
+        self.local_exec_machine_id.is_some()
+    }
+
+    /// Answer with this Mac's switch takes a click: off always, and on once somebody is signed
+    /// in, this Mac is enrolled, and the server knows the relay.
+    pub fn relay_switch_live(&self) -> bool {
+        self.relay_mac.on
+            || (self.is_signed_in() && self.relay_enrolled() && self.reply_source.knows_relay())
+    }
+
+    /// Answer with this Mac should be running: somebody is signed in, the switch is on for them,
+    /// this Mac is enrolled, and the server knows the relay.
+    fn relay_wanted(&self) -> bool {
+        self.is_signed_in()
+            && self.relay_mac.on
+            && self.relay_enrolled()
+            && self.reply_source.knows_relay()
+    }
+
+    /// Start the relay where it should run and does not, and stop it where it runs and should
+    /// not. One that stopped for good (another Mac took over, or the server turned its token
+    /// away) is left stopped until the switch is turned off and on.
+    fn ensure_relay(&mut self, cx: &mut Context<Self>) {
+        if !self.relay_wanted() {
+            if self.relay_worker.is_some() || self.relay_starting.is_some() {
+                self.stop_relay();
+                cx.notify();
+            }
+            return;
+        }
+        if self.relay_worker.is_none() && self.relay_starting.is_none() {
+            self.begin_relay(cx);
+        }
+    }
+
+    /// Start the relay: its key is read from the Keychain off the main thread, since the
+    /// Keychain may ask the person first, and then it opens the stream on the tokio runtime.
+    fn begin_relay(&mut self, cx: &mut Context<Self>) {
+        let (Some(client), Some(config)) = (self.opengrok.clone(), self.config.clone()) else {
+            return;
+        };
+        let Some(machine) = stored_machine(&config.data_dir) else {
+            return;
+        };
+        let Some(address) = self.relay_address() else {
+            return;
+        };
+        self.relay_generation += 1;
+        let generation = self.relay_generation;
+        self.relay_starting = Some(generation);
+        self.relay_mac.report = Some(RelayReport {
+            status: RelayStatus::Connecting,
+            ..RelayReport::default()
+        });
+        let store = self.relay_keys.clone();
+        cx.spawn(async move |this, cx| {
+            let key = cx
+                .background_executor()
+                .spawn(async move { store.read() })
+                .await;
+            let _ = this.update(cx, |state, cx| {
+                if state.relay_starting != Some(generation) || !state.relay_wanted() {
+                    return;
+                }
+                state.relay_starting = None;
+                let key = key.unwrap_or_else(|error| {
+                    // Said without the key, which was never read.
+                    eprintln!("NativeChat relay: the key for opencodex could not be read: {error}");
+                    None
+                });
+                let handle = start_relay(
+                    client,
+                    machine,
+                    RelayTarget {
+                        address,
+                        key: key.map(Arc::new),
+                    },
+                    RelayTimings::default(),
+                );
+                let reports = handle.reports();
+                state.relay_worker = Some(handle);
+                state.follow_relay(generation, reports, cx);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Carry the relay's word on itself into the window as it changes, until it is stopped.
+    fn follow_relay(
+        &mut self,
+        generation: u64,
+        mut reports: tokio::sync::watch::Receiver<RelayReport>,
+        cx: &mut Context<Self>,
+    ) {
+        cx.spawn(async move |this, cx| {
+            loop {
+                let report = reports.borrow_and_update().clone();
+                let following = this
+                    .update(cx, |state, cx| {
+                        state.take_relay_report(generation, report, cx)
+                    })
+                    .unwrap_or(false);
+                if !following || reports.changed().await.is_err() {
+                    return;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// A report from the relay, `false` once it is not this relay's to give. Where the relay
+    /// stands is the server's word too: when this Mac starts answering, or another takes over,
+    /// the setting is read again for which Mac holds it, and while the page is on screen the
+    /// models, which a Mac answering lists.
+    fn take_relay_report(
+        &mut self,
+        generation: u64,
+        report: RelayReport,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.relay_generation != generation {
+            return false;
+        }
+        let before = self
+            .relay_mac
+            .report
+            .as_ref()
+            .map(|report| report.status.clone());
+        let turned = matches!(
+            report.status,
+            RelayStatus::Answering | RelayStatus::Replaced
+        ) && before.as_ref() != Some(&report.status);
+        self.relay_mac.report = Some(report);
+        if turned {
+            self.read_reply_source(cx);
+            if self.reply_source_on_screen() {
+                self.refresh_models(cx);
+            }
+        }
+        cx.notify();
+        true
+    }
+
+    /// Stop the relay, and every call it was answering.
+    fn stop_relay(&mut self) {
+        self.relay_generation += 1;
+        self.relay_worker = None;
+        self.relay_starting = None;
+        self.relay_mac.report = None;
+    }
+
+    /// Where the relay calls opencodex: the address saved on this Mac, or its default.
+    fn relay_address(&self) -> Option<crate::opengrok::OpencodexAddress> {
+        crate::opengrok::OpencodexAddress::parse(&self.relay_mac.shown_address()).ok()
+    }
+
+    /// Answer with this Mac's switch. On, the relay starts (once this Mac is enrolled and the
+    /// server knows the relay); off, it stops, with every call it was answering. Turning it off
+    /// and on is also how a relay that stopped for good starts again: after another Mac took
+    /// over, it takes the relay back. Kept on this Mac, for the account signed in.
+    pub fn set_relay_on(&mut self, on: bool, cx: &mut Context<Self>) {
+        if self.note_relay_on(on) {
+            self.stop_relay();
+            self.ensure_relay(cx);
+            cx.notify();
+        }
+    }
+
+    fn note_relay_on(&mut self, on: bool) -> bool {
+        let Some(account) = self.account.as_ref().map(|account| account.id.clone()) else {
+            return false;
+        };
+        if self.relay_mac.on == on || (on && !self.relay_switch_live()) {
+            return false;
+        }
+        self.relay_mac.on = on;
+        if let Some(config) = &self.config {
+            let mut prefs = crate::prefs::load_relay(&config.data_dir);
+            prefs.on_for = on.then_some(account);
+            crate::prefs::save_relay(&config.data_dir, &prefs);
+        }
+        true
+    }
+
+    /// This Mac's opencodex address as the field holds it now; it waits for Save. The one kept
+    /// here typed back is no change.
+    pub fn set_relay_address(&mut self, typed: String, cx: &mut Context<Self>) {
+        if self.note_relay_address(typed) {
+            cx.notify();
+        }
+    }
+
+    fn note_relay_address(&mut self, typed: String) -> bool {
+        if !self.reply_source.relay_editable() {
+            return false;
+        }
+        let kept = self.relay_mac.shown_address();
+        let draft = (typed.trim() != kept).then_some(typed);
+        if self.reply_source.relay_address_draft == draft {
+            return false;
+        }
+        self.reply_source.relay_address_draft = draft;
+        true
+    }
+
+    /// A key for this Mac's opencodex as the field holds it now; a blank field is no key, and
+    /// leaves the one kept alone. A key typed takes back a Remove key.
+    pub fn set_relay_key(&mut self, typed: &str, cx: &mut Context<Self>) {
+        if self.note_relay_key(typed) {
+            cx.notify();
+        }
+    }
+
+    fn note_relay_key(&mut self, typed: &str) -> bool {
+        let settings = &mut self.reply_source;
+        if !settings.relay_editable() {
+            return false;
+        }
+        let key = RelayKey::new(typed);
+        if key.is_some() {
+            settings.relay_remove_key = false;
+            settings.relay_retype_key = false;
+        }
+        if settings.relay_key_draft == key {
+            return false;
+        }
+        settings.relay_key_draft = key;
+        true
+    }
+
+    /// Remove key for this Mac's opencodex, and Keep key to take it back: Save takes it out of
+    /// the Keychain. Offered only while the Keychain holds one.
+    pub fn toggle_remove_relay_key(&mut self, cx: &mut Context<Self>) {
+        if self.note_remove_relay_key() {
+            cx.notify();
+        }
+    }
+
+    fn note_remove_relay_key(&mut self) -> bool {
+        if !self.reply_source.relay_editable() || !self.relay_mac.has_key {
+            return false;
+        }
+        let settings = &mut self.reply_source;
+        settings.relay_remove_key = !settings.relay_remove_key;
+        if settings.relay_remove_key {
+            settings.relay_key_draft = None;
+        }
+        true
+    }
+
+    /// A model a Mac lists, for the relay: it waits for Save, which keeps it on the server.
+    pub fn pick_relay_model(&mut self, model: String, cx: &mut Context<Self>) {
+        if self.note_relay_model(Some(model)) {
+            cx.notify();
+        }
+    }
+
+    /// No model for the relay: the kept one is taken away with the next Save.
+    pub fn clear_relay_model(&mut self, cx: &mut Context<Self>) {
+        if self.note_relay_model(None) {
+            cx.notify();
+        }
+    }
+
+    fn note_relay_model(&mut self, model: Option<String>) -> bool {
+        let settings = &mut self.reply_source;
+        if !settings.relay_editable() {
+            return false;
+        }
+        let kept = settings
+            .kept_source()
+            .and_then(InferenceSource::relay_model)
+            .map(str::to_string);
+        settings.relay_model_pick = (model != kept).then_some(model);
+        true
+    }
+
+    /// What a Save keeps on this Mac rather than the server: opencodex's address in the prefs,
+    /// at once, and its key in the Keychain, off the main thread, since the Keychain may ask the
+    /// person first. A relay that runs calls opencodex at the new address, and with the new key,
+    /// from its next call on.
+    fn keep_changes_here(&mut self, here: RelayChangesHere, cx: &mut Context<Self>) {
+        if let Some(address) = here.address {
+            self.relay_mac.address = address;
+            if let Some(config) = &self.config {
+                let mut prefs = crate::prefs::load_relay(&config.data_dir);
+                prefs.address = self.relay_mac.address.clone();
+                crate::prefs::save_relay(&config.data_dir, &prefs);
+            }
+            if let (Some(worker), Some(address)) = (&self.relay_worker, self.relay_address()) {
+                worker.readdress(address);
+            }
+        }
+        let Some(key) = here.key else {
+            return;
+        };
+        let store = self.relay_keys.clone();
+        cx.spawn(async move |this, cx| {
+            let kept = cx
+                .background_executor()
+                .spawn(async move {
+                    match key {
+                        Some(key) => store.keep(&key).map(|()| Some(key)),
+                        None => store.forget().map(|()| None),
+                    }
+                })
+                .await;
+            let _ = this.update(cx, |state, cx| {
+                state.settle_key_kept(kept);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// The Keychain's answer to a key kept or forgotten: the page says whether one is kept, and
+    /// the relay, if it runs, asks with it from its next call on. A Keychain that refused says so
+    /// under Save, in its words.
+    fn settle_key_kept(&mut self, kept: Result<Option<RelayKey>, String>) {
+        match kept {
+            Ok(key) => {
+                self.relay_mac.has_key = key.is_some();
+                self.reply_source.relay_retype_key = false;
+                if let Some(worker) = &self.relay_worker {
+                    worker.rekey(key.map(Arc::new));
+                }
+            }
+            Err(why) => {
+                self.reply_source.note = Some(ReplySourceNote::KeyNotKept(format!(
+                    "This Mac's Keychain did not keep the change to opencodex's key: {why}"
+                )));
+            }
+        }
+    }
+
+    /// What Answer with this Mac's status line says: this Mac answering, another Mac answering
+    /// (by its name, when the server gave one), connecting, or not connected; from the relay's
+    /// own word on this Mac and the server's on the others.
+    pub fn relay_line(&self) -> RelayLine {
+        let report = self.relay_mac.report.as_ref();
+        let relay = self
+            .reply_source
+            .kept_source()
+            .and_then(|kept| kept.relay.as_ref());
+        let this_mac = self.local_exec_machine_id.as_deref();
+        let another = relay
+            .filter(|relay| relay.connected)
+            .filter(|relay| relay.machine_id.as_deref() != this_mac || this_mac.is_none());
+        match report.map(|report| &report.status) {
+            Some(RelayStatus::Answering) => RelayLine::Answering {
+                in_flight: report.map_or(0, |report| report.in_flight),
+            },
+            Some(RelayStatus::Replaced) => RelayLine::Another {
+                label: another.and_then(|relay| relay.machine_label.clone()),
+            },
+            _ if another.is_some() => RelayLine::Another {
+                label: another.and_then(|relay| relay.machine_label.clone()),
+            },
+            Some(RelayStatus::Connecting) => RelayLine::Connecting,
+            Some(RelayStatus::Error(why)) => RelayLine::NotConnected {
+                why: Some(why.clone()),
+            },
+            Some(RelayStatus::Off) | None => RelayLine::NotConnected { why: None },
         }
     }
 
@@ -14582,6 +15301,8 @@ impl AppState {
                     let _ = this.update(cx, |state, cx| {
                         state.local_exec_machine_id = Some(machine_id);
                         state.refresh_computers(cx);
+                        // Enrolled: Answer with this Mac can start, if it is switched on.
+                        state.ensure_relay(cx);
                         cx.notify();
                     });
                 }
@@ -32497,6 +33218,315 @@ mod tests {
                 relay_connected: false,
             }),
         };
+    }
+
+    // ---- Answer with this Mac: the relay's half of the page -------------------------------------
+
+    /// A read from a server that knows the Mac relay: the account's door and way, and the relay's
+    /// model, with no Mac holding it.
+    fn relay_kept(kind: InferenceKind, via: &str, relay_model: Option<&str>) -> InferenceSource {
+        InferenceSource {
+            via: Some(via.into()),
+            relay: Some(crate::opengrok::RelayRead {
+                connected: false,
+                machine_id: None,
+                machine_label: None,
+                local_model: relay_model.map(str::to_string),
+            }),
+            ..kept(kind, Some("gpt-5-codex"))
+        }
+    }
+
+    /// The server lists `ids` as models a Mac holding the relay lists.
+    fn with_relay_models(state: &mut AppState, ids: &[&str]) {
+        state.model_catalogue = ModelCatalogue {
+            models: ids
+                .iter()
+                .map(|id| ModelEntry {
+                    id: (*id).to_string(),
+                    source: Some("local_proxy".into()),
+                    via: Some("mac".into()),
+                })
+                .collect(),
+            note: None,
+            local_proxy: Some(crate::opengrok::LocalProxyStatus {
+                healthy: true,
+                relay_connected: true,
+            }),
+        };
+    }
+
+    /// The Mac's row waits for Save like every row, and a Save of it sends the kind and the way,
+    /// with the relay's model when one was picked; without a model for it Save says what it waits
+    /// for, whether a Mac lists some or none does yet. The plan's row, where the account's way is
+    /// the Mac, picks the server's own machine back. A server from before the relay offers no Mac
+    /// row, and is sent no way.
+    #[test]
+    fn the_macs_row_waits_for_save_and_sends_its_way_and_its_model() {
+        use super::{REPLY_SOURCE_NO_RELAY_MODELS, REPLY_SOURCE_PICK_RELAY_MODEL};
+        let mut state = signed_in_state();
+        read_as(
+            &mut state,
+            relay_kept(InferenceKind::Gateway, "loopback", None),
+        );
+        assert!(state.note_reply_source_mac());
+        assert!(state.reply_source.shows_mac());
+        assert!(state.reply_source.is_unsaved());
+        assert_eq!(
+            state.reply_source_hint(),
+            Some(REPLY_SOURCE_NO_RELAY_MODELS)
+        );
+        assert!(!state.reply_source_can_save());
+        with_relay_models(&mut state, &["grok-4", "claude-opus"]);
+        assert_eq!(state.relay_models(), ["grok-4"]);
+        assert_eq!(
+            state.reply_source_hint(),
+            Some(REPLY_SOURCE_PICK_RELAY_MODEL)
+        );
+        assert!(state.note_relay_model(Some("grok-4".into())));
+        assert_eq!(state.reply_source_hint(), None);
+        assert_eq!(
+            save_body(&mut state),
+            Some(json!({
+                "kind": "local_proxy",
+                "via": "mac",
+                "relay": {"localModel": "grok-4"}
+            }))
+        );
+
+        // The account's way is the Mac: the plan's row picks the server's own machine back, with
+        // its way, whatever the account keeps.
+        let mut state = signed_in_state();
+        read_as(
+            &mut state,
+            relay_kept(InferenceKind::LocalProxy, "mac", Some("grok-4")),
+        );
+        state.reply_source.server_on_this_mac = true;
+        with_plan_models(&mut state, &["gpt-5-codex"]);
+        assert!(state.reply_source.shows_mac());
+        assert!(state.note_reply_source_kind(InferenceKind::LocalProxy));
+        assert!(!state.reply_source.shows_mac());
+        assert_eq!(
+            save_body(&mut state),
+            Some(json!({"kind": "local_proxy", "via": "loopback"}))
+        );
+        // The Mac's row picked back is no change at all.
+        assert!(state.note_reply_source_mac());
+        assert!(!state.reply_source.is_unsaved());
+        // The relay's model taken away while the Mac is the account's way is not saved: the
+        // server would turn every reply through the Mac away.
+        assert!(state.note_relay_model(None));
+        assert_eq!(save_body(&mut state), None);
+
+        // A server from before the relay: no Mac row, nothing of the relay's taken, no way sent.
+        let mut state = signed_in_state();
+        read_as(
+            &mut state,
+            kept(InferenceKind::Gateway, Some("gpt-5-codex")),
+        );
+        state.reply_source.server_on_this_mac = true;
+        with_plan_models(&mut state, &["gpt-5-codex"]);
+        assert!(!state.reply_source.knows_relay());
+        assert!(!state.note_reply_source_mac());
+        assert!(!state.note_relay_model(Some("grok-4".into())));
+        assert!(!state.note_relay_address("http://127.0.0.1:9090".into()));
+        assert!(!state.note_relay_key("opencodex-test-key"));
+        assert!(state.note_reply_source_kind(InferenceKind::LocalProxy));
+        assert_eq!(
+            save_body(&mut state),
+            Some(json!({"kind": "local_proxy"})),
+            "the old word alone, the only one such a server reads"
+        );
+    }
+
+    /// opencodex's address and key for Answer with this Mac are this Mac's: Save keeps them here
+    /// and sends the server neither, and sends it nothing at all when nothing else changed. An
+    /// address that is not this Mac is refused before Save, an emptied one goes back to the
+    /// default, and a key typed and left behind with the page is dropped and asked for again.
+    #[test]
+    fn answer_with_this_macs_address_and_key_are_kept_here_and_never_sent() {
+        use super::{RELAY_ADDRESS_NOT_HERE, ReplySourceSave};
+        let mut state = signed_in_state();
+        read_as(
+            &mut state,
+            relay_kept(InferenceKind::Gateway, "loopback", None),
+        );
+        assert!(!state.note_relay_address(crate::opengrok::DEFAULT_PROXY_URL.into()));
+        assert!(state.note_relay_address("http://192.168.1.5:8080".into()));
+        assert_eq!(state.reply_source_hint(), Some(RELAY_ADDRESS_NOT_HERE));
+        assert!(!state.reply_source_can_save());
+        assert!(state.note_relay_address("http://127.0.0.1:9090/".into()));
+        assert!(state.note_relay_key("  opencodex-test-key  "));
+        let printed = format!("{:?}", state.reply_source);
+        assert!(!printed.contains("opencodex-test-key"), "{printed}");
+        assert!(state.reply_source.without_key().relay_key_draft.is_none());
+        assert!(state.reply_source_can_save());
+        let ReplySourceSave { update, here, .. } =
+            state.begin_reply_source_save().expect("a Save begins");
+        assert!(update.is_none(), "nothing the server keeps changed: no PUT");
+        assert_eq!(
+            here.address,
+            Some(Some("http://127.0.0.1:9090".to_string()))
+        );
+        assert_eq!(
+            here.key,
+            Some(crate::opengrok::RelayKey::new("opencodex-test-key"))
+        );
+        assert_eq!(
+            state.reply_source.saving, None,
+            "nothing is with the server"
+        );
+        assert!(!state.reply_source.is_unsaved(), "the page has let them go");
+
+        // The Keychain's answer: kept, or refused in its words.
+        state.settle_key_kept(Ok(crate::opengrok::RelayKey::new("opencodex-test-key")));
+        assert!(state.relay_mac.has_key);
+        state.settle_key_kept(Err("user interaction is not allowed".into()));
+        assert!(matches!(
+            state.reply_source.note,
+            Some(super::ReplySourceNote::KeyNotKept(ref why)) if why.contains("not allowed")
+        ));
+        state.settle_key_kept(Ok(None));
+        assert!(!state.relay_mac.has_key);
+
+        // Remove key only while one is kept; a key typed takes it back.
+        assert!(!state.note_remove_relay_key());
+        state.relay_mac.has_key = true;
+        assert!(state.note_remove_relay_key());
+        assert!(!state.reply_source.relay_key_editable());
+        let ReplySourceSave { here, .. } = state.begin_reply_source_save().unwrap();
+        assert_eq!(here.key, Some(None), "Save forgets it");
+
+        // An emptied address goes back to the default.
+        state.relay_mac.address = Some("http://127.0.0.1:9090".into());
+        assert!(state.note_relay_address(String::new()));
+        let ReplySourceSave { here, .. } = state.begin_reply_source_save().unwrap();
+        assert_eq!(here.address, Some(None));
+
+        // A key typed and left behind with the page is dropped, and asked for again.
+        state.is_app_settings_open = true;
+        state.app_settings_tab = AppSettingsTab::ReplySource;
+        assert!(state.settle_reply_source_page());
+        assert!(state.note_relay_key("opencodex-test-key"));
+        state.app_settings_tab = AppSettingsTab::Logins;
+        assert!(!state.settle_reply_source_page());
+        assert!(state.reply_source.relay_key_draft.is_none());
+        assert!(state.reply_source.relay_retype_key);
+        assert!(state.note_relay_key("opencodex-test-key"));
+        assert!(!state.reply_source.relay_retype_key);
+    }
+
+    /// Answer with this Mac runs only for somebody signed in, with its switch on for them, on an
+    /// enrolled Mac, against a server that knows the relay: enrolling alone never makes a Mac the
+    /// relay. The switch goes on only where it could run, and off always; signing out stops the
+    /// relay and forgets the switch, which is the next person's to read.
+    #[test]
+    fn the_relay_runs_only_switched_on_for_an_enrolled_mac_on_a_server_that_knows_it() {
+        let mut state = signed_in_state();
+        assert!(!state.relay_wanted());
+        assert!(!state.relay_switch_live(), "the setting not read");
+        read_as(
+            &mut state,
+            relay_kept(InferenceKind::Gateway, "loopback", None),
+        );
+        assert!(!state.relay_switch_live(), "not enrolled");
+        assert!(!state.note_relay_on(true));
+        state.local_exec_machine_id = Some("mac_1".into());
+        assert!(state.relay_switch_live());
+        assert!(!state.relay_wanted(), "enrolled, and not switched on");
+        assert!(state.note_relay_on(true));
+        assert!(state.relay_mac.on && state.relay_wanted());
+        assert!(!state.note_relay_on(true), "already on");
+
+        // A server that no longer knows the relay: it would not run, but the switch still goes
+        // off.
+        read_as(&mut state, kept(InferenceKind::Gateway, None));
+        assert!(!state.relay_wanted());
+        assert!(state.relay_switch_live(), "on, so it can go off");
+        assert!(state.note_relay_on(false));
+        assert!(!state.relay_switch_live());
+
+        state.relay_mac.on = true;
+        state.relay_mac.report = Some(crate::opengrok::RelayReport::default());
+        state.forget_account();
+        assert!(!state.relay_mac.on);
+        assert_eq!(state.relay_mac.report, None);
+        assert!(!state.relay_wanted());
+    }
+
+    /// The status line says who is answering: this Mac by its relay's own word, with the calls in
+    /// flight; another Mac by the server's word, by its name, whether this Mac was replaced or is
+    /// switched off; and otherwise connecting, or not connected with why. The server saying this
+    /// Mac holds the relay while its relay is not running is not this Mac answering.
+    #[test]
+    fn the_status_line_says_who_is_answering() {
+        use super::RelayLine;
+        use crate::opengrok::{RelayRead, RelayReport, RelayStatus};
+        let with_relay = |relay: RelayRead| InferenceSource {
+            via: Some("loopback".into()),
+            relay: Some(relay),
+            ..kept(InferenceKind::Gateway, None)
+        };
+        let studio = RelayRead {
+            connected: true,
+            machine_id: Some("mac_2".into()),
+            machine_label: Some("NativeChat on studio".into()),
+            local_model: None,
+        };
+        let mut state = signed_in_state();
+        state.local_exec_machine_id = Some("mac_1".into());
+        read_as(
+            &mut state,
+            with_relay(RelayRead {
+                connected: false,
+                ..studio.clone()
+            }),
+        );
+        assert_eq!(state.relay_line(), RelayLine::NotConnected { why: None });
+        let report = |status: RelayStatus, in_flight: usize| RelayReport {
+            status,
+            in_flight,
+            halted: false,
+        };
+        state.relay_mac.report = Some(report(RelayStatus::Connecting, 0));
+        assert_eq!(state.relay_line(), RelayLine::Connecting);
+        state.relay_mac.report = Some(report(RelayStatus::Answering, 2));
+        assert_eq!(state.relay_line(), RelayLine::Answering { in_flight: 2 });
+        state.relay_mac.report = Some(report(RelayStatus::Error("gone quiet".into()), 0));
+        assert_eq!(
+            state.relay_line(),
+            RelayLine::NotConnected {
+                why: Some("gone quiet".into())
+            }
+        );
+
+        // Another Mac took over: by its name, once the server says it.
+        state.relay_mac.report = Some(report(RelayStatus::Replaced, 0));
+        assert_eq!(state.relay_line(), RelayLine::Another { label: None });
+        read_as(&mut state, with_relay(studio.clone()));
+        assert_eq!(
+            state.relay_line(),
+            RelayLine::Another {
+                label: Some("NativeChat on studio".into())
+            }
+        );
+        // Switched off here, the other Mac is still the one answering.
+        state.relay_mac.report = None;
+        assert_eq!(
+            state.relay_line(),
+            RelayLine::Another {
+                label: Some("NativeChat on studio".into())
+            }
+        );
+        // The server says this Mac, and its relay is not running: not answering.
+        read_as(
+            &mut state,
+            with_relay(RelayRead {
+                machine_id: Some("mac_1".into()),
+                ..studio
+            }),
+        );
+        assert_eq!(state.relay_line(), RelayLine::NotConnected { why: None });
     }
 
     /// What a Save would send now, as JSON, without sending it.

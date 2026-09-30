@@ -325,10 +325,15 @@ impl RelayHandle {
         self.reports.clone()
     }
 
-    /// Call opencodex somewhere else, or with another key, from the next call on. A call already
-    /// out keeps what it was sent with.
-    pub fn retarget(&self, target: RelayTarget) {
-        self.target.send_replace(target);
+    /// Call opencodex at another address from the next call on. A call already out keeps the
+    /// one it was sent to.
+    pub fn readdress(&self, address: OpencodexAddress) {
+        self.target.send_modify(|target| target.address = address);
+    }
+
+    /// Call opencodex with another key, or none, from the next call on.
+    pub fn rekey(&self, key: Option<Arc<RelayKey>>) {
+        self.target.send_modify(|target| target.key = key);
     }
 }
 
