@@ -302,6 +302,10 @@ pub(crate) enum RelayAnswered {
     AlreadyAnswered,
     /// `401`: the server no longer takes this Mac's token.
     TokenRefused,
+    /// `413`: the answer ran past the server's 32 MiB (`MAX_ANSWER_BYTES` in opengrok-server's
+    /// `crates/opengrok-harness/src/relay.rs`), so the server cut it off there and the run it was
+    /// for ended as the Mac's failure. A failed answer, with nothing to send again.
+    TooLarge,
 }
 
 /// The calls this Mac is answering, by the `requestId` their frame carried, so that a `cancel`
@@ -676,6 +680,11 @@ impl Relay {
             Ok(RelayAnswered::Taken | RelayAnswered::Gone | RelayAnswered::AlreadyAnswered) => {}
             Ok(RelayAnswered::TokenRefused) => {
                 let _ = self.halt.send(());
+            }
+            // The run already says so, in the server's words; the Mac has nothing to add, and
+            // the same answer would be cut off again.
+            Ok(RelayAnswered::TooLarge) => {
+                eprintln!("NativeChat relay: the server cut off an answer past its 32 MiB");
             }
             Err(error) => {
                 eprintln!("NativeChat relay: an answer did not reach the server: {error}");
@@ -1289,74 +1298,86 @@ mod tests {
         );
     }
 
-    /// The stream as the server sends it: `ready` makes this Mac the relay, a call is answered,
-    /// and a `404` for its answer (the server gave up on it) is quiet: the relay goes on
-    /// answering, stops for nothing and says nothing is wrong.
+    /// The stream as the server sends it: `ready` makes this Mac the relay, and a call is
+    /// answered once. An answer the server gave up on (`404`), one somebody answered already
+    /// (`409`), and one past the server's 32 MiB (`413`, cut off there: a failed answer) are
+    /// quiet: the answer is not sent again, and the relay goes on answering, stops for nothing and
+    /// says nothing is wrong.
     #[tokio::test]
-    async fn a_404_for_an_answer_is_quiet() {
-        let server = MockServer::start().await;
-        let opencodex = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/v1/chat/completions"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_raw("data: [DONE]\n\n", "text/event-stream"),
-            )
-            .mount(&opencodex)
+    async fn an_answer_gone_answered_already_or_too_large_is_quiet() {
+        for status in [404, 409, 413] {
+            let server = MockServer::start().await;
+            let opencodex = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/chat/completions"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_raw("data: [DONE]\n\n", "text/event-stream"),
+                )
+                .mount(&opencodex)
+                .await;
+            // The first stream brings the call; every one after it only says this Mac is the
+            // relay, as a server with nothing to ask would.
+            Mock::given(method("GET"))
+                .and(path("/inference-relay/requests"))
+                .and(header("authorization", format!("Bearer {TOKEN}").as_str()))
+                .respond_with(ResponseTemplate::new(200).set_body_raw(
+                    sse(&[
+                        json!({"type": "ready", "machineId": "mac_1"}),
+                        infer("req_1", "gpt-5-codex"),
+                        json!({"type": "ping"}),
+                    ]),
+                    "text/event-stream",
+                ))
+                .up_to_n_times(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/inference-relay/requests"))
+                .respond_with(ResponseTemplate::new(200).set_body_raw(
+                    sse(&[json!({"type": "ready", "machineId": "mac_1"})]),
+                    "text/event-stream",
+                ))
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path("/inference-relay/responses/req_1"))
+                .respond_with(
+                    ResponseTemplate::new(status).set_body_json(json!({"error": "refused"})),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+            let handle = start_relay(
+                OpenGrokClient::new(&server.uri()).unwrap(),
+                machine(),
+                target(&opencodex.uri(), None),
+                quick(),
+            );
+            until("the answer went", async || {
+                !answers_to(&server, "req_1").await.is_empty()
+            })
             .await;
-        // The first stream brings the call; every one after it only says this Mac is the relay,
-        // as a server with nothing to ask would.
-        Mock::given(method("GET"))
-            .and(path("/inference-relay/requests"))
-            .and(header("authorization", format!("Bearer {TOKEN}").as_str()))
-            .respond_with(ResponseTemplate::new(200).set_body_raw(
-                sse(&[
-                    json!({"type": "ready", "machineId": "mac_1"}),
-                    infer("req_1", "gpt-5-codex"),
-                    json!({"type": "ping"}),
-                ]),
-                "text/event-stream",
-            ))
-            .up_to_n_times(1)
-            .mount(&server)
+            until("the call took itself out", async || {
+                handle.report().in_flight == 0
+            })
             .await;
-        Mock::given(method("GET"))
-            .and(path("/inference-relay/requests"))
-            .respond_with(ResponseTemplate::new(200).set_body_raw(
-                sse(&[json!({"type": "ready", "machineId": "mac_1"})]),
-                "text/event-stream",
-            ))
-            .mount(&server)
-            .await;
-        Mock::given(method("POST"))
-            .and(path("/inference-relay/responses/req_1"))
-            .respond_with(ResponseTemplate::new(404))
-            .expect(1)
-            .mount(&server)
-            .await;
-        let handle = start_relay(
-            OpenGrokClient::new(&server.uri()).unwrap(),
-            machine(),
-            target(&opencodex.uri(), None),
-            quick(),
-        );
-        until("the answer went", async || {
-            !answers_to(&server, "req_1").await.is_empty()
-        })
-        .await;
-        until("the call took itself out", async || {
-            handle.report().in_flight == 0
-        })
-        .await;
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        let report = handle.report();
-        assert!(
-            !report.halted
-                && matches!(
-                    report.status,
-                    RelayStatus::Answering | RelayStatus::Connecting
-                ),
-            "a call the server gave up on stops nothing and is no error: {report:?}"
-        );
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            assert_eq!(
+                answers_to(&server, "req_1").await.len(),
+                1,
+                "{status}: the answer is not sent again"
+            );
+            let report = handle.report();
+            assert!(
+                !report.halted
+                    && matches!(
+                        report.status,
+                        RelayStatus::Answering | RelayStatus::Connecting
+                    ),
+                "{status}: an answer refused so stops nothing and is no error: {report:?}"
+            );
+        }
     }
 
     /// After `replaced` the Mac stops and does not open the stream again: another Mac is

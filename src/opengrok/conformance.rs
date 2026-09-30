@@ -3773,15 +3773,17 @@ fn relay_stream_refused(status: u16, body: &Value) -> Check {
 /// the status alone (opengrok-server PR #298, branch mac-relay c7b57e9, recorded at c3f9521, not
 /// yet on main: `relay_response` in `crates/opengrok-server/src/inference.rs`), stated here
 /// status by status: taken; a call nothing waits on any more, which is as good as cancelled; one
-/// answered already; and this Mac turned away, which stops the relay (the server says so of a bad
+/// answered already; this Mac turned away, which stops the relay (the server says so of a bad
 /// token and of a call sent to another machine, and this Mac answers only the calls its own
-/// stream brought it). `None` is a refusal read as every other.
+/// stream brought it); and an answer past the server's 32 MiB, cut off there, a failed answer
+/// with nothing to send again. `None` is a refusal read as every other.
 fn relay_answered_as(status: u16) -> Option<RelayAnswered> {
     match status {
         200..=299 => Some(RelayAnswered::Taken),
         404 => Some(RelayAnswered::Gone),
         409 => Some(RelayAnswered::AlreadyAnswered),
         401 => Some(RelayAnswered::TokenRefused),
+        413 => Some(RelayAnswered::TooLarge),
         _ => None,
     }
 }
@@ -5710,4 +5712,31 @@ fn a_replys_way_is_read_beyond_the_recording() {
         inference_source_frame(&frame(value.clone()))
             .unwrap_or_else(|why| panic!("{value}: {why}"));
     }
+}
+
+/// This Mac's answers, read beyond the ones the server's recording holds (a 204, a 401, a 404 and
+/// a 409): an answer past the server's 32 MiB, refused 413 in its words (`relay_response` in
+/// opengrok-server's `crates/opengrok-server/src/inference.rs`, PR #298), reads as a failed
+/// answer and nothing more, and a status the relay does not act on as the server's refusal.
+#[test]
+fn an_answer_is_read_beyond_the_recording() {
+    use serde_json::json;
+    let answered = |status: u16, body: Value| {
+        read_fixture(
+            "POST__inference-relay_responses__request_id_",
+            &json!({
+                "method": "POST", "path": "/inference-relay/responses/req_1",
+                "status": status, "body": body
+            }),
+        )
+    };
+    answered(413, json!({"error": "that answer is too large"}))
+        .unwrap_or_else(|why| panic!("413: {why}"));
+    assert_eq!(
+        OpenGrokClient::relay_answered(413),
+        Some(RelayAnswered::TooLarge)
+    );
+    answered(500, json!({"error": "the run could not take the answer"}))
+        .unwrap_or_else(|why| panic!("500: {why}"));
+    assert_eq!(OpenGrokClient::relay_answered(500), None);
 }

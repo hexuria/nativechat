@@ -2624,8 +2624,9 @@ impl OpenGrokClient {
     /// stream, with its machine token (the same contract). opencodex's stream goes as
     /// `text/event-stream`, uploaded as it arrives rather than gathered first; its model list, and
     /// a failure as `{"error": sentence}`, as `application/json`. `204` is taken, `404` a call the
-    /// server no longer has (as good as cancelled), `409` one answered already, and `401` the token
-    /// refused; anything else is read as the server's refusal.
+    /// server no longer has (as good as cancelled), `409` one answered already, `401` the token
+    /// refused, and `413` an answer past the server's 32 MiB, cut off there; anything else is read
+    /// as the server's refusal.
     pub(crate) async fn answer_inference_relay(
         &self,
         machine_token: &str,
@@ -2670,6 +2671,7 @@ impl OpenGrokClient {
             401 => Some(RelayAnswered::TokenRefused),
             404 => Some(RelayAnswered::Gone),
             409 => Some(RelayAnswered::AlreadyAnswered),
+            413 => Some(RelayAnswered::TooLarge),
             _ => None,
         }
     }
