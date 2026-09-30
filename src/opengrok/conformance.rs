@@ -3747,9 +3747,9 @@ fn relay_stream(_: u16, body: &Value) -> Check {
 
 /// The relay's stream refused (`open_inference_relay` reads the refusal as every other, and the
 /// relay takes it in `stream_once`). A 401 is the server turning this Mac's token away, which
-/// the relay stops for for good rather than asking again with a token that would be turned away
-/// again; it says so in its own words, not the server's. Anything else is said in a sentence
-/// while the relay tries again, and is read as every other refusal.
+/// the relay stops for until this Mac enrols again, rather than asking again with a token that
+/// would be turned away again; it says so in its own words, not the server's. Anything else is
+/// said in a sentence while the relay tries again, and is read as every other refusal.
 fn relay_stream_refused(status: u16, body: &Value) -> Check {
     let error = OpenGrokClient::refusal(status, &body_text(body));
     let stops = token_turned_away(&error);

@@ -21,9 +21,16 @@
 //! without calling opencodex.
 //!
 //! The Mac opens the stream only while the person has switched it on. After the server says
-//! another Mac took over (`replaced`), or refuses this Mac's token, it stops for good: it does not
-//! fight the other Mac for the stream, or knock on a door that has said no, until it is switched
-//! off and on again.
+//! another Mac took over (`replaced`), it stops for good: it does not fight the other Mac for the
+//! stream until it is switched off and on again. After the server refuses this Mac's token it
+//! stops too, and knocks no more with a token that was turned away; but it starts again by itself
+//! once this Mac enrols again ([`Enrolment`]). Re-enrolling a Mac retires its old token and ends
+//! the relay stream that token opened, with no `replaced` or any other word on it, and a stream
+//! opened while its token was being retired is refused `401` (opengrok-server main cad36fd (#303,
+//! after #298), pin 47a5d6b: `enrol_daemon` in `crates/opengrok-server/src/local_exec.rs`,
+//! `relay_requests` in `crates/opengrok-server/src/inference.rs`). So an ended stream is opened
+//! again as after any drop, with the newest token this Mac holds; one refused for an old token
+//! waits for the new.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -39,7 +46,7 @@ use tokio::task::JoinHandle;
 use super::client::OpenGrokClient;
 use super::error::OpenGrokError;
 use super::inference::{is_loopback, is_subscription_model};
-use super::local_exec::MachineCredential;
+use super::local_exec::{Enrolment, MachineCredential};
 
 /// The most of a sentence about a failure the Mac sends the server, in characters. opencodex can
 /// answer a failure with a page of HTML; the person reads one line.
@@ -57,7 +64,8 @@ const MODELS_BYTES: usize = 1024 * 1024;
 const LINE_BYTES: usize = 64 * 1024 * 1024;
 
 /// What the Mac says when the server turns its token away, whether opening the stream or
-/// answering a call. It stops: asking again with the same token would be refused again.
+/// answering a call. It stops until this Mac enrols again: asking again with the same token
+/// would be refused again.
 pub const TOKEN_REFUSED: &str =
     "The server turned this Mac's token away. Turn Answer with this Mac off and on to try again.";
 
@@ -212,8 +220,9 @@ pub struct RelayReport {
     pub status: RelayStatus,
     /// Model calls this Mac is answering right now.
     pub in_flight: usize,
-    /// It has stopped for good: another Mac took over, or the server turned the token away. Only
-    /// switching it off and on again starts it.
+    /// It has stopped: another Mac took over, or the server turned the token away. Switching it
+    /// off and on again starts it; after the token was turned away, so does this Mac enrolling
+    /// again, which the relay follows by itself.
     pub halted: bool,
 }
 
@@ -310,7 +319,8 @@ pub(crate) enum RelayAnswered {
 
 /// The calls this Mac is answering, by the `requestId` their frame carried, so that a `cancel`
 /// naming one can stop it. A call takes itself out when it is answered. Kept across reconnects:
-/// the answer goes back by its id, whichever stream the call came in on.
+/// the answer goes back by its id, whichever stream holds the relay by then, with the token of
+/// the stream the call came in on.
 type Running = Arc<Mutex<HashMap<String, JoinHandle<()>>>>;
 
 /// The running relay. Dropping it stops it, and every call it was answering: switched off,
@@ -368,12 +378,14 @@ impl fmt::Debug for RelayHandle {
     }
 }
 
-/// Start answering for the person: open the stream with this Mac's machine token and serve it
-/// until the handle is dropped, the server hands the relay to another Mac, or it refuses the
-/// token. On the tokio runtime, which the app enters at startup.
+/// Start answering for the person: open the stream with the credential local-exec enrolled this
+/// Mac with, and serve it until the handle is dropped or the server hands the relay to another
+/// Mac. A token the server turns away stops it until this Mac enrols again, and then it starts
+/// again with the new credential by itself. On the tokio runtime, which the app enters at
+/// startup.
 pub fn start_relay(
     client: OpenGrokClient,
-    machine: MachineCredential,
+    enrolment: Enrolment,
     target: RelayTarget,
     timings: RelayTimings,
 ) -> RelayHandle {
@@ -386,14 +398,13 @@ pub fn start_relay(
     let running = Running::default();
     let relay = Arc::new(Relay {
         client,
-        machine,
         target: target_rx,
         opencodex: opencodex_client(),
         report,
         running: Arc::clone(&running),
         halt,
     });
-    let serving = tokio::spawn(serve(relay, halts, timings));
+    let serving = tokio::spawn(serve(relay, enrolment, halts, timings));
     RelayHandle {
         reports,
         target: target_tx,
@@ -417,13 +428,14 @@ fn opencodex_client() -> reqwest::Client {
 
 struct Relay {
     client: OpenGrokClient,
-    machine: MachineCredential,
     target: watch::Receiver<RelayTarget>,
     opencodex: reqwest::Client,
     report: watch::Sender<RelayReport>,
     running: Running,
-    /// An answer the server refused for the token tells the stream to stop.
-    halt: mpsc::UnboundedSender<()>,
+    /// An answer the server refused for its token tells the stream to stop, with the credential
+    /// it went with: the stream stops only if it holds that one. An answer to a call off a stream
+    /// opened before this Mac enrolled again went with a token the relay no longer holds.
+    halt: mpsc::UnboundedSender<MachineCredential>,
 }
 
 /// How one stream ended.
@@ -438,17 +450,33 @@ enum Ended {
     TokenRefused,
 }
 
-async fn serve(relay: Arc<Relay>, mut halts: mpsc::UnboundedReceiver<()>, timings: RelayTimings) {
+async fn serve(
+    relay: Arc<Relay>,
+    mut enrolment: Enrolment,
+    mut halts: mpsc::UnboundedReceiver<MachineCredential>,
+    timings: RelayTimings,
+) {
     let mut wait = timings.first_wait;
+    // The credential the server last turned away, until this Mac enrols with another.
+    let mut refused = None;
     loop {
-        match relay.stream_once(&mut halts, timings.quiet).await {
+        let Some(machine) = next_credential(&mut enrolment, refused.as_ref()).await else {
+            return;
+        };
+        if refused.take().is_some() {
+            // Enrolled again: the new token is tried at once, and the waits start over.
+            wait = timings.first_wait;
+            relay.set_status(RelayStatus::Connecting, false);
+        }
+        match relay.stream_once(&machine, &mut halts, timings.quiet).await {
             Ended::Replaced => {
                 relay.set_status(RelayStatus::Replaced, true);
                 return;
             }
             Ended::TokenRefused => {
                 relay.set_status(RelayStatus::Error(TOKEN_REFUSED.into()), true);
-                return;
+                refused = Some(machine);
+                continue;
             }
             Ended::Answered => {
                 wait = timings.first_wait;
@@ -456,14 +484,50 @@ async fn serve(relay: Arc<Relay>, mut halts: mpsc::UnboundedReceiver<()>, timing
             }
             Ended::Failed(why) => relay.set_status(RelayStatus::Error(why), false),
         }
-        tokio::select! {
-            _ = tokio::time::sleep(wait) => {}
-            Some(()) = halts.recv() => {
-                relay.set_status(RelayStatus::Error(TOKEN_REFUSED.into()), true);
-                return;
-            }
+        if turned_away_meanwhile(wait, &machine, &mut halts).await {
+            relay.set_status(RelayStatus::Error(TOKEN_REFUSED.into()), true);
+            refused = Some(machine);
+            continue;
         }
         wait = (wait * 2).min(timings.longest_wait);
+    }
+}
+
+/// The credential to open the stream with: the newest local-exec holds, or, while that is the one
+/// the server turned away (`refused`), the next it enrols this Mac with, however long that takes.
+/// `None` once local-exec has stopped with no other to give.
+async fn next_credential(
+    enrolment: &mut Enrolment,
+    refused: Option<&MachineCredential>,
+) -> Option<MachineCredential> {
+    loop {
+        if let Some(machine) = enrolment.borrow_and_update().as_ref()
+            && Some(machine) != refused
+        {
+            return Some(machine.clone());
+        }
+        enrolment.changed().await.ok()?;
+    }
+}
+
+/// Wait `wait` before opening the stream again: `true` if meanwhile an answer was turned away for
+/// the token `machine` holds, which would be turned away again.
+async fn turned_away_meanwhile(
+    wait: Duration,
+    machine: &MachineCredential,
+    halts: &mut mpsc::UnboundedReceiver<MachineCredential>,
+) -> bool {
+    let waited = tokio::time::sleep(wait);
+    tokio::pin!(waited);
+    loop {
+        tokio::select! {
+            () = &mut waited => return false,
+            Some(refused) = halts.recv() => {
+                if refused == *machine {
+                    return true;
+                }
+            }
+        }
     }
 }
 
@@ -485,16 +549,16 @@ impl Relay {
         });
     }
 
+    /// One stream, opened with `machine`'s token, read until it ends. The calls it brings are
+    /// answered with that token.
     async fn stream_once(
         self: &Arc<Self>,
-        halts: &mut mpsc::UnboundedReceiver<()>,
+        machine: &MachineCredential,
+        halts: &mut mpsc::UnboundedReceiver<MachineCredential>,
         quiet: Duration,
     ) -> Ended {
-        let opened = tokio::time::timeout(
-            quiet,
-            self.client.open_inference_relay(self.machine.token()),
-        )
-        .await;
+        let opened =
+            tokio::time::timeout(quiet, self.client.open_inference_relay(machine.token())).await;
         let response = match opened {
             Err(_) => return Ended::Failed(SERVER_QUIET.into()),
             Ok(Err(error)) if token_turned_away(&error) => return Ended::TokenRefused,
@@ -505,7 +569,14 @@ impl Relay {
         let mut answering = false;
         loop {
             let next = tokio::select! {
-                Some(()) = halts.recv() => return Ended::TokenRefused,
+                Some(refused) = halts.recv() => {
+                    if refused == *machine {
+                        return Ended::TokenRefused;
+                    }
+                    // An answer to a call off a stream opened before this Mac enrolled again,
+                    // turned away for the token it held then: nothing to do with this one.
+                    continue;
+                }
                 next = tokio::time::timeout(quiet, frames.next_frame()) => next,
             };
             let frame = match next {
@@ -525,25 +596,27 @@ impl Relay {
                     self.set_status(RelayStatus::Answering, false);
                 }
                 RelayFrame::Replaced => return Ended::Replaced,
-                frame => self.take_frame(frame),
+                frame => self.take_frame(frame, machine),
             }
         }
     }
 
-    /// A call off the stream: answer it in a task of its own, so calls run side by side; or stop
-    /// the one a `cancel` names. Anything else is not a call.
-    fn take_frame(self: &Arc<Self>, frame: RelayFrame) {
+    /// A call off the stream `machine` opened: answer it in a task of its own, so calls run side
+    /// by side; or stop the one a `cancel` names. Anything else is not a call.
+    fn take_frame(self: &Arc<Self>, frame: RelayFrame, machine: &MachineCredential) {
         match frame {
             RelayFrame::Infer {
                 request_id,
                 model,
                 request,
                 ..
-            } => self.answer_in_turn(request_id, move |relay| async move {
+            } => self.answer_in_turn(request_id, machine, move |relay| async move {
                 relay.infer(model, request).await
             }),
             RelayFrame::Models { request_id } => {
-                self.answer_in_turn(request_id, |relay| async move { relay.list_models().await });
+                self.answer_in_turn(request_id, machine, |relay| async move {
+                    relay.list_models().await
+                });
             }
             RelayFrame::Cancel { request_id } => self.cancel(&request_id),
             RelayFrame::Ready { .. }
@@ -553,8 +626,12 @@ impl Relay {
         }
     }
 
-    fn answer_in_turn<F, Fut>(self: &Arc<Self>, request_id: String, ask: F)
-    where
+    fn answer_in_turn<F, Fut>(
+        self: &Arc<Self>,
+        request_id: String,
+        machine: &MachineCredential,
+        ask: F,
+    ) where
         F: FnOnce(Arc<Relay>) -> Fut + Send + 'static,
         Fut: std::future::Future<Output = RelayAnswer> + Send + 'static,
     {
@@ -567,10 +644,10 @@ impl Relay {
             return;
         }
         let relay = Arc::clone(self);
-        let id = request_id.clone();
+        let (id, machine) = (request_id.clone(), machine.clone());
         let call = tokio::spawn(async move {
             let answer = ask(Arc::clone(&relay)).await;
-            relay.answer(&id, answer).await;
+            relay.answer(&machine, &id, answer).await;
             let left = {
                 let mut running = relay.running.lock().unwrap_or_else(PoisonError::into_inner);
                 running.remove(&id);
@@ -669,17 +746,23 @@ impl Relay {
         }
     }
 
-    async fn answer(&self, request_id: &str, answer: RelayAnswer) {
+    /// Post a call's answer with the token of the stream the call came in on. The server keeps a
+    /// call for the machine it sent it to (`Ask` in opengrok-server's
+    /// `crates/opengrok-harness/src/relay.rs`, server main cad36fd (#303, after #298), pin 47a5d6b)
+    /// and refuses any other's with the same `401` as a retired token, so a token this Mac enrolled
+    /// with since, for another machine, could not answer it either, and would read as that token
+    /// turned away.
+    async fn answer(&self, machine: &MachineCredential, request_id: &str, answer: RelayAnswer) {
         match self
             .client
-            .answer_inference_relay(self.machine.token(), request_id, answer)
+            .answer_inference_relay(machine.token(), request_id, answer)
             .await
         {
             // A call the server gave up on, or never had, is as good as cancelled: nothing to
             // say. One answered already was somebody's answer, and that one stands.
             Ok(RelayAnswered::Taken | RelayAnswered::Gone | RelayAnswered::AlreadyAnswered) => {}
             Ok(RelayAnswered::TokenRefused) => {
-                let _ = self.halt.send(());
+                let _ = self.halt.send(machine.clone());
             }
             // The run already says so, in the server's words; the Mac has nothing to add, and
             // the same answer would be cut off again.
@@ -694,7 +777,8 @@ impl Relay {
 }
 
 /// The server refused the stream because it no longer takes this Mac's token: a `401`, which the
-/// relay stops for rather than knocking again with a token that would be turned away again.
+/// relay stops for rather than knocking again with a token that would be turned away again,
+/// until this Mac enrols again with a new one.
 pub(super) fn token_turned_away(error: &OpenGrokError) -> bool {
     error.status == Some(401)
 }
@@ -864,10 +948,18 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     const TOKEN: &str = "tok_machine";
+    /// The token this Mac holds once it has enrolled again.
+    const NEW_TOKEN: &str = "tok_enrolled_again";
     const KEY: &str = "opencodex-test-key-4f2a";
 
     fn machine() -> MachineCredential {
         MachineCredential::new("mac_1", TOKEN)
+    }
+
+    /// This Mac enrolled as [`machine`], the way local-exec hands its credential on: the sender,
+    /// for a test to enrol it again with, and the relay's end.
+    fn enrolled() -> (watch::Sender<Option<MachineCredential>>, Enrolment) {
+        watch::channel(Some(machine()))
     }
 
     fn target(address: &str, key: Option<&str>) -> RelayTarget {
@@ -909,7 +1001,6 @@ mod tests {
         let (halt, _) = mpsc::unbounded_channel();
         Arc::new(Relay {
             client: OpenGrokClient::new(&server.uri()).unwrap(),
-            machine: machine(),
             target,
             opencodex: opencodex_client(),
             report,
@@ -1047,9 +1138,10 @@ mod tests {
             "{printed}"
         );
         let server = MockServer::start().await;
+        let (_enrolled, enrolment) = enrolled();
         let handle = start_relay(
             OpenGrokClient::new(&server.uri()).unwrap(),
-            machine(),
+            enrolment,
             target.clone(),
             quick(),
         );
@@ -1093,7 +1185,7 @@ mod tests {
         let relay = relay(&server, target(&opencodex.uri(), Some(KEY)));
 
         let frame = infer("req_1", "gpt-5-codex");
-        relay.take_frame(RelayFrame::from_value(&frame));
+        relay.take_frame(RelayFrame::from_value(&frame), &machine());
         until("the answer reached the server", async || {
             !answers_to(&server, "req_1").await.is_empty()
         })
@@ -1151,15 +1243,19 @@ mod tests {
             .await;
         let relay = relay(&server, target(&opencodex.uri(), None));
 
-        relay.take_frame(RelayFrame::from_value(&infer("req_1", "gpt-5-codex")));
+        relay.take_frame(
+            RelayFrame::from_value(&infer("req_1", "gpt-5-codex")),
+            &machine(),
+        );
         until("opencodex was asked", async || {
             !opencodex.received_requests().await.unwrap().is_empty()
         })
         .await;
         assert_eq!(relay.report.borrow().in_flight, 1);
-        relay.take_frame(RelayFrame::from_value(
-            &json!({"type": "cancel", "requestId": "req_1"}),
-        ));
+        relay.take_frame(
+            RelayFrame::from_value(&json!({"type": "cancel", "requestId": "req_1"})),
+            &machine(),
+        );
         assert!(relay.running.lock().unwrap().is_empty());
         assert_eq!(relay.report.borrow().in_flight, 0);
         // Long enough for opencodex's delayed answer, had the call gone on to post it.
@@ -1185,10 +1281,13 @@ mod tests {
             .await;
         let relay = relay(&server, target(&opencodex.uri(), Some(KEY)));
 
-        relay.take_frame(RelayFrame::from_value(&infer("req_1", "claude-opus-4")));
+        relay.take_frame(
+            RelayFrame::from_value(&infer("req_1", "claude-opus-4")),
+            &machine(),
+        );
         let mut smuggled = infer("req_2", "gpt-5-codex");
         smuggled["request"]["model"] = json!("gemini-2.5-pro");
-        relay.take_frame(RelayFrame::from_value(&smuggled));
+        relay.take_frame(RelayFrame::from_value(&smuggled), &machine());
         for id in ["req_1", "req_2"] {
             until("the refusal reached the server", async || {
                 !answers_to(&server, id).await.is_empty()
@@ -1227,7 +1326,10 @@ mod tests {
             &server,
             target(&format!("http://127.0.0.1:{port}"), Some(KEY)),
         );
-        down.take_frame(RelayFrame::from_value(&infer("req_1", "gpt-5-codex")));
+        down.take_frame(
+            RelayFrame::from_value(&infer("req_1", "gpt-5-codex")),
+            &machine(),
+        );
         until("the sentence reached the server", async || {
             !answers_to(&server, "req_1").await.is_empty()
         })
@@ -1248,7 +1350,10 @@ mod tests {
             .mount(&opencodex)
             .await;
         let refusing = relay(&server, target(&opencodex.uri(), Some(KEY)));
-        refusing.take_frame(RelayFrame::from_value(&infer("req_2", "gpt-5-codex")));
+        refusing.take_frame(
+            RelayFrame::from_value(&infer("req_2", "gpt-5-codex")),
+            &machine(),
+        );
         until("the refusal reached the server", async || {
             !answers_to(&server, "req_2").await.is_empty()
         })
@@ -1280,9 +1385,10 @@ mod tests {
             .mount(&server)
             .await;
         let relay = relay(&server, target(&opencodex.uri(), Some(KEY)));
-        relay.take_frame(RelayFrame::from_value(
-            &json!({"type": "models", "requestId": "req_m"}),
-        ));
+        relay.take_frame(
+            RelayFrame::from_value(&json!({"type": "models", "requestId": "req_m"})),
+            &machine(),
+        );
         until("the list reached the server", async || {
             !answers_to(&server, "req_m").await.is_empty()
         })
@@ -1348,9 +1454,10 @@ mod tests {
                 .expect(1)
                 .mount(&server)
                 .await;
+            let (_enrolled, enrolment) = enrolled();
             let handle = start_relay(
                 OpenGrokClient::new(&server.uri()).unwrap(),
-                machine(),
+                enrolment,
                 target(&opencodex.uri(), None),
                 quick(),
             );
@@ -1397,9 +1504,10 @@ mod tests {
             .expect(1)
             .mount(&server)
             .await;
+        let (_enrolled, enrolment) = enrolled();
         let handle = start_relay(
             OpenGrokClient::new(&server.uri()).unwrap(),
-            machine(),
+            enrolment,
             target("http://127.0.0.1:8080", None),
             quick(),
         );
@@ -1427,7 +1535,8 @@ mod tests {
     }
 
     /// A stream that drops is opened again after a wait, and one that fails to open is tried
-    /// again with a longer one; a server that turns the token away stops it for good, and says so.
+    /// again with a longer one; a server that turns the token away stops it, and it says so, and
+    /// asks nothing more while this Mac holds that token.
     #[tokio::test]
     async fn a_dropped_stream_is_opened_again_and_a_refused_token_stops_it() {
         let server = MockServer::start().await;
@@ -1447,9 +1556,10 @@ mod tests {
             )
             .mount(&server)
             .await;
+        let (_enrolled, enrolment) = enrolled();
         let handle = start_relay(
             OpenGrokClient::new(&server.uri()).unwrap(),
-            machine(),
+            enrolment,
             target("http://127.0.0.1:8080", None),
             quick(),
         );
@@ -1471,6 +1581,287 @@ mod tests {
             3,
             "and not again"
         );
+    }
+
+    /// How many times the relay's stream was opened with `token`.
+    async fn opened_with(server: &MockServer, token: &str) -> usize {
+        let bearer = format!("Bearer {token}");
+        server
+            .received_requests()
+            .await
+            .expect("the recorder is on")
+            .iter()
+            .filter(|request| {
+                request.url.path() == "/inference-relay/requests"
+                    && request
+                        .headers
+                        .get("authorization")
+                        .is_some_and(|sent| sent == bearer.as_str())
+            })
+            .count()
+    }
+
+    /// The stream the server sends a Mac it holds nothing for: `ready`, and then it ends.
+    fn ready_and_ends() -> ResponseTemplate {
+        ResponseTemplate::new(200).set_body_raw(
+            sse(&[json!({"type": "ready", "machineId": "mac_1"})]),
+            "text/event-stream",
+        )
+    }
+
+    /// The server's word to a token it has retired (`machine` in opengrok-server's
+    /// `crates/opengrok-server/src/inference.rs`).
+    fn retired() -> ResponseTemplate {
+        ResponseTemplate::new(401).set_body_json(json!({"error": "enrol this machine first"}))
+    }
+
+    /// Re-enrolling a Mac ends the stream its old token opened with no word on it
+    /// (opengrok-server main cad36fd (#303, after #298), pin 47a5d6b). That reads as any drop, and
+    /// the stream is opened again after a wait: with the old token, which the server has retired,
+    /// so it is refused, and the relay stops and asks nothing more while this Mac holds that token.
+    /// Once local-exec has enrolled this Mac again, the relay starts by itself with the new token,
+    /// and answers. It used to stay stopped until the switch was turned off and on.
+    #[tokio::test]
+    async fn a_relay_stopped_for_a_retired_token_starts_again_once_this_mac_enrols_again() {
+        let server = MockServer::start().await;
+        let opencodex = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw("data: [DONE]\n\n", "text/event-stream"),
+            )
+            .mount(&opencodex)
+            .await;
+        let (old, new) = (format!("Bearer {TOKEN}"), format!("Bearer {NEW_TOKEN}"));
+        Mock::given(method("GET"))
+            .and(path("/inference-relay/requests"))
+            .and(header("authorization", old.as_str()))
+            .respond_with(ready_and_ends())
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/inference-relay/requests"))
+            .and(header("authorization", old.as_str()))
+            .respond_with(retired())
+            .mount(&server)
+            .await;
+        // The new token's first stream brings a call; the ones after it have nothing to ask.
+        Mock::given(method("GET"))
+            .and(path("/inference-relay/requests"))
+            .and(header("authorization", new.as_str()))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                sse(&[
+                    json!({"type": "ready", "machineId": "mac_1"}),
+                    infer("req_2", "gpt-5-codex"),
+                ]),
+                "text/event-stream",
+            ))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/inference-relay/requests"))
+            .and(header("authorization", new.as_str()))
+            .respond_with(ready_and_ends())
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/inference-relay/responses/req_2"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        let (enrolling, enrolment) = enrolled();
+        let handle = start_relay(
+            OpenGrokClient::new(&server.uri()).unwrap(),
+            enrolment,
+            target(&opencodex.uri(), None),
+            quick(),
+        );
+        let mut reports = handle.reports();
+        let stopped = tokio::time::timeout(
+            Duration::from_secs(10),
+            reports.wait_for(|report| report.halted),
+        )
+        .await
+        .expect("the old token is turned away")
+        .expect("the relay reports")
+        .clone();
+        assert_eq!(stopped.status, RelayStatus::Error(TOKEN_REFUSED.into()));
+        // Several times the longest wait between attempts: none is made with the old token.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(
+            opened_with(&server, TOKEN).await,
+            2,
+            "answering, then refused"
+        );
+        assert!(
+            handle.report().halted,
+            "stopped while the token is the same"
+        );
+
+        enrolling.send_replace(Some(MachineCredential::new("mac_1", NEW_TOKEN)));
+        let started = tokio::time::timeout(
+            Duration::from_secs(10),
+            reports.wait_for(|report| !report.halted),
+        )
+        .await
+        .expect("it starts again with the new token")
+        .expect("the relay reports")
+        .clone();
+        assert!(
+            matches!(
+                started.status,
+                RelayStatus::Connecting | RelayStatus::Answering
+            ),
+            "{started:?}"
+        );
+        until(
+            "the new token's stream brought its call, answered",
+            async || !answers_to(&server, "req_2").await.is_empty(),
+        )
+        .await;
+        let posted = &answers_to(&server, "req_2").await[0];
+        assert_eq!(posted.headers.get("authorization").unwrap(), new.as_str());
+        assert_eq!(opened_with(&server, TOKEN).await, 2, "nor ever again");
+    }
+
+    /// A Mac enrolled again by the time its ended stream is opened again opens it with the new
+    /// token: the old one, which the server would turn away, is not tried again.
+    #[tokio::test]
+    async fn a_stream_opened_again_goes_with_the_newest_token() {
+        let server = MockServer::start().await;
+        let old = format!("Bearer {TOKEN}");
+        Mock::given(method("GET"))
+            .and(path("/inference-relay/requests"))
+            .and(header("authorization", old.as_str()))
+            .respond_with(ready_and_ends())
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/inference-relay/requests"))
+            .and(header("authorization", old.as_str()))
+            .respond_with(retired())
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/inference-relay/requests"))
+            .and(header(
+                "authorization",
+                format!("Bearer {NEW_TOKEN}").as_str(),
+            ))
+            .respond_with(ready_and_ends())
+            .mount(&server)
+            .await;
+        let (enrolling, enrolment) = enrolled();
+        // Time between the stream ending and its opening again for this Mac to enrol.
+        let timings = RelayTimings {
+            first_wait: Duration::from_millis(500),
+            longest_wait: Duration::from_millis(500),
+            ..quick()
+        };
+        let handle = start_relay(
+            OpenGrokClient::new(&server.uri()).unwrap(),
+            enrolment,
+            target("http://127.0.0.1:8080", None),
+            timings,
+        );
+        until("the stream opened", async || {
+            opened_with(&server, TOKEN).await >= 1
+        })
+        .await;
+        enrolling.send_replace(Some(MachineCredential::new("mac_1", NEW_TOKEN)));
+        until("the stream opened again with the new token", async || {
+            opened_with(&server, NEW_TOKEN).await >= 1
+        })
+        .await;
+        assert_eq!(opened_with(&server, TOKEN).await, 1, "the old token once");
+        assert!(!handle.report().halted, "{:?}", handle.report());
+    }
+
+    /// A call that came in on the stream the old token opened is answered with that token, as the
+    /// server holds the call for the machine it sent it to, and the server, which has retired the
+    /// token, turns the answer away. That is no word on the token this Mac enrolled with since:
+    /// the stream the new one opened goes on.
+    #[tokio::test]
+    async fn an_answer_turned_away_for_an_old_token_stops_nothing_on_the_new_one() {
+        let server = MockServer::start().await;
+        let opencodex = MockServer::start().await;
+        // opencodex takes its time, so the answer goes once this Mac has enrolled again.
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw("data: [DONE]\n\n", "text/event-stream")
+                    .set_delay(Duration::from_millis(800)),
+            )
+            .mount(&opencodex)
+            .await;
+        let old = format!("Bearer {TOKEN}");
+        Mock::given(method("GET"))
+            .and(path("/inference-relay/requests"))
+            .and(header("authorization", old.as_str()))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                sse(&[
+                    json!({"type": "ready", "machineId": "mac_1"}),
+                    infer("req_1", "gpt-5-codex"),
+                ]),
+                "text/event-stream",
+            ))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/inference-relay/requests"))
+            .and(header("authorization", old.as_str()))
+            .respond_with(retired())
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/inference-relay/requests"))
+            .and(header(
+                "authorization",
+                format!("Bearer {NEW_TOKEN}").as_str(),
+            ))
+            .respond_with(ready_and_ends())
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/inference-relay/responses/req_1"))
+            .respond_with(retired())
+            .mount(&server)
+            .await;
+        let (enrolling, enrolment) = enrolled();
+        let handle = start_relay(
+            OpenGrokClient::new(&server.uri()).unwrap(),
+            enrolment,
+            target(&opencodex.uri(), None),
+            quick(),
+        );
+        until("the call came in", async || {
+            opened_with(&server, TOKEN).await >= 1
+        })
+        .await;
+        enrolling.send_replace(Some(MachineCredential::new("mac_2", NEW_TOKEN)));
+        until("the answer went, and was turned away", async || {
+            !answers_to(&server, "req_1").await.is_empty()
+        })
+        .await;
+        let posted = &answers_to(&server, "req_1").await[0];
+        assert_eq!(
+            posted.headers.get("authorization").unwrap(),
+            old.as_str(),
+            "answered with the token of the stream it came in on"
+        );
+        let opened = opened_with(&server, NEW_TOKEN).await;
+        assert!(opened >= 1, "the new token's stream was open by then");
+        // Several times the longest wait: the new token's stream goes on being opened after each
+        // drop, as it would not be once stopped.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let report = handle.report();
+        assert!(!report.halted, "{report:?}");
+        assert!(opened_with(&server, NEW_TOKEN).await > opened);
     }
 
     /// A stream that goes quiet past three pings is given up and opened again, however open it
@@ -1507,9 +1898,10 @@ mod tests {
             quiet: Duration::from_millis(300),
             ..quick()
         };
+        let (_enrolled, enrolment) = enrolled();
         let handle = start_relay(
             OpenGrokClient::new(&format!("http://{address}")).unwrap(),
-            machine(),
+            enrolment,
             target("http://127.0.0.1:8080", None),
             timings,
         );
