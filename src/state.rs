@@ -13,8 +13,8 @@ pub use crate::cron_spec::{
 use crate::opengrok::{
     Account, ActivityTick, AguiMessage, ApprovalSpec, BotActivity, BoxHandoffReply,
     BoxHandoffResolution, BoxShareScope, ChatPart, ChoiceCard, ComputerHandoffStatus,
-    ConnectedComputer, Coworker, CoworkerComputer, CoworkerPatch, EFFORT_INHERIT, Failure,
-    FormResolution, FormSpec, ImageVisibility, InferenceKind, InferenceSource,
+    ConnectedComputer, Coworker, CoworkerComputer, CoworkerPatch, EFFORT_INHERIT, Enrolment,
+    Failure, FormResolution, FormSpec, ImageVisibility, InferenceKind, InferenceSource,
     InferenceSourceUpdate, LocalExecMode, LocalExecPolicy, LocalExecResolution, ModelCatalogue,
     ModelEntry, NewSchedule, NewSkill, OpenGrokClient, OpenGrokError, PendingCustom, PendingOp,
     PendingUserMessage, PendingWrite, ProfileUpdate, ProxyKey, QueuedApproval, RecipeDetail,
@@ -31,8 +31,8 @@ use crate::opengrok::{
     command_from_replay_events, deeds_from_replay, enrol_this_machine, env_egress_tunnel_enabled,
     host_egress_tunnel_available, host_egress_tunnel_flag, keep_local_save_offer, persons_messages,
     place_hitl_cards_in_document_order, policy_answer, reads_as_gateway_unreachable, retry_enqueue,
-    save_login_from_local, serve_local_exec, stamp_duration, start_relay, stored_machine,
-    stored_machine_id, tool_standin,
+    save_login_from_local, serve_local_exec, stamp_duration, start_relay, stored_machine_id,
+    tool_standin,
 };
 use crate::reachability::Reachability;
 use crate::relay_key::RelayKeyStore;
@@ -828,8 +828,7 @@ pub struct RelayMac {
     pub report: Option<RelayReport>,
 }
 
-/// Why the relay did not start: this Mac's enrolment could not be read back from the file it
-/// wrote.
+/// Why the relay did not start: local-exec holds no credential for this Mac to answer with.
 const RELAY_NO_CREDENTIAL: &str =
     "This Mac's enrolment could not be read. Sign out and in again to enrol it.";
 
@@ -4881,6 +4880,9 @@ pub struct AppState {
     pub approval_decisions: HashMap<String, ApprovalDecision>,
     pub local_exec_machine_id: Option<String>,
     local_exec_cancel: Option<Arc<AtomicBool>>,
+    /// This Mac's credential as local-exec holds it, while local-exec runs: the relay opens its
+    /// stream and answers with it, and follows it when local-exec enrols this Mac again.
+    local_exec_enrolment: Option<Enrolment>,
     pub expanded_shell_output: HashSet<String>,
     /// The step rows, groups of steps and Thought rows the person has opened, by the keys
     /// `components::steps` gives them. Not saved: every one of them is shut when a thread is
@@ -4950,8 +4952,10 @@ pub struct AppState {
     /// Answer with this Mac: the switch, this Mac's opencodex, and the running relay's word on
     /// itself (hexuria/nativechat #156, opengrok-server #292).
     pub relay_mac: RelayMac,
-    /// The relay, while it runs, or once it has stopped for good and says why. Dropping it stops
-    /// it, with every call it was answering: switched off, signed out, or the app quitting.
+    /// The relay, while it runs, or once it has stopped and says why: for good after another Mac
+    /// took over, and until this Mac enrols again after the server turned its token away.
+    /// Dropping it stops it, with every call it was answering: switched off, signed out, or the
+    /// app quitting.
     relay_worker: Option<RelayHandle>,
     /// A start of the relay reading its key, by its number, so a second is not begun meanwhile.
     relay_starting: Option<u64>,
@@ -5523,6 +5527,7 @@ impl AppState {
             approval_decisions: HashMap::new(),
             local_exec_machine_id: None,
             local_exec_cancel: None,
+            local_exec_enrolment: None,
             expanded_shell_output: HashSet::new(),
             expanded_steps: HashSet::new(),
             computers: Vec::new(),
@@ -8326,8 +8331,9 @@ impl AppState {
     }
 
     /// Start the relay where it should run and does not, and stop it where it runs and should
-    /// not. One that stopped for good (another Mac took over, or the server turned its token
-    /// away) is left stopped until the switch is turned off and on.
+    /// not. One that stopped is left as it is. After another Mac took over, only the switch turned
+    /// off and on starts it; after the server turned its token away, so does local-exec enrolling
+    /// this Mac again, which the relay follows by itself ([`Enrolment`]).
     fn ensure_relay(&mut self, cx: &mut Context<Self>) {
         if !self.relay_wanted() {
             if self.relay_worker.is_some() || self.relay_starting.is_some() {
@@ -8344,12 +8350,16 @@ impl AppState {
     /// Start the relay: its key is read from the Keychain off the main thread, since the
     /// Keychain may ask the person first, and then it opens the stream on the tokio runtime.
     fn begin_relay(&mut self, cx: &mut Context<Self>) {
-        let (Some(client), Some(config)) = (self.opengrok.clone(), self.config.clone()) else {
+        let Some(client) = self.opengrok.clone() else {
             return;
         };
         // What would keep it from starting is said where the relay's status is, rather than a
         // switch that is on and a line that only says it is not connected.
-        let Some(machine) = stored_machine(&config.data_dir) else {
+        let Some(enrolment) = self
+            .local_exec_enrolment
+            .clone()
+            .filter(|enrolment| enrolment.borrow().is_some())
+        else {
             self.relay_mac.report = Some(relay_cannot_start(RELAY_NO_CREDENTIAL));
             return;
         };
@@ -8382,7 +8392,7 @@ impl AppState {
                 });
                 let handle = start_relay(
                     client,
-                    machine,
+                    enrolment,
                     RelayTarget {
                         address,
                         key: key.map(Arc::new),
@@ -15459,9 +15469,16 @@ impl AppState {
         self.stop_local_exec();
         let cancel = Arc::new(AtomicBool::new(false));
         self.local_exec_cancel = Some(cancel.clone());
+        // Each credential local-exec enrols this Mac with, for the relay to follow: a relay the
+        // server turned the old token away from starts again with the new one.
+        let (enrolled, enrolment) = tokio::sync::watch::channel(None);
+        self.local_exec_enrolment = Some(enrolment);
         cx.spawn(async move |this, cx| {
             match enrol_this_machine(&client, &config.data_dir).await {
-                Ok(machine_id) => {
+                Ok(machine) => {
+                    let machine_id = machine.machine_id().to_string();
+                    // Held before the relay is asked for, which opens its stream with it.
+                    enrolled.send_replace(Some(machine));
                     let _ = this.update(cx, |state, cx| {
                         state.local_exec_machine_id = Some(machine_id);
                         state.refresh_computers(cx);
@@ -15474,7 +15491,7 @@ impl AppState {
                     eprintln!("NativeChat local-exec: {error}");
                 }
             }
-            serve_local_exec(client, config.data_dir, cancel).await;
+            serve_local_exec(client, config.data_dir, cancel, enrolled).await;
         })
         .detach();
     }
@@ -15485,6 +15502,7 @@ impl AppState {
         }
         self.local_exec_cancel = None;
         self.local_exec_machine_id = None;
+        self.local_exec_enrolment = None;
     }
 
     pub fn toggle_shell_output(&mut self, call_id: String, cx: &mut Context<Self>) {

@@ -40,7 +40,7 @@ pub use inference::{
     ReplySource, TurnSource, Via, is_loopback, is_subscription_model,
 };
 pub use local_exec::{
-    MachineCredential, enrol_this_machine, serve_local_exec, stored_machine, stored_machine_id,
+    Enrolment, MachineCredential, enrol_this_machine, serve_local_exec, stored_machine_id,
 };
 pub use relay::{
     OpencodexAddress, RelayHandle, RelayKey, RelayReport, RelayStatus, RelayTarget, RelayTimings,
