@@ -1128,8 +1128,8 @@ const WITHHELD_ARGUMENTS: &[(&str, &str, Withheld)] = &[
 ];
 
 /// The server's own tools, which withhold only what [`WITHHELD_ARGUMENTS`] names. Any other tool
-/// is a plugin's. `use_skill` is the one a bot reads an attached skill through (#270), not
-/// recorded yet: its `name` is kept as sent, which the plugin rule would not do for a long one.
+/// is a plugin's. `use_skill` is the one a bot reads an attached skill through (#270, recorded
+/// since #290): its `name` is kept as sent, which the plugin rule would not do for a long one.
 const SERVERS_TOOLS: &[&str] = &[
     "shell",
     USER_MACHINE_SHELL,
@@ -4798,8 +4798,8 @@ fn a_coworker_rows_effort_has_a_reading_in_the_ledger() {
     .unwrap();
 }
 
-/// A bot's skills' reading, fed bodies in the shape agreed for opengrok-server#270 until the
-/// server's own are recorded, for the read and for the write's answer alike: skills of both
+/// A bot's skills' reading, fed bodies in the shape agreed for opengrok-server#270 beyond the ones
+/// the corpus records (#290), for the read and for the write's answer alike: skills of both
 /// scopes, attached and not, one switched off and still attached, at a version and at none, an
 /// empty list, the refusals (not the owner's, a withdrawn grant, an id the server does not list,
 /// the cap, a version it has moved on from), and the ways a body could go wrong.
@@ -4887,8 +4887,8 @@ fn a_bots_skills_have_a_reading_in_the_ledger() {
     }
 }
 
-/// `use_skill` (#270) is not recorded yet, and a recording of it is to read as the server's own
-/// tool the day it arrives: the call says which skill is being read rather than "Using
+/// `use_skill` (#270, recorded since #290) reads as the server's own tool, beyond the one turn the
+/// corpus records: the call says which skill is being read rather than "Using
 /// use_skill", the turn that only read one says what it did, and the step keeps the skill's name
 /// as sent, by the rule for the server's own tools — a long name, which reads as a key to the
 /// plugin rule, included.
