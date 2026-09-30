@@ -1776,6 +1776,7 @@ mod tests {
         .map(|id| ModelEntry {
             id: id.into(),
             source: None,
+            via: None,
         })
         .collect()
     }
@@ -1788,6 +1789,7 @@ mod tests {
         let entry = |id: &str, source: Option<&str>| ModelEntry {
             id: id.into(),
             source: source.map(str::to_string),
+            via: None,
         };
         let catalogue = vec![
             entry("oag/cheap", None),

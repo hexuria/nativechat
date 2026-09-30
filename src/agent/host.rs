@@ -2398,6 +2398,10 @@ fn invoke_arg_str(args: &serde_json::Value, keys: &[&str]) -> Option<String> {
     })
 }
 
+/// The state on the composer's chip and on a reply's badge while the door is the person's plan
+/// through their Mac, so an assert need not match the words.
+const VIA_MAC: &str = "via-mac";
+
 /// Settings → Reply source as the page draws it. The typed key is not copied here: the tree says
 /// only that one is waiting for Save, never what it is.
 #[derive(Default)]
@@ -3256,27 +3260,35 @@ impl NativeChatHost {
         }
         // Which door the next turns go through, while there is a choice to make: label as the
         // chip reads, value the door's wire word, state `picked` while it is the person's pick
-        // and not the account's own door.
+        // and not the account's own door, and `via-mac` while it is the plan through the
+        // person's Mac.
         if let Some(chip) = &self.turn_source {
             let mut node = UiNode::button(
                 ids::COMPOSER_REPLY_SOURCE,
-                reply_source::chip_label(chip.kind),
+                reply_source::chip_label(chip.kind, chip.via),
             )
             .with_value(chip.kind.word());
             if chip.picked {
                 node.states.push("picked".into());
             }
+            if chip.via == Some(crate::opengrok::Via::Mac) {
+                node.states.push(VIA_MAC.into());
+            }
             page = page.with_child(node);
         }
         // Each reply's badge, as the feed draws it: label as it reads, value the door's wire
-        // word, and under it the model the server named, which the badge shows on hover: words
-        // the window draws, so a node of their own rather than a state.
+        // word, state `via-mac` on a reply the person's Mac answered, and under it the model the
+        // server named, which the badge shows on hover: words the window draws, so a node of
+        // their own rather than a state.
         for (message_id, source) in &self.reply_sources {
             let mut node = UiNode::status(
                 ids::reply_badge(message_id),
-                reply_source::badge_label(source.kind),
+                reply_source::badge_label(source.kind, source.via),
             )
             .with_value(source.kind.word());
+            if source.via == Some(crate::opengrok::Via::Mac) {
+                node.states.push(VIA_MAC.into());
+            }
             if let Some(model) = &source.model {
                 node = node.with_child(UiNode::status(
                     ids::reply_badge_model(message_id),
@@ -8134,6 +8146,8 @@ mod tests {
                 local_model: local_model.map(str::to_string),
                 healthy: true,
                 has_api_key: false,
+                via: None,
+                relay: None,
             }))
         };
         state.reply_source.kept = read(InferenceKind::Gateway, Some("gpt-5-codex"));
@@ -11151,6 +11165,8 @@ mod tests {
             local_model: None,
             healthy,
             has_api_key: false,
+            via: None,
+            relay: None,
         }
     }
 
@@ -11619,6 +11635,7 @@ mod tests {
         assert!(host.click(ids::COMPOSER_REPLY_SOURCE).is_err());
         host.turn_source = Some(TurnSourceChip {
             kind: InferenceKind::LocalProxy,
+            via: None,
             picked: false,
             local_model: Some("gpt-5-codex".into()),
         });
@@ -11639,6 +11656,7 @@ mod tests {
         ));
         host.turn_source = Some(TurnSourceChip {
             kind: InferenceKind::Gateway,
+            via: None,
             picked: true,
             local_model: None,
         });
@@ -11677,6 +11695,7 @@ mod tests {
             reply_source: Some(ReplySource {
                 kind,
                 model: Some("gpt-5-codex".into()),
+                via: None,
             }),
             is_me: false,
             reply_preview: None,

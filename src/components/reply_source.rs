@@ -9,7 +9,7 @@
 //! the window names.
 
 use crate::components::fields::field_input;
-use crate::opengrok::{DEFAULT_PROXY_URL, InferenceKind, ReplySource};
+use crate::opengrok::{DEFAULT_PROXY_URL, InferenceKind, ReplySource, Via};
 use crate::state::{
     AppState, ProxyHealth, REPLY_SOURCE_NOT_ON_SERVER, REPLY_SOURCE_RETYPE_KEY, ReplySourceNote,
     ReplySourceRead, ReplySourceSettings, TurnSourceChip,
@@ -146,29 +146,36 @@ fn kind_detail(kind: InferenceKind) -> &'static str {
     }
 }
 
-/// What a reply's badge reads.
-pub(crate) fn badge_label(kind: InferenceKind) -> &'static str {
-    match kind {
-        InferenceKind::Gateway => "paid key",
-        InferenceKind::LocalProxy => "your plan",
+/// What a reply's badge reads: whose keys paid for it, and for a reply the person's Mac answered
+/// through the relay, that the Mac did.
+pub(crate) fn badge_label(kind: InferenceKind, via: Option<Via>) -> &'static str {
+    match (kind, via) {
+        (InferenceKind::Gateway, _) => "paid key",
+        (InferenceKind::LocalProxy, Some(Via::Mac)) => "your plan · Mac",
+        (InferenceKind::LocalProxy, _) => "your plan",
     }
 }
 
 /// What the composer's chip reads.
-pub(crate) fn chip_label(kind: InferenceKind) -> &'static str {
-    match kind {
-        InferenceKind::Gateway => "Server",
-        InferenceKind::LocalProxy => "My plan",
+pub(crate) fn chip_label(kind: InferenceKind, via: Option<Via>) -> &'static str {
+    match (kind, via) {
+        (InferenceKind::Gateway, _) => "Server",
+        (InferenceKind::LocalProxy, Some(Via::Mac)) => "My plan · via Mac",
+        (InferenceKind::LocalProxy, _) => "My plan",
     }
 }
 
 /// What the chip says on hover: where the next turn goes, and that it is the person's pick for
 /// their turns rather than the account's own door, which it stays until it is clicked back.
 pub(crate) fn chip_tooltip(chip: &TurnSourceChip) -> String {
+    let plan = match chip.via {
+        Some(Via::Mac) => "your plan through your Mac",
+        _ => "your plan",
+    };
     let door = match (chip.kind, chip.local_model.as_deref()) {
         (InferenceKind::Gateway, _) => "Next replies: the server's paid keys".to_string(),
-        (InferenceKind::LocalProxy, Some(model)) => format!("Next replies: your plan, {model}"),
-        (InferenceKind::LocalProxy, None) => "Next replies: your plan".to_string(),
+        (InferenceKind::LocalProxy, Some(model)) => format!("Next replies: {plan}, {model}"),
+        (InferenceKind::LocalProxy, None) => format!("Next replies: {plan}"),
     };
     if chip.picked {
         format!("{door}, until you switch back. Click to switch.")
@@ -699,10 +706,11 @@ pub(crate) fn composer_chip(
             cx.stop_propagation();
             app.update(cx, |state, cx| state.toggle_turn_source(cx));
         })
-        .child(chip_label(chip.kind))
+        .child(chip_label(chip.kind, chip.via))
 }
 
-/// A reply's badge: "paid key" or "your plan", and the model on hover when the server named one.
+/// A reply's badge: "paid key", "your plan" or "your plan · Mac", and the model on hover when the
+/// server named one.
 /// One to a reply, on the last row of its words, so it is named by the reply's message id.
 pub(crate) fn reply_badge(
     source: &ReplySource,
@@ -724,7 +732,7 @@ pub(crate) fn reply_badge(
         .when_some(model, |this, model| {
             this.tooltip(move |window, cx| Tooltip::new(model.clone()).build(window, cx))
         })
-        .child(badge_label(source.kind))
+        .child(badge_label(source.kind, source.via))
 }
 
 #[cfg(test)]
@@ -735,17 +743,28 @@ mod tests {
         badge_label, chip_label, chip_tooltip, health_line, health_word, kind_id, kind_label,
         models_note,
     };
-    use crate::opengrok::InferenceKind;
+    use crate::opengrok::{InferenceKind, Via};
     use crate::state::{ProxyHealth, TurnSourceChip};
 
-    /// The words the three surfaces say, as the contract's two doors.
+    /// The words the three surfaces say, as the contract's doors: the server's keys, the plan on
+    /// the server's own machine, and the plan the person's Mac answers through the relay. A way
+    /// never named, as from a server before the relay, reads as the plan.
     #[test]
     fn each_door_reads_as_itself_on_every_surface() {
+        let doors = [
+            (InferenceKind::Gateway, None),
+            (InferenceKind::LocalProxy, None),
+            (InferenceKind::LocalProxy, Some(Via::Loopback)),
+            (InferenceKind::LocalProxy, Some(Via::Mac)),
+        ];
         assert_eq!(
-            InferenceKind::ALL.map(badge_label),
-            ["paid key", "your plan"]
+            doors.map(|(kind, via)| badge_label(kind, via)),
+            ["paid key", "your plan", "your plan", "your plan · Mac"]
         );
-        assert_eq!(InferenceKind::ALL.map(chip_label), ["Server", "My plan"]);
+        assert_eq!(
+            doors.map(|(kind, via)| chip_label(kind, via)),
+            ["Server", "My plan", "My plan", "My plan · via Mac"]
+        );
         assert_eq!(
             InferenceKind::ALL.map(kind_label),
             ["Server (paid keys)", "My subscription"]
@@ -765,6 +784,7 @@ mod tests {
     fn the_chip_says_where_the_next_replies_go() {
         let plan = TurnSourceChip {
             kind: InferenceKind::LocalProxy,
+            via: None,
             picked: true,
             local_model: Some("gpt-5-codex".into()),
         };
@@ -774,12 +794,24 @@ mod tests {
         );
         let server = TurnSourceChip {
             kind: InferenceKind::Gateway,
+            via: None,
             picked: false,
             local_model: Some("gpt-5-codex".into()),
         };
         assert_eq!(
             chip_tooltip(&server),
             "Next replies: the server's paid keys, as in Settings. Click to switch."
+        );
+        let mac = TurnSourceChip {
+            kind: InferenceKind::LocalProxy,
+            via: Some(Via::Mac),
+            picked: true,
+            local_model: Some("grok-4".into()),
+        };
+        assert_eq!(
+            chip_tooltip(&mac),
+            "Next replies: your plan through your Mac, grok-4, until you switch back. Click to \
+             switch."
         );
     }
 

@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 use tokio::sync::Mutex as AsyncMutex;
 
 use super::error::OpenGrokError;
-use super::inference::{InferenceKind, InferenceSource, InferenceSourceUpdate};
+use super::inference::{InferenceSource, InferenceSourceUpdate, TurnSource};
 use super::pending::{
     PendingCustom, PendingList, PendingMutation, PendingUserMessage, PendingWrite,
 };
@@ -930,8 +930,10 @@ impl OpenGrokClient {
     /// (the inference-source contract agreed with open-ai-gateway and opengrok-server,
     /// 2026-09-30, built in opengrok-server #294: `named` in
     /// `crates/opengrok-server/src/inference.rs`,
-    /// `route` in `crates/opengrok-harness/src/local_proxy.rs`). Absent, with no chip drawn,
-    /// the account's setting decides, and the turn is the one sent before reply sources existed.
+    /// `route` in `crates/opengrok-harness/src/local_proxy.rs`). It is the bare word, or with a
+    /// way to the plan named `{"kind", "via"}` (#292, contract agreed 2026-09-30, not yet
+    /// recorded; see [`TurnSource`]). Absent, with no chip drawn, the account's setting decides,
+    /// and the turn is the one sent before reply sources existed.
     ///
     /// The run id is the caller's. The server keeps every frame a run emits under it and will
     /// hand the whole lot back from `GET /ag-ui/runs/{run_id}`, which is of no use whatever to a
@@ -948,15 +950,15 @@ impl OpenGrokClient {
         recipe: Option<&TurnRecipe>,
         skill: Option<&str>,
         pending_id: Option<&str>,
-        inference_source: Option<InferenceKind>,
+        inference_source: Option<TurnSource>,
         mut on_event: F,
     ) -> Result<String, OpenGrokError>
     where
         F: FnMut(&serde_json::Value),
     {
         let mut forwarded = json!({ "coworkerId": coworker_id });
-        if let Some(kind) = inference_source {
-            forwarded["inferenceSource"] = Value::String(kind.word().to_string());
+        if let Some(source) = inference_source {
+            forwarded["inferenceSource"] = source.to_value();
         }
         if let Some(recipe) = recipe {
             forwarded["recipe"] = Value::String(recipe.id.clone());
@@ -1035,8 +1037,16 @@ impl OpenGrokClient {
                             .unwrap_or("run failed");
                         // The stream itself is a `200`: the run began and the server ended it
                         // badly, and the sentence it ends with is the only thing that says
-                        // whether the model refused or the gateway was never reached.
-                        return Err(OpenGrokError::from_server(None, message));
+                        // whether the model refused or the gateway was never reached. A run
+                        // through the person's Mac names why it ended beside the sentence
+                        // (`relay_offline`, `relay_timeout`, `relay_failed`: opengrok-server
+                        // #292, contract agreed 2026-09-30, not yet recorded), and that code is
+                        // what offers the turn again on the server's keys.
+                        let code = value
+                            .get("code")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string);
+                        return Err(OpenGrokError::from_server(None, message).with_code(code));
                     }
                     // The person's own words, if a stream ever carries them, are not the reply.
                     let persons = kind.starts_with("TEXT_MESSAGE") && persons.is_persons(&value);
@@ -5460,7 +5470,7 @@ mod tests {
                     None,
                     None,
                     None,
-                    Some(crate::opengrok::InferenceKind::LocalProxy),
+                    Some(crate::opengrok::InferenceKind::LocalProxy.into()),
                 ),
             )
             .await
@@ -5470,7 +5480,7 @@ mod tests {
         assert_eq!(created_row.bubble_id(), "msg_1");
         assert_eq!(
             created_row.inference_source(),
-            Some(crate::opengrok::InferenceKind::LocalProxy)
+            Some(crate::opengrok::InferenceKind::LocalProxy.into())
         );
         assert_eq!(
             created.custom().map(|custom| custom.op),
@@ -6643,6 +6653,8 @@ mod tests {
                 base_url: Some(Some("http://127.0.0.1:8080".into())),
                 local_model: Some(Some("gpt-5-codex".into())),
                 api_key: Some(ProxyKey::new("sk-proxy-1")),
+                via: None,
+                relay: None,
             })
             .await
             .unwrap();
@@ -6655,6 +6667,8 @@ mod tests {
                 base_url: Some(None),
                 local_model: Some(None),
                 api_key: Some(None),
+                via: None,
+                relay: None,
             })
             .await
             .unwrap();
@@ -6684,6 +6698,8 @@ mod tests {
                 base_url: Some(Some("http://my-mac.example.com:8080".into())),
                 local_model: None,
                 api_key: None,
+                via: None,
+                relay: None,
             })
             .await
             .unwrap_err();
@@ -6720,6 +6736,8 @@ mod tests {
                     base_url: None,
                     local_model: None,
                     api_key: None,
+                    via: None,
+                    relay: None,
                 })
                 .await
                 .map(drop),
@@ -6736,11 +6754,12 @@ mod tests {
     }
 
     /// The door picked on the composer's chip travels as `forwardedProps.inferenceSource`, where
-    /// the server reads it and lets it win over the account's setting for this turn. A turn with
-    /// no pick is the turn this client sent before reply sources existed, byte for byte.
+    /// the server reads it and lets it win over the account's setting for this turn: the bare
+    /// word, or with a way to the plan named, `{"kind", "via"}`. A turn with no pick is the turn
+    /// this client sent before reply sources existed, byte for byte.
     #[tokio::test]
     async fn a_turn_carries_the_picked_reply_source_and_a_turn_without_one_is_unchanged() {
-        use crate::opengrok::InferenceKind;
+        use crate::opengrok::{TurnSource, Via};
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/ag-ui"))
@@ -6764,9 +6783,10 @@ mod tests {
             attachments: Vec::new(),
         };
         for (run, source) in [
-            ("run_1", Some(InferenceKind::LocalProxy)),
-            ("run_2", Some(InferenceKind::Gateway)),
+            ("run_1", Some(TurnSource::plan(None))),
+            ("run_2", Some(TurnSource::GATEWAY)),
             ("run_3", None),
+            ("run_4", Some(TurnSource::plan(Some(Via::Mac)))),
         ] {
             client
                 .run_turn(
@@ -6801,6 +6821,13 @@ mod tests {
             json!({ "coworkerId": "cw_1" }),
             "no pick leaves the account's setting to decide"
         );
+        assert_eq!(
+            bodies[3]["forwardedProps"],
+            json!({
+                "coworkerId": "cw_1",
+                "inferenceSource": {"kind": "local_proxy", "via": "mac"}
+            })
+        );
         let mut picked = bodies[0].clone();
         picked["forwardedProps"]
             .as_object_mut()
@@ -6812,6 +6839,63 @@ mod tests {
             serde_json::to_vec(&bodies[2]).unwrap(),
             "the pick is the only thing it adds to the turn"
         );
+    }
+
+    /// A run through the person's Mac that ends badly says why beside its sentence, and the
+    /// turn's error keeps both: the sentence for the person, the code for the app to offer the
+    /// turn again on the server's keys (in the shape agreed for opengrok-server #292, not yet
+    /// recorded). A run error with no code has none.
+    #[tokio::test]
+    async fn a_run_error_keeps_the_relays_code_beside_its_sentence() {
+        let server = MockServer::start().await;
+        for (run, frame) in [
+            (
+                "run_relay",
+                json!({"type": "RUN_ERROR", "message": "Your Mac isn't connected.",
+                    "code": "relay_offline"}),
+            ),
+            (
+                "run_plain",
+                json!({"type": "RUN_ERROR", "message": "the model refused"}),
+            ),
+        ] {
+            Mock::given(method("POST"))
+                .and(path("/ag-ui"))
+                .and(wiremock::matchers::body_partial_json(
+                    json!({ "runId": run }),
+                ))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("content-type", "text/event-stream")
+                        .set_body_string(format!("data: {frame}\n\n")),
+                )
+                .mount(&server)
+                .await;
+        }
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        put_cookie(&client, &live_session());
+        let turn = |run: &'static str| {
+            let client = client.clone();
+            async move {
+                client
+                    .run_turn("cw_1", "thread_1", run, &[], None, None, None, None, |_| {})
+                    .await
+                    .unwrap_err()
+            }
+        };
+        let relay = turn("run_relay").await;
+        assert_eq!(
+            (relay.message.as_str(), relay.code()),
+            ("Your Mac isn't connected.", Some("relay_offline"))
+        );
+        assert_eq!(
+            relay
+                .code()
+                .and_then(crate::opengrok::RelayErrorCode::from_code),
+            Some(crate::opengrok::RelayErrorCode::Offline)
+        );
+        let plain = turn("run_plain").await;
+        assert_eq!(plain.code(), None);
     }
 
     #[tokio::test]
