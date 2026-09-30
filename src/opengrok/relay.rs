@@ -8,7 +8,11 @@
 //! key the person gave on this Mac, then posts opencodex's answer to
 //! `POST /inference-relay/responses/{requestId}` as it comes. The owner approved the rule this
 //! bends: this background half forwards model calls; the window still never calls a model. Every
-//! shape here is opengrok-server #292's, contract agreed 2026-09-30, not yet recorded.
+//! shape here is opengrok-server #292's, as built in opengrok-server PR #298, branch mac-relay
+//! c7b57e9, recorded at c3f9521, not yet on main (`RelayFrame` in
+//! `crates/opengrok-wire/src/relay.rs`, the two routes in
+//! `crates/opengrok-server/src/inference.rs`), and the conformance ledger reads every recorded
+//! frame and answer with this code.
 //!
 //! Frames never carry a URL or a key. The address is this Mac's and must be this Mac
 //! ([`OpencodexAddress`]); the key comes from the Keychain and is never logged, shown, or written
@@ -489,7 +493,7 @@ impl Relay {
         .await;
         let response = match opened {
             Err(_) => return Ended::Failed(SERVER_QUIET.into()),
-            Ok(Err(error)) if error.status == Some(401) => return Ended::TokenRefused,
+            Ok(Err(error)) if token_turned_away(&error) => return Ended::TokenRefused,
             Ok(Err(error)) => return Ended::Failed(stream_refusal(&error)),
             Ok(Ok(response)) => response,
         };
@@ -680,8 +684,14 @@ impl Relay {
     }
 }
 
+/// The server refused the stream because it no longer takes this Mac's token: a `401`, which the
+/// relay stops for rather than knocking again with a token that would be turned away again.
+pub(super) fn token_turned_away(error: &OpenGrokError) -> bool {
+    error.status == Some(401)
+}
+
 /// Why the stream did not open, in a sentence, while the relay tries again.
-fn stream_refusal(error: &OpenGrokError) -> String {
+pub(super) fn stream_refusal(error: &OpenGrokError) -> String {
     if error.unreachable().is_some() {
         return SERVER_UNREACHED.to_string();
     }
@@ -828,7 +838,7 @@ where
 }
 
 /// The JSON a `data:` line holds, if it is one that holds JSON.
-fn data_frame(line: &[u8]) -> Option<Value> {
+pub(super) fn data_frame(line: &[u8]) -> Option<Value> {
     let line = line.strip_suffix(b"\n").unwrap_or(line);
     let line = line.strip_suffix(b"\r").unwrap_or(line);
     let data = line.strip_prefix(b"data:")?;

@@ -191,8 +191,9 @@ pub struct ModelEntry {
     pub source: Option<String>,
     /// For one of the plan's models, which way the server reaches it: `loopback`, listed by
     /// opencodex on the server's machine, or `mac`, listed by the opencodex of the Mac holding
-    /// the relay (opengrok-server #292, contract agreed 2026-09-30, not yet recorded). Kept as
-    /// the word sent and read through [`Self::plan_via`].
+    /// the relay (opengrok-server #292: `listed` in `crates/opengrok-harness/src/local_proxy.rs`,
+    /// PR #298, branch mac-relay c7b57e9, recorded at c3f9521, not yet on main). Kept as the word
+    /// sent and read through [`Self::plan_via`].
     #[serde(default)]
     pub via: Option<String>,
 }
@@ -256,8 +257,8 @@ pub struct LocalProxyStatus {
     /// opencodex answered its `/healthz` when the server asked.
     pub healthy: bool,
     /// A Mac holds the relay, so the models listed through it are its opencodex's word now
-    /// (opengrok-server #292, contract agreed 2026-09-30, not yet recorded). False from a server
-    /// before the relay, which lists none that way.
+    /// (opengrok-server #292: PR #298, branch mac-relay c7b57e9, recorded at c3f9521, not yet on
+    /// main). False from a server before the relay, which lists none that way.
     #[serde(default, rename = "relayConnected")]
     pub relay_connected: bool,
 }
@@ -718,8 +719,8 @@ mod tests {
     }
 
     /// With the Mac relay each of the plan's models says which way the server reaches it, and
-    /// `localProxy` whether a Mac holds the relay (in the shape agreed for opengrok-server #292,
-    /// not yet recorded). A plan's model that names no way is the server's own machine's, as
+    /// `localProxy` whether a Mac holds the relay (opengrok-server PR #298, whose recording the
+    /// ledger reads). A plan's model that names no way is the server's own machine's, as
     /// every one a server before the relay lists; a way this app has not heard of is neither
     /// picker's, and the gateway's models have none.
     #[test]

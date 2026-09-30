@@ -932,9 +932,9 @@ impl OpenGrokClient {
     /// 2026-09-30, built in opengrok-server #294: `named` in
     /// `crates/opengrok-server/src/inference.rs`,
     /// `route` in `crates/opengrok-harness/src/local_proxy.rs`). It is the bare word, or with a
-    /// way to the plan named `{"kind", "via"}` (#292, contract agreed 2026-09-30, not yet
-    /// recorded; see [`TurnSource`]). Absent, with no chip drawn, the account's setting decides,
-    /// and the turn is the one sent before reply sources existed.
+    /// way to the plan named `{"kind", "via"}` (#292: PR #298, branch mac-relay c7b57e9, recorded
+    /// at c3f9521, not yet on main; see [`TurnSource`]). Absent, with no chip drawn, the
+    /// account's setting decides, and the turn is the one sent before reply sources existed.
     ///
     /// The run id is the caller's. The server keeps every frame a run emits under it and will
     /// hand the whole lot back from `GET /ag-ui/runs/{run_id}`, which is of no use whatever to a
@@ -1032,22 +1032,7 @@ impl OpenGrokClient {
                     };
                     let kind = value.get("type").and_then(|v| v.as_str()).unwrap_or("");
                     if kind == "RUN_ERROR" {
-                        let message = value
-                            .get("message")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("run failed");
-                        // The stream itself is a `200`: the run began and the server ended it
-                        // badly, and the sentence it ends with is the only thing that says
-                        // whether the model refused or the gateway was never reached. A run
-                        // through the person's Mac names why it ended beside the sentence
-                        // (`relay_offline`, `relay_timeout`, `relay_failed`: opengrok-server
-                        // #292, contract agreed 2026-09-30, not yet recorded), and that code is
-                        // what offers the turn again on the server's keys.
-                        let code = value
-                            .get("code")
-                            .and_then(|v| v.as_str())
-                            .map(str::to_string);
-                        return Err(OpenGrokError::from_server(None, message).with_code(code));
+                        return Err(Self::run_ended_badly(&value));
                     }
                     // The person's own words, if a stream ever carries them, are not the reply.
                     let persons = kind.starts_with("TEXT_MESSAGE") && persons.is_persons(&value);
@@ -1062,6 +1047,25 @@ impl OpenGrokClient {
             }
         }
         Ok(assistant)
+    }
+
+    /// The turn's error from its `RUN_ERROR` frame. The stream itself is a `200`: the run began
+    /// and the server ended it badly, and the sentence it ends with is the only thing that says
+    /// whether the model refused or the gateway was never reached. A run through the person's Mac
+    /// names why it ended beside the sentence (`relay_offline`, `relay_timeout`, `relay_failed`:
+    /// opengrok-server #292, PR #298, branch mac-relay c7b57e9, recorded at c3f9521, not yet on
+    /// main), and that code is what offers the turn again on the server's keys. Apart from the
+    /// stream so the wire conformance tests read a recorded frame with this very code.
+    pub(super) fn run_ended_badly(frame: &Value) -> OpenGrokError {
+        let message = frame
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("run failed");
+        let code = frame
+            .get("code")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        OpenGrokError::from_server(None, message).with_code(code)
     }
 
     pub async fn answer_run(
@@ -2568,11 +2572,11 @@ impl OpenGrokClient {
         }
     }
 
-    /// `GET /inference-relay/requests`: the Mac relay's stream (opengrok-server #292, contract
-    /// agreed 2026-09-30, not yet recorded), opened with this Mac's machine token as the
-    /// local-exec stream is. Answered with the response as it opens, for the relay to read its
-    /// frames off as they come ([`super::relay`]); a refusal is read as every other, and a `401`
-    /// is the server no longer taking the token, which the relay stops for.
+    /// `GET /inference-relay/requests`: the Mac relay's stream (opengrok-server #292: PR #298,
+    /// branch mac-relay c7b57e9, recorded at c3f9521, not yet on main), opened with this Mac's
+    /// machine token as the local-exec stream is. Answered with the response as it opens, for the
+    /// relay to read its frames off as they come ([`super::relay`]); a refusal is read as every
+    /// other, and a `401` is the server no longer taking the token, which the relay stops for.
     pub async fn open_inference_relay(
         &self,
         machine_token: &str,
@@ -2628,12 +2632,22 @@ impl OpenGrokClient {
             .send()
             .await
             .map_err(|e| OpenGrokError::transport(&e))?;
-        match response.status().as_u16() {
-            200..=299 => Ok(RelayAnswered::Taken),
-            401 => Ok(RelayAnswered::TokenRefused),
-            404 => Ok(RelayAnswered::Gone),
-            409 => Ok(RelayAnswered::AlreadyAnswered),
-            _ => Err(Self::read_error(response).await),
+        match Self::relay_answered(response.status().as_u16()) {
+            Some(answered) => Ok(answered),
+            None => Err(Self::read_error(response).await),
+        }
+    }
+
+    /// What the server made of an answer, by its status alone, or `None` for a refusal to read as
+    /// every other. Apart from the response so the wire conformance tests read a recorded answer
+    /// with this very code.
+    pub(super) fn relay_answered(status: u16) -> Option<RelayAnswered> {
+        match status {
+            200..=299 => Some(RelayAnswered::Taken),
+            401 => Some(RelayAnswered::TokenRefused),
+            404 => Some(RelayAnswered::Gone),
+            409 => Some(RelayAnswered::AlreadyAnswered),
+            _ => None,
         }
     }
 
@@ -6913,8 +6927,8 @@ mod tests {
 
     /// A run through the person's Mac that ends badly says why beside its sentence, and the
     /// turn's error keeps both: the sentence for the person, the code for the app to offer the
-    /// turn again on the server's keys (in the shape agreed for opengrok-server #292, not yet
-    /// recorded). A run error with no code has none.
+    /// turn again on the server's keys (opengrok-server PR #298, which the ledger reads the
+    /// recorded frames of). A run error with no code has none.
     #[tokio::test]
     async fn a_run_error_keeps_the_relays_code_beside_its_sentence() {
         let server = MockServer::start().await;

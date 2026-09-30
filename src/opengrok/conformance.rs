@@ -4,12 +4,14 @@
 //! agree. `fixtures/wire/` is the server's side of that, recorded by the server itself: every
 //! AG-UI frame and REST body its own tests drove, teed off its router by the recorder of
 //! opengrok-server#258 and written out by its `examples/wire_corpus.rs`. It is vendored whole
-//! from the server's `tests/fixtures/wire/` at e55a8c8 on its main (#297, after #296, the reply
-//! source's follow-up), whose `MANIFEST.json` names f56bbde, the commit on the server's main
-//! it was recorded at. The layout is
+//! from the server's `tests/fixtures/wire/` at opengrok-server PR #298, branch mac-relay c7b57e9,
+//! recorded at c3f9521, not yet on main: the Mac relay's server half (#292), on top of its main
+//! e55a8c8. The layout is
 //! opengrok-server#255's: `agui/<type>/<slug>.json`, a CUSTOM under `agui/custom/<name>/`, and
 //! `rest/<METHOD>_<route>/<status>-<slug>.json` holding `{method, path, status, body}`, one file
-//! per distinct shape, named after the first test that produced it. `MANIFEST.json` names the
+//! per distinct shape, named after the first test that produced it; and since the relay, the
+//! frames of its stream under `relay/<type>/<slug>.json`, which are not AG-UI and which the Mac,
+//! not the chat, reads. `MANIFEST.json` names the
 //! server commit, the test behind every file, and every `type`, CUSTOM `name`, approval `reason`
 //! and `formResolution` word the server's code can send. Ids and clocks the tests mint at run
 //! time are placeholders in the server's own formats, and secrets read `«redacted»`.
@@ -20,10 +22,10 @@
 //!
 //! What is held here:
 //!
-//! - every frame is fed to the code that handles its type and name, and every body is read the
-//!   way this app reads its route: a success parsed with the very type the client parses it
-//!   with, and a refusal with the client's own error reading. Each must come out the way the app
-//!   means to read it, not merely without a panic;
+//! - every frame is fed to the code that handles its type and name (a relay frame to the relay's
+//!   own reader), and every body is read the way this app reads its route: a success parsed with
+//!   the very type the client parses it with, and a refusal with the client's own error reading.
+//!   Each must come out the way the app means to read it, not merely without a panic;
 //! - every route the corpus records has that reading, or is excused in [`REST_NOT_READ`] with
 //!   why this app never asks it;
 //! - a route this app was built to ask ahead of the server's recording of it is owed a reading
@@ -65,11 +67,15 @@ use super::gen_ui::{
     USER_MACHINE_SHELL, approval_from_event, approval_summary, capped, command_from_replay_events,
     is_ui_tool,
 };
-use super::inference::{INFERENCE_SOURCE_CUSTOM, InferenceKind, InferenceSource, TurnSource, Via};
+use super::inference::{
+    INFERENCE_SOURCE_CUSTOM, InferenceKind, InferenceSource, RelayErrorCode, TurnSource, Via,
+    is_subscription_model,
+};
 use super::pending::{
     CUSTOM_NAME as PENDING_CUSTOM, PendingCustom, PendingList, PendingMutation, PendingOp,
     PendingUserMessage,
 };
+use super::relay::{RelayAnswered, RelayFrame, data_frame, stream_refusal, token_turned_away};
 use super::timing::{RUN_TIMING_CUSTOM, TURN_TIMELINE_CUSTOM, TurnTiming};
 use super::types::{
     Account, ArtifactListing, Attachment, Coworker, EFFORT_INHERIT, ModelCatalogue, ThreadListing,
@@ -479,7 +485,15 @@ const WORDS_NOT_RECORDED_YET: &[(Slot, &str, &str)] = &[];
 /// Fixtures this app still reads wrongly, with the words their check fails with and why. The
 /// check has to fail with those words: one that passes means the drift is fixed and the entry
 /// goes, and one that fails some other way is a new problem, not this one.
-const KNOWN_DRIFT: &[(&str, &str, &str)] = &[];
+const KNOWN_DRIFT: &[(&str, &str, &str)] = &[(
+    "rest/POST__ag-ui/202-a_queued_send_held_for_an_absent_mac_drains_when_the_mac_reconnects.json",
+    "a turn answers with its event stream, not a JSON body",
+    "The server answers a fire of a queued send it holds for the person's Mac with 202 and the \
+     row as it stands (opengrok-server PR #298, `consume_for_turn` in `agui/pending.rs`), and no \
+     run starts. `run_turn` reads every 2xx as the turn's event stream, so the JSON finds no \
+     `data:` line and the fire reads as a turn that said nothing: the send leaves this Mac's \
+     queue while the server keeps it, and its reply says the coworker said nothing.",
+)];
 
 /// How a 502, 503 or 504 the server wrote itself fails [`refusal`] when it is not in the shape
 /// that says so.
@@ -605,22 +619,15 @@ const REST_NOT_READ: &[(&str, &str, &str)] = &[
 ///
 /// Only routes built ahead of a recording are listed. Routes this app asks that no test on the
 /// server drives are a different gap, and not this list's.
-const REST_NOT_RECORDED_YET: &[(&str, &str, &str)] = &[
-    (
-        "GET__inference-relay_requests",
-        "/inference-relay/requests",
-        "The Mac relay's stream, opened with the machine token (opengrok-server #292, contract \
-         agreed 2026-09-30, not yet recorded; relay.rs reads its frames). Its fixtures come with \
-         the server's #292 and the recording after it.",
-    ),
-    (
-        "POST__inference-relay_responses__request_id_",
-        "/inference-relay/responses/{request_id}",
-        "The Mac's answer to one relayed call: opencodex's stream, its model list, or a failure \
-         as {\"error\"} (opengrok-server #292, contract agreed 2026-09-30, not yet recorded; the \
-         route's placeholder is guessed as the router writes its others). Its fixtures come with \
-         the server's #292 and the recording after it.",
-    ),
+const REST_NOT_RECORDED_YET: &[(&str, &str, &str)] = &[];
+
+/// Routes this app asks with this Mac's machine token (`local_exec.rs` `MachineCredential`)
+/// rather than the person's session, so they never pass through `send_json_within`: a 401 on one
+/// is the server turning the token away, not the session gone, and the route's own reading in
+/// [`REFUSALS`] says what comes of it.
+const MACHINE_TOKEN_ROUTES: &[&str] = &[
+    "GET__inference-relay_requests",
+    "POST__inference-relay_responses__request_id_",
 ];
 
 // ---- the corpus ----
@@ -671,6 +678,8 @@ struct Corpus {
     frames: BTreeMap<String, Value>,
     /// Every REST fixture, by its path under the corpus root.
     bodies: BTreeMap<String, Value>,
+    /// Every frame off the Mac relay's stream, by its path under the corpus root.
+    relay: BTreeMap<String, Value>,
 }
 
 impl Corpus {
@@ -697,11 +706,19 @@ impl Corpus {
                 (file, body)
             })
             .collect();
+        let relay = json_files(&root, "relay")
+            .into_iter()
+            .map(|file| {
+                let frame = read_json(&root, &file);
+                (file, frame)
+            })
+            .collect();
         Self {
             root,
             manifest,
             frames,
             bodies,
+            relay,
         }
     }
 
@@ -954,9 +971,41 @@ fn run_ended(corpus: &Corpus, frame: &Value) -> Check {
             said == Err(str_at(frame, "message").to_string()),
             "RUN_ERROR should end the turn with the server's sentence, got {said:?}"
         );
+        // The turn's error as the live stream reads it (`run_turn`): the sentence, and beside it
+        // the code a run through the person's Mac ends with, which offers the turn again on the
+        // server's keys. A run that names no code offers nothing, and a code nothing here reads
+        // fails, so one the server starts sending is caught before a person misses its action.
+        let error = OpenGrokClient::run_ended_badly(frame);
+        let code = opt_str(frame, "code");
+        must!(
+            error.message == str_at(frame, "message") && error.code() == code,
+            "the turn's error should keep the sentence and the code as sent: {error:?}"
+        );
+        if let Some(code) = code {
+            must!(
+                RELAY_RUN_ERROR_CODES.contains(&code),
+                "a run ends with the code {code:?}, which nothing here reads: read it, or say \
+                 here why a person can be left without it"
+            );
+        }
+        let offered = error.code().and_then(RelayErrorCode::from_code);
+        must!(
+            offered.is_some() == code.is_some(),
+            "a relay's code should offer the turn again on the server's keys, and only a relay's \
+             code: {offered:?} from {code:?}"
+        );
     }
     Ok(())
 }
+
+/// The codes a `RUN_ERROR` carries beside its sentence, which are the Mac relay's and nobody
+/// else's (opengrok-server PR #298, branch mac-relay c7b57e9, recorded at c3f9521, not yet on
+/// main): `ModelError::Relay` in `crates/opengrok-harness/src/relay.rs`, stamped on the frame by
+/// `Projection::failing_with`. No Mac held the relay, the Mac started no answer or went quiet for
+/// the door's clock, or the Mac answered with a failure in its own words. A refusal of the Mac's
+/// own making, such as one Mac carrying all the calls it may at once, is `ModelError::Proxy`,
+/// with a sentence and no code.
+const RELAY_RUN_ERROR_CODES: &[&str] = &["relay_offline", "relay_timeout", "relay_failed"];
 
 /// A message's opening paints nothing, and says whose words follow. The coworker's is it writing.
 /// The person's, which a replay opens each run with right after `RUN_STARTED` (opengrok-server
@@ -1699,9 +1748,9 @@ fn inference_source_frame(frame: &Value) -> Check {
         source.kind.word() == str_at(value, "kind") && source.model.as_deref() == model,
         "the badge should be the frame's kind and model as sent: {source:?} from {value}"
     );
-    // The way the plan was reached, from a server with the Mac relay (opengrok-server #292,
-    // contract agreed 2026-09-30, not yet recorded): as sent on the plan's badge, when it is one
-    // this app can name.
+    // The way the plan was reached (`via`), from a server with the Mac relay (opengrok-server
+    // PR #298, branch mac-relay c7b57e9, recorded at c3f9521, not yet on main): as sent on the
+    // plan's badge, when it is one this app can name.
     let via = opt_str(value, "via")
         .and_then(Via::from_word)
         .filter(|_| source.kind == InferenceKind::LocalProxy);
@@ -1996,12 +2045,14 @@ fn held_as_sent(message: &PendingUserMessage, raw: &Value) -> Check {
     );
     // The door it was queued with, on the row only when the send named one (opengrok-server
     // #294: `message_json` in `crates/opengrok-server/src/agui/pending.rs`): the bare word, or
-    // with the Mac relay `{"kind", "via"}` (#292, contract agreed 2026-09-30, not yet recorded).
+    // with the Mac relay `{"kind", "via"}` (PR #298, branch mac-relay c7b57e9, recorded at
+    // c3f9521, not yet on main).
     must!(
         message.inference_source() == raw.get("inferenceSource").and_then(TurnSource::from_value),
         "the send's door should come through as sent: {message:?}"
     );
-    // Held for the person's Mac, while no Mac holds the relay (the same contract).
+    // Held for the person's Mac while no Mac holds the relay (`heldFor`, read per reply by
+    // `Held::of` in the same file, PR #298).
     must!(
         message.waits_for_mac() == (opt_str(raw, "heldFor") == Some("relay_offline")),
         "whether the send waits for the Mac should come through as sent: {message:?}"
@@ -2200,6 +2251,9 @@ const REST_ROUTES: &[(&str, RestCheck)] = &[
     ("GET__account_inference-source", inference_source),
     ("PUT__account_inference-source", inference_source),
     ("GET__models", models_listed),
+    // This Mac as the person's relay, asked with its machine token.
+    ("GET__inference-relay_requests", relay_stream),
+    ("POST__inference-relay_responses__request_id_", relay_answer),
 ];
 
 /// Routes whose refusals the client reads its own way rather than with `read_error`, and how.
@@ -2217,6 +2271,11 @@ const REFUSALS: &[(&str, RestCheck)] = &[
     ("POST__ag-ui_box-handoff_resolve", handoff_refused),
     ("POST__recipes__id__run", run_refused),
     ("POST__skills_from-tape", tape_refused),
+    ("GET__inference-relay_requests", relay_stream_refused),
+    (
+        "POST__inference-relay_responses__request_id_",
+        relay_answer_refused,
+    ),
 ];
 
 /// One recorded answer, read the way this app reads it: not at all from a route it never asks
@@ -2249,8 +2308,12 @@ fn read_fixture(route: &str, fixture: &Value) -> Check {
     }
     // `send_json_within`: a 401 on any route but `/auth/` is the session gone, whatever the route
     // would have made of the refusal, because the one refresh the app can do on its own has been
-    // tried. On `/auth/login` the same status is a wrong password, a verdict like any other.
-    if status == 401 && !str_at(fixture, "path").starts_with("/auth/") {
+    // tried. On `/auth/login` the same status is a wrong password, a verdict like any other, and
+    // on a route asked with this Mac's machine token it is the token turned away.
+    if status == 401
+        && !str_at(fixture, "path").starts_with("/auth/")
+        && !MACHINE_TOKEN_ROUTES.contains(&route)
+    {
         return signed_out(body);
     }
     let refused = REFUSALS
@@ -2642,12 +2705,11 @@ fn session_in_cookies(_: u16, body: &Value) -> Check {
     Ok(())
 }
 
-/// A turn's success is its event stream, read frame by frame (`run_turn`). NO RECORDED FIXTURE
-/// REACHES THIS: the recorder files a stream's frames under `agui/`, where [`check_frame`] reads
-/// each one, and every `POST__ag-ui` body it keeps is a refusal, read in [`read_fixture`]. The
-/// route is listed for those refusals. This reading stands for the day a 2xx body is recorded
-/// here, which would be the stream's text, `data:` lines the stream reader takes as the
-/// coworker's words or the run's error; until then it covers nothing.
+/// A turn's success is its event stream, read frame by frame (`run_turn`). The recorder files a
+/// stream's frames under `agui/`, where [`check_frame`] reads each one, so the stream's own text
+/// is never recorded here; it would be `data:` lines the stream reader takes as the coworker's
+/// words or the run's error. The one success body recorded is the 202 a fire of a queued send
+/// held for the person's Mac is answered with, which is no stream (see [`KNOWN_DRIFT`]).
 fn turn_stream(_: u16, body: &Value) -> Check {
     let stream = body
         .as_str()
@@ -3524,8 +3586,8 @@ fn coworker_ceiling(_: u16, body: &Value) -> Check {
 /// the door, the proxy's URL and the model as sent, `null` for none, and the two flags the page
 /// acts on. A body without a flag is not read as that flag being false, and a door this app has
 /// not heard of is not read as one it has. Its refusals are read as every other: a 400 in the
-/// server's words for an address or a model it will not keep, a 503 for a key with no vault to
-/// keep it in, and a 401 as the session gone.
+/// server's words for an address or a model it will not keep, or a way to the plan it has not
+/// built (`helper`), a 503 for a key with no vault to keep it in, and a 401 as the session gone.
 fn inference_source(_: u16, body: &Value) -> Check {
     let read: InferenceSource = parse(body)?;
     must!(
@@ -3536,9 +3598,10 @@ fn inference_source(_: u16, body: &Value) -> Check {
             && Some(read.has_api_key) == body["hasApiKey"].as_bool(),
         "the reply source should come through as sent: {read:?} from {body}"
     );
-    // From a server with the Mac relay (opengrok-server #292, contract agreed 2026-09-30, not
-    // yet recorded): the account's way as sent, and where the relay stands, field for field; a
-    // server before it sends neither, and the relay is not offered.
+    // From a server with the Mac relay (opengrok-server PR #298, branch mac-relay c7b57e9,
+    // recorded at c3f9521, not yet on main: `described` in the same file): the account's way as
+    // sent, and where the relay stands, field for field, nulls and all when no Mac holds it. A
+    // server before the relay sends neither, and the relay is not offered.
     must!(
         read.via.as_deref() == opt_str(body, "via"),
         "the account's way should come through as sent: {read:?} from {body}"
@@ -3600,9 +3663,10 @@ fn models_listed(_: u16, body: &Value) -> Check {
         "opencodex's health should come through as sent: {:?} from {body}",
         catalogue.local_proxy
     );
-    // With the Mac relay (opengrok-server #292, contract agreed 2026-09-30, not yet recorded):
-    // each of the plan's models by the way the server reaches it, none named being the server's
-    // own machine, and whether a Mac holds the relay.
+    // With the Mac relay (opengrok-server PR #298, branch mac-relay c7b57e9, recorded at
+    // c3f9521, not yet on main: `listed` in `crates/opengrok-harness/src/local_proxy.rs`): each
+    // of the plan's models by the way the server reaches it, none named being the server's own
+    // machine, and whether a Mac holds the relay.
     for (entry, raw) in catalogue.models.iter().zip(raw) {
         let via = match (entry.is_local_proxy(), opt_str(raw, "via")) {
             (false, _) => None,
@@ -3622,6 +3686,144 @@ fn models_listed(_: u16, body: &Value) -> Check {
         must!(
             proxy.relay_connected == relay.unwrap_or(false),
             "whether a Mac holds the relay should come through as sent: {proxy:?} from {body}"
+        );
+    }
+    Ok(())
+}
+
+/// The Mac relay's stream (`open_inference_relay`), read as it comes. NO RECORDED FIXTURE
+/// REACHES THIS: the recorder files the stream's frames under `relay/`, where [`relay_frame`]
+/// reads each one, and the route's only body it keeps is a refusal, read in [`read_fixture`].
+/// This reading stands for the day a 2xx body is recorded here, which would be the stream's
+/// text: `data:` lines, each a frame the relay reads as it means to.
+fn relay_stream(_: u16, body: &Value) -> Check {
+    let stream = body
+        .as_str()
+        .ok_or("the relay's stream is its frames, not a JSON body")?;
+    let frames: Vec<Value> = stream
+        .lines()
+        .filter_map(|line| data_frame(line.as_bytes()))
+        .collect();
+    must!(
+        !frames.is_empty(),
+        "the relay's stream is `data:` lines: {stream:?}"
+    );
+    frames.iter().try_for_each(relay_frame)
+}
+
+/// The relay's stream refused (`open_inference_relay` reads the refusal as every other, and the
+/// relay takes it in `stream_once`). A 401 is the server turning this Mac's token away, which
+/// the relay stops for for good rather than asking again with a token that would be turned away
+/// again; it says so in its own words, not the server's. Anything else is said in a sentence
+/// while the relay tries again, and is read as every other refusal.
+fn relay_stream_refused(status: u16, body: &Value) -> Check {
+    let error = OpenGrokClient::refusal(status, &body_text(body));
+    let stops = token_turned_away(&error);
+    must!(
+        stops == (status == 401),
+        "a {status} on the relay's stream should {} the relay",
+        if status == 401 { "stop" } else { "not stop" }
+    );
+    if stops {
+        return Ok(());
+    }
+    must!(
+        !stream_refusal(&error).trim().is_empty(),
+        "a refused stream should be said in a sentence while the relay tries again: {error:?}"
+    );
+    refusal(status, body)
+}
+
+/// What the server made of one of this Mac's answers, as `answer_inference_relay` reads it off
+/// the status alone (opengrok-server PR #298, branch mac-relay c7b57e9, recorded at c3f9521, not
+/// yet on main: `relay_response` in `crates/opengrok-server/src/inference.rs`), stated here
+/// status by status: taken; a call nothing waits on any more, which is as good as cancelled; one
+/// answered already; and this Mac turned away, which stops the relay (the server says so of a bad
+/// token and of a call sent to another machine, and this Mac answers only the calls its own
+/// stream brought it). `None` is a refusal read as every other.
+fn relay_answered_as(status: u16) -> Option<RelayAnswered> {
+    match status {
+        200..=299 => Some(RelayAnswered::Taken),
+        404 => Some(RelayAnswered::Gone),
+        409 => Some(RelayAnswered::AlreadyAnswered),
+        401 => Some(RelayAnswered::TokenRefused),
+        _ => None,
+    }
+}
+
+/// This Mac's answer taken: the 204, which the relay reads off the status and nothing else.
+fn relay_answer(status: u16, _: &Value) -> Check {
+    let read = OpenGrokClient::relay_answered(status);
+    must!(
+        read == Some(RelayAnswered::Taken),
+        "an answer the server took with {status} should read as taken, not {read:?}"
+    );
+    Ok(())
+}
+
+/// One of this Mac's answers refused, read off its status ([`relay_answered_as`]), or when the
+/// status says nothing the relay acts on, as every other refusal.
+fn relay_answer_refused(status: u16, body: &Value) -> Check {
+    let expected = relay_answered_as(status);
+    let read = OpenGrokClient::relay_answered(status);
+    must!(
+        read == expected,
+        "an answer refused with {status} should read as {expected:?}, not {read:?}"
+    );
+    if read.is_some() {
+        return Ok(());
+    }
+    refusal(status, body)
+}
+
+/// A frame off the Mac relay's stream, read by the relay's own reader (`RelayFrame::from_value`)
+/// as the frame it is, with every field the relay goes on to use as sent: the frame's own words
+/// as the server writes them (opengrok-server PR #298, branch mac-relay c7b57e9, recorded at
+/// c3f9521, not yet on main: `RelayFrame` in `crates/opengrok-wire/src/relay.rs`), stated here
+/// case by case. A call is one the Mac carries: its model, the frame's and the body's, is one the
+/// Mac may ask the person's subscription for, so the relay asks opencodex rather than refusing
+/// it, and it asks for the stream the relay passes on as it comes.
+fn relay_frame(frame: &Value) -> Check {
+    let text = |key: &str| str_at(frame, key).to_string();
+    let expected = match str_at(frame, "type") {
+        "ready" => RelayFrame::Ready {
+            machine_id: text("machineId"),
+        },
+        "replaced" => RelayFrame::Replaced,
+        "infer" => RelayFrame::Infer {
+            request_id: text("requestId"),
+            run_id: text("runId"),
+            model: text("model"),
+            request: frame["request"].clone(),
+        },
+        "models" => RelayFrame::Models {
+            request_id: text("requestId"),
+        },
+        "cancel" => RelayFrame::Cancel {
+            request_id: text("requestId"),
+        },
+        "ping" => RelayFrame::Ping,
+        kind => {
+            return Err(format!(
+                "no check for a relay frame of type {kind:?}: say here what the relay does with one"
+            ));
+        }
+    };
+    let read = RelayFrame::from_value(frame);
+    must!(
+        read == expected,
+        "the relay should read {expected:?}, not {read:?}"
+    );
+    if let RelayFrame::Infer { model, request, .. } = &read {
+        let asked = str_at(request, "model");
+        must!(
+            is_subscription_model(model) && is_subscription_model(asked),
+            "a call the server sends the Mac should name a model the Mac asks the person's \
+             subscription for: {model:?}, {asked:?}"
+        );
+        must!(
+            request["stream"] == Value::Bool(true),
+            "a call should ask opencodex for the stream the relay passes on: {request}"
         );
     }
     Ok(())
@@ -4030,6 +4232,7 @@ fn the_manifest_names_every_fixture_and_every_fixture_is_in_it() {
         .frames
         .keys()
         .chain(corpus.bodies.keys())
+        .chain(corpus.relay.keys())
         .map(String::as_str)
         .collect();
     let listed: BTreeSet<&str> = manifest
@@ -4065,8 +4268,9 @@ fn the_manifest_names_every_fixture_and_every_fixture_is_in_it() {
     }
 }
 
-/// #255's layout: a frame sits under its own `type`, a CUSTOM under its `name`, and a body under
-/// its method and route with its status in the file name.
+/// #255's layout: a frame sits under its own `type`, a CUSTOM under its `name`, a frame off the
+/// Mac relay's stream under its own `type` in `relay/`, and a body under its method and route
+/// with its status in the file name.
 #[test]
 fn every_fixture_sits_where_its_layout_says() {
     let corpus = Corpus::load();
@@ -4078,6 +4282,12 @@ fn every_fixture_sits_where_its_layout_says() {
         } else {
             format!("agui/{kind}/")
         };
+        if !file.starts_with(&expected) {
+            problems.push(format!("{file} belongs under {expected}"));
+        }
+    }
+    for (file, frame) in &corpus.relay {
+        let expected = format!("relay/{}/", str_at(frame, "type"));
         if !file.starts_with(&expected) {
             problems.push(format!("{file} belongs under {expected}"));
         }
@@ -4226,6 +4436,19 @@ fn every_frame_the_server_sends_is_read_as_intended() {
     assert!(problems.is_empty(), "{}", problems.join("\n"));
 }
 
+/// Every frame off the Mac relay's stream goes through the relay's own reader, and comes out as
+/// the frame it is, with what the relay goes on to use as the server sent it.
+#[test]
+fn every_relay_frame_the_server_sends_is_read_as_intended() {
+    let corpus = Corpus::load();
+    assert!(
+        !corpus.relay.is_empty(),
+        "the recording holds the relay's frames"
+    );
+    let problems = verdicts(corpus.relay.iter(), |_, frame| relay_frame(frame));
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
+}
+
 /// Every body is read the way this app reads its route: a success parses with the type the
 /// client parses it with and the fields the app uses come through as the server sent them, and
 /// a refusal reads as the server's own sentence, the way the client takes one. A route the app
@@ -4304,6 +4527,16 @@ fn every_route_this_app_does_not_read_is_recorded_and_says_why() {
         if read(route) == 0 {
             problems.push(format!(
                 "REFUSALS reads the refusals of {route}, which has no reading in REST_ROUTES"
+            ));
+        }
+    }
+    // A 401 on a route asked with the machine token is read by the route's own refusal reading,
+    // so each has one.
+    for route in MACHINE_TOKEN_ROUTES {
+        if read(route) == 0 || !REFUSALS.iter().any(|(dir, _)| dir == route) {
+            problems.push(format!(
+                "{route} is asked with the machine token, and needs a reading in REST_ROUTES and \
+                 its refusals' own in REFUSALS"
             ));
         }
     }
@@ -5113,9 +5346,9 @@ fn a_queued_sends_door_is_read_beyond_the_recording() {
     let mut lost: PendingUserMessage = serde_json::from_value(rows[0].clone()).unwrap();
     lost.inference_source = None;
     assert!(held_as_sent(&lost, &rows[0]).is_err());
-    // With the Mac relay (in the shape agreed for opengrok-server #292, not yet recorded): a row
-    // names its way to the plan beside the kind, and one the server holds for the person's Mac
-    // says so; a way this app cannot name reads as no door, and never fails the queue.
+    // With the Mac relay, whose recording (opengrok-server PR #298) holds a row sent through the
+    // person's Mac and held for it: beside such a row, a way this app cannot name reads as no
+    // door and never fails the queue, and a row whose hold the parse lost would not pass.
     let mut through_the_mac = row("pum_3", "m4", None);
     through_the_mac["inferenceSource"] = json!({"kind": "local_proxy", "via": "mac"});
     through_the_mac["heldFor"] = json!("relay_offline");
@@ -5152,13 +5385,45 @@ fn a_queued_sends_door_is_read_beyond_the_recording() {
     );
 }
 
+/// The server that made the recording has the Mac relay, and says where the relay stands on every
+/// read of the account's setting and every Save's answer, nulls and all when no Mac holds it
+/// (`described` in opengrok-server's `crates/opengrok-harness/src/local_proxy.rs`, PR #298), on
+/// the gateway as on the plan. So every one of them reads as a server that knows the relay, which
+/// is what lets this app name a way to the plan to it and offer the Mac; a server from before the
+/// relay sends no `relay` and is taken to know none.
+#[test]
+fn every_recorded_setting_is_from_a_server_that_knows_the_relay() {
+    let corpus = Corpus::load();
+    let mut read = 0;
+    for (file, fixture) in &corpus.bodies {
+        let route = file.split('/').nth(1).unwrap_or("");
+        let setting = matches!(
+            route,
+            "GET__account_inference-source" | "PUT__account_inference-source"
+        );
+        if !setting || fixture["status"] != 200 {
+            continue;
+        }
+        let source: InferenceSource = serde_json::from_value(fixture["body"].clone())
+            .unwrap_or_else(|error| panic!("{file}: {error}"));
+        assert!(
+            source.knows_relay(),
+            "{file}: a server with the relay says where it stands: {source:?}"
+        );
+        read += 1;
+    }
+    assert!(read > 0, "the recording holds the account's setting");
+}
+
 /// The reply source's reading, fed bodies beyond the ones the server's recording holds: the read and
-/// the Save's answer alike, set and unset, the Save's refusals in the server's words (a URL that
-/// is not loopback, a provider it will not route), and the ways a body could go wrong.
+/// the Save's answer alike, set and unset as a server from before the relay sends them, the
+/// Save's refusals in the server's words (a URL that is not loopback, a provider it will not
+/// route), and the ways a body could go wrong.
 #[test]
 fn the_reply_source_routes_are_read_beyond_the_recording() {
     use serde_json::json;
-    // The read and a Save's answer are the same body, and read the same way.
+    // The read and a Save's answer are the same body, and read the same way. A server from
+    // before the relay says nothing of a way or of the relay.
     let set = json!({
         "kind": "local_proxy", "baseUrl": "http://127.0.0.1:8080",
         "localModel": "gpt-5-codex", "healthy": true, "hasApiKey": true
@@ -5167,27 +5432,14 @@ fn the_reply_source_routes_are_read_beyond_the_recording() {
         "kind": "gateway", "baseUrl": null, "localModel": null,
         "healthy": false, "hasApiKey": false
     });
-    // From a server with the Mac relay (in the shape agreed for opengrok-server #292, not yet
-    // recorded): the account's way, and where the relay stands, answering or not; a way this
-    // app cannot name still reads.
-    let relayed = json!({
-        "kind": "local_proxy", "baseUrl": null, "localModel": null,
-        "healthy": false, "hasApiKey": false, "via": "mac",
-        "relay": {
-            "connected": true, "machineId": "mac_2",
-            "machineLabel": "NativeChat on studio", "localModel": "gpt-5-codex"
-        }
-    });
-    let nobody = json!({
-        "kind": "gateway", "baseUrl": null, "localModel": null,
-        "healthy": false, "hasApiKey": false, "via": "loopback",
-        "relay": {"connected": false, "machineId": null, "machineLabel": null, "localModel": null}
-    });
+    // From a server with the Mac relay, whose recording (opengrok-server PR #298) holds a Mac
+    // answering and no Mac at all: a way this app cannot name, which that server refuses to keep
+    // until its #293, still reads.
     let helper = json!({
         "kind": "local_proxy", "healthy": true, "hasApiKey": false, "via": "helper",
         "relay": {"connected": false}
     });
-    for body in [&set, &unset, &relayed, &nobody, &helper] {
+    for body in [&set, &unset, &helper] {
         inference_source(200, body).unwrap_or_else(|why| panic!("{body}: {why}"));
     }
     for broken in [
@@ -5202,10 +5454,13 @@ fn the_reply_source_routes_are_read_beyond_the_recording() {
     ] {
         assert!(inference_source(200, &broken).is_err(), "{broken}");
     }
-    // A relay's model the server will not route is refused as the plan's is, in its words.
+    // A relay's model the server will not route is refused as the plan's is, in its words
+    // (`apply` names the field before `subscription_model`'s sentence).
     refusal(
         400,
-        &json!({"error": "relay.localModel: \"claude-opus\" is one of Anthropic's models"}),
+        &json!({"error": "relay.localModel: claude-opus is one of Anthropic's models, and \
+                          Anthropic's terms forbid using a consumer subscription through a \
+                          third-party app; pick an OpenAI or xAI model, or use the gateway"}),
     )
     .unwrap_or_else(|why| panic!("{why}"));
     // The recording holds one of each refusal; the others the server writes (`apply` in
@@ -5348,9 +5603,11 @@ fn use_skill_reads_as_the_servers_own_tool() {
 }
 
 /// `/models`' reading, fed bodies beyond the ones the server's recording holds (it records the
-/// gateway's routes alone, with and without opencodex's word on itself): both doors' entries,
-/// opencodex answering and not, a plan-only list with `note: null`, a server from before reply
-/// sources, and the one shape it must not take quietly, a door this app does not know.
+/// gateway's routes alone and beside the plan's on the server's own machine, opencodex's word on
+/// itself, and no Mac holding the relay): both doors' entries and a plan-only list with
+/// `note: null` as a server from before the relay sends them, opencodex answering and not, a
+/// server from before reply sources, the Mac's own models with a Mac holding the relay, and the
+/// one shape it must not take quietly, a door this app does not know.
 #[test]
 fn the_models_list_is_read_beyond_the_recording() {
     use serde_json::json;
@@ -5372,8 +5629,9 @@ fn the_models_list_is_read_beyond_the_recording() {
         "localProxy": {"healthy": false}
     });
     let before_reply_sources = json!({"models": [{"id": "oag/auto"}], "note": null});
-    // With the Mac relay (in the shape agreed for opengrok-server #292, not yet recorded): each
-    // of the plan's models by its way, and whether a Mac holds the relay.
+    // With the Mac relay (opengrok-server PR #298): the recording has no Mac holding it, so the
+    // Mac's own models (`via: "mac"`) beside the server's own machine's, with a Mac holding it,
+    // and no Mac holding it with nothing to list at all.
     let relayed = json!({
         "models": [
             {"id": "xai/grok-4.6", "points": null, "source": "gateway"},
@@ -5401,20 +5659,18 @@ fn the_models_list_is_read_beyond_the_recording() {
     assert!(models_listed(200, &unknown).is_err());
 }
 
-/// The CUSTOM frame's way, fed frames beyond the ones the server's recording holds (in the shape
-/// agreed for opengrok-server #292, not yet recorded): a reply the person's Mac answered, one the
-/// server's own machine did, one by a way this app cannot name, and the gateway's, each read as
-/// its badge says it.
+/// The CUSTOM frame's way, fed frames beyond the ones the server's recording holds, which has a
+/// reply the person's Mac answered and one the gateway did (opengrok-server PR #298): one the
+/// server's own machine answered, and one by a way this app cannot name, each read as its badge
+/// says it.
 #[test]
 fn a_replys_way_is_read_beyond_the_recording() {
     use serde_json::json;
     let frame =
         |value: Value| json!({"type": "CUSTOM", "name": INFERENCE_SOURCE_CUSTOM, "value": value});
     for value in [
-        json!({"kind": "local_proxy", "via": "mac", "model": "gpt-5-codex"}),
         json!({"kind": "local_proxy", "via": "loopback", "model": "gpt-5-codex"}),
         json!({"kind": "local_proxy", "via": "helper", "model": "gpt-5-codex"}),
-        json!({"kind": "gateway", "model": "oag/cheap"}),
     ] {
         inference_source_frame(&frame(value.clone()))
             .unwrap_or_else(|why| panic!("{value}: {why}"));

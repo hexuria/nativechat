@@ -3637,8 +3637,9 @@ fn replayed_ending(
 }
 
 /// Why a run through the person's Mac ended, when its journal says one did: the code on its
-/// `RUN_ERROR` (opengrok-server #292, contract agreed 2026-09-30, not yet recorded), for a replay
-/// to offer the turn again on the server's keys as the live stream does.
+/// `RUN_ERROR` (opengrok-server #292: PR #298, branch mac-relay c7b57e9, recorded at c3f9521,
+/// not yet on main), for a replay to offer the turn again on the server's keys as the live
+/// stream does.
 fn relay_failure_of(events: &[serde_json::Value]) -> Option<RelayErrorCode> {
     events
         .iter()
