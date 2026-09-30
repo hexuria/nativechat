@@ -260,8 +260,8 @@ impl ModelEntry {
         }
     }
 
-    /// One of the person's own plan's models, which Settings → Reply source offers and a Bot's
-    /// Model field does not.
+    /// One of the person's own plan's models, which Settings → Reply source offers, and a Bot's
+    /// model picker in its plan group where the server keeps a door per Bot.
     pub fn is_local_proxy(&self) -> bool {
         self.source() == Some(super::InferenceKind::LocalProxy)
     }
@@ -293,7 +293,7 @@ pub struct ModelCatalogue {
     /// `crates/opengrok-server/src/agui/routes.rs`, `listed` in
     /// `crates/opengrok-harness/src/local_proxy.rs`). A proxy that is down lists nothing, and
     /// this is how that reads apart from a plan with nothing to offer. One this app cannot read
-    /// is none: the list the Bot's Model field is drawn from never fails for it.
+    /// is none: the list a Bot's model picker is drawn from never fails for it.
     #[serde(
         default,
         rename = "localProxy",

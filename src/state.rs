@@ -13,8 +13,8 @@ pub use crate::cron_spec::{
 use crate::opengrok::{
     Account, ActivityTick, AguiMessage, ApprovalSpec, BotActivity, BoxHandoffReply,
     BoxHandoffResolution, BoxShareScope, ChatPart, ChoiceCard, ComputerHandoffStatus,
-    ConnectedComputer, Coworker, CoworkerComputer, CoworkerPatch, CoworkerSource, EFFORT_INHERIT,
-    Enrolment, Failure, FormResolution, FormSpec, ImageVisibility, InferenceKind, InferenceSource,
+    ConnectedComputer, Coworker, CoworkerComputer, CoworkerPatch, CoworkerSource, Enrolment,
+    Failure, FormResolution, FormSpec, ImageVisibility, InferenceKind, InferenceSource,
     InferenceSourceUpdate, LocalExecMode, LocalExecPolicy, LocalExecResolution, ModelCatalogue,
     ModelEntry, ModelPick, NewSchedule, NewSkill, OpenGrokClient, OpenGrokError, PendingCustom,
     PendingOp, PendingUserMessage, PendingWrite, ProfileUpdate, ProxyKey, QueuedApproval,
@@ -312,8 +312,9 @@ impl AccountConnections {
     }
 }
 
-/// Settings → Reply source, and what the composer's chip defaults from: where the server keeps
-/// the account's replies paid from, and what the person has picked on the page and not saved.
+/// Settings → Reply source, and the door every Bot that has picked none of its own follows: where
+/// the server keeps the account's replies paid from, and what the person has picked on the page
+/// and not saved.
 ///
 /// The setting is the server's and lives nowhere else: this app never keeps it, and never calls a
 /// model either way. What the page shows as kept is only ever what the server last said, from a
@@ -419,8 +420,8 @@ pub enum ReplySourceRead {
     Loading,
     Read(InferenceSource),
     /// The server has no reply sources: it answered the read with a bare 404, as a server from
-    /// before the route does. Every control on the page is dead and the composer has no chip,
-    /// because a switch the server does not read would be a switch that changes nothing.
+    /// before the route does. Every control on the page is dead, because a switch the server does
+    /// not read would be a switch that changes nothing.
     NotOnServer,
     /// It could not be read, in the server's words or the app's.
     Unavailable(String),
@@ -867,55 +868,6 @@ impl RelayMac {
     }
 }
 
-/// What the composer's chip shows: which door the next turn goes through, and whether that is the
-/// person's pick for their turns rather than the account's own door.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TurnSourceChip {
-    pub kind: InferenceKind,
-    /// The way to the person's plan the chip names, when it names one: `mac` is "My plan · via
-    /// Mac", the plan answered by the person's Mac through the relay.
-    pub via: Option<Via>,
-    /// A pick of the person's rather than the account's own door. Either way every turn names
-    /// the door the chip shows.
-    pub picked: bool,
-    /// The model the door's plan answers with, as the server keeps it: the plan's own, or the
-    /// relay's for the Mac.
-    pub local_model: Option<String>,
-}
-
-impl TurnSourceChip {
-    /// The door a turn names while the chip shows this.
-    pub fn source(&self) -> TurnSource {
-        TurnSource {
-            kind: self.kind,
-            via: self.via,
-        }
-    }
-}
-
-/// The doors the composer's chip goes round, in its order, for the account's setting as last
-/// read: the server's keys; the person's plan on the server's machine, once one is set up there
-/// (a model kept for it, or the account's door); and the plan through the person's Mac, once the
-/// server knows the relay and keeps a model for it (or it is the account's door). The account's
-/// own door is always among them, as the account keeps it, even by a way this app cannot name.
-/// A way is named only to a server that knows the relay ([`TurnSource`]).
-fn turn_doors(kept: &InferenceSource) -> Vec<TurnSource> {
-    let account = kept.door();
-    let here = TurnSource::plan(kept.knows_relay().then_some(Via::Loopback));
-    let mac = TurnSource::plan(Some(Via::Mac));
-    let mut doors = vec![TurnSource::GATEWAY];
-    if kept.local_model.is_some() || account == here {
-        doors.push(here);
-    }
-    if kept.knows_relay() && (kept.relay_model().is_some() || account == mac) {
-        doors.push(mac);
-    }
-    if !doors.contains(&account) {
-        doors.push(account);
-    }
-    doors
-}
-
 /// What coming back to the window asks the server for again ([`AppState::window_activated`]).
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct ActivationReads {
@@ -1277,29 +1229,6 @@ impl CeilingRead {
             })
             .map(|row| row.name.clone())
             .collect()
-    }
-}
-
-/// The open bot's Effort control, as its settings draw it and a driver reads it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EffortControl {
-    /// The word the server keeps for the bot, or `None` from a server that keeps no effort (one
-    /// from before opengrok-server#271). The control is dead then: that server would drop a pick
-    /// without a word, and the control would claim a setting nothing keeps.
-    pub kept: Option<String>,
-    /// The word the control shows: the person's pick while it waits for Save, or the kept one.
-    pub shown: String,
-}
-
-impl EffortControl {
-    /// What the bot's turns run with now, in the server's word: `inherit` where it keeps none.
-    pub fn kept_word(&self) -> &str {
-        self.kept.as_deref().unwrap_or(EFFORT_INHERIT)
-    }
-
-    /// A pick is waiting for Save.
-    pub fn unsaved(&self) -> bool {
-        self.shown != self.kept_word()
     }
 }
 
@@ -2547,8 +2476,8 @@ impl Conversation {
 /// A held message WAS the draft, so it keeps what the draft had on it rather than reading the
 /// composer again when the thread finally goes idle — by which time the draft is the next
 /// message somebody is writing. Every part of it travels here, and [`AppState::drain_queued_send`]
-/// hands the turn what this row holds and nothing else: the door included, which is the one the
-/// composer's chip showed when the message was sent, whatever the chip shows by the time it goes.
+/// hands the turn what this row holds and nothing else: the door included, which is the Bot's own
+/// when the message was sent, wherever the Bot has been moved by the time it goes.
 fn held_message(
     message_id: String,
     content: String,
@@ -2587,11 +2516,11 @@ pub struct QueuedSend {
     skill: Option<String>,
     /// The message this one answers, for the quote the coworker is sent.
     reply: Option<ReplyTo>,
-    /// The door the composer's chip showed when the message was sent, which its turn names when
-    /// it drains: the chip may have been clicked since, and this message was sent under the old
-    /// one. `None` when no chip was drawn, and the account's setting decides. A row read back
-    /// from the server brings its own (`inferenceSource`), and one from a server that keeps
-    /// none leaves this Mac's in place. It names the way to the plan too when the chip did, the
+    /// The Bot's own door when the message was sent, which its turn names when it drains: the
+    /// Bot may have been moved since, and this message was sent under the old one. `None` for a
+    /// Bot that follows the account's door, and the server decides. A row read back from the
+    /// server brings its own (`inferenceSource`), and one from a server that keeps none leaves
+    /// this Mac's in place. On the person's plan it names the account's way to it too, the
     /// person's Mac included.
     inference_source: Option<TurnSource>,
     /// The server holds this send until a Mac holds the relay again (`heldFor:
@@ -2774,7 +2703,7 @@ fn recipe_from_pending(item: &PendingUserMessage) -> Option<TurnRecipe> {
 }
 
 /// The row a held send asks OpenGrok to keep: its words under its bubble's id, the quote, the
-/// recipe with its values, the skill, and the door its chip showed, as the hold carries them.
+/// recipe with its values, the skill, and the Bot's door, as the hold carries them.
 fn pending_write_for(hold: &QueuedSend) -> PendingWrite {
     PendingWrite::enqueue(
         hold.content.clone(),
@@ -2963,8 +2892,9 @@ fn apply_reload(
 /// An empty catalogue with no note is a real answer — this key routes to nothing — and is taken.
 ///
 /// Each door's list is kept by the same rule, apart, because `/models` answers for two machines
-/// at once: the gateway's routes, which a Bot's Model field offers, and the person's own plan's,
-/// listed by opencodex, which Settings → Reply source offers. Either can be down while the other
+/// at once: the gateway's routes, the Server group of a Bot's model picker, and the person's own
+/// plan's, listed by opencodex, which Settings → Reply source and the picker's plan group offer.
+/// Either can be down while the other
 /// answers, and a list that came back with only the other's entries must not empty this one's.
 /// The gateway's reason is the note; opencodex's is `localProxy.healthy: false`. A plan list that
 /// comes back empty while opencodex answers, or with no proxy address kept (no `localProxy` at
@@ -4807,7 +4737,6 @@ pub struct AppState {
     /// edit's answer, or a refused edit put back), so the editor's fields follow it. Per routine
     /// because an answer for one must leave another's half-typed fields alone.
     routine_resyncs: HashMap<String, u64>,
-    pub model_picker_open: bool,
     /// Where the Bot's model picker has its popover open, if anywhere: over the composer's chip,
     /// or under the Model card in the Bot's settings. One at a time, since both are the open
     /// Bot's (`components::model_picker`).
@@ -4948,19 +4877,13 @@ pub struct AppState {
     /// same service, or from one an account that has since signed out made.
     connect_asks: u64,
     /// Settings → Reply source: where the server keeps this account's replies paid from, and
-    /// the page's unsaved picks. The composer's chip defaults from it.
+    /// the page's unsaved picks. A Bot that has picked no door of its own follows it.
     pub reply_source: ReplySourceSettings,
     /// Numbers the reads and Saves of the reply source, so an answer that is not the newest, or
     /// that lands after a sign-out, is dropped.
     reply_source_generation: u64,
-    /// The door the person picked on the composer's chip where it is not the account's own. The
-    /// chip shows it, and every turn names what the chip shows, until they change it back, a
-    /// Save makes it the account's own, or they sign out; and it does not outlive the app,
-    /// because only this memory keeps it. The server keeps the account's door, and that is what
-    /// a relaunch starts from.
-    turn_source_pick: Option<TurnSource>,
-    /// The composer is dictating: its chip is not drawn meanwhile, and a turn names the
-    /// account's own door rather than the chip's.
+    /// The composer is dictating: the model picker's chip gives its place to the dictation's
+    /// buttons meanwhile, and is not in a driver's tree either.
     pub(crate) composer_dictating: bool,
     /// Numbers the reads of `/models`, so only the newest answer lands
     /// ([`Self::begin_models_read`]).
@@ -5008,11 +4931,6 @@ pub struct AppState {
     ceiling_switches: u64,
     /// What the Tools card says about the last switch that did not go as asked.
     ceiling_note: Option<CeilingNote>,
-    /// The effort picked in the open bot's settings and not saved yet, with the bot it was picked
-    /// for. The pane's words live in its own fields; a pick lives here so that a driver can make
-    /// one from the menu's choices the way a person does. Save sends it when it differs from what
-    /// the server keeps ([`Self::effort_to_save`]).
-    effort_pick: Option<(String, String)>,
     /// A driver pressed the bot settings' Save. The button is the pane's, and so are the fields
     /// it sends, so the pane takes this and saves as the button would.
     agent_save_requested: bool,
@@ -5506,7 +5424,6 @@ impl AppState {
             routine_runs_asked: HashMap::new(),
             routine_latest_edit: HashMap::new(),
             routine_resyncs: HashMap::new(),
-            model_picker_open: false,
             model_picker: None,
             model_list_open: false,
             model_pick_note: None,
@@ -5568,7 +5485,6 @@ impl AppState {
             connect_asks: 0,
             reply_source: ReplySourceSettings::default(),
             reply_source_generation: 0,
-            turn_source_pick: None,
             composer_dictating: false,
             models_generation: 0,
             reply_source_page_shown: false,
@@ -5584,7 +5500,6 @@ impl AppState {
             ceiling_switch: None,
             ceiling_switches: 0,
             ceiling_note: None,
-            effort_pick: None,
             agent_save_requested: false,
             coworker_skills: None,
             skills_generation: 0,
@@ -6644,12 +6559,10 @@ impl AppState {
         self.connections_generation += 1;
         self.connectors_generation += 1;
         self.connect_asks += 1;
-        // So was the reply source, and whatever read or Save of it is still out; and the pick on
-        // the composer's chip was theirs to make.
+        // So was the reply source, and whatever read or Save of it is still out.
         self.reply_source = ReplySourceSettings::default();
         self.reply_source_page_shown = false;
         self.reply_source_generation += 1;
-        self.turn_source_pick = None;
         // The picker was open on one of their Bots, and what it last said was about theirs.
         self.model_picker = None;
         self.model_list_open = false;
@@ -6725,8 +6638,9 @@ impl AppState {
         })
         .detach();
         self.refresh_models(cx);
-        // The composer's chip defaults from the account's reply source, so it is read with the
-        // roster: at sign-in, and when the server comes back.
+        // Every Bot that has picked no door of its own follows the account's reply source, and
+        // the picker names that door's model, so it is read with the roster: at sign-in, and
+        // when the server comes back.
         self.read_reply_source(cx);
     }
 
@@ -6755,7 +6669,8 @@ impl AppState {
         Some((client, self.models_generation))
     }
 
-    /// What a `/models` answer means — for the Model field, and for whether the gateway is there.
+    /// What a `/models` answer means — for the model picker, and for whether the gateway is
+    /// there.
     ///
     /// This is also the reconnect loop's probe, which is why it answers whether everything is
     /// reachable now: one request settles both questions, and its success *is* the refill. An
@@ -6867,8 +6782,8 @@ impl AppState {
     ///
     /// Reached only on the transition, so the refill below happens once rather than on every
     /// request that succeeds. The roster is what a spell out of reach may have emptied, and
-    /// asking for it asks for the catalogue too — so the Model field fills again without anybody
-    /// going and looking at it.
+    /// asking for it asks for the catalogue too — so the model picker's list fills again without
+    /// anybody going and looking at it.
     fn came_back(&mut self, cx: &mut Context<Self>) {
         self.reconnecting = false;
         self.reconnect_epoch += 1;
@@ -6902,7 +6817,7 @@ impl AppState {
     /// The probe is `/models`: it is the one request that answers both questions at once — a
     /// failure at the socket is the server, a `200` carrying the gateway's reason is the gateway,
     /// and a list of models is everything working — and its success is itself the refill the
-    /// Model field needs. A refusal (a `401`, a `500`) also ends the loop, because a server that
+    /// model picker's list needs. A refusal (a `401`, a `500`) also ends the loop, because a server that
     /// refuses is a server that is being reached; what it refused is not this loop's business.
     fn start_reconnect(&mut self, cx: &mut Context<Self>) {
         if self.reconnecting {
@@ -7017,7 +6932,7 @@ impl AppState {
             self.computer_poll = None;
         }
         if pane == RightPane::Settings {
-            // Looking at the Model field asks again. The catalogue is fetched once at startup
+            // Looking at the Model card asks again. The catalogue is fetched once at startup
             // and one failed fetch used to be the whole of it for the life of the process; the
             // reconnect loop refills it unvisited now, and this is the other half — somebody
             // who opens the pane to see why it is empty gets a fresh answer for opening it.
@@ -7721,8 +7636,8 @@ impl AppState {
     }
 
     /// Ask the server where the account's replies are paid from: on sign-in, with the roster,
-    /// because the composer's chip defaults from it; and whenever Settings → Reply source comes
-    /// on screen, for its health line. What was read stays on the page while it is asked again.
+    /// because every Bot that has picked no door follows it; and whenever Settings → Reply source
+    /// comes on screen, for its health line. What was read stays on the page while it is asked again.
     pub fn read_reply_source(&mut self, cx: &mut Context<Self>) {
         let Some((client, generation)) = self.begin_reply_source_read() else {
             return;
@@ -7794,7 +7709,6 @@ impl AppState {
                 }
             }
         }
-        self.settle_turn_source_pick();
         true
     }
 
@@ -7927,7 +7841,6 @@ impl AppState {
                 AfterReplySourceSave::Done
             }
         };
-        self.settle_turn_source_pick();
         Some(after)
     }
 
@@ -8174,73 +8087,42 @@ impl AppState {
             .collect()
     }
 
-    /// The chip the account's setting makes for, drawn or not: `None` before the setting is read,
-    /// on a server without reply sources, and while the person has no plan set up to switch to
-    /// (the account is on the server's keys, with no model of theirs kept, here or for a Mac):
-    /// [`turn_doors`] offers the server's keys alone. A pick that is no longer among the doors
-    /// (its model was taken away since) shows the account's own door instead.
-    fn turn_source_chip(&self) -> Option<TurnSourceChip> {
-        let kept = self.reply_source.kept_source()?;
-        let doors = turn_doors(kept);
-        if doors.len() < 2 {
-            return None;
-        }
-        let account = kept.door();
-        let door = self
-            .turn_source_pick
-            .filter(|pick| doors.contains(pick))
-            .unwrap_or(account);
-        let local_model = match door.via {
-            Some(Via::Mac) => kept.relay_model().map(str::to_string),
-            _ => kept.local_model.clone(),
-        };
-        Some(TurnSourceChip {
-            kind: door.kind,
-            via: door.via,
-            picked: door != account,
-            local_model,
-        })
-    }
-
-    /// The composer's chip as drawn: [`Self::turn_source_chip`], except while the composer is
-    /// dictating, when the chip gives its place to the dictation's buttons and a turn names the
-    /// account's own door ([`Self::turn_source_for_send`]). `None` where no chip is drawn.
-    pub fn composer_turn_source(&self) -> Option<TurnSourceChip> {
-        self.turn_source_chip().filter(|_| !self.composer_dictating)
-    }
-
-    /// Replies go through the person's own plan: the account's door is it, or the composer's
-    /// chip is on it. A Bot's own model is not what answers then, the plan's model picked in
-    /// Settings → Reply source is, and the Bot's Model field says so.
+    /// Replies from the open Bot go through the person's own plan: its door is the plan, its own
+    /// or the account's that it follows. The server meters no such turn, and the Bot's Usage card
+    /// says so.
     pub fn replies_on_plan(&self) -> bool {
-        let plan = Some(InferenceKind::LocalProxy);
-        self.reply_source.kept_source().map(|kept| kept.kind) == plan
-            || self.turn_source_chip().map(|chip| chip.kind) == plan
+        self.model_pick()
+            .is_some_and(|pick| pick.door == Some(InferenceKind::LocalProxy))
     }
 
-    /// The door a turn sent now names in `forwardedProps.inferenceSource`: the one the chip
-    /// shows, the account's own included. The chip starts at the account's door as last read,
-    /// and that may have moved on another Mac since; naming it anyway is what makes the turn go
-    /// where the chip says.
+    /// The door a turn sent now names in `forwardedProps.inferenceSource`: the open Bot's own,
+    /// and on the person's plan the account's way to it, named only to a server that knows the
+    /// relay, as the account's own door is ([`InferenceSource::door`]). A Bot that follows the
+    /// account's door, a server that keeps none per Bot, and a door this app cannot name all
+    /// send nothing, and the server goes by what it keeps.
     ///
-    /// While the composer dictates, the chip gives its place to the dictation's buttons and the
-    /// turn names the account's own door, as Settings → Reply source shows it: a pick on a chip
-    /// the person cannot see does not steer the turn, and naming nothing would leave it to the
-    /// server's copy of the setting, which may have moved since it was read here. Where there is
-    /// no chip to hide (the setting not read, a server without reply sources, no plan set up to
-    /// switch to), nothing, dictating or not, and the account's setting decides on the server,
-    /// where it is kept.
+    /// The server would go by the Bot's door anyway. Naming it on the turn is what lets a message
+    /// held while the Bot is busy keep the door it was typed under, wherever the Bot is moved
+    /// before it drains.
     fn turn_source_for_send(&self) -> Option<TurnSource> {
-        let chip = self.turn_source_chip()?;
-        if self.composer_dictating {
-            return self.reply_source.kept_source().map(InferenceSource::door);
+        let id = self.active_coworker_id.as_deref()?;
+        let bot = self.coworkers.iter().find(|bot| bot.id == id)?;
+        match bot.source {
+            CoworkerSource::Kind(InferenceKind::Gateway) => Some(TurnSource::GATEWAY),
+            CoworkerSource::Kind(InferenceKind::LocalProxy) => {
+                let via = self
+                    .reply_source
+                    .kept_source()
+                    .and_then(|kept| kept.default_via().filter(|_| kept.knows_relay()));
+                Some(TurnSource::plan(via))
+            }
+            _ => None,
         }
-        Some(chip.source())
     }
 
     /// The door a turn names: a held send's is the one it was held with when the message was
-    /// sent, whatever the chip shows by the time it drains; any other turn's is the one a turn
-    /// sent now names ([`Self::turn_source_for_send`]).
+    /// sent, wherever the Bot is by the time it drains; any other turn's is the one a turn sent
+    /// now names ([`Self::turn_source_for_send`]).
     fn turn_inference_source(&self, drained: Option<&QueuedSend>) -> Option<TurnSource> {
         match drained {
             Some(held) => held.inference_source,
@@ -8248,57 +8130,12 @@ impl AppState {
         }
     }
 
-    /// The composer is dictating, or has stopped. The chip is not drawn meanwhile, so it is not
-    /// in a driver's tree either, and a turn sent meanwhile names the account's own door.
+    /// The composer is dictating, or has stopped. The model picker's chip is not drawn
+    /// meanwhile, so it is not in a driver's tree either.
     pub fn set_composer_dictating(&mut self, dictating: bool, cx: &mut Context<Self>) {
         if self.composer_dictating != dictating {
             self.composer_dictating = dictating;
             cx.notify();
-        }
-    }
-
-    /// A click on the composer's chip: the person's next turns go through the next door until
-    /// it is clicked again. The pick is not sent anywhere until a turn carries it.
-    pub fn toggle_turn_source(&mut self, cx: &mut Context<Self>) {
-        if self.flip_turn_source() {
-            cx.notify();
-        }
-    }
-
-    /// The chip moves to the next of its doors ([`turn_doors`]), round to the first after the
-    /// last: with two it is the other one, as it always was, and with the Mac among them a click
-    /// goes Server, My plan, My plan · via Mac, and back.
-    pub(crate) fn flip_turn_source(&mut self) -> bool {
-        let Some(chip) = self.composer_turn_source() else {
-            return false;
-        };
-        let Some(kept) = self.reply_source.kept_source() else {
-            return false;
-        };
-        let doors = turn_doors(kept);
-        let at = doors
-            .iter()
-            .position(|door| *door == chip.source())
-            .unwrap_or(0);
-        let next = doors[(at + 1) % doors.len()];
-        self.turn_source_pick = (next != kept.door()).then_some(next);
-        true
-    }
-
-    /// After the account's setting changes: a pick on the chip that is now the account's own
-    /// door is no pick, nor is one no longer among the chip's doors, and there is none while the
-    /// setting makes for no chip. A chip that is only out of sight while the composer dictates
-    /// keeps its pick.
-    fn settle_turn_source_pick(&mut self) {
-        let Some(kept) = self.reply_source.kept_source() else {
-            self.turn_source_pick = None;
-            return;
-        };
-        let stale = self
-            .turn_source_pick
-            .is_some_and(|pick| pick == kept.door() || !turn_doors(kept).contains(&pick));
-        if self.turn_source_chip().is_none() || stale {
-            self.turn_source_pick = None;
         }
     }
 
@@ -9122,9 +8959,9 @@ impl AppState {
     fn reads_on_activation(&mut self, now: Instant) -> ActivationReads {
         ActivationReads {
             connections: self.rereads_connections_on_activation(now),
-            // The account's door, whenever somebody is signed in. The composer's chip starts at
-            // it and every turn names what the chip shows, so a door changed on another Mac
-            // meanwhile would send the next turn somewhere the person no longer asked for. It
+            // The account's door, whenever somebody is signed in. Every Bot that has picked no
+            // door follows it, and its picker names that door's model, so a door changed on
+            // another Mac meanwhile would have the picker name a model that does not answer. It
             // is also Settings → Reply source's health line, which changes outside the app: the
             // person starts opencodex in a terminal and comes back to see it running.
             reply_source: self.is_signed_in(),
@@ -9151,58 +8988,6 @@ impl AppState {
         waiting || showing
     }
 
-    /// The open bot's Effort control: `None` with no bot open.
-    pub fn effort_control(&self) -> Option<EffortControl> {
-        let id = self.active_coworker_id.as_deref()?;
-        let coworker = self.coworkers.iter().find(|c| c.id == id)?;
-        let pick = self
-            .effort_pick
-            .as_ref()
-            .filter(|(bot, _)| bot == id)
-            .map(|(_, word)| word.clone());
-        Some(EffortControl {
-            kept: coworker.effort.clone(),
-            shown: pick.unwrap_or_else(|| coworker.effort().to_string()),
-        })
-    }
-
-    /// Pick an effort for the open bot, as a choice in its settings' menu does. It waits for
-    /// Save like everything else the pane holds, and picking the word the server already keeps
-    /// takes a pick back.
-    pub fn pick_effort(&mut self, word: String, cx: &mut Context<Self>) {
-        self.note_effort_pick(word);
-        cx.notify();
-    }
-
-    fn note_effort_pick(&mut self, word: String) {
-        let (Some(id), Some(control)) = (self.active_coworker_id.clone(), self.effort_control())
-        else {
-            return;
-        };
-        self.effort_pick = (word != control.kept_word()).then_some((id, word));
-    }
-
-    /// The effort Save sends: the pick, when it differs from what the server keeps. Otherwise the
-    /// key stays off the patch, and the stored effort is left alone.
-    pub fn effort_to_save(&self) -> Option<String> {
-        self.effort_control()
-            .filter(EffortControl::unsaved)
-            .map(|control| control.shown)
-    }
-
-    /// A patch carrying the pick was stored, so the control goes back to showing the roster, which
-    /// now holds the word the server answered with: the pick, or whatever a server that dropped it
-    /// kept instead. A pick made while the patch was out is a newer one, and stays.
-    fn settle_effort_pick(&mut self, coworker_id: &str, sent: &str) {
-        if self
-            .effort_pick
-            .as_ref()
-            .is_some_and(|(bot, word)| bot == coworker_id && word == sent)
-        {
-            self.effort_pick = None;
-        }
-    }
-
     /// A driver pressing the bot settings' Save, which the pane takes and answers as the button.
     pub fn request_agent_save(&mut self, cx: &mut Context<Self>) {
         self.agent_save_requested = true;
@@ -9220,7 +9005,8 @@ impl AppState {
         }
         self.set_right_pane(RightPane::Closed, cx);
         self.computer_view = ComputerView::Overview;
-        self.model_picker_open = false;
+        self.model_picker = None;
+        self.model_list_open = false;
         self.avatar_editor_open = false;
         self.record_nav();
         cx.notify();
@@ -9261,7 +9047,12 @@ impl AppState {
         }
         self.set_right_pane(RightPane::Computer, cx);
         self.computer_view = ComputerView::Overview;
-        self.model_picker_open = false;
+        // The Bot's card goes with its settings; the composer's chip stays, and so may its
+        // popover.
+        if self.model_picker == Some(PickerPlace::Card) {
+            self.model_picker = None;
+            self.model_list_open = false;
+        }
         self.avatar_editor_open = false;
         self.record_nav();
         cx.notify();
@@ -11803,10 +11594,11 @@ impl AppState {
     }
 
     pub fn dismiss_popovers(&mut self, cx: &mut Context<Self>) {
-        if !self.model_picker_open && !self.avatar_editor_open && self.emoji_picker.is_none() {
+        if self.model_picker.is_none() && !self.avatar_editor_open && self.emoji_picker.is_none() {
             return;
         }
-        self.model_picker_open = false;
+        self.model_picker = None;
+        self.model_list_open = false;
         self.avatar_editor_open = false;
         self.emoji_picker = None;
         self.hidden_bots_open = false;
@@ -12120,24 +11912,18 @@ impl AppState {
         cx.notify();
     }
 
-    pub fn set_model_picker_open(&mut self, open: bool, cx: &mut Context<Self>) {
-        if self.model_picker_open == open && (!open || !self.avatar_editor_open) {
-            return;
-        }
-        self.model_picker_open = open;
-        if open {
-            self.avatar_editor_open = false;
-        }
-        cx.notify();
-    }
-
     pub fn set_avatar_editor_open(&mut self, open: bool, cx: &mut Context<Self>) {
-        if self.avatar_editor_open == open && (!open || !self.model_picker_open) {
+        if self.avatar_editor_open == open
+            && (!open || self.model_picker != Some(PickerPlace::Card))
+        {
             return;
         }
         self.avatar_editor_open = open;
-        if open {
-            self.model_picker_open = false;
+        // The avatar editor and the Model card's popover share the settings pane, and one opens
+        // over the other.
+        if open && self.model_picker == Some(PickerPlace::Card) {
+            self.model_picker = None;
+            self.model_list_open = false;
         }
         cx.notify();
     }
@@ -12198,14 +11984,11 @@ impl AppState {
                 }
                 match result.as_ref() {
                     Ok(_) => {
-                        if let Some(sent) = patch.effort.as_deref() {
-                            state.settle_effort_pick(&id, sent);
-                        }
                         state.auth_error = None;
                         state.note_server_answered(cx);
                     }
-                    // A refused pick stays on the control, as refused words stay in the fields,
-                    // with the server's sentence under them.
+                    // Refused words stay in the fields, with the server's sentence under them;
+                    // the roster has gone back to what the server keeps.
                     Err(error) => state.note_failure(error, cx),
                 }
                 cx.notify();
@@ -12713,11 +12496,6 @@ impl AppState {
         let Some(coworker) = self.coworkers.iter().find(|c| c.id == id).cloned() else {
             return;
         };
-        // An effort picked and not saved goes with the switch, as the words typed into the
-        // settings' fields do: those fill afresh with the next bot's own.
-        if self.active_coworker_id.as_deref() != Some(id.as_str()) {
-            self.effort_pick = None;
-        }
         self.active_coworker_id = Some(id.clone());
         // A bot chosen is a chat: the main slot leaves whatever page it was on.
         self.page = MainPage::Chat;
@@ -14156,7 +13934,7 @@ impl AppState {
     /// `recipe` and `skill` are what the message was typed with. `stop_first` is a run this turn
     /// replaces: it is stopped on the wire before the turn is posted. `drained` is the hold this
     /// turn is firing, when it came off `queued_sends`. `on_server` sends it on the server's paid
-    /// keys whatever the chip shows: the turn the person's Mac could not answer, sent again.
+    /// keys whatever the Bot's door: the turn the person's Mac could not answer, sent again.
     #[allow(clippy::too_many_arguments)]
     fn send_opengrok_turn_with(
         &mut self,
@@ -14186,9 +13964,9 @@ impl AppState {
         let history = self.turn_history(&conversation_id, drained.as_ref());
         let pending_id = drained.as_ref().and_then(|held| held.pending_id.clone());
         let queued_message_id = drained.as_ref().map(|held| held.message_id.clone());
-        // The door the chip shows as the turn leaves, or for a held send the one it showed when
-        // the message was sent: see `turn_inference_source`. A turn sent again on the server's
-        // keys names them.
+        // The Bot's door as the turn leaves, or for a held send the one it had when the message
+        // was sent: see `turn_inference_source`. A turn sent again on the server's keys names
+        // them.
         let turn_source = if on_server {
             Some(TurnSource::GATEWAY)
         } else {
@@ -14718,8 +14496,8 @@ impl AppState {
 
     /// Send this reply on Server instead: the turn the person's Mac could not answer, again, on
     /// the server's paid keys, this once. The failed row goes and the turn runs from the thread
-    /// as it stands, as Try again's does; the person's message is not sent twice, and the
-    /// composer's chip is left where it was, for the turns after this one.
+    /// as it stands, as Try again's does; the person's message is not sent twice, and the Bot's
+    /// door is left where it was, for the turns after this one.
     pub fn send_on_server(&mut self, cx: &mut Context<Self>) {
         let Some(message_id) = self.relay_failed_turn() else {
             return;
@@ -24014,9 +23792,7 @@ mod tests {
 
     // The patch reconciliation, apart from the app: what the roster holds for a coworker once
     // the server has answered.
-    use super::{
-        Coworker, CoworkerPatch, CoworkerSource, EffortControl, apply_patch, settle_patch,
-    };
+    use super::{Coworker, CoworkerPatch, CoworkerSource, apply_patch, settle_patch};
 
     fn bob() -> Coworker {
         Coworker {
@@ -24187,68 +23963,47 @@ mod tests {
         assert_eq!(roster, before);
     }
 
-    /// Save carries the effort only when the pick differs from what the server keeps. Picking
-    /// the kept word takes the pick back, a pick is the bot's it was made for and no other's, and
-    /// a stored pick hands the control back to the roster unless a newer one was made meanwhile.
+    /// A change in the model picker is the roster's the moment it is made, door, model and
+    /// effort together, so both of the picker's places follow the click at once; the server's
+    /// echo then has the last word on each, and a refusal puts all three back.
     #[test]
-    fn save_carries_the_effort_only_when_the_pick_changed_it() {
-        let mut state = AppState::new();
-        state.coworkers = vec![
-            bob(),
-            Coworker {
-                id: "cw_2".to_string(),
-                ..bob()
-            },
-        ];
-        state.active_coworker_id = Some("cw_1".to_string());
-        let untouched = state.effort_control().unwrap();
-        assert_eq!(untouched.shown, "high");
-        assert!(!untouched.unsaved());
-        assert_eq!(state.effort_to_save(), None, "nothing picked, nothing sent");
-
-        state.note_effort_pick("max".to_string());
-        let picked = state.effort_control().unwrap();
-        assert_eq!((picked.kept_word(), picked.shown.as_str()), ("high", "max"));
-        assert!(picked.unsaved());
-        assert_eq!(state.effort_to_save().as_deref(), Some("max"));
-
-        state.note_effort_pick("high".to_string());
-        assert_eq!(state.effort_to_save(), None, "the kept word is no change");
-
-        state.note_effort_pick("low".to_string());
-        state.active_coworker_id = Some("cw_2".to_string());
-        assert_eq!(state.effort_control().unwrap().shown, "high");
-        assert_eq!(state.effort_to_save(), None);
-        state.active_coworker_id = Some("cw_1".to_string());
-
-        state.settle_effort_pick("cw_1", "max");
+    fn a_pick_is_the_rosters_at_once_and_the_servers_word_settles_it() {
+        let before = bob();
+        let patch = CoworkerPatch {
+            source: Some(InferenceKind::LocalProxy),
+            model: Some("gpt-6-luna--fast".to_string()),
+            effort: Some("max".to_string()),
+            ..Default::default()
+        };
+        let mut roster = before.clone();
+        apply_patch(&mut roster, &patch);
         assert_eq!(
-            state.effort_to_save().as_deref(),
-            Some("low"),
-            "a pick made while the patch was out is a newer one"
+            (
+                &roster.source,
+                roster.model.as_str(),
+                roster.effort.as_deref()
+            ),
+            (
+                &CoworkerSource::Kind(InferenceKind::LocalProxy),
+                "gpt-6-luna--fast",
+                Some("max")
+            )
         );
-        state.settle_effort_pick("cw_1", "low");
-        assert_eq!(state.effort_to_save(), None);
-    }
-
-    /// A server from before opengrok-server#271 keeps no effort. The control shows what that
-    /// server's turns run with, which is inherit, and Save has nothing to send.
-    #[test]
-    fn a_server_that_keeps_no_effort_shows_inherit() {
-        let mut state = AppState::new();
-        state.coworkers = vec![Coworker {
-            effort: None,
-            ..bob()
-        }];
-        state.active_coworker_id = Some("cw_1".to_string());
+        let echo = Coworker {
+            source: CoworkerSource::AccountDefault,
+            model: "gpt-6-luna--fast".to_string(),
+            effort: Some("max".to_string()),
+            ..before.clone()
+        };
+        let mut kept = roster.clone();
+        settle_patch(&mut kept, &patch, Some(&echo), &before);
         assert_eq!(
-            state.effort_control(),
-            Some(EffortControl {
-                kept: None,
-                shown: "inherit".to_string(),
-            })
+            kept.source,
+            CoworkerSource::AccountDefault,
+            "the server's word on the door, even where it is not the one sent"
         );
-        assert_eq!(state.effort_to_save(), None);
+        settle_patch(&mut roster, &patch, None, &before);
+        assert_eq!(roster, before, "refused: all three go back");
     }
 
     // ---- A turn survives looking away -------------------------------------------------------
@@ -28827,96 +28582,71 @@ mod tests {
         assert!(state.relay_models().is_empty());
     }
 
-    /// A server with the Mac relay and a model kept for it: the composer's chip goes round the
-    /// three doors, and a turn names the one it shows, the Mac's with its way. The plan on the
-    /// server's machine is named with its way too, so a turn goes there even when the account's
-    /// own way is the Mac; a server from before the relay is sent the bare word, the only one it
-    /// reads. A relay with no model kept for it is no door.
+    /// A Bot on the person's plan names the account's way to it on every turn: through the
+    /// person's Mac where that is the account's way, on the server's own machine where that is,
+    /// named with its way to a server that knows the relay, and as the bare word to one from
+    /// before it, the only word that one reads. A Bot on the server's keys names them whatever
+    /// the account's way, and a Bot that follows the account's door names nothing.
     #[test]
-    fn a_turn_can_go_through_the_persons_mac() {
+    fn a_bot_on_the_plan_names_the_accounts_way_to_it() {
         use crate::opengrok::{RelayRead, Via};
-        let relayed = |kind: InferenceKind, via: &str, relay_model: Option<&str>| InferenceSource {
+        let relayed = |via: &str| InferenceSource {
             via: Some(via.into()),
             relay: Some(RelayRead {
                 connected: true,
                 machine_id: Some("mac_1".into()),
                 machine_label: Some("NativeChat on studio".into()),
-                local_model: relay_model.map(str::to_string),
+                local_model: Some("grok-4".into()),
             }),
-            ..kept(kind, Some("gpt-5-codex"))
+            ..kept(InferenceKind::Gateway, Some("gpt-5-codex"))
         };
-        let here = TurnSource::plan(Some(Via::Loopback));
-        let mac = TurnSource::plan(Some(Via::Mac));
-        let door = |state: &AppState| state.composer_turn_source().map(|chip| chip.source());
-
-        let mut state = signed_in_state();
-        read_as(
-            &mut state,
-            relayed(InferenceKind::Gateway, "loopback", Some("grok-4")),
-        );
-        assert_eq!(door(&state), Some(TurnSource::GATEWAY));
-        assert!(state.flip_turn_source());
-        assert_eq!(door(&state), Some(here));
-        assert_eq!(state.turn_inference_source(None), Some(here));
-        assert!(state.flip_turn_source());
-        let chip = state.composer_turn_source().expect("a chip");
+        let on = |source: serde_json::Value| {
+            let mut state = signed_in_state();
+            state.coworkers = vec![
+                serde_json::from_value(json!({
+                    "id": "cw_1", "name": "Ada", "model": "gpt-5-codex", "source": source
+                }))
+                .expect("a row"),
+            ];
+            state.active_coworker_id = Some("cw_1".into());
+            state
+        };
+        let mut state = on(json!("local_proxy"));
+        read_as(&mut state, relayed("mac"));
         assert_eq!(
-            (chip.source(), chip.picked, chip.local_model.as_deref()),
-            (mac, true, Some("grok-4")),
-            "the Mac's door answers with the relay's model"
+            serde_json::to_value(state.turn_inference_source(None)).unwrap(),
+            json!({"kind": "local_proxy", "via": "mac"})
         );
-        assert_eq!(state.turn_inference_source(None), Some(mac));
-        assert!(state.flip_turn_source());
-        assert_eq!(door(&state), Some(TurnSource::GATEWAY), "and round again");
-
-        // The account's own door is the Mac: the chip starts there, and a pick of the server's
-        // machine names that way, not the account's.
-        let mut state = signed_in_state();
-        read_as(&mut state, relayed(InferenceKind::LocalProxy, "mac", None));
-        assert_eq!(door(&state), Some(mac));
-        assert!(state.flip_turn_source());
-        assert!(state.flip_turn_source());
-        assert_eq!(state.turn_inference_source(None), Some(here));
-        // The same setting read again takes nothing away: the pick stands.
-        read_as(&mut state, relayed(InferenceKind::LocalProxy, "mac", None));
-        assert_eq!(door(&state), Some(here));
-
-        // No model kept for the relay, and the account on the server's keys: no Mac door, and a
-        // pick of it that the setting no longer makes for is dropped.
-        let mut state = signed_in_state();
-        read_as(
-            &mut state,
-            relayed(InferenceKind::Gateway, "loopback", Some("grok-4")),
-        );
-        assert!(state.flip_turn_source());
-        assert!(state.flip_turn_source());
-        assert_eq!(door(&state), Some(mac));
-        read_as(
-            &mut state,
-            relayed(InferenceKind::Gateway, "loopback", None),
-        );
-        assert_eq!(door(&state), Some(TurnSource::GATEWAY), "the pick is gone");
-        assert!(state.flip_turn_source());
-        assert!(state.flip_turn_source());
-        assert_eq!(
-            door(&state),
-            Some(TurnSource::GATEWAY),
-            "two doors, as before"
-        );
-
-        // A server from before the relay: the plan is named the old way, and there is no Mac.
-        let mut state = signed_in_state();
-        read_as(
-            &mut state,
-            kept(InferenceKind::LocalProxy, Some("gpt-5-codex")),
-        );
+        read_as(&mut state, relayed("loopback"));
         assert_eq!(
             state.turn_inference_source(None),
-            Some(TurnSource::plan(None))
+            Some(TurnSource::plan(Some(Via::Loopback)))
+        );
+        // A server from before the relay: the bare word, the only one it reads.
+        read_as(
+            &mut state,
+            kept(InferenceKind::Gateway, Some("gpt-5-codex")),
         );
         assert_eq!(
             serde_json::to_value(state.turn_inference_source(None)).unwrap(),
             json!("local_proxy")
+        );
+        // The account's setting not read yet: the plan, by the server's own way to it.
+        let state = on(json!("local_proxy"));
+        assert_eq!(
+            state.turn_inference_source(None),
+            Some(TurnSource::plan(None))
+        );
+
+        let mut state = on(json!("gateway"));
+        read_as(&mut state, relayed("mac"));
+        assert_eq!(state.turn_inference_source(None), Some(TurnSource::GATEWAY));
+        let mut state = on(serde_json::Value::Null);
+        read_as(&mut state, relayed("mac"));
+        assert_eq!(
+            state.turn_inference_source(None),
+            None,
+            "the account's door, left to the server"
         );
     }
 
@@ -33136,7 +32866,7 @@ mod tests {
 
     use super::{
         ActivationReads, AfterReplySourceSave, REPLY_SOURCE_NOT_ON_SERVER,
-        REPLY_SOURCE_SAVE_UNKNOWN, ReplySourceNote, ReplySourceRead, TurnSourceChip,
+        REPLY_SOURCE_SAVE_UNKNOWN, ReplySourceNote, ReplySourceRead,
     };
     use crate::opengrok::{InferenceKind, InferenceSource, ReplySource, TurnSource};
 
@@ -33170,117 +32900,69 @@ mod tests {
         assert!(state.settle_reply_source_read(generation, Ok(source)));
     }
 
-    fn chip(state: &AppState) -> Option<(InferenceKind, bool)> {
-        state
-            .composer_turn_source()
-            .map(|chip| (chip.kind, chip.picked))
+    /// A Bot with Ada's row and the door given, open.
+    fn with_bot(state: &mut AppState, source: serde_json::Value) {
+        state.coworkers = vec![
+            serde_json::from_value(json!({
+                "id": "cw_1", "name": "Ada", "model": "gpt-5-codex", "source": source
+            }))
+            .expect("a row"),
+        ];
+        state.active_coworker_id = Some("cw_1".into());
     }
 
-    /// The composer's chip starts where the account's setting is, and a turn sent from there
-    /// names that door: the chip shows where the turn goes, and the turn goes there even if the
-    /// setting has moved on another Mac since it was read. A click picks the other door for the
-    /// next turns and it sticks, named by each, until clicked back; and it is gone with a sign
-    /// out, which is also what a relaunch starts from, since nothing but this memory keeps it.
-    /// With no chip to draw a turn names nothing, and the account's setting decides; with the
-    /// chip hidden while the composer dictates, it names the account's own door.
+    /// A turn names the open Bot's own door, whatever the account's is. A Bot that follows the
+    /// account's door, a server that keeps no door per Bot, and a door this app cannot name
+    /// name none, and the server goes by what it keeps. Moving the Bot moves its next turn with
+    /// it; dictating changes nothing about where a turn goes; and a sign-out forgets it all.
     #[test]
-    fn a_turn_names_the_door_the_composer_chip_shows() {
+    fn a_turn_names_the_bots_own_door() {
         let mut state = signed_in_state();
-        assert_eq!(chip(&state), None, "nothing read, no chip");
-        assert_eq!(state.turn_inference_source(None), None);
+        assert_eq!(state.turn_inference_source(None), None, "no Bot open");
+        with_bot(&mut state, json!("gateway"));
         read_as(
             &mut state,
             kept(InferenceKind::LocalProxy, Some("gpt-5-codex")),
         );
         assert_eq!(
-            state.composer_turn_source(),
-            Some(TurnSourceChip {
-                kind: InferenceKind::LocalProxy,
-                via: None,
-                picked: false,
-                local_model: Some("gpt-5-codex".into()),
-            }),
-            "the account's own door"
+            state.turn_inference_source(None),
+            Some(TurnSource::GATEWAY),
+            "the Bot's own door, not the account's"
         );
+        state.coworkers[0].source = CoworkerSource::Kind(InferenceKind::LocalProxy);
         assert_eq!(
             state.turn_inference_source(None),
-            Some(InferenceKind::LocalProxy.into()),
-            "the account's door, as the chip shows it, goes with the turn"
+            Some(TurnSource::plan(None))
         );
-
-        assert!(state.flip_turn_source());
-        assert_eq!(chip(&state), Some((InferenceKind::Gateway, true)));
-        assert_eq!(
-            state.turn_inference_source(None),
-            Some(InferenceKind::Gateway.into()),
-            "the pick goes with the turn"
-        );
-        assert_eq!(
-            state.turn_inference_source(None),
-            Some(InferenceKind::Gateway.into()),
-            "and with the one after it: it sticks"
-        );
-        assert!(state.flip_turn_source());
-        assert_eq!(chip(&state), Some((InferenceKind::LocalProxy, false)));
-        assert_eq!(
-            state.turn_inference_source(None),
-            Some(InferenceKind::LocalProxy.into()),
-            "clicked back: the account's door again"
-        );
-
-        // An account on the server's keys with a plan set up: the chip starts on Server.
-        let mut state = signed_in_state();
-        read_as(&mut state, kept(InferenceKind::Gateway, Some("grok-4")));
-        assert_eq!(chip(&state), Some((InferenceKind::Gateway, false)));
-        assert_eq!(
-            state.turn_inference_source(None),
-            Some(InferenceKind::Gateway.into())
-        );
-        assert!(state.flip_turn_source());
-        assert_eq!(
-            state.turn_inference_source(None),
-            Some(InferenceKind::LocalProxy.into())
-        );
-        // A read that finds the account moved to the person's plan on another Mac: the pick is
-        // the account's own door now, and no pick at all.
-        read_as(&mut state, kept(InferenceKind::LocalProxy, Some("grok-4")));
-        assert_eq!(chip(&state), Some((InferenceKind::LocalProxy, false)));
-        assert_eq!(
-            state.turn_inference_source(None),
-            Some(InferenceKind::LocalProxy.into())
-        );
-
-        // While the composer dictates the chip is not drawn, and a turn names the account's own
-        // door rather than the pick nobody can see; the pick is still there when the chip comes
-        // back.
-        assert!(state.flip_turn_source());
         state.composer_dictating = true;
-        assert_eq!(chip(&state), None);
         assert_eq!(
             state.turn_inference_source(None),
-            Some(InferenceKind::LocalProxy.into())
+            Some(TurnSource::plan(None)),
+            "dictated, the same door"
         );
-        assert!(!state.flip_turn_source(), "no chip to click");
-        read_as(&mut state, kept(InferenceKind::LocalProxy, Some("grok-4")));
         state.composer_dictating = false;
-        assert_eq!(chip(&state), Some((InferenceKind::Gateway, true)));
-
-        // Signing out forgets the pick with the setting.
+        for (none, why) in [
+            (
+                CoworkerSource::AccountDefault,
+                "it follows the account's door",
+            ),
+            (CoworkerSource::NotKept, "the server keeps no door per Bot"),
+            (
+                CoworkerSource::Unknown("byok".into()),
+                "a door this app cannot name",
+            ),
+        ] {
+            state.coworkers[0].source = none;
+            assert_eq!(state.turn_inference_source(None), None, "{why}");
+        }
+        state.coworkers[0].source = CoworkerSource::Kind(InferenceKind::Gateway);
         state.forget_account();
-        assert_eq!(chip(&state), None);
-        assert_eq!(state.turn_inference_source(None), None);
-
-        // No plan set up to switch to: no chip, and nothing a turn could carry.
-        let mut state = signed_in_state();
-        read_as(&mut state, kept(InferenceKind::Gateway, None));
-        assert_eq!(chip(&state), None);
-        assert!(!state.flip_turn_source());
-        assert_eq!(state.turn_inference_source(None), None);
+        assert_eq!(state.turn_inference_source(None), None, "signed out");
     }
 
     /// Coming back to the window reads the account's door again whenever somebody is signed
-    /// in: the chip starts at it and every turn names what the chip shows, so a door changed on
-    /// another Mac meanwhile is read before the next turn goes.
+    /// in: every Bot that has picked no door follows it, and the picker names its model, so a
+    /// door changed on another Mac meanwhile is read before the picker is next looked at.
     #[test]
     fn coming_back_to_the_window_reads_the_accounts_door_again() {
         let mut state = AppState::new();
@@ -33314,17 +32996,17 @@ mod tests {
         assert!(!state.reads_on_activation(Instant::now()).models);
     }
 
-    /// A message sent while a turn runs is held with the door the chip showed when it was sent,
-    /// and its turn names that door when it drains, whatever the chip shows by then; the row
-    /// the server keeps for it names it too. One held while the composer dictated keeps the
-    /// account's own door, which is what a turn sent then names. One held while there was no
-    /// chip to draw names none, even if a chip is drawn by the time it goes.
+    /// A message sent while a turn runs is held with the Bot's door as it was sent, and its turn
+    /// names that door when it drains, wherever the Bot has been moved by then; the row the
+    /// server keeps for it names it too. One held while the Bot followed the account's door
+    /// names none, even if the Bot has a door of its own by the time it goes.
     #[test]
     fn a_held_send_keeps_the_door_it_was_sent_under() {
         let mut state = signed_in_state();
+        with_bot(&mut state, json!("local_proxy"));
         read_as(
             &mut state,
-            kept(InferenceKind::LocalProxy, Some("gpt-5-codex")),
+            kept(InferenceKind::Gateway, Some("gpt-5-codex")),
         );
         let hold = state.hold_for_send("m_1".into(), "later".into(), None, None, None);
         assert_eq!(
@@ -33338,8 +33020,8 @@ mod tests {
         );
         state.enqueue_hold("cw_1".into(), hold);
 
-        // The chip is clicked to Server before the thread goes idle.
-        assert!(state.flip_turn_source());
+        // The Bot is moved to the server's keys before the thread goes idle.
+        state.coworkers[0].source = CoworkerSource::Kind(InferenceKind::Gateway);
         assert_eq!(
             state.turn_inference_source(None),
             Some(InferenceKind::Gateway.into())
@@ -33348,33 +33030,12 @@ mod tests {
         assert_eq!(
             state.turn_inference_source(Some(&drained)),
             Some(InferenceKind::LocalProxy.into()),
-            "sent under My plan, it goes through My plan"
+            "sent on the plan, it goes on the plan"
         );
 
-        // Held while the composer dictated, with the chip picked to Server out of sight: the
-        // account's own door, now and when it drains, once the chip is back on its pick.
-        state.composer_dictating = true;
-        let dictated = state.hold_for_send("m_2".into(), "and this".into(), None, None, None);
-        assert_eq!(
-            dictated.inference_source,
-            Some(InferenceKind::LocalProxy.into())
-        );
-        assert_eq!(
-            serde_json::to_value(super::pending_write_for(&dictated)).unwrap()["inferenceSource"],
-            "local_proxy"
-        );
-        state.composer_dictating = false;
-        assert_eq!(chip(&state), Some((InferenceKind::Gateway, true)));
-        state.enqueue_hold("cw_1".into(), dictated);
-        let drained = state.pop_queued_send("cw_1").expect("the hold drains");
-        assert_eq!(
-            state.turn_inference_source(Some(&drained)),
-            Some(InferenceKind::LocalProxy.into())
-        );
-
-        // Held before the setting was read: no chip, no door, now or when it drains.
-        let mut state = signed_in_state();
-        let quiet = state.hold_for_send("m_3".into(), "early".into(), None, None, None);
+        // Held while the Bot followed the account's door: no door, now or when it drains.
+        state.coworkers[0].source = CoworkerSource::AccountDefault;
+        let quiet = state.hold_for_send("m_2".into(), "early".into(), None, None, None);
         assert_eq!(quiet.inference_source, None);
         assert!(
             serde_json::to_value(super::pending_write_for(&quiet))
@@ -33382,67 +33043,10 @@ mod tests {
                 .get("inferenceSource")
                 .is_none()
         );
-        read_as(
-            &mut state,
-            kept(InferenceKind::LocalProxy, Some("gpt-5-codex")),
-        );
+        state.coworkers[0].source = CoworkerSource::Kind(InferenceKind::LocalProxy);
         state.enqueue_hold("cw_1".into(), quiet);
         let drained = state.pop_queued_send("cw_1").expect("the hold drains");
         assert_eq!(state.turn_inference_source(Some(&drained)), None);
-    }
-
-    /// A turn sent while the composer dictates, its chip given over to the dictation's buttons,
-    /// names the account's own door as Settings shows it, and not a pick on the chip nobody can
-    /// see: an account on the person's plan with Server picked goes through the plan, and one on
-    /// the server's keys with My plan picked goes through the keys. It names nothing where no
-    /// door is known (the setting not read, or a server without reply sources) and where there
-    /// is no chip to hide, as a turn typed then would.
-    #[test]
-    fn a_turn_sent_while_dictating_names_the_accounts_own_door() {
-        let mut state = signed_in_state();
-        state.composer_dictating = true;
-        assert_eq!(state.turn_inference_source(None), None, "nothing read");
-        state.reply_source.kept = Some(ReplySourceRead::NotOnServer);
-        assert_eq!(
-            state.turn_inference_source(None),
-            None,
-            "a server without reply sources"
-        );
-        read_as(&mut state, kept(InferenceKind::Gateway, None));
-        assert_eq!(
-            state.turn_inference_source(None),
-            None,
-            "no plan to switch to, so no chip to hide"
-        );
-        state.composer_dictating = false;
-        assert_eq!(state.turn_inference_source(None), None, "as when typed");
-
-        for (account, pick) in [
-            (InferenceKind::LocalProxy, InferenceKind::Gateway),
-            (InferenceKind::Gateway, InferenceKind::LocalProxy),
-        ] {
-            let mut state = signed_in_state();
-            read_as(&mut state, kept(account, Some("gpt-5-codex")));
-            assert!(state.flip_turn_source());
-            assert_eq!(
-                state.turn_inference_source(None),
-                Some(pick.into()),
-                "typed"
-            );
-            state.composer_dictating = true;
-            assert_eq!(chip(&state), None);
-            assert_eq!(
-                state.turn_inference_source(None),
-                Some(account.into()),
-                "dictated: the account's door, not the hidden pick"
-            );
-            state.composer_dictating = false;
-            assert_eq!(
-                state.turn_inference_source(None),
-                Some(pick.into()),
-                "the pick again"
-            );
-        }
     }
 
     /// An edit of a held send carries the door it was held with, so the row the server drains
@@ -33890,9 +33494,9 @@ mod tests {
     }
 
     /// A server from before reply sources answers the read with a bare 404: the page says it
-    /// cannot switch, every control is dead, and the composer has no chip, since a door the
-    /// server does not read would be a switch that changes nothing. The server's own 404 is not
-    /// that: it is said as a failed read.
+    /// cannot switch and every control is dead, since a door the server does not read would be a
+    /// switch that changes nothing. The server's own 404 is not that: it is said as a failed
+    /// read.
     #[test]
     fn a_server_without_reply_sources_offers_no_switch_anywhere() {
         let mut state = signed_in_state();
@@ -33905,7 +33509,7 @@ mod tests {
         );
         assert!(!state.reply_source.can_edit());
         assert!(!state.note_reply_source_kind(InferenceKind::LocalProxy));
-        assert_eq!(chip(&state), None);
+        assert_eq!(state.turn_inference_source(None), None);
         assert!(state.begin_reply_source_save().is_none());
 
         let mut state = signed_in_state();

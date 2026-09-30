@@ -3,9 +3,8 @@ use gpui_agent::{DispatchResult, virtual_unavailable};
 
 use crate::components::agent_settings::{
     CeilingCardLine, SHARED_BOT_READS_SKILLS, SWITCHED_OFF_IN_SETTINGS, ShownCeilingRow,
-    ShownSkillRow, SkillsCardLine, ceiling_card_lines, ceiling_line, effort_choices, effort_label,
-    offered_without_switches, shown_ceiling_rows, shown_skill_rows, skills_card_lines,
-    skills_summary, tools_summary,
+    ShownSkillRow, SkillsCardLine, ceiling_card_lines, ceiling_line, offered_without_switches,
+    shown_ceiling_rows, shown_skill_rows, skills_card_lines, skills_summary, tools_summary,
 };
 use crate::components::app_settings::{
     NO_LOCAL_RULES, not_in_effect_line, remove_label, rule_list_title,
@@ -360,11 +359,7 @@ pub mod ids {
     pub const REPLY_SOURCE_REMOVE_KEY: &str = reply_source::REMOVE_KEY;
     pub const REPLY_SOURCE_ELSEWHERE: &str = reply_source::ELSEWHERE;
     pub const REPLY_SOURCE_HINT: &str = reply_source::HINT;
-    /// The composer's chip: which door the next turns go through.
-    pub const COMPOSER_REPLY_SOURCE: &str = reply_source::COMPOSER_CHIP;
-    /// Under a Bot's Model field, while replies go through the person's own plan.
-    pub const AGENT_MODEL_PLAN: &str = reply_source::BOT_MODEL_PLAN;
-    /// In a Bot's Usage card, at the same times.
+    /// In a Bot's Usage card, while its replies go through the person's own plan.
     pub const AGENT_USAGE_PLAN: &str = reply_source::BOT_USAGE_PLAN;
     /// The radio's third row, from a server that knows the relay: the plan through the person's
     /// Mac (hexuria/nativechat #156, opengrok-server #292).
@@ -753,8 +748,6 @@ pub enum Command {
         name: String,
         enabled: bool,
     },
-    /// A choice in the bot settings' Effort menu. It waits for Save, as a person's pick does.
-    PickEffort(String),
     /// The bot settings' Save.
     SaveAgentSettings,
     ToggleAgentSkills,
@@ -877,8 +870,6 @@ pub enum Command {
     /// Remove key, or Keep key to take it back.
     ToggleRemoveReplySourceKey,
     SaveReplySource,
-    /// The composer's chip: the next turns go through the next door.
-    ToggleTurnSource,
     /// Settings → Reply source's third row: the person's plan through their Mac.
     PickReplySourceMac,
     /// Send this reply on Server instead: the turn the person's Mac could not answer, again, on
@@ -906,11 +897,13 @@ impl Command {
             Self::ToggleTheme => state.toggle_theme(cx),
             Self::ToggleAccount => state.toggle_account_settings(cx),
             Self::ToggleAgentSettings => state.toggle_agent_settings(cx),
+            // The Model card's popover in the Bot's settings, as the sidebar's model list was.
             Self::ToggleModelPicker => {
-                let open = !state.model_picker_open;
-                state.set_model_picker_open(open, cx);
+                state.toggle_model_picker(crate::state::PickerPlace::Card, cx)
             }
-            Self::SetModelPicker(open) => state.set_model_picker_open(open, cx),
+            Self::SetModelPicker(open) => {
+                state.set_model_picker(open.then_some(crate::state::PickerPlace::Card), cx)
+            }
             Self::ToggleAvatarEditor => {
                 let open = !state.avatar_editor_open;
                 state.set_avatar_editor_open(open, cx);
@@ -1026,7 +1019,6 @@ impl Command {
             Self::ToggleAgentTools => state.toggle_agent_tools(cx),
             Self::ToggleAgentUsage => state.toggle_agent_usage(cx),
             Self::SetCeilingTool { name, enabled } => state.switch_ceiling_tool(name, enabled, cx),
-            Self::PickEffort(word) => state.pick_effort(word, cx),
             Self::SaveAgentSettings => state.request_agent_save(cx),
             Self::ToggleAgentSkills => state.toggle_agent_skills(cx),
             Self::SetBotSkill { skill_id, attached } => {
@@ -1125,7 +1117,6 @@ impl Command {
             Self::ToggleRemoveReplySourceKey => state.toggle_remove_reply_source_key(cx),
             Self::SetReplySourceKey(key) => state.set_reply_source_key(&key.0, cx),
             Self::SaveReplySource => state.save_reply_source(cx),
-            Self::ToggleTurnSource => state.toggle_turn_source(cx),
             Self::PickReplySourceMac => state.pick_reply_source_mac(cx),
             Self::SendOnServer => state.send_on_server(cx),
             Self::SetRelayOn(on) => state.set_relay_on(on, cx),
@@ -1792,29 +1783,6 @@ fn choice_node(choice: &ChoiceSnap) -> UiNode {
         choice_dismiss_id(&choice.message_id),
         "Dismiss",
     ))
-}
-
-/// `agent-effort` (a menu; value = the word it shows, state `unsaved` while that is a pick Save
-/// has not sent), with one `agent-effort-{word}` per choice it offers (label as the menu reads
-/// it, state `selected` on the one shown). All of it is disabled from a server that keeps no
-/// effort, where the menu is dead.
-fn agent_effort_node(effort: &crate::state::EffortControl) -> UiNode {
-    let live = effort.kept.is_some();
-    let mut menu = UiNode::new("agent-effort", "menu", "Effort")
-        .with_value(effort.shown.clone())
-        .with_enabled(live);
-    if effort.unsaved() {
-        menu.states.push("unsaved".into());
-    }
-    for word in effort_choices(effort.kept_word()) {
-        let mut choice =
-            UiNode::button(format!("agent-effort-{word}"), effort_label(&word)).with_enabled(live);
-        if word == effort.shown {
-            choice.states.push("selected".into());
-        }
-        menu = menu.with_child(choice);
-    }
-    menu
 }
 
 /// The open Bot's Tools card as its settings draw it: what the next turn is offered, and the
@@ -2568,9 +2536,6 @@ pub struct NativeChatHost {
     agent_usage: Option<crate::state::UsageReport>,
     agent_usage_open: bool,
     agent_tools_open: bool,
-    /// The open bot's Effort menu, as its settings draw it.
-    agent_effort: Option<crate::state::EffortControl>,
-    model_picker_open: bool,
     avatar_editor_open: bool,
     approvals: Vec<ApprovalSnap>,
     computer_open: bool,
@@ -2600,12 +2565,8 @@ pub struct NativeChatHost {
     can_send_on_server: bool,
     /// The open thread's held messages the server holds for the person's Mac, by bubble id.
     waiting_for_mac: Vec<String>,
-    /// How many routes the Model field can offer, and the server's note about why that is not
-    /// more — which is the sentence the person read under the field while the gateway was down.
-    model_count: usize,
-    model_note: Option<String>,
-    /// Replies go through the person's own plan, whose model answers rather than the Bot's pin:
-    /// the line under the Model field says so (`AppState::replies_on_plan`).
+    /// The open Bot's replies go through the person's own plan, which the server meters none of:
+    /// the Usage card says so (`AppState::replies_on_plan`).
     replies_on_plan: bool,
     /// The Recipes page, when it fills the main slot: its rows, and the recipe open in it.
     recipes_open: bool,
@@ -2705,8 +2666,6 @@ pub struct NativeChatHost {
     /// Settings → Reply source as the page draws it, without the typed key.
     reply_source: ReplySourceSnap,
     reply_source_tab: bool,
-    /// The composer's chip, while there is a choice of door to make.
-    turn_source: Option<crate::state::TurnSourceChip>,
     /// The badges on the open thread's replies, oldest first: (message id, source).
     reply_sources: Vec<(String, crate::opengrok::ReplySource)>,
     pending: Option<Command>,
@@ -2795,8 +2754,6 @@ impl NativeChatHost {
                 .as_ref()
                 .filter(|(owner, _)| state.active_coworker_id.as_deref() == Some(owner.as_str()))
                 .map(|(_, report)| report.clone()),
-            agent_effort: state.effort_control(),
-            model_picker_open: state.model_picker_open,
             avatar_editor_open: state.avatar_editor_open,
             approvals: state
                 .open_approvals()
@@ -2859,14 +2816,6 @@ impl NativeChatHost {
             can_retry_turn: state.retryable_turn().is_some(),
             can_send_on_server: state.relay_failed_turn().is_some(),
             waiting_for_mac: state.sends_waiting_for_mac(),
-            // What the Bot's Model field offers: the gateway's routes, not the person's plan's.
-            model_count: state
-                .model_catalogue
-                .models
-                .iter()
-                .filter(|entry| entry.source() == Some(crate::opengrok::InferenceKind::Gateway))
-                .count(),
-            model_note: state.model_catalogue.note.clone(),
             replies_on_plan: state.replies_on_plan(),
             computer_status: if state.computer_endpoint_missing {
                 "endpoint missing".to_string()
@@ -3229,7 +3178,6 @@ impl NativeChatHost {
             connections: state.connections.clone(),
             reply_source: ReplySourceSnap::from_state(state),
             reply_source_tab: state.app_settings_tab == AppSettingsTab::ReplySource,
-            turn_source: state.composer_turn_source(),
             reply_sources: crate::components::chat::reply_badges(state),
             connections_tab: state.app_settings_tab == AppSettingsTab::Connections,
             pending: None,
@@ -3356,24 +3304,6 @@ impl NativeChatHost {
             );
         }
         for node in self.reply_run_nodes() {
-            page = page.with_child(node);
-        }
-        // Which door the next turns go through, while there is a choice to make: label as the
-        // chip reads, value the door's wire word, state `picked` while it is the person's pick
-        // and not the account's own door, and `via-mac` while it is the plan through the
-        // person's Mac.
-        if let Some(chip) = &self.turn_source {
-            let mut node = UiNode::button(
-                ids::COMPOSER_REPLY_SOURCE,
-                reply_source::chip_label(chip.kind, chip.via),
-            )
-            .with_value(chip.kind.word());
-            if chip.picked {
-                node.states.push("picked".into());
-            }
-            if chip.via == Some(crate::opengrok::Via::Mac) {
-                node.states.push(VIA_MAC.into());
-            }
             page = page.with_child(node);
         }
         // Each reply's badge, as the feed draws it: label as it reads, value the door's wire
@@ -3609,19 +3539,7 @@ impl NativeChatHost {
             .with_child(
                 UiNode::new("avatar-editor", "dialog", "Avatar editor")
                     .with_visible(self.avatar_editor_open),
-            )
-            .with_child(UiNode::button("agent-model-field", "Model"))
-            .with_child(
-                UiNode::new("agent-model-list", "list", "Models")
-                    // How many routes the field can offer. The bug was this going to nothing and
-                    // staying there, so it is the number a driver watches — always in the tree,
-                    // because "none" is as much an answer as any other count.
-                    .with_value(self.model_count.to_string())
-                    .with_visible(self.model_picker_open),
             );
-        if let Some(effort) = &self.agent_effort {
-            settings = settings.with_child(agent_effort_node(effort));
-        }
         if self.agent_tools.is_some() || self.agent_ceiling.is_some() {
             settings = settings.with_child(agent_tools_node(&ToolsCardSnap {
                 tools: self.agent_tools.as_ref(),
@@ -3666,24 +3584,13 @@ impl NativeChatHost {
         {
             settings = settings.with_child(self.agent_connections_node(&bot.id));
         }
-        if let Some(note) = &self.model_note {
-            // The server's word about why the list is not fuller, under the field, exactly where
-            // the person read it. In the tree only while there is one, so its absence is the
-            // assertion that the gateway answered.
-            settings = settings.with_child(UiNode::status("agent-model-note", note.clone()));
-        }
-        // While replies go through the person's own plan: under the Model field, whose pin does
-        // not answer then, and in the Usage card, which does not count them.
+        // While the Bot's replies go through the person's own plan: in the Usage card, which
+        // does not count them.
         if self.replies_on_plan {
-            settings = settings
-                .with_child(UiNode::status(
-                    ids::AGENT_MODEL_PLAN,
-                    reply_source::PLAN_MODEL_NOTE,
-                ))
-                .with_child(UiNode::status(
-                    ids::AGENT_USAGE_PLAN,
-                    reply_source::PLAN_USAGE_NOTE,
-                ));
+            settings = settings.with_child(UiNode::status(
+                ids::AGENT_USAGE_PLAN,
+                reply_source::PLAN_USAGE_NOTE,
+            ));
         }
         // The pane's red line over Save, where a refused Save says why in the server's words.
         if let Some(error) = &self.auth_error {
@@ -4801,8 +4708,7 @@ impl NativeChatHost {
         card
     }
 
-    /// One of Settings → Reply source's controls, or the composer's chip, or `None` for a target
-    /// that is neither. The tab answers from anywhere in Settings, and not while Settings is
+    /// One of Settings → Reply source's controls, or `None` for a target that is none of them. The tab answers from anywhere in Settings, and not while Settings is
     /// shut. Every control on the page is refused while the page is not on screen, before the
     /// setting has been read, and while it is dead there: a Save with the server, for Save a read
     /// too, and for the plan's controls a server that is not on this Mac. A model is refused
@@ -4816,16 +4722,6 @@ impl NativeChatHost {
                     "`{target}` is in Settings, which is shut: open it with `{}`",
                     ids::FOOTER_ACCOUNT
                 ))
-            });
-        }
-        if target == ids::COMPOSER_REPLY_SOURCE {
-            return Some(match self.turn_source {
-                Some(_) => Ok(Command::ToggleTurnSource),
-                None => Err(format!(
-                    "no `{target}` on screen: the server keeps no reply source, no plan of yours \
-                     is set up to switch to (Settings → Reply source), or the composer is \
-                     dictating"
-                )),
             });
         }
         if target.starts_with(ids::RELAY) {
@@ -5915,16 +5811,8 @@ impl NativeChatHost {
                 return Err("`agent-save` is in the bot's settings, which are closed".into());
             }
             Command::SaveAgentSettings
-        } else if target == "agent-effort" {
-            return Err(
-                "`agent-effort` is the menu: a pick is a click on its choice, \
-                 `agent-effort-{word}`"
-                    .into(),
-            );
-        } else if let Some(word) = target.strip_prefix("agent-effort-") {
-            self.effort_command(target, word)?
-        } else if target == "agent-model-field" || target == "agent-model-dismiss" {
-            Command::ToggleModelPicker
+        } else if target == "agent-model-dismiss" {
+            Command::SetModelPicker(false)
         } else if target == "avatar-trigger" || target == "avatar-editor-dismiss" {
             Command::ToggleAvatarEditor
         } else if target == ids::LOGIN_SUBMIT {
@@ -6375,33 +6263,6 @@ impl NativeChatHost {
             [] => Err("no idle user-form".into()),
             _ => Err("user-form invoke requires arg card_key".into()),
         }
-    }
-
-    /// A choice in the bot settings' Effort menu. Refused while the settings are closed, from a
-    /// server that keeps no effort, where the menu is dead, and for a word the menu does not offer.
-    fn effort_command(&self, target: &str, word: &str) -> Result<Command, String> {
-        if !self.agent_settings_open {
-            return Err(format!(
-                "`{target}` is in the bot's settings, which are closed"
-            ));
-        }
-        let Some(effort) = &self.agent_effort else {
-            return Err(format!("`{target}` is not on screen: no bot is open"));
-        };
-        if effort.kept.is_none() {
-            return Err(format!(
-                "`{target}` is dead: this server keeps no effort (it is from before \
-                 opengrok-server#271)"
-            ));
-        }
-        let choices = effort_choices(effort.kept_word());
-        if !choices.iter().any(|choice| choice == word) {
-            return Err(format!(
-                "no effort `{word}` in the menu, which offers {}",
-                choices.join(", ")
-            ));
-        }
-        Ok(Command::PickEffort(word.to_string()))
     }
 
     /// A button under one connected computer's local-exec mode.
@@ -8513,51 +8374,19 @@ mod tests {
         );
     }
 
-    /// The Model field's own account of the outage: the list it can still offer, and the note
-    /// saying why it is not longer. The note goes when the gateway answers; the count does not
-    /// drop to nothing while it is away.
+    /// While the open Bot's replies go through the person's own plan, the Usage card says it
+    /// does not count them (the server meters no turn on the person's plan): the Bot's own door,
+    /// or the account's that it follows. Not on the server's keys, and not for a Bot whose door
+    /// is the server's keys while the account is on the plan.
     #[test]
-    fn the_model_field_says_how_many_routes_it_has_and_why_it_has_no_more() {
-        let mut host = host();
-        host.model_count = 12;
-        host.model_note = Some("the gateway could not be reached: …".to_string());
-        let tree = host.snapshot();
-        assert_eq!(
-            tree.find("agent-model-list")
-                .and_then(|n| n.value.as_deref()),
-            Some("12")
-        );
-        assert!(tree.find("agent-model-note").is_some());
-
-        host.model_note = None;
-        assert!(host.snapshot().find("agent-model-note").is_none());
-    }
-
-    /// While replies go through the person's own plan the Model field says the plan's model
-    /// answers, not the pin in the field, and the Usage card says it does not count them (the
-    /// server meters no turn on the person's plan): from the account's door, or from the
-    /// composer's chip clicked to My plan. Neither line on the server's keys.
-    #[test]
-    fn the_model_field_says_when_the_plans_model_answers() {
-        use crate::opengrok::{InferenceKind, InferenceSource};
+    fn the_usage_card_says_when_the_bots_replies_are_on_the_plan() {
+        use crate::opengrok::{CoworkerSource, InferenceKind, InferenceSource};
         use crate::state::ReplySourceRead;
-        let plan_line = |state: &AppState| {
-            let tree = NativeChatHost::from_app(state).snapshot();
-            let model = tree
-                .find(ids::AGENT_MODEL_PLAN)
-                .map(|node| node.name.clone());
-            let usage = tree
+        let usage_line = |state: &AppState| {
+            NativeChatHost::from_app(state)
+                .snapshot()
                 .find(ids::AGENT_USAGE_PLAN)
-                .map(|node| node.name.clone());
-            assert_eq!(
-                usage.is_some(),
-                model.is_some(),
-                "the Usage card says so exactly when the Model field does"
-            );
-            if let Some(usage) = usage {
-                assert_eq!(usage, reply_source::PLAN_USAGE_NOTE);
-            }
-            model
+                .map(|node| node.name.clone())
         };
         let mut state = AppState::new();
         state.auth_status = crate::state::AuthStatus::SignedIn;
@@ -8566,38 +8395,40 @@ mod tests {
                 .unwrap(),
         );
         state.coworkers = vec![
-            serde_json::from_value(serde_json::json!({ "id": "cw_1", "name": "Ada" })).unwrap(),
+            serde_json::from_value(
+                serde_json::json!({ "id": "cw_1", "name": "Ada", "source": null }),
+            )
+            .unwrap(),
         ];
         state.active_coworker_id = Some("cw_1".into());
-        assert_eq!(plan_line(&state), None, "nothing read");
-        let read = |kind, local_model: Option<&str>| {
+        assert_eq!(usage_line(&state), None, "nothing read");
+        let read = |kind| {
             Some(ReplySourceRead::Read(InferenceSource {
                 kind,
                 base_url: Some("http://127.0.0.1:8080".into()),
-                local_model: local_model.map(str::to_string),
+                local_model: Some("gpt-5-codex".into()),
                 healthy: true,
                 has_api_key: false,
                 via: None,
                 relay: None,
             }))
         };
-        state.reply_source.kept = read(InferenceKind::Gateway, Some("gpt-5-codex"));
+        state.reply_source.kept = read(InferenceKind::Gateway);
+        assert_eq!(usage_line(&state), None, "the server's keys");
+        state.reply_source.kept = read(InferenceKind::LocalProxy);
         assert_eq!(
-            plan_line(&state),
-            None,
-            "the server's keys: the pin answers"
+            usage_line(&state).as_deref(),
+            Some(reply_source::PLAN_USAGE_NOTE),
+            "the account's plan, which the Bot follows"
         );
-        state.reply_source.kept = read(InferenceKind::LocalProxy, Some("gpt-5-codex"));
+        state.coworkers[0].source = CoworkerSource::Kind(InferenceKind::Gateway);
+        assert_eq!(usage_line(&state), None, "the Bot's own door is the keys");
+        state.reply_source.kept = read(InferenceKind::Gateway);
+        state.coworkers[0].source = CoworkerSource::Kind(InferenceKind::LocalProxy);
         assert_eq!(
-            plan_line(&state).as_deref(),
-            Some(reply_source::PLAN_MODEL_NOTE)
-        );
-        // The account on the server's keys, the chip clicked to My plan.
-        state.reply_source.kept = read(InferenceKind::Gateway, Some("gpt-5-codex"));
-        assert!(state.flip_turn_source());
-        assert_eq!(
-            plan_line(&state).as_deref(),
-            Some(reply_source::PLAN_MODEL_NOTE)
+            usage_line(&state).as_deref(),
+            Some(reply_source::PLAN_USAGE_NOTE),
+            "the Bot's own plan"
         );
     }
 
@@ -11508,95 +11339,6 @@ mod tests {
         );
     }
 
-    /// The Effort menu is on the tree with the word it shows as its value and one choice per word
-    /// it offers, and a driver picks from it by the road a person's click takes. `xhigh`, which
-    /// the menu does not offer, is shown as it is while the bot has it.
-    #[test]
-    fn the_effort_menu_is_on_the_tree_and_a_driver_picks_from_it() {
-        use crate::state::EffortControl;
-        let mut host = host();
-        host.agent_settings_open = true;
-        host.agent_effort = Some(EffortControl {
-            kept: Some("xhigh".into()),
-            shown: "xhigh".into(),
-        });
-        let tree = host.snapshot();
-        let menu = tree.find("agent-effort").unwrap();
-        assert_eq!(menu.value.as_deref(), Some("xhigh"));
-        assert!(menu.enabled && menu.states.is_empty(), "{menu:?}");
-        let choices: Vec<&str> = menu.children.iter().map(|c| c.id.as_str()).collect();
-        assert_eq!(
-            choices,
-            [
-                "agent-effort-inherit",
-                "agent-effort-low",
-                "agent-effort-medium",
-                "agent-effort-high",
-                "agent-effort-xhigh",
-                "agent-effort-max",
-            ]
-        );
-        let kept = tree.find("agent-effort-xhigh").unwrap();
-        assert_eq!(kept.name, "xhigh");
-        assert_eq!(kept.states, vec!["selected".to_string()]);
-        assert_eq!(tree.find("agent-effort-inherit").unwrap().name, "Inherit");
-
-        host.dispatch(&Op::click("agent-effort-high")).unwrap();
-        assert!(matches!(
-            host.take_command(),
-            Some(Command::PickEffort(word)) if word == "high"
-        ));
-        assert!(
-            host.dispatch(&Op::click("agent-effort-none")).is_err(),
-            "a word the menu does not offer"
-        );
-        assert!(
-            host.dispatch(&Op::click("agent-effort")).is_err(),
-            "the menu is not a choice"
-        );
-
-        // Picked, and not saved yet.
-        host.agent_effort = Some(EffortControl {
-            kept: Some("xhigh".into()),
-            shown: "high".into(),
-        });
-        let tree = host.snapshot();
-        let menu = tree.find("agent-effort").unwrap();
-        assert_eq!(menu.value.as_deref(), Some("high"));
-        assert_eq!(menu.states, vec!["unsaved".to_string()]);
-        assert_eq!(
-            tree.find("agent-effort-high").unwrap().states,
-            vec!["selected".to_string()]
-        );
-        assert!(tree.find("agent-effort-xhigh").unwrap().states.is_empty());
-
-        host.agent_settings_open = false;
-        assert!(
-            host.dispatch(&Op::click("agent-effort-high")).is_err(),
-            "the settings are closed"
-        );
-    }
-
-    /// From a server that keeps no effort the menu is on the tree reading inherit, and dead: a
-    /// click on a choice is refused rather than making a pick nothing would keep.
-    #[test]
-    fn the_effort_menu_is_dead_where_the_server_keeps_no_effort() {
-        use crate::state::EffortControl;
-        let mut host = host();
-        host.agent_settings_open = true;
-        host.agent_effort = Some(EffortControl {
-            kept: None,
-            shown: "inherit".into(),
-        });
-        let tree = host.snapshot();
-        let menu = tree.find("agent-effort").unwrap();
-        assert_eq!(menu.value.as_deref(), Some("inherit"));
-        assert!(!menu.enabled);
-        assert!(!tree.find("agent-effort-high").unwrap().enabled);
-        assert!(host.dispatch(&Op::click("agent-effort-high")).is_err());
-        assert!(host.take_command().is_none());
-    }
-
     /// Save is on the tree and pressed by way of the app, since the fields it sends are the
     /// pane's; a refused Save is on the tree in the server's words, where the pane shows it.
     #[test]
@@ -12333,54 +12075,14 @@ mod tests {
         assert_eq!(host.reply_source.settings.relay_key_draft, None);
     }
 
-    /// The composer's chip is on the tree while there is a choice of door, valued by the door and
-    /// `picked` while it is the person's pick, and a click works it as a person's does, where the
-    /// composer's panel is worked from the keyboard. Each reply's badge is there as the feed draws
-    /// it: under a reply with words, and not under one that said nothing but its status line.
+    /// Each reply's badge is on the tree as the feed draws it: under a reply with words, and not
+    /// under one that said nothing but its status line.
     #[test]
-    fn the_composer_chip_and_each_replys_badge_are_on_the_tree() {
+    fn each_replys_badge_is_on_the_tree() {
         use crate::opengrok::{InferenceKind, InferenceSource, ReplySource};
-        use crate::state::{ReplySourceRead, TurnSourceChip};
-        let mut host = host();
-        assert!(host.snapshot().find(ids::COMPOSER_REPLY_SOURCE).is_none());
-        assert!(host.click(ids::COMPOSER_REPLY_SOURCE).is_err());
-        host.turn_source = Some(TurnSourceChip {
-            kind: InferenceKind::LocalProxy,
-            via: None,
-            picked: false,
-            local_model: Some("gpt-5-codex".into()),
-        });
-        let chip = host
-            .snapshot()
-            .find(ids::COMPOSER_REPLY_SOURCE)
-            .cloned()
-            .unwrap();
-        assert_eq!(
-            (chip.name.as_str(), chip.value.as_deref()),
-            ("My plan", Some("local_proxy"))
-        );
-        assert!(chip.states.is_empty());
-        host.click(ids::COMPOSER_REPLY_SOURCE).unwrap();
-        assert!(matches!(
-            host.take_command(),
-            Some(Command::ToggleTurnSource)
-        ));
-        host.turn_source = Some(TurnSourceChip {
-            kind: InferenceKind::Gateway,
-            via: None,
-            picked: true,
-            local_model: None,
-        });
-        let chip = host
-            .snapshot()
-            .find(ids::COMPOSER_REPLY_SOURCE)
-            .cloned()
-            .unwrap();
-        assert_eq!(chip.name, "Server");
-        assert!(chip.states.contains(&"picked".to_string()));
-
-        // From the app: a reply with words wears its badge, one that said only its status line
-        // does not, and the composer's chip is the account's door.
+        use crate::state::ReplySourceRead;
+        // From the app: a reply with words wears its badge, and one that said only its status
+        // line does not.
         let mut state = AppState::new();
         state.auth_status = crate::state::AuthStatus::SignedIn;
         state.account = Some(
@@ -12449,14 +12151,6 @@ mod tests {
             tree.find(&ids::reply_badge("m_2")).is_none(),
             "a status line has no bubble to wear a badge"
         );
-        let chip = tree.find(ids::COMPOSER_REPLY_SOURCE).unwrap();
-        assert_eq!(chip.value.as_deref(), Some("local_proxy"));
-
-        // While the composer dictates the chip gives its place to the dictation's buttons, and
-        // is not in the tree either.
-        state.composer_dictating = true;
-        let tree = NativeChatHost::from_app(&state).snapshot();
-        assert!(tree.find(ids::COMPOSER_REPLY_SOURCE).is_none());
     }
 
     /// A bot's skills as the server gives them (opengrok-server#270): the owner's `triage`

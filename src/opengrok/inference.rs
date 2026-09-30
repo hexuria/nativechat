@@ -82,14 +82,6 @@ impl InferenceKind {
     pub fn from_word(word: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|kind| kind.word() == word)
     }
-
-    /// The other door: what the composer's chip turns to when it is clicked.
-    pub fn other(self) -> Self {
-        match self {
-            Self::Gateway => Self::LocalProxy,
-            Self::LocalProxy => Self::Gateway,
-        }
-    }
 }
 
 /// The way the person's own plan is reached, in the server's words (opengrok-server #292: `Via`
@@ -530,8 +522,6 @@ mod tests {
         assert_eq!(InferenceKind::LocalProxy.word(), "local_proxy");
         assert_eq!(InferenceKind::from_word("local-proxy"), None);
         assert_eq!(InferenceKind::from_word(""), None);
-        assert_eq!(InferenceKind::Gateway.other(), InferenceKind::LocalProxy);
-        assert_eq!(InferenceKind::LocalProxy.other(), InferenceKind::Gateway);
     }
 
     /// The account's setting reads as the contract writes it, the two nullable fields either

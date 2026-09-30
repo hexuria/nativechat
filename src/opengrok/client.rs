@@ -924,17 +924,17 @@ impl OpenGrokClient {
     /// server drains that row atomically before the harness starts so two machines cannot both
     /// post it. Absent, a last user-message id that matches `clientMessageId` still drains.
     ///
-    /// `inference_source` is the door the composer's chip shows for this turn, the account's own
-    /// included, or for a held send the door its chip showed when it was queued: it goes as
-    /// `forwardedProps.inferenceSource` and wins over the account's setting for this turn only,
-    /// so the turn goes where the chip said even when the setting has moved since it was read
+    /// `inference_source` is the Bot's own door for this turn, or for a held send the door the
+    /// Bot had when it was queued: it goes as `forwardedProps.inferenceSource` and wins over the
+    /// Bot's and the account's for this turn only, so a held send goes where it was typed to go
+    /// even when the Bot has been moved since
     /// (the inference-source contract agreed with open-ai-gateway and opengrok-server,
     /// 2026-09-30, built in opengrok-server #294: `named` in
     /// `crates/opengrok-server/src/inference.rs`,
     /// `route` in `crates/opengrok-harness/src/local_proxy.rs`). It is the bare word, or with a
     /// way to the plan named `{"kind", "via"}` (#292: server main cad36fd (#303, after #298), pin
-    /// 47a5d6b; see [`TurnSource`]). Absent, with no chip drawn, the
-    /// account's setting decides, and the turn is the one sent before reply sources existed.
+    /// 47a5d6b; see [`TurnSource`]). Absent, for a Bot that follows the account's door, the
+    /// server decides, and the turn is the one sent before reply sources existed.
     ///
     /// The run id is the caller's. The server keeps every frame a run emits under it and will
     /// hand the whole lot back from `GET /ag-ui/runs/{run_id}`, which is of no use whatever to a
@@ -5479,9 +5479,9 @@ mod tests {
         assert!(!error.is_signed_out());
     }
 
-    /// The queue's four routes as the v1 contract writes them. A send queued while the
-    /// composer's chip showed a door carries it (`inferenceSource`, opengrok-server #294), and
-    /// the row the server answers with names it back.
+    /// The queue's four routes as the v1 contract writes them. A send queued with a door
+    /// carries it (`inferenceSource`, opengrok-server #294), and the row the server answers with
+    /// names it back.
     #[tokio::test]
     async fn enqueue_edit_cancel_and_list_pending_follow_the_v1_contract() {
         let server = MockServer::start().await;
@@ -6862,10 +6862,10 @@ mod tests {
         }
     }
 
-    /// The door picked on the composer's chip travels as `forwardedProps.inferenceSource`, where
-    /// the server reads it and lets it win over the account's setting for this turn: the bare
-    /// word, or with a way to the plan named, `{"kind", "via"}`. A turn with no pick is the turn
-    /// this client sent before reply sources existed, byte for byte.
+    /// The Bot's door travels as `forwardedProps.inferenceSource`, where the server reads it and
+    /// lets it win for this turn: the bare word, or with a way to the plan named, `{"kind",
+    /// "via"}`. A turn with no door is the turn this client sent before reply sources existed,
+    /// byte for byte.
     #[tokio::test]
     async fn a_turn_carries_the_picked_reply_source_and_a_turn_without_one_is_unchanged() {
         use crate::opengrok::{TurnSource, Via};
