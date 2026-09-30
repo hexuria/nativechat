@@ -123,6 +123,12 @@ impl OpenGrokClient {
         })
     }
 
+    /// The server runs on this Mac: its address is loopback ([`super::is_loopback`]). The person's
+    /// own plan is set up only from there, because the server calls opencodex on its own machine.
+    pub fn is_on_this_machine(&self) -> bool {
+        super::is_loopback(&self.base)
+    }
+
     pub fn with_session_file(mut self, path: PathBuf) -> Self {
         self.session_path = Some(path);
         self
@@ -828,9 +834,12 @@ impl OpenGrokClient {
 
     /// `GET /account/inference-source` — where the account's replies are paid from: the server's
     /// paid keys, or the person's own subscription through opencodex (the inference-source
-    /// contract agreed with open-ai-gateway and opengrok-server, 2026-09-30, server PR pending).
-    /// A server from before the route answers a bare 404, which the caller reads as a server that
-    /// cannot switch. Given [`INFERENCE_SOURCE_TIMEOUT`].
+    /// contract agreed with open-ai-gateway and opengrok-server, 2026-09-30, server PR pending:
+    /// `get_source` in `crates/opengrok-server/src/inference.rs`, answered by `described` in
+    /// `crates/opengrok-harness/src/local_proxy.rs`). A signed-in account always gets a 200, the
+    /// default `{"kind": "gateway", ...}` until it has saved one. A server from before the route
+    /// answers a bare 404, which the caller reads as a server that cannot switch. Given
+    /// [`INFERENCE_SOURCE_TIMEOUT`].
     pub async fn inference_source(&self) -> Result<InferenceSource, OpenGrokError> {
         let response = self
             .send_json_within::<()>(
@@ -845,10 +854,12 @@ impl OpenGrokClient {
     }
 
     /// `PUT /account/inference-source` — keep a new reply source, answered with the setting as
-    /// the server now keeps it (the same contract). A `baseUrl` that is not literal loopback, or
-    /// a `localModel` from a provider the server will not route a subscription to, is refused
-    /// with a 400 and `{"error": sentence}`, and nothing is kept. Given
-    /// [`INFERENCE_SOURCE_TIMEOUT`].
+    /// the server now keeps it, with a fresh `healthy` (the same contract: `put_source` in
+    /// `crates/opengrok-server/src/inference.rs`, `apply` in
+    /// `crates/opengrok-harness/src/local_proxy.rs`). A field left out is kept and a `null`
+    /// clears it ([`InferenceSourceUpdate`]). A `baseUrl` that is not literal loopback, or a
+    /// `localModel` from a provider the server will not route a subscription to, is refused with
+    /// a 400 and `{"error": sentence}`, and nothing is kept. Given [`INFERENCE_SOURCE_TIMEOUT`].
     pub async fn set_inference_source(
         &self,
         update: &InferenceSourceUpdate,
@@ -6575,10 +6586,11 @@ mod tests {
     }
 
     /// The account's reply source as the contract writes it: `GET` reads the setting, and a
-    /// Save is one `PUT` of the whole form, key and all when one was typed, answered with the
-    /// setting as the server now keeps it.
+    /// Save is one `PUT` of the door and what changed, key and all when one was typed, answered
+    /// with the setting as the server now keeps it. A field emptied on the page goes as `null`,
+    /// and so does Remove key.
     #[tokio::test]
-    async fn the_reply_source_is_read_and_a_save_puts_the_whole_form() {
+    async fn the_reply_source_is_read_and_a_save_puts_what_changed() {
         use crate::opengrok::{InferenceKind, InferenceSourceUpdate, ProxyKey};
         let server = MockServer::start().await;
         Mock::given(method("GET"))
@@ -6605,6 +6617,18 @@ mod tests {
             .expect(1)
             .mount(&server)
             .await;
+        Mock::given(method("PUT"))
+            .and(path("/account/inference-source"))
+            .and(body_json(json!({
+                "kind": "gateway", "baseUrl": null, "localModel": null, "apiKey": null
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "kind": "gateway", "baseUrl": null, "localModel": null,
+                "healthy": false, "hasApiKey": false
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
         let client = OpenGrokClient::new(&server.uri()).unwrap();
         let read = client.inference_source().await.unwrap();
         assert_eq!(
@@ -6614,15 +6638,28 @@ mod tests {
         let kept = client
             .set_inference_source(&InferenceSourceUpdate {
                 kind: InferenceKind::LocalProxy,
-                base_url: Some("http://127.0.0.1:8080".into()),
-                local_model: Some("gpt-5-codex".into()),
-                api_key: ProxyKey::new("sk-proxy-1"),
+                base_url: Some(Some("http://127.0.0.1:8080".into())),
+                local_model: Some(Some("gpt-5-codex".into())),
+                api_key: Some(ProxyKey::new("sk-proxy-1")),
             })
             .await
             .unwrap();
         assert_eq!(kept.kind, InferenceKind::LocalProxy);
         assert_eq!(kept.local_model.as_deref(), Some("gpt-5-codex"));
         assert!(kept.healthy && kept.has_api_key);
+        let cleared = client
+            .set_inference_source(&InferenceSourceUpdate {
+                kind: InferenceKind::Gateway,
+                base_url: Some(None),
+                local_model: Some(None),
+                api_key: Some(None),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            (cleared.base_url, cleared.local_model, cleared.has_api_key),
+            (None, None, false)
+        );
     }
 
     /// A URL that is not literal loopback is refused with a 400 and the server's sentence, and
@@ -6642,7 +6679,7 @@ mod tests {
         let refused = client
             .set_inference_source(&InferenceSourceUpdate {
                 kind: InferenceKind::LocalProxy,
-                base_url: Some("http://my-mac.example.com:8080".into()),
+                base_url: Some(Some("http://my-mac.example.com:8080".into())),
                 local_model: None,
                 api_key: None,
             })

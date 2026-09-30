@@ -3,16 +3,22 @@
 //!
 //! The app never calls a model, whichever it is. The fork is in opengrok-server's model door:
 //! the harness, the tools and the journal stay on the server either way, and when the source is
-//! `local_proxy` it is the server that talks to opencodex, the proxy on the person's Mac, over
-//! loopback. What lives here is the cockpit's half of that: the account's setting (`GET` and
-//! `PUT /account/inference-source`), the override one turn can carry in
+//! `local_proxy` it is the server that talks to opencodex, the proxy that holds the person's
+//! sign-in, over the server's own loopback. So opencodex runs on the same machine as the server,
+//! and the person's plan can be set up only from a Mac that is that machine ([`is_loopback`]).
+//! What lives here is the cockpit's half of that: the account's setting (`GET` and
+//! `PUT /account/inference-source`), the door one turn names in
 //! `forwardedProps.inferenceSource`, and the CUSTOM frame (`opengrok.inferenceSource`) that says
 //! which door a reply came through.
 //!
 //! Every shape here is transcribed from the inference-source contract agreed with
-//! open-ai-gateway and opengrok-server (2026-09-30), server PR pending. No server answers it yet,
-//! so none of it is in `fixtures/wire/`: the conformance ledger owes the two routes and the
-//! CUSTOM name their readings until the server's recording holds them.
+//! open-ai-gateway and opengrok-server (2026-09-30), server PR pending, and checked against the
+//! server's half as built (branch inference-source, e04eb97): the routes in
+//! `crates/opengrok-server/src/inference.rs`, what a Save does and what a read answers
+//! (`apply`, `described`, `loopback_base`) in `crates/opengrok-harness/src/local_proxy.rs`, and
+//! the door's words and the forbidden providers in `crates/opengrok-core/src/inference.rs`. The
+//! server's recording has not reached `fixtures/wire/`, so the conformance ledger owes the two
+//! routes and the CUSTOM name their readings until it does.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -26,13 +32,27 @@ pub const INFERENCE_SOURCE_CUSTOM: &str = "opengrok.inferenceSource";
 /// refuses anything that is not literal loopback, so this is also the shape a URL has to have.
 pub const DEFAULT_PROXY_URL: &str = "http://127.0.0.1:8080";
 
+/// Whether an address is the machine it is dialled from, as the server reads one: `127.0.0.0/8`,
+/// `[::1]` or the name `localhost`, with or without a port (`loopback_base` in
+/// `crates/opengrok-harness/src/local_proxy.rs`). The app asks it of its own server's address:
+/// the server calls opencodex on its own loopback, so the person's plan is set up from this Mac
+/// only when the server runs on it.
+pub fn is_loopback(url: &url::Url) -> bool {
+    match url.host() {
+        Some(url::Host::Domain(name)) => name.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        None => false,
+    }
+}
+
 /// Which door a turn's model calls go through, in the server's words.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum InferenceKind {
     /// The server's paid keys, through open-ai-gateway.
     Gateway,
-    /// The person's own subscription, through opencodex on their Mac.
+    /// The person's own subscription, through opencodex on the same machine as the server.
     LocalProxy,
 }
 
@@ -90,28 +110,37 @@ pub struct InferenceSource {
 
 /// A `PUT /account/inference-source` body: `{"kind", "baseUrl"?, "localModel"?, "apiKey"?}`.
 ///
-/// The server keeps it or refuses the whole of it with a 400 and `{"error": sentence}`: a
-/// `baseUrl` that is not literal loopback (it follows no redirects), or a `localModel` from a
-/// provider it will not route a subscription to. It routes only OpenAI/Codex and xAI/Grok models
-/// that way, and fails closed on anything else.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+/// `kind` is always there. Each other field is there only when the page changes it, and the
+/// server reads a field three ways (`apply` in `crates/opengrok-harness/src/local_proxy.rs`):
+/// absent keeps what it has, `null` (or `""`) clears it, and a value replaces it. So each is
+/// `None` to leave out, `Some(None)` for `null`, and `Some(Some(_))` for a value; `apiKey: null`
+/// is Remove key.
+///
+/// The server keeps it or refuses the whole of it with a 400 and `{"error": sentence}`, and asks
+/// every field that is there whatever the kind: a `baseUrl` that is not literal loopback (it
+/// follows no redirects), or a `localModel` from a provider it will not route a subscription to.
+/// It routes only OpenAI/Codex and xAI/Grok models that way, and fails closed on anything else.
+///
+/// Not `Clone`: it can hold the key.
+#[derive(Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct InferenceSourceUpdate {
     pub kind: InferenceKind,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub base_url: Option<String>,
+    pub base_url: Option<Option<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub local_model: Option<String>,
+    pub local_model: Option<Option<String>>,
     /// Sent once, when the person typed one, and kept by the server: `hasApiKey` is all that
-    /// ever comes back. Absent leaves the key the server has alone.
+    /// ever comes back. `Some(None)` asks the server to forget the one it has; absent leaves it.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub api_key: Option<ProxyKey>,
+    pub api_key: Option<Option<ProxyKey>>,
 }
 
 /// A key for the proxy as the person typed it, on its way to the server. This app keeps it
-/// nowhere: it is sent in one `PUT` and dropped, and its `Debug` is a mark, so no log or panic
-/// message ever carries it.
-#[derive(Clone, PartialEq, Eq, Serialize)]
+/// nowhere but the page it was typed on, until it is sent in one `PUT` or the page is left: it is
+/// never cloned (the type is not `Clone`), and its `Debug` is a mark, so no log or panic message
+/// ever carries it.
+#[derive(PartialEq, Eq, Serialize)]
 #[serde(transparent)]
 pub struct ProxyKey(String);
 
@@ -120,6 +149,12 @@ impl ProxyKey {
     pub fn new(typed: &str) -> Option<Self> {
         let typed = typed.trim();
         (!typed.is_empty()).then(|| Self(typed.to_string()))
+    }
+
+    /// The key, for the one field that shows it, masked: a key a driver wrote is drawn there as
+    /// the dots a typed one is.
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
     }
 }
 
@@ -181,10 +216,12 @@ impl ReplySource {
 /// Whether a model is one "My subscription" must never be pointed at. The server routes only
 /// OpenAI/Codex and xAI/Grok models to a person's subscription and refuses the rest, so the
 /// picker never offers what the server would refuse, even should a list ever carry one: the
-/// terms of Claude and Gemini forbid routing a consumer subscription through another app.
+/// terms of Anthropic and Google forbid routing a consumer subscription through another app. The
+/// words are the server's own list (`FORBIDDEN` in `crates/opengrok-core/src/inference.rs`): an
+/// id that has any of them anywhere in it, in any case.
 pub fn is_forbidden_subscription_model(id: &str) -> bool {
     let id = id.to_ascii_lowercase();
-    ["claude", "anthropic", "gemini", "google/"]
+    ["anthropic", "claude", "google", "gemini"]
         .iter()
         .any(|provider| id.contains(provider))
 }
@@ -251,15 +288,17 @@ mod tests {
         }
     }
 
-    /// A `PUT` body names only what the form holds, and the key rides along only when one was
-    /// typed. No `Debug` of the body, or of the key, ever prints the key.
+    /// A `PUT` body names the door and only what the page changed: a value to keep, `null` to
+    /// clear, and nothing for a field left alone, which the server keeps. The key rides along
+    /// only when one was typed, and `null` is Remove key. No `Debug` of the body, or of the key,
+    /// ever prints the key.
     #[test]
-    fn a_put_body_carries_what_the_form_holds_and_never_prints_the_key() {
+    fn a_put_body_carries_what_changed_and_null_clears() {
         let full = InferenceSourceUpdate {
             kind: InferenceKind::LocalProxy,
-            base_url: Some("http://127.0.0.1:8080".into()),
-            local_model: Some("gpt-5-codex".into()),
-            api_key: ProxyKey::new("  sk-proxy-1  "),
+            base_url: Some(Some("http://127.0.0.1:8080".into())),
+            local_model: Some(Some("gpt-5-codex".into())),
+            api_key: Some(ProxyKey::new("  sk-proxy-1  ")),
         };
         assert_eq!(
             serde_json::to_value(&full).unwrap(),
@@ -277,12 +316,52 @@ mod tests {
             kind: InferenceKind::Gateway,
             base_url: None,
             local_model: None,
-            api_key: ProxyKey::new("   "),
+            api_key: None,
         };
         assert_eq!(
             serde_json::to_value(&bare).unwrap(),
-            json!({"kind": "gateway"})
+            json!({"kind": "gateway"}),
+            "a field left alone is left out"
         );
+        let cleared = InferenceSourceUpdate {
+            kind: InferenceKind::Gateway,
+            base_url: Some(None),
+            local_model: Some(None),
+            api_key: Some(None),
+        };
+        assert_eq!(
+            serde_json::to_value(&cleared).unwrap(),
+            json!({"kind": "gateway", "baseUrl": null, "localModel": null, "apiKey": null})
+        );
+        assert_eq!(ProxyKey::new("   "), None, "a blank field is no key");
+    }
+
+    /// The app's own server is on this Mac when its address is loopback as the server reads one:
+    /// any of 127.0.0.0/8, `[::1]`, or `localhost`, with or without a port. A name that only
+    /// starts with `localhost`, a LAN address or `0.0.0.0` is somewhere else.
+    #[test]
+    fn this_mac_is_the_servers_machine_only_at_a_loopback_address() {
+        for here in [
+            "http://127.0.0.1:1447",
+            "http://127.5.6.7",
+            "http://localhost:1447/",
+            "https://LOCALHOST",
+            "http://[::1]:1447",
+        ] {
+            assert!(is_loopback(&url::Url::parse(here).unwrap()), "{here}");
+        }
+        for elsewhere in [
+            "http://192.168.1.5:1447",
+            "https://opengrok.example.com",
+            "http://localhost.example.com:1447",
+            "http://0.0.0.0:1447",
+            "http://[::2]:1447",
+        ] {
+            assert!(
+                !is_loopback(&url::Url::parse(elsewhere).unwrap()),
+                "{elsewhere}"
+            );
+        }
     }
 
     /// The CUSTOM frame reads as its kind and its model; a frame of another name, a kind this
@@ -347,8 +426,9 @@ mod tests {
         assert_eq!(ReplySource::from_json(r#"{"kind":"elsewhere"}"#), None);
     }
 
-    /// Claude's and Gemini's models are never offered for the person's subscription, however
-    /// the id spells its provider; OpenAI's and xAI's are.
+    /// Anthropic's and Google's models are never offered for the person's subscription,
+    /// however the id spells its provider, as the server's list reads them: any id with
+    /// `google` anywhere in it included. OpenAI's and xAI's are.
     #[test]
     fn claude_and_gemini_are_never_a_subscription_model() {
         for forbidden in [
@@ -356,6 +436,8 @@ mod tests {
             "anthropic/claude-opus",
             "Gemini-2.5-Pro",
             "google/gemini-flash",
+            "google-palm-2",
+            "vertex/Google-model",
         ] {
             assert!(is_forbidden_subscription_model(forbidden), "{forbidden}");
         }

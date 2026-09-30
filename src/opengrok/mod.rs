@@ -35,7 +35,7 @@ pub use gen_ui::{
 };
 pub use inference::{
     DEFAULT_PROXY_URL, INFERENCE_SOURCE_CUSTOM, InferenceKind, InferenceSource,
-    InferenceSourceUpdate, ProxyKey, ReplySource, is_forbidden_subscription_model,
+    InferenceSourceUpdate, ProxyKey, ReplySource, is_forbidden_subscription_model, is_loopback,
 };
 pub use local_exec::{enrol_this_machine, serve_local_exec, stored_machine_id};
 pub(crate) use user_form::USER_FORM_REASON;

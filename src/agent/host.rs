@@ -355,6 +355,11 @@ pub mod ids {
     pub const REPLY_SOURCE_SAVE: &str = reply_source::SAVE;
     pub const REPLY_SOURCE_ERROR: &str = reply_source::ERROR;
     pub const REPLY_SOURCE_UNAVAILABLE: &str = reply_source::UNAVAILABLE;
+    pub const REPLY_SOURCE_NO_MODEL: &str = reply_source::NO_MODEL;
+    pub const REPLY_SOURCE_MODELS_NOTE: &str = reply_source::MODELS_NOTE;
+    pub const REPLY_SOURCE_REMOVE_KEY: &str = reply_source::REMOVE_KEY;
+    pub const REPLY_SOURCE_ELSEWHERE: &str = reply_source::ELSEWHERE;
+    pub const REPLY_SOURCE_HINT: &str = reply_source::HINT;
     /// The composer's chip: which door the next turns go through.
     pub const COMPOSER_REPLY_SOURCE: &str = reply_source::COMPOSER_CHIP;
     /// Under a Bot's Model field, while replies go through the person's own plan.
@@ -375,6 +380,11 @@ pub mod ids {
     /// A reply's badge, by the reply's message id.
     pub fn reply_badge(message_id: &str) -> String {
         reply_source::badge_id(message_id)
+    }
+
+    /// The model a reply's badge names on hover, under the badge.
+    pub fn reply_badge_model(message_id: &str) -> String {
+        reply_source::badge_model_id(message_id)
     }
 
     /// One connected service on Settings → Connections, by the server's connection id.
@@ -831,7 +841,11 @@ pub enum Command {
     PickReplySourceKind(crate::opengrok::InferenceKind),
     SetReplySourceUrl(String),
     PickReplySourceModel(String),
+    /// No model: the kept one is taken away with the next Save.
+    ClearReplySourceModel,
     SetReplySourceKey(RedactedSecret),
+    /// Remove key, or Keep key to take it back.
+    ToggleRemoveReplySourceKey,
     SaveReplySource,
     /// The composer's chip: the next turns go through the other door.
     ToggleTurnSource,
@@ -1062,6 +1076,8 @@ impl Command {
             Self::PickReplySourceKind(kind) => state.pick_reply_source_kind(kind, cx),
             Self::SetReplySourceUrl(url) => state.set_reply_source_url(url, cx),
             Self::PickReplySourceModel(model) => state.pick_reply_source_model(model, cx),
+            Self::ClearReplySourceModel => state.clear_reply_source_model(cx),
+            Self::ToggleRemoveReplySourceKey => state.toggle_remove_reply_source_key(cx),
             Self::SetReplySourceKey(key) => state.set_reply_source_key(&key.0, cx),
             Self::SaveReplySource => state.save_reply_source(cx),
             Self::ToggleTurnSource => state.toggle_turn_source(cx),
@@ -2392,20 +2408,23 @@ struct ReplySourceSnap {
     can_save: bool,
     /// The models of the person's plan the picker offers.
     models: Vec<String>,
+    /// What the health line says (`AppState::proxy_health`).
+    health: Option<crate::state::ProxyHealth>,
+    /// The line beside Save (`AppState::reply_source_hint`).
+    hint: Option<&'static str>,
 }
 
 impl ReplySourceSnap {
     fn from_state(state: &AppState) -> Self {
-        let mut settings = state.reply_source.clone();
-        let unsaved = settings.is_unsaved();
-        let can_save = settings.can_save();
-        let key_typed = settings.key_draft.take().is_some();
+        let settings = &state.reply_source;
         Self {
-            settings,
-            key_typed,
-            unsaved,
-            can_save,
+            settings: settings.without_key(),
+            key_typed: settings.key_draft.is_some(),
+            unsaved: settings.is_unsaved(),
+            can_save: state.reply_source_can_save(),
             models: state.subscription_models(),
+            health: state.proxy_health(),
+            hint: state.reply_source_hint(),
         }
     }
 }
@@ -3249,7 +3268,8 @@ impl NativeChatHost {
             page = page.with_child(node);
         }
         // Each reply's badge, as the feed draws it: label as it reads, value the door's wire
-        // word, and the model the server named, which the badge shows on hover, as a state.
+        // word, and under it the model the server named, which the badge shows on hover: words
+        // the window draws, so a node of their own rather than a state.
         for (message_id, source) in &self.reply_sources {
             let mut node = UiNode::status(
                 ids::reply_badge(message_id),
@@ -3257,7 +3277,10 @@ impl NativeChatHost {
             )
             .with_value(source.kind.word());
             if let Some(model) = &source.model {
-                node.states.push(model.clone());
+                node = node.with_child(UiNode::status(
+                    ids::reply_badge_model(message_id),
+                    model.clone(),
+                ));
             }
             page = page.with_child(node);
         }
@@ -4368,25 +4391,25 @@ impl NativeChatHost {
     }
 
     /// Settings → Reply source as the page draws it: `settings-reply-source` (value = the door
-    /// the server keeps; states `unsaved`, `saving`, `reading`) holding the radio, the proxy URL,
-    /// the model picker with a choice per model of the person's plan, the key field (never its
-    /// text), the health line, the note on Claude and Gemini, Save, and the line under Save.
-    /// While the setting is being asked for the section is there with state `asking` and nothing
-    /// in it; on a server without reply sources, or when it could not be read, it holds only the
-    /// line that stands in for the form.
+    /// the server keeps; states `unsaved`, `saving`, `reading`) holding the radio, the line saying
+    /// the plan is set up only from the server's own Mac where this is not it, the proxy URL, the
+    /// model picker with No model and a choice per model of the person's plan, the line under
+    /// it, the key field (never its text) and Remove key, the health line, the note on Claude and
+    /// Gemini, the line under Save, the line beside it, and Save. Before the setting has been
+    /// read, on a server without reply sources, or when it could not be read, the section holds
+    /// only the line the page draws in place of the form (state `asking` while that is the
+    /// server being asked).
     fn reply_source_node(&self) -> UiNode {
+        use crate::state::ProxyHealth;
         let snap = &self.reply_source;
         let settings = &snap.settings;
         let mut section = UiNode::new(ids::REPLY_SOURCE, "group", "Reply source");
         let Some(kept) = settings.kept_source() else {
-            match reply_source::unavailable_line(settings) {
-                Some(line) if line != reply_source::ASKING => {
-                    section =
-                        section.with_child(UiNode::status(ids::REPLY_SOURCE_UNAVAILABLE, line));
-                }
-                _ => section.states.push("asking".into()),
+            let line = reply_source::unavailable_line(settings).unwrap_or(reply_source::ASKING);
+            if line == reply_source::ASKING {
+                section.states.push("asking".into());
             }
-            return section;
+            return section.with_child(UiNode::status(ids::REPLY_SOURCE_UNAVAILABLE, line));
         };
         section = section.with_value(kept.kind.word());
         for (on, state) in [
@@ -4399,10 +4422,16 @@ impl NativeChatHost {
             }
         }
         let live = settings.can_edit();
+        let plan_live = settings.plan_editable();
+        let here = settings.server_on_this_mac;
         let shown = settings.shown_kind().unwrap_or(kept.kind);
         let mut radio = UiNode::new(ids::REPLY_SOURCE_KIND, "radiogroup", "Reply source")
             .with_value(shown.word());
         for kind in crate::opengrok::InferenceKind::ALL {
+            let enabled = match kind {
+                crate::opengrok::InferenceKind::Gateway => live,
+                crate::opengrok::InferenceKind::LocalProxy => plan_live,
+            };
             radio = radio.with_child(
                 UiNode::new(
                     ids::reply_source_kind(kind),
@@ -4410,64 +4439,101 @@ impl NativeChatHost {
                     reply_source::kind_label(kind),
                 )
                 .with_checked(kind == shown)
-                .with_enabled(live),
+                .with_enabled(enabled),
             );
         }
         let shown_model = settings.shown_model();
         let mut models = UiNode::new(
             ids::REPLY_SOURCE_MODEL,
             "menu",
-            shown_model
-                .clone()
-                .unwrap_or_else(|| reply_source::PICK_MODEL.to_string()),
+            shown_model.unwrap_or(reply_source::PICK_MODEL),
         )
-        .with_value(shown_model.clone().unwrap_or_default())
-        .with_enabled(live && !snap.models.is_empty());
+        .with_value(shown_model.unwrap_or_default())
+        .with_enabled(plan_live && (!snap.models.is_empty() || shown_model.is_some()));
         if snap.models.is_empty() {
             models.states.push("empty".into());
         }
+        if shown_model.is_some() {
+            models = models.with_child(
+                UiNode::button(ids::REPLY_SOURCE_NO_MODEL, reply_source::NO_MODEL_LABEL)
+                    .with_enabled(plan_live),
+            );
+        }
         for model in &snap.models {
-            let mut choice =
-                UiNode::button(ids::reply_source_model(model), model.clone()).with_enabled(live);
-            if shown_model.as_deref() == Some(model.as_str()) {
+            let mut choice = UiNode::button(ids::reply_source_model(model), model.clone())
+                .with_enabled(plan_live);
+            if shown_model == Some(model.as_str()) {
                 choice.states.push("selected".into());
             }
             models = models.with_child(choice);
         }
-        let mut key = UiNode::textbox(ids::REPLY_SOURCE_KEY, "Proxy key").with_enabled(live);
+        // The window draws a key waiting for Save as masked dots in the field, a driver's too.
+        let mut key = UiNode::textbox(ids::REPLY_SOURCE_KEY, "Proxy key")
+            .with_enabled(plan_live && !settings.remove_key);
         if kept.has_api_key {
             key.states.push("set".into());
         }
         if snap.key_typed {
             key.states.push("typed".into());
         }
+        let health = snap.health.unwrap_or(ProxyHealth::NoAddress);
+        section = section.with_child(radio);
+        if !here {
+            section = section.with_child(UiNode::status(
+                ids::REPLY_SOURCE_ELSEWHERE,
+                reply_source::ELSEWHERE_LINE,
+            ));
+        }
         section = section
-            .with_child(radio)
             .with_child(
                 UiNode::textbox(ids::REPLY_SOURCE_URL, "Proxy URL")
                     .with_value(settings.shown_url())
-                    .with_enabled(live),
+                    .with_enabled(plan_live),
             )
-            .with_child(models)
-            .with_child(key)
+            .with_child(models);
+        if let Some(line) = reply_source::models_note(health, !snap.models.is_empty()) {
+            section = section.with_child(UiNode::status(ids::REPLY_SOURCE_MODELS_NOTE, line));
+        }
+        section = section.with_child(key);
+        if kept.has_api_key {
+            let mut remove = UiNode::button(
+                ids::REPLY_SOURCE_REMOVE_KEY,
+                if settings.remove_key {
+                    reply_source::KEEP_KEY_LABEL
+                } else {
+                    reply_source::REMOVE_KEY_LABEL
+                },
+            )
+            .with_enabled(plan_live);
+            if settings.remove_key {
+                remove.states.push("picked".into());
+            }
+            section = section.with_child(remove);
+        }
+        section = section
             .with_child(
                 UiNode::status(ids::REPLY_SOURCE_HEALTH, {
-                    let (words, command) = reply_source::health_line(kept);
+                    let (words, command) = reply_source::health_line(health, here);
                     command
                         .map_or_else(|| words.to_string(), |command| format!("{words} {command}"))
                 })
-                .with_value(if kept.healthy {
-                    "running"
-                } else {
-                    "not-running"
-                }),
+                .with_value(reply_source::health_word(health)),
             )
             .with_child(UiNode::status(
                 ids::REPLY_SOURCE_PROVIDERS,
                 reply_source::PROVIDERS_NOTE,
             ));
-        if let Some(note) = &settings.note {
-            section = section.with_child(UiNode::status(ids::REPLY_SOURCE_ERROR, note.line()));
+        // The line under Save: state `trouble` while it is drawn in the danger colour, a refusal
+        // or a failed read; a Save being checked, and a key to type again, are drawn muted.
+        if let Some(line) = reply_source::error_line(settings) {
+            let mut error = UiNode::status(ids::REPLY_SOURCE_ERROR, line);
+            if reply_source::error_is_trouble(settings) {
+                error.states.push("trouble".into());
+            }
+            section = section.with_child(error);
+        }
+        if let Some(hint) = snap.hint {
+            section = section.with_child(UiNode::status(ids::REPLY_SOURCE_HINT, hint));
         }
         section.with_child(
             UiNode::button(ids::REPLY_SOURCE_SAVE, reply_source::save_label(settings))
@@ -4478,8 +4544,9 @@ impl NativeChatHost {
     /// One of Settings → Reply source's controls, or the composer's chip, or `None` for a target
     /// that is neither. The tab answers from anywhere in Settings, and not while Settings is
     /// shut. Every control on the page is refused while the page is not on screen, before the
-    /// setting has been read, and while it is dead there: a Save with the server, and for Save a
-    /// read too. A model is refused unless the picker offers it.
+    /// setting has been read, and while it is dead there: a Save with the server, for Save a read
+    /// too, and for the plan's controls a server that is not on this Mac. A model is refused
+    /// unless the picker offers it.
     fn reply_source_command(&self, target: &str) -> Option<Result<Command, String>> {
         if target == ids::SETTINGS_REPLY_SOURCE {
             return Some(if self.account_open {
@@ -4495,8 +4562,9 @@ impl NativeChatHost {
             return Some(match self.turn_source {
                 Some(_) => Ok(Command::ToggleTurnSource),
                 None => Err(format!(
-                    "no `{target}` on screen: the server keeps no reply source, or no plan of \
-                     yours is set up to switch to (Settings → Reply source)"
+                    "no `{target}` on screen: the server keeps no reply source, no plan of yours \
+                     is set up to switch to (Settings → Reply source), or the composer is \
+                     dictating"
                 )),
             });
         }
@@ -4516,10 +4584,10 @@ impl NativeChatHost {
         }
         let snap = &self.reply_source;
         let settings = &snap.settings;
-        if settings.kept_source().is_none() {
+        let Some(kept) = settings.kept_source() else {
             let line = reply_source::unavailable_line(settings).unwrap_or(reply_source::ASKING);
             return Err(format!("no `{target}` on screen: {line}"));
-        }
+        };
         let dead = || {
             let why = if settings.saving.is_some() {
                 "a Save is with the server"
@@ -4528,13 +4596,27 @@ impl NativeChatHost {
             };
             Err(format!("`{target}` is dead: {why}"))
         };
+        // The plan's controls: dead while the page is, and where the server is not on this Mac.
+        let plan = |command: Command| {
+            if !settings.can_edit() {
+                dead()
+            } else if !settings.server_on_this_mac {
+                Err(format!(
+                    "`{target}` is dead: {}",
+                    reply_source::ELSEWHERE_LINE
+                ))
+            } else {
+                Ok(command)
+            }
+        };
         if target == ids::REPLY_SOURCE_URL || target == ids::REPLY_SOURCE_KEY {
             return Err(format!("`{target}` is a field: use set_value"));
         }
         if target == ids::REPLY_SOURCE_MODEL {
             return Err(format!(
-                "`{target}` is the menu: a pick is a click on its choice, `{}`",
-                ids::reply_source_model("{model}")
+                "`{target}` is the menu: a pick is a click on its choice, `{}`, or `{}`",
+                ids::reply_source_model("{model}"),
+                ids::REPLY_SOURCE_NO_MODEL
             ));
         }
         if target == ids::REPLY_SOURCE_SAVE {
@@ -4542,9 +4624,27 @@ impl NativeChatHost {
                 Ok(Command::SaveReplySource)
             } else if !settings.can_edit() || settings.reading.is_some() {
                 dead()
+            } else if let Some(hint) = snap.hint.filter(|_| snap.unsaved) {
+                Err(format!("`{target}` is dead: {hint}"))
             } else {
                 Err(format!(
                     "`{target}` is dead: nothing on the page differs from what the server keeps"
+                ))
+            };
+        }
+        if target == ids::REPLY_SOURCE_REMOVE_KEY {
+            return if kept.has_api_key {
+                plan(Command::ToggleRemoveReplySourceKey)
+            } else {
+                Err(format!("no `{target}` on screen: the server holds no key"))
+            };
+        }
+        if target == ids::REPLY_SOURCE_NO_MODEL {
+            return if settings.shown_model().is_some() {
+                plan(Command::ClearReplySourceModel)
+            } else {
+                Err(format!(
+                    "no `{target}` on screen: no model is shown to take away"
                 ))
             };
         }
@@ -4552,10 +4652,14 @@ impl NativeChatHost {
             .into_iter()
             .find(|kind| target == ids::reply_source_kind(*kind))
         {
-            return if settings.can_edit() {
-                Ok(Command::PickReplySourceKind(kind))
-            } else {
-                dead()
+            return match kind {
+                crate::opengrok::InferenceKind::Gateway if settings.can_edit() => {
+                    Ok(Command::PickReplySourceKind(kind))
+                }
+                crate::opengrok::InferenceKind::Gateway => dead(),
+                crate::opengrok::InferenceKind::LocalProxy => {
+                    plan(Command::PickReplySourceKind(kind))
+                }
             };
         }
         if let Some(model) = target.strip_prefix(&format!("{}-", ids::REPLY_SOURCE_MODEL)) {
@@ -4563,17 +4667,16 @@ impl NativeChatHost {
                 Err(format!(
                     "no `{target}` on screen: the picker offers no model `{model}`"
                 ))
-            } else if !settings.can_edit() {
-                dead()
             } else {
-                Ok(Command::PickReplySourceModel(model.to_string()))
+                plan(Command::PickReplySourceModel(model.to_string()))
             };
         }
         Err(format!("`{target}` is a line on the page, not a control"))
     }
 
     /// `set_value` on Settings → Reply source's URL or key field, as typing it there would; the
-    /// key goes to the page and never into a tree. Refused off the page and while it is dead.
+    /// key goes to the page, which draws it masked, and never into a tree. Refused off the page,
+    /// while it is dead, and where the server is not on this Mac.
     fn set_reply_source_field(
         &mut self,
         target: &str,
@@ -4586,9 +4689,10 @@ impl NativeChatHost {
                 ids::SETTINGS_REPLY_SOURCE
             ));
         }
-        if !self.reply_source.settings.can_edit() {
+        if !self.reply_source.settings.plan_editable() {
             return Err(format!(
-                "`{target}` is dead: the setting is not read yet, or a Save is with the server"
+                "`{target}` is dead: the setting is not read yet, a Save is with the server, or \
+                 this app's server is not on this Mac"
             ));
         }
         self.pending = Some(if target == ids::REPLY_SOURCE_URL {
@@ -11005,16 +11109,25 @@ mod tests {
         }
     }
 
-    /// Settings → Reply source is on the tree as the page draws it: the section valued by the
-    /// door the server keeps, its radio, the proxy URL, the model picker with the plan's models,
-    /// the key field, the health line, the note on Claude and Gemini, and Save. Each control is
-    /// the page's own, and refused off the page, before the setting is read and while it is
-    /// dead; the tab only while Settings is open. The typed key is never on the tree.
+    /// Settings → Reply source is on the tree as the page draws it: the line standing in for the
+    /// form until the server has answered, then the section valued by the door the server keeps,
+    /// its radio, the proxy URL, the model picker with No model and the plan's models and the
+    /// line under it, the key field with Remove key, the health line, the note on Claude and
+    /// Gemini, the lines by Save, and Save. Each control is the page's own, and refused off the
+    /// page, before the setting is read and while it is dead; the plan's controls also where the
+    /// server is not on this Mac, which the page says. The tab answers only while Settings is
+    /// open. The typed key is never on the tree.
     #[test]
     fn the_reply_source_page_is_on_the_tree_and_clicks_as_the_page_does() {
-        use crate::components::reply_source::{PROVIDERS_NOTE, RUNNING};
+        use crate::components::reply_source::{
+            ASKING, ELSEWHERE_LINE, KEEP_KEY_LABEL, MODELS_MAY_BE_OLD, NO_MODEL_LABEL,
+            PROVIDERS_NOTE, REMOVE_KEY_LABEL, RUNNING,
+        };
         use crate::opengrok::{InferenceKind, ProxyKey};
-        use crate::state::{REPLY_SOURCE_NOT_ON_SERVER, ReplySourceNote, ReplySourceRead};
+        use crate::state::{
+            ProxyHealth, REPLY_SOURCE_NOT_ON_SERVER, REPLY_SOURCE_PICK_MODEL,
+            REPLY_SOURCE_RETYPE_KEY, REPLY_SOURCE_SAVE_UNKNOWN, ReplySourceNote, ReplySourceRead,
+        };
         let mut host = host();
         let shut = host.click(ids::SETTINGS_REPLY_SOURCE).unwrap_err();
         assert!(shut.contains(ids::FOOTER_ACCOUNT), "{shut}");
@@ -11033,22 +11146,36 @@ mod tests {
             .unwrap_err();
         assert!(off.contains(ids::SETTINGS_REPLY_SOURCE), "{off}");
 
-        // On the page, before the server has answered: the section, asking, and nothing to press.
+        // On the page, before the server has answered: the section, asking, and the line the
+        // page draws meanwhile; nothing to press.
         host.reply_source_tab = true;
         let tree = host.snapshot();
         let section = tree.find(ids::REPLY_SOURCE).unwrap();
         assert!(section.states.contains(&"asking".to_string()));
-        assert!(section.children.is_empty());
+        assert_eq!(
+            section
+                .children
+                .iter()
+                .map(|node| (node.id.as_str(), node.name.as_str()))
+                .collect::<Vec<_>>(),
+            [(ids::REPLY_SOURCE_UNAVAILABLE, ASKING)],
+            "as drawn"
+        );
         assert!(host.click(ids::REPLY_SOURCE_SAVE).is_err());
         assert!(host.set_value(ids::REPLY_SOURCE_URL, "x").is_err());
 
         // A server without reply sources: the page says so, and there is still nothing to press.
         host.reply_source.settings.kept = Some(ReplySourceRead::NotOnServer);
-        assert_eq!(
-            host.snapshot()
-                .find(ids::REPLY_SOURCE_UNAVAILABLE)
+        let tree = host.snapshot();
+        assert!(
+            !tree
+                .find(ids::REPLY_SOURCE)
                 .unwrap()
-                .name,
+                .states
+                .contains(&"asking".to_string())
+        );
+        assert_eq!(
+            tree.find(ids::REPLY_SOURCE_UNAVAILABLE).unwrap().name,
             REPLY_SOURCE_NOT_ON_SERVER
         );
         let refused = host
@@ -11056,11 +11183,15 @@ mod tests {
             .unwrap_err();
         assert!(refused.contains(REPLY_SOURCE_NOT_ON_SERVER), "{refused}");
 
-        // Read: the account is on the server's keys, opencodex is not answering.
-        host.reply_source.settings.kept = Some(ReplySourceRead::Read(kept_source(
-            InferenceKind::Gateway,
-            false,
-        )));
+        // Read, with the server on this Mac: the account is on the server's keys with an address
+        // kept, opencodex is not answering, and the models it listed last are offered.
+        host.reply_source.settings.kept =
+            Some(ReplySourceRead::Read(crate::opengrok::InferenceSource {
+                base_url: Some("http://127.0.0.1:8080".into()),
+                ..kept_source(InferenceKind::Gateway, false)
+            }));
+        host.reply_source.settings.server_on_this_mac = true;
+        host.reply_source.health = Some(ProxyHealth::NotRunning);
         host.reply_source.models = vec!["gpt-5-codex".into(), "grok-4".into()];
         let tree = host.snapshot();
         let section = tree.find(ids::REPLY_SOURCE).unwrap();
@@ -11079,20 +11210,25 @@ mod tests {
             .find(&ids::reply_source_kind(InferenceKind::LocalProxy))
             .unwrap();
         assert_eq!(
-            (plan.name.as_str(), plan.checked),
-            ("My subscription", Some(false))
+            (plan.name.as_str(), plan.checked, plan.enabled),
+            ("My subscription", Some(false), true)
         );
+        assert!(tree.find(ids::REPLY_SOURCE_ELSEWHERE).is_none());
         assert_eq!(
             tree.find(ids::REPLY_SOURCE_URL).unwrap().value.as_deref(),
-            Some("http://127.0.0.1:8080"),
-            "the default until the server keeps one"
+            Some("http://127.0.0.1:8080")
         );
         let models = tree.find(ids::REPLY_SOURCE_MODEL).unwrap();
         assert_eq!(
             (models.name.as_str(), models.children.len()),
-            ("Pick a model", 2)
+            ("Pick a model", 2),
+            "no model shown, so no No model"
         );
         assert!(tree.find(&ids::reply_source_model("grok-4")).is_some());
+        assert_eq!(
+            tree.find(ids::REPLY_SOURCE_MODELS_NOTE).unwrap().name,
+            MODELS_MAY_BE_OLD
+        );
         let health = tree.find(ids::REPLY_SOURCE_HEALTH).unwrap();
         assert_eq!(
             (health.name.as_str(), health.value.as_deref()),
@@ -11102,9 +11238,14 @@ mod tests {
             tree.find(ids::REPLY_SOURCE_PROVIDERS).unwrap().name,
             PROVIDERS_NOTE
         );
+        assert!(
+            tree.find(ids::REPLY_SOURCE_REMOVE_KEY).is_none(),
+            "no key held"
+        );
         let save = tree.find(ids::REPLY_SOURCE_SAVE).unwrap();
         assert_eq!((save.name.as_str(), save.enabled), ("Save", false));
         assert!(tree.find(ids::REPLY_SOURCE_ERROR).is_none());
+        assert!(tree.find(ids::REPLY_SOURCE_HINT).is_none());
         assert!(tree.ids_are_unique());
 
         // Each control is the page's own.
@@ -11135,6 +11276,14 @@ mod tests {
         ));
         assert!(host.click(&ids::reply_source_model("claude-opus")).is_err());
         assert!(
+            host.click(ids::REPLY_SOURCE_NO_MODEL).is_err(),
+            "no model shown to take away"
+        );
+        assert!(
+            host.click(ids::REPLY_SOURCE_REMOVE_KEY).is_err(),
+            "no key held to remove"
+        );
+        assert!(
             host.click(ids::REPLY_SOURCE_MODEL).is_err(),
             "the menu is not a choice"
         );
@@ -11145,10 +11294,29 @@ mod tests {
         let nothing = host.click(ids::REPLY_SOURCE_SAVE).unwrap_err();
         assert!(nothing.contains("nothing on the page differs"), "{nothing}");
 
-        // A pick waits for Save, and Save sends it. The key typed on the page is said to be
-        // there and never shown.
+        // My subscription picked with no model: Save says what it waits for, beside it and when
+        // clicked.
         host.reply_source.settings.kind_pick = Some(InferenceKind::LocalProxy);
         host.reply_source.unsaved = true;
+        host.reply_source.hint = Some(REPLY_SOURCE_PICK_MODEL);
+        let tree = host.snapshot();
+        assert_eq!(
+            tree.find(ids::REPLY_SOURCE_HINT).unwrap().name,
+            REPLY_SOURCE_PICK_MODEL
+        );
+        let waiting = host.click(ids::REPLY_SOURCE_SAVE).unwrap_err();
+        assert!(waiting.contains(REPLY_SOURCE_PICK_MODEL), "{waiting}");
+
+        // A model picked, a key typed, and the server holding a key: No model and Remove key are
+        // there to press; the key is said to be there and never shown. Save sends it all.
+        host.reply_source.hint = None;
+        host.reply_source.settings.model_pick = Some(Some("gpt-5-codex".into()));
+        host.reply_source.settings.kept =
+            Some(ReplySourceRead::Read(crate::opengrok::InferenceSource {
+                base_url: Some("http://127.0.0.1:8080".into()),
+                has_api_key: true,
+                ..kept_source(InferenceKind::Gateway, false)
+            }));
         host.reply_source.can_save = true;
         host.reply_source.key_typed = true;
         let tree = host.snapshot();
@@ -11162,8 +11330,37 @@ mod tests {
             tree.find(ids::REPLY_SOURCE_KIND).unwrap().value.as_deref(),
             Some("local_proxy")
         );
+        let models = tree.find(ids::REPLY_SOURCE_MODEL).unwrap();
+        assert_eq!(models.value.as_deref(), Some("gpt-5-codex"));
+        assert_eq!(
+            tree.find(ids::REPLY_SOURCE_NO_MODEL).unwrap().name,
+            NO_MODEL_LABEL
+        );
         let key = tree.find(ids::REPLY_SOURCE_KEY).unwrap();
         assert!(key.states.contains(&"typed".to_string()) && key.value.is_none());
+        assert!(key.states.contains(&"set".to_string()));
+        let remove = tree.find(ids::REPLY_SOURCE_REMOVE_KEY).unwrap();
+        assert_eq!(
+            (remove.name.as_str(), remove.enabled),
+            (REMOVE_KEY_LABEL, true)
+        );
+        host.click(ids::REPLY_SOURCE_NO_MODEL).unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::ClearReplySourceModel)
+        ));
+        host.click(ids::REPLY_SOURCE_REMOVE_KEY).unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::ToggleRemoveReplySourceKey)
+        ));
+        host.reply_source.settings.remove_key = true;
+        let tree = host.snapshot();
+        let remove = tree.find(ids::REPLY_SOURCE_REMOVE_KEY).unwrap();
+        assert_eq!(remove.name, KEEP_KEY_LABEL);
+        assert!(remove.states.contains(&"picked".to_string()));
+        assert!(!tree.find(ids::REPLY_SOURCE_KEY).unwrap().enabled);
+        host.reply_source.settings.remove_key = false;
         assert!(tree.find(ids::REPLY_SOURCE_SAVE).unwrap().enabled);
         host.click(ids::REPLY_SOURCE_SAVE).unwrap();
         assert!(matches!(
@@ -11171,8 +11368,9 @@ mod tests {
             Some(Command::SaveReplySource)
         ));
 
-        // While the Save is out every control is dead and says why; its refusal is the
-        // server's own words, under Save.
+        // While the Save is out every control is dead and says why. Its fate unknown is drawn
+        // muted; a refusal, in the server's own words, is trouble; a key to type again follows
+        // either, and stays once the note has gone.
         host.reply_source.settings.saving = Some(3);
         host.reply_source.can_save = false;
         let tree = host.snapshot();
@@ -11188,24 +11386,62 @@ mod tests {
             .unwrap_err();
         assert!(dead.contains("a Save is with the server"), "{dead}");
         assert!(host.set_value(ids::REPLY_SOURCE_URL, "x").is_err());
-        let said = "baseUrl must be a literal loopback address such as http://127.0.0.1:8080";
         host.reply_source.settings.saving = None;
-        host.reply_source.settings.note = Some(ReplySourceNote::Refused(said.into()));
-        host.reply_source.settings.kept =
-            Some(ReplySourceRead::Read(crate::opengrok::InferenceSource {
-                has_api_key: true,
-                ..kept_source(InferenceKind::LocalProxy, true)
-            }));
-        let tree = host.snapshot();
-        assert_eq!(tree.find(ids::REPLY_SOURCE_ERROR).unwrap().name, said);
-        assert_eq!(tree.find(ids::REPLY_SOURCE_HEALTH).unwrap().name, RUNNING);
-        assert!(
-            tree.find(ids::REPLY_SOURCE_KEY)
-                .unwrap()
-                .states
-                .contains(&"set".to_string())
+        host.reply_source.settings.note = Some(ReplySourceNote::Unknown);
+        host.reply_source.settings.retype_key = true;
+        let error = host
+            .snapshot()
+            .find(ids::REPLY_SOURCE_ERROR)
+            .cloned()
+            .unwrap();
+        assert_eq!(
+            error.name,
+            format!("{REPLY_SOURCE_SAVE_UNKNOWN} {REPLY_SOURCE_RETYPE_KEY}")
         );
+        assert!(error.states.is_empty(), "checking again is not trouble");
+        let said = "baseUrl must be a literal loopback address such as http://127.0.0.1:8080";
+        host.reply_source.settings.note = Some(ReplySourceNote::Refused(said.into()));
+        host.reply_source.settings.retype_key = false;
+        host.reply_source.health = Some(ProxyHealth::Running);
+        let tree = host.snapshot();
+        let error = tree.find(ids::REPLY_SOURCE_ERROR).unwrap();
+        assert_eq!(error.name, said);
+        assert!(error.states.contains(&"trouble".to_string()));
+        assert_eq!(tree.find(ids::REPLY_SOURCE_HEALTH).unwrap().name, RUNNING);
         assert!(tree.ids_are_unique());
+
+        // The app's server is not on this Mac: the page says the plan is set up only from the
+        // server's own Mac, and the plan's controls are dead; Server is still there to pick.
+        host.reply_source.settings.note = None;
+        host.reply_source.settings.kind_pick = None;
+        host.reply_source.settings.model_pick = None;
+        host.reply_source.settings.server_on_this_mac = false;
+        host.reply_source.health = Some(ProxyHealth::NotRunning);
+        let tree = host.snapshot();
+        assert_eq!(
+            tree.find(ids::REPLY_SOURCE_ELSEWHERE).unwrap().name,
+            ELSEWHERE_LINE
+        );
+        assert!(
+            !tree
+                .find(&ids::reply_source_kind(InferenceKind::LocalProxy))
+                .unwrap()
+                .enabled
+        );
+        assert!(!tree.find(ids::REPLY_SOURCE_URL).unwrap().enabled);
+        assert_eq!(
+            tree.find(ids::REPLY_SOURCE_HEALTH).unwrap().name,
+            "Not running on the server's machine",
+            "no command to start what this Mac cannot reach"
+        );
+        let elsewhere = host
+            .click(&ids::reply_source_kind(InferenceKind::LocalProxy))
+            .unwrap_err();
+        assert!(elsewhere.contains(ELSEWHERE_LINE), "{elsewhere}");
+        assert!(host.click(ids::REPLY_SOURCE_REMOVE_KEY).is_err());
+        assert!(host.set_value(ids::REPLY_SOURCE_KEY, "sk").is_err());
+        host.click(&ids::reply_source_kind(InferenceKind::Gateway))
+            .unwrap();
 
         // The snapshot never holds the key the page does.
         let mut state = AppState::new();
@@ -11321,13 +11557,25 @@ mod tests {
             (badge.name.as_str(), badge.value.as_deref()),
             ("your plan", Some("local_proxy"))
         );
-        assert!(badge.states.contains(&"gpt-5-codex".to_string()));
+        assert!(badge.states.is_empty(), "the model is not a state");
+        assert_eq!(
+            tree.find(&ids::reply_badge_model("m_1"))
+                .map(|node| node.name.as_str()),
+            Some("gpt-5-codex"),
+            "the model the badge shows on hover, under it"
+        );
         assert!(
             tree.find(&ids::reply_badge("m_2")).is_none(),
             "a status line has no bubble to wear a badge"
         );
         let chip = tree.find(ids::COMPOSER_REPLY_SOURCE).unwrap();
         assert_eq!(chip.value.as_deref(), Some("local_proxy"));
+
+        // While the composer dictates the chip gives its place to the dictation's buttons, and
+        // is not in the tree either.
+        state.composer_dictating = true;
+        let tree = NativeChatHost::from_app(&state).snapshot();
+        assert!(tree.find(ids::COMPOSER_REPLY_SOURCE).is_none());
     }
 
     /// A bot's skills as the server gives them (opengrok-server#270): the owner's `triage`

@@ -194,35 +194,52 @@
 //! its Tools (opengrok-server#268).
 //!
 //! Reply source, where a Bot's replies are paid from: the server's paid keys or the person's own
-//! subscription through opencodex. `settings-tab-reply-source` (refused while Settings is shut);
-//! while Settings is open on it, `settings-reply-source` (value = the door the server keeps,
-//! `gateway` / `local_proxy`; states `unsaved` while a pick waits for Save, `saving` and
-//! `reading` while one is with the server; state `asking` and nothing in it until the server has
-//! answered) holding `settings-reply-source-kind` (a radio group, value = the door shown) with
+//! subscription through opencodex, running on the same machine as the server.
+//! `settings-tab-reply-source` (refused while Settings is shut); while Settings is open on it,
+//! `settings-reply-source` (value = the door the server keeps, `gateway` / `local_proxy`; states
+//! `unsaved` while a pick waits for Save, `saving` and `reading` while one is with the server).
+//! Until the setting has been read, on a server without reply sources, or when it could not be
+//! read, the section holds only `settings-reply-source-unavailable`, the line the page draws in
+//! place of the form (`Asking the server…` while the section has state `asking`). Once read it
+//! holds `settings-reply-source-kind` (a radio group, value = the door shown) with
 //! `settings-reply-source-kind-gateway|local_proxy` (label as the radio reads, checked on the one
-//! shown; a click picks it and it waits for Save, as on the page), `settings-reply-source-url`
-//! (value = the proxy URL shown; `set_value` and `type` write it as typing would),
-//! `settings-reply-source-model` (a menu, value = the model shown; state `empty` while the server
-//! lists no model of the person's plan) with a `settings-reply-source-model-{id}` per model it
-//! offers (state `selected` on the shown one; a click picks it), `settings-reply-source-key`
-//! (never valued: states `set` while the server holds a key, `typed` while one waits for Save;
-//! `set_value` writes the whole key, `type` is refused), `settings-reply-source-health` (label the
-//! line, value `running` / `not-running`), `settings-reply-source-providers` (why Claude and
-//! Gemini are not offered), `settings-reply-source-save` (enabled only while a click would send
-//! something) and `settings-reply-source-error` (the server's words for a refused Save, why nobody
-//! knows what became of one, or a read that failed). On a server without reply sources, or when
-//! the setting could not be read, the section holds only `settings-reply-source-unavailable`.
-//! Every control is refused off the page, before the setting is read, and while a Save is out;
-//! Save is refused while a read is out too.
+//! shown; a click picks it and it waits for Save, as on the page; `local_proxy` only where the
+//! app's server is on this Mac); `settings-reply-source-elsewhere` where it is not (the page's
+//! line saying the plan is set up only from the server's own Mac); `settings-reply-source-url`
+//! (value = the proxy URL shown; `set_value` and `type` write it as typing would, and an empty
+//! one clears the address with the next Save); `settings-reply-source-model` (a menu, value = the
+//! model shown; state `empty` while the server lists no model of the person's plan) with
+//! `settings-reply-source-no-model` (while a model is shown: none, which clears it with the next
+//! Save) and a `settings-reply-source-model-{id}` per model it offers (state `selected` on the
+//! shown one; a click picks it); `settings-reply-source-models-note` (the line under the picker:
+//! why it offers nothing, or that opencodex is down and these are the models it listed last);
+//! `settings-reply-source-key` (never valued: states `set` while the server holds a key, `typed`
+//! while one waits for Save, which the window draws as masked dots whoever typed it; `set_value`
+//! writes the whole key, `type` is refused); `settings-reply-source-remove-key` (while the server
+//! holds a key: label `Remove key`, or `Keep key` with state `picked` while its removal waits
+//! for Save); `settings-reply-source-health` (label the line, value `running` / `not-running` /
+//! `no-address`); `settings-reply-source-providers` (why Claude and Gemini are not offered);
+//! `settings-reply-source-error` (the server's words for a refused Save, why nobody knows what
+//! became of one, or a read that failed, and after a Save or a page left with a key typed, the
+//! line asking for it again; state `trouble` while drawn in the danger colour, a refusal or a
+//! failed read); `settings-reply-source-hint` (what Save waits for, a model or an address, or what
+//! it keeps while no model of the plan is listed); and `settings-reply-source-save` (enabled only
+//! while a click would send something). Every control is refused off the page, before the setting
+//! is read, and while a Save is out; Save is refused while a read is out too, and says what it
+//! waits for; and the plan's controls are refused where the server is not on this Mac.
 //!
 //! `composer-reply-source` is the composer's chip, in the tree only while there is a choice of
-//! door (label `Server` / `My plan`, value = the door the next turns go through, state `picked`
-//! while that is the person's pick and not the account's own door). Unlike the composer's panel
-//! and chips it is clicked, as a person clicks it: a click switches the door, which then goes
-//! with every turn until it is switched back, and is gone with a sign-out or a relaunch.
-//! `reply-source-{messageId}` is the badge of
-//! each reply in the open thread that wears one, as the feed draws it (label `paid key` / `your
-//! plan`, value = the door, state = the model the server named).
+//! door and the composer is not dictating (label `Server` / `My plan`, value = the door the next
+//! turns go through, which each of them names; state `picked` while that is the person's pick
+//! and not the account's own door). Unlike the composer's panel and chips it is clicked, as a
+//! person clicks it: a click switches the door, which then goes with every turn until it is
+//! switched back, and is gone with a sign-out or a relaunch. `reply-source-{messageId}` is the
+//! badge of each reply in the open thread that wears one, as the feed draws it (label `paid key`
+//! / `your plan`, value = the door), holding `reply-source-model-{messageId}` (label = the model
+//! the server named, which the badge shows on hover) when it named one. In the bot's settings,
+//! while the account's door or the chip is on the person's plan, `agent-model-plan` (under the
+//! Model field: the plan's model answers, not the pin) and `agent-usage-plan` (the Usage card
+//! does not count those replies).
 //!
 //! Named invokes (parity / gpui-agent): `UserFormContinue`, `UserFormDismiss`,
 //! `UserFormOpenScreen`, `UserFormUseSaved`, `UserFormClearSaved` (also kebab
