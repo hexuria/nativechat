@@ -5,12 +5,12 @@ use crate::chrome::{
 use crate::components::fields::field_input;
 use crate::components::persona::PersonaMark;
 use crate::opengrok::{
-    CeilingRow, CoworkerPatch, CoworkerTool, EFFORT_INHERIT, EFFORT_WORDS, ModelEntry,
-    USER_MACHINE_SHELL,
+    BotSkillRow, BotSkillScope, CeilingRow, CoworkerPatch, CoworkerTool, EFFORT_INHERIT,
+    EFFORT_WORDS, ModelEntry, USER_MACHINE_SHELL,
 };
 use crate::state::{
-    AppState, CeilingBlock, CeilingCard, CeilingSwitch, EffortControl, ToolCeiling, ToolList,
-    UsageReport,
+    AppState, BotSkills, CeilingBlock, CeilingCard, CeilingSwitch, EffortControl, SkillSwitch,
+    SkillsBlock, SkillsCard, ToolCeiling, ToolList, UsageReport,
 };
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{
@@ -527,6 +527,17 @@ impl Render for AgentSettings {
         let offered = offered_without_switches(ceiling.as_ref(), tools.as_ref()).to_vec();
         let has_list = !offered.is_empty();
         let danger = theme.danger;
+        let skills_open = self.state.read(cx).agent_skills_open;
+        let skills = self.state.read(cx).skills_card();
+        let skills_line = skills
+            .as_ref()
+            .map(|card| skills_summary(&card.skills, card.pending.as_ref()));
+        let (skill_rows, skill_lines) = skills
+            .as_ref()
+            .map(|card| (shown_skill_rows(card), skills_card_lines(card)))
+            .unwrap_or_default();
+        let has_skill_rows = !skill_rows.is_empty();
+        let skills_shared = skills.as_ref().is_some_and(|card| card.shared);
         let usage = {
             let state = self.state.read(cx);
             state
@@ -1042,6 +1053,71 @@ impl Render for AgentSettings {
                                                 })
                                                 .when(tools_open && has_list, |this| {
                                                     this.child(tools_body(&offered, muted))
+                                                }),
+                                        )
+                                    })
+                                    // Below Tools: what the Bot is told about on every turn,
+                                    // beside what it may do (opengrok-server#270).
+                                    .when_some(skills_line, |this, line| {
+                                        this.child(
+                                            div()
+                                                .id("agent-skills")
+                                                .mb(px(16.))
+                                                .px(px(14.))
+                                                .py(px(12.))
+                                                .rounded(px(10.))
+                                                .border_1()
+                                                .border_color(theme.border)
+                                                .child(
+                                                    div()
+                                                        .flex()
+                                                        .items_center()
+                                                        .justify_between()
+                                                        .gap(px(10.))
+                                                        .child(
+                                                            v_flex()
+                                                                .min_w(px(0.))
+                                                                .gap(px(2.))
+                                                                .child(div().text_sm().child("Skills"))
+                                                                .child(
+                                                                    div()
+                                                                        .text_xs()
+                                                                        .text_color(muted)
+                                                                        .child(line),
+                                                                ),
+                                                        )
+                                                        .when(has_skill_rows, |this| {
+                                                            this.child(
+                                                                div()
+                                                                    .id("agent-skills-toggle")
+                                                                    .px(px(11.))
+                                                                    .py(px(5.))
+                                                                    .rounded(px(8.))
+                                                                    .border_1()
+                                                                    .border_color(
+                                                                        rgb(0x7f7f7f).opacity(0.4),
+                                                                    )
+                                                                    .text_xs()
+                                                                    .cursor_pointer()
+                                                                    .on_mouse_down(MouseButton::Left, {
+                                                                        let app = app.clone();
+                                                                        move |_, _, cx| {
+                                                                            app.update(cx, |state, cx| state.toggle_agent_skills(cx));
+                                                                        }
+                                                                    })
+                                                                    .child(if skills_open { "Hide" } else { "Show" }),
+                                                            )
+                                                        }),
+                                                )
+                                                .when(skills_open && has_skill_rows, |this| {
+                                                    this.child(skills_body(
+                                                        app.clone(),
+                                                        skill_rows,
+                                                        skill_lines,
+                                                        skills_shared,
+                                                        muted,
+                                                        danger,
+                                                    ))
                                                 }),
                                         )
                                     })
@@ -2353,6 +2429,281 @@ fn ceiling_row(
         })
 }
 
+/// The Skills card's line when the account's library has nothing in it the owner may attach.
+pub(crate) const NO_SKILLS_TO_ATTACH: &str =
+    "No skills to attach yet. Write one in Settings → Skills.";
+
+/// Under a skill switched off in Settings → Skills, which is dimmed: why, and where it is
+/// switched back on. It can be detached here, and not attached.
+pub(crate) const SWITCHED_OFF_IN_SETTINGS: &str = "Switched off in Settings → Skills";
+
+/// On a shared Bot's Skills card: whoever uses the Bot can read the skills attached to it, which
+/// the owner should know before attaching one (opengrok-server#270). Only where the roster says
+/// the Bot is shared ([`SkillsCard::shared`]).
+pub(crate) const SHARED_BOT_READS_SKILLS: &str =
+    "People who use this Bot can read its attached skills.";
+
+/// Under the switches: what attaching a skill does.
+pub(crate) const WHAT_ATTACHING_DOES: &str = "This Bot is told about every skill attached here that is switched on, and reads one when it needs it.";
+
+/// The Skills card's line: how many skills the switches show attached, and how many of those are
+/// switched off, or why there are no switches. Nothing is counted that the server did not send.
+pub(crate) fn skills_summary(skills: &BotSkills, pending: Option<&SkillSwitch>) -> String {
+    match skills {
+        BotSkills::Loading => "Asking the server…".to_string(),
+        BotSkills::Unavailable(why) => why.clone(),
+        BotSkills::Read(read) if read.rows.is_empty() => NO_SKILLS_TO_ATTACH.to_string(),
+        BotSkills::Read(read) => match read.attached(pending) {
+            (0, _) => "None attached".to_string(),
+            (attached, 0) => format!("{attached} attached"),
+            (attached, off) => format!("{attached} attached · {off} switched off"),
+        },
+    }
+}
+
+/// One skill on the Skills card, as it is drawn and as the driver is told it is drawn: both are
+/// made from this, so the two cannot disagree about where a switch stands or whether it can move.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ShownSkillRow {
+    /// The skill's id, which is what its switch is known by.
+    pub id: String,
+    /// The skill's name, which is what a person types after a slash for it.
+    pub title: String,
+    /// The first line of what the skill is for.
+    pub first_line: String,
+    /// The owner's own, filed under "Yours"; otherwise their organization's.
+    pub mine: bool,
+    /// Where the switch stands: attached as the server has it, or as it was asked to be while
+    /// that is with the server.
+    pub on: bool,
+    /// This row's switch is the one with the server.
+    pub switching: bool,
+    /// The switch can be moved now. It cannot while the card is blocked ([`SkillsCard::blocked`])
+    /// or to attach a skill switched off in Settings → Skills.
+    pub live: bool,
+    /// Switched off in Settings → Skills: the row is dimmed and says so.
+    pub switched_off: bool,
+    /// What the card says under this row about its last switch.
+    pub note: Option<String>,
+}
+
+/// A line on the Skills card above its switches, as it is drawn and as the driver is told it is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SkillsCardLine {
+    /// Why every switch is dead for good: the server's words for a 403.
+    ReadOnly(String),
+    /// Why every switch is dead for now: another Bot's skill switch, or a read of this one's
+    /// skills, is with the server.
+    Wait(String),
+    /// What the server said about the last switch, when it is not about a row on the card: a
+    /// stale version, or the cap on attached skills.
+    Note(String),
+}
+
+/// The open Bot's skills as the Skills card draws them, in the server's order, or none while they
+/// are not read.
+pub(crate) fn shown_skill_rows(card: &SkillsCard) -> Vec<ShownSkillRow> {
+    let BotSkills::Read(read) = &card.skills else {
+        return Vec::new();
+    };
+    let pending = card.pending.as_ref();
+    read.rows
+        .iter()
+        .map(|row| {
+            let on = read.shown_attached(row, pending);
+            ShownSkillRow {
+                id: row.id.clone(),
+                title: skill_title(row),
+                first_line: first_line_of(&row.description),
+                mine: row.scope == BotSkillScope::Mine,
+                on,
+                switching: pending.is_some_and(|switch| switch.skill_id == row.id),
+                live: read.may_switch(&row.id, !on, card.blocked.as_ref()).is_ok(),
+                switched_off: !row.enabled,
+                note: card
+                    .note
+                    .as_ref()
+                    .filter(|note| note.row() == Some(row.id.as_str()))
+                    .map(|note| note.words.clone()),
+            }
+        })
+        .collect()
+}
+
+/// The lines above the open Bot's skill switches, by the Tools card's rules
+/// ([`ceiling_card_lines`]): why none can move, unless this Bot's own switch is showing it on its
+/// row, and what the server said about the last switch when no row on the card is the one it is
+/// about.
+pub(crate) fn skills_card_lines(card: &SkillsCard) -> Vec<SkillsCardLine> {
+    let BotSkills::Read(read) = &card.skills else {
+        return Vec::new();
+    };
+    let mut lines = Vec::new();
+    match &card.blocked {
+        Some(SkillsBlock::ReadOnly(words)) => lines.push(SkillsCardLine::ReadOnly(words.clone())),
+        Some(blocked @ (SkillsBlock::AnotherBot | SkillsBlock::Reading)) => {
+            lines.push(SkillsCardLine::Wait(blocked.why().to_string()));
+        }
+        Some(SkillsBlock::Switching) | None => {}
+    }
+    if let Some(note) = &card.note {
+        let under_a_row = note
+            .row()
+            .is_some_and(|id| read.rows.iter().any(|row| row.id == id));
+        // A read-only card's reason is already its first line.
+        if !under_a_row && !matches!(card.blocked, Some(SkillsBlock::ReadOnly(_))) {
+            lines.push(SkillsCardLine::Note(note.words.clone()));
+        }
+    }
+    lines
+}
+
+/// A skill's name as its row is headed, as the library and the composer show it: the name with
+/// its spaces run together, and a skill with none called what it is.
+fn skill_title(row: &BotSkillRow) -> String {
+    let name = row.name.split_whitespace().collect::<Vec<_>>().join(" ");
+    if name.is_empty() {
+        "Untitled skill".to_string()
+    } else {
+        name
+    }
+}
+
+/// The switches: the owner's own skills and their organization's, under a heading each, below the
+/// card's own lines, and on a shared Bot the line saying who can read what is attached. A switch
+/// is sent the moment it is clicked, and only a live one takes a click.
+fn skills_body(
+    app: Entity<AppState>,
+    rows: Vec<ShownSkillRow>,
+    lines: Vec<SkillsCardLine>,
+    shared: bool,
+    muted: Hsla,
+    danger: Hsla,
+) -> impl IntoElement {
+    let (mine, org): (Vec<_>, Vec<_>) = rows.into_iter().partition(|row| row.mine);
+    let group = |title: &'static str, rows: Vec<ShownSkillRow>| {
+        v_flex()
+            .gap(px(8.))
+            .child(div().text_xs().text_color(muted).child(title))
+            .children(
+                rows.into_iter()
+                    .map(|row| skill_row(app.clone(), row, muted, danger)),
+            )
+    };
+    v_flex()
+        .pt(px(12.))
+        .gap(px(12.))
+        // Above the switches, because each is about all of them.
+        .children(lines.into_iter().map(|line| {
+            let (id, words) = match line {
+                SkillsCardLine::ReadOnly(words) => ("agent-skills-read-only", words),
+                SkillsCardLine::Wait(words) => ("agent-skills-wait", words),
+                SkillsCardLine::Note(words) => ("agent-skills-note", words),
+            };
+            div().id(id).text_xs().text_color(muted).child(words)
+        }))
+        .when(!mine.is_empty(), |this| this.child(group("Yours", mine)))
+        .when(!org.is_empty(), |this| {
+            this.child(group("Your organization's", org))
+        })
+        .when(shared, |this| {
+            this.child(
+                div()
+                    .id("agent-skills-shared")
+                    .text_xs()
+                    .text_color(muted)
+                    .child(SHARED_BOT_READS_SKILLS),
+            )
+        })
+        .child(div().text_xs().text_color(muted).child(WHAT_ATTACHING_DOES))
+}
+
+/// One skill: its name and the first line of what it is for, and its switch at the right, with
+/// "Saving…" beside it while it is with the server. A skill switched off in Settings → Skills is
+/// dimmed with why under it, and what the card says about the row's last switch is under it too.
+fn skill_row(
+    app: Entity<AppState>,
+    row: ShownSkillRow,
+    muted: Hsla,
+    danger: Hsla,
+) -> impl IntoElement {
+    let ShownSkillRow {
+        id,
+        title,
+        first_line,
+        mine: _,
+        on,
+        switching,
+        live,
+        switched_off,
+        note,
+    } = row;
+    // Every id under a row has a fixed word between `agent-skills-` and the skill's id, and the
+    // card's own ids have none, so no id a skill can have makes one id another's.
+    let switch_id = SharedString::from(format!("agent-skills-switch-{id}"));
+    let off_id = SharedString::from(format!("agent-skills-off-{id}"));
+    let error_id = SharedString::from(format!("agent-skills-error-{id}"));
+    v_flex()
+        .id(SharedString::from(format!("agent-skills-row-{id}")))
+        .gap(px(2.))
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap(px(10.))
+                .child(
+                    v_flex()
+                        .min_w(px(0.))
+                        .flex_1()
+                        .gap(px(1.))
+                        .when(switched_off, |this| this.opacity(0.5))
+                        .child(div().text_sm().child(title))
+                        .when(!first_line.is_empty(), |this| {
+                            this.child(div().text_xs().text_color(muted).child(first_line))
+                        }),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(6.))
+                        .flex_shrink_0()
+                        .when(switching, |this| {
+                            this.child(div().text_xs().text_color(muted).child("Saving…"))
+                        })
+                        .child(
+                            div()
+                                .id(switch_id)
+                                .when(!live, |this| this.opacity(0.5))
+                                .when(live, |this| {
+                                    this.cursor_pointer().on_mouse_down(
+                                        MouseButton::Left,
+                                        move |_, _, cx| {
+                                            app.update(cx, |state, cx| {
+                                                state.switch_bot_skill(id.clone(), !on, cx);
+                                            });
+                                        },
+                                    )
+                                })
+                                .child(notify_switch(on)),
+                        ),
+                ),
+        )
+        .when(switched_off, |this| {
+            this.child(
+                div()
+                    .id(off_id)
+                    .text_xs()
+                    .text_color(muted)
+                    .child(SWITCHED_OFF_IN_SETTINGS),
+            )
+        })
+        .when_some(note, |this, words| {
+            this.child(div().id(error_id).text_xs().text_color(danger).child(words))
+        })
+}
+
 #[cfg(test)]
 mod tools_tests {
     use super::{
@@ -2810,5 +3161,223 @@ mod tools_tests {
         ] {
             assert_eq!(super::dollars(six).as_deref(), read, "{six:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod skills_tests {
+    use super::{
+        NO_SKILLS_TO_ATTACH, SkillsCardLine, shown_skill_rows, skills_card_lines, skills_summary,
+    };
+    use crate::state::{
+        ANOTHER_BOTS_SKILL_SWITCH, BotSkills, NOT_THE_SKILLS_OWNER, SKILLS_BEING_READ, SkillNote,
+        SkillNotePlace, SkillSwitch, SkillsBlock, SkillsCard, SkillsRead,
+    };
+
+    /// Every kind of skill the card draws: the owner's own attached with two lines of words, one
+    /// of theirs not attached whose name has stray spaces, a colleague's attached, one of the
+    /// owner's switched off and still attached, one switched off and not, and one with no name.
+    fn a_read() -> SkillsRead {
+        SkillsRead {
+            rows: serde_json::from_value(serde_json::json!([
+                {"id": "sk_triage", "name": "triage", "description": "Sort the inbox.\nThen reply.",
+                    "scope": "mine", "attached": true, "enabled": true},
+                {"id": "sk_draft", "name": "  first   draft ", "description": "",
+                    "scope": "mine", "attached": false, "enabled": true},
+                {"id": "sk_review", "name": "review", "description": "The team's checklist.",
+                    "scope": "org", "attached": true, "enabled": true},
+                {"id": "sk_old", "name": "old-notes", "description": "Last year's.",
+                    "scope": "mine", "attached": true, "enabled": false},
+                {"id": "sk_archive", "name": "archive", "description": "",
+                    "scope": "org", "attached": false, "enabled": false},
+                {"id": "sk_blank", "name": " ", "description": "",
+                    "scope": "mine", "attached": false, "enabled": true}
+            ]))
+            .expect("skill rows"),
+            version: Some(4),
+        }
+    }
+
+    /// The card for [`a_read`], with nothing with the server and nothing said.
+    fn a_card() -> SkillsCard {
+        SkillsCard {
+            skills: BotSkills::Read(a_read()),
+            pending: None,
+            blocked: None,
+            note: None,
+            shared: false,
+        }
+    }
+
+    fn asked(skill_id: &str, attached: bool) -> SkillSwitch {
+        SkillSwitch {
+            coworker_id: "cw_1".into(),
+            skill_id: skill_id.into(),
+            attached,
+            token: 1,
+        }
+    }
+
+    /// The card's line counts the switches as they stand on screen — a skill switched off in
+    /// Settings → Skills and still attached is attached, and said to be switched off — and says
+    /// why there are none when there are none.
+    #[test]
+    fn the_skills_card_says_how_many_are_attached() {
+        let read = BotSkills::Read(a_read());
+        assert_eq!(skills_summary(&read, None), "3 attached · 1 switched off");
+        assert_eq!(
+            skills_summary(&read, Some(&asked("sk_draft", true))),
+            "4 attached · 1 switched off",
+            "the count says what the switches say"
+        );
+        assert_eq!(
+            skills_summary(&read, Some(&asked("sk_old", false))),
+            "2 attached",
+            "nothing switched off is attached any more"
+        );
+        let mut none = a_read();
+        for row in &mut none.rows {
+            row.attached = false;
+        }
+        assert_eq!(
+            skills_summary(&BotSkills::Read(none), None),
+            "None attached"
+        );
+        let empty = SkillsRead {
+            rows: Vec::new(),
+            version: Some(1),
+        };
+        assert_eq!(
+            skills_summary(&BotSkills::Read(empty), None),
+            NO_SKILLS_TO_ATTACH
+        );
+        assert_eq!(
+            skills_summary(&BotSkills::Loading, None),
+            "Asking the server…"
+        );
+        assert_eq!(
+            skills_summary(&BotSkills::Unavailable(NOT_THE_SKILLS_OWNER.into()), None),
+            NOT_THE_SKILLS_OWNER
+        );
+    }
+
+    /// Each skill is drawn as the server describes it: its name as a person types it, the first
+    /// line of what it is for, filed under the owner's or the organization's, and dimmed when it
+    /// is switched off. Every switch is live but one that would attach a skill switched off.
+    #[test]
+    fn a_skill_row_is_drawn_as_the_server_describes_it() {
+        let shown = shown_skill_rows(&a_card());
+        let titles: Vec<&str> = shown.iter().map(|row| row.title.as_str()).collect();
+        assert_eq!(
+            titles,
+            [
+                "triage",
+                "first draft",
+                "review",
+                "old-notes",
+                "archive",
+                "Untitled skill"
+            ]
+        );
+        assert_eq!(shown[0].first_line, "Sort the inbox.");
+        assert_eq!(
+            shown.iter().map(|row| row.mine).collect::<Vec<_>>(),
+            [true, true, false, true, false, true]
+        );
+        assert_eq!(
+            shown.iter().map(|row| row.switched_off).collect::<Vec<_>>(),
+            [false, false, false, true, true, false]
+        );
+        assert_eq!(
+            shown.iter().map(|row| row.live).collect::<Vec<_>>(),
+            [true, true, true, true, false, true],
+            "a switched-off skill can be detached, and not attached"
+        );
+        assert!(
+            shown_skill_rows(&SkillsCard {
+                skills: BotSkills::Loading,
+                ..a_card()
+            })
+            .is_empty()
+        );
+    }
+
+    /// Nothing is live while the card is blocked, and the card says why above the rows — except
+    /// for this Bot's own switch, which its row shows where it was asked to go. The server's words
+    /// sit under the skill they are about, and on the card when no skill on it is.
+    #[test]
+    fn a_blocked_skills_card_says_why_and_its_rows_are_dead() {
+        let own = SkillsCard {
+            pending: Some(asked("sk_draft", true)),
+            blocked: Some(SkillsBlock::Switching),
+            ..a_card()
+        };
+        let shown = shown_skill_rows(&own);
+        assert!(shown.iter().all(|row| !row.live));
+        assert!(shown[1].on && shown[1].switching);
+        assert!(
+            skills_card_lines(&own).is_empty(),
+            "the row says it is saving"
+        );
+
+        for (blocked, why) in [
+            (SkillsBlock::AnotherBot, ANOTHER_BOTS_SKILL_SWITCH),
+            (SkillsBlock::Reading, SKILLS_BEING_READ),
+        ] {
+            let waiting = SkillsCard {
+                blocked: Some(blocked),
+                ..a_card()
+            };
+            assert!(shown_skill_rows(&waiting).iter().all(|row| !row.live));
+            assert_eq!(
+                skills_card_lines(&waiting),
+                [SkillsCardLine::Wait(why.to_string())]
+            );
+        }
+
+        let said = |place: SkillNotePlace| SkillNote {
+            coworker_id: "cw_1".into(),
+            words: "no skill sk_review".into(),
+            place,
+        };
+        let under_review = SkillsCard {
+            note: Some(said(SkillNotePlace::Row("sk_review".into()))),
+            ..a_card()
+        };
+        assert_eq!(
+            shown_skill_rows(&under_review)
+                .iter()
+                .map(|row| row.note.as_deref())
+                .collect::<Vec<_>>(),
+            [None, None, Some("no skill sk_review"), None, None, None]
+        );
+        assert!(skills_card_lines(&under_review).is_empty());
+        let gone = SkillsCard {
+            note: Some(said(SkillNotePlace::Row("sk_gone".into()))),
+            ..a_card()
+        };
+        assert_eq!(
+            skills_card_lines(&gone),
+            [SkillsCardLine::Note("no skill sk_review".to_string())],
+            "no skill on the card to say it under"
+        );
+
+        let read_only = SkillsCard {
+            blocked: Some(SkillsBlock::ReadOnly("your grant was withdrawn".into())),
+            note: Some(SkillNote {
+                coworker_id: "cw_1".into(),
+                words: "your grant was withdrawn".into(),
+                place: SkillNotePlace::ReadOnly,
+            }),
+            ..a_card()
+        };
+        assert!(shown_skill_rows(&read_only).iter().all(|row| !row.live));
+        assert_eq!(
+            skills_card_lines(&read_only),
+            [SkillsCardLine::ReadOnly(
+                "your grant was withdrawn".to_string()
+            )],
+            "said once"
+        );
     }
 }
