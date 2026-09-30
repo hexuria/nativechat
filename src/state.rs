@@ -4023,8 +4023,8 @@ pub struct AppState {
     pub local_exec_machine_id: Option<String>,
     local_exec_cancel: Option<Arc<AtomicBool>>,
     pub expanded_shell_output: HashSet<String>,
-    /// The step rows, groups of steps and Thought rows the person has opened, by the keys
-    /// `components::steps` gives them. Not saved: every one of them is shut when a thread is
+    /// The step rows, groups of steps, Thought rows and Timing rows the person has opened, by the
+    /// keys `components::steps` gives them. Not saved: every one of them is shut when a thread is
     /// opened again, which is how a reply is meant to be read.
     pub expanded_steps: HashSet<String>,
     pub computers: Vec<ConnectedComputer>,
@@ -13297,7 +13297,7 @@ impl AppState {
         cx.notify();
     }
 
-    /// Open or shut step rows, groups of steps and Thought rows, by their keys.
+    /// Open or shut step rows, groups of steps, Thought rows and Timing rows, by their keys.
     pub fn set_steps_open(&mut self, keys: &[String], open: bool, cx: &mut Context<Self>) {
         self.mark_steps_open(keys, open);
         cx.notify();

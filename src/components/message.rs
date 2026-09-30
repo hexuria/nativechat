@@ -32,7 +32,6 @@ pub struct MessageBubble {
     is_me: bool,
     timestamp: Option<String>,
     duration: Option<String>,
-    timing_debug: Option<String>,
     message_id: String,
     source_id: String,
     debug_mode: bool,
@@ -72,7 +71,6 @@ impl MessageBubble {
             is_me: false,
             timestamp: None,
             duration: None,
-            timing_debug: None,
             message_id,
             source_id: String::new(),
             debug_mode: false,
@@ -206,12 +204,6 @@ impl MessageBubble {
     pub fn duration(mut self, duration: impl Into<String>) -> Self {
         let duration = duration.into();
         self.duration = (!duration.trim().is_empty()).then_some(duration);
-        self
-    }
-
-    pub fn timing_debug(mut self, timing: impl Into<String>) -> Self {
-        let timing = timing.into();
-        self.timing_debug = (!timing.trim().is_empty()).then_some(timing);
         self
     }
 
@@ -463,21 +455,6 @@ impl RenderOnce for MessageBubble {
                                 .child("Queued — sends when the coworker is free"),
                         )
                         .when_some(actions, |this, actions| this.child(actions)),
-                )
-            })
-            .when_some(self.timing_debug.clone(), |this, timing| {
-                this.child(
-                    v_flex()
-                        .id(ElementId::Name(format!("turn-timing-{row_key}").into()))
-                        .mt(px(4.))
-                        .gap(px(1.))
-                        .text_xs()
-                        .text_color(muted)
-                        .children(
-                            timing
-                                .lines()
-                                .map(|line| div().child(SharedString::from(line.to_string()))),
-                        ),
                 )
             })
             .when_some(self.reaction.clone(), |this, emoji| {
