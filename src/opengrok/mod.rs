@@ -11,6 +11,7 @@ mod gen_ui;
 mod inference;
 mod local_exec;
 mod pending;
+mod relay;
 mod timing;
 mod types;
 mod user_form;
@@ -38,7 +39,13 @@ pub use inference::{
     InferenceSource, InferenceSourceUpdate, ProxyKey, RelayErrorCode, RelayRead, RelayUpdate,
     ReplySource, TurnSource, Via, is_loopback, is_subscription_model,
 };
-pub use local_exec::{enrol_this_machine, serve_local_exec, stored_machine_id};
+pub use local_exec::{
+    MachineCredential, enrol_this_machine, serve_local_exec, stored_machine, stored_machine_id,
+};
+pub use relay::{
+    OpencodexAddress, RelayHandle, RelayKey, RelayReport, RelayStatus, RelayTarget, RelayTimings,
+    SERVER_QUIET, SERVER_UNREACHED, SERVER_WITHOUT_RELAY, TOKEN_REFUSED, start_relay,
+};
 pub(crate) use user_form::USER_FORM_REASON;
 pub use user_form::{
     BOX_HANDOFF_RESOLVE_PATH, BoxHandoffReply, BoxHandoffResolution, ComputerHandoffSpec,

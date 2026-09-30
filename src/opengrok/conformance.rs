@@ -605,7 +605,23 @@ const REST_NOT_READ: &[(&str, &str, &str)] = &[
 ///
 /// Only routes built ahead of a recording are listed. Routes this app asks that no test on the
 /// server drives are a different gap, and not this list's.
-const REST_NOT_RECORDED_YET: &[(&str, &str, &str)] = &[];
+const REST_NOT_RECORDED_YET: &[(&str, &str, &str)] = &[
+    (
+        "GET__inference-relay_requests",
+        "/inference-relay/requests",
+        "The Mac relay's stream, opened with the machine token (opengrok-server #292, contract \
+         agreed 2026-09-30, not yet recorded; relay.rs reads its frames). Its fixtures come with \
+         the server's #292 and the recording after it.",
+    ),
+    (
+        "POST__inference-relay_responses__request_id_",
+        "/inference-relay/responses/{request_id}",
+        "The Mac's answer to one relayed call: opencodex's stream, its model list, or a failure \
+         as {\"error\"} (opengrok-server #292, contract agreed 2026-09-30, not yet recorded; the \
+         route's placeholder is guessed as the router writes its others). Its fixtures come with \
+         the server's #292 and the recording after it.",
+    ),
+];
 
 // ---- the corpus ----
 

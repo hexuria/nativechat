@@ -15,6 +15,7 @@ pub mod opengrok;
 pub mod prefs;
 pub(crate) mod private_file;
 pub mod reachability;
+pub mod relay_key;
 pub mod root;
 pub mod send_policy;
 pub mod services;
