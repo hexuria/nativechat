@@ -8,6 +8,18 @@ use std::path::{Path, PathBuf};
 
 const ON_SEND: &str = "on_send";
 const SHOW_TURN_TIMING: &str = "show_turn_timing";
+const RELAY: &str = "relay";
+
+/// "Answer with this Mac", as this Mac keeps it: who it is switched on for, and where this Mac's
+/// opencodex listens. The key for opencodex is in the Keychain (`crate::relay_key`), never here.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RelayPrefs {
+    /// The account the switch is on for. Enrolling never makes a Mac the relay, and a Mac two
+    /// people sign in on answers only for the one who switched it on.
+    pub on_for: Option<String>,
+    /// opencodex's address as saved, or `None` for where it listens unless told otherwise.
+    pub address: Option<String>,
+}
 
 pub fn prefs_path(data_dir: &Path) -> PathBuf {
     data_dir.join("prefs.json")
@@ -53,6 +65,40 @@ pub fn save_show_turn_timing(data_dir: &Path, on: bool) {
 pub fn save_show_turn_timing_to(path: &Path, on: bool) {
     let mut prefs = read_object(path);
     prefs.insert(SHOW_TURN_TIMING.to_string(), on.into());
+    write_object(path, prefs);
+}
+
+pub fn load_relay(data_dir: &Path) -> RelayPrefs {
+    load_relay_from(&prefs_path(data_dir))
+}
+
+pub fn load_relay_from(path: &Path) -> RelayPrefs {
+    let prefs = read_object(path);
+    let field = |key: &str| {
+        prefs
+            .get(RELAY)
+            .and_then(|relay| relay.get(key))
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    };
+    RelayPrefs {
+        on_for: field("onFor"),
+        address: field("address"),
+    }
+}
+
+pub fn save_relay(data_dir: &Path, relay: &RelayPrefs) {
+    save_relay_to(&prefs_path(data_dir), relay);
+}
+
+pub fn save_relay_to(path: &Path, relay: &RelayPrefs) {
+    let mut prefs = read_object(path);
+    prefs.insert(
+        RELAY.to_string(),
+        serde_json::json!({ "onFor": relay.on_for, "address": relay.address }),
+    );
     write_object(path, prefs);
 }
 
@@ -133,6 +179,30 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
         assert_eq!(value["on_send"], "steer");
         assert_eq!(value["later_build"]["x"], 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Answer with this Mac is off until switched on for somebody, and keeps its address beside
+    /// the other prefs without touching them.
+    #[test]
+    fn the_relay_is_off_until_switched_on_and_keeps_its_address() {
+        let dir = scratch("relay");
+        let path = prefs_path(&dir);
+        assert_eq!(load_relay_from(&path), RelayPrefs::default(), "no file yet");
+        save_on_send_to(&path, OnSend::Steer);
+        let on = RelayPrefs {
+            on_for: Some("acc_1".into()),
+            address: Some("http://127.0.0.1:9090".into()),
+        };
+        save_relay_to(&path, &on);
+        assert_eq!(load_relay_from(&path), on);
+        assert_eq!(
+            load_on_send_from(&path),
+            OnSend::Steer,
+            "the other prefs stay"
+        );
+        save_relay_to(&path, &RelayPrefs::default());
+        assert_eq!(load_relay_from(&path), RelayPrefs::default());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

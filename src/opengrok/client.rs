@@ -5,7 +5,7 @@ use std::sync::Arc;
 use futures::StreamExt;
 use futures::future::{FutureExt, Shared};
 use reqwest::cookie::{CookieStore, Jar};
-use reqwest::header::{ACCEPT, CACHE_CONTROL, HeaderValue};
+use reqwest::header::{ACCEPT, CACHE_CONTROL, CONTENT_TYPE, HeaderValue};
 use reqwest::{Client, StatusCode, Url};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -16,6 +16,7 @@ use super::inference::{InferenceSource, InferenceSourceUpdate, TurnSource};
 use super::pending::{
     PendingCustom, PendingList, PendingMutation, PendingUserMessage, PendingWrite,
 };
+use super::relay::{RelayAnswer, RelayAnswered};
 use super::types::{
     Account, AguiMessage, Coworker, CoworkerPatch, ModelCatalogue, ProfileUpdate, ThreadListing,
     error_code_from_body, error_message_from_body, written_by_opengrok,
@@ -2564,6 +2565,75 @@ impl OpenGrokClient {
             Ok(())
         } else {
             Err(Self::read_error(response).await)
+        }
+    }
+
+    /// `GET /inference-relay/requests`: the Mac relay's stream (opengrok-server #292, contract
+    /// agreed 2026-09-30, not yet recorded), opened with this Mac's machine token as the
+    /// local-exec stream is. Answered with the response as it opens, for the relay to read its
+    /// frames off as they come ([`super::relay`]); a refusal is read as every other, and a `401`
+    /// is the server no longer taking the token, which the relay stops for.
+    pub async fn open_inference_relay(
+        &self,
+        machine_token: &str,
+    ) -> Result<reqwest::Response, OpenGrokError> {
+        let url = self.url("/inference-relay/requests")?;
+        let response = self
+            .http
+            .get(url)
+            .header(ACCEPT, "text/event-stream")
+            .header(CACHE_CONTROL, "no-cache")
+            .bearer_auth(machine_token)
+            .send()
+            .await
+            .map_err(|e| OpenGrokError::transport(&e))?;
+        if !response.status().is_success() {
+            return Err(Self::read_error(response).await);
+        }
+        Ok(response)
+    }
+
+    /// `POST /inference-relay/responses/{requestId}`: this Mac's answer to one call off the relay
+    /// stream, with its machine token (the same contract). opencodex's stream goes as
+    /// `text/event-stream`, uploaded as it arrives rather than gathered first; its model list, and
+    /// a failure as `{"error": sentence}`, as `application/json`. `204` is taken, `404` a call the
+    /// server no longer has (as good as cancelled), `409` one answered already, and `401` the token
+    /// refused; anything else is read as the server's refusal.
+    pub(crate) async fn answer_inference_relay(
+        &self,
+        machine_token: &str,
+        request_id: &str,
+        answer: RelayAnswer,
+    ) -> Result<RelayAnswered, OpenGrokError> {
+        let url = self.url(&format!(
+            "/inference-relay/responses/{}",
+            path_segment(request_id)
+        ))?;
+        let (content_type, body) = match answer {
+            RelayAnswer::Stream(body) => ("text/event-stream", body),
+            RelayAnswer::Models(models) => {
+                ("application/json", reqwest::Body::from(models.to_string()))
+            }
+            RelayAnswer::Error(sentence) => (
+                "application/json",
+                reqwest::Body::from(json!({ "error": sentence }).to_string()),
+            ),
+        };
+        let response = self
+            .http
+            .post(url)
+            .bearer_auth(machine_token)
+            .header(CONTENT_TYPE, content_type)
+            .body(body)
+            .send()
+            .await
+            .map_err(|e| OpenGrokError::transport(&e))?;
+        match response.status().as_u16() {
+            200..=299 => Ok(RelayAnswered::Taken),
+            401 => Ok(RelayAnswered::TokenRefused),
+            404 => Ok(RelayAnswered::Gone),
+            409 => Ok(RelayAnswered::AlreadyAnswered),
+            _ => Err(Self::read_error(response).await),
         }
     }
 

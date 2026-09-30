@@ -52,6 +52,52 @@ pub fn stored_machine_id(data_dir: &Path) -> Option<String> {
     load_credential(&data_dir.join(CREDENTIAL_FILE)).map(|cred| cred.machine_id)
 }
 
+/// This Mac's credential with the server as enrolment left it: its machine id, and the token the
+/// local-exec stream opens with. The Mac relay opens its stream and posts its answers with the
+/// same token (`super::relay`, opengrok-server #292), so enrolling is what lets this Mac answer,
+/// though it never makes it the relay by itself. Its `Debug` never prints the token.
+#[derive(Clone)]
+pub struct MachineCredential {
+    machine_id: String,
+    token: String,
+}
+
+impl MachineCredential {
+    #[cfg(test)]
+    pub(crate) fn new(machine_id: &str, token: &str) -> Self {
+        Self {
+            machine_id: machine_id.to_string(),
+            token: token.to_string(),
+        }
+    }
+
+    pub fn machine_id(&self) -> &str {
+        &self.machine_id
+    }
+
+    pub(crate) fn token(&self) -> &str {
+        &self.token
+    }
+}
+
+impl std::fmt::Debug for MachineCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MachineCredential")
+            .field("machine_id", &self.machine_id)
+            .field("token", &"«redacted»")
+            .finish()
+    }
+}
+
+/// This Mac's credential, once it has enrolled: read from the file enrolment wrote, with nothing
+/// asked of the server.
+pub fn stored_machine(data_dir: &Path) -> Option<MachineCredential> {
+    load_credential(&data_dir.join(CREDENTIAL_FILE)).map(|cred| MachineCredential {
+        machine_id: cred.machine_id,
+        token: cred.token,
+    })
+}
+
 pub async fn serve_local_exec(client: OpenGrokClient, data_dir: PathBuf, cancel: Arc<AtomicBool>) {
     let mut cred = match ensure_daemon(&client, &data_dir).await {
         Ok(cred) => cred,
