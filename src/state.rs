@@ -2798,6 +2798,23 @@ fn unheard_hidden_runs(messages: &[Message], offered: &[ThreadRun]) -> Vec<Strin
         .collect()
 }
 
+/// The bubble a followed run paints into by name: the thread's live turn's, when that turn is
+/// this run.
+///
+/// The live turn is the one run the thread is holding still for. A run the app follows without
+/// holding it — a card answered from a notification while another turn is going in the same
+/// thread, or a run picked up off the approvals queue — has no claim on that bubble: painting
+/// there wrote its words and its badge over another run's reply. It finds its own row by its run
+/// id instead, or is given one ([`bubble_for_run`]).
+fn followed_bubble(
+    live_turns: &HashMap<String, LiveTurn>,
+    conversation_id: Option<&str>,
+    run_id: &str,
+) -> Option<String> {
+    let turn = live_turns.get(conversation_id?)?;
+    (turn.run_id == run_id).then(|| turn.message_id.clone())
+}
+
 fn bubble_for_run(
     messages: &mut Vec<Message>,
     target: Option<&str>,
@@ -13481,10 +13498,13 @@ impl AppState {
                                 let parts = state.graft_user_forms(parts.clone());
                                 // The bubble this run has been filling in all along, by the name
                                 // it was given when the turn started — the resumed half of a turn
-                                // belongs to the same row as the half before the card.
-                                let target = conversation_id.as_ref().and_then(|id| {
-                                    state.live_turns.get(id).map(|turn| turn.message_id.clone())
-                                });
+                                // belongs to the same row as the half before the card. Only when
+                                // the thread's live turn is this run: see `followed_bubble`.
+                                let target = followed_bubble(
+                                    &state.live_turns,
+                                    conversation_id.as_deref(),
+                                    &run_id,
+                                );
                                 // The bubble this actually painted into, so the row it is
                                 // written down as is that bubble and not a new one.
                                 let mut painted: Option<String> = None;
@@ -21376,6 +21396,56 @@ mod tests {
             messages[1].content, "an older reply",
             "the last thing said before is untouched"
         );
+    }
+
+    /// A run the app follows without holding it paints its own row, badge and all, and never the
+    /// live turn's: a card answered from a notification while another turn is going in the same
+    /// thread resumes a run the thread is not holding still for. The live turn's own run still
+    /// paints the bubble it was given.
+    #[test]
+    fn a_followed_run_the_thread_is_not_holding_leaves_the_live_turns_bubble_alone() {
+        use crate::opengrok::{InferenceKind, ReplySource};
+        let mut live_turns = std::collections::HashMap::new();
+        live_turns.insert(
+            "cw_1".to_string(),
+            LiveTurn {
+                run_id: "run_live".into(),
+                message_id: "m_live".into(),
+                persisting: false,
+            },
+        );
+        let mut messages = vec![
+            at(message("m_ask", true, "go"), 500),
+            from_run("m_old", "an older reply", "run_old", 1_000),
+            at(message("m_again", true, "and this"), 1_500),
+            from_run("m_live", "", "run_live", 2_000),
+        ];
+        // The resumed run's journal says it went through the person's plan; the live turn is
+        // the server's keys, and has not said so yet.
+        let resumed = ReplySource {
+            kind: InferenceKind::LocalProxy,
+            model: Some("gpt-5-codex".into()),
+        };
+        let target = super::followed_bubble(&live_turns, Some("cw_1"), "run_old");
+        assert_eq!(target, None, "the live turn is another run's");
+        let at = bubble_for_run(&mut messages, target.as_deref(), "run_old", None);
+        messages[at].reply_source = Some(resumed.clone());
+        assert_eq!(messages[at].id, "m_old", "its own row, found by its run");
+        let live = messages.iter().find(|m| m.id == "m_live").unwrap();
+        assert_eq!(live.reply_source, None, "no badge on the live turn's reply");
+
+        // A followed run with no row yet is given one, not the live turn's.
+        let target = super::followed_bubble(&live_turns, Some("cw_1"), "run_new");
+        let at = bubble_for_run(&mut messages, target.as_deref(), "run_new", None);
+        assert_ne!(messages[at].id, "m_live");
+        assert_eq!(messages[at].run_id.as_deref(), Some("run_new"));
+
+        // The live turn's own run, resumed after its card: the bubble it was given.
+        assert_eq!(
+            super::followed_bubble(&live_turns, Some("cw_1"), "run_live").as_deref(),
+            Some("m_live")
+        );
+        assert_eq!(super::followed_bubble(&live_turns, None, "run_live"), None);
     }
 
     #[test]
@@ -31346,5 +31416,55 @@ mod tests {
         let rows = db.get_messages("s1").await.expect("the thread reopens");
         let old = rows.iter().find(|row| row.id == "m_old").unwrap();
         assert_eq!(restored_message(old.clone()).reply_source, None);
+    }
+
+    /// The saved badge is its run's. A row written again under another run does not keep the
+    /// door the first run went through: it wears the new run's when the write knows it, and
+    /// none when it does not.
+    #[tokio::test]
+    async fn a_row_filed_under_another_run_does_not_keep_the_old_runs_badge() {
+        let db = test_db().await;
+        db.ensure_session("s1", "Ada").await.expect("a session");
+        let mut reply = message("m_reply", false, "Done.");
+        reply.run_id = Some("run_1".into());
+        reply.reply_source = Some(ReplySource {
+            kind: InferenceKind::LocalProxy,
+            model: Some("gpt-5-codex".into()),
+        });
+        let write = |run: &'static str, stamp: SaveStamp| {
+            let db = db.clone();
+            async move {
+                keep_reply(
+                    &db,
+                    "s1",
+                    "Ada",
+                    "m_reply",
+                    "Done.",
+                    &[],
+                    Some(run),
+                    false,
+                    stamp,
+                )
+                .await
+                .expect("saved");
+                let rows = db.get_messages("s1").await.expect("the thread reopens");
+                restored_message(rows[0].clone()).reply_source
+            }
+        };
+        assert_eq!(write("run_1", reply.save_stamp()).await, reply.reply_source);
+        let mut unknown = reply.save_stamp();
+        unknown.source_json = None;
+        assert_eq!(
+            write("run_2", unknown).await,
+            None,
+            "run_1's door says nothing about run_2"
+        );
+        let gateway = ReplySource {
+            kind: InferenceKind::Gateway,
+            model: Some("oag/cheap".into()),
+        };
+        let mut known = reply.save_stamp();
+        known.source_json = Some(gateway.to_json());
+        assert_eq!(write("run_3", known).await, Some(gateway));
     }
 }

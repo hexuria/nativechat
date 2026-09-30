@@ -164,6 +164,11 @@ impl DatabaseService {
             // write that comes later never clears a mark that is already there. The person
             // can hide a reply while it is still being typed out, and the row for it does not
             // exist until the turn settles.
+            //
+            // The badge is the run's, not the row's. A second write for the same run that knows
+            // no source keeps the one there; a write that files the row under another run takes
+            // that run's source, or none, because the door the old run went through says nothing
+            // about the new one. (Every `chat_messages.*` in the SET is the row before this write.)
             "INSERT INTO chat_messages (id, session_id, role, content, model, provider, reply_to_id, reply_preview, reply_is_me, run_id, deleted_at, created_at, finished_at, run_timing, inference_source)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(id) DO UPDATE SET
@@ -174,7 +179,11 @@ impl DatabaseService {
                deleted_at = coalesce(chat_messages.deleted_at, excluded.deleted_at),
                finished_at = coalesce(excluded.finished_at, chat_messages.finished_at),
                run_timing = coalesce(excluded.run_timing, chat_messages.run_timing),
-               inference_source = coalesce(excluded.inference_source, chat_messages.inference_source)",
+               inference_source = CASE
+                 WHEN chat_messages.run_id IS excluded.run_id
+                   THEN coalesce(excluded.inference_source, chat_messages.inference_source)
+                 ELSE excluded.inference_source
+               END",
         )
         .bind(id)
         .bind(session_id)
