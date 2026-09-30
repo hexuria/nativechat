@@ -19,17 +19,17 @@ use crate::opengrok::{
     ModelEntry, NewSchedule, NewSkill, OpenGrokClient, OpenGrokError, PendingCustom, PendingOp,
     PendingUserMessage, PendingWrite, ProfileUpdate, ProxyKey, QueuedApproval, RecipeDetail,
     RecipeKind, RecipeParameter, RecipeRun, RecipeRunResult, RecipeShareTarget, RecipeStep,
-    RecipeSummary, RelayHandle, RelayKey, RelayReport, RelayStatus, RelayTarget, RelayTimings,
-    RelayUpdate, ReplyQuote, ReplySource, RunCause, RunRecipeResponse, RunReplay, SKILL_BODY_CHARS,
-    SKILL_BUNDLE_FILES, SKILL_BUNDLE_LIMIT, SaveLoginSpec, ScheduleEdit, ScheduleKind, ScheduleRow,
-    ScheduleRun, ScheduleRunStatus, ScreenshotSpec, SkillDetail, SkillFile, SkillPatch,
-    SkillSource, SkillSummary, ThreadListing, ThreadReplay, ThreadRun, ToolCallTracker,
-    TurnAssembler, TurnRecipe, TurnSource, TurnTiming, USER_FORM_SERVER_FILL_AVAILABLE,
-    Unreachable, UserFormDismissMode, UserFormHttpSettle, UserFormValues, UserFormVerb, Via,
-    WAITING_FOR_YOU, activity_from_replay, approval_summary, box_handoff_resolve_entry_id,
-    collapse_computer_roster, command_from_args, command_from_replay_events, deeds_from_replay,
-    enrol_this_machine, env_egress_tunnel_enabled, host_egress_tunnel_available,
-    host_egress_tunnel_flag, keep_local_save_offer, persons_messages,
+    RecipeSummary, RelayErrorCode, RelayHandle, RelayKey, RelayReport, RelayStatus, RelayTarget,
+    RelayTimings, RelayUpdate, ReplyQuote, ReplySource, RunCause, RunRecipeResponse, RunReplay,
+    SKILL_BODY_CHARS, SKILL_BUNDLE_FILES, SKILL_BUNDLE_LIMIT, SaveLoginSpec, ScheduleEdit,
+    ScheduleKind, ScheduleRow, ScheduleRun, ScheduleRunStatus, ScreenshotSpec, SkillDetail,
+    SkillFile, SkillPatch, SkillSource, SkillSummary, ThreadListing, ThreadReplay, ThreadRun,
+    ToolCallTracker, TurnAssembler, TurnRecipe, TurnSource, TurnTiming,
+    USER_FORM_SERVER_FILL_AVAILABLE, Unreachable, UserFormDismissMode, UserFormHttpSettle,
+    UserFormValues, UserFormVerb, Via, WAITING_FOR_YOU, activity_from_replay, approval_summary,
+    box_handoff_resolve_entry_id, collapse_computer_roster, command_from_args,
+    command_from_replay_events, deeds_from_replay, enrol_this_machine, env_egress_tunnel_enabled,
+    host_egress_tunnel_available, host_egress_tunnel_flag, keep_local_save_offer, persons_messages,
     place_hitl_cards_in_document_order, policy_answer, reads_as_gateway_unreachable, retry_enqueue,
     save_login_from_local, serve_local_exec, stamp_duration, start_relay, stored_machine,
     stored_machine_id, tool_standin,
@@ -2537,6 +2537,7 @@ fn held_message(
         skill,
         reply,
         inference_source,
+        waits_for_mac: false,
         pending_id: None,
         posted: false,
         stale: StaleRefusal::Fresh,
@@ -2566,6 +2567,10 @@ pub struct QueuedSend {
     /// none leaves this Mac's in place. It names the way to the plan too when the chip did, the
     /// person's Mac included.
     inference_source: Option<TurnSource>,
+    /// The server holds this send until a Mac holds the relay again (`heldFor:
+    /// "relay_offline"` on its row, opengrok-server #292): its queue line says it waits for the
+    /// person's Mac rather than for the coworker. The row's word, read with every row.
+    waits_for_mac: bool,
     /// The `pum_…` row on OpenGrok, once enqueue has landed. Absent while offline, or on an
     /// OpenGrok that has not shipped pending-user-messages yet.
     pending_id: Option<String>,
@@ -2764,6 +2769,7 @@ fn hold_from_row(item: &PendingUserMessage) -> QueuedSend {
         skill: item.skill_id.clone().filter(|id| !id.is_empty()),
         reply: reply_from_pending(item.reply_to.as_ref()),
         inference_source: item.inference_source(),
+        waits_for_mac: item.waits_for_mac(),
         pending_id: Some(item.id.clone()).filter(|id| !id.is_empty()),
         posted: true,
         stale: StaleRefusal::Fresh,
@@ -3201,6 +3207,8 @@ struct RecoveredReply {
     run_timing: Option<TurnTiming>,
     /// Which door the reply came through, when the journal carried its CUSTOM.
     reply_source: Option<ReplySource>,
+    /// The run ended because the person's Mac could not answer, and why.
+    relay_failure: Option<RelayErrorCode>,
 }
 
 /// Something the person said that a replay brought back and this thread does not hold.
@@ -3273,6 +3281,7 @@ fn missing_replies(messages: &[Message], runs: &[ThreadRun]) -> Vec<RecoveredRep
                 finished_at: recovered_finished_at(run),
                 run_timing: TurnTiming::from_events(&run.events),
                 reply_source,
+                relay_failure: relay_failure_of(&run.events),
             })
         })
         .collect()
@@ -3607,6 +3616,19 @@ fn replayed_ending(
         ),
         _ => None,
     }
+}
+
+/// Why a run through the person's Mac ended, when its journal says one did: the code on its
+/// `RUN_ERROR` (opengrok-server #292, contract agreed 2026-09-30, not yet recorded), for a replay
+/// to offer the turn again on the server's keys as the live stream does.
+fn relay_failure_of(events: &[serde_json::Value]) -> Option<RelayErrorCode> {
+    events
+        .iter()
+        .rev()
+        .find(|event| event.get("type").and_then(serde_json::Value::as_str) == Some("RUN_ERROR"))
+        .and_then(|event| event.get("code"))
+        .and_then(serde_json::Value::as_str)
+        .and_then(RelayErrorCode::from_code)
 }
 
 /// A time as a row carries it. Rows written before times were kept to the millisecond have
@@ -4919,6 +4941,10 @@ pub struct AppState {
     /// Where the key for this Mac's opencodex is kept: the Keychain, once the app is configured,
     /// and memory before that and in tests.
     relay_keys: Arc<dyn RelayKeyStore>,
+    /// Replies whose run ended because the person's Mac could not answer (a relay `RUN_ERROR`'s
+    /// `code`), by the reply's message id: the thread's last one offers the turn again on the
+    /// server's keys ([`Self::send_on_server`]).
+    relay_failures: HashMap<String, RelayErrorCode>,
     /// Everything the open Bot could be offered and which of it it may be, as its Tools card's
     /// switches show it (opengrok-server#268): the Bot's id and the answer, like
     /// [`Self::coworker_tools`]. Drawn through [`Self::ceiling_card`].
@@ -5504,6 +5530,7 @@ impl AppState {
             relay_starting: None,
             relay_generation: 0,
             relay_keys: Arc::new(crate::relay_key::MemoryKeyStore::default()),
+            relay_failures: HashMap::new(),
             coworker_ceiling: None,
             ceiling_generation: 0,
             ceiling_reading: None,
@@ -6580,6 +6607,7 @@ impl AppState {
         // theirs, and is read again for whoever signs in next.
         self.stop_relay();
         self.relay_mac.on = false;
+        self.relay_failures.clear();
         self.composer_dictating = false;
         // And any list of models still being asked for was asked as them, and the plan's models
         // listed were their plan's: the gateway's routes are the deployment's and stay.
@@ -13308,6 +13336,7 @@ impl AppState {
                 return;
             };
             let grafted_id = graft_reply(&mut conversation.messages, &reply);
+            self.note_relay_failure(&grafted_id, reply.relay_failure);
             let message_id = grafted_id.clone();
             if reply.live {
                 // Whatever stopped watching this run, the run did not stop. Registering it makes
@@ -13578,6 +13607,7 @@ impl AppState {
         // A row this turn already has takes the badge now; one written later takes it from the
         // bubble.
         self.persist_replayed_badges(conversation_id, badge.into_iter().collect(), cx);
+        self.note_relay_failure(&turn.message_id, relay_failure_of(&replay.events));
         if let Some(shot) = parts.iter().rev().find_map(|part| match part {
             ChatPart::Screenshot(spec) => Some(spec.clone()),
             _ => None,
@@ -13860,7 +13890,16 @@ impl AppState {
         // sent, and what the composer is holding now belongs to the message still being
         // written. Taking it here sent somebody's skill on a turn they never attached it to
         // and left the chip standing over a draft with nothing behind it.
-        self.send_opengrok_turn_with(conversation_id, content, recipe, None, None, None, cx);
+        self.send_opengrok_turn_with(
+            conversation_id,
+            content,
+            recipe,
+            None,
+            None,
+            None,
+            false,
+            cx,
+        );
     }
 
     /// The messages a turn posts.
@@ -13931,7 +13970,8 @@ impl AppState {
 
     /// `recipe` and `skill` are what the message was typed with. `stop_first` is a run this turn
     /// replaces: it is stopped on the wire before the turn is posted. `drained` is the hold this
-    /// turn is firing, when it came off `queued_sends`.
+    /// turn is firing, when it came off `queued_sends`. `on_server` sends it on the server's paid
+    /// keys whatever the chip shows: the turn the person's Mac could not answer, sent again.
     #[allow(clippy::too_many_arguments)]
     fn send_opengrok_turn_with(
         &mut self,
@@ -13941,6 +13981,7 @@ impl AppState {
         skill: Option<String>,
         stop_first: Option<String>,
         drained: Option<QueuedSend>,
+        on_server: bool,
         cx: &mut Context<Self>,
     ) {
         let Some(client) = self.opengrok.clone() else {
@@ -13961,8 +14002,13 @@ impl AppState {
         let pending_id = drained.as_ref().and_then(|held| held.pending_id.clone());
         let queued_message_id = drained.as_ref().map(|held| held.message_id.clone());
         // The door the chip shows as the turn leaves, or for a held send the one it showed when
-        // the message was sent: see `turn_inference_source`.
-        let turn_source = self.turn_inference_source(drained.as_ref());
+        // the message was sent: see `turn_inference_source`. A turn sent again on the server's
+        // keys names them.
+        let turn_source = if on_server {
+            Some(TurnSource::GATEWAY)
+        } else {
+            self.turn_inference_source(drained.as_ref())
+        };
 
         // Both ids are minted here, before anything is sent. The run id because the server files
         // every frame under it and this is the app's only handle on the run once the stream is
@@ -14291,6 +14337,14 @@ impl AppState {
                     }
                 }
                 let parked = waiting_approval || waiting_user_form;
+                // A turn the person's Mac could not answer says why, and offers itself again on
+                // the server's keys.
+                let relay_failure = result
+                    .as_ref()
+                    .err()
+                    .and_then(OpenGrokError::code)
+                    .and_then(RelayErrorCode::from_code);
+                state.note_relay_failure(&reply_id, relay_failure);
                 let reply = (!parked)
                     .then(|| {
                         state
@@ -14431,6 +14485,66 @@ impl AppState {
             conversation.messages.retain(|m| m.id != message_id);
         }
         self.send_opengrok_turn(conversation_id, String::new(), cx);
+    }
+
+    /// Keep, or let go, why a reply's run ended at the person's Mac.
+    fn note_relay_failure(&mut self, message_id: &str, failure: Option<RelayErrorCode>) {
+        match failure {
+            Some(code) => {
+                self.relay_failures.insert(message_id.to_string(), code);
+            }
+            None => {
+                self.relay_failures.remove(message_id);
+            }
+        }
+    }
+
+    /// The row of the open thread's last turn when the person's Mac could not answer it
+    /// (`relay_offline`, `relay_timeout`, `relay_failed`), if its last turn is one. Only the last,
+    /// as with Try again: an older one has messages after it, and sending it again would answer
+    /// the newest message rather than the one that went unanswered.
+    pub fn relay_failed_turn(&self) -> Option<String> {
+        if self.is_turn_in_flight() || self.session.is_expired() {
+            return None;
+        }
+        let conversation = self
+            .conversations
+            .iter()
+            .find(|c| Some(&c.id) == self.active_conversation_id.as_ref())?;
+        let last = conversation.messages.iter().rev().find(|m| !m.hidden)?;
+        (!last.is_me && self.relay_failures.contains_key(&last.id)).then(|| last.id.clone())
+    }
+
+    /// Send this reply on Server instead: the turn the person's Mac could not answer, again, on
+    /// the server's paid keys, this once. The failed row goes and the turn runs from the thread
+    /// as it stands, as Try again's does; the person's message is not sent twice, and the
+    /// composer's chip is left where it was, for the turns after this one.
+    pub fn send_on_server(&mut self, cx: &mut Context<Self>) {
+        let Some(message_id) = self.relay_failed_turn() else {
+            return;
+        };
+        let Some(conversation_id) = self.active_conversation_id.clone() else {
+            return;
+        };
+        if let Some(conversation) = self
+            .conversations
+            .iter_mut()
+            .find(|c| c.id == conversation_id)
+        {
+            conversation.messages.retain(|m| m.id != message_id);
+        }
+        self.relay_failures.remove(&message_id);
+        let recipe = self.active_recipe.as_ref().map(ActiveRecipe::turn);
+        self.send_opengrok_turn_with(
+            conversation_id,
+            String::new(),
+            recipe,
+            None,
+            None,
+            None,
+            true,
+            cx,
+        );
     }
 
     /// Stop the turn the open thread has in flight.
@@ -14971,6 +15085,14 @@ impl AppState {
                                         id,
                                         badge.into_iter().collect(),
                                         cx,
+                                    );
+                                }
+                                // A run the person's Mac could not answer offers itself again on
+                                // the server's keys, followed as it is watched live.
+                                if let Some(painted) = painted.as_deref() {
+                                    state.note_relay_failure(
+                                        painted,
+                                        relay_failure_of(&replay.events),
                                     );
                                 }
                                 match status.as_str() {
@@ -17709,6 +17831,7 @@ impl AppState {
             skill,
             stop_first,
             None,
+            false,
             cx,
         );
     }
@@ -17769,6 +17892,7 @@ impl AppState {
             next.skill.clone(),
             None,
             Some(next),
+            false,
             cx,
         );
     }
@@ -17934,6 +18058,27 @@ impl AppState {
             .values()
             .flatten()
             .any(|queued| queued.message_id == message_id)
+    }
+
+    /// A held send the server holds until a Mac holds the relay again: its queue line says
+    /// "Waiting for your Mac".
+    pub fn is_send_waiting_for_mac(&self, message_id: &str) -> bool {
+        self.queued_sends
+            .values()
+            .flatten()
+            .any(|queued| queued.message_id == message_id && queued.waits_for_mac)
+    }
+
+    /// The open thread's held sends the server holds for the person's Mac, by bubble id.
+    pub fn sends_waiting_for_mac(&self) -> Vec<String> {
+        self.active_conversation_id
+            .as_deref()
+            .and_then(|id| self.queued_sends.get(id))
+            .into_iter()
+            .flatten()
+            .filter(|queued| queued.waits_for_mac)
+            .map(|queued| queued.message_id.clone())
+            .collect()
     }
 
     fn bubble_hidden(&self, conversation_id: &str, message_id: &str) -> bool {
@@ -18859,6 +19004,7 @@ impl AppState {
         held.recipe = recipe_from_pending(row);
         held.skill = row.skill_id.clone().filter(|id| !id.is_empty());
         held.inference_source = row.inference_source().or(held.inference_source);
+        held.waits_for_mac = row.waits_for_mac();
         if !row.id.is_empty() {
             held.pending_id = Some(row.id.clone());
         }
@@ -18960,6 +19106,10 @@ impl AppState {
                     && let Some(held) = self.hold_mut(&bubble_id)
                 {
                     held.inference_source = Some(door);
+                }
+                // Whether the server holds it for the person's Mac is the row's word as it stands.
+                if let Some(held) = self.hold_mut(&bubble_id) {
+                    held.waits_for_mac = item.waits_for_mac();
                 }
                 if self.apply_queued_edit(&bubble_id, item.content.clone()) {
                     if let Some(queued) = self
@@ -19067,6 +19217,7 @@ impl AppState {
             existing.skill = hold.skill;
             existing.reply = hold.reply;
             existing.inference_source = hold.inference_source.or(existing.inference_source);
+            existing.waits_for_mac = hold.waits_for_mac;
             if hold.pending_id.is_some() {
                 existing.pending_id = hold.pending_id;
             }
@@ -24667,6 +24818,7 @@ mod tests {
             finished_at: Some(SystemTime::UNIX_EPOCH + Duration::from_millis(8_000)),
             run_timing: None,
             reply_source: None,
+            relay_failure: None,
         };
 
         let id = graft_reply(&mut messages, &reply);
@@ -33168,6 +33320,133 @@ mod tests {
         state.put_back_stale_hold("cw_1", "m_reply", held, &edited);
         let front = state.queued_sends.get("cw_1").unwrap().front().unwrap();
         assert_eq!(front.inference_source, Some(InferenceKind::Gateway.into()));
+    }
+
+    /// A turn the person's Mac could not answer offers itself again on the server's keys, as the
+    /// thread's last turn and only then: live, by the run error's code, and read back, by the
+    /// code on the journal's `RUN_ERROR`. A failure of any other kind, a later message, a turn in
+    /// flight, and a sign-out all take the offer away.
+    #[test]
+    fn a_turn_the_mac_could_not_answer_is_offered_again_on_the_servers_keys() {
+        use crate::opengrok::RelayErrorCode;
+        let mut state = signed_in_state();
+        state.conversations.push(Conversation {
+            id: "cw_1".into(),
+            title: "Ada".into(),
+            created_at: String::new(),
+            updated_at: String::new(),
+            messages: vec![
+                message("m_ask", true, "summarise it"),
+                message(
+                    "m_failed",
+                    false,
+                    &format!("{RUN_ERROR_PREFIX}Your Mac isn't connected."),
+                ),
+            ],
+            unread_count: 0,
+            origin: None,
+        });
+        state.active_conversation_id = Some("cw_1".into());
+        assert_eq!(state.relay_failed_turn(), None, "a failure of another kind");
+        state.note_relay_failure("m_failed", Some(RelayErrorCode::Offline));
+        assert_eq!(state.relay_failed_turn().as_deref(), Some("m_failed"));
+        state.live_turns.insert(
+            "cw_1".into(),
+            LiveTurn {
+                run_id: "run_2".into(),
+                message_id: "m_next".into(),
+                persisting: false,
+            },
+        );
+        assert_eq!(state.relay_failed_turn(), None, "a turn in flight");
+        state.live_turns.clear();
+        state.conversations[0]
+            .messages
+            .push(message("m_more", true, "and another thing"));
+        assert_eq!(
+            state.relay_failed_turn(),
+            None,
+            "not the last turn any more"
+        );
+        state.conversations[0].messages.pop();
+        state.note_relay_failure("m_failed", None);
+        assert_eq!(
+            state.relay_failed_turn(),
+            None,
+            "a later word without the code"
+        );
+        state.note_relay_failure("m_failed", Some(RelayErrorCode::Timeout));
+        state.forget_account();
+        assert_eq!(state.relay_failed_turn(), None, "signed out");
+
+        // Read back: the journal's RUN_ERROR carries the code, and a reply recovered from it
+        // brings it.
+        let events = vec![
+            json!({"type": "RUN_STARTED", "runId": "run_1", "threadId": "cw_1"}),
+            json!({"type": "CUSTOM", "name": "opengrok.inferenceSource",
+                "value": {"kind": "local_proxy", "via": "mac", "model": "grok-4"}}),
+            json!({"type": "RUN_ERROR", "message": "Your Mac didn't answer in time.",
+                "code": "relay_timeout"}),
+        ];
+        assert_eq!(
+            super::relay_failure_of(&events),
+            Some(RelayErrorCode::Timeout)
+        );
+        assert_eq!(
+            super::relay_failure_of(&[json!({"type": "RUN_ERROR", "message": "refused"})]),
+            None
+        );
+        let run: ThreadRun = serde_json::from_value(json!({
+            "runId": "run_1", "status": "failed", "startedAtMs": 1_000,
+            "failure": "Your Mac didn't answer in time.", "events": events
+        }))
+        .expect("a run");
+        let recovered = super::missing_replies(&[message("m_ask", true, "summarise it")], &[run]);
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].relay_failure, Some(RelayErrorCode::Timeout));
+        assert!(recovered[0].content.starts_with(RUN_ERROR_PREFIX));
+    }
+
+    /// A held message the server holds for the person's Mac says so, by its row's word as it
+    /// stands: a snapshot that no longer holds it for the Mac takes the line away, and a message
+    /// held here is not held for the Mac until the server says so.
+    #[test]
+    fn a_held_message_says_it_waits_for_the_mac_while_the_server_holds_it_so() {
+        use crate::opengrok::PendingUserMessage;
+        let row = |held_for: Option<&str>| -> PendingUserMessage {
+            let mut row = json!({
+                "id": "pum_1", "threadId": "cw_1", "content": "later",
+                "clientMessageId": "m_1", "status": "pending",
+                "inferenceSource": {"kind": "local_proxy", "via": "mac"}
+            });
+            if let Some(held_for) = held_for {
+                row["heldFor"] = json!(held_for);
+            }
+            serde_json::from_value(row).expect("a row")
+        };
+        let mut state = signed_in_state();
+        state.conversations.push(Conversation {
+            id: "cw_1".into(),
+            title: "Ada".into(),
+            created_at: String::new(),
+            updated_at: String::new(),
+            messages: vec![message("m_1", true, "later")],
+            unread_count: 0,
+            origin: None,
+        });
+        state.active_conversation_id = Some("cw_1".into());
+        let hold = state.hold_for_send("m_2".into(), "and this".into(), None, None, None);
+        assert!(!hold.waits_for_mac);
+        state.fold_pending_snapshot("cw_1", &[row(Some("relay_offline"))]);
+        assert!(state.is_send_waiting_for_mac("m_1"));
+        assert_eq!(state.sends_waiting_for_mac(), ["m_1"]);
+        assert_eq!(
+            state.queued_sends["cw_1"][0].inference_source,
+            Some(TurnSource::plan(Some(crate::opengrok::Via::Mac)))
+        );
+        state.fold_pending_snapshot("cw_1", &[row(None)]);
+        assert!(!state.is_send_waiting_for_mac("m_1"));
+        assert!(state.is_send_queued("m_1"));
     }
 
     /// A server from before reply sources answers the read with a bare 404: the page says it

@@ -263,7 +263,13 @@
 //! badge of each reply in the open thread that wears one, as the feed draws it (label `paid key`
 //! / `your plan` / `your plan · Mac`, value = the door, state `via-mac` on one the person's Mac
 //! answered), holding `reply-source-model-{messageId}` (label = the model
-//! the server named, which the badge shows on hover) when it named one. In the bot's settings,
+//! the server named, which the badge shows on hover) when it named one. A reply whose run
+//! ended because the person's Mac could not answer (a relay `RUN_ERROR` code) keeps its line, and
+//! while it is the open thread's last turn the page holds `run-error-send-on-server` (`Send this
+//! reply on Server instead`): a click sends the same turn again on the server's paid keys, this
+//! once, as `retry-turn` does for a turn that never left. Under `composer-queued`, a
+//! `queued-waiting-{messageId}` (`Waiting for your Mac`) for each held message the server holds
+//! for the person's Mac (`heldFor: "relay_offline"`). In the bot's settings,
 //! while the account's door or the chip is on the person's plan, `agent-model-plan` (under the
 //! Model field: the plan's model answers, not the pin) and `agent-usage-plan` (the Usage card
 //! does not count those replies).
