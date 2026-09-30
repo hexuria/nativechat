@@ -4537,8 +4537,9 @@ impl NativeChatHost {
     /// valued by how many models it offers and visible while shown, and holds while shown a
     /// `model-row-{source}-{id}` per model (valued by its door's word, `selected` on the one that
     /// answers, `fast` where it has a fast version), `model-plan` where a server without per-Bot
-    /// doors has the account's plan model answer, `model-routines` where the Bot's routines will
-    /// fail on its pin, and `model-note`, the server's word on why the list is not fuller.
+    /// doors has the account's plan model answer, `model-routines` where the Bot's own door is the
+    /// person's plan and its routines won't run, and `model-note`, the server's word on why the
+    /// list is not fuller.
     /// `model-error`, while open: the server's words for the last change it refused. The card's
     /// are the same with `agent-` before them.
     fn model_picker_node(&self, place: PickerPlace) -> Option<UiNode> {
@@ -12650,13 +12651,13 @@ mod tests {
             .iter()
             .map(|row| (row.id.as_str(), row.name.as_str(), row.states.as_slice()))
             .collect();
-        // Under the rows, the line saying this Bot's routines will fail: they run on the
-        // gateway, which lists no GPT-6 Luna.
+        // Under the rows, the line saying this Bot's routines won't run: its own door is the
+        // person's plan, and routines run on the server's keys.
         let routines = host
             .model_pick
             .as_ref()
             .and_then(|pick| pick.routines.clone())
-            .expect("a Bot on its own plan, on a model the gateway lacks");
+            .expect("a Bot on its own plan");
         assert_eq!(
             rows,
             [
@@ -12841,14 +12842,14 @@ mod tests {
         assert!(host.click("model-plan").is_err(), "a line, not a row");
     }
 
-    /// A Bot on its own plan pinned to a model the gateway does not list: while the list shows,
-    /// `model-routines` under its rows says the Bot's routines will fail, as the window does, and
-    /// the card's list says it under `agent-`. It is a line, not a control; and there is none for
-    /// a Bot whose routines have their model, or one that follows the account.
+    /// A Bot on its own plan (opengrok-server #304): while the list shows, `model-routines` under
+    /// its rows says the Bot's routines won't run, as the window does, and the card's list says
+    /// it under `agent-`. It is a line, not a control. It is there whatever the Bot is pinned
+    /// to, a model the gateway lists included, and there is none for a Bot that follows the
+    /// account or is on the gateway.
     #[test]
-    fn the_list_says_where_a_bots_routines_will_fail() {
-        let said = "Routines run on the server's keys, which don't have GPT-6 Luna, so this Bot's \
-                    routines will fail. Pick a Server model for a Bot that runs routines.";
+    fn the_list_says_a_bot_on_its_own_plan_runs_no_routines() {
+        let said = crate::opengrok::ROUTINES_ON_PLAN;
         let mut host = host();
         host.model_pick = Some(a_pick(
             Some(serde_json::json!("local_proxy")),
@@ -12900,14 +12901,27 @@ mod tests {
         );
         assert!(host.click("agent-model-routines").is_err());
 
+        // A pin the gateway lists: refused all the same.
+        host.model_pick = Some(a_pick(
+            Some(serde_json::json!("local_proxy")),
+            "xai/grok-4.7",
+            "medium",
+        ));
+        assert_eq!(
+            host.snapshot()
+                .find("agent-model-routines")
+                .map(|node| node.name.as_str()),
+            Some(said)
+        );
         for (source, pin) in [
-            (serde_json::json!("local_proxy"), "xai/grok-4.7"),
             (serde_json::Value::Null, "gpt-6-luna"),
+            (serde_json::json!("gateway"), "xai/grok-4.7"),
+            (serde_json::json!("gateway"), "gpt-6-luna"),
         ] {
-            host.model_pick = Some(a_pick(Some(source), pin, "medium"));
+            host.model_pick = Some(a_pick(Some(source.clone()), pin, "medium"));
             assert!(
                 host.snapshot().find("agent-model-routines").is_none(),
-                "{pin}"
+                "{source} on {pin}"
             );
         }
     }
