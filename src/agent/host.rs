@@ -357,6 +357,10 @@ pub mod ids {
     pub const REPLY_SOURCE_UNAVAILABLE: &str = reply_source::UNAVAILABLE;
     /// The composer's chip: which door the next turns go through.
     pub const COMPOSER_REPLY_SOURCE: &str = reply_source::COMPOSER_CHIP;
+    /// Under a Bot's Model field, while replies go through the person's own plan.
+    pub const AGENT_MODEL_PLAN: &str = reply_source::BOT_MODEL_PLAN;
+    /// In a Bot's Usage card, at the same times.
+    pub const AGENT_USAGE_PLAN: &str = reply_source::BOT_USAGE_PLAN;
 
     /// One of the radio's two choices, by the door's wire word.
     pub fn reply_source_kind(kind: crate::opengrok::InferenceKind) -> String {
@@ -2478,6 +2482,9 @@ pub struct NativeChatHost {
     /// more — which is the sentence the person read under the field while the gateway was down.
     model_count: usize,
     model_note: Option<String>,
+    /// Replies go through the person's own plan, whose model answers rather than the Bot's pin:
+    /// the line under the Model field says so (`AppState::replies_on_plan`).
+    replies_on_plan: bool,
     /// The Recipes page, when it fills the main slot: its rows, and the recipe open in it.
     recipes_open: bool,
     recipes_filter: &'static str,
@@ -2736,6 +2743,7 @@ impl NativeChatHost {
                 .filter(|entry| entry.source() == Some(crate::opengrok::InferenceKind::Gateway))
                 .count(),
             model_note: state.model_catalogue.note.clone(),
+            replies_on_plan: state.replies_on_plan(),
             computer_status: if state.computer_endpoint_missing {
                 "endpoint missing".to_string()
             } else {
@@ -3510,6 +3518,19 @@ impl NativeChatHost {
             // the person read it. In the tree only while there is one, so its absence is the
             // assertion that the gateway answered.
             settings = settings.with_child(UiNode::status("agent-model-note", note.clone()));
+        }
+        // While replies go through the person's own plan: under the Model field, whose pin does
+        // not answer then, and in the Usage card, which does not count them.
+        if self.replies_on_plan {
+            settings = settings
+                .with_child(UiNode::status(
+                    ids::AGENT_MODEL_PLAN,
+                    reply_source::PLAN_MODEL_NOTE,
+                ))
+                .with_child(UiNode::status(
+                    ids::AGENT_USAGE_PLAN,
+                    reply_source::PLAN_USAGE_NOTE,
+                ));
         }
         // The pane's red line over Save, where a refused Save says why in the server's words.
         if let Some(error) = &self.auth_error {
@@ -7918,6 +7939,72 @@ mod tests {
 
         host.model_note = None;
         assert!(host.snapshot().find("agent-model-note").is_none());
+    }
+
+    /// While replies go through the person's own plan the Model field says the plan's model
+    /// answers, not the pin in the field, and the Usage card says it does not count them (the
+    /// server meters no turn on the person's plan): from the account's door, or from the
+    /// composer's chip clicked to My plan. Neither line on the server's keys.
+    #[test]
+    fn the_model_field_says_when_the_plans_model_answers() {
+        use crate::opengrok::{InferenceKind, InferenceSource};
+        use crate::state::ReplySourceRead;
+        let plan_line = |state: &AppState| {
+            let tree = NativeChatHost::from_app(state).snapshot();
+            let model = tree
+                .find(ids::AGENT_MODEL_PLAN)
+                .map(|node| node.name.clone());
+            let usage = tree
+                .find(ids::AGENT_USAGE_PLAN)
+                .map(|node| node.name.clone());
+            assert_eq!(
+                usage.is_some(),
+                model.is_some(),
+                "the Usage card says so exactly when the Model field does"
+            );
+            if let Some(usage) = usage {
+                assert_eq!(usage, reply_source::PLAN_USAGE_NOTE);
+            }
+            model
+        };
+        let mut state = AppState::new();
+        state.auth_status = crate::state::AuthStatus::SignedIn;
+        state.account = Some(
+            serde_json::from_value(serde_json::json!({ "id": "acct_1", "email": "a@b.c" }))
+                .unwrap(),
+        );
+        state.coworkers = vec![
+            serde_json::from_value(serde_json::json!({ "id": "cw_1", "name": "Ada" })).unwrap(),
+        ];
+        state.active_coworker_id = Some("cw_1".into());
+        assert_eq!(plan_line(&state), None, "nothing read");
+        let read = |kind, local_model: Option<&str>| {
+            Some(ReplySourceRead::Read(InferenceSource {
+                kind,
+                base_url: Some("http://127.0.0.1:8080".into()),
+                local_model: local_model.map(str::to_string),
+                healthy: true,
+                has_api_key: false,
+            }))
+        };
+        state.reply_source.kept = read(InferenceKind::Gateway, Some("gpt-5-codex"));
+        assert_eq!(
+            plan_line(&state),
+            None,
+            "the server's keys: the pin answers"
+        );
+        state.reply_source.kept = read(InferenceKind::LocalProxy, Some("gpt-5-codex"));
+        assert_eq!(
+            plan_line(&state).as_deref(),
+            Some(reply_source::PLAN_MODEL_NOTE)
+        );
+        // The account on the server's keys, the chip clicked to My plan.
+        state.reply_source.kept = read(InferenceKind::Gateway, Some("gpt-5-codex"));
+        assert!(state.flip_turn_source());
+        assert_eq!(
+            plan_line(&state).as_deref(),
+            Some(reply_source::PLAN_MODEL_NOTE)
+        );
     }
 
     /// The signed-out banner appears, carries its own way out, and leaves when there is a

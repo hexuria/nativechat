@@ -16,7 +16,7 @@ use crate::opengrok::{
     ConnectedComputer, Coworker, CoworkerComputer, CoworkerPatch, EFFORT_INHERIT, Failure,
     FormResolution, FormSpec, ImageVisibility, InferenceKind, InferenceSource,
     InferenceSourceUpdate, LocalExecMode, LocalExecPolicy, LocalExecResolution, ModelCatalogue,
-    NewSchedule, NewSkill, OpenGrokClient, OpenGrokError, PendingCustom, PendingOp,
+    ModelEntry, NewSchedule, NewSkill, OpenGrokClient, OpenGrokError, PendingCustom, PendingOp,
     PendingUserMessage, PendingWrite, ProfileUpdate, ProxyKey, QueuedApproval, RecipeDetail,
     RecipeKind, RecipeParameter, RecipeRun, RecipeRunResult, RecipeShareTarget, RecipeStep,
     RecipeSummary, ReplyQuote, ReplySource, RunCause, RunRecipeResponse, RunReplay,
@@ -499,6 +499,8 @@ struct ActivationReads {
     connections: bool,
     /// The account's reply source.
     reply_source: bool,
+    /// `/models`, for Settings → Reply source's picker.
+    models: bool,
 }
 
 /// What follows a Save's answer.
@@ -2503,13 +2505,36 @@ fn apply_reload(
 /// the server's note so the field can say why it may be stale.
 ///
 /// An empty catalogue with no note is a real answer — this key routes to nothing — and is taken.
+///
+/// Each door's list is kept by the same rule, apart, because `/models` answers for two machines
+/// at once: the gateway's routes, which a Bot's Model field offers, and the person's own plan's,
+/// listed by opencodex, which Settings → Reply source offers. Either can be down while the other
+/// answers, and a list that came back with only the other's entries must not empty this one's.
+/// The gateway's reason is the note; opencodex's is `localProxy.healthy: false`. A plan list that
+/// comes back empty while opencodex answers, or with no proxy address kept (no `localProxy` at
+/// all), is a real answer, and is taken.
 fn apply_catalogue(held: &mut ModelCatalogue, fresh: ModelCatalogue) -> Option<String> {
     let note = fresh.note.clone();
-    if fresh.models.is_empty() && !held.models.is_empty() && note.is_some() {
-        held.note = note.clone();
-        return note;
-    }
-    *held = fresh;
+    let (fresh_plan, fresh_gateway): (Vec<ModelEntry>, Vec<ModelEntry>) = fresh
+        .models
+        .into_iter()
+        .partition(ModelEntry::is_local_proxy);
+    let (held_plan, held_gateway): (Vec<ModelEntry>, Vec<ModelEntry>) =
+        held.models.drain(..).partition(ModelEntry::is_local_proxy);
+    let gateway = if fresh_gateway.is_empty() && note.is_some() {
+        held_gateway
+    } else {
+        fresh_gateway
+    };
+    let proxy_down = fresh.local_proxy.is_some_and(|proxy| !proxy.healthy);
+    let plan = if fresh_plan.is_empty() && proxy_down {
+        held_plan
+    } else {
+        fresh_plan
+    };
+    held.models = gateway.into_iter().chain(plan).collect();
+    held.note = note.clone();
+    held.local_proxy = fresh.local_proxy;
     note
 }
 
@@ -4405,7 +4430,10 @@ pub struct AppState {
     /// a relaunch starts from.
     turn_source_pick: Option<InferenceKind>,
     /// The composer is dictating: its chip is not drawn meanwhile, and a turn names no door.
-    composer_dictating: bool,
+    pub(crate) composer_dictating: bool,
+    /// Numbers the reads of `/models`, so only the newest answer lands
+    /// ([`Self::begin_models_read`]).
+    models_generation: u64,
     /// Everything the open Bot could be offered and which of it it may be, as its Tools card's
     /// switches show it (opengrok-server#268): the Bot's id and the answer, like
     /// [`Self::coworker_tools`]. Drawn through [`Self::ceiling_card`].
@@ -4984,6 +5012,7 @@ impl AppState {
             reply_source_generation: 0,
             turn_source_pick: None,
             composer_dictating: false,
+            models_generation: 0,
             coworker_ceiling: None,
             ceiling_generation: 0,
             ceiling_reading: None,
@@ -6053,6 +6082,13 @@ impl AppState {
         self.reply_source_generation += 1;
         self.turn_source_pick = None;
         self.composer_dictating = false;
+        // And any list of models still being asked for was asked as them, and the plan's models
+        // listed were their plan's: the gateway's routes are the deployment's and stay.
+        self.models_generation += 1;
+        self.model_catalogue
+            .models
+            .retain(|entry| !entry.is_local_proxy());
+        self.model_catalogue.local_proxy = None;
         self.host_egress_tunnel_available = false;
         self.egress_tunnel_enabled = true;
         self.coworker_computer = None;
@@ -6117,31 +6153,47 @@ impl AppState {
     }
 
     pub fn refresh_models(&mut self, cx: &mut Context<Self>) {
-        let Some(client) = self.opengrok.clone() else {
+        let Some((client, generation)) = self.begin_models_read() else {
             return;
         };
         cx.spawn(async move |this, cx| {
             let result = client.list_models().await;
             let _ = this.update(cx, |state, cx| {
-                state.settle_models(result, cx);
+                state.settle_models(generation, result, cx);
                 cx.notify();
             });
         })
         .detach();
     }
 
+    /// Number a read of `/models`, the reconnect loop's probe among them. Every read begun
+    /// before it is overtaken, and its answer is dropped when it comes: several are asked in a
+    /// row (sign-in, Settings → Reply source, a Save's answer, a Bot's settings) and they need
+    /// not answer in that order, and an older list landing last would put back models the
+    /// newer one no longer offers.
+    fn begin_models_read(&mut self) -> Option<(OpenGrokClient, u64)> {
+        let client = self.opengrok.clone()?;
+        self.models_generation += 1;
+        Some((client, self.models_generation))
+    }
+
     /// What a `/models` answer means — for the Model field, and for whether the gateway is there.
     ///
     /// This is also the reconnect loop's probe, which is why it answers whether everything is
-    /// reachable now: one request settles both questions, and its success *is* the refill.
+    /// reachable now: one request settles both questions, and its success *is* the refill. An
+    /// answer to a read that something newer has overtaken, or that lands after a sign-out,
+    /// touches nothing and counts as no answer: the newer read settles both questions itself.
     fn settle_models(
         &mut self,
+        generation: u64,
         result: Result<ModelCatalogue, OpenGrokError>,
         cx: &mut Context<Self>,
     ) -> bool {
-        match result {
-            Ok(catalogue) => {
-                let note = apply_catalogue(&mut self.model_catalogue, catalogue);
+        let Some(taken) = self.take_models(generation, result) else {
+            return false;
+        };
+        match taken {
+            Ok(note) => {
                 match note.filter(|note| reads_as_gateway_unreachable(note)) {
                     Some(note) => {
                         self.note_unreachable(Unreachable::Gateway, &note, cx);
@@ -6159,6 +6211,20 @@ impl AppState {
                 error.unreachable().is_none()
             }
         }
+    }
+
+    /// The list a `/models` answer brings, taken while its read is still the newest: the
+    /// server's note when it came, or the failure. `None` for an answer that something newer has
+    /// overtaken, which touches nothing.
+    fn take_models(
+        &mut self,
+        generation: u64,
+        result: Result<ModelCatalogue, OpenGrokError>,
+    ) -> Option<Result<Option<String>, OpenGrokError>> {
+        if generation != self.models_generation {
+            return None;
+        }
+        Some(result.map(|catalogue| apply_catalogue(&mut self.model_catalogue, catalogue)))
     }
 
     /// Every failure the app hears about is sorted here, once, so that no call site has to guess.
@@ -6278,12 +6344,18 @@ impl AppState {
                     return;
                 };
                 cx.background_executor().timer(wait).await;
+                let Ok(generation) = this.update(cx, |state, _| {
+                    state.models_generation += 1;
+                    state.models_generation
+                }) else {
+                    return;
+                };
                 let result = client.list_models().await;
                 let Ok(reachable) = this.update(cx, |state, cx| {
                     if state.reconnect_epoch != epoch {
                         return true;
                     }
-                    let reachable = state.settle_models(result, cx);
+                    let reachable = state.settle_models(generation, result, cx);
                     cx.notify();
                     reachable
                 }) else {
@@ -7314,6 +7386,15 @@ impl AppState {
         self.turn_source_chip().filter(|_| !self.composer_dictating)
     }
 
+    /// Replies go through the person's own plan: the account's door is it, or the composer's
+    /// chip is on it. A Bot's own model is not what answers then, the plan's model picked in
+    /// Settings → Reply source is, and the Bot's Model field says so.
+    pub fn replies_on_plan(&self) -> bool {
+        let plan = Some(InferenceKind::LocalProxy);
+        self.reply_source.kept_source().map(|kept| kept.kind) == plan
+            || self.turn_source_chip().map(|chip| chip.kind) == plan
+    }
+
     /// The door a turn sent now names in `forwardedProps.inferenceSource`: the one the chip
     /// shows, the account's own included. The chip starts at the account's door as last read,
     /// and that may have moved on another Mac since; naming it anyway is what makes the turn go
@@ -7349,7 +7430,7 @@ impl AppState {
         }
     }
 
-    fn flip_turn_source(&mut self) -> bool {
+    pub(crate) fn flip_turn_source(&mut self) -> bool {
         let Some(chip) = self.composer_turn_source() else {
             return false;
         };
@@ -7767,6 +7848,9 @@ impl AppState {
         if reads.reply_source {
             self.read_reply_source(cx);
         }
+        if reads.models {
+            self.refresh_models(cx);
+        }
     }
 
     /// What coming back to the window asks the server for again.
@@ -7779,7 +7863,16 @@ impl AppState {
             // is also Settings → Reply source's health line, which changes outside the app: the
             // person starts opencodex in a terminal and comes back to see it running.
             reply_source: self.is_signed_in(),
+            // And while that page is on screen, the plan's models with it, as arriving on the
+            // page reads them: opencodex that has just been started lists them for the first
+            // time, and the picker should not wait for the page to be left and come back to.
+            models: self.is_signed_in() && self.reply_source_on_screen(),
         }
+    }
+
+    /// Settings is open on Reply source.
+    fn reply_source_on_screen(&self) -> bool {
+        self.is_app_settings_open && self.app_settings_tab == AppSettingsTab::ReplySource
     }
 
     /// Settings → Reply source has come on screen: read the setting, for the health line and in
@@ -26892,7 +26985,148 @@ mod tests {
                 })
                 .collect(),
             note: note.map(str::to_string),
+            local_proxy: None,
         }
+    }
+
+    /// A `/models` answer with both doors in it: the gateway's routes, the plan's models, the
+    /// gateway's note and opencodex's health, as the server lists them.
+    fn both_doors(
+        gateway: &[&str],
+        plan: &[&str],
+        note: Option<&str>,
+        proxy_healthy: Option<bool>,
+    ) -> ModelCatalogue {
+        let entry = |id: &&str, source: &str| ModelEntry {
+            id: (*id).to_string(),
+            source: Some(source.to_string()),
+        };
+        ModelCatalogue {
+            models: gateway
+                .iter()
+                .map(|id| entry(id, "gateway"))
+                .chain(plan.iter().map(|id| entry(id, "local_proxy")))
+                .collect(),
+            note: note.map(str::to_string),
+            local_proxy: proxy_healthy.map(|healthy| crate::opengrok::LocalProxyStatus { healthy }),
+        }
+    }
+
+    fn model_ids(catalogue: &ModelCatalogue) -> Vec<&str> {
+        catalogue.models.iter().map(|m| m.id.as_str()).collect()
+    }
+
+    /// `/models` answers for two machines at once, and each door's list is kept apart: the
+    /// gateway going leaves its routes in the Bot's Model field while the plan's models come
+    /// back fresh, and opencodex going leaves the plan's models in the picker while the
+    /// gateway's come back fresh. An empty plan list is taken when opencodex answered, or when
+    /// no proxy address is kept at all, since nothing is missing then.
+    #[test]
+    fn one_door_down_does_not_empty_the_other_doors_list() {
+        let gateway_down = "the gateway could not be reached: error sending request";
+        let mut held = ModelCatalogue::default();
+        apply_catalogue(
+            &mut held,
+            both_doors(
+                &["oag/cheap", "oag/fast"],
+                &["gpt-5-codex"],
+                None,
+                Some(true),
+            ),
+        );
+        assert_eq!(model_ids(&held), ["oag/cheap", "oag/fast", "gpt-5-codex"]);
+
+        // The gateway goes; opencodex still lists the plan's models, and a new one.
+        let note = apply_catalogue(
+            &mut held,
+            both_doors(
+                &[],
+                &["gpt-5-codex", "grok-4"],
+                Some(gateway_down),
+                Some(true),
+            ),
+        );
+        assert!(reads_as_gateway_unreachable(note.as_deref().unwrap()));
+        assert_eq!(
+            model_ids(&held),
+            ["oag/cheap", "oag/fast", "gpt-5-codex", "grok-4"],
+            "the Bot's Model field keeps its routes"
+        );
+        assert_eq!(held.note.as_deref(), Some(gateway_down));
+
+        // opencodex goes; the gateway is back with a new route.
+        let note = apply_catalogue(
+            &mut held,
+            both_doors(&["oag/cheap", "oag/new"], &[], None, Some(false)),
+        );
+        assert_eq!(note, None);
+        assert_eq!(
+            model_ids(&held),
+            ["oag/cheap", "oag/new", "gpt-5-codex", "grok-4"],
+            "the picker keeps the plan's models while opencodex is down"
+        );
+        assert_eq!(
+            held.local_proxy,
+            Some(crate::opengrok::LocalProxyStatus { healthy: false }),
+            "and says it is down"
+        );
+
+        // opencodex answers and serves nothing a plan may use: that is the answer.
+        apply_catalogue(&mut held, both_doors(&["oag/cheap"], &[], None, Some(true)));
+        assert_eq!(model_ids(&held), ["oag/cheap"]);
+
+        // No proxy address kept: no plan models, and nothing is missing.
+        apply_catalogue(
+            &mut held,
+            both_doors(&["oag/cheap"], &["gpt-5-codex"], None, Some(true)),
+        );
+        apply_catalogue(&mut held, both_doors(&["oag/cheap"], &[], None, None));
+        assert_eq!(model_ids(&held), ["oag/cheap"]);
+        assert_eq!(held.local_proxy, None);
+    }
+
+    /// Only the newest read of `/models` lands. Several are asked in a row and need not answer
+    /// in order: an older one landing last is dropped, and so is one that lands after a
+    /// sign-out, which also forgets the plan's models and keeps the gateway's.
+    #[test]
+    fn only_the_newest_models_read_lands() {
+        let mut state = AppState::new();
+        state.opengrok = Some(OpenGrokClient::new("http://127.0.0.1:9").expect("a URL"));
+        let (_, older) = state.begin_models_read().expect("a read");
+        let (_, newer) = state.begin_models_read().expect("a read");
+        assert!(newer > older);
+        let fresh = both_doors(&["oag/new"], &["gpt-5-codex"], None, Some(true));
+        let stale = both_doors(&["oag/old"], &[], None, Some(true));
+        assert!(
+            state.take_models(newer, Ok(fresh)).is_some(),
+            "the newer one lands"
+        );
+        assert!(
+            state.take_models(older, Ok(stale)).is_none(),
+            "the older one, landing last, is dropped"
+        );
+        assert_eq!(
+            model_ids(&state.model_catalogue),
+            ["oag/new", "gpt-5-codex"]
+        );
+
+        let (_, before_sign_out) = state.begin_models_read().expect("a read");
+        state.forget_account();
+        assert!(
+            state
+                .take_models(
+                    before_sign_out,
+                    Ok(both_doors(&["oag/x"], &["m"], None, None))
+                )
+                .is_none(),
+            "an answer asked as someone who has signed out"
+        );
+        assert_eq!(
+            model_ids(&state.model_catalogue),
+            ["oag/new"],
+            "the plan's models were the account's; the gateway's routes are the deployment's"
+        );
+        assert_eq!(state.model_catalogue.local_proxy, None);
     }
 
     /// The whole of the reported bug, on the data: the gateway goes, the Model field keeps what
@@ -31221,6 +31455,20 @@ mod tests {
             },
             "with Settings shut, and with no Reply source on screen"
         );
+        // Settings → Reply source on screen: the plan's models with it, since opencodex may have
+        // just been started in a terminal and listed them for the first time.
+        state.is_app_settings_open = true;
+        state.app_settings_tab = AppSettingsTab::ReplySource;
+        assert_eq!(
+            state.reads_on_activation(Instant::now()),
+            ActivationReads {
+                reply_source: true,
+                models: true,
+                ..ActivationReads::default()
+            }
+        );
+        state.app_settings_tab = AppSettingsTab::Logins;
+        assert!(!state.reads_on_activation(Instant::now()).models);
     }
 
     /// A message sent while a turn runs is held with the door the chip showed when it was sent,
@@ -31598,6 +31846,7 @@ mod tests {
                 entry("oag/fast", Some("gateway")),
             ],
             note: None,
+            local_proxy: None,
         };
         assert_eq!(state.subscription_models(), vec!["gpt-5-codex", "grok-4"]);
     }

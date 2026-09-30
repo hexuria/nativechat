@@ -45,6 +45,10 @@ pub(crate) const ERROR: &str = "settings-reply-source-error";
 pub(crate) const UNAVAILABLE: &str = "settings-reply-source-unavailable";
 /// The composer's chip.
 pub(crate) const COMPOSER_CHIP: &str = "composer-reply-source";
+/// Under a Bot's Model field, while replies go through the person's own plan.
+pub(crate) const BOT_MODEL_PLAN: &str = "agent-model-plan";
+/// In a Bot's Usage card, while replies go through the person's own plan.
+pub(crate) const BOT_USAGE_PLAN: &str = "agent-usage-plan";
 
 /// One of the radio's two choices.
 pub(crate) fn kind_id(kind: InferenceKind) -> String {
@@ -77,6 +81,13 @@ pub(crate) const PICK_MODEL: &str = "Pick a model";
 pub(crate) const NO_MODELS: &str = "The server lists no models from your plan yet.";
 pub(crate) const KEY_PLACEHOLDER: &str = "Proxy key, if opencodex asks for one";
 pub(crate) const KEY_SET: &str = "The server holds a key. Type one to replace it.";
+/// Under a Bot's Model field while the account or the composer's chip is on the person's plan:
+/// the server asks the plan's model then, never the Bot's gateway pin.
+pub(crate) const PLAN_MODEL_NOTE: &str =
+    "On your own subscription, replies use the model chosen in Settings → Reply source.";
+/// In a Bot's Usage card at the same times: a turn on the person's own plan is not metered and
+/// carries no gateway key, so the server's usage report never counts it.
+pub(crate) const PLAN_USAGE_NOTE: &str = "Replies on your own subscription aren't counted here.";
 
 /// A choice of the radio, as it reads.
 pub(crate) fn kind_label(kind: InferenceKind) -> &'static str {

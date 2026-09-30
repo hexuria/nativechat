@@ -495,6 +495,7 @@ impl Render for AgentSettings {
             )
         };
         let effort = self.state.read(cx).effort_control();
+        let on_plan = self.state.read(cx).replies_on_plan();
         let model_focus = self.model_input.read(cx).focus_handle(cx);
         // The list is what the filter leaves of the catalogue, and the row Enter takes is
         // counted over that rather than over the catalogue behind it.
@@ -846,6 +847,22 @@ impl Render for AgentSettings {
                                                 .child(note),
                                         )
                                     })
+                                    // The pin above is the gateway's. On the person's own plan
+                                    // the server asks the plan's model instead, so the field
+                                    // says whose model answers rather than let the pin look
+                                    // like it does.
+                                    .when(on_plan, |this| {
+                                        this.child(
+                                            div()
+                                                .id(crate::components::reply_source::BOT_MODEL_PLAN)
+                                                .pt(px(4.))
+                                                .text_xs()
+                                                .text_color(muted)
+                                                .child(
+                                                    crate::components::reply_source::PLAN_MODEL_NOTE,
+                                                ),
+                                        )
+                                    })
                                     .when_some(effort, |this, effort| {
                                         this.child(effort_card(
                                             app.clone(),
@@ -910,6 +927,19 @@ impl Render for AgentSettings {
                                                         },
                                                     ),
                                             )
+                                            // A turn on the person's own plan is not metered and
+                                            // carries no gateway key, so the report above never
+                                            // counts it; while replies go that way, the card says so.
+                                            .when(on_plan, |this| {
+                                                this.child(
+                                                    div()
+                                                        .id(crate::components::reply_source::BOT_USAGE_PLAN)
+                                                        .pt(px(6.))
+                                                        .text_xs()
+                                                        .text_color(muted)
+                                                        .child(crate::components::reply_source::PLAN_USAGE_NOTE),
+                                                )
+                                            })
                                             // Under the header row, as the Tools card's list is, so
                                             // the Hide button stays beside the card's own line.
                                             .when(!usage_rows.is_empty(), |this| {
