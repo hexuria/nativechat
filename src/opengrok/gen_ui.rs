@@ -6,6 +6,7 @@
 //! rendered as markdown, and does not stall the prose around it.
 
 use std::collections::HashSet;
+use std::time::Instant;
 
 use serde_json::Value;
 
@@ -58,6 +59,17 @@ pub struct StepSpec {
     pub result: Option<String>,
     /// `TOOL_CALL_RESULT.ok`. `None` until it arrives.
     pub ok: Option<bool>,
+    /// How long the call's answer took, in milliseconds: from its `TOOL_CALL_END` to its
+    /// `TOOL_CALL_RESULT`, as this app received the two (see [`TurnAssembler::push_event_at`]).
+    ///
+    /// Measured here because the wire has no time for a call: the harness's `run-timing` frame
+    /// lists its tools by name and not by call (opengrok-harness `timing.rs` `ToolPhase`), and
+    /// every frame of a run carries the run's opening `timestamp` (`projection.rs` `event`).
+    /// `None` wherever this app did not watch both arrive, or cannot say whose time it was: a
+    /// replay, a call already under way when the app began following its run, a call answered
+    /// together with another (the harness sends a round's results only once all of them have
+    /// run), and a call that waited on a person. None of those is guessed at.
+    pub took_ms: Option<u64>,
 }
 
 /// How much of a step's arguments and of its result, and of a thought, is kept: a step row is
@@ -114,15 +126,27 @@ impl StepSpec {
         super::activity::describe_arguments(&self.tool, &self.arguments)
     }
 
+    /// How long the call took, as the end of its row says it: `1s`, `350ms`. `None` when this
+    /// app did not time it (see [`Self::took_ms`]).
+    pub fn took(&self) -> Option<String> {
+        self.took_ms.map(super::timing::format_ms)
+    }
+
     /// The step as its database row keeps it (`chat_message_parts.text` of a `step` row), for
-    /// [`Self::from_value`] to read back unchanged. The call id has a column of its own.
+    /// [`Self::from_value`] to read back unchanged. The call id has a column of its own. A time
+    /// this app measured is kept with it, since nothing can measure it again once the turn is
+    /// over; a row written before there were any reads back with none.
     pub fn to_value(&self) -> Value {
-        serde_json::json!({
+        let mut value = serde_json::json!({
             "tool": self.tool,
             "arguments": self.arguments,
             "result": self.result,
             "ok": self.ok,
-        })
+        });
+        if let (Some(took_ms), Some(object)) = (self.took_ms, value.as_object_mut()) {
+            object.insert("took_ms".into(), took_ms.into());
+        }
+        value
     }
 
     /// A row read back is held to the same rules as a step kept as it happened, which changes
@@ -146,6 +170,7 @@ impl StepSpec {
                 .and_then(Value::as_str)
                 .map(str::to_string),
             ok: value.get("ok").and_then(Value::as_bool),
+            took_ms: value.get("took_ms").and_then(Value::as_u64),
         })
     }
 }
@@ -186,6 +211,71 @@ fn step_mut<'a>(parts: &'a mut [ChatPart], call_id: &str) -> Option<&'a mut Step
         ChatPart::Step(step) if step.call_id == call_id => Some(step),
         _ => None,
     })
+}
+
+/// When the frames that start and stop a call's clock first reached this app, for a run it
+/// follows by asking the server for the run again and again (`AppState::follow_run`) rather
+/// than by listening to its stream. Each ask brings back every frame so far; a frame is as new
+/// as the first ask that brought it, so a call's time is good to one ask.
+///
+/// Frames the first ask brings back happened before anyone here was watching, and have no
+/// time: a call already under way then gets none (see [`StepSpec::took_ms`]).
+#[derive(Debug, Default)]
+pub struct FrameArrivals {
+    asked: bool,
+    first_seen: std::collections::HashMap<String, Option<Instant>>,
+}
+
+impl FrameArrivals {
+    /// What one ask brought back, `now` being when it came.
+    pub fn note(&mut self, events: &[Value], now: Instant) {
+        let seen = self.asked.then_some(now);
+        for key in events.iter().filter_map(clock_frame_key) {
+            self.first_seen.entry(key).or_insert(seen);
+        }
+        self.asked = true;
+    }
+
+    /// When `event` first came, for the frames a call's clock reads.
+    pub fn at(&self, event: &Value) -> Option<Instant> {
+        clock_frame_key(event).and_then(|key| self.first_seen.get(&key).copied().flatten())
+    }
+}
+
+/// The frames a call's clock reads, by kind and call: its end and its answer. The same call's
+/// answer can come twice, the gate's word and then the tool's, and the first is the one that
+/// stops the clock.
+fn clock_frame_key(event: &Value) -> Option<String> {
+    let kind = event.get("type").and_then(Value::as_str)?;
+    if !matches!(kind, "TOOL_CALL_END" | "TOOL_CALL_RESULT") {
+        return None;
+    }
+    let id = event.get("toolCallId").and_then(Value::as_str)?;
+    Some(format!("{kind}/{id}"))
+}
+
+/// A reply rebuilt from the server's frames keeps the times this app measured for its calls
+/// before it was rebuilt. The frames carry no time of their own, so a rebuild (a followed run
+/// repainting the turn, a thread coming back to a turn it left running) would otherwise take
+/// every "· 1s" off the rows it had.
+pub fn keep_call_times(before: &[ChatPart], after: &mut [ChatPart]) {
+    let times: std::collections::HashMap<&str, u64> = before
+        .iter()
+        .filter_map(|part| match part {
+            ChatPart::Step(step) => Some((step.call_id.as_str(), step.took_ms?)),
+            _ => None,
+        })
+        .collect();
+    if times.is_empty() {
+        return;
+    }
+    for part in after {
+        if let ChatPart::Step(step) = part
+            && step.took_ms.is_none()
+        {
+            step.took_ms = times.get(step.call_id.as_str()).copied();
+        }
+    }
 }
 
 /// A call waiting on a yes is drawn once, as its card. Its step comes back when its result
@@ -694,6 +784,22 @@ pub struct TurnAssembler {
     /// Thoughts still being said, in the order they began. Each becomes a part when its message
     /// ends, when a call starts while it is being said, or when the run ends.
     reasoning: Vec<OpenThought>,
+    /// Calls whose arguments are all in and whose answer has not come, by call id: the clock
+    /// each call's row reads its time from ([`StepSpec::took_ms`]).
+    clocks: std::collections::HashMap<String, CallClock>,
+}
+
+/// A call waiting for its answer.
+#[derive(Debug)]
+struct CallClock {
+    /// When its `TOOL_CALL_END` reached this app. `None` when it came before the app was
+    /// watching: in a replay, or in the part of a followed run that had already happened.
+    since: Option<Instant>,
+    /// Another call was waiting for its answer at the same time. The harness runs a round's
+    /// calls one after another and sends all their results together once the last is done
+    /// (opengrok-harness `lib.rs`, the loop over `results` after `run_all_timed`), so either
+    /// call's wait would be the whole round's, and which part of it was its own cannot be told.
+    shared: bool,
 }
 
 /// A thought still being said: its message id, and as much of it as is kept (see
@@ -781,6 +887,15 @@ pub fn persons_messages(events: &[Value]) -> Vec<(String, String)> {
 }
 
 impl TurnAssembler {
+    /// A frame as it reached this app, `at` being when it did, or `None` for a frame that came
+    /// before the app was watching. The live stream and a followed run come in this way, so each
+    /// call's row can say how long its answer took ([`StepSpec::took_ms`]). A replay comes in
+    /// through [`Self::push_event`] and times nothing.
+    pub fn push_event_at(&mut self, event: &Value, at: Option<Instant>) {
+        self.push_event(event);
+        self.time_call(event, at);
+    }
+
     pub fn push_event(&mut self, event: &Value) {
         let kind = event.get("type").and_then(Value::as_str).unwrap_or("");
         match kind {
@@ -994,6 +1109,63 @@ impl TurnAssembler {
         (plain, parts)
     }
 
+    /// Starts and stops the clocks of the calls a frame is about. A call's clock starts when its
+    /// arguments are all in, which is when the harness can run it, and stops at its answer; the
+    /// model's time writing those arguments is the model's, not the call's.
+    fn time_call(&mut self, event: &Value, at: Option<Instant>) {
+        let kind = event.get("type").and_then(Value::as_str).unwrap_or("");
+        let call_id = |key: &str| event.get(key).and_then(Value::as_str).unwrap_or("");
+        match kind {
+            "TOOL_CALL_END" => {
+                let id = call_id("toolCallId");
+                if id.is_empty() {
+                    return;
+                }
+                let shared = !self.clocks.is_empty();
+                for clock in self.clocks.values_mut() {
+                    clock.shared = true;
+                }
+                self.clocks
+                    .insert(id.to_string(), CallClock { since: at, shared });
+            }
+            "TOOL_CALL_RESULT" => {
+                let id = call_id("toolCallId");
+                let Some(clock) = self.clocks.remove(id) else {
+                    return;
+                };
+                // Strictly later: an answer that came in the same delivery as its call's end, as
+                // two frames of one poll of a followed run do, says only that it took less than
+                // a poll, and "0ms" would be a guess.
+                let took = match (clock.since, at) {
+                    (Some(since), Some(at)) if !clock.shared && at > since => at - since,
+                    _ => return,
+                };
+                if let Some(step) = step_mut(&mut self.committed, id) {
+                    step.took_ms = Some(u64::try_from(took.as_millis()).unwrap_or(u64::MAX));
+                }
+            }
+            "CUSTOM"
+                if event.get("name").and_then(Value::as_str) == Some(RUN_AWAITING_APPROVAL)
+                    || is_user_form_awaiting(event) =>
+            {
+                // The call is waiting on a person. What came back for it just before this was
+                // the gate's word ("waiting for approval: …"), not the tool's answer, and the
+                // answer that comes once the person has decided will have waited on them too.
+                let id = match call_id("callId") {
+                    "" => call_id("toolCallId"),
+                    id => id,
+                };
+                self.clocks.remove(id);
+                if let Some(step) = step_mut(&mut self.committed, id) {
+                    step.took_ms = None;
+                }
+            }
+            // A call still waiting when its run ends or parks is not coming back on this clock.
+            "RUN_FINISHED" | "RUN_ERROR" => self.clocks.clear(),
+            _ => {}
+        }
+    }
+
     /// A call that is not a chart, a form or a user-form becomes a step where it starts, so it
     /// sits between the words before it and the words after.
     fn open_step(&mut self, call_id: &str, tool: &str) {
@@ -1007,6 +1179,7 @@ impl TurnAssembler {
             arguments: String::new(),
             result: None,
             ok: None,
+            took_ms: None,
         }));
         self.step_args.insert(call_id.to_string(), String::new());
     }
@@ -4192,6 +4365,7 @@ mod tests {
             arguments: "{\"command\":\"cargo test\"}".into(),
             result: Some("exit 0\ntest result: ok".into()),
             ok: Some(true),
+            took_ms: None,
         };
         assert_eq!(
             parts,
@@ -4228,6 +4402,245 @@ mod tests {
             }
             other => panic!("expected one step still going, got {other:?}"),
         }
+    }
+
+    fn call(id: &str, tool: &str, arguments: &str) -> [Value; 3] {
+        [
+            json!({"type":"TOOL_CALL_START","toolCallId":id,"toolCallName":tool}),
+            json!({"type":"TOOL_CALL_ARGS","toolCallId":id,"delta":arguments}),
+            json!({"type":"TOOL_CALL_END","toolCallId":id}),
+        ]
+    }
+
+    fn answer(id: &str, content: &str) -> Value {
+        json!({"type":"TOOL_CALL_RESULT","toolCallId":id,"content":content,"ok":true})
+    }
+
+    /// Each call's time, by call id, as its row would say it.
+    fn times(turn: &TurnAssembler) -> Vec<(String, Option<String>)> {
+        let (_, parts) = turn.snapshot();
+        steps_in(&parts)
+            .into_iter()
+            .map(|step| (step.call_id.clone(), step.took()))
+            .collect()
+    }
+
+    /// A live turn that ran two calls, one per round, as the harness runs them: each call's row
+    /// says how long its own answer took, from its arguments being all in to its result. The
+    /// model's time writing the arguments, and the time between the rounds, are not the call's.
+    #[test]
+    fn a_live_turn_gives_each_call_its_own_time() {
+        let t0 = Instant::now();
+        let mut turn = TurnAssembler::default();
+        let mut feed = |at: u64, event: &Value| {
+            turn.push_event_at(event, Some(t0 + std::time::Duration::from_millis(at)));
+        };
+        feed(
+            0,
+            &json!({"type":"RUN_STARTED","threadId":"cw_1","runId":"r1"}),
+        );
+        let [start, args, end] = call("c1", "shell", "{\"command\":\"uname -a\"}");
+        feed(100, &start);
+        feed(900, &args);
+        feed(1000, &end);
+        feed(2000, &answer("c1", "Darwin"));
+        let [start, args, end] = call("c2", "read_file", "{\"path\":\"notes.txt\"}");
+        feed(4000, &start);
+        feed(4100, &args);
+        feed(4200, &end);
+        feed(4550, &answer("c2", "hello"));
+        feed(6000, &text("It is a Mac."));
+        feed(7000, &json!({"type":"RUN_FINISHED"}));
+        turn.finish();
+        assert_eq!(
+            times(&turn),
+            vec![
+                ("c1".to_string(), Some("1s".to_string())),
+                ("c2".to_string(), Some("350ms".to_string())),
+            ]
+        );
+        let (_, parts) = turn.snapshot();
+        let steps = steps_in(&parts);
+        assert_eq!(steps[0].took_ms, Some(1000));
+        assert_eq!(steps[0].label(), "Running `uname -a`");
+        assert_eq!(steps[1].took_ms, Some(350));
+    }
+
+    /// Two calls made in one round are run one after the other and answered together, once the
+    /// second is done: either call's wait is the whole round's, so neither row claims it. The
+    /// next round's call, alone again, has its own.
+    #[test]
+    fn calls_answered_together_have_no_time_of_their_own() {
+        let t0 = Instant::now();
+        let mut turn = TurnAssembler::default();
+        let mut feed = |at: u64, event: &Value| {
+            turn.push_event_at(event, Some(t0 + std::time::Duration::from_millis(at)));
+        };
+        for event in call("c1", "shell", "{\"command\":\"ls\"}") {
+            feed(100, &event);
+        }
+        for event in call("c2", "shell", "{\"command\":\"pwd\"}") {
+            feed(300, &event);
+        }
+        feed(3300, &answer("c1", "a.txt"));
+        feed(3301, &answer("c2", "/srv"));
+        for event in call("c3", "shell", "{\"command\":\"wc -l a.txt\"}") {
+            feed(5000, &event);
+        }
+        feed(5500, &answer("c3", "3 a.txt"));
+        assert_eq!(
+            times(&turn),
+            vec![
+                ("c1".to_string(), None),
+                ("c2".to_string(), None),
+                ("c3".to_string(), Some("500ms".to_string())),
+            ]
+        );
+    }
+
+    /// A replay is the run's frames with no time on any of them, since every frame of a run
+    /// carries the run's opening timestamp. Its rows say nothing about how long a call took,
+    /// rather than a guess.
+    #[test]
+    fn a_replay_times_no_call() {
+        let mut frames =
+            vec![json!({"type":"RUN_STARTED","threadId":"cw_1","runId":"r1","timestamp":100})];
+        frames.extend(call("c1", "shell", "{\"command\":\"uname -a\"}"));
+        frames.push(answer("c1", "Darwin"));
+        frames.extend(call("c2", "read_file", "{\"path\":\"notes.txt\"}"));
+        frames.push(answer("c2", "hello"));
+        frames.push(json!({"type":"RUN_FINISHED","timestamp":100}));
+        let replayed = assembled(&frames);
+        assert_eq!(
+            times(&replayed),
+            vec![("c1".to_string(), None), ("c2".to_string(), None)]
+        );
+        // Frames nobody saw arrive are the same as a replay's.
+        let mut unseen = TurnAssembler::default();
+        for frame in &frames {
+            unseen.push_event_at(frame, None);
+        }
+        assert_eq!(times(&unseen), times(&replayed));
+    }
+
+    /// A call held for the person's yes is answered twice: first with the gate's word, then,
+    /// once the person has decided, with the tool's. Neither is the call's own time.
+    #[test]
+    fn a_call_that_waited_on_a_person_has_no_time() {
+        let t0 = Instant::now();
+        let mut turn = TurnAssembler::default();
+        let mut feed = |at: u64, event: &Value| {
+            turn.push_event_at(event, Some(t0 + std::time::Duration::from_millis(at)));
+        };
+        for event in call("c1", "shell", "{\"command\":\"rm -rf build\"}") {
+            feed(100, &event);
+        }
+        feed(
+            140,
+            &json!({"type":"TOOL_CALL_RESULT","toolCallId":"c1","ok":false,
+                    "content":"waiting for approval: it deletes files"}),
+        );
+        feed(
+            150,
+            &json!({"type":"CUSTOM","name":"run-awaiting-approval","runId":"r1","callId":"c1",
+                    "tool":"shell","arguments":{"command":"rm -rf build"},"reason":"exec-consent"}),
+        );
+        feed(160, &json!({"type":"RUN_FINISHED"}));
+        feed(90_000, &answer("c1", "removed"));
+        assert_eq!(times(&turn), vec![("c1".to_string(), None)]);
+    }
+
+    /// A run followed by asking the server again and again: a frame is as new as the first ask
+    /// that brought it. A call that was already under way at the first ask has no time; a call
+    /// that ended in one ask and was answered in a later one has the time between them; a call
+    /// that ended and was answered in the same ask took less than an ask, and says nothing.
+    #[test]
+    fn a_followed_run_times_the_calls_it_saw_arrive() {
+        let t0 = Instant::now();
+        let mut journal = vec![json!({"type":"RUN_STARTED","threadId":"cw_1","runId":"r1"})];
+        journal.extend(call("c1", "shell", "{\"command\":\"make\"}"));
+        let asks: Vec<(u64, Vec<Value>)> = vec![
+            (0, Vec::new()),
+            (2000, {
+                let mut more = vec![answer("c1", "built")];
+                more.extend(call("c2", "shell", "{\"command\":\"make test\"}"));
+                more
+            }),
+            (5000, {
+                let mut more = vec![answer("c2", "ok")];
+                more.extend(call("c3", "shell", "{\"command\":\"ls\"}"));
+                more.push(answer("c3", "a.out"));
+                more
+            }),
+        ];
+        let mut arrivals = FrameArrivals::default();
+        for (at, more) in asks {
+            journal.extend(more);
+            arrivals.note(&journal, t0 + std::time::Duration::from_millis(at));
+        }
+        // Each ask rebuilds the reply from every frame so far, so the last rebuild is the reply.
+        let mut rebuilt = TurnAssembler::default();
+        for event in &journal {
+            rebuilt.push_event_at(event, arrivals.at(event));
+        }
+        assert_eq!(
+            times(&rebuilt),
+            vec![
+                ("c1".to_string(), None),
+                ("c2".to_string(), Some("3s".to_string())),
+                ("c3".to_string(), None),
+            ]
+        );
+    }
+
+    /// Rebuilding a reply from the server's frames keeps the times this app measured for its
+    /// calls, which the frames cannot give back, and takes nothing from a call it could time.
+    #[test]
+    fn a_rebuilt_reply_keeps_the_times_it_had() {
+        let step = |id: &str, took_ms: Option<u64>| {
+            ChatPart::Step(StepSpec {
+                call_id: id.into(),
+                tool: "shell".into(),
+                arguments: String::new(),
+                result: Some("ok".into()),
+                ok: Some(true),
+                took_ms,
+            })
+        };
+        let before = vec![step("c1", Some(1000)), step("c2", None)];
+        let mut after = vec![step("c1", None), step("c2", None), step("c3", Some(700))];
+        keep_call_times(&before, &mut after);
+        assert_eq!(
+            after,
+            vec![
+                step("c1", Some(1000)),
+                step("c2", None),
+                step("c3", Some(700))
+            ]
+        );
+    }
+
+    /// A step's time is kept with its database row and read back; a row written before there
+    /// were times reads back with none.
+    #[test]
+    fn a_step_s_time_is_kept_with_its_row() {
+        let step = StepSpec {
+            call_id: "c1".into(),
+            tool: "shell".into(),
+            arguments: "{\"command\":\"ls\"}".into(),
+            result: Some("a.txt".into()),
+            ok: Some(true),
+            took_ms: Some(1234),
+        };
+        assert_eq!(
+            StepSpec::from_value("c1".into(), &step.to_value()).as_ref(),
+            Some(&step)
+        );
+        let older =
+            json!({"tool":"shell","arguments":"{\"command\":\"ls\"}","result":"a.txt","ok":true});
+        let read = StepSpec::from_value("c1".into(), &older).expect("an older row reads");
+        assert_eq!(read.took_ms, None);
+        assert_eq!(read.took(), None);
     }
 
     /// Reasoning is a part of its own, drawn as a thought, and none of it is the reply's words.

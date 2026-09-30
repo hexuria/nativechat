@@ -30,6 +30,7 @@ use crate::opengrok::{
     place_hitl_cards_in_document_order, policy_answer, reads_as_gateway_unreachable, retry_enqueue,
     save_login_from_local, serve_local_exec, stamp_duration, stored_machine_id, tool_standin,
 };
+use crate::opengrok::{FrameArrivals, keep_call_times};
 use crate::reachability::Reachability;
 use crate::send_policy::{Busy, OnSend, SendPlan, plan_send};
 use crate::services::database::{
@@ -2364,9 +2365,19 @@ fn stream_paint_due(
 /// as the live stream holds them: a tool whose arguments are still arriving is not a widget yet,
 /// and forcing it out would paint half a chart and then take it away again.
 fn reply_from_replay(events: &[serde_json::Value], status: &str) -> (String, Vec<ChatPart>) {
+    reply_from_followed(events, status, &FrameArrivals::default())
+}
+
+/// [`reply_from_replay`] for a run this app is following as it goes: the same bubbles, and each
+/// call it saw end and come back, by when each first did, says how long that took.
+fn reply_from_followed(
+    events: &[serde_json::Value],
+    status: &str,
+    arrivals: &FrameArrivals,
+) -> (String, Vec<ChatPart>) {
     let mut assembler = TurnAssembler::default();
     for event in events {
-        assembler.push_event(event);
+        assembler.push_event_at(event, arrivals.at(event));
     }
     if status != "running" {
         assembler.finish();
@@ -11548,7 +11559,7 @@ impl AppState {
         cx: &mut Context<Self>,
     ) {
         let (plain, parts) = reply_from_replay(&replay.events, &replay.status);
-        let parts = self.graft_user_forms(parts);
+        let mut parts = self.graft_user_forms(parts);
         let plain = replayed_ending(
             &replay.events,
             &replay.status,
@@ -11560,6 +11571,8 @@ impl AppState {
             streaming_message_mut(&mut self.conversations, conversation_id, &turn.message_id)
         {
             message.content = plain.clone();
+            // What the stream timed before the thread was left keeps its times.
+            keep_call_times(&message.parts, &mut parts);
             message.parts = parts.clone();
         }
         if let Some(shot) = parts.iter().rev().find_map(|part| match part {
@@ -12050,7 +12063,9 @@ impl AppState {
                                         });
                                     }
                                 }
-                                assembler.push_event(event);
+                                // When each frame came is how a call's row knows how long its
+                                // answer took: nothing on the wire says.
+                                assembler.push_event_at(event, Some(Instant::now()));
                                 let timing = TurnTiming::from_event(event);
                                 let (plain, parts) = assembler.snapshot();
                                 let box_shot = assembler.latest_screenshot().cloned();
@@ -12823,6 +12838,9 @@ impl AppState {
         cx.spawn(async move |this, cx| {
             let mut last_len = 0usize;
             let mut last_status = String::new();
+            // When each call's end and answer first came back, so the calls this poll saw
+            // happen can say how long they took.
+            let mut arrivals = FrameArrivals::default();
             for _ in 0..400 {
                 if registered {
                     let settled = this
@@ -12840,13 +12858,15 @@ impl AppState {
                 }
                 match client.replay_run(&run_id).await {
                     Ok(replay) => {
+                        arrivals.note(&replay.events, Instant::now());
                         // The status counts as news of its own: the frame that ends a run is
                         // often one the last poll already saw, and a run that stopped holding
                         // its text back has words to show for it even when nothing new arrived.
                         if replay.events.len() != last_len || replay.status != last_status {
                             last_len = replay.events.len();
                             last_status = replay.status.clone();
-                            let (plain, parts) = reply_from_replay(&replay.events, &replay.status);
+                            let (plain, parts) =
+                                reply_from_followed(&replay.events, &replay.status, &arrivals);
                             let status = replay.status.clone();
                             // A resumed turn that only ran tools says what it did, so the
                             // thread keeps a memory of the run the person allowed.
@@ -12869,7 +12889,7 @@ impl AppState {
                                     + Duration::from_millis(replay.started_at_ms as u64)
                             });
                             let _ = this.update(cx, |state, cx| {
-                                let parts = state.graft_user_forms(parts.clone());
+                                let mut parts = state.graft_user_forms(parts.clone());
                                 // The bubble this run has been filling in all along, by the name
                                 // it was given when the turn started — the resumed half of a turn
                                 // belongs to the same row as the half before the card.
@@ -12894,6 +12914,9 @@ impl AppState {
                                     let last = &mut conversation.messages[at];
                                     painted = Some(last.id.clone());
                                     last.content = plain.clone();
+                                    // The half before a card was timed live, and the server's
+                                    // frames cannot give those times back.
+                                    keep_call_times(&last.parts, &mut parts);
                                     last.parts = parts.clone();
                                     if let Some(timing) = TurnTiming::from_events(&replay.events) {
                                         apply_timing(last, timing);
@@ -22062,6 +22085,8 @@ mod tests {
                 arguments: "{\"command\":\"du -sh /srv/archive\"}".into(),
                 result: Some("4.0G\t/srv/archive".into()),
                 ok: Some(true),
+                // Timed as it happened: nothing can time it again once the turn is over.
+                took_ms: Some(1234),
             }),
             ChatPart::Step(crate::opengrok::StepSpec {
                 call_id: "c2".into(),
@@ -22069,6 +22094,7 @@ mod tests {
                 arguments: "{\"path\":\"/srv/archive/INDEX\"}".into(),
                 result: None,
                 ok: None,
+                took_ms: None,
             }),
             ChatPart::Text("The archive is four gigabytes.".into()),
         ];
@@ -22109,6 +22135,7 @@ mod tests {
                 arguments: "{\"command\":\"ls\"}".into(),
                 result: Some("a.txt".into()),
                 ok: Some(true),
+                took_ms: None,
             }),
             ChatPart::Text("After.".into()),
         ];
@@ -22385,6 +22412,7 @@ mod tests {
             arguments: "{\"command\":\"du -sh /srv/archive\"}".into(),
             result: Some("4.0G\t/srv/archive".into()),
             ok: Some(true),
+            took_ms: None,
         })];
         let (content, saved) = reply_to_keep("", &parts).expect("the step is worth keeping");
         let db = test_db().await;

@@ -84,6 +84,9 @@ pub(crate) enum RunRow {
         open: bool,
         /// The key of the open "N steps" it is drawn inside, when it is inside one.
         group: Option<String>,
+        /// How long the call took, at the end of its line ([`StepSpec::took`]): only while
+        /// Settings → Show turn timing is on, and only for a call this app timed.
+        took: Option<String>,
     },
     Thought {
         key: String,
@@ -132,18 +135,26 @@ pub(crate) struct RunLayout {
     runs: Vec<RunPlan>,
     /// The rows of this reply that are open.
     open: HashSet<String>,
+    /// Settings → Show turn timing: each step's line ends with how long it took.
+    timing: bool,
 }
 
 impl RunLayout {
     /// `parts` are the ones the feed draws for the reply, in its order; `open` is
-    /// [`AppState::expanded_steps`].
-    pub(crate) fn new(message_id: &str, parts: &[ChatPart], open: &HashSet<String>) -> Self {
+    /// [`AppState::expanded_steps`], and `timing` is [`AppState::show_turn_timing`].
+    pub(crate) fn new(
+        message_id: &str,
+        parts: &[ChatPart],
+        open: &HashSet<String>,
+        timing: bool,
+    ) -> Self {
         let mut layout = Self {
             message_id: message_id.to_string(),
             run_of: Vec::new(),
             thought_of: Vec::new(),
             runs: Vec::new(),
             open: HashSet::new(),
+            timing,
         };
         let stretches = step_runs(parts);
         if stretches.is_empty() {
@@ -242,6 +253,7 @@ impl RunLayout {
                 rows.push(RunRow::Step {
                     open: self.open.contains(&key),
                     key,
+                    took: self.timing.then(|| step.took()).flatten(),
                     step,
                     group,
                 });
@@ -302,6 +314,7 @@ pub(crate) fn render_run_row(row: &RunRow, app: Entity<AppState>, cx: &App) -> A
             step,
             open,
             group,
+            took,
         } => {
             let head = heading(
                 key,
@@ -311,7 +324,16 @@ pub(crate) fn render_run_row(row: &RunRow, app: Entity<AppState>, cx: &App) -> A
                 Toggle::row(key, *open, group),
                 app,
                 cx,
-            );
+            )
+            // On the line itself, open or shut, so a stretch of rows can be read down the side
+            // for where the time went without opening any of them.
+            .when_some(took.clone(), |this, took| {
+                this.child(
+                    div()
+                        .text_color(theme.muted_foreground.opacity(0.7))
+                        .child(format!("· {took}")),
+                )
+            });
             if !*open {
                 return head.into_any_element();
             }
