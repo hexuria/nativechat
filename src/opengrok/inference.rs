@@ -18,7 +18,10 @@
 //! `crates/opengrok-harness/src/local_proxy.rs`, and the door's words and the models a
 //! subscription may answer in `crates/opengrok-core/src/inference.rs`. The conformance ledger
 //! reads the two routes and the CUSTOM frame against the server's recording, vendored in
-//! `fixtures/wire/` from opengrok-server's main cad36fd (#303, after #298), pin 47a5d6b.
+//! `fixtures/wire/` from opengrok-server PR #304, bot-model-source 0ae9f2a, recorded at 4059c59,
+//! not yet on main. That PR changes none of these shapes from its main cad36fd (#303, after
+//! #298): it puts a Bot's own door between a turn's and the account's (`route` in
+//! `crates/opengrok-harness/src/local_proxy.rs`).
 //!
 //! The Mac relay (opengrok-server #292, built in #298, whose recording holds its words) lifts
 //! the one-machine limit: the server sends a turn's model calls down a stream to the person's Mac,
@@ -463,7 +466,8 @@ pub const HELD_FOR_RELAY_OFFLINE: &str = "relay_offline";
 /// never offers what a Save would be refused for, even should a list ever carry one (a list held
 /// from before, or a server that tags a row `local_proxy` without asking): `subscription_model`
 /// in opengrok-server's `crates/opengrok-core/src/inference.rs`, anchored since #296 and unchanged
-/// at the vendored pin 47a5d6b (server main cad36fd, #303, after #298).
+/// at the vendored pin 4059c59 (PR #304, bot-model-source 0ae9f2a, not yet on main), where a
+/// Bot's own plan model is held to it too.
 ///
 /// An allowlist, not a denylist: an id it does not recognise is refused, so a provider nobody
 /// has looked at is not offered by being new. With an `openai/` or `xai/` prefix and the `--fast`

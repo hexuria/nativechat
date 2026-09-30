@@ -4,17 +4,17 @@
 //! agree. `fixtures/wire/` is the server's side of that, recorded by the server itself: every
 //! AG-UI frame and REST body its own tests drove, teed off its router by the recorder of
 //! opengrok-server#258 and written out by its `examples/wire_corpus.rs`. It is vendored whole from
-//! the server's `tests/fixtures/wire/` at server main cad36fd (#303, after #298, the Mac relay's
-//! server half, #292), pin 47a5d6b, the commit its `MANIFEST.json` names as the one it was recorded
-//! at. The layout is
-//! opengrok-server#255's: `agui/<type>/<slug>.json`, a CUSTOM under `agui/custom/<name>/`, and
-//! `rest/<METHOD>_<route>/<status>-<slug>.json` holding `{method, path, status, body}`, one file
-//! per distinct shape, named after the first test that produced it; and since the relay, the
-//! frames of its stream under `relay/<type>/<slug>.json`, which are not AG-UI and which the Mac,
-//! not the chat, reads. `MANIFEST.json` names the
-//! server commit, the test behind every file, and every `type`, CUSTOM `name`, approval `reason`
-//! and `formResolution` word the server's code can send. Ids and clocks the tests mint at run
-//! time are placeholders in the server's own formats, and secrets read `«redacted»`.
+//! the server's `tests/fixtures/wire/` at opengrok-server PR #304, bot-model-source 0ae9f2a (a
+//! Bot's own door and the model line, on the server's main cad36fd, #303, after the Mac relay's
+//! #298), recorded at 4059c59, the commit its `MANIFEST.json` names, and not yet on main. The
+//! layout is opengrok-server#255's: `agui/<type>/<slug>.json`, a CUSTOM under
+//! `agui/custom/<name>/`, and `rest/<METHOD>_<route>/<status>-<slug>.json` holding
+//! `{method, path, status, body}`, one file per distinct shape, named after the first test that
+//! produced it; and since the relay, the frames of its stream under `relay/<type>/<slug>.json`,
+//! which are not AG-UI and which the Mac, not the chat, reads. `MANIFEST.json` names the server
+//! commit, the test behind every file, and every `type`, CUSTOM `name`, approval `reason` and
+//! `formResolution` word the server's code can send. Ids and clocks the tests mint at run time
+//! are placeholders in the server's own formats, and secrets read `«redacted»`.
 //!
 //! A newer recording is taken by copying the server's `tests/fixtures/wire/` over this one
 //! whole, never by editing a file here: the files are the server's evidence, and one fixed by
@@ -624,47 +624,14 @@ const MACHINE_TOKEN_ROUTES: &[&str] = &[
 ];
 
 /// Keys this app reads and sends on routes the corpus records, ahead of the server's recording
-/// of them: built to a shape proposed to the server session before the server sends it. The
+/// of them: built to a shape agreed with the server session before the server sends it. The
 /// routes themselves are recorded and read ([`REST_ROUTES`]), so they cannot wait in
 /// [`REST_NOT_RECORDED_YET`]; what waits is one key on their bodies. Each is named by the route's
 /// directory, with the key and what brings its fixtures, and is read meanwhile from bodies
-/// written in the proposed shape ([`a_bots_door_is_read_beyond_the_recording`]). The day a
-/// recorded body of the route carries the key, the entry has gone stale and comes off this list,
-/// and [`every_key_asked_ahead_of_its_recording_is_read_and_not_recorded_yet`] fails until it
-/// does.
-const REST_FIELDS_NOT_RECORDED_YET: &[(&str, &str, &str)] = &[
-    (
-        "GET__coworkers",
-        "source",
-        "A Bot's own door, `\"gateway\" | \"local_proxy\" | null` on every row, `null` for a Bot \
-         that follows the account's (opengrok-server `bot-model-source`, confirmed 2026-09-30, \
-         not yet recorded: `coworker_row` writes it on every row the server answers with, and \
-         never leaves it out; coworker_matches reads it, and a row without it is a server that \
-         keeps no door per Bot). The server mounts no GET /coworkers/{id}: this list, a hire's \
-         answer and a PATCH's are where a Bot's door is read. Its fixtures come with the server's \
-         `bot-model-source` and the recording after it: a coworker row carrying `source`.",
-    ),
-    (
-        "POST__coworkers",
-        "source",
-        "A hire answers with the row the roster keeps (the same `coworker_row`), its door and all: \
-         `null` on a new Bot, which follows the account's door until it is given one of its own; \
-         coworker_matches reads it. Its fixtures come with the server's `bot-model-source` and \
-         the recording after it: a hire's row carrying `source`.",
-    ),
-    (
-        "PATCH__coworkers__coworker_id_",
-        "source",
-        "The model picker's PATCH sends the Bot's door with its model (the same \
-         `bot-model-source`), and the answer is the row carrying it. The server refuses with a 400 \
-         in its own words, and writes nothing of the body, a patch that leaves the Bot on \
-         `local_proxy` with a model its subscription allowlist does not take, and a `source` that \
-         is neither of its two words (`source must be \"gateway\" or \"local_proxy\"`); each is \
-         read as its sentence like every refusal of the route. Its fixtures come with the \
-         server's `bot-model-source` and the recording after it: the row with its door, and those \
-         refusals.",
-    ),
-];
+/// written in the agreed shape. The day a recorded body of the route carries the key, the entry
+/// has gone stale and comes off this list, and
+/// [`every_key_asked_ahead_of_its_recording_is_read_and_not_recorded_yet`] fails until it does.
+const REST_FIELDS_NOT_RECORDED_YET: &[(&str, &str, &str)] = &[];
 
 // ---- the corpus ----
 
@@ -3438,11 +3405,11 @@ fn coworker_matches(coworker: &Coworker, raw: &Value) -> Check {
             && coworker.effort() == opt_str(raw, "effort").unwrap_or(EFFORT_INHERIT)
             && coworker.visibility.as_deref() == opt_str(raw, "visibility")
             && coworker.is_shared() == (opt_str(raw, "visibility") == Some("org"))
-            // `source` arrives with the per-Bot door (opengrok-server `bot-model-source`,
-            // confirmed 2026-09-30, not yet recorded: REST_FIELDS_NOT_RECORDED_YET), and every
-            // recording from before it has none, a server that keeps no door per Bot. Once sent,
-            // `null` is the account's door, and a word is kept as sent, one this app has not
-            // heard of included.
+            // `source` arrives with the per-Bot door (opengrok-server PR #304, bot-model-source
+            // 0ae9f2a, recorded at 4059c59, not yet on main: `coworker_row` writes it on every
+            // row, `null` and all), and every recording from before it has none, a server that
+            // keeps no door per Bot. Once sent, `null` is the account's door, and a word is kept
+            // as sent, one this app has not heard of included.
             && coworker.source == door_as_sent(raw),
         "a coworker came through changed: {coworker:?}"
     );
@@ -5563,12 +5530,71 @@ fn every_recorded_setting_is_from_a_server_that_knows_the_relay() {
     assert!(read > 0, "the recording holds the account's setting");
 }
 
-/// A Bot's door, read beyond the recording in the shape opengrok-server's `bot-model-source`
-/// answers with (confirmed 2026-09-30, not yet recorded): the roster's rows, a hire's answer and a
-/// patch's with `source` as each of its words, `null`, a word this app has not heard of, and
-/// missing, each read as sent, and a row whose parse lost its door caught; and the patch's two
-/// 400s, for a Bot left on the person's plan with a model the allowlist does not take and for a
-/// door that is neither word, each read as the server's sentence.
+/// The server that made the recording keeps a door per Bot, and writes it on every coworker row it
+/// answers with, `null` and all (`coworker_row` in opengrok-server's
+/// `crates/opengrok-server/src/agui/routes.rs`, PR #304, bot-model-source 0ae9f2a, recorded at
+/// 4059c59, not yet on main): the roster's, a hire's and a PATCH's. So every recorded row reads
+/// as one from a server that keeps a door per Bot, which is what lets a Bot's model picker offer
+/// the person's plan and send the Bot's door with a pick; a server from before per-Bot doors
+/// writes no `source`, and is taken to keep none. A hire answers `null`, a Bot that follows the
+/// account's door until it is given one of its own, and the recording holds a row on each of the
+/// Bot's own two doors, so every reading of the key meets the server's own words.
+#[test]
+fn every_recorded_coworker_row_is_from_a_server_that_keeps_a_door_per_bot() {
+    let corpus = Corpus::load();
+    let mut doors = Vec::new();
+    for (file, fixture) in &corpus.bodies {
+        let route = file.split('/').nth(1).unwrap_or("");
+        let rows = match (route, &fixture["body"]) {
+            ("GET__coworkers", Value::Array(rows)) => rows.clone(),
+            ("POST__coworkers" | "PATCH__coworkers__coworker_id_", row)
+                if row.get("id").is_some() =>
+            {
+                vec![row.clone()]
+            }
+            _ => continue,
+        };
+        for row in rows {
+            let bot: Coworker =
+                serde_json::from_value(row).unwrap_or_else(|error| panic!("{file}: {error}"));
+            assert_ne!(
+                bot.source,
+                CoworkerSource::NotKept,
+                "{file}: a server that keeps a door per Bot writes it on every row: {bot:?}"
+            );
+            if route == "POST__coworkers" {
+                assert_eq!(
+                    bot.source,
+                    CoworkerSource::AccountDefault,
+                    "{file}: a hire follows the account's door until it is given one: {bot:?}"
+                );
+            }
+            if !doors.contains(&bot.source) {
+                doors.push(bot.source);
+            }
+        }
+    }
+    for door in [
+        CoworkerSource::AccountDefault,
+        CoworkerSource::Kind(InferenceKind::Gateway),
+        CoworkerSource::Kind(InferenceKind::LocalProxy),
+    ] {
+        assert!(
+            doors.contains(&door),
+            "the recording holds a Bot whose door reads {door:?}: {doors:?}"
+        );
+    }
+}
+
+/// A Bot's door, read beyond the recording, which holds rows with `null` and each of the server's
+/// two words, a hire's and a PATCH's among them, and the PATCH's 400s for a Bot left on the
+/// person's plan with a model the allowlist does not take (opengrok-server PR #304,
+/// bot-model-source 0ae9f2a, recorded at 4059c59, not yet on main): a row whose door is a word
+/// this app has not heard of, and one from a server before per-Bot doors, with no `source` at
+/// all, each read as sent, and a row whose parse lost its door caught; and the 400 for a `source`
+/// that is neither word, which the recorder keeps no file of, having one 400 of that shape
+/// already and no pin on this one, and which this app never provokes, sending only a word it
+/// knows.
 #[test]
 fn a_bots_door_is_read_beyond_the_recording() {
     use serde_json::json;
@@ -5583,51 +5609,19 @@ fn a_bots_door_is_read_beyond_the_recording() {
         }
         row
     };
-    let roster = json!([
-        row("cw_plan", Some(json!("local_proxy"))),
-        row("cw_keys", Some(json!("gateway"))),
-        row("cw_default", Some(Value::Null)),
-        row("cw_odd", Some(json!("byok"))),
-        row("cw_old", None),
-    ]);
+    let roster = json!([row("cw_odd", Some(json!("byok"))), row("cw_old", None)]);
     read_fixture(
         "GET__coworkers",
         &json!({"method": "GET", "path": "/coworkers", "status": 200, "body": roster}),
     )
     .unwrap_or_else(|why| panic!("{why}"));
-    read_fixture(
-        "POST__coworkers",
-        &json!({
-            "method": "POST", "path": "/coworkers", "status": 201,
-            "body": row("cw_new", Some(Value::Null))
-        }),
-    )
-    .unwrap_or_else(|why| panic!("{why}"));
     let answered = row("cw_plan", Some(json!("local_proxy")));
-    read_fixture(
-        "PATCH__coworkers__coworker_id_",
-        &json!({
-            "method": "PATCH", "path": "/coworkers/cw_plan", "status": 200,
-            "body": answered.clone()
-        }),
-    )
-    .unwrap_or_else(|why| panic!("{why}"));
     let mut lost: Coworker = serde_json::from_value(answered.clone()).unwrap();
     lost.source = CoworkerSource::AccountDefault;
     assert!(
         coworker_matches(&lost, &answered).is_err(),
         "a row whose door the parse lost would not pass"
     );
-    let said = "model: \"oag/cheap\" is not a model this server knows to be OpenAI's or xAI's, \
-                and only theirs may use your own subscription";
-    read_fixture(
-        "PATCH__coworkers__coworker_id_",
-        &json!({
-            "method": "PATCH", "path": "/coworkers/cw_plan", "status": 400,
-            "body": {"error": said}
-        }),
-    )
-    .unwrap_or_else(|why| panic!("{said}: {why}"));
     let unknown = "source must be \"gateway\" or \"local_proxy\"";
     read_fixture(
         "PATCH__coworkers__coworker_id_",

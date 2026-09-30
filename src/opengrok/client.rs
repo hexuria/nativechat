@@ -7246,15 +7246,17 @@ mod tests {
     }
 
     /// A change in the model picker goes as one PATCH carrying the Bot's door, its model and its
-    /// effort, each only when it changed (opengrok-server `bot-model-source`, confirmed
-    /// 2026-09-30, not yet recorded), and the answer is the row as the server now keeps it, door
-    /// and all. A Bot left on the person's plan with a model the allowlist does not take is
-    /// refused with a 400 in the server's words, which is what the person is shown.
+    /// effort, each only when it changed (opengrok-server PR #304, bot-model-source 0ae9f2a,
+    /// recorded at 4059c59, not yet on main), and the answer is the row as the server now keeps
+    /// it, door and all. A door and a model the allowlist does not take, sent together, are
+    /// refused together with a 400 in the server's words, which is what the person is shown: the
+    /// sentence the recording holds for that pair.
     #[tokio::test]
     async fn a_picks_patch_carries_the_door_the_model_and_the_effort() {
         use crate::opengrok::{CoworkerSource, InferenceKind};
-        let refused = "model: \"oag/cheap\" is not a model this server knows to be OpenAI's or \
-                       xAI's, and only theirs may use your own subscription";
+        let refused = "model: claude-sonnet-4.5 is one of Anthropic's models, and Anthropic's \
+                       terms forbid using a consumer subscription through a third-party app; \
+                       pick an OpenAI or xAI model, or use the gateway";
         let server = MockServer::start().await;
         Mock::given(method("PATCH"))
             .and(path("/coworkers/cw_1"))
@@ -7276,7 +7278,7 @@ mod tests {
         Mock::given(method("PATCH"))
             .and(path("/coworkers/cw_1"))
             .and(body_json(
-                json!({"source": "local_proxy", "model": "oag/cheap"}),
+                json!({"source": "local_proxy", "model": "claude-sonnet-4.5"}),
             ))
             .respond_with(ResponseTemplate::new(400).set_body_json(json!({"error": refused})))
             .mount(&server)
@@ -7307,7 +7309,7 @@ mod tests {
                 "cw_1",
                 &CoworkerPatch {
                     source: Some(InferenceKind::LocalProxy),
-                    model: Some("oag/cheap".into()),
+                    model: Some("claude-sonnet-4.5".into()),
                     ..Default::default()
                 },
             )
