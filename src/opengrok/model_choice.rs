@@ -302,6 +302,22 @@ pub struct ModelPick {
     /// The line that takes the plan group's place on a server without per-Bot doors, while the
     /// account is on the person's plan.
     pub account_plan: Option<AccountPlan>,
+    /// The line that says this Bot's routines will fail. A routine fires through the server's
+    /// gateway on the Bot's pin, whatever door the Bot's own turns take (opengrok-server #294,
+    /// `autonomy/mod.rs`), so a Bot on its own plan pinned to a model the gateway does not list
+    /// has nothing to run its routines on. Said only against a list holding some of the gateway's
+    /// models: before `/models` answers, or on a deployment with no gateway, nothing says what
+    /// the gateway has.
+    pub routines: Option<String>,
+}
+
+/// What [`ModelPick::routines`] says, naming the model the gateway does not have.
+fn routines_line(model: &str) -> String {
+    format!(
+        "Routines run on the server's keys, which don't have {}, so this Bot's routines will \
+         fail. Pick a Server model for a Bot that runs routines.",
+        base_label(model)
+    )
 }
 
 /// The way to the account's plan a turn that names none goes: the account's own where the server
@@ -398,6 +414,23 @@ pub fn bot_pick(
         (!per_bot && door == Some(InferenceKind::LocalProxy)).then_some(AccountPlan {
             model: account_model,
         });
+    // The model is the pin with its fast tier taken off, as the list folds a twin into its model
+    // and the line names it: a gateway that lists the model is never said not to have it.
+    let gateway_ids: Vec<&str> = catalogue
+        .models
+        .iter()
+        .filter(|entry| entry.source() == Some(InferenceKind::Gateway))
+        .map(|entry| entry.id.as_str())
+        .collect();
+    let routines = pin
+        .as_deref()
+        .map(without_fast)
+        .filter(|base| {
+            bot_door == Some(InferenceKind::LocalProxy)
+                && !gateway_ids.is_empty()
+                && !gateway_ids.contains(base)
+        })
+        .map(routines_line);
     ModelPick {
         bot_id: bot.id.clone(),
         per_bot,
@@ -411,6 +444,7 @@ pub fn bot_pick(
         effort_kept: bot.effort.is_some(),
         groups,
         account_plan,
+        routines,
     }
 }
 
@@ -1107,5 +1141,65 @@ mod tests {
             serde_json::to_value(pick.reset_patch().unwrap()).unwrap(),
             json!({"model": "gpt-6-luna"})
         );
+    }
+
+    /// Routines fire through the server's gateway on the Bot's pin (opengrok-server #294). A Bot
+    /// on its own plan pinned to a model the gateway does not list is told its routines will
+    /// fail, by the model's name with ⚡ or without, whatever the account's door.
+    #[test]
+    fn a_bot_on_its_own_plan_is_told_its_routines_will_fail_where_the_gateway_lacks_its_model() {
+        let said = "Routines run on the server's keys, which don't have GPT-6 Luna, so this Bot's \
+                    routines will fail. Pick a Server model for a Bot that runs routines.";
+        let on_plan = account(InferenceKind::LocalProxy, Some("gpt-6-luna"));
+        let on_keys = account(InferenceKind::Gateway, None);
+        for (pin, kept) in [
+            ("gpt-6-luna", Some(&on_plan)),
+            ("gpt-6-luna--fast", Some(&on_plan)),
+            ("gpt-6-luna", Some(&on_keys)),
+            ("gpt-6-luna", None),
+        ] {
+            let own = bot(Some(json!("local_proxy")), pin, Some("medium"));
+            let pick = bot_pick(&own, kept, &catalogue(SERVER), plan(PLAN));
+            assert_eq!(pick.routines.as_deref(), Some(said), "{pin} with {kept:?}");
+        }
+    }
+
+    /// No word about routines where they have their model, or where nothing says they do not: a
+    /// pin the gateway lists, fast tier or not; a Bot that follows the account or is on the
+    /// gateway, whose door the line is not about; a server without per-Bot doors, or a door this
+    /// app cannot name; and a list that holds none of the gateway's models to tell by.
+    #[test]
+    fn routines_that_have_their_model_or_cannot_be_told_are_not_warned_of() {
+        let on_plan = account(InferenceKind::LocalProxy, Some("gpt-6-luna"));
+        let routines = |source: Option<Value>, pin: &str, gateway: &[&str]| {
+            let row = bot(source, pin, Some("medium"));
+            bot_pick(&row, Some(&on_plan), &catalogue(gateway), plan(PLAN)).routines
+        };
+        let own = || Some(json!("local_proxy"));
+        assert_eq!(routines(own(), "xai/grok-4.7", SERVER), None, "listed");
+        assert_eq!(
+            routines(own(), "xai/grok-4.7--fast", SERVER),
+            None,
+            "its model is listed"
+        );
+        assert_eq!(
+            routines(own(), "gpt-6-luna", &["gpt-6-luna", "oag/cheap"]),
+            None,
+            "this gateway has it"
+        );
+        assert_eq!(routines(Some(Value::Null), "gpt-6-luna", SERVER), None);
+        assert_eq!(routines(Some(json!("gateway")), "gpt-6-luna", SERVER), None);
+        assert_eq!(
+            routines(None, "gpt-6-luna", SERVER),
+            None,
+            "no per-Bot doors"
+        );
+        assert_eq!(routines(Some(json!("byok")), "gpt-6-luna", SERVER), None);
+        assert_eq!(
+            routines(own(), "gpt-6-luna", &[]),
+            None,
+            "nothing of the gateway's listed yet"
+        );
+        assert_eq!(routines(own(), "", SERVER), None, "no pin to name");
     }
 }

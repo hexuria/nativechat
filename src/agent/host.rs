@@ -371,7 +371,7 @@ pub mod ids {
 
     /// One part of the picker's popover in `place`, by the composer's id for it: `model-pop`,
     /// `model-fast`, `model-effort`, `model-open-list`, `model-reset`, `model-list`,
-    /// `model-plan`, `model-note` or `model-error`.
+    /// `model-plan`, `model-note`, `model-routines` or `model-error`.
     pub fn model_part(place: PickerPlace, part: &str) -> String {
         model_picker::part_id(place, part)
     }
@@ -1269,7 +1269,9 @@ enum LoginField {
 /// card's with `agent-` before them; the card itself is named by `agent-model-card`, and stands
 /// for the chip it is the twin of. `None` for anything that is not one of the picker's ids.
 fn picker_part(target: &str) -> Option<(PickerPlace, &str)> {
-    use model_picker::{CHIP, EFFORT, ERROR, FAST, LIST, NOTE, OPEN_LIST, PLAN, POP, RESET, ROW};
+    use model_picker::{
+        CHIP, EFFORT, ERROR, FAST, LIST, NOTE, OPEN_LIST, PLAN, POP, RESET, ROUTINES, ROW,
+    };
     if target == ids::MODEL_CHIP {
         return Some((PickerPlace::Composer, CHIP));
     }
@@ -1280,7 +1282,10 @@ fn picker_part(target: &str) -> Option<(PickerPlace, &str)> {
         Some(part) => (PickerPlace::Card, part),
         None => (PickerPlace::Composer, target),
     };
-    let known = [POP, FAST, RESET, EFFORT, OPEN_LIST, LIST, PLAN, NOTE, ERROR].contains(&part)
+    let known = [
+        POP, FAST, RESET, EFFORT, OPEN_LIST, LIST, PLAN, NOTE, ROUTINES, ERROR,
+    ]
+    .contains(&part)
         || part.starts_with(ROW);
     known.then_some((place, part))
 }
@@ -4532,12 +4537,13 @@ impl NativeChatHost {
     /// valued by how many models it offers and visible while shown, and holds while shown a
     /// `model-row-{source}-{id}` per model (valued by its door's word, `selected` on the one that
     /// answers, `fast` where it has a fast version), `model-plan` where a server without per-Bot
-    /// doors has the account's plan model answer, and `model-note`, the server's word on why the
-    /// list is not fuller. `model-error`, while open: the server's words for the last change it
-    /// refused. The card's are the same with `agent-` before them.
+    /// doors has the account's plan model answer, `model-routines` where the Bot's routines will
+    /// fail on its pin, and `model-note`, the server's word on why the list is not fuller.
+    /// `model-error`, while open: the server's words for the last change it refused. The card's
+    /// are the same with `agent-` before them.
     fn model_picker_node(&self, place: PickerPlace) -> Option<UiNode> {
         use model_picker::{
-            EFFORT, ERROR, FAST, LIST, MODELS_TITLE, NOTE, OPEN_LIST, PLAN, POP, RESET,
+            EFFORT, ERROR, FAST, LIST, MODELS_TITLE, NOTE, OPEN_LIST, PLAN, POP, RESET, ROUTINES,
         };
         let pick = self.model_pick.as_ref()?;
         let open = self.model_picker == Some(place);
@@ -4613,6 +4619,9 @@ impl NativeChatHost {
                     item.states.push("fast".into());
                 }
                 list = list.with_child(item);
+            }
+            if let Some(line) = &pick.routines {
+                list = list.with_child(UiNode::status(part(ROUTINES), line.clone()));
             }
             if let Some(note) = &self.model_note {
                 list = list.with_child(UiNode::status(part(NOTE), note.clone()));
@@ -4925,7 +4934,7 @@ impl NativeChatHost {
         target: &str,
     ) -> Result<Command, String> {
         use model_picker::{
-            CHIP, EFFORT, ERROR, FAST, LIST, NOTE, OPEN_LIST, PLAN, POP, RESET, ROW,
+            CHIP, EFFORT, ERROR, FAST, LIST, NOTE, OPEN_LIST, PLAN, POP, RESET, ROUTINES, ROW,
         };
         let Some(pick) = &self.model_pick else {
             return Err(format!("`{target}` is not on screen: no Bot is open"));
@@ -4959,7 +4968,7 @@ impl NativeChatHost {
                 "`{target}` is the popover: click one of its controls"
             )),
             OPEN_LIST => Ok(Command::ToggleModelList),
-            PLAN | NOTE | ERROR => Err(format!("`{target}` is a line, not a control")),
+            PLAN | NOTE | ROUTINES | ERROR => Err(format!("`{target}` is a line, not a control")),
             FAST | EFFORT | RESET if list_open => Err(format!(
                 "`{target}` is not on screen: the popover shows its list, and `{opener}` goes \
                  back"
@@ -12641,6 +12650,13 @@ mod tests {
             .iter()
             .map(|row| (row.id.as_str(), row.name.as_str(), row.states.as_slice()))
             .collect();
+        // Under the rows, the line saying this Bot's routines will fail: they run on the
+        // gateway, which lists no GPT-6 Luna.
+        let routines = host
+            .model_pick
+            .as_ref()
+            .and_then(|pick| pick.routines.clone())
+            .expect("a Bot on its own plan, on a model the gateway lacks");
         assert_eq!(
             rows,
             [
@@ -12651,6 +12667,7 @@ mod tests {
                 ),
                 ("model-row-gateway-oag/cheap", "Cheap (auto)", &[][..]),
                 ("model-row-gateway-xai/grok-4.7", "Grok 4.7", &[][..]),
+                ("model-routines", routines.as_str(), &[][..]),
             ]
         );
         assert!(
@@ -12822,6 +12839,77 @@ mod tests {
             Some("GPT-5 Codex")
         );
         assert!(host.click("model-plan").is_err(), "a line, not a row");
+    }
+
+    /// A Bot on its own plan pinned to a model the gateway does not list: while the list shows,
+    /// `model-routines` under its rows says the Bot's routines will fail, as the window does, and
+    /// the card's list says it under `agent-`. It is a line, not a control; and there is none for
+    /// a Bot whose routines have their model, or one that follows the account.
+    #[test]
+    fn the_list_says_where_a_bots_routines_will_fail() {
+        let said = "Routines run on the server's keys, which don't have GPT-6 Luna, so this Bot's \
+                    routines will fail. Pick a Server model for a Bot that runs routines.";
+        let mut host = host();
+        host.model_pick = Some(a_pick(
+            Some(serde_json::json!("local_proxy")),
+            "gpt-6-luna--fast",
+            "medium",
+        ));
+        host.model_picker = Some(PickerPlace::Composer);
+        assert!(
+            host.snapshot().find("model-routines").is_none(),
+            "the popover shows its controls"
+        );
+        host.model_list_open = true;
+        let tree = host.snapshot();
+        let ids_in_list: Vec<&str> = tree
+            .find("model-list")
+            .unwrap()
+            .children
+            .iter()
+            .map(|node| node.id.as_str())
+            .collect();
+        assert_eq!(
+            ids_in_list,
+            [
+                "model-row-local_proxy-gpt-6-luna",
+                "model-row-gateway-oag/cheap",
+                "model-row-gateway-xai/grok-4.7",
+                "model-routines",
+            ]
+        );
+        assert_eq!(
+            tree.find("model-routines").map(|node| node.name.as_str()),
+            Some(said)
+        );
+        let refused = host.click("model-routines").unwrap_err();
+        assert!(refused.contains("a line, not a control"), "{refused}");
+        assert!(host.take_command().is_none());
+
+        host.agent_settings_open = true;
+        host.model_picker = Some(PickerPlace::Card);
+        let tree = host.snapshot();
+        assert_eq!(
+            tree.find("agent-model-routines")
+                .map(|node| node.name.as_str()),
+            Some(said)
+        );
+        assert!(
+            tree.find("model-routines").is_none(),
+            "the chip's popover is shut"
+        );
+        assert!(host.click("agent-model-routines").is_err());
+
+        for (source, pin) in [
+            (serde_json::json!("local_proxy"), "xai/grok-4.7"),
+            (serde_json::Value::Null, "gpt-6-luna"),
+        ] {
+            host.model_pick = Some(a_pick(Some(source), pin, "medium"));
+            assert!(
+                host.snapshot().find("agent-model-routines").is_none(),
+                "{pin}"
+            );
+        }
     }
 
     /// From the app: the chip and the card are the open Bot's picker, and the chip leaves the
