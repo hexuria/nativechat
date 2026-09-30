@@ -173,10 +173,10 @@
 //! ⚡ is on and it has a twin, and goes back to the controls), `model-plan` (on a server whose
 //! rows carry no `source`, while the account is on the person's plan: the account's plan model,
 //! which answers for every Bot there; a line, not a row), `model-routines` (on a Bot whose own
-//! door is the person's plan and whose model, ⚡ aside, is not among the gateway's models the
-//! list holds: the line saying its routines, which run on the server's paid keys whatever its
-//! door (opengrok-server #294), will fail, and to pick a Server model for a Bot that runs them;
-//! a line, not a row) and `model-note` (the server's word on why the list is not fuller).
+//! door is the person's plan, whatever it is pinned to: the line saying its routines won't run,
+//! since they run on the server's paid keys and the server refuses every routine of such a Bot
+//! (opengrok-server #304), and to pick a Server model to run it on a schedule; a line, not a
+//! row) and `model-note` (the server's word on why the list is not fuller).
 //! `model-error` is the server's words for the last change it refused. Every change is saved on
 //! the Bot at once, `source`, `model` and `effort` on `PATCH /coworkers/{id}` (opengrok-server
 //! PR #304, bot-model-source 0ae9f2a, recorded at 4059c59, not yet on main). The card's parts
