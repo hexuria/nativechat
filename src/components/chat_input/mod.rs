@@ -656,8 +656,8 @@ impl MessageInput {
     }
 
     /// The reply-source chip gives its place to the dictation's buttons, and the state is told:
-    /// a chip that is not drawn is not in a driver's tree, and a turn sent meanwhile names no
-    /// door (`AppState::composer_turn_source`).
+    /// a chip that is not drawn is not in a driver's tree, and a turn sent meanwhile names the
+    /// account's own door rather than a pick nobody can see (`AppState::turn_source_for_send`).
     fn tell_state_dictating(&self, cx: &mut Context<Self>) {
         let dictating = self.voice_mode;
         self.state

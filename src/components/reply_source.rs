@@ -275,22 +275,42 @@ impl ReplySourcePage {
             cx.notify();
         })
         .detach();
-        // What is typed is the form: the state keeps the copy Save sends and a driver writes.
-        cx.subscribe(&url, |this, input, event: &InputEvent, cx| {
-            if matches!(event, InputEvent::Change) {
-                let url = input.read(cx).value().to_string();
-                this.state
-                    .update(cx, |state, cx| state.set_reply_source_url(url, cx));
-            }
-        })
+        // What is typed is the form: the state keeps the copy Save sends and a driver writes. A
+        // field takes typing only while the page draws it editable, as the radio and the picker
+        // take a click only then. Keys that reach one the page has just made read-only, before
+        // it is drawn so, change no draft, and the field is put back to what the page holds
+        // rather than left showing what nothing took.
+        cx.subscribe_in(
+            &url,
+            window,
+            |this, input, event: &InputEvent, window, cx| {
+                if !matches!(event, InputEvent::Change) {
+                    return;
+                }
+                if this.state.read(cx).reply_source.plan_editable() {
+                    let url = input.read(cx).value().to_string();
+                    this.state
+                        .update(cx, |state, cx| state.set_reply_source_url(url, cx));
+                }
+                this.sync_inputs(window, cx);
+            },
+        )
         .detach();
-        cx.subscribe(&key, |this, input, event: &InputEvent, cx| {
-            if matches!(event, InputEvent::Change) {
-                let typed = input.read(cx).value().to_string();
-                this.state
-                    .update(cx, |state, cx| state.set_reply_source_key(&typed, cx));
-            }
-        })
+        cx.subscribe_in(
+            &key,
+            window,
+            |this, input, event: &InputEvent, window, cx| {
+                if !matches!(event, InputEvent::Change) {
+                    return;
+                }
+                if this.state.read(cx).reply_source.key_editable() {
+                    let typed = input.read(cx).value().to_string();
+                    this.state
+                        .update(cx, |state, cx| state.set_reply_source_key(&typed, cx));
+                }
+                this.sync_inputs(window, cx);
+            },
+        )
         .detach();
         let mut page = Self { state, url, key };
         page.sync_inputs(window, cx);
@@ -464,6 +484,7 @@ impl Render for ReplySourcePage {
         let models_line = models_note(health, !models.is_empty());
         let has_key = kept.has_api_key;
         let removing = settings.remove_key;
+        let key_live = settings.key_editable();
         let unsaved = settings.is_unsaved() && settings.saving.is_none();
         let error = error_line(settings);
         let trouble = error_is_trouble(settings);
@@ -543,7 +564,7 @@ impl Render for ReplySourcePage {
                             .child(
                                 div()
                                     .id(KEY)
-                                    .child(field_input(&self.key).disabled(!plan_live || removing)),
+                                    .child(field_input(&self.key).disabled(!key_live)),
                             )
                             .when(has_key, |this| {
                                 let app = app.clone();

@@ -527,6 +527,12 @@ impl ReplySourceSettings {
         self.can_edit() && self.server_on_this_mac
     }
 
+    /// The key field takes typing: the plan's half of the page does, and Remove key is not
+    /// picked, which draws the field read-only until Keep key takes it back.
+    pub fn key_editable(&self) -> bool {
+        self.plan_editable() && !self.remove_key
+    }
+
     /// Why Save will not send the page as it shows it: My subscription without what a turn on it
     /// needs, an address, or a model while `plan_models` says the server lists some to pick from.
     /// The server would keep either, and then turn every reply away until the gap was filled.
@@ -2832,9 +2838,37 @@ fn source_news(assembler: &TurnAssembler, told: &mut Option<ReplySource>) -> Opt
 /// A replay's word on which door a run went through, onto the reply it paints. Only a word: a
 /// replay without the frame (a server from before reply sources, or a journal that has not got
 /// that far) leaves the badge the reply already wears, which the live stream may have given it.
-fn wear_replayed_source(message: &mut Message, source: Option<ReplySource>) {
-    if source.is_some() {
-        message.reply_source = source;
+/// Answers whether the badge changed, which is when its row has to be told
+/// ([`AppState::persist_replayed_badges`]).
+fn wear_replayed_source(message: &mut Message, source: Option<ReplySource>) -> bool {
+    match source {
+        Some(source) if message.reply_source.as_ref() != Some(&source) => {
+            message.reply_source = Some(source);
+            true
+        }
+        _ => false,
+    }
+}
+
+/// A badge a replay put on a reply: the reply's row, the run whose journal named the door, and
+/// the door. The row is told, so a thread reopened from disk wears it without the server.
+#[derive(Debug, Clone, PartialEq)]
+struct ReplayedBadge {
+    message_id: String,
+    run_id: String,
+    source: ReplySource,
+}
+
+/// The badges a replay put on replies, written onto their rows, each only while its row is still
+/// filed under the run that earned it ([`DatabaseService::keep_reply_source`]).
+async fn keep_replayed_badges(db: &DatabaseService, badges: &[ReplayedBadge]) {
+    for badge in badges {
+        let kept = db
+            .keep_reply_source(&badge.message_id, &badge.run_id, &badge.source.to_json())
+            .await;
+        if let Err(error) = kept {
+            eprintln!("NativeChat: a reply's badge from the server was not saved: {error}");
+        }
     }
 }
 
@@ -4591,7 +4625,8 @@ pub struct AppState {
     /// because only this memory keeps it. The server keeps the account's door, and that is what
     /// a relaunch starts from.
     turn_source_pick: Option<InferenceKind>,
-    /// The composer is dictating: its chip is not drawn meanwhile, and a turn names no door.
+    /// The composer is dictating: its chip is not drawn meanwhile, and a turn names the
+    /// account's own door rather than the chip's.
     pub(crate) composer_dictating: bool,
     /// Numbers the reads of `/models`, so only the newest answer lands
     /// ([`Self::begin_models_read`]).
@@ -7513,10 +7548,21 @@ impl AppState {
 
     /// The proxy URL as the field holds it now. Emptied, it is the address taken away.
     pub fn set_reply_source_url(&mut self, url: String, cx: &mut Context<Self>) {
-        if self.reply_source.plan_editable() && self.reply_source.shown_url() != url {
-            self.reply_source.url_draft = Some(url);
+        if self.note_reply_source_url(url) {
             cx.notify();
         }
+    }
+
+    /// Only while the plan's half of the page takes a change, as the radio and the picker: a
+    /// field drawn read-only (a Save out, the setting not read, the server on another machine)
+    /// leaves the address as it was, whatever reaches it.
+    fn note_reply_source_url(&mut self, url: String) -> bool {
+        let settings = &mut self.reply_source;
+        if !settings.plan_editable() || settings.shown_url() == url {
+            return false;
+        }
+        settings.url_draft = Some(url);
+        true
     }
 
     /// A model picked from the models of the person's plan.
@@ -7653,13 +7699,14 @@ impl AppState {
     }
 
     /// The models the page offers for the person's plan: what `GET /models` lists as served
-    /// through opencodex, in its order, less any the server would refuse for a subscription.
+    /// through opencodex, in its order, and only those the server's allowlist lets a
+    /// subscription answer with ([`crate::opengrok::is_subscription_model`]).
     pub fn subscription_models(&self) -> Vec<String> {
         self.model_catalogue
             .models
             .iter()
             .filter(|entry| entry.source() == Some(InferenceKind::LocalProxy))
-            .filter(|entry| !crate::opengrok::is_forbidden_subscription_model(&entry.id))
+            .filter(|entry| crate::opengrok::is_subscription_model(&entry.id))
             .map(|entry| entry.id.clone())
             .collect()
     }
@@ -7681,8 +7728,8 @@ impl AppState {
     }
 
     /// The composer's chip as drawn: [`Self::turn_source_chip`], except while the composer is
-    /// dictating, when the chip gives its place to the dictation's buttons. `None` where no chip
-    /// is drawn, which is also where a turn names no door.
+    /// dictating, when the chip gives its place to the dictation's buttons and a turn names the
+    /// account's own door ([`Self::turn_source_for_send`]). `None` where no chip is drawn.
     pub fn composer_turn_source(&self) -> Option<TurnSourceChip> {
         self.turn_source_chip().filter(|_| !self.composer_dictating)
     }
@@ -7699,14 +7746,26 @@ impl AppState {
     /// The door a turn sent now names in `forwardedProps.inferenceSource`: the one the chip
     /// shows, the account's own included. The chip starts at the account's door as last read,
     /// and that may have moved on another Mac since; naming it anyway is what makes the turn go
-    /// where the chip says. With no chip drawn, nothing, and the account's setting decides on
-    /// the server, where it is kept.
+    /// where the chip says.
+    ///
+    /// While the composer dictates, the chip gives its place to the dictation's buttons and the
+    /// turn names the account's own door, as Settings → Reply source shows it: a pick on a chip
+    /// the person cannot see does not steer the turn, and naming nothing would leave it to the
+    /// server's copy of the setting, which may have moved since it was read here. Where there is
+    /// no chip to hide (the setting not read, a server without reply sources, no plan set up to
+    /// switch to), nothing, dictating or not, and the account's setting decides on the server,
+    /// where it is kept.
     fn turn_source_for_send(&self) -> Option<InferenceKind> {
-        self.composer_turn_source().map(|chip| chip.kind)
+        let chip = self.turn_source_chip()?;
+        if self.composer_dictating {
+            return self.reply_source.kept_source().map(|kept| kept.kind);
+        }
+        Some(chip.kind)
     }
 
-    /// The door a turn names: a held send's is the one its chip showed when the message was
-    /// sent, whatever the chip shows by the time it drains; any other turn's is the chip's now.
+    /// The door a turn names: a held send's is the one it was held with when the message was
+    /// sent, whatever the chip shows by the time it drains; any other turn's is the one a turn
+    /// sent now names ([`Self::turn_source_for_send`]).
     fn turn_inference_source(&self, drained: Option<&QueuedSend>) -> Option<InferenceKind> {
         match drained {
             Some(held) => held.inference_source,
@@ -7715,7 +7774,7 @@ impl AppState {
     }
 
     /// The composer is dictating, or has stopped. The chip is not drawn meanwhile, so it is not
-    /// in a driver's tree either, and a turn sent meanwhile names no door.
+    /// in a driver's tree either, and a turn sent meanwhile names the account's own door.
     pub fn set_composer_dictating(&mut self, dictating: bool, cx: &mut Context<Self>) {
         if self.composer_dictating != dictating {
             self.composer_dictating = dictating;
@@ -12319,7 +12378,8 @@ impl AppState {
                         state.reconciled_threads.insert(conversation_id.clone());
                         state.hide_withheld_runs(&conversation_id, &thread, cx);
                         state.apply_thread_replay(&conversation_id, &thread, cx);
-                        state.overlay_replay_cards(&conversation_id, &thread.runs);
+                        let badges = state.overlay_replay_cards(&conversation_id, &thread.runs);
+                        state.persist_replayed_badges(&conversation_id, badges, cx);
                         state.apply_pending_from_replay(&conversation_id, &thread, cx);
                     }
                     Err(_) => {
@@ -12481,7 +12541,14 @@ impl AppState {
     /// Idle + settled user-form cards (never secrets) from
     /// `formRequest` + sibling `formResolution`, local save prompts, and
     /// pinned screenshots from OpenGrok onto rows sqlite already has.
-    fn overlay_replay_cards(&mut self, conversation_id: &str, runs: &[ThreadRun]) {
+    ///
+    /// Answers with the badges it filled in, for their rows to be told
+    /// ([`Self::persist_replayed_badges`]).
+    fn overlay_replay_cards(
+        &mut self,
+        conversation_id: &str,
+        runs: &[ThreadRun],
+    ) -> Vec<ReplayedBadge> {
         let mut grafted: Vec<(String, Vec<ChatPart>)> = Vec::new();
         #[allow(clippy::type_complexity)]
         let mut clocks: Vec<(
@@ -12506,7 +12573,7 @@ impl AppState {
             .iter_mut()
             .find(|conversation| conversation.id == conversation_id)
         else {
-            return;
+            return Vec::new();
         };
         for (run_id, parts) in &grafted {
             if let Some(message) = conversation
@@ -12517,6 +12584,7 @@ impl AppState {
                 overlay_server_cards(message, parts);
             }
         }
+        let mut badges = Vec::new();
         for (run_id, finished_at, timing, source) in clocks {
             if let Some(message) = conversation
                 .messages
@@ -12529,9 +12597,17 @@ impl AppState {
                     apply_timing(message, timing);
                 }
                 // A row written before its run's source was kept, or by a build that did not
-                // read it, wears the badge the server's journal says it earned.
-                if message.reply_source.is_none() {
-                    message.reply_source = source;
+                // read it, wears the badge the server's journal says it earned, and keeps it: the
+                // row is told, so the thread reopened offline wears it too.
+                if message.reply_source.is_none()
+                    && let Some(source) = source
+                {
+                    message.reply_source = Some(source.clone());
+                    badges.push(ReplayedBadge {
+                        message_id: message.id.clone(),
+                        run_id,
+                        source,
+                    });
                 }
                 if message.finished_at.is_none() {
                     message.finished_at = finished_at;
@@ -12557,6 +12633,33 @@ impl AppState {
         {
             self.last_box_shot = Some(shot);
         }
+        badges
+    }
+
+    /// Tell the rows of these replies the badges a replay put on them, as the live stream's
+    /// badge is written down with its reply by `persist_assistant_reply`: a thread reopened from
+    /// disk, offline or before it is reconciled again, wears them without the server. Only the
+    /// badge is written, never the words or the pieces, and only onto a row there already is,
+    /// still filed under the run the journal spoke for; a reply not written down yet takes the
+    /// badge from its bubble when it is. A thread this Mac does not keep on disk is left alone.
+    fn persist_replayed_badges(
+        &self,
+        conversation_id: &str,
+        badges: Vec<ReplayedBadge>,
+        cx: &mut Context<Self>,
+    ) {
+        if badges.is_empty() {
+            return;
+        }
+        let Some(db) = self
+            .database_service
+            .clone()
+            .filter(|_| self.keeps_on_disk(conversation_id))
+        else {
+            return;
+        };
+        cx.spawn(async move |_, _| keep_replayed_badges(&db, &badges).await)
+            .detach();
     }
 
     pub fn select_conversation(&mut self, conversation_id: String, cx: &mut Context<Self>) {
@@ -12643,13 +12746,23 @@ impl AppState {
             &plain,
         )
         .unwrap_or(plain);
+        let mut badge = None;
         if let Some(message) =
             streaming_message_mut(&mut self.conversations, conversation_id, &turn.message_id)
         {
             message.content = plain.clone();
             message.parts = parts.clone();
-            wear_replayed_source(message, source);
+            if wear_replayed_source(message, source.clone()) {
+                badge = source.map(|source| ReplayedBadge {
+                    message_id: turn.message_id.clone(),
+                    run_id: turn.run_id.clone(),
+                    source,
+                });
+            }
         }
+        // A row this turn already has takes the badge now; one written later takes it from the
+        // bubble.
+        self.persist_replayed_badges(conversation_id, badge.into_iter().collect(), cx);
         if let Some(shot) = parts.iter().rev().find_map(|part| match part {
             ChatPart::Screenshot(spec) => Some(spec.clone()),
             _ => None,
@@ -13986,6 +14099,8 @@ impl AppState {
                                 // The bubble this actually painted into, so the row it is
                                 // written down as is that bubble and not a new one.
                                 let mut painted: Option<String> = None;
+                                // The badge this poll put on it, for its row to be told.
+                                let mut badge = None;
                                 if let Some(conversation_id) = conversation_id.as_ref()
                                     && let Some(conversation) = state
                                         .conversations
@@ -14005,7 +14120,13 @@ impl AppState {
                                     if let Some(timing) = TurnTiming::from_events(&replay.events) {
                                         apply_timing(last, timing);
                                     }
-                                    wear_replayed_source(last, source.clone());
+                                    if wear_replayed_source(last, source.clone()) {
+                                        badge = source.clone().map(|source| ReplayedBadge {
+                                            message_id: last.id.clone(),
+                                            run_id: run_id.clone(),
+                                            source,
+                                        });
+                                    }
                                     if status != "running" && status != "awaiting-approval" {
                                         stamp_run_finished(last, SystemTime::now());
                                     }
@@ -14027,6 +14148,15 @@ impl AppState {
                                             );
                                         }
                                     }
+                                }
+                                // A row this run already has takes the badge now; one written
+                                // later takes it from the bubble.
+                                if let Some(id) = conversation_id.as_deref() {
+                                    state.persist_replayed_badges(
+                                        id,
+                                        badge.into_iter().collect(),
+                                        cx,
+                                    );
                                 }
                                 match status.as_str() {
                                     "awaiting-approval" => {
@@ -17574,8 +17704,9 @@ impl AppState {
         .detach();
     }
 
-    /// A message held back as it was sent: what the draft had on it, and the door the composer's
-    /// chip showed, which is the door its turn names when it drains.
+    /// A message held back as it was sent: what the draft had on it, and the door a turn sent
+    /// then would name ([`Self::turn_source_for_send`]), which is the door its turn names when
+    /// it drains.
     fn hold_for_send(
         &self,
         message_id: String,
@@ -31647,7 +31778,8 @@ mod tests {
     /// setting has moved on another Mac since it was read. A click picks the other door for the
     /// next turns and it sticks, named by each, until clicked back; and it is gone with a sign
     /// out, which is also what a relaunch starts from, since nothing but this memory keeps it.
-    /// With no chip drawn a turn names nothing, and the account's setting decides.
+    /// With no chip to draw a turn names nothing, and the account's setting decides; with the
+    /// chip hidden while the composer dictates, it names the account's own door.
     #[test]
     fn a_turn_names_the_door_the_composer_chip_shows() {
         let mut state = signed_in_state();
@@ -31714,12 +31846,16 @@ mod tests {
             Some(InferenceKind::LocalProxy)
         );
 
-        // While the composer dictates the chip is not drawn, and a turn names no door; the pick
-        // is still there when the chip comes back.
+        // While the composer dictates the chip is not drawn, and a turn names the account's own
+        // door rather than the pick nobody can see; the pick is still there when the chip comes
+        // back.
         assert!(state.flip_turn_source());
         state.composer_dictating = true;
         assert_eq!(chip(&state), None);
-        assert_eq!(state.turn_inference_source(None), None);
+        assert_eq!(
+            state.turn_inference_source(None),
+            Some(InferenceKind::LocalProxy)
+        );
         assert!(!state.flip_turn_source(), "no chip to click");
         read_as(&mut state, kept(InferenceKind::LocalProxy, Some("grok-4")));
         state.composer_dictating = false;
@@ -31776,8 +31912,9 @@ mod tests {
 
     /// A message sent while a turn runs is held with the door the chip showed when it was sent,
     /// and its turn names that door when it drains, whatever the chip shows by then; the row
-    /// the server keeps for it names it too. One held while no chip was drawn names none, even
-    /// if a chip is drawn by the time it goes.
+    /// the server keeps for it names it too. One held while the composer dictated keeps the
+    /// account's own door, which is what a turn sent then names. One held while there was no
+    /// chip to draw names none, even if a chip is drawn by the time it goes.
     #[test]
     fn a_held_send_keeps_the_door_it_was_sent_under() {
         let mut state = signed_in_state();
@@ -31807,9 +31944,27 @@ mod tests {
             "sent under My plan, it goes through My plan"
         );
 
-        // Held while the composer dictated: no chip, no door, now or when it drains.
+        // Held while the composer dictated, with the chip picked to Server out of sight: the
+        // account's own door, now and when it drains, once the chip is back on its pick.
         state.composer_dictating = true;
-        let quiet = state.hold_for_send("m_2".into(), "and this".into(), None, None, None);
+        let dictated = state.hold_for_send("m_2".into(), "and this".into(), None, None, None);
+        assert_eq!(dictated.inference_source, Some(InferenceKind::LocalProxy));
+        assert_eq!(
+            serde_json::to_value(super::pending_write_for(&dictated)).unwrap()["inferenceSource"],
+            "local_proxy"
+        );
+        state.composer_dictating = false;
+        assert_eq!(chip(&state), Some((InferenceKind::Gateway, true)));
+        state.enqueue_hold("cw_1".into(), dictated);
+        let drained = state.pop_queued_send("cw_1").expect("the hold drains");
+        assert_eq!(
+            state.turn_inference_source(Some(&drained)),
+            Some(InferenceKind::LocalProxy)
+        );
+
+        // Held before the setting was read: no chip, no door, now or when it drains.
+        let mut state = signed_in_state();
+        let quiet = state.hold_for_send("m_3".into(), "early".into(), None, None, None);
         assert_eq!(quiet.inference_source, None);
         assert!(
             serde_json::to_value(super::pending_write_for(&quiet))
@@ -31817,10 +31972,63 @@ mod tests {
                 .get("inferenceSource")
                 .is_none()
         );
-        state.composer_dictating = false;
+        read_as(
+            &mut state,
+            kept(InferenceKind::LocalProxy, Some("gpt-5-codex")),
+        );
         state.enqueue_hold("cw_1".into(), quiet);
         let drained = state.pop_queued_send("cw_1").expect("the hold drains");
         assert_eq!(state.turn_inference_source(Some(&drained)), None);
+    }
+
+    /// A turn sent while the composer dictates, its chip given over to the dictation's buttons,
+    /// names the account's own door as Settings shows it, and not a pick on the chip nobody can
+    /// see: an account on the person's plan with Server picked goes through the plan, and one on
+    /// the server's keys with My plan picked goes through the keys. It names nothing where no
+    /// door is known (the setting not read, or a server without reply sources) and where there
+    /// is no chip to hide, as a turn typed then would.
+    #[test]
+    fn a_turn_sent_while_dictating_names_the_accounts_own_door() {
+        let mut state = signed_in_state();
+        state.composer_dictating = true;
+        assert_eq!(state.turn_inference_source(None), None, "nothing read");
+        state.reply_source.kept = Some(ReplySourceRead::NotOnServer);
+        assert_eq!(
+            state.turn_inference_source(None),
+            None,
+            "a server without reply sources"
+        );
+        read_as(&mut state, kept(InferenceKind::Gateway, None));
+        assert_eq!(
+            state.turn_inference_source(None),
+            None,
+            "no plan to switch to, so no chip to hide"
+        );
+        state.composer_dictating = false;
+        assert_eq!(state.turn_inference_source(None), None, "as when typed");
+
+        for (account, pick) in [
+            (InferenceKind::LocalProxy, InferenceKind::Gateway),
+            (InferenceKind::Gateway, InferenceKind::LocalProxy),
+        ] {
+            let mut state = signed_in_state();
+            read_as(&mut state, kept(account, Some("gpt-5-codex")));
+            assert!(state.flip_turn_source());
+            assert_eq!(state.turn_inference_source(None), Some(pick), "typed");
+            state.composer_dictating = true;
+            assert_eq!(chip(&state), None);
+            assert_eq!(
+                state.turn_inference_source(None),
+                Some(account),
+                "dictated: the account's door, not the hidden pick"
+            );
+            state.composer_dictating = false;
+            assert_eq!(
+                state.turn_inference_source(None),
+                Some(pick),
+                "the pick again"
+            );
+        }
     }
 
     /// An edit of a held send carries the door it was held with, so the row the server drains
@@ -32262,6 +32470,61 @@ mod tests {
         );
     }
 
+    /// The URL and key fields take typing only while the page draws them editable, as the radio
+    /// and the picker take a click only then: before the setting is read, while a Save is out,
+    /// and where the server is not on this Mac, what reaches them changes no draft. The key field
+    /// is read-only while Remove key waits for Save too; the URL is not.
+    #[test]
+    fn a_field_drawn_read_only_takes_no_typing() {
+        let typed = |state: &mut AppState| {
+            (
+                state.note_reply_source_url("http://127.0.0.1:9090".into()),
+                state.note_reply_source_key("sk-proxy-1"),
+            )
+        };
+        let drafts = |state: &AppState| {
+            (
+                state.reply_source.url_draft.clone(),
+                state.reply_source.key_draft.is_some(),
+            )
+        };
+
+        let mut state = signed_in_state();
+        assert_eq!(typed(&mut state), (false, false), "not read yet");
+        assert_eq!(drafts(&state), (None, false));
+
+        read_as(
+            &mut state,
+            InferenceSource {
+                has_api_key: true,
+                ..kept(InferenceKind::Gateway, None)
+            },
+        );
+        assert!(state.note_reply_source_url("http://127.0.0.1:8081".into()));
+        assert!(state.note_reply_source_key("sk-proxy-0"));
+        assert!(state.begin_reply_source_save().is_some());
+        assert_eq!(typed(&mut state), (false, false), "a Save is out");
+        assert_eq!(
+            drafts(&state),
+            (Some("http://127.0.0.1:8081".into()), false),
+            "the address waits on the Save as it was, and its key went with it"
+        );
+        state.reply_source.saving = None;
+
+        assert!(state.note_remove_reply_source_key());
+        assert!(state.reply_source.plan_editable() && !state.reply_source.key_editable());
+        assert!(
+            state.note_reply_source_url("http://127.0.0.1:9090".into()),
+            "Remove key leaves the address alone"
+        );
+
+        let mut state = signed_in_state();
+        state.opengrok = Some(OpenGrokClient::new("https://opengrok.example.com").unwrap());
+        read_as(&mut state, kept(InferenceKind::Gateway, None));
+        assert_eq!(typed(&mut state), (false, false), "the server is elsewhere");
+        assert_eq!(drafts(&state), (None, false));
+    }
+
     /// Settings → Reply source coming on screen is told once, which is when the setting and the
     /// models are read; and a key typed there and not saved does not outlive the page: leaving
     /// the tab, or Settings, drops it, and the page asks for it again when it is back. Signing
@@ -32460,7 +32723,8 @@ mod tests {
     }
 
     /// The page offers the models `GET /models` lists as the person's plan's, in its order, and
-    /// never one the server would refuse for a subscription; the gateway's are the Bot's.
+    /// never one the server would refuse for a subscription: Claude, or an id it does not know
+    /// to be OpenAI's or xAI's. The gateway's are the Bot's.
     #[test]
     fn the_page_offers_only_the_plans_models() {
         let mut state = AppState::new();
@@ -32473,6 +32737,8 @@ mod tests {
                 entry("oag/cheap", None),
                 entry("gpt-5-codex", Some("local_proxy")),
                 entry("claude-sonnet-4.5", Some("local_proxy")),
+                entry("my-codex-thing", Some("local_proxy")),
+                entry("llama-3.1-70b", Some("local_proxy")),
                 entry("grok-4", Some("local_proxy")),
                 entry("oag/fast", Some("gateway")),
             ],
@@ -32736,7 +33002,7 @@ mod tests {
             unread_count: 0,
             origin: None,
         });
-        state.overlay_replay_cards(
+        let filled = state.overlay_replay_cards(
             "cw_1",
             &[
                 thread_run("run_1", "finished", 1_000, &journal("run_1", on_plan())),
@@ -32750,14 +33016,27 @@ mod tests {
             .map(|m| m.reply_source.clone())
             .collect();
         assert_eq!(badges, vec![Some(plan.clone()), Some(paid.clone()), None]);
+        assert_eq!(
+            filled,
+            vec![super::ReplayedBadge {
+                message_id: "m_1".into(),
+                run_id: "run_1".into(),
+                source: plan.clone(),
+            }],
+            "only the badge it filled in goes to a row"
+        );
 
-        // A replay painting a run the thread holds.
+        // A replay painting a run the thread holds says so when the badge changes, and only then.
         let (_, _, said) = super::replayed_run(&journal("run_4", on_plan()), "finished");
         let mut live = message("m_4", false, "");
-        super::wear_replayed_source(&mut live, said);
+        assert!(super::wear_replayed_source(&mut live, said.clone()));
         assert_eq!(live.reply_source.as_ref(), Some(&plan));
+        assert!(
+            !super::wear_replayed_source(&mut live, said),
+            "the next poll says it again"
+        );
         let (_, _, silent) = super::replayed_run(&journal("run_4", None), "running");
-        super::wear_replayed_source(&mut live, silent);
+        assert!(!super::wear_replayed_source(&mut live, silent));
         assert_eq!(
             live.reply_source,
             Some(plan),
@@ -32813,5 +33092,129 @@ mod tests {
         let mut known = reply.save_stamp();
         known.source_json = Some(gateway.to_json());
         assert_eq!(write("run_3", known).await, Some(gateway));
+    }
+
+    /// A badge a thread's replay fills in is written down, as the live stream's is with its
+    /// reply: the thread reopened from disk wears it without asking the server, and the next
+    /// replay has nothing left to fill in. The row takes it only while it is still filed under
+    /// the run whose journal named the door; one written since under another run keeps what that
+    /// write gave it, and a reply with no row yet has nothing to take it.
+    #[tokio::test]
+    async fn a_badge_a_replay_fills_in_is_written_down() {
+        let plan = ReplySource {
+            kind: InferenceKind::LocalProxy,
+            model: Some("gpt-5-codex".into()),
+        };
+        let journal = |run: &str, source: Option<serde_json::Value>| {
+            let mut events = vec![json!({"type": "RUN_STARTED", "runId": run, "threadId": "cw_1"})];
+            events.extend(source.map(|value| {
+                json!({"type": "CUSTOM", "name": "opengrok.inferenceSource", "value": value})
+            }));
+            events.extend([
+                json!({"type": "TEXT_MESSAGE_START", "messageId": run, "role": "assistant"}),
+                json!({"type": "TEXT_MESSAGE_CONTENT", "messageId": run, "delta": "Done."}),
+                json!({"type": "TEXT_MESSAGE_END", "messageId": run}),
+                json!({"type": "RUN_FINISHED", "runId": run}),
+            ]);
+            events
+        };
+        let runs = [
+            thread_run(
+                "run_1",
+                "finished",
+                1_000,
+                &journal(
+                    "run_1",
+                    Some(json!({"kind": "local_proxy", "model": "gpt-5-codex"})),
+                ),
+            ),
+            thread_run("run_2", "finished", 2_000, &journal("run_2", None)),
+        ];
+        async fn reopened(db: &DatabaseService) -> Vec<Message> {
+            let rows = db.get_messages("cw_1").await.expect("the thread reopens");
+            rows.into_iter().map(restored_message).collect()
+        }
+        let db = test_db().await;
+        db.ensure_session("cw_1", "Ada").await.expect("a session");
+        // Two replies written down before their runs' doors were kept.
+        for (id, run, at_ms) in [("m_1", "run_1", 1_000), ("m_2", "run_2", 2_000)] {
+            let reply = from_run(id, "Done.", run, at_ms);
+            keep_reply(
+                &db,
+                "cw_1",
+                "Ada",
+                id,
+                "Done.",
+                &[],
+                Some(run),
+                false,
+                reply.save_stamp(),
+            )
+            .await
+            .expect("saved");
+        }
+
+        let mut state = AppState::new();
+        state
+            .conversations
+            .push(thread("cw_1", reopened(&db).await));
+        let filled = state.overlay_replay_cards("cw_1", &runs);
+        super::keep_replayed_badges(&db, &filled).await;
+        let badges: Vec<(String, Option<ReplySource>)> = reopened(&db)
+            .await
+            .into_iter()
+            .map(|m| (m.id, m.reply_source))
+            .collect();
+        assert_eq!(
+            badges,
+            vec![("m_1".into(), Some(plan.clone())), ("m_2".into(), None)],
+            "reopened from disk, the badge the replay filled in is there"
+        );
+        let mut again = AppState::new();
+        again
+            .conversations
+            .push(thread("cw_1", reopened(&db).await));
+        assert!(again.overlay_replay_cards("cw_1", &runs).is_empty());
+
+        // m_2 written again under run_3 before run_2's badge landed: run_2's door says nothing
+        // about run_3, so the row keeps the none its last write gave it.
+        let refiled = from_run("m_2", "Again.", "run_3", 2_000);
+        keep_reply(
+            &db,
+            "cw_1",
+            "Ada",
+            "m_2",
+            "Again.",
+            &[],
+            Some("run_3"),
+            false,
+            refiled.save_stamp(),
+        )
+        .await
+        .expect("saved");
+        super::keep_replayed_badges(
+            &db,
+            &[super::ReplayedBadge {
+                message_id: "m_2".into(),
+                run_id: "run_2".into(),
+                source: plan.clone(),
+            }],
+        )
+        .await;
+        let m_2 = reopened(&db)
+            .await
+            .into_iter()
+            .find(|m| m.id == "m_2")
+            .unwrap();
+        assert_eq!(
+            (m_2.run_id.as_deref(), m_2.reply_source),
+            (Some("run_3"), None)
+        );
+        assert!(
+            !db.keep_reply_source("m_9", "run_9", &plan.to_json())
+                .await
+                .expect("asked"),
+            "no row, nothing written"
+        );
     }
 }

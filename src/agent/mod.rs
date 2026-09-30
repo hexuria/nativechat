@@ -207,18 +207,20 @@
 //! app's server is on this Mac); `settings-reply-source-elsewhere` where it is not (the page's
 //! line saying the plan is set up only from the server's own Mac); `settings-reply-source-url`
 //! (value = the proxy URL shown; `set_value` and `type` write it as typing would, and an empty
-//! one clears the address with the next Save); `settings-reply-source-model` (a menu, value = the
-//! model shown; state `empty` while the server lists no model of the person's plan) with
-//! `settings-reply-source-no-model` (while a model is shown: none, which clears it with the next
-//! Save) and a `settings-reply-source-model-{id}` per model it offers (state `selected` on the
-//! shown one; a click picks it); `settings-reply-source-models-note` (the line under the picker:
-//! why it offers nothing, or that opencodex is down and these are the models it listed last);
-//! `settings-reply-source-key` (never valued: states `set` while the server holds a key, `typed`
-//! while one waits for Save, which the window draws as masked dots whoever typed it; `set_value`
-//! writes the whole key, `type` is refused); `settings-reply-source-remove-key` (while the server
-//! holds a key: label `Remove key`, or `Keep key` with state `picked` while its removal waits
-//! for Save); `settings-reply-source-health` (label the line, value `running` / `not-running` /
-//! `no-address`); `settings-reply-source-providers` (why Claude and Gemini are not offered);
+//! one clears the address with the next Save; `key` is refused); `settings-reply-source-model`
+//! (a menu, value = the model shown; state `empty` while the server lists no model of the
+//! person's plan) with `settings-reply-source-no-model` (while a model is shown: none, which
+//! clears it with the next Save) and a `settings-reply-source-model-{id}` per model it offers
+//! (state `selected` on the shown one; a click picks it); `settings-reply-source-models-note`
+//! (the line under the picker: why it offers nothing, or that opencodex is down and these are
+//! the models it listed last); `settings-reply-source-key` (never valued: states `set` while the
+//! server holds a key, `typed` while one waits for Save, which the window draws as masked dots
+//! whoever typed it; `set_value` writes the whole key, `type` and `key` are refused; disabled,
+//! as the window draws it, while Remove key is picked); `settings-reply-source-remove-key`
+//! (while the server holds a key: label `Remove key`, or `Keep key` with state `picked` while
+//! its removal waits for Save); `settings-reply-source-health` (label the line, value
+//! `running` / `not-running` / `no-address`); `settings-reply-source-providers` (why Claude and
+//! Gemini are not offered);
 //! `settings-reply-source-error` (the server's words for a refused Save, why nobody knows what
 //! became of one, or a read that failed, and after a Save or a page left with a key typed, the
 //! line asking for it again; state `trouble` while drawn in the danger colour, a refusal or a

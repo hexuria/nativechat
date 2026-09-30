@@ -231,6 +231,30 @@ impl DatabaseService {
         Ok(())
     }
 
+    /// Write down which door a reply came through, learned from a replay of its run, on the
+    /// reply's row. Only a row still filed under that run takes it: the badge is the run's, as in
+    /// `save_message`, and a row since written under another run keeps the source that write
+    /// gave it, or none. Nothing else of the row is touched, and a reply not written down yet has
+    /// no row to take it; the write that makes one carries the badge from its bubble. Reports
+    /// whether a row took it.
+    pub async fn keep_reply_source(
+        &self,
+        id: &str,
+        run_id: &str,
+        source_json: &str,
+    ) -> Result<bool> {
+        let written = sqlx::query(
+            "UPDATE chat_messages SET inference_source = ? WHERE id = ? AND run_id = ?",
+        )
+        .bind(source_json)
+        .bind(id)
+        .bind(run_id)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        Ok(written == 1)
+    }
+
     /// Write down something the person said that a replay brought back, under the id it was
     /// sent with, unless a row already has that id.
     ///

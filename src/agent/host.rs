@@ -1174,7 +1174,8 @@ fn not_editable(target: &str) -> String {
     format!(
         "`{target}` is not editable (composer, login-email, login-password, \
          user-form-field-*, settings-logins-search, settings-skills-search, \
-         settings-login-notes-*, or \"\" for whatever holds the caret)"
+         settings-login-notes-*, settings-reply-source-url, settings-reply-source-key, or \"\" \
+         for whatever holds the caret)"
     )
 }
 
@@ -4469,7 +4470,7 @@ impl NativeChatHost {
         }
         // The window draws a key waiting for Save as masked dots in the field, a driver's too.
         let mut key = UiNode::textbox(ids::REPLY_SOURCE_KEY, "Proxy key")
-            .with_enabled(plan_live && !settings.remove_key);
+            .with_enabled(settings.key_editable());
         if kept.has_api_key {
             key.states.push("set".into());
         }
@@ -4674,26 +4675,53 @@ impl NativeChatHost {
         Err(format!("`{target}` is a line on the page, not a control"))
     }
 
-    /// `set_value` on Settings → Reply source's URL or key field, as typing it there would; the
-    /// key goes to the page, which draws it masked, and never into a tree. Refused off the page,
-    /// while it is dead, and where the server is not on this Mac.
-    fn set_reply_source_field(
-        &mut self,
-        target: &str,
-        value: &str,
-    ) -> Result<DispatchResult, String> {
+    /// Why Settings → Reply source's URL or key field takes no typing now, or `None` while it
+    /// does: the page's own reasons for drawing it read-only, as the radio and the picker give
+    /// them for a click. Off the page, before the setting is read, while a Save is out, where
+    /// the server is not on this Mac, and the key while Remove key is picked. Every way a driver
+    /// types asks it first (`set_value`, `type`, `key`), so none of them reaches a draft the
+    /// window would not let a person change.
+    fn reply_source_field_closed(&self, target: &str) -> Option<String> {
         if !(self.account_open && self.reply_source_tab) {
-            return Err(format!(
+            return Some(format!(
                 "`{target}` is on Settings → Reply source, which is not what is on screen: open \
                  it with `{}`",
                 ids::SETTINGS_REPLY_SOURCE
             ));
         }
-        if !self.reply_source.settings.plan_editable() {
-            return Err(format!(
-                "`{target}` is dead: the setting is not read yet, a Save is with the server, or \
-                 this app's server is not on this Mac"
+        let settings = &self.reply_source.settings;
+        if settings.kept_source().is_none() {
+            let line = reply_source::unavailable_line(settings).unwrap_or(reply_source::ASKING);
+            return Some(format!("no `{target}` on screen: {line}"));
+        }
+        if !settings.can_edit() {
+            return Some(format!("`{target}` is dead: a Save is with the server"));
+        }
+        if !settings.plan_editable() {
+            return Some(format!(
+                "`{target}` is dead: {}",
+                reply_source::ELSEWHERE_LINE
             ));
+        }
+        if target == ids::REPLY_SOURCE_KEY && !settings.key_editable() {
+            return Some(format!(
+                "`{target}` is dead: Remove key waits for Save; `{}`, now Keep key, takes it back",
+                ids::REPLY_SOURCE_REMOVE_KEY
+            ));
+        }
+        None
+    }
+
+    /// `set_value` on Settings → Reply source's URL or key field, as typing it there would; the
+    /// key goes to the page, which draws it masked, and never into a tree. Refused wherever the
+    /// page draws the field read-only ([`Self::reply_source_field_closed`]).
+    fn set_reply_source_field(
+        &mut self,
+        target: &str,
+        value: &str,
+    ) -> Result<DispatchResult, String> {
+        if let Some(closed) = self.reply_source_field_closed(target) {
+            return Err(closed);
         }
         self.pending = Some(if target == ids::REPLY_SOURCE_URL {
             Command::SetReplySourceUrl(value.to_string())
@@ -5713,9 +5741,7 @@ impl NativeChatHost {
             return self.set_reply_source_field(target, &url);
         }
         if target == ids::REPLY_SOURCE_KEY {
-            // What the field holds is never copied here, so there is nothing to add to: the key
-            // is written whole.
-            return Err(format!("`{target}` takes the whole key: use set_value"));
+            return Err(self.reply_source_field_keys(target));
         }
         if let Some(refusal) = self.skill_sheet_field(target) {
             return refusal;
@@ -5727,6 +5753,22 @@ impl NativeChatHost {
         })
     }
 
+    /// Keys aimed at Settings → Reply source's URL or key field, one by one: `key` on either,
+    /// `type` on the key. They are refused, and say what writes the field instead, or first why
+    /// the page draws it read-only. What the key field holds is never copied here, so there is
+    /// nothing to add a key to or take one off: the key is written whole. The URL is written by
+    /// `set_value`, and `type` adds to it.
+    fn reply_source_field_keys(&self, target: &str) -> String {
+        if let Some(closed) = self.reply_source_field_closed(target) {
+            return closed;
+        }
+        if target == ids::REPLY_SOURCE_KEY {
+            format!("`{target}` takes the whole key: use set_value")
+        } else {
+            format!("`{target}` takes text, not single keys: use set_value, or type to add to it")
+        }
+    }
+
     /// Press one key. No modifiers: a chord is `op keybinding`'s business, not this one's.
     fn key(&mut self, target: &str, key: &str) -> Result<DispatchResult, String> {
         if let Some(field) = login_field(target) {
@@ -5734,6 +5776,9 @@ impl NativeChatHost {
         }
         if let Some(refusal) = self.skill_sheet_field(target) {
             return refusal;
+        }
+        if target == ids::REPLY_SOURCE_URL || target == ids::REPLY_SOURCE_KEY {
+            return Err(self.reply_source_field_keys(target));
         }
         if target == ids::SKILLS_SEARCH {
             return match key_token(key)?.as_str() {
@@ -11453,6 +11498,112 @@ mod tests {
         let host = NativeChatHost::from_app(&state);
         assert!(host.reply_source.key_typed && host.reply_source.unsaved);
         assert_eq!(host.reply_source.settings.key_draft, None);
+    }
+
+    /// A key pressed at Settings → Reply source's URL or key field is answered as the page
+    /// answers typing there, never with the list of what takes text as if the field were not
+    /// one: first why the page draws it read-only (off the page, before the setting is read, a
+    /// Save out, the server on another machine, and for the key a Remove key waiting for Save),
+    /// and otherwise what writes it. `set_value` and `type` are refused for the same reasons.
+    /// None of them leaves a command or a keystroke behind, so no draft changes.
+    #[test]
+    fn a_key_at_a_reply_source_field_is_refused_as_the_page_refuses_typing() {
+        use crate::components::reply_source::ELSEWHERE_LINE;
+        use crate::opengrok::{InferenceKind, InferenceSource};
+        use crate::state::ReplySourceRead;
+        let fields = [ids::REPLY_SOURCE_URL, ids::REPLY_SOURCE_KEY];
+        let typing = |target: &str| {
+            [
+                Op::key(target, "a"),
+                Op::type_text(target, "a"),
+                Op::SetValue {
+                    target: target.into(),
+                    value: "a".into(),
+                },
+            ]
+        };
+        let mut host = host();
+        host.account_open = true;
+        host.reply_source_tab = true;
+        for field in fields {
+            for op in typing(field) {
+                let refused = host.dispatch(&op).unwrap_err();
+                assert!(
+                    refused.contains("on screen: Asking the server"),
+                    "{refused}"
+                );
+            }
+        }
+
+        host.reply_source.settings.kept = Some(ReplySourceRead::Read(InferenceSource {
+            base_url: Some("http://127.0.0.1:8080".into()),
+            has_api_key: true,
+            ..kept_source(InferenceKind::Gateway, true)
+        }));
+        host.reply_source.settings.server_on_this_mac = true;
+        let url = host
+            .dispatch(&Op::key(ids::REPLY_SOURCE_URL, "backspace"))
+            .unwrap_err();
+        assert!(
+            url.contains("use set_value, or type") && !url.contains("is not editable"),
+            "{url}"
+        );
+        let key = host
+            .dispatch(&Op::key(ids::REPLY_SOURCE_KEY, "a"))
+            .unwrap_err();
+        assert!(
+            key.contains("takes the whole key: use set_value") && !key.contains("is not editable"),
+            "{key}"
+        );
+        assert!(host.take_compose().is_none() && host.take_command().is_none());
+
+        // Remove key waits for Save: the key field is drawn read-only and takes nothing, and the
+        // URL, which Remove key has nothing to do with, still does.
+        host.reply_source.settings.remove_key = true;
+        assert!(!host.snapshot().find(ids::REPLY_SOURCE_KEY).unwrap().enabled);
+        for op in typing(ids::REPLY_SOURCE_KEY) {
+            let refused = host.dispatch(&op).unwrap_err();
+            assert!(refused.contains(ids::REPLY_SOURCE_REMOVE_KEY), "{refused}");
+        }
+        assert!(host.take_command().is_none());
+        host.set_value(ids::REPLY_SOURCE_URL, "http://127.0.0.1:9090")
+            .unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::SetReplySourceUrl(url)) if url == "http://127.0.0.1:9090"
+        ));
+        host.reply_source.settings.remove_key = false;
+
+        host.reply_source.settings.saving = Some(4);
+        for field in fields {
+            for op in typing(field) {
+                let refused = host.dispatch(&op).unwrap_err();
+                assert!(refused.contains("a Save is with the server"), "{refused}");
+            }
+        }
+        host.reply_source.settings.saving = None;
+        host.reply_source.settings.server_on_this_mac = false;
+        for field in fields {
+            for op in typing(field) {
+                let refused = host.dispatch(&op).unwrap_err();
+                assert!(refused.contains(ELSEWHERE_LINE), "{refused}");
+            }
+        }
+        host.reply_source_tab = false;
+        for field in fields {
+            for op in typing(field) {
+                let refused = host.dispatch(&op).unwrap_err();
+                assert!(refused.contains(ids::SETTINGS_REPLY_SOURCE), "{refused}");
+            }
+        }
+        assert!(host.take_compose().is_none() && host.take_command().is_none());
+
+        // Where nothing takes text, the list of what does names both fields.
+        let elsewhere = host.dispatch(&Op::key(ids::SIDEBAR, "a")).unwrap_err();
+        assert!(
+            elsewhere.contains(ids::REPLY_SOURCE_URL) && elsewhere.contains(ids::REPLY_SOURCE_KEY),
+            "{elsewhere}"
+        );
     }
 
     /// The composer's chip is on the tree while there is a choice of door, valued by the door and

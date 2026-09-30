@@ -15,10 +15,10 @@
 //! open-ai-gateway and opengrok-server (2026-09-30), and checked against the server's half as
 //! built in opengrok-server #294: the routes in `crates/opengrok-server/src/inference.rs`, what a
 //! Save does and what a read answers (`apply`, `described`, `loopback_base`) in
-//! `crates/opengrok-harness/src/local_proxy.rs`, and the door's words and the forbidden
-//! providers in `crates/opengrok-core/src/inference.rs`. The conformance ledger reads the two
-//! routes and the CUSTOM frame against the server's recording, vendored in `fixtures/wire/` from
-//! its main at d16b10e (pin 7d6e3d0).
+//! `crates/opengrok-harness/src/local_proxy.rs`, and the door's words and the models a
+//! subscription may answer in `crates/opengrok-core/src/inference.rs`. The conformance ledger
+//! reads the two routes and the CUSTOM frame against the server's recording, vendored in
+//! `fixtures/wire/` from its main at d16b10e (pin 7d6e3d0).
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -213,17 +213,51 @@ impl ReplySource {
     }
 }
 
-/// Whether a model is one "My subscription" must never be pointed at. The server routes only
-/// OpenAI/Codex and xAI/Grok models to a person's subscription and refuses the rest, so the
-/// picker never offers what the server would refuse, even should a list ever carry one: the
-/// terms of Anthropic and Google forbid routing a consumer subscription through another app. The
-/// words are the server's own list (`FORBIDDEN` in `crates/opengrok-core/src/inference.rs`): an
-/// id that has any of them anywhere in it, in any case.
-pub fn is_forbidden_subscription_model(id: &str) -> bool {
-    let id = id.to_ascii_lowercase();
-    ["anthropic", "claude", "google", "gemini"]
+/// Whether "My subscription" may be pointed at a model, by the server's own rule, so the picker
+/// never offers what a Save would be refused for, even should a list ever carry one (a list held
+/// from before, or a server that tags a row `local_proxy` without asking): `subscription_model`
+/// in opengrok-server's `crates/opengrok-core/src/inference.rs`, anchored as its follow-up to
+/// #294 has it. Main at d16b10e still takes `codex` anywhere in an id, so until that lands the
+/// picker is the stricter of the two.
+///
+/// An allowlist, not a denylist: an id it does not recognise is refused, so a provider nobody
+/// has looked at is not offered by being new. With an `openai/` or `xai/` prefix and the `--fast`
+/// tier taken off, the id STARTS with `gpt-`, `o1`, `o3`, `o4` or `codex` (OpenAI's) or `grok-`
+/// (xAI's), and a prefix names the provider its model is from; an id that only contains one of
+/// those words (`my-codex-thing`, `notgrok-1`) is nobody's the server knows. Claude and Gemini
+/// are refused wherever their names, or their makers', appear in an id: Anthropic's and Google's
+/// terms forbid routing a consumer subscription through a third-party app.
+pub fn is_subscription_model(id: &str) -> bool {
+    let id = id.trim().to_ascii_lowercase();
+    if id.is_empty()
+        || ["anthropic", "claude", "google", "gemini"]
+            .iter()
+            .any(|provider| id.contains(provider))
+    {
+        return false;
+    }
+    let (provider, core) = id
+        .split_once('/')
+        .map_or((None, id.as_str()), |(provider, core)| {
+            (Some(provider), core)
+        });
+    let core = core.strip_suffix("--fast").unwrap_or(core);
+    let openai = ["gpt-", "o1", "o3", "o4", "codex"]
         .iter()
-        .any(|provider| id.contains(provider))
+        .any(|start| core.starts_with(start));
+    let xai = core.starts_with("grok-");
+    let recognised = match provider {
+        None => openai || xai,
+        Some("openai") => openai,
+        Some("xai") => xai,
+        Some(_) => false,
+    };
+    recognised
+        && id.len() <= 128
+        && !core.contains('/')
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"-._:/".contains(&byte))
 }
 
 #[cfg(test)]
@@ -426,28 +460,61 @@ mod tests {
         assert_eq!(ReplySource::from_json(r#"{"kind":"elsewhere"}"#), None);
     }
 
-    /// Anthropic's and Google's models are never offered for the person's subscription,
-    /// however the id spells its provider, as the server's list reads them: any id with
-    /// `google` anywhere in it included. OpenAI's and xAI's are.
+    /// Only OpenAI's and xAI's models are offered for the person's subscription, as the server's
+    /// anchored allowlist reads them: bare or with their own provider's prefix, in any case, with
+    /// or without the `--fast` tier. An id that only contains an allowed word is nobody's, and
+    /// neither is one from a provider nobody has looked at. Anthropic's and Google's are refused
+    /// wherever their names appear, an allowed start included.
     #[test]
-    fn claude_and_gemini_are_never_a_subscription_model() {
-        for forbidden in [
-            "claude-sonnet-4.5",
-            "anthropic/claude-opus",
-            "Gemini-2.5-Pro",
-            "google/gemini-flash",
-            "google-palm-2",
-            "vertex/Google-model",
-        ] {
-            assert!(is_forbidden_subscription_model(forbidden), "{forbidden}");
-        }
+    fn only_openai_and_xai_models_are_a_subscription_model() {
         for allowed in [
             "gpt-5-codex",
             "openai/gpt-5",
+            "GPT-5.5",
+            "o3-mini",
+            "o4",
+            "codex-mini-latest",
+            "gpt-6-sol--fast",
             "grok-4",
             "xai/grok-code-fast",
+            "xai/grok-4.7--fast",
         ] {
-            assert!(!is_forbidden_subscription_model(allowed), "{allowed}");
+            assert!(is_subscription_model(allowed), "{allowed}");
+        }
+        for merely_contains in [
+            "my-codex-thing",
+            "my-codex-thing--fast",
+            "openai/my-codex-thing",
+            "notgrok-1",
+            "xai/notgrok-1",
+            "xgpt-5.5",
+            "turbo-o3",
+            "xai/codex-mini-latest",
+            "openai/grok-4",
+        ] {
+            assert!(!is_subscription_model(merely_contains), "{merely_contains}");
+        }
+        for forbidden in [
+            "claude-sonnet-4.5",
+            "anthropic/claude-opus",
+            "claude-codex",
+            "Gemini-2.5-Pro",
+            "google/gemini-flash",
+            "gemini-gpt-4",
+            "gpt-5-google",
+        ] {
+            assert!(!is_subscription_model(forbidden), "{forbidden}");
+        }
+        for unknown in [
+            "",
+            "  ",
+            "llama-3.1-70b",
+            "oag/cheap",
+            "meta/gpt-5",
+            "openai/gpt-5/extra",
+            "gpt-5 codex",
+        ] {
+            assert!(!is_subscription_model(unknown), "{unknown:?}");
         }
     }
 }
