@@ -11,6 +11,7 @@ use serde_json::Value;
 
 use super::client::LocalExecMode;
 use super::credential::SaveLoginSpec;
+use super::inference::{INFERENCE_SOURCE_CUSTOM, ReplySource};
 use super::user_form::{
     ComputerHandoffSpec, UserFormSpec, is_user_form_awaiting, is_user_form_tool,
 };
@@ -687,6 +688,10 @@ pub struct TurnAssembler {
     /// Thoughts still being said, in the order they began. Each becomes a part when its message
     /// ends, when a call starts while it is being said, or when the run ends.
     reasoning: Vec<OpenThought>,
+    /// Which door the run's model calls go through, from its `opengrok.inferenceSource` CUSTOM
+    /// ([`ReplySource`]). It is not a part: it paints nothing in the reply, and is the reply's
+    /// badge.
+    source: Option<ReplySource>,
 }
 
 /// A thought still being said: its message id, and as much of it as is kept (see
@@ -878,6 +883,15 @@ impl TurnAssembler {
             }
             "CUSTOM" => {
                 let name = event.get("name").and_then(Value::as_str).unwrap_or("");
+                // Which door the run went through, said right after RUN_STARTED, live and in a
+                // replay alike. Read before anything else can take it for a card or a widget,
+                // and never drawn in the reply: it is the reply's badge.
+                if name == INFERENCE_SOURCE_CUSTOM {
+                    if let Some(source) = ReplySource::from_event(event) {
+                        self.source = Some(source);
+                    }
+                    return;
+                }
                 if is_user_form_awaiting(event) {
                     self.flush_text();
                     let call_id = event
@@ -1063,6 +1077,12 @@ impl TurnAssembler {
 
     pub fn waiting_approval(&self) -> bool {
         self.waiting_approval
+    }
+
+    /// Which door the run's reply came through, once its `opengrok.inferenceSource` CUSTOM has
+    /// arrived. A server from before reply sources sends none, and a reply of its has no badge.
+    pub fn reply_source(&self) -> Option<&ReplySource> {
+        self.source.as_ref()
     }
 
     /// An unresolved user-form card or live Computer sibling is on the turn.
@@ -2138,6 +2158,53 @@ mod tests {
 
     fn text(delta: &str) -> Value {
         json!({"type":"TEXT_MESSAGE_CONTENT","delta":delta})
+    }
+
+    /// The badge comes from the live stream's own frame, the CUSTOM the server sends right after
+    /// RUN_STARTED, and from that frame alone: it is on the reply from the moment it arrives,
+    /// paints nothing among the reply's words, and a run with no such frame has no badge.
+    #[test]
+    fn the_reply_source_comes_from_the_custom_frame_and_paints_nothing() {
+        use super::super::inference::InferenceKind;
+        let mut live = TurnAssembler::default();
+        live.push_event(&json!({"type": "RUN_STARTED", "runId": "r1", "threadId": "cw_1"}));
+        assert_eq!(live.reply_source(), None, "nothing said yet");
+        live.push_event(&json!({
+            "type": "CUSTOM",
+            "name": INFERENCE_SOURCE_CUSTOM,
+            "value": {"kind": "local_proxy", "model": "gpt-5-codex"}
+        }));
+        assert_eq!(
+            live.reply_source(),
+            Some(&ReplySource {
+                kind: InferenceKind::LocalProxy,
+                model: Some("gpt-5-codex".into()),
+            }),
+            "on the reply before a word of it has come"
+        );
+        assert_eq!(live.snapshot(), (String::new(), Vec::new()));
+        live.push_event(&text("Done."));
+        live.push_event(&json!({"type": "RUN_FINISHED", "runId": "r1"}));
+        live.finish();
+        assert_eq!(live.snapshot().1, vec![ChatPart::Text("Done.".into())]);
+        assert_eq!(
+            live.reply_source().map(|source| source.kind),
+            Some(InferenceKind::LocalProxy)
+        );
+
+        // A frame of a door this app cannot name leaves the badge off rather than guessing.
+        let mut odd = TurnAssembler::default();
+        odd.push_event(&json!({
+            "type": "CUSTOM", "name": INFERENCE_SOURCE_CUSTOM, "value": {"kind": "byok"}
+        }));
+        odd.push_event(&text("Hi."));
+        assert_eq!(odd.reply_source(), None);
+        assert_eq!(odd.snapshot().1, vec![ChatPart::Text("Hi.".into())]);
+
+        let mut older = TurnAssembler::default();
+        older.push_event(&json!({"type": "RUN_STARTED", "runId": "r1", "threadId": "cw_1"}));
+        older.push_event(&text("Hi."));
+        assert_eq!(older.reply_source(), None, "a server before reply sources");
     }
 
     fn review_card(why: &str) -> ApprovalSpec {

@@ -29,7 +29,8 @@
 //!   in [`REST_NOT_RECORDED_YET`], which says what brings its fixtures, until the corpus holds
 //!   it;
 //! - the ledger, every wire word this app branches on, is either a word the manifest says the
-//!   server sends or excused in [`NOT_SENT_BY_SERVER`], with the evidence;
+//!   server sends, excused in [`NOT_SENT_BY_SERVER`] with the evidence, or read ahead of the
+//!   server's recording in [`WORDS_NOT_RECORDED_YET`], which says what brings it;
 //! - every word the server sends is either in the ledger or excused in [`CLIENT_IGNORES`], so a
 //!   name the server starts sending fails here before a person finds it missing on screen;
 //! - [`KNOWN_DRIFT`] names the fixtures this app still reads wrongly. Their checks must fail, so
@@ -62,6 +63,7 @@ use super::gen_ui::{
     USER_MACHINE_SHELL, approval_from_event, approval_summary, capped, command_from_replay_events,
     is_ui_tool,
 };
+use super::inference::{INFERENCE_SOURCE_CUSTOM, InferenceSource};
 use super::pending::{
     CUSTOM_NAME as PENDING_CUSTOM, PendingCustom, PendingList, PendingMutation, PendingOp,
     PendingUserMessage,
@@ -199,6 +201,8 @@ fn ledger() -> Vec<(Slot, &'static str)> {
         TURN_TIMELINE_CUSTOM,
         CREDENTIAL_OFFER_SAVE,
         UI_CUSTOM_NAME,
+        // `TurnAssembler::push_event` reads which door a run went through, for the reply's badge.
+        INFERENCE_SOURCE_CUSTOM,
         // `UiSpec::from_custom` reads a CUSTOM with no name as a widget that names itself.
         "",
     ]
@@ -461,6 +465,22 @@ const CLIENT_IGNORES: &[(Slot, &str, &str)] = &[
     ),
 ];
 
+/// Words this app reads ahead of the server's recording of them: built to a shape agreed with the
+/// server session before the server sends it, so the manifest does not list it yet. Each says
+/// what brings it. It is no dead word, which is what [`NOT_SENT_BY_SERVER`] records: the day the
+/// manifest lists it, it comes off this list, and its frames are read like every other by the
+/// arm waiting for them in [`check_frame`];
+/// [`every_word_read_ahead_of_its_recording_is_matched_and_not_sent_yet`] fails until it does.
+const WORDS_NOT_RECORDED_YET: &[(Slot, &str, &str)] = &[(
+    Slot::CustomName,
+    INFERENCE_SOURCE_CUSTOM,
+    "Which door a run's model calls go through, `value {\"kind\", \"model\"}`, sent right after \
+     RUN_STARTED and journaled with the run: the reply's badge, live and in a replay \
+     (`TurnAssembler::reply_source`). The inference-source contract agreed with open-ai-gateway \
+     and opengrok-server (2026-09-30); it arrives with the server PR that adds the reply \
+     source, whose recording brings its frames.",
+)];
+
 /// Fixtures this app still reads wrongly, with the words their check fails with and why. The
 /// check has to fail with those words: one that passes means the drift is fixed and the entry
 /// goes, and one that fails some other way is a new problem, not this one.
@@ -590,7 +610,25 @@ const REST_NOT_READ: &[(&str, &str, &str)] = &[
 ///
 /// Only routes built ahead of a recording are listed. Routes this app asks that no test on the
 /// server drives are a different gap, and not this list's.
-const REST_NOT_RECORDED_YET: &[(&str, &str, &str)] = &[];
+const REST_NOT_RECORDED_YET: &[(&str, &str, &str)] = &[
+    (
+        "GET__account_inference-source",
+        "/account/inference-source",
+        "Settings → Reply source, and the composer's chip that defaults from it, read where the \
+         account's replies are paid from here (the inference-source contract agreed with \
+         open-ai-gateway and opengrok-server, 2026-09-30). The server PR that adds the route \
+         brings its fixtures; the reading they get, `inference_source`, is held meanwhile to \
+         bodies in the agreed shape.",
+    ),
+    (
+        "PUT__account_inference-source",
+        "/account/inference-source",
+        "Settings → Reply source's Save: answered with the setting as the server keeps it, or \
+         a 400 with the server's sentence for a URL that is not loopback or a model it will not \
+         route to a subscription. The same server PR brings its fixtures; its success is read \
+         by `inference_source` and its refusals as every other.",
+    ),
+];
 
 // ---- the corpus ----
 
@@ -1636,11 +1674,37 @@ fn custom(frame: &Value) -> Check {
         PENDING_CUSTOM => pending(frame),
         USER_FORM_CUSTOM => settled_form(frame),
         CREDENTIAL_OFFER_SAVE => offer_save(frame),
+        INFERENCE_SOURCE_CUSTOM => inference_source_frame(frame),
         name if is_excused(CLIENT_IGNORES, Slot::CustomName, name) => ignored(frame),
         name => Err(format!(
             "no check for a CUSTOM {name:?}: say here what this app does with one"
         )),
     }
+}
+
+/// Which door a run goes through (`opengrok.inferenceSource`): it says nothing on the status line
+/// and paints nothing among the reply's words, and the reply's badge is the frame's own kind and
+/// model, as the assembler reads it live and in a replay alike.
+fn inference_source_frame(frame: &Value) -> Check {
+    must!(
+        tick(frame) == ActivityTick::Keep,
+        "which door a run goes through is not something the coworker is doing: {:?}",
+        tick(frame)
+    );
+    nothing_painted(frame)?;
+    let assembler = assembled(&[frame]);
+    let source = assembler
+        .reply_source()
+        .ok_or("the frame should give the reply its badge")?;
+    let value = &frame["value"];
+    let model = opt_str(value, "model")
+        .map(str::trim)
+        .filter(|model| !model.is_empty());
+    must!(
+        source.kind.word() == str_at(value, "kind") && source.model.as_deref() == model,
+        "the badge should be the frame's kind and model as sent: {source:?} from {value}"
+    );
+    Ok(())
 }
 
 /// A frame this app has no arm for leaves the turn as it was.
@@ -3416,6 +3480,23 @@ fn coworker_ceiling(_: u16, body: &Value) -> Check {
     Ok(())
 }
 
+/// The account's reply source, read or as a Save's answer (the inference-source contract agreed
+/// with open-ai-gateway and opengrok-server, 2026-09-30): the door, the proxy's URL and the model
+/// as sent, `null` for none, and the two flags the page acts on. A body without a flag is not
+/// read as that flag being false, and a door this app has not heard of is not read as one it has.
+fn inference_source(_: u16, body: &Value) -> Check {
+    let read: InferenceSource = parse(body)?;
+    must!(
+        read.kind.word() == str_at(body, "kind")
+            && read.base_url.as_deref() == opt_str(body, "baseUrl")
+            && read.local_model.as_deref() == opt_str(body, "localModel")
+            && Some(read.healthy) == body["healthy"].as_bool()
+            && Some(read.has_api_key) == body["hasApiKey"].as_bool(),
+        "the reply source should come through as sent: {read:?} from {body}"
+    );
+    Ok(())
+}
+
 /// A coworker's computer (`coworker_computer`), which the Computer pane and the tunnel's chrome
 /// are drawn from: whose box it is and where it is shared, its state and its screen, the
 /// person's standing answer to the tunnel's card, and the tunnel's own readiness. A share scope
@@ -4177,12 +4258,18 @@ fn every_word_this_app_matches_is_sent_or_excused() {
     for (slot, word) in &ledger {
         let sent = emits.words(*slot).iter().any(|sent| sent.as_str() == *word);
         let excused = is_excused(NOT_SENT_BY_SERVER, *slot, word);
+        let ahead = is_excused(WORDS_NOT_RECORDED_YET, *slot, word);
         if sent && excused {
             problems.push(format!(
                 "{} {word:?} is sent now: take it off NOT_SENT_BY_SERVER",
                 slot.field()
             ));
-        } else if !sent && !excused {
+        } else if sent && ahead {
+            problems.push(format!(
+                "{} {word:?} is recorded now: take it off WORDS_NOT_RECORDED_YET",
+                slot.field()
+            ));
+        } else if !sent && !excused && !ahead {
             problems.push(format!(
                 "{} {word:?} is matched here and the server does not send it: find out why, and \
                  say so in NOT_SENT_BY_SERVER",
@@ -4739,4 +4826,96 @@ fn a_coworker_rows_effort_has_a_reading_in_the_ledger() {
         }),
     )
     .unwrap();
+}
+
+/// The words this app reads ahead of the server's recording ([`WORDS_NOT_RECORDED_YET`]) are
+/// words it does match, which the manifest does not list yet, each saying what brings it; and a
+/// CUSTOM name among them has its frame's arm waiting in [`check_frame`], so the recording is read
+/// the day it arrives. Once the manifest lists one, the entry has gone stale.
+#[test]
+fn every_word_read_ahead_of_its_recording_is_matched_and_not_sent_yet() {
+    let corpus = Corpus::load();
+    let emits = &corpus.manifest.emits;
+    let ledger = ledger();
+    let mut problems = Vec::new();
+    for (slot, word, why) in WORDS_NOT_RECORDED_YET {
+        if !ledger.contains(&(*slot, *word)) {
+            problems.push(format!(
+                "WORDS_NOT_RECORDED_YET lists the {} {word:?}, which nothing here matches",
+                slot.field()
+            ));
+        }
+        if emits.words(*slot).iter().any(|sent| sent == word) {
+            problems.push(format!(
+                "the manifest lists the {} {word:?} now: take it off WORDS_NOT_RECORDED_YET",
+                slot.field()
+            ));
+        }
+        if is_excused(NOT_SENT_BY_SERVER, *slot, word) || is_excused(CLIENT_IGNORES, *slot, word) {
+            problems.push(format!(
+                "the {} {word:?} is read ahead of its recording and excused as well",
+                slot.field()
+            ));
+        }
+        if why.trim().is_empty() {
+            problems.push(format!(
+                "WORDS_NOT_RECORDED_YET does not say what brings {word:?}"
+            ));
+        }
+    }
+    // The frame the server is to send, in the agreed shape, has its reading waiting.
+    for value in [
+        serde_json::json!({"kind": "local_proxy", "model": "gpt-5-codex"}),
+        serde_json::json!({"kind": "gateway", "model": "oag/cheap"}),
+        serde_json::json!({"kind": "gateway", "model": null}),
+    ] {
+        let frame = serde_json::json!({
+            "type": "CUSTOM", "name": INFERENCE_SOURCE_CUSTOM, "value": value
+        });
+        if let Err(why) = check_frame(&corpus, &frame) {
+            problems.push(format!("{frame}: {why}"));
+        }
+    }
+    let unknown = serde_json::json!({
+        "type": "CUSTOM", "name": INFERENCE_SOURCE_CUSTOM, "value": {"kind": "byok"}
+    });
+    if check_frame(&corpus, &unknown).is_ok() {
+        problems.push("a door this app cannot name should give no badge".to_string());
+    }
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
+}
+
+/// The reply source's reading, fed bodies in the shape agreed in the inference-source contract
+/// until the server's own are recorded: the read and the Save's answer alike, set and unset, the
+/// Save's refusals in the server's words (a URL that is not loopback, a provider it will not
+/// route), and the ways a body could go wrong.
+#[test]
+fn the_reply_source_routes_have_their_reading_waiting() {
+    use serde_json::json;
+    // The read and a Save's answer are the same body, and read the same way.
+    let set = json!({
+        "kind": "local_proxy", "baseUrl": "http://127.0.0.1:8080",
+        "localModel": "gpt-5-codex", "healthy": true, "hasApiKey": true
+    });
+    let unset = json!({
+        "kind": "gateway", "baseUrl": null, "localModel": null,
+        "healthy": false, "hasApiKey": false
+    });
+    for body in [&set, &unset] {
+        inference_source(200, body).unwrap_or_else(|why| panic!("{body}: {why}"));
+    }
+    for broken in [
+        json!({"kind": "gateway", "baseUrl": null, "localModel": null, "hasApiKey": false}),
+        json!({"kind": "byok", "healthy": false, "hasApiKey": false}),
+        json!({"baseUrl": null, "healthy": false, "hasApiKey": false}),
+        json!({"kind": "gateway", "healthy": "yes", "hasApiKey": false}),
+    ] {
+        assert!(inference_source(200, &broken).is_err(), "{broken}");
+    }
+    for said in [
+        "baseUrl must be a literal loopback address such as http://127.0.0.1:8080",
+        "localModel names a provider this server does not route subscriptions to",
+    ] {
+        refusal(400, &json!({ "error": said })).unwrap_or_else(|why| panic!("{said}: {why}"));
+    }
 }

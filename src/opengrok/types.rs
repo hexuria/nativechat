@@ -167,6 +167,24 @@ pub struct ThreadListing {
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct ModelEntry {
     pub id: String,
+    /// Which door serves it, `gateway` or `local_proxy` (the inference-source contract agreed
+    /// with open-ai-gateway and opengrok-server, 2026-09-30, server PR pending): a `local_proxy`
+    /// entry is one of opencodex's models, as the server lists them for the person's own
+    /// subscription. Kept as the word the server sent and read through [`Self::source`].
+    #[serde(default)]
+    pub source: Option<String>,
+}
+
+impl ModelEntry {
+    /// The door this model is served through. A server from before reply sources sends no
+    /// `source`, and every model it lists is the gateway's. A word this app has not heard of is
+    /// `None`, and such a model is offered by neither picker rather than guessed into one.
+    pub fn source(&self) -> Option<super::InferenceKind> {
+        match self.source.as_deref() {
+            None => Some(super::InferenceKind::Gateway),
+            Some(word) => super::InferenceKind::from_word(word),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -529,6 +547,40 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&effort).unwrap(),
             serde_json::json!({"effort": "inherit"})
+        );
+    }
+
+    /// A `/models` entry says which door serves it. A server from before reply sources sends
+    /// none, and its models are the gateway's; a word this app has not heard of names neither
+    /// door, and one entry's word never fails the list.
+    #[test]
+    fn a_models_source_reads_as_sent_and_a_missing_one_as_the_gateway() {
+        use super::super::InferenceKind;
+        let catalogue: ModelCatalogue = serde_json::from_value(serde_json::json!({
+            "models": [
+                {"id": "oag/cheap"},
+                {"id": "oag/fast", "source": "gateway", "points": null},
+                {"id": "gpt-5-codex", "source": "local_proxy"},
+                {"id": "odd", "source": "byok"},
+                {"id": "nulled", "source": null}
+            ],
+            "note": null
+        }))
+        .expect("one entry's source never fails the list");
+        let sources: Vec<(&str, Option<InferenceKind>)> = catalogue
+            .models
+            .iter()
+            .map(|entry| (entry.id.as_str(), entry.source()))
+            .collect();
+        assert_eq!(
+            sources,
+            vec![
+                ("oag/cheap", Some(InferenceKind::Gateway)),
+                ("oag/fast", Some(InferenceKind::Gateway)),
+                ("gpt-5-codex", Some(InferenceKind::LocalProxy)),
+                ("odd", None),
+                ("nulled", Some(InferenceKind::Gateway)),
+            ]
         );
     }
 

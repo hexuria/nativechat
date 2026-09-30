@@ -168,6 +168,37 @@
 //! the card's sentence that a lent connection reaches a plugin only once the bot is allowed it in
 //! its Tools (opengrok-server#268).
 //!
+//! Reply source, where a Bot's replies are paid from: the server's paid keys or the person's own
+//! subscription through opencodex. `settings-tab-reply-source` (refused while Settings is shut);
+//! while Settings is open on it, `settings-reply-source` (value = the door the server keeps,
+//! `gateway` / `local_proxy`; states `unsaved` while a pick waits for Save, `saving` and
+//! `reading` while one is with the server; state `asking` and nothing in it until the server has
+//! answered) holding `settings-reply-source-kind` (a radio group, value = the door shown) with
+//! `settings-reply-source-kind-gateway|local_proxy` (label as the radio reads, checked on the one
+//! shown; a click picks it and it waits for Save, as on the page), `settings-reply-source-url`
+//! (value = the proxy URL shown; `set_value` and `type` write it as typing would),
+//! `settings-reply-source-model` (a menu, value = the model shown; state `empty` while the server
+//! lists no model of the person's plan) with a `settings-reply-source-model-{id}` per model it
+//! offers (state `selected` on the shown one; a click picks it), `settings-reply-source-key`
+//! (never valued: states `set` while the server holds a key, `typed` while one waits for Save;
+//! `set_value` writes the whole key, `type` is refused), `settings-reply-source-health` (label the
+//! line, value `running` / `not-running`), `settings-reply-source-providers` (why Claude and
+//! Gemini are not offered), `settings-reply-source-save` (enabled only while a click would send
+//! something) and `settings-reply-source-error` (the server's words for a refused Save, why nobody
+//! knows what became of one, or a read that failed). On a server without reply sources, or when
+//! the setting could not be read, the section holds only `settings-reply-source-unavailable`.
+//! Every control is refused off the page, before the setting is read, and while a Save is out;
+//! Save is refused while a read is out too.
+//!
+//! `composer-reply-source` is the composer's chip, in the tree only while there is a choice of
+//! door (label `Server` / `My plan`, value = the door the next turns go through, state `picked`
+//! while that is the person's pick and not the account's own door). Unlike the composer's panel
+//! and chips it is clicked, as a person clicks it: a click switches the door, which then goes
+//! with every turn until it is switched back, and is gone with a sign-out or a relaunch.
+//! `reply-source-{messageId}` is the badge of
+//! each reply in the open thread that wears one, as the feed draws it (label `paid key` / `your
+//! plan`, value = the door, state = the model the server named).
+//!
 //! Named invokes (parity / gpui-agent): `UserFormContinue`, `UserFormDismiss`,
 //! `UserFormOpenScreen`, `UserFormUseSaved`, `UserFormClearSaved` (also kebab
 //! `user-form.continue` / `user-form.dismiss` / `user-form.screen` /

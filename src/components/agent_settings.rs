@@ -1279,10 +1279,15 @@ fn current_model_row(shown: &[String], current: &str) -> usize {
 /// route id is read as who serves it and what it is — `oag/cheap` — and someone who remembers
 /// only the second half would be shown nothing at all by a prefix. An empty field is no filter,
 /// so it lists everything on offer.
+///
+/// Only the gateway's routes are on offer here. A Bot is pinned to a route the server's paid keys
+/// serve; a model of the person's own plan (`source: local_proxy`) is the account's, picked on
+/// Settings → Reply source, and pinned here it would send the gateway an id it does not serve.
 fn matching_models(catalogue: &[ModelEntry], query: &str) -> Vec<String> {
     let needle = query.trim().to_lowercase();
     catalogue
         .iter()
+        .filter(|entry| entry.source() == Some(crate::opengrok::InferenceKind::Gateway))
         .filter(|entry| needle.is_empty() || entry.id.to_lowercase().contains(&needle))
         .map(|entry| entry.id.clone())
         .collect()
@@ -1662,8 +1667,33 @@ mod tests {
             "anthropic/opus",
         ]
         .into_iter()
-        .map(|id| ModelEntry { id: id.into() })
+        .map(|id| ModelEntry {
+            id: id.into(),
+            source: None,
+        })
         .collect()
+    }
+
+    /// The Bot's Model field offers the gateway's routes and nothing of the person's own plan:
+    /// a Bot pinned to one of opencodex's models would send the gateway an id it does not serve.
+    /// A model whose door this app cannot name is offered by neither.
+    #[test]
+    fn a_bots_model_field_offers_only_the_gateways_routes() {
+        let entry = |id: &str, source: Option<&str>| ModelEntry {
+            id: id.into(),
+            source: source.map(str::to_string),
+        };
+        let catalogue = vec![
+            entry("oag/cheap", None),
+            entry("gpt-5-codex", Some("local_proxy")),
+            entry("oag/fast", Some("gateway")),
+            entry("odd", Some("byok")),
+        ];
+        assert_eq!(
+            matching_models(&catalogue, ""),
+            vec!["oag/cheap", "oag/fast"]
+        );
+        assert!(matching_models(&catalogue, "codex").is_empty());
     }
 
     #[test]

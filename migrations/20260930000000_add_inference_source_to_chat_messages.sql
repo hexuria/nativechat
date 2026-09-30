@@ -1,0 +1,11 @@
+-- Which door a coworker's reply came through: the server's paid keys (`gateway`) or the person's
+-- own subscription through opencodex (`local_proxy`), with the model that answered, as the run's
+-- `opengrok.inferenceSource` CUSTOM said it: `{"kind": "...", "model": "..."}`.
+--
+-- The reply's badge reads it. A thread reopened from disk is not read back from the server for a
+-- run it already holds, so without the column a reply would wear its badge only for as long as
+-- the app stayed open.
+--
+-- Null on the person's own messages, on every reply written before this, and on a reply from a
+-- server that sends no such frame.
+ALTER TABLE chat_messages ADD COLUMN inference_source TEXT;

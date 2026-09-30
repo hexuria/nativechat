@@ -241,6 +241,9 @@ pub struct MessageInput {
     /// button. Cached off [`AppState`] like the rest, so the composer draws without reading the
     /// state on every frame.
     turn_in_flight: bool,
+    /// The chip that picks which door the next turns go through, the server's paid keys or the
+    /// person's plan, while there is a choice to make. Cached off [`AppState`] like the rest.
+    turn_source: Option<crate::state::TurnSourceChip>,
 }
 
 impl MessageInput {
@@ -262,6 +265,7 @@ impl MessageInput {
         let reply_to = app_state.reply_to.clone();
         let coworker_name = composer_bot_name(app_state);
         let turn_in_flight = app_state.is_turn_in_flight();
+        let turn_source = app_state.composer_turn_source();
 
         let this = Self {
             state: state.clone(),
@@ -287,6 +291,7 @@ impl MessageInput {
             notice: None,
             dismissed_at: None,
             turn_in_flight,
+            turn_source,
         };
 
         // Subscribe to state changes to update cached values and notify only when relevant
@@ -334,6 +339,11 @@ impl MessageInput {
                 let running = state.is_turn_in_flight();
                 if this.turn_in_flight != running {
                     this.turn_in_flight = running;
+                    changed = true;
+                }
+                let turn_source = state.composer_turn_source();
+                if this.turn_source != turn_source {
+                    this.turn_source = turn_source;
                     changed = true;
                 }
             }
@@ -2457,6 +2467,19 @@ impl Render for MessageInput {
                                         confirm_btn
                                     })
                                 })
+                                // Which door the next turns go through, beside the button that
+                                // sends them. Only while there is a choice: see
+                                // `AppState::composer_turn_source`.
+                                .when_some(
+                                    self.turn_source.clone().filter(|_| !self.voice_mode),
+                                    |this, chip| {
+                                        this.child(crate::components::reply_source::composer_chip(
+                                            &chip,
+                                            state_model.clone(),
+                                            &theme,
+                                        ))
+                                    },
+                                )
                                 .when(!self.voice_mode, |this| {
                                     // Text Mode: Mic and Send/Headphone
                                     this.child({
