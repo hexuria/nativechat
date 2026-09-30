@@ -10,6 +10,7 @@ mod error;
 mod gen_ui;
 mod inference;
 mod local_exec;
+mod model_choice;
 mod pending;
 mod relay;
 mod timing;
@@ -41,6 +42,12 @@ pub use inference::{
 };
 pub use local_exec::{
     Enrolment, MachineCredential, enrol_this_machine, serve_local_exec, stored_machine_id,
+};
+pub use model_choice::{
+    AccountPlan, ChoiceGroup, DEFAULT_EFFORT_LABEL, EFFORT_NOT_KEPT, EFFORT_STOPS,
+    FAST_ACCOUNT_PLAN, FAST_DOOR_UNKNOWN, FAST_NO_TWIN, FAST_SUFFIX, ModelChoice, ModelPick,
+    NO_MODEL, PLAN_GROUP, SERVER_GROUP, base_label, bot_pick, effort_label, effort_stop, is_fast,
+    model_label, plan_choices, server_choices, slider_stop, stop_word, without_fast,
 };
 pub use relay::{
     OpencodexAddress, RelayHandle, RelayKey, RelayReport, RelayStatus, RelayTarget, RelayTimings,
@@ -90,7 +97,7 @@ pub use pending::{
 };
 pub use timing::{TurnTiming, stamp_duration};
 pub use types::{
-    Account, AguiMessage, Attachment, Coworker, CoworkerPatch, EFFORT_INHERIT, EFFORT_WORDS,
-    LocalProxyStatus, ModelCatalogue, ModelEntry, ProfileUpdate, ReplyQuote, SentAttachment,
-    ThreadListing, assistant_text_from_sse,
+    Account, AguiMessage, Attachment, Coworker, CoworkerPatch, CoworkerSource, EFFORT_INHERIT,
+    EFFORT_WORDS, LocalProxyStatus, ModelCatalogue, ModelEntry, ProfileUpdate, ReplyQuote,
+    SentAttachment, ThreadListing, assistant_text_from_sse,
 };
