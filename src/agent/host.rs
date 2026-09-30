@@ -99,6 +99,11 @@ pub mod ids {
     /// The one control that opens a blank routine, whichever of its two shapes the Computer
     /// pane is drawing: the "Create routine" card when the bot has none, the `+` when it has.
     pub const ROUTINE_NEW: &str = "routine-new";
+    /// Under `computer-status`, while the Computer pane says why the server could not give the
+    /// bot a computer: the server's words as the pane shows them, with its code as the value.
+    pub const COMPUTER_ERROR: &str = "computer-error";
+    /// Get a computer, beside that reason: asks the server again, and is dead while it is asked.
+    pub const COMPUTER_GET: &str = "computer-get";
     /// The newest coworker reply's steps (value = how many), in the tree only while it has
     /// any, and its Thought rows (value = how many), only while it has any.
     pub const REPLY_STEPS: &str = "reply-steps";
@@ -538,6 +543,9 @@ pub enum Command {
     RetryTurn,
     ToggleComputerPane,
     OpenCoworkerScreen,
+    /// Get a computer: ask the server again for the open bot's computer, after it said why it
+    /// could not give one.
+    GetComputer,
     /// Update / Reset the active bot's computer: open the confirm dialog, then answer it.
     OpenComputerConfirm(crate::state::ComputerAction),
     ConfirmComputerAction,
@@ -831,6 +839,7 @@ impl Command {
             Self::RetryTurn => state.retry_turn(cx),
             Self::ToggleComputerPane => state.toggle_computer_pane(cx),
             Self::OpenCoworkerScreen => state.open_coworker_screen(cx),
+            Self::GetComputer => state.ensure_coworker_computer(cx),
             Self::OpenComputerConfirm(action) => state.open_computer_confirm(action, cx),
             Self::ConfirmComputerAction => state.confirm_computer_action(cx),
             Self::CancelComputerConfirm => state.close_computer_confirm(cx),
@@ -2380,6 +2389,11 @@ pub struct NativeChatHost {
     /// The coworker's computer as the pane sees it: "<state>; screen: yes|no",
     /// "endpoint missing", or "unknown".
     computer_status: String,
+    /// Why the server could not give the open bot a computer, as the pane shows it in place of
+    /// "No computer yet", and the server's code for it.
+    computer_error: Option<(String, String)>,
+    /// Get a computer is with the server for the open bot.
+    computer_asking: bool,
     computer_update_label: String,
     computer_reset_label: String,
     /// The confirm dialog's question, when it is open.
@@ -2666,6 +2680,19 @@ impl NativeChatHost {
                     })
                     .unwrap_or_else(|| "unknown".to_string())
             },
+            // Read the way the pane reads it (`ComputerControls::from_state`), so the tree says
+            // what the pane says.
+            computer_error: state
+                .coworker_computer
+                .as_ref()
+                .and_then(crate::opengrok::CoworkerComputer::why_no_computer)
+                .map(|error| {
+                    (
+                        crate::components::computer::no_computer_line(error),
+                        error.code.clone(),
+                    )
+                }),
+            computer_asking: state.asking_for_computer(),
             recipes_open: state.page == crate::state::MainPage::Recipes,
             recipes_filter: state.recipes_filter.query(),
             recipes: state
@@ -3216,13 +3243,25 @@ impl NativeChatHost {
         for offer in &self.save_logins {
             page = page.with_child(save_login_node(offer));
         }
+        let mut status = UiNode::new("computer-status", "status", self.computer_status.clone());
+        if let Some((line, code)) = &self.computer_error {
+            status = status.with_child(
+                UiNode::status(ids::COMPUTER_ERROR, line.clone()).with_value(code.clone()),
+            );
+        }
         let mut computer = UiNode::new("computer-pane", "dialog", "Computer")
             .with_visible(self.computer_open)
-            .with_child(UiNode::new(
-                "computer-status",
-                "status",
-                self.computer_status.clone(),
-            ))
+            .with_child(status);
+        if self.computer_error.is_some() {
+            computer = computer.with_child(
+                UiNode::button(
+                    ids::COMPUTER_GET,
+                    crate::components::computer::GET_A_COMPUTER,
+                )
+                .with_enabled(!self.computer_asking),
+            );
+        }
+        computer = computer
             .with_child(UiNode::button(
                 "computer-update",
                 self.computer_update_label.clone(),
@@ -5116,6 +5155,19 @@ impl NativeChatHost {
             Command::SetAppSettingsTab(AppSettingsTab::Updates)
         } else if target == "app-settings-back" {
             Command::CloseAppSettings
+        } else if target == ids::COMPUTER_GET {
+            if !self.computer_open || self.computer_error.is_none() {
+                return Err(format!(
+                    "`{target}` is on the Computer pane only while it says why the bot has no \
+                     computer"
+                ));
+            }
+            if self.computer_asking {
+                return Err(format!(
+                    "`{target}` waits while the server is being asked for a computer"
+                ));
+            }
+            Command::GetComputer
         } else if target == "computer-update" || target == "settings-computer-update" {
             Command::OpenComputerConfirm(crate::state::ComputerAction::Update)
         } else if target == "computer-reset" {
@@ -8699,6 +8751,65 @@ mod tests {
                 .find("route-traffic-this-computer")
                 .is_some()
         );
+    }
+
+    /// Why the server could not give the bot a computer is on the tree under `computer-status`,
+    /// in the words the pane shows and with the server's code, and Get a computer beside it asks
+    /// again. The first status that names a box takes both away, and a click on Get a computer
+    /// then is refused.
+    #[test]
+    fn the_computer_pane_s_reason_for_no_computer_is_on_the_tree() {
+        let recorded = |recording: &str| -> crate::opengrok::CoworkerComputer {
+            let fixture: serde_json::Value = serde_json::from_str(recording).unwrap();
+            serde_json::from_value(fixture["body"].clone()).unwrap()
+        };
+        let mut state = AppState::new();
+        // Signed in with a bot on the roster, or the tree is the sign-in or empty-roster page
+        // and has no Computer pane in it.
+        state.auth_status = crate::state::AuthStatus::SignedIn;
+        state.account = Some(
+            serde_json::from_value(serde_json::json!({ "id": "acct_1", "email": "a@b.c" }))
+                .unwrap(),
+        );
+        state.coworkers = vec![
+            serde_json::from_value(serde_json::json!({ "id": "cw_1", "name": "Ada" })).unwrap(),
+        ];
+        state.active_coworker_id = Some("cw_1".into());
+        state.right_pane = crate::state::RightPane::Computer;
+        state.coworker_computer = Some(recorded(include_str!(
+            "../../fixtures/wire/rest/GET__coworkers__coworker_id__computer/200-a_hosted_hire_whose_ascii_create_fails_records_why_and_makes_no_box.json"
+        )));
+        let mut host = NativeChatHost::from_app(&state);
+        let tree = host.snapshot();
+        let status = tree.find("computer-status").unwrap();
+        let error = status
+            .children
+            .iter()
+            .find(|node| node.id == ids::COMPUTER_ERROR)
+            .expect("the reason, under the status");
+        assert_eq!(
+            error.name,
+            "The box refused: 429 {\"error\":\"box creation rate limit reached\"}"
+        );
+        assert_eq!(error.value.as_deref(), Some("quota_exceeded"));
+        let get = tree.find(ids::COMPUTER_GET).expect("Get a computer");
+        assert_eq!(get.name, "Get a computer");
+        assert!(get.enabled);
+        host.dispatch(&Op::click(ids::COMPUTER_GET)).unwrap();
+        assert!(matches!(host.take_command(), Some(Command::GetComputer)));
+
+        state.coworker_computer = Some(recorded(include_str!(
+            "../../fixtures/wire/rest/GET__coworkers__coworker_id__computer/200-a_healthy_local_vm_does_not_wear_another_scopes_failure.json"
+        )));
+        let mut host = NativeChatHost::from_app(&state);
+        let tree = host.snapshot();
+        assert!(
+            tree.find("computer-status").is_some(),
+            "the pane is still drawn"
+        );
+        assert!(tree.find(ids::COMPUTER_ERROR).is_none());
+        assert!(tree.find(ids::COMPUTER_GET).is_none());
+        assert!(host.dispatch(&Op::click(ids::COMPUTER_GET)).is_err());
     }
 
     #[test]

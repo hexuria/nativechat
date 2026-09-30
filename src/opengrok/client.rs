@@ -3201,6 +3201,36 @@ pub struct CoworkerComputer {
         deserialize_with = "deserialize_optional_exec_mode"
     )]
     pub egress_policy: Option<LocalExecMode>,
+    /// Why the server could not give this Bot a computer, as it recorded it; `None` when it has
+    /// said nothing. [`Self::why_no_computer`] is when the pane shows it.
+    #[serde(rename = "computerError", default)]
+    pub computer_error: Option<ComputerError>,
+}
+
+/// Why the server could not give a Bot a computer: a stable code, the sentence a person reads,
+/// and when the server recorded it.
+///
+/// Transcribed from opengrok-server `crates/opengrok-server/src/agui/provision.rs`, checked
+/// against the server's main at e55a8c8. `coworker_screen` there puts it on
+/// `GET /coworkers/{id}/computer`, and on the `POST` that asks for a computer, which answers the
+/// same way: with `state: absent` when no box could be made and the account holds the reason,
+/// with `stopped` or `unknown` when the box's provider cannot be reached, and beside a running
+/// box when box.ascii.dev refused and a Local VM took over (`FELL_BACK`). `error_json_at` is its
+/// one shape on every surface, the hire's reply in `agui/routes.rs` among them. The corpus
+/// records it under `fixtures/wire/rest/GET__coworkers__coworker_id__computer/`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct ComputerError {
+    /// One of the server's stable codes (`no_org_key`, `quota_exceeded`, `provider_error`, …),
+    /// kept as sent.
+    pub code: String,
+    /// The server's own sentence, e.g. "the box refused: 125 Unable to find image …", which is
+    /// what the pane shows.
+    pub message: String,
+    /// When the server recorded it. The reason is kept on the account until an attempt clears
+    /// or replaces it, so it can be older than the status it rides on. `0` from a server older
+    /// than the stamp (opengrok-server 26abc27), which sent the other two alone.
+    #[serde(rename = "updatedAtMs", default)]
+    pub updated_at_ms: i64,
 }
 
 fn deserialize_optional_exec_mode<'de, D>(
@@ -3385,6 +3415,16 @@ impl CoworkerComputer {
             .as_deref()
             .map(str::trim)
             .filter(|id| !id.is_empty())
+    }
+
+    /// Why the server could not give this Bot a computer, while the status names no box: the
+    /// pane says it in place of "No computer yet". A status that names a box is a computer
+    /// given, and the error it can carry is a takeover's note about that box (opengrok-server
+    /// `provision.rs` `FELL_BACK`), not a reason to ask for another.
+    pub fn why_no_computer(&self) -> Option<&ComputerError> {
+        self.computer_error
+            .as_ref()
+            .filter(|_| self.box_id.is_none())
     }
 }
 
@@ -8163,6 +8203,74 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(odd.egress_policy, None, "an unknown word hides the control");
+    }
+
+    /// Why the server could not give a bot a computer rides on its status, as the corpus records
+    /// it for a hire whose box could not be made: the code, the words and the stamp, as sent.
+    /// The pane reads it off any status that names no box, whether no box could be made
+    /// (`absent`, as on the owner's server with no Local VM image) or its provider cannot be
+    /// reached (`stopped`, `unknown`). Beside a box it is a takeover's note, and a healthy box's
+    /// status carries none.
+    #[test]
+    fn coworker_computer_reads_why_the_server_could_not_give_one() {
+        let recorded = |recording: &str| -> CoworkerComputer {
+            let fixture: Value = serde_json::from_str(recording).expect("the recording");
+            serde_json::from_value(fixture["body"].clone()).expect("the status")
+        };
+        let refused = recorded(include_str!(
+            "../../fixtures/wire/rest/GET__coworkers__coworker_id__computer/200-a_hosted_hire_whose_ascii_create_fails_records_why_and_makes_no_box.json"
+        ));
+        assert_eq!(refused.state, "absent");
+        assert_eq!(
+            refused.computer_error,
+            Some(ComputerError {
+                code: "quota_exceeded".into(),
+                message: "the box refused: 429 {\"error\":\"box creation rate limit reached\"}"
+                    .into(),
+                updated_at_ms: 1_790_000_000_000,
+            })
+        );
+        assert_eq!(refused.why_no_computer(), refused.computer_error.as_ref());
+
+        let image_missing = "the box refused: 125 Unable to find image 'grok-box:local' locally \
+                             … pull access denied for grok-box";
+        for state in ["absent", "stopped", "unknown"] {
+            let status: CoworkerComputer = serde_json::from_value(json!({
+                "agentId": "cw_1",
+                "state": state,
+                "vncUrl": null,
+                "computerError": {
+                    "code": "provider_error",
+                    "message": image_missing,
+                    "updatedAtMs": 1_790_000_000_000_i64
+                },
+                "isEgressTunnelAvailable": false
+            }))
+            .unwrap();
+            assert_eq!(
+                status.why_no_computer().map(|error| error.message.as_str()),
+                Some(image_missing),
+                "{state}"
+            );
+        }
+
+        let takeover = recorded(include_str!(
+            "../../fixtures/wire/rest/GET__coworkers__coworker_id__computer/200-a_self_hosted_takeover_keeps_the_fallback_and_says_so.json"
+        ));
+        assert_eq!(
+            takeover
+                .computer_error
+                .as_ref()
+                .map(|error| error.code.as_str()),
+            Some("invalid_key")
+        );
+        assert_eq!(takeover.why_no_computer(), None, "a computer was given");
+
+        let healthy = recorded(include_str!(
+            "../../fixtures/wire/rest/GET__coworkers__coworker_id__computer/200-a_healthy_local_vm_does_not_wear_another_scopes_failure.json"
+        ));
+        assert_eq!(healthy.computer_error, None);
+        assert_eq!(healthy.why_no_computer(), None);
     }
 
     #[tokio::test]

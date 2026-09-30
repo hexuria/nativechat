@@ -76,6 +76,14 @@
 //! while the routine has no trigger, and the webhook's three only while it has one, so
 //! `assert --exists false` answers "this one already fires" and "this one is not a webhook".
 //!
+//! The Computer pane: `computer-pane`, with `computer-status` (label `<state>; screen: yes|no`,
+//! `endpoint missing` or `unknown`) and, under it, `computer-error` while the pane says why the
+//! server could not give the bot a computer, in place of "No computer yet" (label = the server's
+//! words as the pane shows them, value = the server's code for it, e.g. `provider_error`; a
+//! status that names a box has none, so `assert --exists false` is "a computer was given").
+//! Beside it, only then, `computer-get` (Get a computer: asks the server again; dead while an
+//! ask is with the server). `computer-update`, `computer-reset`.
+//!
 //! Files (#90): `composer-file-{i}` under `composer` (label = the file's name, value `uploading`
 //! / `ready` / `failed`); `message-file-{artId}` on the chat page for each file a message in the
 //! open thread carried (label = filename, value = the message id). Invoke `composer.attach --arg
