@@ -1,6 +1,7 @@
 use crate::actions::CloseSettings;
 use crate::chrome::TITLE_BAR_H;
 use crate::components::logins::LoginsPage;
+use crate::components::reply_source::ReplySourcePage;
 use crate::components::skills::SkillsPage;
 use crate::opengrok::LocalExecMode;
 use crate::send_policy::OnSend;
@@ -18,6 +19,8 @@ pub struct AppSettings {
     logins: Option<Entity<LoginsPage>>,
     /// Settings → Skills, made on the first render of that tab, for the same reason.
     skills: Option<Entity<SkillsPage>>,
+    /// Settings → Reply source, made on the first render of that tab, for the same reason.
+    reply_source: Option<Entity<ReplySourcePage>>,
 }
 
 impl AppSettings {
@@ -27,6 +30,7 @@ impl AppSettings {
             state,
             logins: None,
             skills: None,
+            reply_source: None,
         }
     }
 
@@ -47,6 +51,20 @@ impl AppSettings {
         let state = self.state.clone();
         let page = cx.new(|cx| SkillsPage::new(window, state, cx));
         self.skills = Some(page.clone());
+        page
+    }
+
+    fn reply_source_page(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<ReplySourcePage> {
+        if let Some(page) = &self.reply_source {
+            return page.clone();
+        }
+        let state = self.state.clone();
+        let page = cx.new(|cx| ReplySourcePage::new(window, state, cx));
+        self.reply_source = Some(page.clone());
         page
     }
 }
@@ -115,6 +133,9 @@ impl Render for AppSettings {
                 crate::components::connections::connections_page(app.clone(), cx)
                     .into_any_element(),
             ),
+            AppSettingsTab::ReplySource => {
+                Some(self.reply_source_page(window, cx).into_any_element())
+            }
             AppSettingsTab::Logins | AppSettingsTab::Skills => None,
         };
         let body = match cards {
@@ -287,6 +308,13 @@ impl AppSettings {
                 cx,
             ))
             .child(nav_item(
+                crate::components::reply_source::SETTINGS_TAB,
+                "Reply source",
+                tab == AppSettingsTab::ReplySource,
+                AppSettingsTab::ReplySource,
+                cx,
+            ))
+            .child(nav_item(
                 "settings-tab-skills",
                 "Skills",
                 tab == AppSettingsTab::Skills,
@@ -306,6 +334,7 @@ fn tab_title(tab: AppSettingsTab) -> &'static str {
         AppSettingsTab::Updates => "Updates",
         AppSettingsTab::Logins => "Logins",
         AppSettingsTab::Connections => "Connections",
+        AppSettingsTab::ReplySource => "Reply source",
         AppSettingsTab::Skills => "Skills",
     }
 }

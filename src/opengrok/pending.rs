@@ -10,6 +10,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use super::inference::InferenceKind;
+
 /// Writes that name another number are refused unread. Missing `v` is v1.
 pub const PAYLOAD_V: u32 = 1;
 
@@ -47,9 +49,29 @@ pub struct PendingUserMessage {
     pub drained_at_ms: Option<i64>,
     #[serde(default)]
     pub drained_run_id: Option<String>,
+    /// The door the send was queued with, `gateway` or `local_proxy`: what the composer's chip
+    /// showed when it was held. Present only when the send named one; absent, the account's
+    /// setting decides, which is not the row's to say. The server keeps it from the write that
+    /// queued the send (`inferenceSource`, the word `forwardedProps.inferenceSource` is on a live
+    /// turn) and honours it with the turn's precedence when the row drains, here or on another
+    /// machine. Agreed with opengrok-server 2026-09-30 and built in its #294 (`message_json`,
+    /// `WriteBody` and `consume_for_turn` in `crates/opengrok-server/src/agui/pending.rs`, the
+    /// column in `crates/opengrok-store/src/pending.rs`), whose recording the ledger reads. Kept as the word sent and read through
+    /// [`Self::inference_source`], so one row's word never fails the queue.
+    #[serde(default)]
+    pub inference_source: Option<String>,
 }
 
 impl PendingUserMessage {
+    /// The door this send was queued with. A row that names none, or a door this app cannot
+    /// name, is `None`: the turn that fires it then names none either, and the server goes by
+    /// the row's own word or the account's setting.
+    pub fn inference_source(&self) -> Option<InferenceKind> {
+        self.inference_source
+            .as_deref()
+            .and_then(InferenceKind::from_word)
+    }
+
     /// The bubble this row is about. NativeChat's id is `clientMessageId`; a
     /// row minted elsewhere with none of that uses the server id so hydrate
     /// still has a stable name.
@@ -205,6 +227,14 @@ pub struct PendingWrite {
     pub recipe_values: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub skill_id: Option<String>,
+    /// The door the send was queued with, as the composer's chip showed it: the row's
+    /// `inferenceSource` (opengrok-server #294: `WriteBody.inference_source` in
+    /// `crates/opengrok-server/src/agui/pending.rs`). An edit
+    /// carries it too, so the row matches the hold whichever machine queued it. Left out when no
+    /// chip was drawn: the account's setting decides then, and an edit that leaves it out keeps
+    /// the row's.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inference_source: Option<InferenceKind>,
 }
 
 impl PendingWrite {
@@ -215,6 +245,7 @@ impl PendingWrite {
         recipe_id: Option<String>,
         recipe_values: Option<Value>,
         skill_id: Option<String>,
+        inference_source: Option<InferenceKind>,
     ) -> Self {
         Self {
             v: PAYLOAD_V,
@@ -224,10 +255,17 @@ impl PendingWrite {
             recipe_id: recipe_id.filter(|id| !id.is_empty()),
             recipe_values,
             skill_id: skill_id.filter(|id| !id.is_empty()),
+            inference_source,
         }
     }
 
     pub fn content_patch(content: String) -> Self {
+        Self::edit(content, None)
+    }
+
+    /// An edit of a held send: its new words, and the door it was held with when it has one.
+    /// Every other field is left out, and the server keeps the row's.
+    pub fn edit(content: String, inference_source: Option<InferenceKind>) -> Self {
         Self {
             v: PAYLOAD_V,
             content: Some(content),
@@ -236,6 +274,7 @@ impl PendingWrite {
             recipe_id: None,
             recipe_values: None,
             skill_id: None,
+            inference_source,
         }
     }
 }
@@ -336,6 +375,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         ))
         .expect("json");
         assert_eq!(body["v"], PAYLOAD_V);
@@ -344,6 +384,106 @@ mod tests {
         assert!(body.get("replyTo").is_none(), "{body}");
         assert!(body.get("recipeId").is_none(), "{body}");
         assert!(body.get("skillId").is_none(), "{body}");
+        assert!(body.get("inferenceSource").is_none(), "{body}");
+    }
+
+    /// A send queued while the composer's chip showed a door carries it to the server as the
+    /// word a live turn names it by, so a machine that drains the row asks through that door.
+    /// An edit carries the hold's door; one with none leaves it out, and the server keeps the
+    /// row's.
+    #[test]
+    fn a_queued_send_names_the_door_it_was_queued_with() {
+        for (kind, word) in [
+            (InferenceKind::LocalProxy, "local_proxy"),
+            (InferenceKind::Gateway, "gateway"),
+        ] {
+            let body = serde_json::to_value(PendingWrite::enqueue(
+                "later".into(),
+                "msg_1".into(),
+                None,
+                None,
+                None,
+                None,
+                Some(kind),
+            ))
+            .expect("json");
+            assert_eq!(body["inferenceSource"], word, "{body}");
+        }
+        let patch =
+            serde_json::to_value(PendingWrite::content_patch("instead".into())).expect("json");
+        assert!(patch.get("inferenceSource").is_none(), "{patch}");
+        // An edit carries the door the send was held with, and only that beside the words.
+        let edit = serde_json::to_value(PendingWrite::edit(
+            "instead".into(),
+            Some(InferenceKind::LocalProxy),
+        ))
+        .expect("json");
+        assert_eq!(
+            edit,
+            json!({ "v": 1, "content": "instead", "inferenceSource": "local_proxy" })
+        );
+    }
+
+    /// The server's snapshot (hand-written in the shape agreed with opengrok-server on
+    /// 2026-09-30; its recording comes with the server PR) names the door a row was queued with
+    /// only when the send named one. A row without the field, from a server before it or a send
+    /// that named none, reads as no door; a word this app cannot name reads the same and never
+    /// fails the queue.
+    #[test]
+    fn a_snapshot_row_says_which_door_it_was_queued_with() {
+        let row = |source: Option<Value>| {
+            let mut row = json!({
+                "v": 1,
+                "id": "pum_1",
+                "threadId": "th_1",
+                "content": "later",
+                "clientMessageId": "msg_1",
+                "status": "pending",
+                "createdAtMs": 10,
+                "updatedAtMs": 10,
+                "drainedAtMs": null,
+                "drainedRunId": null
+            });
+            if let Some(source) = source {
+                row["inferenceSource"] = source;
+            }
+            row
+        };
+        let list: PendingList = serde_json::from_value(json!({
+            "pendingUserMessages": [
+                row(Some(json!("local_proxy"))),
+                row(Some(json!("gateway"))),
+                row(None),
+                row(Some(Value::Null)),
+                row(Some(json!("byok"))),
+            ],
+            "pendingEvents": [
+                custom_event("snapshot", Some(row(Some(json!("local_proxy"))))),
+                custom_event("snapshot", Some(row(None))),
+            ]
+        }))
+        .expect("one row's word never fails the queue");
+        let doors: Vec<Option<InferenceKind>> = list
+            .pending_user_messages
+            .iter()
+            .map(PendingUserMessage::inference_source)
+            .collect();
+        assert_eq!(
+            doors,
+            vec![
+                Some(InferenceKind::LocalProxy),
+                Some(InferenceKind::Gateway),
+                None,
+                None,
+                None
+            ]
+        );
+        let live: Vec<Option<InferenceKind>> = list
+            .live_messages()
+            .iter()
+            .map(PendingUserMessage::inference_source)
+            .collect();
+        assert_eq!(live, vec![Some(InferenceKind::LocalProxy), None]);
     }
 
     #[test]

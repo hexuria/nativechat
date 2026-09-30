@@ -12,6 +12,7 @@ use serde_json::{Value, json};
 use tokio::sync::Mutex as AsyncMutex;
 
 use super::error::OpenGrokError;
+use super::inference::{InferenceKind, InferenceSource, InferenceSourceUpdate};
 use super::pending::{
     PendingCustom, PendingList, PendingMutation, PendingUserMessage, PendingWrite,
 };
@@ -120,6 +121,12 @@ impl OpenGrokClient {
             session_path: None,
             refresh_flight: Arc::new(AsyncMutex::new(None)),
         })
+    }
+
+    /// The server runs on this Mac: its address is loopback ([`super::is_loopback`]). The person's
+    /// own plan is set up only from there, because the server calls opencodex on its own machine.
+    pub fn is_on_this_machine(&self) -> bool {
+        super::is_loopback(&self.base)
     }
 
     pub fn with_session_file(mut self, path: PathBuf) -> Self {
@@ -825,6 +832,51 @@ impl OpenGrokClient {
         Self::json_or_error(response).await
     }
 
+    /// `GET /account/inference-source` — where the account's replies are paid from: the server's
+    /// paid keys, or the person's own subscription through opencodex (the inference-source
+    /// contract agreed with open-ai-gateway and opengrok-server, 2026-09-30, built in
+    /// opengrok-server #294: `get_source` in `crates/opengrok-server/src/inference.rs`, answered
+    /// by `described` in
+    /// `crates/opengrok-harness/src/local_proxy.rs`). A signed-in account always gets a 200, the
+    /// default `{"kind": "gateway", ...}` until it has saved one. A server from before the route
+    /// answers a bare 404, which the caller reads as a server that cannot switch. Given
+    /// [`INFERENCE_SOURCE_TIMEOUT`].
+    pub async fn inference_source(&self) -> Result<InferenceSource, OpenGrokError> {
+        let response = self
+            .send_json_within::<()>(
+                reqwest::Method::GET,
+                "/account/inference-source",
+                None,
+                Some(INFERENCE_SOURCE_TIMEOUT),
+                None,
+            )
+            .await?;
+        Self::json_or_error(response).await
+    }
+
+    /// `PUT /account/inference-source` — keep a new reply source, answered with the setting as
+    /// the server now keeps it, with a fresh `healthy` (the same contract: `put_source` in
+    /// `crates/opengrok-server/src/inference.rs`, `apply` in
+    /// `crates/opengrok-harness/src/local_proxy.rs`). A field left out is kept and a `null`
+    /// clears it ([`InferenceSourceUpdate`]). A `baseUrl` that is not literal loopback, or a
+    /// `localModel` from a provider the server will not route a subscription to, is refused with
+    /// a 400 and `{"error": sentence}`, and nothing is kept. Given [`INFERENCE_SOURCE_TIMEOUT`].
+    pub async fn set_inference_source(
+        &self,
+        update: &InferenceSourceUpdate,
+    ) -> Result<InferenceSource, OpenGrokError> {
+        let response = self
+            .send_json_within(
+                reqwest::Method::PUT,
+                "/account/inference-source",
+                Some(update),
+                Some(INFERENCE_SOURCE_TIMEOUT),
+                None,
+            )
+            .await?;
+        Self::json_or_error(response).await
+    }
+
     pub async fn delete_coworker(&self, coworker_id: &str) -> Result<(), OpenGrokError> {
         let path = format!("/coworkers/{coworker_id}");
         let response = self
@@ -871,6 +923,16 @@ impl OpenGrokClient {
     /// server drains that row atomically before the harness starts so two machines cannot both
     /// post it. Absent, a last user-message id that matches `clientMessageId` still drains.
     ///
+    /// `inference_source` is the door the composer's chip shows for this turn, the account's own
+    /// included, or for a held send the door its chip showed when it was queued: it goes as
+    /// `forwardedProps.inferenceSource` and wins over the account's setting for this turn only,
+    /// so the turn goes where the chip said even when the setting has moved since it was read
+    /// (the inference-source contract agreed with open-ai-gateway and opengrok-server,
+    /// 2026-09-30, built in opengrok-server #294: `named` in
+    /// `crates/opengrok-server/src/inference.rs`,
+    /// `route` in `crates/opengrok-harness/src/local_proxy.rs`). Absent, with no chip drawn,
+    /// the account's setting decides, and the turn is the one sent before reply sources existed.
+    ///
     /// The run id is the caller's. The server keeps every frame a run emits under it and will
     /// hand the whole lot back from `GET /ag-ui/runs/{run_id}`, which is of no use whatever to a
     /// client that only learns the id from the frames it already saw: the one moment the id is
@@ -886,12 +948,16 @@ impl OpenGrokClient {
         recipe: Option<&TurnRecipe>,
         skill: Option<&str>,
         pending_id: Option<&str>,
+        inference_source: Option<InferenceKind>,
         mut on_event: F,
     ) -> Result<String, OpenGrokError>
     where
         F: FnMut(&serde_json::Value),
     {
         let mut forwarded = json!({ "coworkerId": coworker_id });
+        if let Some(kind) = inference_source {
+            forwarded["inferenceSource"] = Value::String(kind.word().to_string());
+        }
         if let Some(recipe) = recipe {
             forwarded["recipe"] = Value::String(recipe.id.clone());
             forwarded["recipeValues"] = Value::Object(recipe.values.clone());
@@ -2981,6 +3047,13 @@ pub struct ConnectionView {
 /// dead until the app quits.
 pub const CONNECTIONS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
+/// How long [`OpenGrokClient::inference_source`] and [`OpenGrokClient::set_inference_source`]
+/// are given. Either is a read or a write of one row on the server, and the server's word about
+/// opencodex, which it gets by asking the proxy on loopback. While a Save is out every control on
+/// Settings → Reply source is dead, and one that never answered would leave them dead until the
+/// app quit.
+pub const INFERENCE_SOURCE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
 /// A service this server can connect, as `GET /connectors` lists it: `{name, label}`, where
 /// `name` is what a connection's `connector` says and `label` is what a person reads ("Gmail").
 ///
@@ -4951,7 +5024,7 @@ mod tests {
         let server = MockServer::start().await;
         let client = OpenGrokClient::new(&server.uri()).unwrap();
         let error = client
-            .run_turn("cw", "t", "run_1", &[], None, None, None, |_| {})
+            .run_turn("cw", "t", "run_1", &[], None, None, None, None, |_| {})
             .await
             .unwrap_err();
         assert!(error.is_signed_out());
@@ -5287,11 +5360,19 @@ mod tests {
         assert!(!error.is_signed_out());
     }
 
+    /// The queue's four routes as the v1 contract writes them. A send queued while the
+    /// composer's chip showed a door carries it (`inferenceSource`, opengrok-server #294), and
+    /// the row the server answers with names it back.
     #[tokio::test]
     async fn enqueue_edit_cancel_and_list_pending_follow_the_v1_contract() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/ag-ui/threads/th_1/pending"))
+            .and(wiremock::matchers::body_partial_json(serde_json::json!({
+                "content": "later",
+                "clientMessageId": "msg_1",
+                "inferenceSource": "local_proxy"
+            })))
             .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
                 "v": 1,
                 "threadId": "th_1",
@@ -5301,7 +5382,8 @@ mod tests {
                     "threadId": "th_1",
                     "content": "later",
                     "clientMessageId": "msg_1",
-                    "status": "pending"
+                    "status": "pending",
+                    "inferenceSource": "local_proxy"
                 },
                 "event": {
                     "type": "CUSTOM",
@@ -5378,6 +5460,7 @@ mod tests {
                     None,
                     None,
                     None,
+                    Some(crate::opengrok::InferenceKind::LocalProxy),
                 ),
             )
             .await
@@ -5385,6 +5468,10 @@ mod tests {
         let created_row = created.row().expect("created row");
         assert_eq!(created_row.id, "pum_1");
         assert_eq!(created_row.bubble_id(), "msg_1");
+        assert_eq!(
+            created_row.inference_source(),
+            Some(crate::opengrok::InferenceKind::LocalProxy)
+        );
         assert_eq!(
             created.custom().map(|custom| custom.op),
             Some(crate::opengrok::PendingOp::Created)
@@ -5431,6 +5518,7 @@ mod tests {
                 "v": 1,
                 "content": "later",
                 "clientMessageId": "msg_1",
+                "inferenceSource": "local_proxy",
             })
         );
         let patch: Value = serde_json::from_slice(&requests[1].body).unwrap();
@@ -5489,6 +5577,7 @@ mod tests {
                 None,
                 None,
                 Some("pum_1"),
+                None,
                 |_| {},
             )
             .await
@@ -5573,6 +5662,7 @@ mod tests {
                 None,
                 None,
                 Some("pum_1"),
+                None,
                 |_| {},
             )
             .await
@@ -5601,7 +5691,7 @@ mod tests {
             let client = OpenGrokClient::new(&server.uri()).unwrap();
             put_cookie(&client, &live_session());
             let error = client
-                .run_turn("cw_1", "th_1", "run_1", &[], None, None, None, |_| {})
+                .run_turn("cw_1", "th_1", "run_1", &[], None, None, None, None, |_| {})
                 .await
                 .expect_err("refused");
             assert_eq!(error.status, Some(409));
@@ -5700,7 +5790,7 @@ mod tests {
         // is all that is left, and the app is still showing a roster.
         put_cookie(&client, "og_refresh=tok-r; Path=/; Max-Age=3600");
         client
-            .run_turn("cw", "t", "run_1", &[], None, None, None, |_| {})
+            .run_turn("cw", "t", "run_1", &[], None, None, None, None, |_| {})
             .await
             .expect("the turn goes out, on a token the app fetched for itself");
 
@@ -5736,7 +5826,7 @@ mod tests {
         let client = OpenGrokClient::new(&server.uri()).unwrap();
         put_cookie(&client, &live_session());
         let error = client
-            .run_turn("cw", "t", "run_1", &[], None, None, None, |_| {})
+            .run_turn("cw", "t", "run_1", &[], None, None, None, None, |_| {})
             .await
             .unwrap_err();
         assert!(error.is_signed_out());
@@ -5767,7 +5857,7 @@ mod tests {
         let client = OpenGrokClient::new(&server.uri()).unwrap();
         put_cookie(&client, &live_session());
         let error = client
-            .run_turn("cw", "t", "run_1", &[], None, None, None, |_| {})
+            .run_turn("cw", "t", "run_1", &[], None, None, None, None, |_| {})
             .await
             .unwrap_err();
         assert!(!error.is_signed_out(), "nobody should be asked to sign in");
@@ -6257,6 +6347,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
                 {
                     let first_at = first_at.clone();
                     move |event| {
@@ -6326,6 +6417,7 @@ mod tests {
                 Some(&recipe),
                 None,
                 None,
+                None,
                 |_| {},
             )
             .await
@@ -6365,6 +6457,7 @@ mod tests {
                     reply_to: None,
                     attachments: Vec::new(),
                 }],
+                None,
                 None,
                 None,
                 None,
@@ -6425,6 +6518,7 @@ mod tests {
                 None,
                 Some("skl_1"),
                 None,
+                None,
                 |_| {},
             )
             .await
@@ -6435,6 +6529,7 @@ mod tests {
                 "thread_1",
                 "run_2",
                 &[said("u1")],
+                None,
                 None,
                 None,
                 None,
@@ -6490,6 +6585,233 @@ mod tests {
         let cat = client.list_models().await.unwrap();
         assert_eq!(cat.models.len(), 2);
         assert_eq!(cat.models[0].id, "xai/grok-4.6@sub");
+    }
+
+    /// The account's reply source as the contract writes it: `GET` reads the setting, and a
+    /// Save is one `PUT` of the door and what changed, key and all when one was typed, answered
+    /// with the setting as the server now keeps it. A field emptied on the page goes as `null`,
+    /// and so does Remove key.
+    #[tokio::test]
+    async fn the_reply_source_is_read_and_a_save_puts_what_changed() {
+        use crate::opengrok::{InferenceKind, InferenceSourceUpdate, ProxyKey};
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/account/inference-source"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "kind": "gateway", "baseUrl": null, "localModel": null,
+                "healthy": false, "hasApiKey": false
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/account/inference-source"))
+            .and(body_json(json!({
+                "kind": "local_proxy",
+                "baseUrl": "http://127.0.0.1:8080",
+                "localModel": "gpt-5-codex",
+                "apiKey": "sk-proxy-1"
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "kind": "local_proxy", "baseUrl": "http://127.0.0.1:8080",
+                "localModel": "gpt-5-codex", "healthy": true, "hasApiKey": true
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/account/inference-source"))
+            .and(body_json(json!({
+                "kind": "gateway", "baseUrl": null, "localModel": null, "apiKey": null
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "kind": "gateway", "baseUrl": null, "localModel": null,
+                "healthy": false, "hasApiKey": false
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        let read = client.inference_source().await.unwrap();
+        assert_eq!(
+            (read.kind, read.base_url, read.healthy, read.has_api_key),
+            (InferenceKind::Gateway, None, false, false)
+        );
+        let kept = client
+            .set_inference_source(&InferenceSourceUpdate {
+                kind: InferenceKind::LocalProxy,
+                base_url: Some(Some("http://127.0.0.1:8080".into())),
+                local_model: Some(Some("gpt-5-codex".into())),
+                api_key: Some(ProxyKey::new("sk-proxy-1")),
+            })
+            .await
+            .unwrap();
+        assert_eq!(kept.kind, InferenceKind::LocalProxy);
+        assert_eq!(kept.local_model.as_deref(), Some("gpt-5-codex"));
+        assert!(kept.healthy && kept.has_api_key);
+        let cleared = client
+            .set_inference_source(&InferenceSourceUpdate {
+                kind: InferenceKind::Gateway,
+                base_url: Some(None),
+                local_model: Some(None),
+                api_key: Some(None),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            (cleared.base_url, cleared.local_model, cleared.has_api_key),
+            (None, None, false)
+        );
+    }
+
+    /// A URL that is not literal loopback is refused with a 400 and the server's sentence, and
+    /// the person is shown that sentence as it was written: a verdict about what they typed,
+    /// not a server out of reach.
+    #[tokio::test]
+    async fn a_url_that_is_not_loopback_is_refused_in_the_servers_words() {
+        use crate::opengrok::{InferenceKind, InferenceSourceUpdate};
+        let said = "baseUrl must be a literal loopback address such as http://127.0.0.1:8080";
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/account/inference-source"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(json!({ "error": said })))
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        let refused = client
+            .set_inference_source(&InferenceSourceUpdate {
+                kind: InferenceKind::LocalProxy,
+                base_url: Some(Some("http://my-mac.example.com:8080".into())),
+                local_model: None,
+                api_key: None,
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(
+            (refused.status, refused.message.as_str(), refused.failure()),
+            (Some(400), said, Failure::Verdict)
+        );
+    }
+
+    /// Both reply-source routes give up by themselves ([`INFERENCE_SOURCE_TIMEOUT`]), as a server
+    /// out of reach: a Save that never answered would leave the page's controls dead. The clock
+    /// is the test's own, and so is the server (see `a_connection_route_that_does_not_answer_gives_up`).
+    #[tokio::test(start_paused = true)]
+    async fn a_reply_source_route_that_does_not_answer_gives_up() {
+        use crate::opengrok::{InferenceKind, InferenceSourceUpdate};
+        let server = MockServer::builder().start().await;
+        Mock::given(wiremock::matchers::any())
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({
+                        "kind": "gateway", "baseUrl": null, "localModel": null,
+                        "healthy": false, "hasApiKey": false
+                    }))
+                    .set_delay(std::time::Duration::from_secs(25)),
+            )
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        let answers = [
+            client.inference_source().await.map(drop),
+            client
+                .set_inference_source(&InferenceSourceUpdate {
+                    kind: InferenceKind::Gateway,
+                    base_url: None,
+                    local_model: None,
+                    api_key: None,
+                })
+                .await
+                .map(drop),
+        ];
+        for (at, answer) in answers.into_iter().enumerate() {
+            let error = answer.expect_err("a route with no deadline waited for the answer");
+            assert_eq!(
+                error.failure(),
+                Failure::OutOfReach(Unreachable::Server),
+                "route {at}: {}",
+                error.message
+            );
+        }
+    }
+
+    /// The door picked on the composer's chip travels as `forwardedProps.inferenceSource`, where
+    /// the server reads it and lets it win over the account's setting for this turn. A turn with
+    /// no pick is the turn this client sent before reply sources existed, byte for byte.
+    #[tokio::test]
+    async fn a_turn_carries_the_picked_reply_source_and_a_turn_without_one_is_unchanged() {
+        use crate::opengrok::InferenceKind;
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/ag-ui"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(
+                        "data: {\"type\":\"RUN_FINISHED\",\"runId\":\"r\"}\n\n".to_string(),
+                    ),
+            )
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        put_cookie(&client, &live_session());
+        let said = || AguiMessage {
+            id: "u1".into(),
+            role: "user".into(),
+            content: "summarise the thread".into(),
+            tool_call_id: None,
+            reply_to: None,
+            attachments: Vec::new(),
+        };
+        for (run, source) in [
+            ("run_1", Some(InferenceKind::LocalProxy)),
+            ("run_2", Some(InferenceKind::Gateway)),
+            ("run_3", None),
+        ] {
+            client
+                .run_turn(
+                    "cw_1",
+                    "thread_1",
+                    run,
+                    &[said()],
+                    None,
+                    None,
+                    None,
+                    source,
+                    |_| {},
+                )
+                .await
+                .unwrap();
+        }
+        let requests = server.received_requests().await.expect("the turns went");
+        let bodies: Vec<Value> = requests
+            .iter()
+            .map(|request| serde_json::from_slice(&request.body).unwrap())
+            .collect();
+        assert_eq!(
+            bodies[0]["forwardedProps"],
+            json!({ "coworkerId": "cw_1", "inferenceSource": "local_proxy" })
+        );
+        assert_eq!(
+            bodies[1]["forwardedProps"],
+            json!({ "coworkerId": "cw_1", "inferenceSource": "gateway" })
+        );
+        assert_eq!(
+            bodies[2]["forwardedProps"],
+            json!({ "coworkerId": "cw_1" }),
+            "no pick leaves the account's setting to decide"
+        );
+        let mut picked = bodies[0].clone();
+        picked["forwardedProps"]
+            .as_object_mut()
+            .expect("props are an object")
+            .remove("inferenceSource");
+        picked["runId"] = bodies[2]["runId"].clone();
+        assert_eq!(
+            serde_json::to_vec(&picked).unwrap(),
+            serde_json::to_vec(&bodies[2]).unwrap(),
+            "the pick is the only thing it adds to the turn"
+        );
     }
 
     #[tokio::test]

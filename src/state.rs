@@ -14,19 +14,21 @@ use crate::opengrok::{
     Account, ActivityTick, AguiMessage, ApprovalSpec, BotActivity, BoxHandoffReply,
     BoxHandoffResolution, BoxShareScope, ChatPart, ChoiceCard, ComputerHandoffStatus,
     ConnectedComputer, Coworker, CoworkerComputer, CoworkerPatch, EFFORT_INHERIT, Failure,
-    FormResolution, FormSpec, ImageVisibility, LocalExecMode, LocalExecPolicy, LocalExecResolution,
-    ModelCatalogue, NewSchedule, NewSkill, OpenGrokClient, OpenGrokError, PendingCustom, PendingOp,
-    PendingUserMessage, PendingWrite, ProfileUpdate, QueuedApproval, RecipeDetail, RecipeKind,
-    RecipeParameter, RecipeRun, RecipeRunResult, RecipeShareTarget, RecipeStep, RecipeSummary,
-    ReplyQuote, RunCause, RunRecipeResponse, RunReplay, SKILL_BODY_CHARS, SKILL_BUNDLE_FILES,
-    SKILL_BUNDLE_LIMIT, SaveLoginSpec, ScheduleEdit, ScheduleKind, ScheduleRow, ScheduleRun,
-    ScheduleRunStatus, ScreenshotSpec, SkillDetail, SkillFile, SkillPatch, SkillSource,
-    SkillSummary, ThreadListing, ThreadReplay, ThreadRun, ToolCallTracker, TurnAssembler,
-    TurnRecipe, TurnTiming, USER_FORM_SERVER_FILL_AVAILABLE, Unreachable, UserFormDismissMode,
-    UserFormHttpSettle, UserFormValues, UserFormVerb, WAITING_FOR_YOU, activity_from_replay,
-    approval_summary, box_handoff_resolve_entry_id, collapse_computer_roster, command_from_args,
-    command_from_replay_events, deeds_from_replay, enrol_this_machine, env_egress_tunnel_enabled,
-    host_egress_tunnel_available, host_egress_tunnel_flag, keep_local_save_offer, persons_messages,
+    FormResolution, FormSpec, ImageVisibility, InferenceKind, InferenceSource,
+    InferenceSourceUpdate, LocalExecMode, LocalExecPolicy, LocalExecResolution, ModelCatalogue,
+    ModelEntry, NewSchedule, NewSkill, OpenGrokClient, OpenGrokError, PendingCustom, PendingOp,
+    PendingUserMessage, PendingWrite, ProfileUpdate, ProxyKey, QueuedApproval, RecipeDetail,
+    RecipeKind, RecipeParameter, RecipeRun, RecipeRunResult, RecipeShareTarget, RecipeStep,
+    RecipeSummary, ReplyQuote, ReplySource, RunCause, RunRecipeResponse, RunReplay,
+    SKILL_BODY_CHARS, SKILL_BUNDLE_FILES, SKILL_BUNDLE_LIMIT, SaveLoginSpec, ScheduleEdit,
+    ScheduleKind, ScheduleRow, ScheduleRun, ScheduleRunStatus, ScreenshotSpec, SkillDetail,
+    SkillFile, SkillPatch, SkillSource, SkillSummary, ThreadListing, ThreadReplay, ThreadRun,
+    ToolCallTracker, TurnAssembler, TurnRecipe, TurnTiming, USER_FORM_SERVER_FILL_AVAILABLE,
+    Unreachable, UserFormDismissMode, UserFormHttpSettle, UserFormValues, UserFormVerb,
+    WAITING_FOR_YOU, activity_from_replay, approval_summary, box_handoff_resolve_entry_id,
+    collapse_computer_roster, command_from_args, command_from_replay_events, deeds_from_replay,
+    enrol_this_machine, env_egress_tunnel_enabled, host_egress_tunnel_available,
+    host_egress_tunnel_flag, keep_local_save_offer, persons_messages,
     place_hitl_cards_in_document_order, policy_answer, reads_as_gateway_unreachable, retry_enqueue,
     save_login_from_local, serve_local_exec, stamp_duration, stored_machine_id, tool_standin,
 };
@@ -305,6 +307,386 @@ impl AccountConnections {
             self.confirming_disconnect = None;
         }
     }
+}
+
+/// Settings → Reply source, and what the composer's chip defaults from: where the server keeps
+/// the account's replies paid from, and what the person has picked on the page and not saved.
+///
+/// The setting is the server's and lives nowhere else: this app never keeps it, and never calls a
+/// model either way. What the page shows as kept is only ever what the server last said, from a
+/// read or from its answer to a Save. A pick waits on the page, marked unsaved, until Save sends
+/// the door and whatever on the page differs from what the server keeps (a field left alone is
+/// left out, and the server keeps it); a Save the server refuses leaves the kept setting as it
+/// was, with the server's words under Save and the picks still there to fix. Nothing here is
+/// written to disk.
+///
+/// Not `Clone`: it can hold a key the person typed, and nothing copies that. The gpui-agent tree
+/// takes [`Self::without_key`].
+#[derive(Debug, Default, PartialEq)]
+pub struct ReplySourceSettings {
+    /// What `GET /account/inference-source` last said, or the last Save's answer. `None` until it
+    /// has been asked since sign-in.
+    pub kept: Option<ReplySourceRead>,
+    /// The door picked on the page and not saved. `None` shows the kept one.
+    pub kind_pick: Option<InferenceKind>,
+    /// The proxy URL as typed and not saved. `None` shows the kept one, or the default; an empty
+    /// one is the address taken away.
+    pub url_draft: Option<String>,
+    /// The model picked and not saved: `None` shows the kept one, `Some(None)` is the model taken
+    /// away, and `Some(Some(id))` one picked from the plan's list.
+    pub model_pick: Option<Option<String>>,
+    /// A key for the proxy, typed and not sent. It goes with the next Save and is dropped the
+    /// moment that Save leaves, whatever becomes of it, and when the page is left or the person
+    /// signs out before a Save: the server keeps it, and `hasApiKey` is all that ever comes back.
+    /// Never on disk, never in a driver's tree, never printed, never cloned.
+    pub key_draft: Option<ProxyKey>,
+    /// Remove key was pressed: the next Save asks the server to forget the key it holds.
+    pub remove_key: bool,
+    /// A key typed here is gone and the server may not have it: it went with a Save that was
+    /// refused or never answered, or the page was left before a Save. Dropping it is right, since
+    /// nothing here keeps a key; the page says so, and asks for it again, until one is typed or a
+    /// Save is kept.
+    pub retype_key: bool,
+    /// The app's server runs on this Mac: its address is loopback. The server calls opencodex on
+    /// its own machine, so the person's plan can be set up only from there; anywhere else the
+    /// plan's half of the page is read-only and says why. Set with every read.
+    pub server_on_this_mac: bool,
+    /// The read with the server, by its number. Save waits for it: what the page shows of the
+    /// setting is about to be replaced by what the read brings, and a Save of the old could undo
+    /// a change made on another Mac. The picks are the person's, and wait on top of either.
+    pub reading: Option<u64>,
+    /// The Save with the server, by its number. Every control on the page is dead while it is
+    /// out, and no read begins meanwhile: its answer is the newest word there will be.
+    pub saving: Option<u64>,
+    /// What the page says about the last thing that did not go as asked, under Save.
+    pub note: Option<ReplySourceNote>,
+}
+
+/// What Settings → Reply source says, under Save, about the last thing that did not go as asked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReplySourceNote {
+    /// The server refused the last Save, in its own words, and kept nothing. It stays until the
+    /// next Save.
+    Refused(String),
+    /// A Save went out and no answer came back: it may have been kept or not, and the setting is
+    /// read again to find out. The read's answer clears it. Not trouble yet, so the page draws it
+    /// muted.
+    Unknown,
+    /// A read failed while an earlier one's answer is still on the page, and why. The next read
+    /// that lands clears it.
+    ReadFailed(String),
+}
+
+impl ReplySourceNote {
+    /// The line the page shows.
+    pub fn line(&self) -> &str {
+        match self {
+            Self::Refused(said) | Self::ReadFailed(said) => said,
+            Self::Unknown => REPLY_SOURCE_SAVE_UNKNOWN,
+        }
+    }
+}
+
+/// The account's reply source, as far as the app knows it.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ReplySourceRead {
+    Loading,
+    Read(InferenceSource),
+    /// The server has no reply sources: it answered the read with a bare 404, as a server from
+    /// before the route does. Every control on the page is dead and the composer has no chip,
+    /// because a switch the server does not read would be a switch that changes nothing.
+    NotOnServer,
+    /// It could not be read, in the server's words or the app's.
+    Unavailable(String),
+}
+
+/// Whether opencodex answers the server, as Settings → Reply source's health line says it
+/// ([`AppState::proxy_health`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProxyHealth {
+    /// The server keeps no proxy address, so there is nothing to ask.
+    NoAddress,
+    Running,
+    NotRunning,
+}
+
+/// What Settings → Reply source says on a server without the route.
+pub(crate) const REPLY_SOURCE_NOT_ON_SERVER: &str =
+    "This server can't switch where your replies come from yet.";
+
+/// What it says when a Save went out and no answer came back: the server may have kept it or not,
+/// and the page reads the setting again to find out.
+pub(crate) const REPLY_SOURCE_SAVE_UNKNOWN: &str =
+    "The server did not answer, so the change may or may not have been kept. Checking again…";
+
+/// What it says when a key typed on the page is gone and the server may not have it
+/// ([`ReplySourceSettings::retype_key`]).
+pub(crate) const REPLY_SOURCE_RETYPE_KEY: &str = "Type the key again to save it.";
+
+/// Why Save will not send My subscription with no model while the server lists some: the server
+/// would keep it and then turn every reply away until a model was set.
+pub(crate) const REPLY_SOURCE_PICK_MODEL: &str = "Pick a model from your plan first.";
+
+/// Why Save will not send My subscription with the address taken away: the server would keep it
+/// and then turn every reply away until one was set.
+pub(crate) const REPLY_SOURCE_NEEDS_ADDRESS: &str = "Give the proxy's address first.";
+
+/// What Save does with My subscription picked while the server lists no model of the plan yet:
+/// it keeps the address, which is what lets the server list them, and leaves the door on the
+/// server's keys, so no reply is turned away meanwhile.
+pub(crate) const REPLY_SOURCE_HOLDS_GATEWAY: &str = "No model of your plan is listed yet. Save \
+     keeps the address so the server can list them; replies stay on the server's paid keys until \
+     you pick one.";
+
+impl ReplySourceSettings {
+    /// The setting as the server last gave it, once there is one.
+    pub fn kept_source(&self) -> Option<&InferenceSource> {
+        match &self.kept {
+            Some(ReplySourceRead::Read(source)) => Some(source),
+            _ => None,
+        }
+    }
+
+    /// The door the page shows picked: the person's unsaved pick, or the kept one.
+    pub fn shown_kind(&self) -> Option<InferenceKind> {
+        self.kind_pick
+            .or_else(|| self.kept_source().map(|source| source.kind))
+    }
+
+    /// The proxy URL the field shows: as typed, or as the server keeps it, or where opencodex
+    /// listens by default.
+    pub fn shown_url(&self) -> String {
+        self.url_draft
+            .clone()
+            .or_else(|| {
+                self.kept_source()
+                    .and_then(|source| source.base_url.clone())
+            })
+            .unwrap_or_else(|| crate::opengrok::DEFAULT_PROXY_URL.to_string())
+    }
+
+    /// The model the picker shows: the person's unsaved pick, none when they took it away, or
+    /// the kept one.
+    pub fn shown_model(&self) -> Option<&str> {
+        match &self.model_pick {
+            Some(pick) => pick.as_deref(),
+            None => self
+                .kept_source()
+                .and_then(|source| source.local_model.as_deref()),
+        }
+    }
+
+    /// What Save asks of the proxy URL: `None` leaves the server's alone, `Some(None)` clears it,
+    /// and `Some(Some(url))` keeps `url`. The address the field shows counts whenever it is not
+    /// the server's, the default included while the server keeps none, so a first Save sends it:
+    /// without one the server lists none of the plan's models. None is asked where the server is
+    /// not on this Mac, whose field is read-only.
+    fn url_change(&self) -> Option<Option<String>> {
+        if !self.server_on_this_mac {
+            return None;
+        }
+        let kept = self.kept_source()?;
+        let shown = self.shown_url();
+        let wanted = Some(shown.trim())
+            .filter(|url| !url.is_empty())
+            .map(str::to_string);
+        (wanted != kept.base_url).then_some(wanted)
+    }
+
+    /// What Save asks of the model, as [`Self::url_change`] does of the URL.
+    fn model_change(&self) -> Option<Option<String>> {
+        if !self.server_on_this_mac {
+            return None;
+        }
+        let kept = self.kept_source()?;
+        let pick = self.model_pick.as_ref()?;
+        (*pick != kept.local_model).then(|| pick.clone())
+    }
+
+    /// Something on the page differs from what the server keeps.
+    pub fn is_unsaved(&self) -> bool {
+        let Some(kept) = self.kept_source() else {
+            return false;
+        };
+        self.kind_pick.is_some_and(|kind| kind != kept.kind)
+            || self.url_change().is_some()
+            || self.model_change().is_some()
+            || self.key_draft.is_some()
+            || self.remove_key
+    }
+
+    /// The page's controls take a change: the setting has been read, and no Save is with the
+    /// server.
+    pub fn can_edit(&self) -> bool {
+        self.kept_source().is_some() && self.saving.is_none()
+    }
+
+    /// The plan's half of the page takes a change: the page does, and the server is on this Mac,
+    /// the only place the person's plan can be set up from.
+    pub fn plan_editable(&self) -> bool {
+        self.can_edit() && self.server_on_this_mac
+    }
+
+    /// The key field takes typing: the plan's half of the page does, and Remove key is not
+    /// picked, which draws the field read-only until Keep key takes it back.
+    pub fn key_editable(&self) -> bool {
+        self.plan_editable() && !self.remove_key
+    }
+
+    /// Why Save will not send the page as it shows it: My subscription without what a turn on it
+    /// needs, an address, or a model while `plan_models` says the server lists some to pick from.
+    /// The server would keep either, and then turn every reply away until the gap was filled.
+    pub fn blocker(&self, plan_models: bool) -> Option<&'static str> {
+        if self.shown_kind()? != InferenceKind::LocalProxy || !self.server_on_this_mac {
+            return None;
+        }
+        if self.shown_url().trim().is_empty() {
+            return Some(REPLY_SOURCE_NEEDS_ADDRESS);
+        }
+        (self.shown_model().is_none() && plan_models).then_some(REPLY_SOURCE_PICK_MODEL)
+    }
+
+    /// My subscription is shown with an address and no model, and the server lists none of the
+    /// plan's yet: Save keeps the address, which is what lets the server list them, and leaves
+    /// the door on the server's keys until a model is picked. The app never saves the person's
+    /// plan without a model.
+    pub fn holds_gateway(&self, plan_models: bool) -> bool {
+        self.server_on_this_mac
+            && self.shown_kind() == Some(InferenceKind::LocalProxy)
+            && self.shown_model().is_none()
+            && !plan_models
+            && !self.shown_url().trim().is_empty()
+    }
+
+    /// The line beside Save about what it will or will not do with the page as it stands.
+    pub fn hint(&self, plan_models: bool) -> Option<&'static str> {
+        self.blocker(plan_models).or_else(|| {
+            (self.holds_gateway(plan_models) && self.is_unsaved())
+                .then_some(REPLY_SOURCE_HOLDS_GATEWAY)
+        })
+    }
+
+    /// The door a Save keeps: the one shown, but the server's keys while
+    /// [`Self::holds_gateway`].
+    fn saved_kind(&self, plan_models: bool) -> Option<InferenceKind> {
+        if self.holds_gateway(plan_models) {
+            return Some(InferenceKind::Gateway);
+        }
+        self.shown_kind()
+    }
+
+    /// Save would send something: a change the server would keep has been made, nothing stands
+    /// in its way, and nothing is with the server.
+    pub fn can_save(&self, plan_models: bool) -> bool {
+        let Some(kept) = self.kept_source() else {
+            return false;
+        };
+        let changes = self.saved_kind(plan_models) != Some(kept.kind)
+            || self.url_change().is_some()
+            || self.model_change().is_some()
+            || self.key_draft.is_some()
+            || self.remove_key;
+        self.can_edit()
+            && self.reading.is_none()
+            && self.is_unsaved()
+            && self.blocker(plan_models).is_none()
+            && changes
+    }
+
+    /// The `PUT` a Save sends: the door it keeps, and each field the page changed. The typed key
+    /// is taken, not copied: it leaves the page with this Save, whatever becomes of it.
+    fn take_update(&mut self, plan_models: bool) -> Option<InferenceSourceUpdate> {
+        let kind = self.saved_kind(plan_models)?;
+        let api_key = match (self.key_draft.take(), self.remove_key) {
+            (Some(key), _) => Some(Some(key)),
+            (None, true) => Some(None),
+            (None, false) => None,
+        };
+        Some(InferenceSourceUpdate {
+            kind,
+            base_url: self.url_change(),
+            local_model: self.model_change(),
+            api_key,
+        })
+    }
+
+    /// Put the page back to what the server keeps: every unsaved pick goes.
+    fn forget_picks(&mut self) {
+        self.kind_pick = None;
+        self.url_draft = None;
+        self.model_pick = None;
+        self.key_draft = None;
+        self.remove_key = false;
+    }
+
+    /// Everything but the typed key, for the gpui-agent tree, which says only that one waits.
+    pub fn without_key(&self) -> Self {
+        Self {
+            kept: self.kept.clone(),
+            kind_pick: self.kind_pick,
+            url_draft: self.url_draft.clone(),
+            model_pick: self.model_pick.clone(),
+            key_draft: None,
+            remove_key: self.remove_key,
+            retype_key: self.retype_key,
+            server_on_this_mac: self.server_on_this_mac,
+            reading: self.reading,
+            saving: self.saving,
+            note: self.note.clone(),
+        }
+    }
+}
+
+/// What the composer's chip shows: which door the next turn goes through, and whether that is the
+/// person's pick for their turns rather than the account's own door.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TurnSourceChip {
+    pub kind: InferenceKind,
+    /// A pick of the person's rather than the account's own door. Either way every turn names
+    /// the door the chip shows.
+    pub picked: bool,
+    /// The model the person's plan answers with, as the server keeps it.
+    pub local_model: Option<String>,
+}
+
+/// What coming back to the window asks the server for again ([`AppState::window_activated`]).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct ActivationReads {
+    /// The person's connections: a sign-in is waited on, or a list of them is on screen.
+    connections: bool,
+    /// The account's reply source.
+    reply_source: bool,
+    /// `/models`, for Settings → Reply source's picker.
+    models: bool,
+}
+
+/// What follows a Save's answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AfterReplySourceSave {
+    /// Nothing more to ask.
+    Done,
+    /// Read the models again: the server lists opencodex's for the setting it now keeps.
+    ReadModels,
+    /// Read the setting again: nobody knows whether the Save was kept.
+    ReadAgain,
+}
+
+/// What a Save that has gone out carried, for its answer to be read by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SentSave {
+    generation: u64,
+    /// It carried a key typed on the page, which is gone from the page now.
+    key_sent: bool,
+    /// The door shown that it did not keep yet: My subscription, held on the server's keys
+    /// until a model is picked ([`ReplySourceSettings::holds_gateway`]).
+    held: Option<InferenceKind>,
+}
+
+/// A Save of the reply source that has begun: what to send, and what it carried.
+struct ReplySourceSave {
+    client: OpenGrokClient,
+    sent: SentSave,
+    update: InferenceSourceUpdate,
 }
 
 /// The open Bot's tool ceiling, as far as its settings know it: everything it could be offered
@@ -987,6 +1369,10 @@ pub struct Message {
     pub finished_at: Option<SystemTime>,
     /// Harness CUSTOM `run-timing` / `turn-timeline`, when the server sent one.
     pub run_timing: Option<TurnTiming>,
+    /// Which door a coworker's reply came through, from its run's `opengrok.inferenceSource`
+    /// CUSTOM: the server's paid keys or the person's own plan, and the model. It is the reply's
+    /// badge, and a reply from a server that sends no such frame has none.
+    pub reply_source: Option<ReplySource>,
     pub is_me: bool,
     pub reply_preview: Option<String>,
     /// The message this one answers. The preview is what the bubble paints; this is what the
@@ -1057,6 +1443,7 @@ impl Message {
             sent_at: self.sent_at,
             finished_at: self.finished_at,
             timing_json: self.run_timing.as_ref().map(TurnTiming::to_json),
+            source_json: self.reply_source.as_ref().map(ReplySource::to_json),
         }
     }
 }
@@ -1625,6 +2012,31 @@ fn connectors_unavailable(error: &OpenGrokError) -> String {
     )
 }
 
+/// Why the account's reply source could not be read, in words for Settings → Reply source.
+/// Nothing from something in front of the server is shown as the server's words.
+fn reply_source_unreadable(error: &OpenGrokError) -> String {
+    if error.unreachable().is_some() {
+        return "Could not reach the server to ask where your replies come from.".to_string();
+    }
+    if error.is_signed_out() {
+        return "Sign in again to see where your replies come from.".to_string();
+    }
+    rules_refusal("Where your replies come from could not be read", error)
+}
+
+/// A refused Save of the reply source, as the page says it: the server's own sentence when it
+/// wrote one (a URL that is not loopback, a model it will not route a subscription to), as it
+/// wrote it.
+fn reply_source_refusal(error: &OpenGrokError) -> String {
+    if error.is_signed_out() {
+        return "Sign in again to change where your replies come from.".to_string();
+    }
+    if error.written_by_opengrok() && !error.message.trim().is_empty() {
+        return error.message.clone();
+    }
+    rules_refusal("Not saved", error)
+}
+
 /// Why the open Bot's ceiling has no switches, in words for its Tools card.
 ///
 /// A 404 in the server's own shape (`{"error": "no such coworker"}`) is the server saying this
@@ -1855,13 +2267,15 @@ impl Conversation {
 /// A held message WAS the draft, so it keeps what the draft had on it rather than reading the
 /// composer again when the thread finally goes idle — by which time the draft is the next
 /// message somebody is writing. Every part of it travels here, and [`AppState::drain_queued_send`]
-/// hands the turn what this row holds and nothing else.
+/// hands the turn what this row holds and nothing else: the door included, which is the one the
+/// composer's chip showed when the message was sent, whatever the chip shows by the time it goes.
 fn held_message(
     message_id: String,
     content: String,
     recipe: Option<TurnRecipe>,
     skill: Option<String>,
     reply: Option<ReplyTo>,
+    inference_source: Option<InferenceKind>,
 ) -> QueuedSend {
     QueuedSend {
         message_id,
@@ -1869,6 +2283,7 @@ fn held_message(
         recipe,
         skill,
         reply,
+        inference_source,
         pending_id: None,
         posted: false,
         stale: StaleRefusal::Fresh,
@@ -1891,6 +2306,12 @@ pub struct QueuedSend {
     skill: Option<String>,
     /// The message this one answers, for the quote the coworker is sent.
     reply: Option<ReplyTo>,
+    /// The door the composer's chip showed when the message was sent, which its turn names when
+    /// it drains: the chip may have been clicked since, and this message was sent under the old
+    /// one. `None` when no chip was drawn, and the account's setting decides. A row read back
+    /// from the server brings its own (`inferenceSource`), and one from a server that keeps
+    /// none leaves this Mac's in place.
+    inference_source: Option<InferenceKind>,
     /// The `pum_…` row on OpenGrok, once enqueue has landed. Absent while offline, or on an
     /// OpenGrok that has not shipped pending-user-messages yet.
     pending_id: Option<String>,
@@ -2065,6 +2486,22 @@ fn recipe_from_pending(item: &PendingUserMessage) -> Option<TurnRecipe> {
     Some(TurnRecipe { id, values })
 }
 
+/// The row a held send asks OpenGrok to keep: its words under its bubble's id, the quote, the
+/// recipe with its values, the skill, and the door its chip showed, as the hold carries them.
+fn pending_write_for(hold: &QueuedSend) -> PendingWrite {
+    PendingWrite::enqueue(
+        hold.content.clone(),
+        hold.message_id.clone(),
+        hold.reply.as_ref().map(reply_json),
+        hold.recipe.as_ref().map(|recipe| recipe.id.clone()),
+        hold.recipe
+            .as_ref()
+            .map(|recipe| serde_json::Value::Object(recipe.values.clone())),
+        hold.skill.clone(),
+        hold.inference_source,
+    )
+}
+
 fn hold_from_row(item: &PendingUserMessage) -> QueuedSend {
     QueuedSend {
         message_id: item.bubble_id().to_string(),
@@ -2072,6 +2509,7 @@ fn hold_from_row(item: &PendingUserMessage) -> QueuedSend {
         recipe: recipe_from_pending(item),
         skill: item.skill_id.clone().filter(|id| !id.is_empty()),
         reply: reply_from_pending(item.reply_to.as_ref()),
+        inference_source: item.inference_source(),
         pending_id: Some(item.id.clone()).filter(|id| !id.is_empty()),
         posted: true,
         stale: StaleRefusal::Fresh,
@@ -2235,13 +2673,36 @@ fn apply_reload(
 /// the server's note so the field can say why it may be stale.
 ///
 /// An empty catalogue with no note is a real answer — this key routes to nothing — and is taken.
+///
+/// Each door's list is kept by the same rule, apart, because `/models` answers for two machines
+/// at once: the gateway's routes, which a Bot's Model field offers, and the person's own plan's,
+/// listed by opencodex, which Settings → Reply source offers. Either can be down while the other
+/// answers, and a list that came back with only the other's entries must not empty this one's.
+/// The gateway's reason is the note; opencodex's is `localProxy.healthy: false`. A plan list that
+/// comes back empty while opencodex answers, or with no proxy address kept (no `localProxy` at
+/// all), is a real answer, and is taken.
 fn apply_catalogue(held: &mut ModelCatalogue, fresh: ModelCatalogue) -> Option<String> {
     let note = fresh.note.clone();
-    if fresh.models.is_empty() && !held.models.is_empty() && note.is_some() {
-        held.note = note.clone();
-        return note;
-    }
-    *held = fresh;
+    let (fresh_plan, fresh_gateway): (Vec<ModelEntry>, Vec<ModelEntry>) = fresh
+        .models
+        .into_iter()
+        .partition(ModelEntry::is_local_proxy);
+    let (held_plan, held_gateway): (Vec<ModelEntry>, Vec<ModelEntry>) =
+        held.models.drain(..).partition(ModelEntry::is_local_proxy);
+    let gateway = if fresh_gateway.is_empty() && note.is_some() {
+        held_gateway
+    } else {
+        fresh_gateway
+    };
+    let proxy_down = fresh.local_proxy.is_some_and(|proxy| !proxy.healthy);
+    let plan = if fresh_plan.is_empty() && proxy_down {
+        held_plan
+    } else {
+        fresh_plan
+    };
+    held.models = gateway.into_iter().chain(plan).collect();
+    held.note = note.clone();
+    held.local_proxy = fresh.local_proxy;
     note
 }
 
@@ -2264,6 +2725,7 @@ fn status_row(line: &str) -> Message {
         sent_at: SystemTime::now(),
         finished_at: None,
         run_timing: None,
+        reply_source: None,
         is_me: false,
         reply_preview: None,
         reply_to_id: None,
@@ -2310,6 +2772,10 @@ fn restored_message(row: ChatMessage) -> Message {
         sent_at,
         finished_at: row.finished_at.as_deref().and_then(parse_sql_time),
         run_timing: row.run_timing.as_deref().and_then(TurnTiming::from_json),
+        reply_source: row
+            .inference_source
+            .as_deref()
+            .and_then(ReplySource::from_json),
         is_me: row.role == "user",
         reply_preview: row.reply_preview,
         reply_to_id: row.reply_to_id,
@@ -2355,6 +2821,64 @@ fn stream_paint_due(
     sig != prev_sig || last.is_none_or(|at| now.saturating_duration_since(at) >= STREAM_PAINT_MIN)
 }
 
+/// The door a live run's reply came through, the first time the stream says so, or when it says
+/// another: `None` on every other frame, so the reply's row is told once. `told` is what the row
+/// has been told so far.
+fn source_news(assembler: &TurnAssembler, told: &mut Option<ReplySource>) -> Option<ReplySource> {
+    let source = assembler
+        .reply_source()
+        .filter(|source| told.as_ref() != Some(*source))
+        .cloned();
+    if source.is_some() {
+        told.clone_from(&source);
+    }
+    source
+}
+
+/// A replay's word on which door a run went through, onto the reply it paints. Only a word: a
+/// replay without the frame (a server from before reply sources, or a journal that has not got
+/// that far) leaves the badge the reply already wears, which the live stream may have given it.
+/// Answers whether the badge changed, which is when its row has to be told
+/// ([`AppState::persist_replayed_badges`]).
+fn wear_replayed_source(message: &mut Message, source: Option<ReplySource>) -> bool {
+    match source {
+        Some(source) if message.reply_source.as_ref() != Some(&source) => {
+            message.reply_source = Some(source);
+            true
+        }
+        _ => false,
+    }
+}
+
+/// A badge a replay put on a reply: the reply's row, the run whose journal named the door, and
+/// the door. The row is told, so a thread reopened from disk wears it without the server.
+#[derive(Debug, Clone, PartialEq)]
+struct ReplayedBadge {
+    message_id: String,
+    run_id: String,
+    source: ReplySource,
+}
+
+/// The badges a replay put on replies, written onto their rows, each only while its row is still
+/// filed under the run that earned it ([`DatabaseService::keep_reply_source`]).
+async fn keep_replayed_badges(db: &DatabaseService, badges: &[ReplayedBadge]) {
+    for badge in badges {
+        let kept = db
+            .keep_reply_source(&badge.message_id, &badge.run_id, &badge.source.to_json())
+            .await;
+        if let Err(error) = kept {
+            eprintln!("NativeChat: a reply's badge from the server was not saved: {error}");
+        }
+    }
+}
+
+/// [`replayed_run`]'s words and pieces, for the tests that read nothing else of it.
+#[cfg(test)]
+fn reply_from_replay(events: &[serde_json::Value], status: &str) -> (String, Vec<ChatPart>) {
+    let (plain, parts, _) = replayed_run(events, status);
+    (plain, parts)
+}
+
 /// A run rebuilt from the frames the server kept, as the live stream would have painted it.
 ///
 /// The same assembler the stream feeds, over the same frames in the same order, because a turn
@@ -2363,7 +2887,13 @@ fn stream_paint_due(
 /// person has to decide which to believe. A run still going keeps its last frames held, exactly
 /// as the live stream holds them: a tool whose arguments are still arriving is not a widget yet,
 /// and forcing it out would paint half a chart and then take it away again.
-fn reply_from_replay(events: &[serde_json::Value], status: &str) -> (String, Vec<ChatPart>) {
+///
+/// The same holds for which door the run went through: its `opengrok.inferenceSource` CUSTOM is
+/// read by that same assembler, so a reply read back wears the badge it wore live.
+fn replayed_run(
+    events: &[serde_json::Value],
+    status: &str,
+) -> (String, Vec<ChatPart>, Option<ReplySource>) {
     let mut assembler = TurnAssembler::default();
     for event in events {
         assembler.push_event(event);
@@ -2371,7 +2901,8 @@ fn reply_from_replay(events: &[serde_json::Value], status: &str) -> (String, Vec
     if status != "running" {
         assembler.finish();
     }
-    assembler.snapshot()
+    let (plain, parts) = assembler.snapshot();
+    (plain, parts, assembler.reply_source().cloned())
 }
 
 /// How many of a thread's runs are asked for when reconciling it against the server.
@@ -2397,6 +2928,8 @@ struct RecoveredReply {
     finished_at: Option<SystemTime>,
     /// Harness timing CUSTOM, when the journal carried one.
     run_timing: Option<TurnTiming>,
+    /// Which door the reply came through, when the journal carried its CUSTOM.
+    reply_source: Option<ReplySource>,
 }
 
 /// Something the person said that a replay brought back and this thread does not hold.
@@ -2446,7 +2979,7 @@ fn missing_replies(messages: &[Message], runs: &[ThreadRun]) -> Vec<RecoveredRep
         .iter()
         .filter(|run| !run.run_id.trim().is_empty() && (trusted || run.is_live()))
         .filter_map(|run| {
-            let (plain, parts) = reply_from_replay(&run.events, &run.status);
+            let (plain, parts, reply_source) = replayed_run(&run.events, &run.status);
             let plain = replayed_ending(&run.events, &run.status, run.failure.as_deref(), &plain)
                 .unwrap_or(plain);
             if plain.trim().is_empty() && parts.is_empty() {
@@ -2468,6 +3001,7 @@ fn missing_replies(messages: &[Message], runs: &[ThreadRun]) -> Vec<RecoveredRep
                 },
                 finished_at: recovered_finished_at(run),
                 run_timing: TurnTiming::from_events(&run.events),
+                reply_source,
             })
         })
         .collect()
@@ -2543,6 +3077,23 @@ fn unheard_hidden_runs(messages: &[Message], offered: &[ThreadRun]) -> Vec<Strin
         .collect()
 }
 
+/// The bubble a followed run paints into by name: the thread's live turn's, when that turn is
+/// this run.
+///
+/// The live turn is the one run the thread is holding still for. A run the app follows without
+/// holding it — a card answered from a notification while another turn is going in the same
+/// thread, or a run picked up off the approvals queue — has no claim on that bubble: painting
+/// there wrote its words and its badge over another run's reply. It finds its own row by its run
+/// id instead, or is given one ([`bubble_for_run`]).
+fn followed_bubble(
+    live_turns: &HashMap<String, LiveTurn>,
+    conversation_id: Option<&str>,
+    run_id: &str,
+) -> Option<String> {
+    let turn = live_turns.get(conversation_id?)?;
+    (turn.run_id == run_id).then(|| turn.message_id.clone())
+}
+
 fn bubble_for_run(
     messages: &mut Vec<Message>,
     target: Option<&str>,
@@ -2569,6 +3120,7 @@ fn bubble_for_run(
         sent_at: started_at.unwrap_or_else(SystemTime::now),
         finished_at: None,
         run_timing: None,
+        reply_source: None,
         is_me: false,
         reply_preview: None,
         reply_to_id: None,
@@ -2656,6 +3208,7 @@ fn graft_questions(messages: &mut Vec<Message>, questions: &[RecoveredQuestion])
                 sent_at: question.said_at,
                 finished_at: None,
                 run_timing: None,
+                reply_source: None,
                 is_me: true,
                 // The replay carries the words as they were sent, and a reply's quote is baked
                 // into them there (`agui_messages`); the frames say nothing of `replyTo`. So a
@@ -2695,6 +3248,7 @@ fn graft_reply(messages: &mut Vec<Message>, reply: &RecoveredReply) -> String {
             sent_at: reply.started_at,
             finished_at: reply.finished_at,
             run_timing: reply.run_timing.clone(),
+            reply_source: reply.reply_source.clone(),
             is_me: false,
             reply_preview: None,
             reply_to_id: None,
@@ -3554,6 +4108,9 @@ pub enum AppSettingsTab {
     Logins,
     /// The services the person has signed in to for their Bots, and the ones on offer (#2).
     Connections,
+    /// Where the account's replies are paid from: the server's paid keys, or the person's own
+    /// subscription through opencodex.
+    ReplySource,
     Skills,
 }
 
@@ -4056,6 +4613,27 @@ pub struct AppState {
     /// Connect it was asked for. The service's name cannot tell that ask from another for the
     /// same service, or from one an account that has since signed out made.
     connect_asks: u64,
+    /// Settings → Reply source: where the server keeps this account's replies paid from, and
+    /// the page's unsaved picks. The composer's chip defaults from it.
+    pub reply_source: ReplySourceSettings,
+    /// Numbers the reads and Saves of the reply source, so an answer that is not the newest, or
+    /// that lands after a sign-out, is dropped.
+    reply_source_generation: u64,
+    /// The door the person picked on the composer's chip where it is not the account's own. The
+    /// chip shows it, and every turn names what the chip shows, until they change it back, a
+    /// Save makes it the account's own, or they sign out; and it does not outlive the app,
+    /// because only this memory keeps it. The server keeps the account's door, and that is what
+    /// a relaunch starts from.
+    turn_source_pick: Option<InferenceKind>,
+    /// The composer is dictating: its chip is not drawn meanwhile, and a turn names the
+    /// account's own door rather than the chip's.
+    pub(crate) composer_dictating: bool,
+    /// Numbers the reads of `/models`, so only the newest answer lands
+    /// ([`Self::begin_models_read`]).
+    models_generation: u64,
+    /// Settings → Reply source was on screen when Settings last changed what it shows, so its
+    /// arrival and its leaving are each told once ([`Self::settle_reply_source_page`]).
+    reply_source_page_shown: bool,
     /// Everything the open Bot could be offered and which of it it may be, as its Tools card's
     /// switches show it (opengrok-server#268): the Bot's id and the answer, like
     /// [`Self::coworker_tools`]. Drawn through [`Self::ceiling_card`].
@@ -4630,6 +5208,12 @@ impl AppState {
             connections_generation: 0,
             connectors_generation: 0,
             connect_asks: 0,
+            reply_source: ReplySourceSettings::default(),
+            reply_source_generation: 0,
+            turn_source_pick: None,
+            composer_dictating: false,
+            models_generation: 0,
+            reply_source_page_shown: false,
             coworker_ceiling: None,
             ceiling_generation: 0,
             ceiling_reading: None,
@@ -5693,6 +6277,20 @@ impl AppState {
         self.connections_generation += 1;
         self.connectors_generation += 1;
         self.connect_asks += 1;
+        // So was the reply source, and whatever read or Save of it is still out; and the pick on
+        // the composer's chip was theirs to make.
+        self.reply_source = ReplySourceSettings::default();
+        self.reply_source_page_shown = false;
+        self.reply_source_generation += 1;
+        self.turn_source_pick = None;
+        self.composer_dictating = false;
+        // And any list of models still being asked for was asked as them, and the plan's models
+        // listed were their plan's: the gateway's routes are the deployment's and stay.
+        self.models_generation += 1;
+        self.model_catalogue
+            .models
+            .retain(|entry| !entry.is_local_proxy());
+        self.model_catalogue.local_proxy = None;
         self.host_egress_tunnel_available = false;
         self.egress_tunnel_enabled = true;
         self.coworker_computer = None;
@@ -5751,34 +6349,53 @@ impl AppState {
         })
         .detach();
         self.refresh_models(cx);
+        // The composer's chip defaults from the account's reply source, so it is read with the
+        // roster: at sign-in, and when the server comes back.
+        self.read_reply_source(cx);
     }
 
     pub fn refresh_models(&mut self, cx: &mut Context<Self>) {
-        let Some(client) = self.opengrok.clone() else {
+        let Some((client, generation)) = self.begin_models_read() else {
             return;
         };
         cx.spawn(async move |this, cx| {
             let result = client.list_models().await;
             let _ = this.update(cx, |state, cx| {
-                state.settle_models(result, cx);
+                state.settle_models(generation, result, cx);
                 cx.notify();
             });
         })
         .detach();
     }
 
+    /// Number a read of `/models`, the reconnect loop's probe among them. Every read begun
+    /// before it is overtaken, and its answer is dropped when it comes: several are asked in a
+    /// row (sign-in, Settings → Reply source, a Save's answer, a Bot's settings) and they need
+    /// not answer in that order, and an older list landing last would put back models the
+    /// newer one no longer offers.
+    fn begin_models_read(&mut self) -> Option<(OpenGrokClient, u64)> {
+        let client = self.opengrok.clone()?;
+        self.models_generation += 1;
+        Some((client, self.models_generation))
+    }
+
     /// What a `/models` answer means — for the Model field, and for whether the gateway is there.
     ///
     /// This is also the reconnect loop's probe, which is why it answers whether everything is
-    /// reachable now: one request settles both questions, and its success *is* the refill.
+    /// reachable now: one request settles both questions, and its success *is* the refill. An
+    /// answer to a read that something newer has overtaken, or that lands after a sign-out,
+    /// touches nothing and counts as no answer: the newer read settles both questions itself.
     fn settle_models(
         &mut self,
+        generation: u64,
         result: Result<ModelCatalogue, OpenGrokError>,
         cx: &mut Context<Self>,
     ) -> bool {
-        match result {
-            Ok(catalogue) => {
-                let note = apply_catalogue(&mut self.model_catalogue, catalogue);
+        let Some(taken) = self.take_models(generation, result) else {
+            return false;
+        };
+        match taken {
+            Ok(note) => {
                 match note.filter(|note| reads_as_gateway_unreachable(note)) {
                     Some(note) => {
                         self.note_unreachable(Unreachable::Gateway, &note, cx);
@@ -5796,6 +6413,20 @@ impl AppState {
                 error.unreachable().is_none()
             }
         }
+    }
+
+    /// The list a `/models` answer brings, taken while its read is still the newest: the
+    /// server's note when it came, or the failure. `None` for an answer that something newer has
+    /// overtaken, which touches nothing.
+    fn take_models(
+        &mut self,
+        generation: u64,
+        result: Result<ModelCatalogue, OpenGrokError>,
+    ) -> Option<Result<Option<String>, OpenGrokError>> {
+        if generation != self.models_generation {
+            return None;
+        }
+        Some(result.map(|catalogue| apply_catalogue(&mut self.model_catalogue, catalogue)))
     }
 
     /// Every failure the app hears about is sorted here, once, so that no call site has to guess.
@@ -5915,12 +6546,18 @@ impl AppState {
                     return;
                 };
                 cx.background_executor().timer(wait).await;
+                let Ok(generation) = this.update(cx, |state, _| {
+                    state.models_generation += 1;
+                    state.models_generation
+                }) else {
+                    return;
+                };
                 let result = client.list_models().await;
                 let Ok(reachable) = this.update(cx, |state, cx| {
                     if state.reconnect_epoch != epoch {
                         return true;
                     }
-                    let reachable = state.settle_models(result, cx);
+                    let reachable = state.settle_models(generation, result, cx);
                     cx.notify();
                     reachable
                 }) else {
@@ -6707,6 +7344,472 @@ impl AppState {
         cx.notify();
     }
 
+    /// Ask the server where the account's replies are paid from: on sign-in, with the roster,
+    /// because the composer's chip defaults from it; and whenever Settings → Reply source comes
+    /// on screen, for its health line. What was read stays on the page while it is asked again.
+    pub fn read_reply_source(&mut self, cx: &mut Context<Self>) {
+        let Some((client, generation)) = self.begin_reply_source_read() else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let read = client.inference_source().await;
+            let _ = this.update(cx, |state, cx| {
+                if state.settle_reply_source_read(generation, read) {
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Begin a read of the reply source: every read begun before it is overtaken, and dropped
+    /// when it answers. None while a Save is out, whose answer is the newest word there will be,
+    /// and none with nobody signed in to ask for.
+    fn begin_reply_source_read(&mut self) -> Option<(OpenGrokClient, u64)> {
+        let client = self.opengrok.clone()?;
+        if !self.is_signed_in() || self.reply_source.saving.is_some() {
+            return None;
+        }
+        if self.reply_source.kept_source().is_none() {
+            self.reply_source.kept = Some(ReplySourceRead::Loading);
+        }
+        self.reply_source.server_on_this_mac = client.is_on_this_machine();
+        self.reply_source_generation += 1;
+        self.reply_source.reading = Some(self.reply_source_generation);
+        Some((client, self.reply_source_generation))
+    }
+
+    /// Put a read of the reply source on the page, unless something newer has begun since or the
+    /// person has signed out. `false` when it was dropped and nothing was touched.
+    fn settle_reply_source_read(
+        &mut self,
+        generation: u64,
+        read: Result<InferenceSource, OpenGrokError>,
+    ) -> bool {
+        let settings = &mut self.reply_source;
+        if settings.reading != Some(generation) {
+            return false;
+        }
+        settings.reading = None;
+        match read {
+            Ok(source) => {
+                settings.kept = Some(ReplySourceRead::Read(source));
+                // What the server says now answers a Save nobody knew the fate of, and a read
+                // that failed. A refusal is about the Save, and stays until the next one.
+                if !matches!(settings.note, Some(ReplySourceNote::Refused(_))) {
+                    settings.note = None;
+                }
+            }
+            // A bare 404 is a server from before the route; the server's own 404 is not that.
+            Err(error) if error.is_not_found() && !error.written_by_opengrok() => {
+                settings.forget_picks();
+                settings.note = None;
+                settings.kept = Some(ReplySourceRead::NotOnServer);
+            }
+            Err(error) => {
+                let why = reply_source_unreadable(&error);
+                if settings.kept_source().is_some() {
+                    settings.note = Some(ReplySourceNote::ReadFailed(why));
+                } else {
+                    settings.kept = Some(ReplySourceRead::Unavailable(why));
+                }
+            }
+        }
+        self.settle_turn_source_pick();
+        true
+    }
+
+    /// Settings → Reply source's Save: the door and what changed, in one `PUT`. Every control is
+    /// dead until the server answers, and what it answers is what the page shows after. A
+    /// refusal leaves the kept setting as it was and the picks where they were, with the
+    /// server's words under Save.
+    pub fn save_reply_source(&mut self, cx: &mut Context<Self>) {
+        let Some(save) = self.begin_reply_source_save() else {
+            return;
+        };
+        let ReplySourceSave {
+            client,
+            sent,
+            update,
+        } = save;
+        cx.spawn(async move |this, cx| {
+            let answer = client.set_inference_source(&update).await;
+            // The key, if one went, goes no further than this request.
+            drop(update);
+            let _ = this.update(cx, |state, cx| {
+                match state.settle_reply_source_save(sent, answer) {
+                    None | Some(AfterReplySourceSave::Done) => {}
+                    Some(AfterReplySourceSave::ReadModels) => state.refresh_models(cx),
+                    Some(AfterReplySourceSave::ReadAgain) => state.read_reply_source(cx),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// Begin a Save, for the caller to send: `None` while there is nothing to save, something in
+    /// its way, or anything with the server. A key typed on the page goes with it and leaves the
+    /// page for good.
+    fn begin_reply_source_save(&mut self) -> Option<ReplySourceSave> {
+        let plan_models = self.plan_models_listed();
+        if !self.reply_source.can_save(plan_models) {
+            return None;
+        }
+        let client = self.opengrok.clone()?;
+        let held = self
+            .reply_source
+            .holds_gateway(plan_models)
+            .then_some(InferenceKind::LocalProxy);
+        let update = self.reply_source.take_update(plan_models)?;
+        let key_sent = matches!(update.api_key, Some(Some(_)));
+        self.reply_source.note = None;
+        self.reply_source_generation += 1;
+        self.reply_source.saving = Some(self.reply_source_generation);
+        Some(ReplySourceSave {
+            client,
+            sent: SentSave {
+                generation: self.reply_source_generation,
+                key_sent,
+                held,
+            },
+            update,
+        })
+    }
+
+    /// Put a Save's answer on the page, and say what to ask next. `None` when the answer is not
+    /// the Save's that is out (the person signed out since) and nothing was touched.
+    fn settle_reply_source_save(
+        &mut self,
+        sent: SentSave,
+        answer: Result<InferenceSource, OpenGrokError>,
+    ) -> Option<AfterReplySourceSave> {
+        let settings = &mut self.reply_source;
+        if settings.saving != Some(sent.generation) {
+            return None;
+        }
+        settings.saving = None;
+        let after = match answer {
+            Ok(kept) => {
+                settings.forget_picks();
+                settings.retype_key = false;
+                // The address is kept and the door held on the server's keys: My subscription
+                // stays picked, for a model to be picked from the list the server now makes.
+                if let Some(kind) = sent.held.filter(|held| *held != kept.kind) {
+                    settings.kind_pick = Some(kind);
+                }
+                settings.kept = Some(ReplySourceRead::Read(kept));
+                AfterReplySourceSave::ReadModels
+            }
+            Err(error) if error.is_not_found() && !error.written_by_opengrok() => {
+                settings.forget_picks();
+                settings.kept = Some(ReplySourceRead::NotOnServer);
+                AfterReplySourceSave::Done
+            }
+            // No answer at all, or one that could not be read: the server may have kept it, and
+            // only asking again can say.
+            Err(error) if error.unreachable().is_some() || error.status.is_none() => {
+                settings.note = Some(ReplySourceNote::Unknown);
+                settings.retype_key |= sent.key_sent;
+                AfterReplySourceSave::ReadAgain
+            }
+            Err(error) => {
+                settings.note = Some(ReplySourceNote::Refused(reply_source_refusal(&error)));
+                settings.retype_key |= sent.key_sent;
+                AfterReplySourceSave::Done
+            }
+        };
+        self.settle_turn_source_pick();
+        Some(after)
+    }
+
+    /// Settings → Reply source's radio. It waits for Save like everything on the page. My
+    /// subscription is offered only where the server runs on this Mac.
+    pub fn pick_reply_source_kind(&mut self, kind: InferenceKind, cx: &mut Context<Self>) {
+        if self.note_reply_source_kind(kind) {
+            cx.notify();
+        }
+    }
+
+    fn note_reply_source_kind(&mut self, kind: InferenceKind) -> bool {
+        let settings = &mut self.reply_source;
+        let editable = match kind {
+            InferenceKind::Gateway => settings.can_edit(),
+            InferenceKind::LocalProxy => settings.plan_editable(),
+        };
+        if !editable {
+            return false;
+        }
+        let kept = settings.kept_source().map(|source| source.kind);
+        settings.kind_pick = (Some(kind) != kept).then_some(kind);
+        true
+    }
+
+    /// The proxy URL as the field holds it now. Emptied, it is the address taken away.
+    pub fn set_reply_source_url(&mut self, url: String, cx: &mut Context<Self>) {
+        if self.note_reply_source_url(url) {
+            cx.notify();
+        }
+    }
+
+    /// Only while the plan's half of the page takes a change, as the radio and the picker: a
+    /// field drawn read-only (a Save out, the setting not read, the server on another machine)
+    /// leaves the address as it was, whatever reaches it.
+    fn note_reply_source_url(&mut self, url: String) -> bool {
+        let settings = &mut self.reply_source;
+        if !settings.plan_editable() || settings.shown_url() == url {
+            return false;
+        }
+        settings.url_draft = Some(url);
+        true
+    }
+
+    /// A model picked from the models of the person's plan.
+    pub fn pick_reply_source_model(&mut self, model: String, cx: &mut Context<Self>) {
+        if self.note_reply_source_model(Some(model)) {
+            cx.notify();
+        }
+    }
+
+    /// No model: the one the server keeps is taken away with the next Save.
+    pub fn clear_reply_source_model(&mut self, cx: &mut Context<Self>) {
+        if self.note_reply_source_model(None) {
+            cx.notify();
+        }
+    }
+
+    fn note_reply_source_model(&mut self, model: Option<String>) -> bool {
+        let settings = &mut self.reply_source;
+        if !settings.plan_editable() {
+            return false;
+        }
+        let kept = settings
+            .kept_source()
+            .and_then(|source| source.local_model.clone());
+        settings.model_pick = (model != kept).then_some(model);
+        true
+    }
+
+    /// A key for the proxy as the field holds it now; a blank field is no key, and leaves the
+    /// one the server has alone. A key typed takes back a Remove key, and is the key the page
+    /// asked for again.
+    pub fn set_reply_source_key(&mut self, typed: &str, cx: &mut Context<Self>) {
+        if self.note_reply_source_key(typed) {
+            cx.notify();
+        }
+    }
+
+    fn note_reply_source_key(&mut self, typed: &str) -> bool {
+        let settings = &mut self.reply_source;
+        if !settings.plan_editable() {
+            return false;
+        }
+        let key = ProxyKey::new(typed);
+        if key.is_some() {
+            settings.remove_key = false;
+            settings.retype_key = false;
+        }
+        if settings.key_draft == key {
+            return false;
+        }
+        settings.key_draft = key;
+        true
+    }
+
+    /// Remove key, and Keep key to take it back: the next Save asks the server to forget the key
+    /// it holds. Offered only while the server holds one.
+    pub fn toggle_remove_reply_source_key(&mut self, cx: &mut Context<Self>) {
+        if self.note_remove_reply_source_key() {
+            cx.notify();
+        }
+    }
+
+    fn note_remove_reply_source_key(&mut self) -> bool {
+        let settings = &mut self.reply_source;
+        let holds_key = settings
+            .kept_source()
+            .is_some_and(|source| source.has_api_key);
+        if !settings.plan_editable() || !holds_key {
+            return false;
+        }
+        settings.remove_key = !settings.remove_key;
+        if settings.remove_key {
+            settings.key_draft = None;
+        }
+        true
+    }
+
+    /// Settings has changed what it shows. Reply source coming on screen reads the setting, for
+    /// the health line and in case it changed on another Mac, and the models, for the picker;
+    /// leaving it drops a key typed there and not saved ([`Self::settle_reply_source_page`]).
+    fn reply_source_page_moved(&mut self, cx: &mut Context<Self>) {
+        if self.settle_reply_source_page() {
+            self.read_reply_source(cx);
+            self.refresh_models(cx);
+        }
+    }
+
+    /// Whether Settings → Reply source has just come on screen. Off screen, a key typed there and
+    /// not saved is dropped, and the page asks for it again when it is back: nothing keeps a key
+    /// the person walked away from, in memory or anywhere else.
+    fn settle_reply_source_page(&mut self) -> bool {
+        let shown = self.reply_source_on_screen();
+        let arrived = shown && !self.reply_source_page_shown;
+        self.reply_source_page_shown = shown;
+        if !shown && self.reply_source.key_draft.take().is_some() {
+            self.reply_source.retype_key = true;
+        }
+        arrived
+    }
+
+    /// The server lists models of the person's plan to pick from.
+    fn plan_models_listed(&self) -> bool {
+        !self.subscription_models().is_empty()
+    }
+
+    /// Save would send something ([`ReplySourceSettings::can_save`]).
+    pub fn reply_source_can_save(&self) -> bool {
+        self.reply_source.can_save(self.plan_models_listed())
+    }
+
+    /// The line beside Save about what it will or will not do ([`ReplySourceSettings::hint`]).
+    pub fn reply_source_hint(&self) -> Option<&'static str> {
+        self.reply_source.hint(self.plan_models_listed())
+    }
+
+    /// Whether opencodex answers the server, for the page's health line: no address kept is its
+    /// own answer; otherwise `/models`' word on it (`localProxy.healthy`) when that gave one,
+    /// being what filled the picker, and the setting's `healthy` when it did not. `None` before
+    /// the setting is read.
+    pub fn proxy_health(&self) -> Option<ProxyHealth> {
+        let kept = self.reply_source.kept_source()?;
+        if kept.base_url.is_none() {
+            return Some(ProxyHealth::NoAddress);
+        }
+        let healthy = self
+            .model_catalogue
+            .local_proxy
+            .map_or(kept.healthy, |proxy| proxy.healthy);
+        Some(if healthy {
+            ProxyHealth::Running
+        } else {
+            ProxyHealth::NotRunning
+        })
+    }
+
+    /// The models the page offers for the person's plan: what `GET /models` lists as served
+    /// through opencodex, in its order, and only those the server's allowlist lets a
+    /// subscription answer with ([`crate::opengrok::is_subscription_model`]).
+    pub fn subscription_models(&self) -> Vec<String> {
+        self.model_catalogue
+            .models
+            .iter()
+            .filter(|entry| entry.source() == Some(InferenceKind::LocalProxy))
+            .filter(|entry| crate::opengrok::is_subscription_model(&entry.id))
+            .map(|entry| entry.id.clone())
+            .collect()
+    }
+
+    /// The chip the account's setting makes for, drawn or not: `None` before the setting is read,
+    /// on a server without reply sources, and while the person has no plan set up to switch to
+    /// (the account is on the server's keys, with no model of theirs kept).
+    fn turn_source_chip(&self) -> Option<TurnSourceChip> {
+        let kept = self.reply_source.kept_source()?;
+        if kept.kind == InferenceKind::Gateway && kept.local_model.is_none() {
+            return None;
+        }
+        let kind = self.turn_source_pick.unwrap_or(kept.kind);
+        Some(TurnSourceChip {
+            kind,
+            picked: kind != kept.kind,
+            local_model: kept.local_model.clone(),
+        })
+    }
+
+    /// The composer's chip as drawn: [`Self::turn_source_chip`], except while the composer is
+    /// dictating, when the chip gives its place to the dictation's buttons and a turn names the
+    /// account's own door ([`Self::turn_source_for_send`]). `None` where no chip is drawn.
+    pub fn composer_turn_source(&self) -> Option<TurnSourceChip> {
+        self.turn_source_chip().filter(|_| !self.composer_dictating)
+    }
+
+    /// Replies go through the person's own plan: the account's door is it, or the composer's
+    /// chip is on it. A Bot's own model is not what answers then, the plan's model picked in
+    /// Settings → Reply source is, and the Bot's Model field says so.
+    pub fn replies_on_plan(&self) -> bool {
+        let plan = Some(InferenceKind::LocalProxy);
+        self.reply_source.kept_source().map(|kept| kept.kind) == plan
+            || self.turn_source_chip().map(|chip| chip.kind) == plan
+    }
+
+    /// The door a turn sent now names in `forwardedProps.inferenceSource`: the one the chip
+    /// shows, the account's own included. The chip starts at the account's door as last read,
+    /// and that may have moved on another Mac since; naming it anyway is what makes the turn go
+    /// where the chip says.
+    ///
+    /// While the composer dictates, the chip gives its place to the dictation's buttons and the
+    /// turn names the account's own door, as Settings → Reply source shows it: a pick on a chip
+    /// the person cannot see does not steer the turn, and naming nothing would leave it to the
+    /// server's copy of the setting, which may have moved since it was read here. Where there is
+    /// no chip to hide (the setting not read, a server without reply sources, no plan set up to
+    /// switch to), nothing, dictating or not, and the account's setting decides on the server,
+    /// where it is kept.
+    fn turn_source_for_send(&self) -> Option<InferenceKind> {
+        let chip = self.turn_source_chip()?;
+        if self.composer_dictating {
+            return self.reply_source.kept_source().map(|kept| kept.kind);
+        }
+        Some(chip.kind)
+    }
+
+    /// The door a turn names: a held send's is the one it was held with when the message was
+    /// sent, whatever the chip shows by the time it drains; any other turn's is the one a turn
+    /// sent now names ([`Self::turn_source_for_send`]).
+    fn turn_inference_source(&self, drained: Option<&QueuedSend>) -> Option<InferenceKind> {
+        match drained {
+            Some(held) => held.inference_source,
+            None => self.turn_source_for_send(),
+        }
+    }
+
+    /// The composer is dictating, or has stopped. The chip is not drawn meanwhile, so it is not
+    /// in a driver's tree either, and a turn sent meanwhile names the account's own door.
+    pub fn set_composer_dictating(&mut self, dictating: bool, cx: &mut Context<Self>) {
+        if self.composer_dictating != dictating {
+            self.composer_dictating = dictating;
+            cx.notify();
+        }
+    }
+
+    /// A click on the composer's chip: the person's next turns go through the other door until
+    /// it is clicked again. The pick is not sent anywhere until a turn carries it.
+    pub fn toggle_turn_source(&mut self, cx: &mut Context<Self>) {
+        if self.flip_turn_source() {
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn flip_turn_source(&mut self) -> bool {
+        let Some(chip) = self.composer_turn_source() else {
+            return false;
+        };
+        let next = chip.kind.other();
+        let account = self.reply_source.kept_source().map(|kept| kept.kind);
+        self.turn_source_pick = (Some(next) != account).then_some(next);
+        true
+    }
+
+    /// After the account's setting changes: a pick on the chip that is now the account's own
+    /// door is no pick, and there is none while the setting makes for no chip. A chip that is
+    /// only out of sight while the composer dictates keeps its pick.
+    fn settle_turn_source_pick(&mut self) {
+        let account = self.reply_source.kept_source().map(|kept| kept.kind);
+        if self.turn_source_chip().is_none() || self.turn_source_pick == account {
+            self.turn_source_pick = None;
+        }
+    }
+
     /// Ask the server for the person's connections and for the services it can connect: each
     /// time Settings → Connections or a bot's settings open, and on Refresh. What was listed
     /// stays on screen while it is asked again.
@@ -7098,9 +8201,38 @@ impl AppState {
     /// connections list is on screen, so someone who signed in and came back later than the wait
     /// still finds it without pressing Refresh.
     pub fn window_activated(&mut self, cx: &mut Context<Self>) {
-        if self.rereads_connections_on_activation(Instant::now()) {
+        let reads = self.reads_on_activation(Instant::now());
+        if reads.connections {
             self.read_connections(cx);
         }
+        if reads.reply_source {
+            self.read_reply_source(cx);
+        }
+        if reads.models {
+            self.refresh_models(cx);
+        }
+    }
+
+    /// What coming back to the window asks the server for again.
+    fn reads_on_activation(&mut self, now: Instant) -> ActivationReads {
+        ActivationReads {
+            connections: self.rereads_connections_on_activation(now),
+            // The account's door, whenever somebody is signed in. The composer's chip starts at
+            // it and every turn names what the chip shows, so a door changed on another Mac
+            // meanwhile would send the next turn somewhere the person no longer asked for. It
+            // is also Settings → Reply source's health line, which changes outside the app: the
+            // person starts opencodex in a terminal and comes back to see it running.
+            reply_source: self.is_signed_in(),
+            // And while that page is on screen, the plan's models with it, as arriving on the
+            // page reads them: opencodex that has just been started lists them for the first
+            // time, and the picker should not wait for the page to be left and come back to.
+            models: self.is_signed_in() && self.reply_source_on_screen(),
+        }
+    }
+
+    /// Settings is open on Reply source.
+    fn reply_source_on_screen(&self) -> bool {
+        self.is_app_settings_open && self.app_settings_tab == AppSettingsTab::ReplySource
     }
 
     /// Whether coming back to the window asks for the person's connections again: a sign-in is
@@ -10640,6 +11772,7 @@ impl AppState {
         }
         self.page = MainPage::Chat;
         self.is_app_settings_open = false;
+        self.reply_source_page_moved(cx);
         self.select_conversation(routine_id.to_string(), cx);
         self.record_nav();
     }
@@ -10795,6 +11928,7 @@ impl AppState {
         if self.is_app_settings_open && self.app_settings_tab == AppSettingsTab::Connections {
             self.refresh_connections(cx);
         }
+        self.reply_source_page_moved(cx);
         // A routine's thread is somewhere a person can go back to, while it is still one of
         // this bot's routines' threads and this bot is the one open. Anything else lands on the
         // bot's own chat: a thread opened under another bot would send under the wrong name.
@@ -11244,7 +12378,8 @@ impl AppState {
                         state.reconciled_threads.insert(conversation_id.clone());
                         state.hide_withheld_runs(&conversation_id, &thread, cx);
                         state.apply_thread_replay(&conversation_id, &thread, cx);
-                        state.overlay_replay_cards(&conversation_id, &thread.runs);
+                        let badges = state.overlay_replay_cards(&conversation_id, &thread.runs);
+                        state.persist_replayed_badges(&conversation_id, badges, cx);
                         state.apply_pending_from_replay(&conversation_id, &thread, cx);
                     }
                     Err(_) => {
@@ -11406,16 +12541,30 @@ impl AppState {
     /// Idle + settled user-form cards (never secrets) from
     /// `formRequest` + sibling `formResolution`, local save prompts, and
     /// pinned screenshots from OpenGrok onto rows sqlite already has.
-    fn overlay_replay_cards(&mut self, conversation_id: &str, runs: &[ThreadRun]) {
+    ///
+    /// Answers with the badges it filled in, for their rows to be told
+    /// ([`Self::persist_replayed_badges`]).
+    fn overlay_replay_cards(
+        &mut self,
+        conversation_id: &str,
+        runs: &[ThreadRun],
+    ) -> Vec<ReplayedBadge> {
         let mut grafted: Vec<(String, Vec<ChatPart>)> = Vec::new();
-        let mut clocks: Vec<(String, Option<SystemTime>, Option<TurnTiming>)> = Vec::new();
+        #[allow(clippy::type_complexity)]
+        let mut clocks: Vec<(
+            String,
+            Option<SystemTime>,
+            Option<TurnTiming>,
+            Option<ReplySource>,
+        )> = Vec::new();
         for run in runs.iter().filter(|run| !run.run_id.trim().is_empty()) {
-            let (_, parts) = reply_from_replay(&run.events, &run.status);
+            let (_, parts, source) = replayed_run(&run.events, &run.status);
             let parts = self.graft_user_forms(parts);
             clocks.push((
                 run.run_id.clone(),
                 recovered_finished_at(run),
                 TurnTiming::from_events(&run.events),
+                source,
             ));
             grafted.push((run.run_id.clone(), parts));
         }
@@ -11424,7 +12573,7 @@ impl AppState {
             .iter_mut()
             .find(|conversation| conversation.id == conversation_id)
         else {
-            return;
+            return Vec::new();
         };
         for (run_id, parts) in &grafted {
             if let Some(message) = conversation
@@ -11435,7 +12584,8 @@ impl AppState {
                 overlay_server_cards(message, parts);
             }
         }
-        for (run_id, finished_at, timing) in clocks {
+        let mut badges = Vec::new();
+        for (run_id, finished_at, timing, source) in clocks {
             if let Some(message) = conversation
                 .messages
                 .iter_mut()
@@ -11445,6 +12595,19 @@ impl AppState {
                     && let Some(timing) = timing
                 {
                     apply_timing(message, timing);
+                }
+                // A row written before its run's source was kept, or by a build that did not
+                // read it, wears the badge the server's journal says it earned, and keeps it: the
+                // row is told, so the thread reopened offline wears it too.
+                if message.reply_source.is_none()
+                    && let Some(source) = source
+                {
+                    message.reply_source = Some(source.clone());
+                    badges.push(ReplayedBadge {
+                        message_id: message.id.clone(),
+                        run_id,
+                        source,
+                    });
                 }
                 if message.finished_at.is_none() {
                     message.finished_at = finished_at;
@@ -11470,6 +12633,33 @@ impl AppState {
         {
             self.last_box_shot = Some(shot);
         }
+        badges
+    }
+
+    /// Tell the rows of these replies the badges a replay put on them, as the live stream's
+    /// badge is written down with its reply by `persist_assistant_reply`: a thread reopened from
+    /// disk, offline or before it is reconciled again, wears them without the server. Only the
+    /// badge is written, never the words or the pieces, and only onto a row there already is,
+    /// still filed under the run the journal spoke for; a reply not written down yet takes the
+    /// badge from its bubble when it is. A thread this Mac does not keep on disk is left alone.
+    fn persist_replayed_badges(
+        &self,
+        conversation_id: &str,
+        badges: Vec<ReplayedBadge>,
+        cx: &mut Context<Self>,
+    ) {
+        if badges.is_empty() {
+            return;
+        }
+        let Some(db) = self
+            .database_service
+            .clone()
+            .filter(|_| self.keeps_on_disk(conversation_id))
+        else {
+            return;
+        };
+        cx.spawn(async move |_, _| keep_replayed_badges(&db, &badges).await)
+            .detach();
     }
 
     pub fn select_conversation(&mut self, conversation_id: String, cx: &mut Context<Self>) {
@@ -11547,7 +12737,7 @@ impl AppState {
         replay: &RunReplay,
         cx: &mut Context<Self>,
     ) {
-        let (plain, parts) = reply_from_replay(&replay.events, &replay.status);
+        let (plain, parts, source) = replayed_run(&replay.events, &replay.status);
         let parts = self.graft_user_forms(parts);
         let plain = replayed_ending(
             &replay.events,
@@ -11556,12 +12746,23 @@ impl AppState {
             &plain,
         )
         .unwrap_or(plain);
+        let mut badge = None;
         if let Some(message) =
             streaming_message_mut(&mut self.conversations, conversation_id, &turn.message_id)
         {
             message.content = plain.clone();
             message.parts = parts.clone();
+            if wear_replayed_source(message, source.clone()) {
+                badge = source.map(|source| ReplayedBadge {
+                    message_id: turn.message_id.clone(),
+                    run_id: turn.run_id.clone(),
+                    source,
+                });
+            }
         }
+        // A row this turn already has takes the badge now; one written later takes it from the
+        // bubble.
+        self.persist_replayed_badges(conversation_id, badge.into_iter().collect(), cx);
         if let Some(shot) = parts.iter().rev().find_map(|part| match part {
             ChatPart::Screenshot(spec) => Some(spec.clone()),
             _ => None,
@@ -11944,6 +13145,9 @@ impl AppState {
         let history = self.turn_history(&conversation_id, drained.as_ref());
         let pending_id = drained.as_ref().and_then(|held| held.pending_id.clone());
         let queued_message_id = drained.as_ref().map(|held| held.message_id.clone());
+        // The door the chip shows as the turn leaves, or for a held send the one it showed when
+        // the message was sent: see `turn_inference_source`.
+        let turn_source = self.turn_inference_source(drained.as_ref());
 
         // Both ids are minted here, before anything is sent. The run id because the server files
         // every frame under it and this is the app's only handle on the run once the stream is
@@ -11963,6 +13167,7 @@ impl AppState {
                 sent_at: SystemTime::now(),
                 finished_at: None,
                 run_timing: None,
+                reply_source: None,
                 is_me: false,
                 reply_preview: None,
                 reply_to_id: None,
@@ -12017,6 +13222,9 @@ impl AppState {
                     let mut assembler = TurnAssembler::default();
                     let mut last_stream_paint: Option<Instant> = None;
                     let mut last_stream_sig = (0usize, 0u8);
+                    // The door the run goes through, once the assembler has read it off the
+                    // run's own frame: kept here so the row is told once, when it arrives.
+                    let mut told_source: Option<ReplySource> = None;
                     let result = client
                         .run_turn(
                             &id,
@@ -12026,6 +13234,7 @@ impl AppState {
                             recipe.as_ref(),
                             skill.as_deref(),
                             pending_id.as_deref(),
+                            turn_source,
                             |event| {
                                 match tracker.tick(event) {
                                     ActivityTick::Keep => {}
@@ -12052,13 +13261,15 @@ impl AppState {
                                 }
                                 assembler.push_event(event);
                                 let timing = TurnTiming::from_event(event);
+                                let source = source_news(&assembler, &mut told_source);
                                 let (plain, parts) = assembler.snapshot();
                                 let box_shot = assembler.latest_screenshot().cloned();
                                 let sig = stream_part_sig(&parts);
                                 let now = Instant::now();
                                 let paint =
                                     stream_paint_due(last_stream_paint, now, last_stream_sig, sig)
-                                        || timing.is_some();
+                                        || timing.is_some()
+                                        || source.is_some();
                                 let _ = this.update(cx, |state, cx| {
                                     // A run the person stopped or sent past has no row any more;
                                     // its late frames must not graft into the turn that replaced it.
@@ -12081,6 +13292,11 @@ impl AppState {
                                         message.parts = grafted;
                                         if let Some(timing) = timing {
                                             apply_timing(message, timing);
+                                        }
+                                        // The badge, from the moment the server says which door
+                                        // the run went through, before a word of the reply.
+                                        if let Some(source) = source {
+                                            message.reply_source = Some(source);
                                         }
                                         // Tokens update the row every frame; notify at ~60Hz
                                         // or when a card/picture lands, not on every SSE event.
@@ -12846,7 +14062,8 @@ impl AppState {
                         if replay.events.len() != last_len || replay.status != last_status {
                             last_len = replay.events.len();
                             last_status = replay.status.clone();
-                            let (plain, parts) = reply_from_replay(&replay.events, &replay.status);
+                            let (plain, parts, source) =
+                                replayed_run(&replay.events, &replay.status);
                             let status = replay.status.clone();
                             // A resumed turn that only ran tools says what it did, so the
                             // thread keeps a memory of the run the person allowed.
@@ -12872,13 +14089,18 @@ impl AppState {
                                 let parts = state.graft_user_forms(parts.clone());
                                 // The bubble this run has been filling in all along, by the name
                                 // it was given when the turn started — the resumed half of a turn
-                                // belongs to the same row as the half before the card.
-                                let target = conversation_id.as_ref().and_then(|id| {
-                                    state.live_turns.get(id).map(|turn| turn.message_id.clone())
-                                });
+                                // belongs to the same row as the half before the card. Only when
+                                // the thread's live turn is this run: see `followed_bubble`.
+                                let target = followed_bubble(
+                                    &state.live_turns,
+                                    conversation_id.as_deref(),
+                                    &run_id,
+                                );
                                 // The bubble this actually painted into, so the row it is
                                 // written down as is that bubble and not a new one.
                                 let mut painted: Option<String> = None;
+                                // The badge this poll put on it, for its row to be told.
+                                let mut badge = None;
                                 if let Some(conversation_id) = conversation_id.as_ref()
                                     && let Some(conversation) = state
                                         .conversations
@@ -12897,6 +14119,13 @@ impl AppState {
                                     last.parts = parts.clone();
                                     if let Some(timing) = TurnTiming::from_events(&replay.events) {
                                         apply_timing(last, timing);
+                                    }
+                                    if wear_replayed_source(last, source.clone()) {
+                                        badge = source.clone().map(|source| ReplayedBadge {
+                                            message_id: last.id.clone(),
+                                            run_id: run_id.clone(),
+                                            source,
+                                        });
                                     }
                                     if status != "running" && status != "awaiting-approval" {
                                         stamp_run_finished(last, SystemTime::now());
@@ -12919,6 +14148,15 @@ impl AppState {
                                             );
                                         }
                                     }
+                                }
+                                // A row this run already has takes the badge now; one written
+                                // later takes it from the bubble.
+                                if let Some(id) = conversation_id.as_deref() {
+                                    state.persist_replayed_badges(
+                                        id,
+                                        badge.into_iter().collect(),
+                                        cx,
+                                    );
                                 }
                                 match status.as_str() {
                                     "awaiting-approval" => {
@@ -13221,6 +14459,7 @@ impl AppState {
             sent_at: SystemTime::now(),
             finished_at: None,
             run_timing: None,
+            reply_source: None,
             is_me: false,
             reply_preview: None,
             reply_to_id: None,
@@ -15561,6 +16800,7 @@ impl AppState {
                 sent_at: said_at,
                 finished_at: None,
                 run_timing: None,
+                reply_source: None,
                 is_me: true,
                 reply_preview: reply.as_ref().map(|r| r.preview.clone()),
                 reply_to_id: reply.as_ref().map(|r| r.message_id.clone()),
@@ -15627,25 +16867,9 @@ impl AppState {
             // on screen and on its way to disk already, so nothing is lost if the app quits
             // first — the row reads as a message that got no answer, which is what it is.
             SendPlan::Queue => {
-                self.enqueue_hold(
-                    conversation_id.clone(),
-                    held_message(
-                        local_id.clone(),
-                        content.clone(),
-                        recipe.clone(),
-                        skill.clone(),
-                        reply_for_queue.clone(),
-                    ),
-                );
-                self.sync_queued_send_to_server(
-                    conversation_id,
-                    local_id,
-                    content,
-                    recipe,
-                    skill,
-                    reply_for_queue,
-                    cx,
-                );
+                let hold = self.hold_for_send(local_id, content, recipe, skill, reply_for_queue);
+                self.enqueue_hold(conversation_id.clone(), hold.clone());
+                self.sync_queued_send_to_server(conversation_id, &hold, cx);
                 cx.notify();
                 return;
             }
@@ -15711,6 +16935,7 @@ impl AppState {
                 sent_at: SystemTime::now(),
                 finished_at: None,
                 run_timing: None,
+                reply_source: None,
                 is_me: true,
                 reply_preview: next.reply.as_ref().map(|r| r.preview.clone()),
                 reply_to_id: next.reply.as_ref().map(|r| r.message_id.clone()),
@@ -16426,13 +17651,10 @@ impl AppState {
             return;
         };
         let local_content = content.clone();
+        let body = self.pending_edit_for(&message_id, content);
         cx.spawn(async move |this, cx| {
             match client
-                .edit_pending_user_message(
-                    &thread_id,
-                    &pending_id,
-                    &PendingWrite::content_patch(content),
-                )
+                .edit_pending_user_message(&thread_id, &pending_id, &body)
                 .await
             {
                 Ok(mutation) => {
@@ -16482,17 +17704,46 @@ impl AppState {
         .detach();
     }
 
-    /// POST the hold to OpenGrok while the bubble stays local. 404 / unreachable keep the
-    /// in-memory queue (offline, or a server that has not shipped the store).
-    #[allow(clippy::too_many_arguments)]
-    fn sync_queued_send_to_server(
-        &mut self,
-        thread_id: String,
+    /// A message held back as it was sent: what the draft had on it, and the door a turn sent
+    /// then would name ([`Self::turn_source_for_send`]), which is the door its turn names when
+    /// it drains.
+    fn hold_for_send(
+        &self,
         message_id: String,
         content: String,
         recipe: Option<TurnRecipe>,
         skill: Option<String>,
         reply: Option<ReplyTo>,
+    ) -> QueuedSend {
+        held_message(
+            message_id,
+            content,
+            recipe,
+            skill,
+            reply,
+            self.turn_source_for_send(),
+        )
+    }
+
+    /// The PATCH an edit of a held send makes: its new words, and the door it was held with
+    /// when it has one, so the row the server drains names the door the send was sent under.
+    /// A hold with none leaves it out, and the row keeps its own.
+    fn pending_edit_for(&self, message_id: &str, content: String) -> PendingWrite {
+        let door = self
+            .queued_sends
+            .values()
+            .flatten()
+            .find(|held| held.message_id == message_id)
+            .and_then(|held| held.inference_source);
+        PendingWrite::edit(content, door)
+    }
+
+    /// POST the hold to OpenGrok while the bubble stays local. 404 / unreachable keep the
+    /// in-memory queue (offline, or a server that has not shipped the store).
+    fn sync_queued_send_to_server(
+        &mut self,
+        thread_id: String,
+        hold: &QueuedSend,
         cx: &mut Context<Self>,
     ) {
         let Some(client) = self.opengrok.clone() else {
@@ -16501,18 +17752,12 @@ impl AppState {
         if !self.can_send_turn() {
             return;
         }
+        let message_id = hold.message_id.clone();
         if let Some(held) = self.hold_mut(&message_id) {
             held.posted = true;
         }
-        let body = PendingWrite::enqueue(
-            content.clone(),
-            message_id.clone(),
-            reply.as_ref().map(reply_json),
-            recipe.as_ref().map(|recipe| recipe.id.clone()),
-            recipe.map(|recipe| serde_json::Value::Object(recipe.values)),
-            skill,
-        );
-        let posted_content = content;
+        let body = pending_write_for(hold);
+        let posted_content = hold.content.clone();
         cx.spawn(async move |this, cx| {
             let mut attempt = 1;
             loop {
@@ -16708,7 +17953,11 @@ impl AppState {
                 if let Some(save) = self.upsert_queued_bubble(conversation_id, row) {
                     fold.save.push(save);
                 }
-                rebuilt.push_back(hold_from_row(row));
+                let mut hold = hold_from_row(row);
+                // A server that keeps no door on its rows sends none back, and the one this Mac
+                // queued the send with is still the one it was sent under.
+                hold.inference_source = hold.inference_source.or(queued.inference_source);
+                rebuilt.push_back(hold);
             }
             // The row is gone. A drain on another machine and a cancel on another machine
             // look the same in this list. The hold stays off the queue, so this machine
@@ -16792,6 +18041,7 @@ impl AppState {
         held.reply = reply_from_pending(row.reply_to.as_ref());
         held.recipe = recipe_from_pending(row);
         held.skill = row.skill_id.clone().filter(|id| !id.is_empty());
+        held.inference_source = row.inference_source().or(held.inference_source);
         if !row.id.is_empty() {
             held.pending_id = Some(row.id.clone());
         }
@@ -16888,6 +18138,12 @@ impl AppState {
                 };
                 let bubble_id = item.bubble_id().to_string();
                 self.pending_inflight.remove(&bubble_id);
+                // An edit made elsewhere can change the door too; one that names none keeps it.
+                if let Some(door) = item.inference_source()
+                    && let Some(held) = self.hold_mut(&bubble_id)
+                {
+                    held.inference_source = Some(door);
+                }
                 if self.apply_queued_edit(&bubble_id, item.content.clone()) {
                     if let Some(queued) = self
                         .queued_sends
@@ -16993,6 +18249,7 @@ impl AppState {
             existing.recipe = hold.recipe;
             existing.skill = hold.skill;
             existing.reply = hold.reply;
+            existing.inference_source = hold.inference_source.or(existing.inference_source);
             if hold.pending_id.is_some() {
                 existing.pending_id = hold.pending_id;
             }
@@ -17044,6 +18301,7 @@ impl AppState {
             sent_at,
             finished_at: None,
             run_timing: None,
+            reply_source: None,
             is_me: true,
             reply_preview: reply.as_ref().map(|reply| reply.preview.clone()),
             reply_to_id: reply.as_ref().map(|reply| reply.message_id.clone()),
@@ -17140,6 +18398,7 @@ impl AppState {
                 self.refresh_connections(cx);
             }
         }
+        self.reply_source_page_moved(cx);
         self.record_nav();
         cx.notify();
     }
@@ -17165,6 +18424,7 @@ impl AppState {
             if tab == AppSettingsTab::Connections {
                 self.refresh_connections(cx);
             }
+            self.reply_source_page_moved(cx);
             cx.notify();
         }
     }
@@ -17431,6 +18691,7 @@ impl AppState {
         if tab == AppSettingsTab::Connections {
             self.refresh_connections(cx);
         }
+        self.reply_source_page_moved(cx);
         self.record_nav();
         cx.notify();
     }
@@ -19636,6 +20897,7 @@ mod tests {
             None,
             Some("skl_1".to_string()),
             None,
+            None,
         );
         assert_eq!(held.skill.as_deref(), Some("skl_1"));
         assert_eq!(held.content, "do the thing");
@@ -19826,6 +21088,7 @@ mod tests {
             sent_at: SystemTime::UNIX_EPOCH,
             finished_at: None,
             run_timing: None,
+            reply_source: None,
             is_me,
             reply_preview: None,
             reply_to_id: None,
@@ -20752,6 +22015,56 @@ mod tests {
         );
     }
 
+    /// A run the app follows without holding it paints its own row, badge and all, and never the
+    /// live turn's: a card answered from a notification while another turn is going in the same
+    /// thread resumes a run the thread is not holding still for. The live turn's own run still
+    /// paints the bubble it was given.
+    #[test]
+    fn a_followed_run_the_thread_is_not_holding_leaves_the_live_turns_bubble_alone() {
+        use crate::opengrok::{InferenceKind, ReplySource};
+        let mut live_turns = std::collections::HashMap::new();
+        live_turns.insert(
+            "cw_1".to_string(),
+            LiveTurn {
+                run_id: "run_live".into(),
+                message_id: "m_live".into(),
+                persisting: false,
+            },
+        );
+        let mut messages = vec![
+            at(message("m_ask", true, "go"), 500),
+            from_run("m_old", "an older reply", "run_old", 1_000),
+            at(message("m_again", true, "and this"), 1_500),
+            from_run("m_live", "", "run_live", 2_000),
+        ];
+        // The resumed run's journal says it went through the person's plan; the live turn is
+        // the server's keys, and has not said so yet.
+        let resumed = ReplySource {
+            kind: InferenceKind::LocalProxy,
+            model: Some("gpt-5-codex".into()),
+        };
+        let target = super::followed_bubble(&live_turns, Some("cw_1"), "run_old");
+        assert_eq!(target, None, "the live turn is another run's");
+        let at = bubble_for_run(&mut messages, target.as_deref(), "run_old", None);
+        messages[at].reply_source = Some(resumed.clone());
+        assert_eq!(messages[at].id, "m_old", "its own row, found by its run");
+        let live = messages.iter().find(|m| m.id == "m_live").unwrap();
+        assert_eq!(live.reply_source, None, "no badge on the live turn's reply");
+
+        // A followed run with no row yet is given one, not the live turn's.
+        let target = super::followed_bubble(&live_turns, Some("cw_1"), "run_new");
+        let at = bubble_for_run(&mut messages, target.as_deref(), "run_new", None);
+        assert_ne!(messages[at].id, "m_live");
+        assert_eq!(messages[at].run_id.as_deref(), Some("run_new"));
+
+        // The live turn's own run, resumed after its card: the bubble it was given.
+        assert_eq!(
+            super::followed_bubble(&live_turns, Some("cw_1"), "run_live").as_deref(),
+            Some("m_live")
+        );
+        assert_eq!(super::followed_bubble(&live_turns, None, "run_live"), None);
+    }
+
     #[test]
     fn a_sent_time_past_what_a_clock_can_hold_is_blank() {
         let mut bubble = message("m_far", true, "hi");
@@ -20933,6 +22246,7 @@ mod tests {
                 sent_at: start,
                 finished_at: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1 << 45)),
                 timing_json: None,
+                source_json: None,
             },
         )
         .await
@@ -20972,6 +22286,7 @@ mod tests {
                     .unwrap()
                     .to_json(),
                 ),
+                source_json: None,
             },
         )
         .await
@@ -21742,6 +23057,7 @@ mod tests {
             deleted_at: None,
             finished_at: None,
             run_timing: None,
+            inference_source: None,
             parts: Vec::new(),
         }
     }
@@ -22532,6 +23848,7 @@ mod tests {
             started_at: SystemTime::UNIX_EPOCH + Duration::from_millis(2_000),
             finished_at: Some(SystemTime::UNIX_EPOCH + Duration::from_millis(8_000)),
             run_timing: None,
+            reply_source: None,
         };
 
         let id = graft_reply(&mut messages, &reply);
@@ -23191,6 +24508,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             ));
         state
     }
@@ -23279,6 +24597,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             ));
         hide_bubble(&mut state, "m_held");
         go_idle(&mut state);
@@ -23308,13 +24627,14 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             ));
         state
             .take_hold_for_edit("m_a", "")
             .expect("the first hold comes off");
         state.enqueue_hold(
             "cw_1".into(),
-            super::held_message("m_a".into(), "first, edited".into(), None, None, None),
+            super::held_message("m_a".into(), "first, edited".into(), None, None, None, None),
         );
         let ids = |state: &AppState| {
             state.queued_sends["cw_1"]
@@ -23330,7 +24650,14 @@ mod tests {
         state.queued_sends.get_mut("cw_1").unwrap().pop_front();
         state.enqueue_hold(
             "cw_1".into(),
-            super::held_message("m_b".into(), "second, edited".into(), None, None, None),
+            super::held_message(
+                "m_b".into(),
+                "second, edited".into(),
+                None,
+                None,
+                None,
+                None,
+            ),
         );
         assert_eq!(
             ids(&state),
@@ -23444,6 +24771,7 @@ mod tests {
                     preview: "open youtube".to_string(),
                     is_me: true,
                 }),
+                None,
             ));
         state.reply_to = Some(ReplyTo {
             message_id: "m_live".to_string(),
@@ -23505,6 +24833,7 @@ mod tests {
                     "and then this".to_string(),
                     recipe,
                     skill,
+                    None,
                     None,
                 ));
         }
@@ -23685,7 +25014,7 @@ mod tests {
         state.conversations[0]
             .messages
             .push(at(message("m_b", true, "second"), 40));
-        let mut b = super::held_message("m_b".into(), "second".into(), None, None, None);
+        let mut b = super::held_message("m_b".into(), "second".into(), None, None, None, None);
         b.pending_id = Some("pum_b".into());
         state.queued_sends.get_mut("cw_1").unwrap().push_back(b);
 
@@ -24083,6 +25412,7 @@ mod tests {
             None,
             None,
             Some(reply.clone()),
+            None,
         );
         queued.pending_id = Some("pum_1".into());
         state
@@ -24195,6 +25525,7 @@ mod tests {
         queue.push_back(super::held_message(
             "m_b".into(),
             "second".into(),
+            None,
             None,
             None,
             None,
@@ -26084,10 +27415,152 @@ mod tests {
                 .iter()
                 .map(|id| ModelEntry {
                     id: (*id).to_string(),
+                    source: None,
                 })
                 .collect(),
             note: note.map(str::to_string),
+            local_proxy: None,
         }
+    }
+
+    /// A `/models` answer with both doors in it: the gateway's routes, the plan's models, the
+    /// gateway's note and opencodex's health, as the server lists them.
+    fn both_doors(
+        gateway: &[&str],
+        plan: &[&str],
+        note: Option<&str>,
+        proxy_healthy: Option<bool>,
+    ) -> ModelCatalogue {
+        let entry = |id: &&str, source: &str| ModelEntry {
+            id: (*id).to_string(),
+            source: Some(source.to_string()),
+        };
+        ModelCatalogue {
+            models: gateway
+                .iter()
+                .map(|id| entry(id, "gateway"))
+                .chain(plan.iter().map(|id| entry(id, "local_proxy")))
+                .collect(),
+            note: note.map(str::to_string),
+            local_proxy: proxy_healthy.map(|healthy| crate::opengrok::LocalProxyStatus { healthy }),
+        }
+    }
+
+    fn model_ids(catalogue: &ModelCatalogue) -> Vec<&str> {
+        catalogue.models.iter().map(|m| m.id.as_str()).collect()
+    }
+
+    /// `/models` answers for two machines at once, and each door's list is kept apart: the
+    /// gateway going leaves its routes in the Bot's Model field while the plan's models come
+    /// back fresh, and opencodex going leaves the plan's models in the picker while the
+    /// gateway's come back fresh. An empty plan list is taken when opencodex answered, or when
+    /// no proxy address is kept at all, since nothing is missing then.
+    #[test]
+    fn one_door_down_does_not_empty_the_other_doors_list() {
+        let gateway_down = "the gateway could not be reached: error sending request";
+        let mut held = ModelCatalogue::default();
+        apply_catalogue(
+            &mut held,
+            both_doors(
+                &["oag/cheap", "oag/fast"],
+                &["gpt-5-codex"],
+                None,
+                Some(true),
+            ),
+        );
+        assert_eq!(model_ids(&held), ["oag/cheap", "oag/fast", "gpt-5-codex"]);
+
+        // The gateway goes; opencodex still lists the plan's models, and a new one.
+        let note = apply_catalogue(
+            &mut held,
+            both_doors(
+                &[],
+                &["gpt-5-codex", "grok-4"],
+                Some(gateway_down),
+                Some(true),
+            ),
+        );
+        assert!(reads_as_gateway_unreachable(note.as_deref().unwrap()));
+        assert_eq!(
+            model_ids(&held),
+            ["oag/cheap", "oag/fast", "gpt-5-codex", "grok-4"],
+            "the Bot's Model field keeps its routes"
+        );
+        assert_eq!(held.note.as_deref(), Some(gateway_down));
+
+        // opencodex goes; the gateway is back with a new route.
+        let note = apply_catalogue(
+            &mut held,
+            both_doors(&["oag/cheap", "oag/new"], &[], None, Some(false)),
+        );
+        assert_eq!(note, None);
+        assert_eq!(
+            model_ids(&held),
+            ["oag/cheap", "oag/new", "gpt-5-codex", "grok-4"],
+            "the picker keeps the plan's models while opencodex is down"
+        );
+        assert_eq!(
+            held.local_proxy,
+            Some(crate::opengrok::LocalProxyStatus { healthy: false }),
+            "and says it is down"
+        );
+
+        // opencodex answers and serves nothing a plan may use: that is the answer.
+        apply_catalogue(&mut held, both_doors(&["oag/cheap"], &[], None, Some(true)));
+        assert_eq!(model_ids(&held), ["oag/cheap"]);
+
+        // No proxy address kept: no plan models, and nothing is missing.
+        apply_catalogue(
+            &mut held,
+            both_doors(&["oag/cheap"], &["gpt-5-codex"], None, Some(true)),
+        );
+        apply_catalogue(&mut held, both_doors(&["oag/cheap"], &[], None, None));
+        assert_eq!(model_ids(&held), ["oag/cheap"]);
+        assert_eq!(held.local_proxy, None);
+    }
+
+    /// Only the newest read of `/models` lands. Several are asked in a row and need not answer
+    /// in order: an older one landing last is dropped, and so is one that lands after a
+    /// sign-out, which also forgets the plan's models and keeps the gateway's.
+    #[test]
+    fn only_the_newest_models_read_lands() {
+        let mut state = AppState::new();
+        state.opengrok = Some(OpenGrokClient::new("http://127.0.0.1:9").expect("a URL"));
+        let (_, older) = state.begin_models_read().expect("a read");
+        let (_, newer) = state.begin_models_read().expect("a read");
+        assert!(newer > older);
+        let fresh = both_doors(&["oag/new"], &["gpt-5-codex"], None, Some(true));
+        let stale = both_doors(&["oag/old"], &[], None, Some(true));
+        assert!(
+            state.take_models(newer, Ok(fresh)).is_some(),
+            "the newer one lands"
+        );
+        assert!(
+            state.take_models(older, Ok(stale)).is_none(),
+            "the older one, landing last, is dropped"
+        );
+        assert_eq!(
+            model_ids(&state.model_catalogue),
+            ["oag/new", "gpt-5-codex"]
+        );
+
+        let (_, before_sign_out) = state.begin_models_read().expect("a read");
+        state.forget_account();
+        assert!(
+            state
+                .take_models(
+                    before_sign_out,
+                    Ok(both_doors(&["oag/x"], &["m"], None, None))
+                )
+                .is_none(),
+            "an answer asked as someone who has signed out"
+        );
+        assert_eq!(
+            model_ids(&state.model_catalogue),
+            ["oag/new"],
+            "the plan's models were the account's; the gateway's routes are the deployment's"
+        );
+        assert_eq!(state.model_catalogue.local_proxy, None);
     }
 
     /// The whole of the reported bug, on the data: the gateway goes, the Model field keeps what
@@ -30256,5 +31729,1492 @@ mod tests {
         assert_eq!(files("m1"), 1);
         assert_eq!(files("m2"), 0, "a hidden message sends no files");
         assert_eq!(files("m3"), 0);
+    }
+
+    // ---- Reply source: the server's paid keys, or the person's own plan ------------------------
+
+    use super::{
+        ActivationReads, AfterReplySourceSave, REPLY_SOURCE_NOT_ON_SERVER,
+        REPLY_SOURCE_SAVE_UNKNOWN, ReplySourceNote, ReplySourceRead, TurnSourceChip,
+    };
+    use crate::opengrok::{InferenceKind, InferenceSource, ReplySource};
+
+    /// Somebody signed in, with a client that is never asked: every answer here is handed in.
+    fn signed_in_state() -> AppState {
+        let mut state = AppState::new();
+        state.opengrok = Some(OpenGrokClient::new("http://127.0.0.1:9").expect("a URL"));
+        state.account = Some(
+            serde_json::from_value(json!({ "id": "acc_1", "email": "ada@example.com" }))
+                .expect("an account"),
+        );
+        state.auth_status = super::AuthStatus::SignedIn;
+        state
+    }
+
+    fn kept(kind: InferenceKind, local_model: Option<&str>) -> InferenceSource {
+        InferenceSource {
+            kind,
+            base_url: Some("http://127.0.0.1:8080".into()),
+            local_model: local_model.map(str::to_string),
+            healthy: true,
+            has_api_key: false,
+        }
+    }
+
+    /// The account's setting as a read brings it.
+    fn read_as(state: &mut AppState, source: InferenceSource) {
+        let (_, generation) = state.begin_reply_source_read().expect("a read begins");
+        assert!(state.settle_reply_source_read(generation, Ok(source)));
+    }
+
+    fn chip(state: &AppState) -> Option<(InferenceKind, bool)> {
+        state
+            .composer_turn_source()
+            .map(|chip| (chip.kind, chip.picked))
+    }
+
+    /// The composer's chip starts where the account's setting is, and a turn sent from there
+    /// names that door: the chip shows where the turn goes, and the turn goes there even if the
+    /// setting has moved on another Mac since it was read. A click picks the other door for the
+    /// next turns and it sticks, named by each, until clicked back; and it is gone with a sign
+    /// out, which is also what a relaunch starts from, since nothing but this memory keeps it.
+    /// With no chip to draw a turn names nothing, and the account's setting decides; with the
+    /// chip hidden while the composer dictates, it names the account's own door.
+    #[test]
+    fn a_turn_names_the_door_the_composer_chip_shows() {
+        let mut state = signed_in_state();
+        assert_eq!(chip(&state), None, "nothing read, no chip");
+        assert_eq!(state.turn_inference_source(None), None);
+        read_as(
+            &mut state,
+            kept(InferenceKind::LocalProxy, Some("gpt-5-codex")),
+        );
+        assert_eq!(
+            state.composer_turn_source(),
+            Some(TurnSourceChip {
+                kind: InferenceKind::LocalProxy,
+                picked: false,
+                local_model: Some("gpt-5-codex".into()),
+            }),
+            "the account's own door"
+        );
+        assert_eq!(
+            state.turn_inference_source(None),
+            Some(InferenceKind::LocalProxy),
+            "the account's door, as the chip shows it, goes with the turn"
+        );
+
+        assert!(state.flip_turn_source());
+        assert_eq!(chip(&state), Some((InferenceKind::Gateway, true)));
+        assert_eq!(
+            state.turn_inference_source(None),
+            Some(InferenceKind::Gateway),
+            "the pick goes with the turn"
+        );
+        assert_eq!(
+            state.turn_inference_source(None),
+            Some(InferenceKind::Gateway),
+            "and with the one after it: it sticks"
+        );
+        assert!(state.flip_turn_source());
+        assert_eq!(chip(&state), Some((InferenceKind::LocalProxy, false)));
+        assert_eq!(
+            state.turn_inference_source(None),
+            Some(InferenceKind::LocalProxy),
+            "clicked back: the account's door again"
+        );
+
+        // An account on the server's keys with a plan set up: the chip starts on Server.
+        let mut state = signed_in_state();
+        read_as(&mut state, kept(InferenceKind::Gateway, Some("grok-4")));
+        assert_eq!(chip(&state), Some((InferenceKind::Gateway, false)));
+        assert_eq!(
+            state.turn_inference_source(None),
+            Some(InferenceKind::Gateway)
+        );
+        assert!(state.flip_turn_source());
+        assert_eq!(
+            state.turn_inference_source(None),
+            Some(InferenceKind::LocalProxy)
+        );
+        // A read that finds the account moved to the person's plan on another Mac: the pick is
+        // the account's own door now, and no pick at all.
+        read_as(&mut state, kept(InferenceKind::LocalProxy, Some("grok-4")));
+        assert_eq!(chip(&state), Some((InferenceKind::LocalProxy, false)));
+        assert_eq!(
+            state.turn_inference_source(None),
+            Some(InferenceKind::LocalProxy)
+        );
+
+        // While the composer dictates the chip is not drawn, and a turn names the account's own
+        // door rather than the pick nobody can see; the pick is still there when the chip comes
+        // back.
+        assert!(state.flip_turn_source());
+        state.composer_dictating = true;
+        assert_eq!(chip(&state), None);
+        assert_eq!(
+            state.turn_inference_source(None),
+            Some(InferenceKind::LocalProxy)
+        );
+        assert!(!state.flip_turn_source(), "no chip to click");
+        read_as(&mut state, kept(InferenceKind::LocalProxy, Some("grok-4")));
+        state.composer_dictating = false;
+        assert_eq!(chip(&state), Some((InferenceKind::Gateway, true)));
+
+        // Signing out forgets the pick with the setting.
+        state.forget_account();
+        assert_eq!(chip(&state), None);
+        assert_eq!(state.turn_inference_source(None), None);
+
+        // No plan set up to switch to: no chip, and nothing a turn could carry.
+        let mut state = signed_in_state();
+        read_as(&mut state, kept(InferenceKind::Gateway, None));
+        assert_eq!(chip(&state), None);
+        assert!(!state.flip_turn_source());
+        assert_eq!(state.turn_inference_source(None), None);
+    }
+
+    /// Coming back to the window reads the account's door again whenever somebody is signed
+    /// in: the chip starts at it and every turn names what the chip shows, so a door changed on
+    /// another Mac meanwhile is read before the next turn goes.
+    #[test]
+    fn coming_back_to_the_window_reads_the_accounts_door_again() {
+        let mut state = AppState::new();
+        assert_eq!(
+            state.reads_on_activation(Instant::now()),
+            ActivationReads::default(),
+            "nobody signed in, nothing to ask"
+        );
+        let mut state = signed_in_state();
+        assert_eq!(
+            state.reads_on_activation(Instant::now()),
+            ActivationReads {
+                reply_source: true,
+                ..ActivationReads::default()
+            },
+            "with Settings shut, and with no Reply source on screen"
+        );
+        // Settings → Reply source on screen: the plan's models with it, since opencodex may have
+        // just been started in a terminal and listed them for the first time.
+        state.is_app_settings_open = true;
+        state.app_settings_tab = AppSettingsTab::ReplySource;
+        assert_eq!(
+            state.reads_on_activation(Instant::now()),
+            ActivationReads {
+                reply_source: true,
+                models: true,
+                ..ActivationReads::default()
+            }
+        );
+        state.app_settings_tab = AppSettingsTab::Logins;
+        assert!(!state.reads_on_activation(Instant::now()).models);
+    }
+
+    /// A message sent while a turn runs is held with the door the chip showed when it was sent,
+    /// and its turn names that door when it drains, whatever the chip shows by then; the row
+    /// the server keeps for it names it too. One held while the composer dictated keeps the
+    /// account's own door, which is what a turn sent then names. One held while there was no
+    /// chip to draw names none, even if a chip is drawn by the time it goes.
+    #[test]
+    fn a_held_send_keeps_the_door_it_was_sent_under() {
+        let mut state = signed_in_state();
+        read_as(
+            &mut state,
+            kept(InferenceKind::LocalProxy, Some("gpt-5-codex")),
+        );
+        let hold = state.hold_for_send("m_1".into(), "later".into(), None, None, None);
+        assert_eq!(hold.inference_source, Some(InferenceKind::LocalProxy));
+        assert_eq!(
+            serde_json::to_value(super::pending_write_for(&hold)).unwrap()["inferenceSource"],
+            "local_proxy",
+            "the server's row is told the door too"
+        );
+        state.enqueue_hold("cw_1".into(), hold);
+
+        // The chip is clicked to Server before the thread goes idle.
+        assert!(state.flip_turn_source());
+        assert_eq!(
+            state.turn_inference_source(None),
+            Some(InferenceKind::Gateway)
+        );
+        let drained = state.pop_queued_send("cw_1").expect("the hold drains");
+        assert_eq!(
+            state.turn_inference_source(Some(&drained)),
+            Some(InferenceKind::LocalProxy),
+            "sent under My plan, it goes through My plan"
+        );
+
+        // Held while the composer dictated, with the chip picked to Server out of sight: the
+        // account's own door, now and when it drains, once the chip is back on its pick.
+        state.composer_dictating = true;
+        let dictated = state.hold_for_send("m_2".into(), "and this".into(), None, None, None);
+        assert_eq!(dictated.inference_source, Some(InferenceKind::LocalProxy));
+        assert_eq!(
+            serde_json::to_value(super::pending_write_for(&dictated)).unwrap()["inferenceSource"],
+            "local_proxy"
+        );
+        state.composer_dictating = false;
+        assert_eq!(chip(&state), Some((InferenceKind::Gateway, true)));
+        state.enqueue_hold("cw_1".into(), dictated);
+        let drained = state.pop_queued_send("cw_1").expect("the hold drains");
+        assert_eq!(
+            state.turn_inference_source(Some(&drained)),
+            Some(InferenceKind::LocalProxy)
+        );
+
+        // Held before the setting was read: no chip, no door, now or when it drains.
+        let mut state = signed_in_state();
+        let quiet = state.hold_for_send("m_3".into(), "early".into(), None, None, None);
+        assert_eq!(quiet.inference_source, None);
+        assert!(
+            serde_json::to_value(super::pending_write_for(&quiet))
+                .unwrap()
+                .get("inferenceSource")
+                .is_none()
+        );
+        read_as(
+            &mut state,
+            kept(InferenceKind::LocalProxy, Some("gpt-5-codex")),
+        );
+        state.enqueue_hold("cw_1".into(), quiet);
+        let drained = state.pop_queued_send("cw_1").expect("the hold drains");
+        assert_eq!(state.turn_inference_source(Some(&drained)), None);
+    }
+
+    /// A turn sent while the composer dictates, its chip given over to the dictation's buttons,
+    /// names the account's own door as Settings shows it, and not a pick on the chip nobody can
+    /// see: an account on the person's plan with Server picked goes through the plan, and one on
+    /// the server's keys with My plan picked goes through the keys. It names nothing where no
+    /// door is known (the setting not read, or a server without reply sources) and where there
+    /// is no chip to hide, as a turn typed then would.
+    #[test]
+    fn a_turn_sent_while_dictating_names_the_accounts_own_door() {
+        let mut state = signed_in_state();
+        state.composer_dictating = true;
+        assert_eq!(state.turn_inference_source(None), None, "nothing read");
+        state.reply_source.kept = Some(ReplySourceRead::NotOnServer);
+        assert_eq!(
+            state.turn_inference_source(None),
+            None,
+            "a server without reply sources"
+        );
+        read_as(&mut state, kept(InferenceKind::Gateway, None));
+        assert_eq!(
+            state.turn_inference_source(None),
+            None,
+            "no plan to switch to, so no chip to hide"
+        );
+        state.composer_dictating = false;
+        assert_eq!(state.turn_inference_source(None), None, "as when typed");
+
+        for (account, pick) in [
+            (InferenceKind::LocalProxy, InferenceKind::Gateway),
+            (InferenceKind::Gateway, InferenceKind::LocalProxy),
+        ] {
+            let mut state = signed_in_state();
+            read_as(&mut state, kept(account, Some("gpt-5-codex")));
+            assert!(state.flip_turn_source());
+            assert_eq!(state.turn_inference_source(None), Some(pick), "typed");
+            state.composer_dictating = true;
+            assert_eq!(chip(&state), None);
+            assert_eq!(
+                state.turn_inference_source(None),
+                Some(account),
+                "dictated: the account's door, not the hidden pick"
+            );
+            state.composer_dictating = false;
+            assert_eq!(
+                state.turn_inference_source(None),
+                Some(pick),
+                "the pick again"
+            );
+        }
+    }
+
+    /// An edit of a held send carries the door it was held with, so the row the server drains
+    /// names it; a hold with none sends none, and the row keeps its own. An edit made on another
+    /// Mac that names a door moves this Mac's hold to it, and one that names none leaves it.
+    #[test]
+    fn an_edit_of_a_held_send_carries_its_door() {
+        use crate::opengrok::{PendingCustom, PendingOp};
+        let mut state = signed_in_state();
+        for (id, door) in [("m_1", Some(InferenceKind::LocalProxy)), ("m_2", None)] {
+            state.enqueue_hold(
+                "cw_1".into(),
+                super::held_message(id.into(), "later".into(), None, None, None, door),
+            );
+        }
+        assert_eq!(
+            serde_json::to_value(state.pending_edit_for("m_1", "instead".into())).unwrap(),
+            json!({ "v": 1, "content": "instead", "inferenceSource": "local_proxy" })
+        );
+        assert_eq!(
+            serde_json::to_value(state.pending_edit_for("m_2", "instead".into())).unwrap(),
+            json!({ "v": 1, "content": "instead" })
+        );
+        let edited_elsewhere = |door: Option<&str>| {
+            let mut row = json!({
+                "id": "pum_2", "threadId": "cw_1", "content": "instead",
+                "clientMessageId": "m_2", "status": "pending"
+            });
+            if let Some(door) = door {
+                row["inferenceSource"] = json!(door);
+            }
+            PendingCustom {
+                timestamp: None,
+                v: 1,
+                op: PendingOp::Edited,
+                thread_id: "cw_1".into(),
+                message: Some(serde_json::from_value(row).expect("a row")),
+            }
+        };
+        let door_of = |state: &AppState| {
+            state.queued_sends["cw_1"]
+                .iter()
+                .find(|held| held.message_id == "m_2")
+                .and_then(|held| held.inference_source)
+        };
+        state.apply_pending_custom(&edited_elsewhere(Some("gateway")), None);
+        assert_eq!(door_of(&state), Some(InferenceKind::Gateway));
+        state.apply_pending_custom(&edited_elsewhere(None), None);
+        assert_eq!(
+            door_of(&state),
+            Some(InferenceKind::Gateway),
+            "none named, none changed"
+        );
+    }
+
+    /// A held row read back from the server brings the door it was queued with, from this Mac
+    /// or another; a server that keeps none on its rows leaves the one this Mac held the send
+    /// with, and a refused drain put back with the server's row keeps its door the same way.
+    #[test]
+    fn a_held_rows_door_comes_back_with_it() {
+        use crate::opengrok::{PendingCustom, PendingOp, PendingUserMessage};
+        let row = |id: &str, bubble: &str, source: Option<&str>| -> PendingUserMessage {
+            let mut row = json!({
+                "id": id, "threadId": "cw_1", "content": "later",
+                "clientMessageId": bubble, "status": "pending"
+            });
+            if let Some(source) = source {
+                row["inferenceSource"] = json!(source);
+            }
+            serde_json::from_value(row).expect("a row")
+        };
+        let mut state = signed_in_state();
+        state.conversations.push(Conversation {
+            id: "cw_1".into(),
+            title: "Ada".into(),
+            created_at: String::new(),
+            updated_at: String::new(),
+            messages: vec![
+                message("m_here", true, "later"),
+                message("m_there", true, "later"),
+            ],
+            unread_count: 0,
+            origin: None,
+        });
+        let mut here = super::held_message(
+            "m_here".into(),
+            "later".into(),
+            None,
+            None,
+            None,
+            Some(InferenceKind::LocalProxy),
+        );
+        here.pending_id = Some("pum_here".into());
+        here.posted = true;
+        state.enqueue_hold("cw_1".into(), here);
+        // This Mac's row comes back from a server that keeps no door; another Mac's row names
+        // the one it was queued with.
+        state.fold_pending_snapshot(
+            "cw_1",
+            &[
+                row("pum_here", "m_here", None),
+                row("pum_there", "m_there", Some("gateway")),
+            ],
+        );
+        let doors: Vec<(String, Option<InferenceKind>)> = state
+            .queued_sends
+            .get("cw_1")
+            .unwrap()
+            .iter()
+            .map(|held| (held.message_id.clone(), held.inference_source))
+            .collect();
+        assert_eq!(
+            doors,
+            vec![
+                ("m_here".to_string(), Some(InferenceKind::LocalProxy)),
+                ("m_there".to_string(), Some(InferenceKind::Gateway)),
+            ]
+        );
+
+        // A drain the server refused as stale puts the hold back with the server's row.
+        let held = state.pop_queued_send("cw_1").expect("m_here drains");
+        let edited = PendingCustom {
+            timestamp: None,
+            v: 1,
+            op: PendingOp::Edited,
+            thread_id: "cw_1".into(),
+            message: Some(row("pum_here", "m_here", None)),
+        };
+        state.put_back_stale_hold("cw_1", "m_reply", held, &edited);
+        let front = state.queued_sends.get("cw_1").unwrap().front().unwrap();
+        assert_eq!(
+            (front.message_id.as_str(), front.inference_source),
+            ("m_here", Some(InferenceKind::LocalProxy))
+        );
+        let held = state.pop_queued_send("cw_1").expect("m_here drains again");
+        let edited = PendingCustom {
+            message: Some(row("pum_here", "m_here", Some("gateway"))),
+            ..edited
+        };
+        state.put_back_stale_hold("cw_1", "m_reply", held, &edited);
+        let front = state.queued_sends.get("cw_1").unwrap().front().unwrap();
+        assert_eq!(front.inference_source, Some(InferenceKind::Gateway));
+    }
+
+    /// A server from before reply sources answers the read with a bare 404: the page says it
+    /// cannot switch, every control is dead, and the composer has no chip, since a door the
+    /// server does not read would be a switch that changes nothing. The server's own 404 is not
+    /// that: it is said as a failed read.
+    #[test]
+    fn a_server_without_reply_sources_offers_no_switch_anywhere() {
+        let mut state = signed_in_state();
+        let (_, generation) = state.begin_reply_source_read().unwrap();
+        assert!(state.settle_reply_source_read(generation, Err(OpenGrokError::status(404, ""))));
+        assert_eq!(state.reply_source.kept, Some(ReplySourceRead::NotOnServer));
+        assert_eq!(
+            crate::components::reply_source::unavailable_line(&state.reply_source),
+            Some(REPLY_SOURCE_NOT_ON_SERVER)
+        );
+        assert!(!state.reply_source.can_edit());
+        assert!(!state.note_reply_source_kind(InferenceKind::LocalProxy));
+        assert_eq!(chip(&state), None);
+        assert!(state.begin_reply_source_save().is_none());
+
+        let mut state = signed_in_state();
+        let (_, generation) = state.begin_reply_source_read().unwrap();
+        assert!(state.settle_reply_source_read(
+            generation,
+            Err(OpenGrokError::from_opengrok(404, "no such account"))
+        ));
+        assert!(matches!(
+            state.reply_source.kept,
+            Some(ReplySourceRead::Unavailable(_))
+        ));
+    }
+
+    /// The server lists `ids` as the person's plan's models, opencodex answering.
+    fn with_plan_models(state: &mut AppState, ids: &[&str]) {
+        state.model_catalogue = ModelCatalogue {
+            models: ids
+                .iter()
+                .map(|id| ModelEntry {
+                    id: (*id).to_string(),
+                    source: Some("local_proxy".into()),
+                })
+                .collect(),
+            note: None,
+            local_proxy: Some(crate::opengrok::LocalProxyStatus { healthy: true }),
+        };
+    }
+
+    /// What a Save would send now, as JSON, without sending it.
+    fn save_body(state: &mut AppState) -> Option<serde_json::Value> {
+        let save = state.begin_reply_source_save()?;
+        let body = serde_json::to_value(&save.update).unwrap();
+        state.reply_source.saving = None;
+        Some(body)
+    }
+
+    /// A Save sends the door and what the page changed, the typed key with it, once: the key
+    /// leaves the app with that Save, whatever becomes of it. While it is out nothing on the page
+    /// takes a change and no read begins. The server's answer is what shows after, the picks gone
+    /// into it, and the models are read again for the setting the server now keeps; a later
+    /// Save sends only what changed since.
+    #[test]
+    fn a_save_puts_what_changed_once_and_its_answer_is_what_shows() {
+        let mut state = signed_in_state();
+        with_plan_models(&mut state, &["gpt-5-codex", "grok-4"]);
+        read_as(&mut state, kept(InferenceKind::Gateway, None));
+        assert!(
+            !state.reply_source_can_save(),
+            "nothing picked, nothing to save"
+        );
+        // A read with the server takes picks, and Save waits for what it brings.
+        let (_, reading) = state.begin_reply_source_read().unwrap();
+        assert!(state.note_reply_source_kind(InferenceKind::LocalProxy));
+        assert!(state.note_reply_source_model(Some("gpt-5-codex".into())));
+        assert!(state.reply_source.is_unsaved() && !state.reply_source_can_save());
+        assert!(state.begin_reply_source_save().is_none());
+        assert!(state.settle_reply_source_read(reading, Ok(kept(InferenceKind::Gateway, None))));
+        assert!(
+            state.reply_source_can_save(),
+            "the picks waited on top of the read"
+        );
+        state.reply_source.url_draft = Some("http://127.0.0.1:18080".into());
+        assert!(state.note_reply_source_key("sk-proxy-1"));
+        assert!(state.reply_source.is_unsaved());
+
+        let save = state.begin_reply_source_save().expect("a Save begins");
+        assert_eq!(
+            serde_json::to_value(&save.update).unwrap(),
+            json!({
+                "kind": "local_proxy",
+                "baseUrl": "http://127.0.0.1:18080",
+                "localModel": "gpt-5-codex",
+                "apiKey": "sk-proxy-1"
+            })
+        );
+        assert!(save.sent.key_sent);
+        assert_eq!(
+            state.reply_source.key_draft, None,
+            "sent once, kept nowhere"
+        );
+        assert!(!state.reply_source.can_edit(), "every control is dead");
+        assert!(!state.note_reply_source_kind(InferenceKind::Gateway));
+        assert!(
+            state.begin_reply_source_read().is_none(),
+            "no read overtakes it"
+        );
+        assert!(
+            state.begin_reply_source_save().is_none(),
+            "one Save at a time"
+        );
+
+        let answer = InferenceSource {
+            kind: InferenceKind::LocalProxy,
+            base_url: Some("http://127.0.0.1:18080".into()),
+            local_model: Some("gpt-5-codex".into()),
+            healthy: false,
+            has_api_key: true,
+        };
+        assert_eq!(
+            state.settle_reply_source_save(save.sent, Ok(answer.clone())),
+            Some(AfterReplySourceSave::ReadModels)
+        );
+        assert_eq!(state.reply_source.kept_source(), Some(&answer));
+        assert_eq!(
+            (
+                state.reply_source.kind_pick,
+                state.reply_source.url_draft.clone(),
+                state.reply_source.model_pick.clone(),
+            ),
+            (None, None, None),
+            "the picks are what the server keeps now"
+        );
+        assert!(!state.reply_source.is_unsaved());
+        assert_eq!(state.reply_source.shown_url(), "http://127.0.0.1:18080");
+        assert!(state.reply_source.can_edit());
+
+        // Only the model changes next: the address the server keeps is left out, and kept.
+        assert!(state.note_reply_source_model(Some("grok-4".into())));
+        assert_eq!(
+            save_body(&mut state),
+            Some(json!({"kind": "local_proxy", "localModel": "grok-4"}))
+        );
+    }
+
+    /// A first Save never leaves the person's plan without what a turn on it needs. A new
+    /// account's page shows the default address as unsaved, since the server keeps none and
+    /// lists none of the plan's models without one, and says no address is kept rather than
+    /// that opencodex is down. My subscription picked while the server lists no model saves the
+    /// address with the door held on the server's keys, and stays picked; once models are
+    /// listed Save waits for one to be picked, and then sends the door with it. An emptied
+    /// address is refused the same way.
+    #[test]
+    fn a_first_save_never_leaves_the_plan_without_what_a_turn_needs() {
+        use super::{
+            REPLY_SOURCE_HOLDS_GATEWAY, REPLY_SOURCE_NEEDS_ADDRESS, REPLY_SOURCE_PICK_MODEL,
+        };
+        let unset = InferenceSource {
+            kind: InferenceKind::Gateway,
+            base_url: None,
+            local_model: None,
+            healthy: false,
+            has_api_key: false,
+        };
+        let mut state = signed_in_state();
+        read_as(&mut state, unset.clone());
+        assert_eq!(state.proxy_health(), Some(super::ProxyHealth::NoAddress));
+        assert!(
+            state.reply_source.is_unsaved(),
+            "the default address is not the server's yet"
+        );
+        assert_eq!(
+            save_body(&mut state),
+            Some(json!({"kind": "gateway", "baseUrl": "http://127.0.0.1:8080"}))
+        );
+
+        // My subscription, with no model of the plan listed yet.
+        assert!(state.note_reply_source_kind(InferenceKind::LocalProxy));
+        assert_eq!(state.reply_source_hint(), Some(REPLY_SOURCE_HOLDS_GATEWAY));
+        let save = state
+            .begin_reply_source_save()
+            .expect("the address is saved");
+        assert_eq!(
+            serde_json::to_value(&save.update).unwrap(),
+            json!({"kind": "gateway", "baseUrl": "http://127.0.0.1:8080"}),
+            "never the plan without a model"
+        );
+        let kept_address = InferenceSource {
+            base_url: Some("http://127.0.0.1:8080".into()),
+            healthy: true,
+            ..unset.clone()
+        };
+        state.settle_reply_source_save(save.sent, Ok(kept_address.clone()));
+        assert_eq!(
+            state.reply_source.shown_kind(),
+            Some(InferenceKind::LocalProxy),
+            "My subscription stays picked, for a model"
+        );
+        assert!(
+            !state.reply_source_can_save(),
+            "nothing more to send until a model is listed and picked"
+        );
+        assert_eq!(state.reply_source_hint(), Some(REPLY_SOURCE_HOLDS_GATEWAY));
+
+        // The server lists the plan's models now: a model first.
+        with_plan_models(&mut state, &["gpt-5-codex"]);
+        assert_eq!(state.reply_source_hint(), Some(REPLY_SOURCE_PICK_MODEL));
+        assert!(!state.reply_source_can_save());
+        assert!(state.begin_reply_source_save().is_none());
+        assert!(state.note_reply_source_model(Some("gpt-5-codex".into())));
+        assert_eq!(state.reply_source_hint(), None);
+        assert_eq!(
+            save_body(&mut state),
+            Some(json!({"kind": "local_proxy", "localModel": "gpt-5-codex"}))
+        );
+
+        // An address emptied under My subscription is refused here too.
+        state.reply_source.url_draft = Some("  ".into());
+        assert_eq!(state.reply_source_hint(), Some(REPLY_SOURCE_NEEDS_ADDRESS));
+        assert!(state.begin_reply_source_save().is_none());
+    }
+
+    /// My subscription is offered only where the app's server runs on this Mac: the server calls
+    /// opencodex on its own machine. Elsewhere the plan's half of the page takes no change and
+    /// asks nothing of the server, the default address is not counted as unsaved, and the
+    /// account can still be moved to the server's keys.
+    #[test]
+    fn the_plan_is_set_up_only_where_the_server_runs_on_this_mac() {
+        let mut state = signed_in_state();
+        state.opengrok = Some(OpenGrokClient::new("https://opengrok.example.com").unwrap());
+        read_as(
+            &mut state,
+            InferenceSource {
+                base_url: None,
+                ..kept(InferenceKind::LocalProxy, Some("gpt-5-codex"))
+            },
+        );
+        assert!(!state.reply_source.server_on_this_mac);
+        assert!(!state.reply_source.plan_editable());
+        assert!(!state.reply_source.is_unsaved(), "no address to count");
+        assert!(!state.note_reply_source_model(Some("grok-4".into())));
+        assert!(!state.note_reply_source_key("sk-proxy-1"));
+        assert!(!state.note_remove_reply_source_key());
+        assert!(state.note_reply_source_kind(InferenceKind::Gateway));
+        assert_eq!(save_body(&mut state), Some(json!({"kind": "gateway"})));
+        assert!(
+            !state.note_reply_source_kind(InferenceKind::LocalProxy),
+            "not offered from here"
+        );
+
+        let mut state = signed_in_state();
+        read_as(&mut state, kept(InferenceKind::Gateway, None));
+        assert!(
+            state.reply_source.server_on_this_mac,
+            "127.0.0.1 is this Mac"
+        );
+    }
+
+    /// A field emptied on the page is cleared on the server, as `null`: the address, the model
+    /// (No model), and the key (Remove key, offered while the server holds one). Typing a key
+    /// takes a Remove key back, and Keep key does too.
+    #[test]
+    fn an_emptied_field_is_cleared_and_remove_key_forgets_the_key() {
+        let mut state = signed_in_state();
+        read_as(
+            &mut state,
+            InferenceSource {
+                has_api_key: true,
+                ..kept(InferenceKind::Gateway, Some("gpt-5-codex"))
+            },
+        );
+        state.reply_source.url_draft = Some(String::new());
+        assert!(state.note_reply_source_model(None));
+        assert_eq!(state.reply_source.shown_model(), None);
+        assert!(state.note_remove_reply_source_key());
+        assert_eq!(
+            save_body(&mut state),
+            Some(json!({"kind": "gateway", "baseUrl": null, "localModel": null, "apiKey": null}))
+        );
+        assert!(state.note_reply_source_key("sk-new"));
+        assert!(
+            !state.reply_source.remove_key,
+            "a typed key replaces instead"
+        );
+        assert!(state.note_remove_reply_source_key());
+        assert_eq!(
+            state.reply_source.key_draft, None,
+            "and Remove key drops it"
+        );
+        assert!(state.note_remove_reply_source_key(), "Keep key");
+        assert!(!state.reply_source.remove_key);
+
+        let mut state = signed_in_state();
+        read_as(&mut state, kept(InferenceKind::Gateway, None));
+        assert!(
+            !state.note_remove_reply_source_key(),
+            "no key held, nothing to remove"
+        );
+    }
+
+    /// The URL and key fields take typing only while the page draws them editable, as the radio
+    /// and the picker take a click only then: before the setting is read, while a Save is out,
+    /// and where the server is not on this Mac, what reaches them changes no draft. The key field
+    /// is read-only while Remove key waits for Save too; the URL is not.
+    #[test]
+    fn a_field_drawn_read_only_takes_no_typing() {
+        let typed = |state: &mut AppState| {
+            (
+                state.note_reply_source_url("http://127.0.0.1:9090".into()),
+                state.note_reply_source_key("sk-proxy-1"),
+            )
+        };
+        let drafts = |state: &AppState| {
+            (
+                state.reply_source.url_draft.clone(),
+                state.reply_source.key_draft.is_some(),
+            )
+        };
+
+        let mut state = signed_in_state();
+        assert_eq!(typed(&mut state), (false, false), "not read yet");
+        assert_eq!(drafts(&state), (None, false));
+
+        read_as(
+            &mut state,
+            InferenceSource {
+                has_api_key: true,
+                ..kept(InferenceKind::Gateway, None)
+            },
+        );
+        assert!(state.note_reply_source_url("http://127.0.0.1:8081".into()));
+        assert!(state.note_reply_source_key("sk-proxy-0"));
+        assert!(state.begin_reply_source_save().is_some());
+        assert_eq!(typed(&mut state), (false, false), "a Save is out");
+        assert_eq!(
+            drafts(&state),
+            (Some("http://127.0.0.1:8081".into()), false),
+            "the address waits on the Save as it was, and its key went with it"
+        );
+        state.reply_source.saving = None;
+
+        assert!(state.note_remove_reply_source_key());
+        assert!(state.reply_source.plan_editable() && !state.reply_source.key_editable());
+        assert!(
+            state.note_reply_source_url("http://127.0.0.1:9090".into()),
+            "Remove key leaves the address alone"
+        );
+
+        let mut state = signed_in_state();
+        state.opengrok = Some(OpenGrokClient::new("https://opengrok.example.com").unwrap());
+        read_as(&mut state, kept(InferenceKind::Gateway, None));
+        assert_eq!(typed(&mut state), (false, false), "the server is elsewhere");
+        assert_eq!(drafts(&state), (None, false));
+    }
+
+    /// Settings → Reply source coming on screen is told once, which is when the setting and the
+    /// models are read; and a key typed there and not saved does not outlive the page: leaving
+    /// the tab, or Settings, drops it, and the page asks for it again when it is back. Signing
+    /// out drops it with everything else, and the gpui-agent tree never holds it.
+    #[test]
+    fn the_page_reads_when_it_arrives_and_a_key_left_on_it_is_dropped() {
+        use super::REPLY_SOURCE_RETYPE_KEY;
+        let mut state = signed_in_state();
+        read_as(&mut state, kept(InferenceKind::Gateway, None));
+        assert!(!state.settle_reply_source_page(), "Settings is shut");
+        state.is_app_settings_open = true;
+        state.app_settings_tab = AppSettingsTab::ReplySource;
+        assert!(state.settle_reply_source_page(), "arrived: read");
+        assert!(
+            !state.settle_reply_source_page(),
+            "still there: no read again"
+        );
+        assert!(state.note_reply_source_key("sk-proxy-1"));
+        assert!(state.reply_source.without_key().key_draft.is_none());
+
+        state.app_settings_tab = AppSettingsTab::Logins;
+        assert!(!state.settle_reply_source_page());
+        assert_eq!(state.reply_source.key_draft, None, "gone with the tab");
+        assert!(state.reply_source.retype_key);
+        assert_eq!(
+            crate::components::reply_source::error_line(&state.reply_source).as_deref(),
+            Some(REPLY_SOURCE_RETYPE_KEY)
+        );
+
+        state.app_settings_tab = AppSettingsTab::ReplySource;
+        assert!(state.settle_reply_source_page(), "back: read again");
+        assert!(state.note_reply_source_key("sk-proxy-1"));
+        assert!(!state.reply_source.retype_key, "typed again");
+        state.is_app_settings_open = false;
+        assert!(!state.settle_reply_source_page());
+        assert_eq!(state.reply_source.key_draft, None, "gone with Settings");
+
+        state.is_app_settings_open = true;
+        assert!(state.settle_reply_source_page());
+        assert!(state.note_reply_source_key("sk-proxy-1"));
+        state.forget_account();
+        assert_eq!(state.reply_source.key_draft, None, "gone with the account");
+    }
+
+    /// A URL that is not loopback is refused with the server's sentence, which the page shows as
+    /// written; the setting stays what the server keeps, the picks stay to be fixed, and Save is
+    /// live again. A key typed for that Save is gone, and the page says to type it again rather
+    /// than drop it without a word. A Save nobody heard back from reads the setting again, and
+    /// the read's answer clears the line that said nobody knew; a refusal's line stays until the
+    /// next Save.
+    #[test]
+    fn a_refused_save_shows_the_servers_words_and_keeps_the_picks() {
+        use super::REPLY_SOURCE_RETYPE_KEY;
+        use crate::components::reply_source::error_line;
+        let said = "baseUrl must be a literal loopback address such as http://127.0.0.1:8080";
+        let mut state = signed_in_state();
+        read_as(&mut state, kept(InferenceKind::Gateway, None));
+        state.reply_source.url_draft = Some("http://my-mac.example.com:8080".into());
+        assert!(state.note_reply_source_key("sk-proxy-1"));
+        let save = state.begin_reply_source_save().unwrap();
+        assert_eq!(
+            state.settle_reply_source_save(save.sent, Err(OpenGrokError::from_opengrok(400, said))),
+            Some(AfterReplySourceSave::Done)
+        );
+        assert_eq!(
+            state.reply_source.note,
+            Some(ReplySourceNote::Refused(said.to_string()))
+        );
+        assert_eq!(state.reply_source.note.as_ref().unwrap().line(), said);
+        assert_eq!(state.reply_source.key_draft, None, "the key went with it");
+        assert_eq!(
+            error_line(&state.reply_source),
+            Some(format!("{said} {REPLY_SOURCE_RETYPE_KEY}"))
+        );
+        assert_eq!(
+            state
+                .reply_source
+                .kept_source()
+                .unwrap()
+                .base_url
+                .as_deref(),
+            Some("http://127.0.0.1:8080"),
+            "nothing was kept, and nothing claims it was"
+        );
+        assert_eq!(
+            state.reply_source.shown_url(),
+            "http://my-mac.example.com:8080",
+            "the URL stays where the person can fix it"
+        );
+        assert!(state.reply_source_can_save());
+        // A read that lands meanwhile (the window came back to the front) leaves the refusal.
+        read_as(&mut state, kept(InferenceKind::Gateway, None));
+        assert_eq!(
+            state.reply_source.note,
+            Some(ReplySourceNote::Refused(said.to_string()))
+        );
+
+        // No answer at all: nobody knows, and the setting is read again to find out. The key
+        // typed again went with it, and is asked for again too.
+        state.reply_source.url_draft = Some("http://127.0.0.1:9090".into());
+        assert!(state.note_reply_source_key("sk-proxy-1"));
+        assert!(!state.reply_source.retype_key);
+        let save = state.begin_reply_source_save().unwrap();
+        assert_eq!(state.reply_source.note, None, "a new Save, a new line");
+        assert_eq!(
+            state.settle_reply_source_save(
+                save.sent,
+                Err(OpenGrokError::message("error sending request"))
+            ),
+            Some(AfterReplySourceSave::ReadAgain)
+        );
+        assert_eq!(
+            state.reply_source.note.as_ref().map(ReplySourceNote::line),
+            Some(REPLY_SOURCE_SAVE_UNKNOWN)
+        );
+        assert!(state.reply_source.retype_key);
+        read_as(&mut state, kept(InferenceKind::Gateway, None));
+        assert_eq!(state.reply_source.note, None);
+        assert_eq!(
+            error_line(&state.reply_source).as_deref(),
+            Some(REPLY_SOURCE_RETYPE_KEY),
+            "the key is still asked for after the read"
+        );
+        // A Save the server keeps is the end of it.
+        let save = state.begin_reply_source_save().unwrap();
+        state.settle_reply_source_save(save.sent, Ok(kept(InferenceKind::Gateway, None)));
+        assert_eq!(error_line(&state.reply_source), None);
+    }
+
+    /// The health line: no address kept is said as such, not as opencodex being down; with one,
+    /// `/models`' word on the proxy is preferred when it gave one, being what filled the picker,
+    /// and the setting's own `healthy` otherwise.
+    #[test]
+    fn the_health_line_prefers_the_model_lists_word_on_the_proxy() {
+        use super::ProxyHealth;
+        let mut state = signed_in_state();
+        assert_eq!(state.proxy_health(), None, "nothing read");
+        read_as(&mut state, kept(InferenceKind::LocalProxy, Some("m")));
+        assert_eq!(state.proxy_health(), Some(ProxyHealth::Running));
+        state.model_catalogue.local_proxy =
+            Some(crate::opengrok::LocalProxyStatus { healthy: false });
+        assert_eq!(state.proxy_health(), Some(ProxyHealth::NotRunning));
+        read_as(
+            &mut state,
+            InferenceSource {
+                base_url: None,
+                ..kept(InferenceKind::Gateway, None)
+            },
+        );
+        assert_eq!(state.proxy_health(), Some(ProxyHealth::NoAddress));
+    }
+
+    /// Only the newest read of the setting lands: an older one answered late, or one that lands
+    /// after the person signed out, is dropped, as is a Save's answer after a sign out. A read
+    /// that fails with the setting already on the page leaves it there and says so.
+    #[test]
+    fn a_late_answer_about_the_reply_source_lands_on_nothing() {
+        let mut state = signed_in_state();
+        let (_, older) = state.begin_reply_source_read().unwrap();
+        let (_, newer) = state.begin_reply_source_read().unwrap();
+        assert!(
+            state.settle_reply_source_read(newer, Ok(kept(InferenceKind::LocalProxy, Some("m"))))
+        );
+        assert!(!state.settle_reply_source_read(older, Ok(kept(InferenceKind::Gateway, None))));
+        assert_eq!(
+            state.reply_source.kept_source().map(|kept| kept.kind),
+            Some(InferenceKind::LocalProxy)
+        );
+
+        let (_, failing) = state.begin_reply_source_read().unwrap();
+        assert!(state.settle_reply_source_read(
+            failing,
+            Err(OpenGrokError::from_opengrok(
+                500,
+                "the store is unavailable"
+            ))
+        ));
+        assert_eq!(
+            state.reply_source.kept_source().map(|kept| kept.kind),
+            Some(InferenceKind::LocalProxy),
+            "what was read stays on the page"
+        );
+        assert!(matches!(
+            state.reply_source.note,
+            Some(ReplySourceNote::ReadFailed(_))
+        ));
+
+        state.note_reply_source_kind(InferenceKind::Gateway);
+        let save = state.begin_reply_source_save().unwrap();
+        state.forget_account();
+        assert_eq!(
+            state.settle_reply_source_save(save.sent, Ok(kept(InferenceKind::Gateway, None))),
+            None
+        );
+        assert_eq!(state.reply_source.kept, None);
+    }
+
+    /// The page offers the models `GET /models` lists as the person's plan's, in its order, and
+    /// never one the server would refuse for a subscription: Claude, or an id it does not know
+    /// to be OpenAI's or xAI's. The gateway's are the Bot's.
+    #[test]
+    fn the_page_offers_only_the_plans_models() {
+        let mut state = AppState::new();
+        let entry = |id: &str, source: Option<&str>| ModelEntry {
+            id: id.into(),
+            source: source.map(str::to_string),
+        };
+        state.model_catalogue = ModelCatalogue {
+            models: vec![
+                entry("oag/cheap", None),
+                entry("gpt-5-codex", Some("local_proxy")),
+                entry("claude-sonnet-4.5", Some("local_proxy")),
+                entry("my-codex-thing", Some("local_proxy")),
+                entry("llama-3.1-70b", Some("local_proxy")),
+                entry("grok-4", Some("local_proxy")),
+                entry("oag/fast", Some("gateway")),
+            ],
+            note: None,
+            local_proxy: None,
+        };
+        assert_eq!(state.subscription_models(), vec!["gpt-5-codex", "grok-4"]);
+    }
+
+    /// Which door a reply came through is read off the run's own frame by the same assembler a
+    /// replay feeds, so a reply the server kept while the app was elsewhere comes back wearing
+    /// the badge it would have worn live.
+    #[test]
+    fn a_reply_read_back_from_the_server_wears_its_badge() {
+        let events = vec![
+            json!({"type": "RUN_STARTED", "runId": "run_1", "threadId": "cw_1"}),
+            json!({
+                "type": "CUSTOM", "name": "opengrok.inferenceSource",
+                "value": {"kind": "local_proxy", "model": "gpt-5-codex"}
+            }),
+            json!({"type": "TEXT_MESSAGE_START", "messageId": "a1", "role": "assistant"}),
+            json!({"type": "TEXT_MESSAGE_CONTENT", "messageId": "a1", "delta": "Done."}),
+            json!({"type": "RUN_FINISHED", "runId": "run_1"}),
+        ];
+        let badge = ReplySource {
+            kind: InferenceKind::LocalProxy,
+            model: Some("gpt-5-codex".into()),
+        };
+        let (plain, _, source) = super::replayed_run(&events, "finished");
+        assert_eq!((plain.as_str(), source.as_ref()), ("Done.", Some(&badge)));
+
+        let messages = vec![at(message("m_ask", true, "go"), 500)];
+        let recovered = missing_replies(
+            &messages,
+            &[thread_run("run_1", "finished", 1_000, &events)],
+        );
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].reply_source.as_ref(), Some(&badge));
+        let mut messages = messages;
+        let id = graft_reply(&mut messages, &recovered[0]);
+        let grafted = messages.iter().find(|m| m.id == id).unwrap();
+        assert_eq!(grafted.reply_source.as_ref(), Some(&badge));
+
+        // A run from a server that sends no such frame comes back with no badge.
+        let older: Vec<_> = events
+            .iter()
+            .filter(|event| event["type"] != "CUSTOM")
+            .cloned()
+            .collect();
+        assert_eq!(super::replayed_run(&older, "finished").2, None);
+    }
+
+    /// The badge is written down with the reply and read back with it, so a thread reopened from
+    /// disk, which is not read back from the server for a run it already holds, still wears it.
+    #[tokio::test]
+    async fn a_replys_badge_survives_a_reload() {
+        let db = test_db().await;
+        db.ensure_session("s1", "Ada").await.expect("a session");
+        let mut reply = message("m_reply", false, "Done.");
+        reply.run_id = Some("run_1".into());
+        reply.reply_source = Some(ReplySource {
+            kind: InferenceKind::Gateway,
+            model: Some("oag/cheap".into()),
+        });
+        keep_reply(
+            &db,
+            "s1",
+            "Ada",
+            &reply.id,
+            &reply.content,
+            &[],
+            reply.run_id.as_deref(),
+            false,
+            reply.save_stamp(),
+        )
+        .await
+        .expect("saved");
+        // A second write of the same reply that knows no source does not take it away.
+        let mut again = reply.save_stamp();
+        again.source_json = None;
+        keep_reply(
+            &db,
+            "s1",
+            "Ada",
+            &reply.id,
+            "Done.",
+            &[],
+            Some("run_1"),
+            false,
+            again,
+        )
+        .await
+        .expect("saved again");
+        let rows = db.get_messages("s1").await.expect("the thread reopens");
+        let restored = restored_message(rows[0].clone());
+        assert_eq!(restored.reply_source, reply.reply_source);
+
+        let mut plain = message("m_old", false, "Before badges.");
+        plain.run_id = Some("run_0".into());
+        keep_reply(
+            &db,
+            "s1",
+            "Ada",
+            &plain.id,
+            "Before badges.",
+            &[],
+            Some("run_0"),
+            false,
+            plain.save_stamp(),
+        )
+        .await
+        .expect("saved");
+        let rows = db.get_messages("s1").await.expect("the thread reopens");
+        let old = rows.iter().find(|row| row.id == "m_old").unwrap();
+        assert_eq!(restored_message(old.clone()).reply_source, None);
+    }
+
+    /// The live stream's badge: the reply is told which door its run went through the moment
+    /// the stream says so, before a word of it and once, and nothing later in the stream takes
+    /// it off. The row written down when the turn settles carries it, as
+    /// `persist_assistant_reply` writes the bubble's own `save_stamp`, so the thread reopened
+    /// from disk wears it too.
+    #[tokio::test]
+    async fn the_live_streams_badge_is_on_the_reply_and_written_down_with_it() {
+        let badge = ReplySource {
+            kind: InferenceKind::LocalProxy,
+            model: Some("gpt-5-codex".into()),
+        };
+        let frames = [
+            json!({"type": "RUN_STARTED", "runId": "run_1", "threadId": "cw_1"}),
+            json!({
+                "type": "CUSTOM", "name": "opengrok.inferenceSource",
+                "value": {"kind": "local_proxy", "model": "gpt-5-codex"}
+            }),
+            json!({"type": "TEXT_MESSAGE_START", "messageId": "a1", "role": "assistant"}),
+            json!({"type": "TEXT_MESSAGE_CONTENT", "messageId": "a1", "delta": "Done."}),
+            json!({"type": "TEXT_MESSAGE_END", "messageId": "a1"}),
+            json!({"type": "RUN_FINISHED", "runId": "run_1"}),
+        ];
+        let mut reply = message("m_reply", false, "");
+        reply.run_id = Some("run_1".into());
+        let mut conversations = vec![Conversation {
+            id: "cw_1".into(),
+            title: "Ada".into(),
+            created_at: String::new(),
+            updated_at: String::new(),
+            messages: vec![message("m_ask", true, "go"), reply],
+            unread_count: 0,
+            origin: None,
+        }];
+        // The stream's own steps, frame by frame, as `send_opengrok_turn_with` takes them.
+        let mut assembler = TurnAssembler::default();
+        let mut told = None;
+        let mut news = Vec::new();
+        for frame in &frames {
+            assembler.push_event(frame);
+            let source = super::source_news(&assembler, &mut told);
+            news.push(source.is_some());
+            let (plain, parts) = assembler.snapshot();
+            let row = super::streaming_message_mut(&mut conversations, "cw_1", "m_reply")
+                .expect("the turn's row");
+            row.content = plain;
+            row.parts = parts;
+            if let Some(source) = source {
+                row.reply_source = Some(source);
+            }
+            if frame["type"] == "CUSTOM" {
+                assert_eq!(
+                    (row.content.as_str(), row.reply_source.as_ref()),
+                    ("", Some(&badge)),
+                    "the badge before a word of the reply"
+                );
+            }
+        }
+        assert_eq!(news, [false, true, false, false, false, false], "told once");
+        assembler.finish();
+        let (plain, parts) = assembler.snapshot();
+        let row = super::streaming_message_mut(&mut conversations, "cw_1", "m_reply").unwrap();
+        row.content = plain;
+        row.parts = parts;
+        assert_eq!(
+            row.reply_source.as_ref(),
+            Some(&badge),
+            "the stream's end keeps it"
+        );
+
+        // Written down as `persist_assistant_reply` writes it, and read back.
+        let db = test_db().await;
+        let (content, parts) = super::reply_to_keep(&row.content, &row.parts).expect("words");
+        keep_reply(
+            &db,
+            "cw_1",
+            "Ada",
+            &row.id,
+            &content,
+            &parts,
+            Some("run_1"),
+            false,
+            row.save_stamp(),
+        )
+        .await
+        .expect("saved");
+        let rows = db.get_messages("cw_1").await.expect("the thread reopens");
+        let saved = rows.iter().find(|saved| saved.id == "m_reply").unwrap();
+        assert_eq!(restored_message(saved.clone()).reply_source, Some(badge));
+    }
+
+    /// A replay backfills the badge: a row written before its run's source was kept takes the
+    /// one the server's journal says, a row that already wears one keeps it, and a run whose
+    /// journal carries no such frame gives none. A replay painting a run the thread holds gives
+    /// the journal's badge, and one that says nothing leaves what the live stream gave. The
+    /// journal opens each run with the person's message before the frame, as the server's
+    /// replay does.
+    #[test]
+    fn a_replay_backfills_the_badge_a_row_is_missing() {
+        let plan = ReplySource {
+            kind: InferenceKind::LocalProxy,
+            model: Some("gpt-5-codex".into()),
+        };
+        let paid = ReplySource {
+            kind: InferenceKind::Gateway,
+            model: Some("oag/cheap".into()),
+        };
+        // As a replay opens a run: the person's own message first, then the frame that says
+        // which door the run went through.
+        let journal = |run: &str, source: Option<serde_json::Value>| {
+            let asked = format!("{run}_asked");
+            let mut events = vec![
+                json!({"type": "RUN_STARTED", "runId": run, "threadId": "cw_1"}),
+                json!({"type": "TEXT_MESSAGE_START", "messageId": asked, "role": "user"}),
+                json!({"type": "TEXT_MESSAGE_CONTENT", "messageId": asked, "delta": "go on"}),
+                json!({"type": "TEXT_MESSAGE_END", "messageId": asked}),
+            ];
+            if let Some(value) = source {
+                events.push(json!({
+                    "type": "CUSTOM", "name": "opengrok.inferenceSource", "value": value
+                }));
+            }
+            events.extend([
+                json!({"type": "TEXT_MESSAGE_START", "messageId": run, "role": "assistant"}),
+                json!({"type": "TEXT_MESSAGE_CONTENT", "messageId": run, "delta": "Done."}),
+                json!({"type": "TEXT_MESSAGE_END", "messageId": run}),
+                json!({"type": "RUN_FINISHED", "runId": run}),
+            ]);
+            events
+        };
+        let on_plan = || Some(json!({"kind": "local_proxy", "model": "gpt-5-codex"}));
+        let mut worn = from_run("m_2", "Done.", "run_2", 2_000);
+        worn.reply_source = Some(paid.clone());
+        let mut state = AppState::new();
+        state.conversations.push(Conversation {
+            id: "cw_1".into(),
+            title: "Ada".into(),
+            created_at: String::new(),
+            updated_at: String::new(),
+            messages: vec![
+                from_run("m_1", "Done.", "run_1", 1_000),
+                worn,
+                from_run("m_3", "Done.", "run_3", 3_000),
+            ],
+            unread_count: 0,
+            origin: None,
+        });
+        let filled = state.overlay_replay_cards(
+            "cw_1",
+            &[
+                thread_run("run_1", "finished", 1_000, &journal("run_1", on_plan())),
+                thread_run("run_2", "finished", 2_000, &journal("run_2", on_plan())),
+                thread_run("run_3", "finished", 3_000, &journal("run_3", None)),
+            ],
+        );
+        let badges: Vec<Option<ReplySource>> = state.conversations[0]
+            .messages
+            .iter()
+            .map(|m| m.reply_source.clone())
+            .collect();
+        assert_eq!(badges, vec![Some(plan.clone()), Some(paid.clone()), None]);
+        assert_eq!(
+            filled,
+            vec![super::ReplayedBadge {
+                message_id: "m_1".into(),
+                run_id: "run_1".into(),
+                source: plan.clone(),
+            }],
+            "only the badge it filled in goes to a row"
+        );
+
+        // A replay painting a run the thread holds says so when the badge changes, and only then.
+        let (_, _, said) = super::replayed_run(&journal("run_4", on_plan()), "finished");
+        let mut live = message("m_4", false, "");
+        assert!(super::wear_replayed_source(&mut live, said.clone()));
+        assert_eq!(live.reply_source.as_ref(), Some(&plan));
+        assert!(
+            !super::wear_replayed_source(&mut live, said),
+            "the next poll says it again"
+        );
+        let (_, _, silent) = super::replayed_run(&journal("run_4", None), "running");
+        assert!(!super::wear_replayed_source(&mut live, silent));
+        assert_eq!(
+            live.reply_source,
+            Some(plan),
+            "a journal that has not said leaves the badge the stream gave"
+        );
+    }
+
+    /// The saved badge is its run's. A row written again under another run does not keep the
+    /// door the first run went through: it wears the new run's when the write knows it, and
+    /// none when it does not.
+    #[tokio::test]
+    async fn a_row_filed_under_another_run_does_not_keep_the_old_runs_badge() {
+        let db = test_db().await;
+        db.ensure_session("s1", "Ada").await.expect("a session");
+        let mut reply = message("m_reply", false, "Done.");
+        reply.run_id = Some("run_1".into());
+        reply.reply_source = Some(ReplySource {
+            kind: InferenceKind::LocalProxy,
+            model: Some("gpt-5-codex".into()),
+        });
+        let write = |run: &'static str, stamp: SaveStamp| {
+            let db = db.clone();
+            async move {
+                keep_reply(
+                    &db,
+                    "s1",
+                    "Ada",
+                    "m_reply",
+                    "Done.",
+                    &[],
+                    Some(run),
+                    false,
+                    stamp,
+                )
+                .await
+                .expect("saved");
+                let rows = db.get_messages("s1").await.expect("the thread reopens");
+                restored_message(rows[0].clone()).reply_source
+            }
+        };
+        assert_eq!(write("run_1", reply.save_stamp()).await, reply.reply_source);
+        let mut unknown = reply.save_stamp();
+        unknown.source_json = None;
+        assert_eq!(
+            write("run_2", unknown).await,
+            None,
+            "run_1's door says nothing about run_2"
+        );
+        let gateway = ReplySource {
+            kind: InferenceKind::Gateway,
+            model: Some("oag/cheap".into()),
+        };
+        let mut known = reply.save_stamp();
+        known.source_json = Some(gateway.to_json());
+        assert_eq!(write("run_3", known).await, Some(gateway));
+    }
+
+    /// A badge a thread's replay fills in is written down, as the live stream's is with its
+    /// reply: the thread reopened from disk wears it without asking the server, and the next
+    /// replay has nothing left to fill in. The row takes it only while it is still filed under
+    /// the run whose journal named the door; one written since under another run keeps what that
+    /// write gave it, and a reply with no row yet has nothing to take it.
+    #[tokio::test]
+    async fn a_badge_a_replay_fills_in_is_written_down() {
+        let plan = ReplySource {
+            kind: InferenceKind::LocalProxy,
+            model: Some("gpt-5-codex".into()),
+        };
+        let journal = |run: &str, source: Option<serde_json::Value>| {
+            let mut events = vec![json!({"type": "RUN_STARTED", "runId": run, "threadId": "cw_1"})];
+            events.extend(source.map(|value| {
+                json!({"type": "CUSTOM", "name": "opengrok.inferenceSource", "value": value})
+            }));
+            events.extend([
+                json!({"type": "TEXT_MESSAGE_START", "messageId": run, "role": "assistant"}),
+                json!({"type": "TEXT_MESSAGE_CONTENT", "messageId": run, "delta": "Done."}),
+                json!({"type": "TEXT_MESSAGE_END", "messageId": run}),
+                json!({"type": "RUN_FINISHED", "runId": run}),
+            ]);
+            events
+        };
+        let runs = [
+            thread_run(
+                "run_1",
+                "finished",
+                1_000,
+                &journal(
+                    "run_1",
+                    Some(json!({"kind": "local_proxy", "model": "gpt-5-codex"})),
+                ),
+            ),
+            thread_run("run_2", "finished", 2_000, &journal("run_2", None)),
+        ];
+        async fn reopened(db: &DatabaseService) -> Vec<Message> {
+            let rows = db.get_messages("cw_1").await.expect("the thread reopens");
+            rows.into_iter().map(restored_message).collect()
+        }
+        let db = test_db().await;
+        db.ensure_session("cw_1", "Ada").await.expect("a session");
+        // Two replies written down before their runs' doors were kept.
+        for (id, run, at_ms) in [("m_1", "run_1", 1_000), ("m_2", "run_2", 2_000)] {
+            let reply = from_run(id, "Done.", run, at_ms);
+            keep_reply(
+                &db,
+                "cw_1",
+                "Ada",
+                id,
+                "Done.",
+                &[],
+                Some(run),
+                false,
+                reply.save_stamp(),
+            )
+            .await
+            .expect("saved");
+        }
+
+        let mut state = AppState::new();
+        state
+            .conversations
+            .push(thread("cw_1", reopened(&db).await));
+        let filled = state.overlay_replay_cards("cw_1", &runs);
+        super::keep_replayed_badges(&db, &filled).await;
+        let badges: Vec<(String, Option<ReplySource>)> = reopened(&db)
+            .await
+            .into_iter()
+            .map(|m| (m.id, m.reply_source))
+            .collect();
+        assert_eq!(
+            badges,
+            vec![("m_1".into(), Some(plan.clone())), ("m_2".into(), None)],
+            "reopened from disk, the badge the replay filled in is there"
+        );
+        let mut again = AppState::new();
+        again
+            .conversations
+            .push(thread("cw_1", reopened(&db).await));
+        assert!(again.overlay_replay_cards("cw_1", &runs).is_empty());
+
+        // m_2 written again under run_3 before run_2's badge landed: run_2's door says nothing
+        // about run_3, so the row keeps the none its last write gave it.
+        let refiled = from_run("m_2", "Again.", "run_3", 2_000);
+        keep_reply(
+            &db,
+            "cw_1",
+            "Ada",
+            "m_2",
+            "Again.",
+            &[],
+            Some("run_3"),
+            false,
+            refiled.save_stamp(),
+        )
+        .await
+        .expect("saved");
+        super::keep_replayed_badges(
+            &db,
+            &[super::ReplayedBadge {
+                message_id: "m_2".into(),
+                run_id: "run_2".into(),
+                source: plan.clone(),
+            }],
+        )
+        .await;
+        let m_2 = reopened(&db)
+            .await
+            .into_iter()
+            .find(|m| m.id == "m_2")
+            .unwrap();
+        assert_eq!(
+            (m_2.run_id.as_deref(), m_2.reply_source),
+            (Some("run_3"), None)
+        );
+        assert!(
+            !db.keep_reply_source("m_9", "run_9", &plan.to_json())
+                .await
+                .expect("asked"),
+            "no row, nothing written"
+        );
     }
 }
