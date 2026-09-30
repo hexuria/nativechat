@@ -485,15 +485,7 @@ const WORDS_NOT_RECORDED_YET: &[(Slot, &str, &str)] = &[];
 /// Fixtures this app still reads wrongly, with the words their check fails with and why. The
 /// check has to fail with those words: one that passes means the drift is fixed and the entry
 /// goes, and one that fails some other way is a new problem, not this one.
-const KNOWN_DRIFT: &[(&str, &str, &str)] = &[(
-    "rest/POST__ag-ui/202-a_queued_send_held_for_an_absent_mac_drains_when_the_mac_reconnects.json",
-    "a turn answers with its event stream, not a JSON body",
-    "The server answers a fire of a queued send it holds for the person's Mac with 202 and the \
-     row as it stands (opengrok-server PR #298, `consume_for_turn` in `agui/pending.rs`), and no \
-     run starts. `run_turn` reads every 2xx as the turn's event stream, so the JSON finds no \
-     `data:` line and the fire reads as a turn that said nothing: the send leaves this Mac's \
-     queue while the server keeps it, and its reply says the coworker said nothing.",
-)];
+const KNOWN_DRIFT: &[(&str, &str, &str)] = &[];
 
 /// How a 502, 503 or 504 the server wrote itself fails [`refusal`] when it is not in the shape
 /// that says so.
@@ -2709,8 +2701,11 @@ fn session_in_cookies(_: u16, body: &Value) -> Check {
 /// stream's frames under `agui/`, where [`check_frame`] reads each one, so the stream's own text
 /// is never recorded here; it would be `data:` lines the stream reader takes as the coworker's
 /// words or the run's error. The one success body recorded is the 202 a fire of a queued send
-/// held for the person's Mac is answered with, which is no stream (see [`KNOWN_DRIFT`]).
-fn turn_stream(_: u16, body: &Value) -> Check {
+/// held for the person's Mac is answered with, which is no stream: [`held_for_mac`] reads it.
+fn turn_stream(status: u16, body: &Value) -> Check {
+    if status == 202 {
+        return held_for_mac(body);
+    }
     let stream = body
         .as_str()
         .ok_or("a turn answers with its event stream, not a JSON body")?;
@@ -2725,6 +2720,46 @@ fn turn_stream(_: u16, body: &Value) -> Check {
         );
     }
     Ok(())
+}
+
+/// A turn answered 202 (opengrok-server PR #298, branch mac-relay c7b57e9, recorded at c3f9521,
+/// not yet on main: `consume_for_turn` in `crates/opengrok-server/src/agui/pending.rs`): the
+/// queued send it fired is held for the person's Mac, and no run started. `run_turn` reads it as
+/// the turn not starting, never as a stream: held for the Mac by its status and its word, with
+/// the server's sentence, and with the row as it now stands for the queue to put back, still
+/// queued and waiting for the Mac, the very row that was fired.
+fn held_for_mac(body: &Value) -> Check {
+    let error = OpenGrokClient::turn_held(&body_text(body));
+    must!(
+        error.is_held_for_mac(),
+        "a send held for the Mac should read as held for it, not {error:?}"
+    );
+    let said = str_at(body, "message");
+    must!(
+        !said.trim().is_empty() && error.message == said,
+        "the hold should read as the server's sentence {said:?}, not {:?}",
+        error.message
+    );
+    let custom = error
+        .pending_custom()
+        .ok_or("the row as it stands should come with the hold")?;
+    let raw = body
+        .pointer("/event/value/message")
+        .ok_or("the hold's CUSTOM should carry the row")?;
+    let row = custom
+        .message
+        .as_ref()
+        .ok_or("the row should parse off the hold's CUSTOM")?;
+    must!(
+        custom.op == PendingOp::Edited
+            && custom.thread_id == str_at(&body["event"]["value"], "threadId"),
+        "a held send stays queued on its thread, as an edit says: {custom:?}"
+    );
+    must!(
+        row.id == str_at(body, "id") && row.waits_for_mac(),
+        "the row should be the send fired, waiting for the Mac: {row:?}"
+    );
+    held_as_sent(row, raw)
 }
 
 fn thread_list(_: u16, body: &Value) -> Check {

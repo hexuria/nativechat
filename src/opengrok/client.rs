@@ -1006,6 +1006,12 @@ impl OpenGrokClient {
         if response.status() == StatusCode::UNAUTHORIZED {
             return Err(Self::signed_out_error(response).await);
         }
+        // A 202 is no stream: the queued send this turn fired is held for the person's Mac, and
+        // no run started. Read as every 2xx was, it was a turn that said nothing.
+        if response.status() == StatusCode::ACCEPTED {
+            let body = response.text().await.unwrap_or_default();
+            return Err(Self::turn_held(&body));
+        }
         if !response.status().is_success() {
             return Err(Self::read_error(response).await);
         }
@@ -1066,6 +1072,23 @@ impl OpenGrokClient {
             .and_then(Value::as_str)
             .map(str::to_string);
         OpenGrokError::from_server(None, message).with_code(code)
+    }
+
+    /// `POST /ag-ui`'s 202, `{v, id, heldFor, message, event}`: the queued send this turn fired
+    /// is one the person's Mac would carry, and no Mac holds the relay, so the server left it
+    /// queued and started no run (opengrok-server PR #298, branch mac-relay c7b57e9, recorded at
+    /// c3f9521, not yet on main: `consume_for_turn` in
+    /// `crates/opengrok-server/src/agui/pending.rs`). It sends the send itself when a Mac opens
+    /// the relay. Read as the turn not starting: the server's sentence, its `heldFor` word as the
+    /// code ([`OpenGrokError::is_held_for_mac`]), and the row as it now stands as the queue's
+    /// CUSTOM. Apart from the response so the wire conformance tests read the recorded answer
+    /// with this very code.
+    pub(super) fn turn_held(body: &str) -> OpenGrokError {
+        let body: Value = serde_json::from_str(body).unwrap_or(Value::Null);
+        let said = |key: &str| body.get(key).and_then(Value::as_str).map(str::to_string);
+        OpenGrokError::from_opengrok(202, said("message").unwrap_or_default())
+            .with_code(said("heldFor"))
+            .with_pending_event(body.get("event").cloned())
     }
 
     pub async fn answer_run(
@@ -6980,6 +7003,61 @@ mod tests {
         );
         let plain = turn("run_plain").await;
         assert_eq!(plain.code(), None);
+    }
+
+    /// A fire of a queued send the server holds for the person's Mac is answered 202 with the row
+    /// as it stands (opengrok-server PR #298), and no run starts. The turn is not read as a stream
+    /// that said nothing: it is held for the Mac, with the server's sentence and the row, still
+    /// queued and waiting for the Mac, for the queue to put back. No frame reaches the turn.
+    #[tokio::test]
+    async fn a_fire_the_server_holds_for_the_mac_is_no_turn() {
+        let server = MockServer::start().await;
+        let row = json!({
+            "v": 1, "id": "pum_1", "threadId": "thread_1", "content": "then this, by my Mac",
+            "replyTo": null, "recipeId": null, "recipeValues": null, "skillId": null,
+            "clientMessageId": "m2", "status": "pending", "createdAtMs": 1, "updatedAtMs": 1,
+            "drainedAtMs": null, "drainedRunId": null,
+            "inferenceSource": {"kind": "local_proxy", "via": "mac"},
+            "heldFor": "relay_offline"
+        });
+        let said = "Your Mac isn't connected, so this message stays queued and goes when it \
+                    reconnects.";
+        Mock::given(method("POST"))
+            .and(path("/ag-ui"))
+            .respond_with(ResponseTemplate::new(202).set_body_json(json!({
+                "v": 1, "id": "pum_1", "heldFor": "relay_offline", "message": said,
+                "event": {
+                    "type": "CUSTOM", "timestamp": 1, "name": "pending-user-message",
+                    "value": {"v": 1, "op": "edited", "threadId": "thread_1", "message": row}
+                }
+            })))
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        put_cookie(&client, &live_session());
+        let mut frames = 0;
+        let held = client
+            .run_turn(
+                "cw_1",
+                "thread_1",
+                "run_1",
+                &[],
+                None,
+                None,
+                Some("pum_1"),
+                None,
+                |_| frames += 1,
+            )
+            .await
+            .expect_err("a held send starts no turn");
+        assert!(held.is_held_for_mac(), "{held:?}");
+        assert_eq!(held.message, said);
+        assert_eq!(frames, 0);
+        let custom = held.pending_custom().expect("the row as it stands");
+        assert_eq!(custom.op, crate::opengrok::PendingOp::Edited);
+        let row = custom.message.expect("the row");
+        assert_eq!(row.id, "pum_1");
+        assert!(row.waits_for_mac());
     }
 
     #[tokio::test]
