@@ -30,7 +30,8 @@
 //!   why this app never asks it;
 //! - a route this app was built to ask ahead of the server's recording of it is owed a reading
 //!   in [`REST_NOT_RECORDED_YET`], which says what brings its fixtures, until the corpus holds
-//!   it;
+//!   it; and a key read ahead of its recording on a route the corpus does record waits in
+//!   [`REST_FIELDS_NOT_RECORDED_YET`] until a recorded body of the route carries it;
 //! - the ledger, every wire word this app branches on, is either a word the manifest says the
 //!   server sends, excused in [`NOT_SENT_BY_SERVER`] with the evidence, or read ahead of the
 //!   server's recording in [`WORDS_NOT_RECORDED_YET`], which says what brings it;
@@ -78,8 +79,8 @@ use super::pending::{
 use super::relay::{RelayAnswered, RelayFrame, data_frame, stream_refusal, token_turned_away};
 use super::timing::{RUN_TIMING_CUSTOM, TURN_TIMELINE_CUSTOM, TurnTiming};
 use super::types::{
-    Account, ArtifactListing, Attachment, Coworker, EFFORT_INHERIT, ModelCatalogue, ThreadListing,
-    assistant_text_from_sse,
+    Account, ArtifactListing, Attachment, Coworker, CoworkerSource, EFFORT_INHERIT, ModelCatalogue,
+    ThreadListing, assistant_text_from_sse,
 };
 use super::user_form::{
     BoxHandoffReply, COMPUTER_HANDOFF_NAMES, ComputerHandoffStatus, FORM_ENTRY_MISSING,
@@ -620,6 +621,36 @@ const REST_NOT_RECORDED_YET: &[(&str, &str, &str)] = &[];
 const MACHINE_TOKEN_ROUTES: &[&str] = &[
     "GET__inference-relay_requests",
     "POST__inference-relay_responses__request_id_",
+];
+
+/// Keys this app reads and sends on routes the corpus records, ahead of the server's recording
+/// of them: built to a shape proposed to the server session before the server sends it. The
+/// routes themselves are recorded and read ([`REST_ROUTES`]), so they cannot wait in
+/// [`REST_NOT_RECORDED_YET`]; what waits is one key on their bodies. Each is named by the route's
+/// directory, with the key and what brings its fixtures, and is read meanwhile from bodies
+/// written in the proposed shape ([`a_bots_door_is_read_beyond_the_recording`]). The day a
+/// recorded body of the route carries the key, the entry has gone stale and comes off this list,
+/// and [`every_key_asked_ahead_of_its_recording_is_read_and_not_recorded_yet`] fails until it
+/// does.
+const REST_FIELDS_NOT_RECORDED_YET: &[(&str, &str, &str)] = &[
+    (
+        "GET__coworkers",
+        "source",
+        "A Bot's own door, `\"gateway\" | \"local_proxy\" | null` on every row, `null` for a Bot \
+         that follows the account's (opengrok-server contract proposed 2026-09-30, Part A, not \
+         yet recorded; coworker_matches reads it, and a row without it is a server that keeps no \
+         door per Bot). Its fixtures come with the server's Part A and the recording after it: a \
+         coworker row carrying `source`.",
+    ),
+    (
+        "PATCH__coworkers__coworker_id_",
+        "source",
+        "The model picker's PATCH sends the Bot's door with its model (the same contract), and the \
+         answer is the row carrying it. The server refuses with a 400 in its own words a patch \
+         that leaves the Bot on `local_proxy` with a model its subscription allowlist does not \
+         take, read as its sentence like every refusal of the route. Its fixtures come with Part \
+         A's recording: the row with its door, and that refusal.",
+    ),
 ];
 
 // ---- the corpus ----
@@ -3393,10 +3424,31 @@ fn coworker_matches(coworker: &Coworker, raw: &Value) -> Check {
             && coworker.effort.as_deref() == opt_str(raw, "effort")
             && coworker.effort() == opt_str(raw, "effort").unwrap_or(EFFORT_INHERIT)
             && coworker.visibility.as_deref() == opt_str(raw, "visibility")
-            && coworker.is_shared() == (opt_str(raw, "visibility") == Some("org")),
+            && coworker.is_shared() == (opt_str(raw, "visibility") == Some("org"))
+            // `source` arrives with the per-Bot door (the contract proposed 2026-09-30, Part A,
+            // not yet recorded: REST_FIELDS_NOT_RECORDED_YET), and every recording from before it
+            // has none, a server that keeps no door per Bot. Once sent, `null` is the account's
+            // door, and a word is kept as sent, one this app has not heard of included.
+            && coworker.source == door_as_sent(raw),
         "a coworker came through changed: {coworker:?}"
     );
     Ok(())
+}
+
+/// A row's `source` as this app is held to read it, stated here rather than borrowed from the
+/// client: missing, a server that keeps no door per Bot; `null`, the account's door; a word, the
+/// Bot's own, or kept as sent where this app has not heard of it; anything else kept as its text.
+fn door_as_sent(raw: &Value) -> CoworkerSource {
+    match raw.get("source") {
+        None => CoworkerSource::NotKept,
+        Some(Value::Null) => CoworkerSource::AccountDefault,
+        Some(Value::String(word)) => match word.as_str() {
+            "gateway" => CoworkerSource::Kind(InferenceKind::Gateway),
+            "local_proxy" => CoworkerSource::Kind(InferenceKind::LocalProxy),
+            other => CoworkerSource::Unknown(other.to_string()),
+        },
+        Some(other) => CoworkerSource::Unknown(other.to_string()),
+    }
 }
 
 fn coworkers(_: u16, body: &Value) -> Check {
@@ -4628,6 +4680,52 @@ fn every_route_asked_ahead_of_its_recording_is_asked_and_not_recorded_yet() {
     assert!(problems.is_empty(), "{}", problems.join("\n"));
 }
 
+/// The keys this app reads ahead of their recordings on recorded routes
+/// ([`REST_FIELDS_NOT_RECORDED_YET`]) are on routes the corpus records and this app reads, each
+/// saying what brings it, and no recorded body of the route carries the key yet. Once one does,
+/// the entry has gone stale: the reading already waiting for it reads the recording, and the
+/// entry leaves the list.
+#[test]
+fn every_key_asked_ahead_of_its_recording_is_read_and_not_recorded_yet() {
+    let corpus = Corpus::load();
+    let mut problems = Vec::new();
+    for (route, key, why) in REST_FIELDS_NOT_RECORDED_YET {
+        let fixtures: Vec<&Value> = corpus
+            .bodies
+            .iter()
+            .filter(|(file, _)| file.split('/').nth(1) == Some(*route))
+            .map(|(_, fixture)| fixture)
+            .collect();
+        if fixtures.is_empty() {
+            problems.push(format!(
+                "the corpus does not record {route} at all: it is owed a reading in \
+                 REST_NOT_RECORDED_YET, not a key in REST_FIELDS_NOT_RECORDED_YET"
+            ));
+        }
+        if !REST_ROUTES.iter().any(|(dir, _)| dir == route) {
+            problems.push(format!(
+                "{route} has no reading in REST_ROUTES to read its {key:?} with"
+            ));
+        }
+        if why.trim().is_empty() {
+            problems.push(format!(
+                "REST_FIELDS_NOT_RECORDED_YET does not say what brings {route}'s {key:?}"
+            ));
+        }
+        let carried = fixtures.iter().any(|fixture| match &fixture["body"] {
+            Value::Array(rows) => rows.iter().any(|row| row.get(*key).is_some()),
+            body => body.get(*key).is_some(),
+        });
+        if carried {
+            problems.push(format!(
+                "the corpus records {key:?} on {route} now: take it off \
+                 REST_FIELDS_NOT_RECORDED_YET"
+            ));
+        }
+    }
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
+}
+
 /// Every type and name the server sends has a fixture, or the manifest lists it as unrecorded:
 /// no test exercises it yet.
 #[test]
@@ -5449,6 +5547,64 @@ fn every_recorded_setting_is_from_a_server_that_knows_the_relay() {
         read += 1;
     }
     assert!(read > 0, "the recording holds the account's setting");
+}
+
+/// A Bot's door, read beyond the recording in the shape proposed for opengrok-server's Part A
+/// (2026-09-30, not yet recorded): the roster's rows and a patch's answer with `source` as each of
+/// its words, `null`, a word this app has not heard of, and missing, each read as sent, and a row
+/// whose parse lost its door caught; and the patch's 400 for a Bot left on the person's plan with
+/// a model the allowlist does not take, read as the server's sentence.
+#[test]
+fn a_bots_door_is_read_beyond_the_recording() {
+    use serde_json::json;
+    let row = |id: &str, source: Option<Value>| {
+        let mut row = json!({
+            "id": id, "name": "Ada", "model": "gpt-6-luna", "role": null, "title": null,
+            "avatarShape": null, "avatarColor": null, "updatedAtMs": 10,
+            "hiddenFromSidebar": false, "boxId": null, "effort": "medium", "visibility": "private"
+        });
+        if let Some(source) = source {
+            row["source"] = source;
+        }
+        row
+    };
+    let roster = json!([
+        row("cw_plan", Some(json!("local_proxy"))),
+        row("cw_keys", Some(json!("gateway"))),
+        row("cw_default", Some(Value::Null)),
+        row("cw_odd", Some(json!("byok"))),
+        row("cw_old", None),
+    ]);
+    read_fixture(
+        "GET__coworkers",
+        &json!({"method": "GET", "path": "/coworkers", "status": 200, "body": roster}),
+    )
+    .unwrap_or_else(|why| panic!("{why}"));
+    let answered = row("cw_plan", Some(json!("local_proxy")));
+    read_fixture(
+        "PATCH__coworkers__coworker_id_",
+        &json!({
+            "method": "PATCH", "path": "/coworkers/cw_plan", "status": 200,
+            "body": answered.clone()
+        }),
+    )
+    .unwrap_or_else(|why| panic!("{why}"));
+    let mut lost: Coworker = serde_json::from_value(answered.clone()).unwrap();
+    lost.source = CoworkerSource::AccountDefault;
+    assert!(
+        coworker_matches(&lost, &answered).is_err(),
+        "a row whose door the parse lost would not pass"
+    );
+    let said = "model: \"oag/cheap\" is not a model this server knows to be OpenAI's or xAI's, \
+                and only theirs may use your own subscription";
+    read_fixture(
+        "PATCH__coworkers__coworker_id_",
+        &json!({
+            "method": "PATCH", "path": "/coworkers/cw_plan", "status": 400,
+            "body": {"error": said}
+        }),
+    )
+    .unwrap_or_else(|why| panic!("{said}: {why}"));
 }
 
 /// The reply source's reading, fed bodies beyond the ones the server's recording holds: the read and

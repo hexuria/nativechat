@@ -12017,6 +12017,15 @@ impl AppState {
         ))
     }
 
+    /// The server keeps a door per Bot: some row of the roster carries `source` (the contract
+    /// proposed 2026-09-30, Part A, not yet recorded). Settings → Reply source is then the
+    /// default for the Bots that have picked none, and says so.
+    pub fn server_keeps_bot_doors(&self) -> bool {
+        self.coworkers
+            .iter()
+            .any(|bot| bot.source != CoworkerSource::NotKept)
+    }
+
     /// Open the picker's popover in one place, or shut it. Opening one shuts the other, and the
     /// avatar editor, which shares the settings pane with the card; and a popover opens on its
     /// controls, not on the list it was last left at.

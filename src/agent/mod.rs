@@ -152,14 +152,38 @@
 //! attached, though it can always be detached. The Tools card's switches and these are apart:
 //! neither waits on the other.
 //!
-//! In the bot's settings: `agent-effort` (a menu; value = the effort word it shows, state
-//! `unsaved` while that is a pick Save has not sent; disabled and reading `inherit` from a server
-//! that keeps no effort, one from before opengrok-server#271) with one `agent-effort-{word}` per
-//! choice (`inherit`, `low`, `medium`, `high`, `max`, and the word the bot already has when it is
-//! none of those, e.g. `xhigh`; label as the menu reads it, state `selected` on the one shown). A
-//! click on a choice picks it, as the menu does, and `agent-save` sends it with the rest of the
-//! pane, as the Save button does. `agent-settings-error` is the pane's red line over Save: a
-//! refused Save, in the server's words.
+//! The Bot's model picker, one control in two places: `model-chip`, the composer's chip, in the
+//! tree while a Bot is open and the composer is not dictating, and `agent-model-card`, the Model
+//! card in the Bot's settings. Each is a button named as the chip reads (`GPT-6 Luna · Medium
+//! ⚡`) and valued by the model the Bot's next turn runs on, with its door's wire word as a state
+//! (`gateway` / `local_proxy`), `fast` while ⚡ is on, and `expanded` while its popover is open; a
+//! click opens or shuts the popover, the card's only while the settings are open. The popover,
+//! `model-pop`, visible while open, holds `model-fast` (a switch, checked while on; dead, with why
+//! as its value, where the list holds no fast version of the model or the account's plan model
+//! answers for every Bot), `model-effort` (a slider named as the effort reads, `Light` … `Ultra`
+//! or `Default`, and valued by the server's word; `set_value` takes `low`, `medium`, `high`,
+//! `xhigh` or `max`; dead from a server that keeps no effort, one from before
+//! opengrok-server#271), `model-open-list` (named by the model; it opens the list) and
+//! `model-reset` (↺: Default effort and ⚡ off, the model left alone; live while there is
+//! something to put back). While the list shows, those give way to `model-open-list` as the
+//! heading back (state `expanded`) and to the rows of `model-list` (always in the tree, valued by
+//! how many models it offers): a `model-row-{source}-{id}` per model, by its door's wire word and
+//! the id a pick pins with ⚡ off (valued by its door's word, state `selected` on the one that
+//! answers and `fast` where the list holds its fast twin; a click puts the Bot on it, fast where
+//! ⚡ is on and it has a twin, and goes back to the controls), `model-plan` (on a server whose
+//! rows carry no `source`, while the account is on the person's plan: the account's plan model,
+//! which answers for every Bot there; a line, not a row) and `model-note` (the server's word on
+//! why the list is not fuller). `model-error` is the server's words for the last change it
+//! refused. Every change is saved on the Bot at once, `source`, `model` and `effort` on
+//! `PATCH /coworkers/{id}` (the contract proposed 2026-09-30, opengrok-server Part A, not yet
+//! recorded). The card's parts are the chip's with `agent-` before them: `agent-model-pop`,
+//! `agent-model-fast`, `agent-model-effort`, `agent-model-open-list`, `agent-model-reset`,
+//! `agent-model-list`, `agent-model-row-{source}-{id}`, `agent-model-plan`, `agent-model-note`
+//! and `agent-model-error`. Invoke `model.picker`, `model.picker.open` and `model.picker.close`
+//! work the card's popover, and a click on `agent-model-dismiss` shuts whichever is open.
+//!
+//! In the bot's settings: `agent-settings-error` is the pane's red line over Save: a refused Save
+//! or pick, in the server's words.
 //!
 //! Connections (#2), a connection named by the server's id and a service by the name
 //! `GET /connectors` lists it under. Only the person's own connections are on either surface: a
@@ -253,15 +277,9 @@
 //! (while a key is kept: `Remove key`, or `Keep key` with state `picked`). The address and key are
 //! kept on this Mac by Save, the key in the Keychain, and never sent to the server.
 //!
-//! `composer-reply-source` is the composer's chip, in the tree only while there is a choice of
-//! door and the composer is not dictating (label `Server` / `My plan` / `My plan · via Mac`,
-//! value = the door the next turns go through, which each of them names; state `picked` while
-//! that is the person's pick and not the account's own door, `via-mac` on the Mac's). Unlike the
-//! composer's panel and chips it is clicked, as a person clicks it: a click moves to the next
-//! door, round to the first after the last, which then goes with every turn until it is
-//! switched back, and is gone with a sign-out or a relaunch. `reply-source-{messageId}` is the
-//! badge of each reply in the open thread that wears one, as the feed draws it (label `paid key`
-//! / `your plan` / `your plan · Mac`, value = the door, state `via-mac` on one the person's Mac
+//! `reply-source-{messageId}` is the badge of each reply in the open thread that wears one, as the
+//! feed draws it (label `paid key` / `your plan` / `your plan · Mac`, with ` ⚡` after it where the
+//! model that answered is a fast twin; value = the door, state `via-mac` on one the person's Mac
 //! answered), holding `reply-source-model-{messageId}` (label = the model
 //! the server named, which the badge shows on hover) when it named one. A reply whose run
 //! ended because the person's Mac could not answer (a relay `RUN_ERROR` code) keeps its line, and
@@ -269,10 +287,9 @@
 //! reply on Server instead`): a click sends the same turn again on the server's paid keys, this
 //! once, as `retry-turn` does for a turn that never left. Under `composer-queued`, a
 //! `queued-waiting-{messageId}` (`Waiting for your Mac`) for each held message the server holds
-//! for the person's Mac (`heldFor: "relay_offline"`). In the bot's settings,
-//! while the account's door or the chip is on the person's plan, `agent-model-plan` (under the
-//! Model field: the plan's model answers, not the pin) and `agent-usage-plan` (the Usage card
-//! does not count those replies).
+//! for the person's Mac (`heldFor: "relay_offline"`). In the bot's settings, while the Bot's
+//! replies go through the person's plan, its own door or the account's that it follows,
+//! `agent-usage-plan` (the Usage card does not count those replies).
 //!
 //! Named invokes (parity / gpui-agent): `UserFormContinue`, `UserFormDismiss`,
 //! `UserFormOpenScreen`, `UserFormUseSaved`, `UserFormClearSaved` (also kebab
