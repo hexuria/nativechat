@@ -12,13 +12,13 @@
 //! which door a reply came through.
 //!
 //! Every shape here is transcribed from the inference-source contract agreed with
-//! open-ai-gateway and opengrok-server (2026-09-30), server PR pending, and checked against the
-//! server's half as built (branch inference-source, e04eb97): the routes in
-//! `crates/opengrok-server/src/inference.rs`, what a Save does and what a read answers
-//! (`apply`, `described`, `loopback_base`) in `crates/opengrok-harness/src/local_proxy.rs`, and
-//! the door's words and the forbidden providers in `crates/opengrok-core/src/inference.rs`. The
-//! server's recording has not reached `fixtures/wire/`, so the conformance ledger owes the two
-//! routes and the CUSTOM name their readings until it does.
+//! open-ai-gateway and opengrok-server (2026-09-30), and checked against the server's half as
+//! built in opengrok-server #294: the routes in `crates/opengrok-server/src/inference.rs`, what a
+//! Save does and what a read answers (`apply`, `described`, `loopback_base`) in
+//! `crates/opengrok-harness/src/local_proxy.rs`, and the door's words and the forbidden
+//! providers in `crates/opengrok-core/src/inference.rs`. The conformance ledger reads the two
+//! routes and the CUSTOM frame against the server's recording, vendored in `fixtures/wire/` from
+//! its main at d16b10e (pin 7d6e3d0).
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;

@@ -182,8 +182,8 @@ pub struct ThreadListing {
 pub struct ModelEntry {
     pub id: String,
     /// Which door serves it, `gateway` or `local_proxy` (the inference-source contract agreed
-    /// with open-ai-gateway and opengrok-server, 2026-09-30, server PR pending: `list_models` in
-    /// `crates/opengrok-server/src/agui/routes.rs`, `listed` in
+    /// with open-ai-gateway and opengrok-server, 2026-09-30, built in opengrok-server #294:
+    /// `list_models` in `crates/opengrok-server/src/agui/routes.rs`, `listed` in
     /// `crates/opengrok-harness/src/local_proxy.rs`): a `local_proxy` entry is one of
     /// opencodex's models, as the server lists them for the person's own subscription. Kept as
     /// the word the server sent and read through [`Self::source`].
@@ -218,7 +218,7 @@ pub struct ModelCatalogue {
     /// Whether opencodex answered the server as it listed these, `"localProxy": {"healthy"}`:
     /// there whenever the account keeps a proxy address, whatever its reply source, and absent
     /// while it keeps none (the inference-source contract agreed with opengrok-server
-    /// 2026-09-30, server PR pending: `list_models` in
+    /// 2026-09-30, built in its #294: `list_models` in
     /// `crates/opengrok-server/src/agui/routes.rs`, `listed` in
     /// `crates/opengrok-harness/src/local_proxy.rs`). A proxy that is down lists nothing, and
     /// this is how that reads apart from a plan with nothing to offer. One this app cannot read

@@ -54,9 +54,9 @@ pub struct PendingUserMessage {
     /// setting decides, which is not the row's to say. The server keeps it from the write that
     /// queued the send (`inferenceSource`, the word `forwardedProps.inferenceSource` is on a live
     /// turn) and honours it with the turn's precedence when the row drains, here or on another
-    /// machine. Agreed with opengrok-server 2026-09-30, server PR pending (`message_json`,
+    /// machine. Agreed with opengrok-server 2026-09-30 and built in its #294 (`message_json`,
     /// `WriteBody` and `consume_for_turn` in `crates/opengrok-server/src/agui/pending.rs`, the
-    /// column in `crates/opengrok-store/src/pending.rs`). Kept as the word sent and read through
+    /// column in `crates/opengrok-store/src/pending.rs`), whose recording the ledger reads. Kept as the word sent and read through
     /// [`Self::inference_source`], so one row's word never fails the queue.
     #[serde(default)]
     pub inference_source: Option<String>,
@@ -228,8 +228,8 @@ pub struct PendingWrite {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub skill_id: Option<String>,
     /// The door the send was queued with, as the composer's chip showed it: the row's
-    /// `inferenceSource` (agreed with opengrok-server 2026-09-30, server PR pending;
-    /// `WriteBody.inference_source` in `crates/opengrok-server/src/agui/pending.rs`). An edit
+    /// `inferenceSource` (opengrok-server #294: `WriteBody.inference_source` in
+    /// `crates/opengrok-server/src/agui/pending.rs`). An edit
     /// carries it too, so the row matches the hold whichever machine queued it. Left out when no
     /// chip was drawn: the account's setting decides then, and an edit that leaves it out keeps
     /// the row's.

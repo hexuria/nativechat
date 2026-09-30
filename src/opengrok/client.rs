@@ -834,8 +834,9 @@ impl OpenGrokClient {
 
     /// `GET /account/inference-source` — where the account's replies are paid from: the server's
     /// paid keys, or the person's own subscription through opencodex (the inference-source
-    /// contract agreed with open-ai-gateway and opengrok-server, 2026-09-30, server PR pending:
-    /// `get_source` in `crates/opengrok-server/src/inference.rs`, answered by `described` in
+    /// contract agreed with open-ai-gateway and opengrok-server, 2026-09-30, built in
+    /// opengrok-server #294: `get_source` in `crates/opengrok-server/src/inference.rs`, answered
+    /// by `described` in
     /// `crates/opengrok-harness/src/local_proxy.rs`). A signed-in account always gets a 200, the
     /// default `{"kind": "gateway", ...}` until it has saved one. A server from before the route
     /// answers a bare 404, which the caller reads as a server that cannot switch. Given
@@ -927,7 +928,8 @@ impl OpenGrokClient {
     /// `forwardedProps.inferenceSource` and wins over the account's setting for this turn only,
     /// so the turn goes where the chip said even when the setting has moved since it was read
     /// (the inference-source contract agreed with open-ai-gateway and opengrok-server,
-    /// 2026-09-30, server PR pending: `named` in `crates/opengrok-server/src/inference.rs`,
+    /// 2026-09-30, built in opengrok-server #294: `named` in
+    /// `crates/opengrok-server/src/inference.rs`,
     /// `route` in `crates/opengrok-harness/src/local_proxy.rs`). Absent, with no chip drawn,
     /// the account's setting decides, and the turn is the one sent before reply sources existed.
     ///
@@ -5359,8 +5361,8 @@ mod tests {
     }
 
     /// The queue's four routes as the v1 contract writes them. A send queued while the
-    /// composer's chip showed a door carries it (`inferenceSource`, agreed with opengrok-server
-    /// 2026-09-30, server PR pending), and the row the server answers with names it back.
+    /// composer's chip showed a door carries it (`inferenceSource`, opengrok-server #294), and
+    /// the row the server answers with names it back.
     #[tokio::test]
     async fn enqueue_edit_cancel_and_list_pending_follow_the_v1_contract() {
         let server = MockServer::start().await;
