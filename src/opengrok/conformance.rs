@@ -33,7 +33,8 @@
 //!   it; and a key read ahead of its recording on a route the corpus does record waits in
 //!   [`REST_FIELDS_NOT_RECORDED_YET`] until a recorded body of the route carries it;
 //! - the ledger, every wire word this app branches on, is either a word the manifest says the
-//!   server sends, excused in [`NOT_SENT_BY_SERVER`] with the evidence, or read ahead of the
+//!   server sends (a `RUN_ERROR`'s code, which the manifest does not list, one a recorded frame
+//!   carries), excused in [`NOT_SENT_BY_SERVER`] with the evidence, or read ahead of the
 //!   server's recording in [`WORDS_NOT_RECORDED_YET`], which says what brings it;
 //! - every word the server sends is either in the ledger or excused in [`CLIENT_IGNORES`], so a
 //!   name the server starts sending fails here before a person finds it missing on screen;
@@ -69,7 +70,7 @@ use super::gen_ui::{
     is_ui_tool,
 };
 use super::inference::{
-    INFERENCE_SOURCE_CUSTOM, InferenceKind, InferenceSource, RelayErrorCode, TurnSource, Via,
+    INFERENCE_SOURCE_CUSTOM, InferenceKind, InferenceSource, RunErrorCode, TurnSource, Via,
     is_subscription_model,
 };
 use super::pending::{
@@ -105,14 +106,17 @@ enum Slot {
     ApprovalReason,
     /// `formResolution` on a settled user-form card.
     FormResolution,
+    /// `code` on a `RUN_ERROR`, beside its sentence.
+    RunErrorCode,
 }
 
 impl Slot {
-    const ALL: [Slot; 4] = [
+    const ALL: [Slot; 5] = [
         Slot::AguiType,
         Slot::CustomName,
         Slot::ApprovalReason,
         Slot::FormResolution,
+        Slot::RunErrorCode,
     ];
 
     fn field(self) -> &'static str {
@@ -121,6 +125,7 @@ impl Slot {
             Slot::CustomName => "CUSTOM name",
             Slot::ApprovalReason => "approval reason",
             Slot::FormResolution => "formResolution",
+            Slot::RunErrorCode => "RUN_ERROR code",
         }
     }
 }
@@ -231,6 +236,13 @@ fn ledger() -> Vec<(Slot, &'static str)> {
         FORM_RESOLUTION_WORDS
             .iter()
             .map(|(word, _)| (Slot::FormResolution, *word)),
+    );
+    // `RunErrorCode::from_code` reads a `RUN_ERROR`'s code, live and in a replay, and every code
+    // it reads offers the turn again on the server's keys.
+    words.extend(
+        RunErrorCode::ALL
+            .iter()
+            .map(|code| (Slot::RunErrorCode, code.word())),
     );
     words
 }
@@ -481,7 +493,16 @@ const CLIENT_IGNORES: &[(Slot, &str, &str)] = &[
 /// arm waiting for them in [`check_frame`];
 /// [`every_word_read_ahead_of_its_recording_is_matched_and_not_sent_yet`] fails until it does,
 /// and meanwhile holds that arm to the frames [`frames_read_ahead`] writes in the agreed shape.
-const WORDS_NOT_RECORDED_YET: &[(Slot, &str, &str)] = &[];
+const WORDS_NOT_RECORDED_YET: &[(Slot, &str, &str)] = &[(
+    Slot::RunErrorCode,
+    "plan_unavailable",
+    "opengrok-server #304, agreed 2026-09-30, not yet recorded. A turn refused for the person's \
+     own setting ends with this code beside its sentence, journaled like the relay's codes: a \
+     teammate with no proxy on a shared Bot on the plan, or a proxy turn with no address or no \
+     model stored. A reply source that could not be read is refused with no code. The reply's \
+     line offers the turn again on the server's keys, live and in a replay \
+     (`RunErrorCode::PlanUnavailable`). The PR's recording brings its frames.",
+)];
 
 /// Fixtures this app still reads wrongly, with the words their check fails with and why. The
 /// check has to fail with those words: one that passes means the drift is fixed and the entry
@@ -655,6 +676,11 @@ struct Emits {
     custom_names: Vec<String>,
     approval_reasons: Vec<String>,
     form_resolutions: Vec<String>,
+    /// Not the manifest's, which lists no codes: the codes the recording's `RUN_ERROR` frames
+    /// carry, read off the frames by [`Corpus::load`]. A code is sent once a recorded frame
+    /// carries it.
+    #[serde(skip)]
+    run_error_codes: Vec<String>,
 }
 
 impl Emits {
@@ -664,6 +690,7 @@ impl Emits {
             Slot::CustomName => &self.custom_names,
             Slot::ApprovalReason => &self.approval_reasons,
             Slot::FormResolution => &self.form_resolutions,
+            Slot::RunErrorCode => &self.run_error_codes,
         }
     }
 }
@@ -688,20 +715,26 @@ struct Corpus {
 impl Corpus {
     fn load() -> Self {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join(CORPUS);
-        let manifest: Manifest = serde_json::from_value(read_json(&root, "MANIFEST.json"))
+        let mut manifest: Manifest = serde_json::from_value(read_json(&root, "MANIFEST.json"))
             .unwrap_or_else(|error| {
                 panic!(
                     "{CORPUS}/MANIFEST.json is not #255's manifest with emits.approval_reasons \
                      and emits.form_resolutions beside the types and names: {error}"
                 )
             });
-        let frames = json_files(&root, "agui")
+        let frames: BTreeMap<String, Value> = json_files(&root, "agui")
             .into_iter()
             .map(|file| {
                 let frame = read_json(&root, &file);
                 (file, frame)
             })
             .collect();
+        let codes: BTreeSet<&str> = frames
+            .values()
+            .filter(|frame| str_at(frame, "type") == "RUN_ERROR")
+            .filter_map(|frame| opt_str(frame, "code"))
+            .collect();
+        manifest.emits.run_error_codes = codes.into_iter().map(str::to_string).collect();
         let bodies = json_files(&root, "rest")
             .into_iter()
             .map(|file| {
@@ -975,9 +1008,10 @@ fn run_ended(corpus: &Corpus, frame: &Value) -> Check {
             "RUN_ERROR should end the turn with the server's sentence, got {said:?}"
         );
         // The turn's error as the live stream reads it (`run_turn`): the sentence, and beside it
-        // the code a run through the person's Mac ends with, which offers the turn again on the
-        // server's keys. A run that names no code offers nothing, and a code nothing here reads
-        // fails, so one the server starts sending is caught before a person misses its action.
+        // the code a run the person's plan could not answer ends with, which offers the turn
+        // again on the server's keys. A run that names no code offers nothing, and a code nothing
+        // here reads fails, so one the server starts sending is caught before a person misses
+        // its action.
         let error = OpenGrokClient::run_ended_badly(frame);
         let code = opt_str(frame, "code");
         must!(
@@ -986,29 +1020,35 @@ fn run_ended(corpus: &Corpus, frame: &Value) -> Check {
         );
         if let Some(code) = code {
             must!(
-                RELAY_RUN_ERROR_CODES.contains(&code),
+                RUN_ERROR_CODES.contains(&code),
                 "a run ends with the code {code:?}, which nothing here reads: read it, or say \
                  here why a person can be left without it"
             );
         }
-        let offered = error.code().and_then(RelayErrorCode::from_code);
+        let offered = error.code().and_then(RunErrorCode::from_code);
         must!(
             offered.is_some() == code.is_some(),
-            "a relay's code should offer the turn again on the server's keys, and only a relay's \
-             code: {offered:?} from {code:?}"
+            "a code on a RUN_ERROR should offer the turn again on the server's keys, and only \
+             such a code: {offered:?} from {code:?}"
         );
     }
     Ok(())
 }
 
-/// The codes a `RUN_ERROR` carries beside its sentence, which are the Mac relay's and nobody
-/// else's (opengrok-server main cad36fd (#303, after #298), pin 47a5d6b): `ModelError::Relay` in
-/// `crates/opengrok-harness/src/relay.rs`, stamped on the frame by
+/// The codes a `RUN_ERROR` carries beside its sentence, each for a turn the person's plan could
+/// not answer. The Mac relay's (opengrok-server main cad36fd (#303, after #298), pin 47a5d6b):
+/// `ModelError::Relay` in `crates/opengrok-harness/src/relay.rs`, stamped on the frame by
 /// `Projection::failing_with`. No Mac held the relay, the Mac started no answer or went quiet for
 /// the door's clock, or the Mac answered with a failure in its own words. A refusal of the Mac's
 /// own making, such as one Mac carrying all the calls it may at once, is `ModelError::Proxy`,
-/// with a sentence and no code.
-const RELAY_RUN_ERROR_CODES: &[&str] = &["relay_offline", "relay_timeout", "relay_failed"];
+/// with a sentence and no code. And `plan_unavailable`, read ahead of its recording
+/// ([`WORDS_NOT_RECORDED_YET`]): the person's own setting left the plan nothing to answer with.
+const RUN_ERROR_CODES: &[&str] = &[
+    "relay_offline",
+    "relay_timeout",
+    "relay_failed",
+    "plan_unavailable",
+];
 
 /// A message's opening paints nothing, and says whose words follow. The coworker's is it writing.
 /// The person's, which a replay opens each run with right after `RUN_STARTED` (opengrok-server
@@ -5348,7 +5388,53 @@ fn a_coworker_rows_effort_has_a_reading_in_the_ledger() {
 /// holds every entry of [`WORDS_NOT_RECORDED_YET`] to these, so a word added there comes with
 /// its frames here, and leaves with it when the recording brings the real ones.
 #[allow(clippy::type_complexity)]
-const FRAMES_READ_AHEAD: &[(Slot, &str, fn() -> Vec<(Value, bool)>)] = &[];
+const FRAMES_READ_AHEAD: &[(Slot, &str, fn() -> Vec<(Value, bool)>)] = &[(
+    Slot::RunErrorCode,
+    "plan_unavailable",
+    plan_unavailable_frames,
+)];
+
+/// A turn refused for the person's own setting, in the shape agreed for opengrok-server #304 (not
+/// yet recorded): the server's sentence for each refusal the code is for, with `code:
+/// "plan_unavailable"` beside it as the relay's codes sit, each read as the turn's error with
+/// the code that offers it again on the server's keys; and the code misspelt, which nothing here
+/// reads.
+fn plan_unavailable_frames() -> Vec<(Value, bool)> {
+    let frame = |message: &str, code: &str| {
+        serde_json::json!({
+            "type": "RUN_ERROR",
+            "threadId": "thr-0199bb4e000070008000000000000001",
+            "runId": "0199bb4e-0000-7000-8000-000000000002",
+            "message": message,
+            "code": code
+        })
+    };
+    let no_proxy = "You chose your own subscription, but no proxy address is set; set one in \
+                    your inference source (like http://127.0.0.1:8080), or switch this turn to \
+                    the gateway.";
+    vec![
+        (frame(no_proxy, "plan_unavailable"), true),
+        (
+            frame(
+                "Choose a model for your own subscription first: your inference source names \
+                 none, so the turn was not sent. Pick one your proxy serves, or switch this turn \
+                 to the gateway.",
+                "plan_unavailable",
+            ),
+            true,
+        ),
+        (
+            frame(
+                "Choose a model for your Mac first: your inference source names none for it, so \
+                 the turn was not sent. Pick one your Mac's opencodex serves, or switch this \
+                 turn to the gateway.",
+                "plan_unavailable",
+            ),
+            true,
+        ),
+        (frame(no_proxy, "plan-unavailable"), false),
+    ]
+}
 
 /// [`FRAMES_READ_AHEAD`]'s frames for one word, none when it has none.
 fn frames_read_ahead(slot: Slot, word: &str) -> Vec<(Value, bool)> {

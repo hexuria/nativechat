@@ -37,8 +37,8 @@ pub use gen_ui::{
 };
 pub use inference::{
     DEFAULT_PROXY_URL, HELD_FOR_RELAY_OFFLINE, INFERENCE_SOURCE_CUSTOM, InferenceKind,
-    InferenceSource, InferenceSourceUpdate, ProxyKey, RelayErrorCode, RelayRead, RelayUpdate,
-    ReplySource, TurnSource, Via, is_loopback, is_subscription_model,
+    InferenceSource, InferenceSourceUpdate, ProxyKey, RelayRead, RelayUpdate, ReplySource,
+    RunErrorCode, TurnSource, Via, is_loopback, is_subscription_model,
 };
 pub use local_exec::{
     Enrolment, MachineCredential, enrol_this_machine, serve_local_exec, stored_machine_id,

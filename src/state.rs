@@ -19,8 +19,8 @@ use crate::opengrok::{
     ModelEntry, ModelPick, NewSchedule, NewSkill, OpenGrokClient, OpenGrokError, PendingCustom,
     PendingOp, PendingUserMessage, PendingWrite, ProfileUpdate, ProxyKey, QueuedApproval,
     RecipeDetail, RecipeKind, RecipeParameter, RecipeRun, RecipeRunResult, RecipeShareTarget,
-    RecipeStep, RecipeSummary, RelayErrorCode, RelayHandle, RelayKey, RelayReport, RelayStatus,
-    RelayTarget, RelayTimings, RelayUpdate, ReplyQuote, ReplySource, RunCause, RunRecipeResponse,
+    RecipeStep, RecipeSummary, RelayHandle, RelayKey, RelayReport, RelayStatus, RelayTarget,
+    RelayTimings, RelayUpdate, ReplyQuote, ReplySource, RunCause, RunErrorCode, RunRecipeResponse,
     RunReplay, SKILL_BODY_CHARS, SKILL_BUNDLE_FILES, SKILL_BUNDLE_LIMIT, SaveLoginSpec,
     ScheduleEdit, ScheduleKind, ScheduleRow, ScheduleRun, ScheduleRunStatus, ScreenshotSpec,
     SkillDetail, SkillFile, SkillPatch, SkillSource, SkillSummary, ThreadListing, ThreadReplay,
@@ -3165,8 +3165,8 @@ struct RecoveredReply {
     run_timing: Option<TurnTiming>,
     /// Which door the reply came through, when the journal carried its CUSTOM.
     reply_source: Option<ReplySource>,
-    /// The run ended because the person's Mac could not answer, and why.
-    relay_failure: Option<RelayErrorCode>,
+    /// The run ended because the person's plan could not answer, and why.
+    plan_failure: Option<RunErrorCode>,
 }
 
 /// Something the person said that a replay brought back and this thread does not hold.
@@ -3239,7 +3239,7 @@ fn missing_replies(messages: &[Message], runs: &[ThreadRun]) -> Vec<RecoveredRep
                 finished_at: recovered_finished_at(run),
                 run_timing: TurnTiming::from_events(&run.events),
                 reply_source,
-                relay_failure: relay_failure_of(&run.events),
+                plan_failure: plan_failure_of(&run.events),
             })
         })
         .collect()
@@ -3576,18 +3576,19 @@ fn replayed_ending(
     }
 }
 
-/// Why a run through the person's Mac ended, when its journal says one did: the code on its
-/// `RUN_ERROR` (opengrok-server #292: server main cad36fd (#303, after #298), pin 47a5d6b), for a
-/// replay to offer the turn again on the server's keys as the live
-/// stream does.
-fn relay_failure_of(events: &[serde_json::Value]) -> Option<RelayErrorCode> {
+/// Why the person's plan could not answer a run, when its journal says so: the code on its
+/// `RUN_ERROR` ([`RunErrorCode`]), journaled with it for the relay's (opengrok-server #292: server
+/// main cad36fd (#303, after #298), pin 47a5d6b) and for `plan_unavailable` (#304, agreed
+/// 2026-09-30, not yet recorded), for a replay to offer the turn again on the server's keys as
+/// the live stream does.
+fn plan_failure_of(events: &[serde_json::Value]) -> Option<RunErrorCode> {
     events
         .iter()
         .rev()
         .find(|event| event.get("type").and_then(serde_json::Value::as_str) == Some("RUN_ERROR"))
         .and_then(|event| event.get("code"))
         .and_then(serde_json::Value::as_str)
-        .and_then(RelayErrorCode::from_code)
+        .and_then(RunErrorCode::from_code)
 }
 
 /// A time as a row carries it. Rows written before times were kept to the millisecond have
@@ -4907,10 +4908,10 @@ pub struct AppState {
     /// Where the key for this Mac's opencodex is kept: the Keychain, once the app is configured,
     /// and memory before that and in tests.
     relay_keys: Arc<dyn RelayKeyStore>,
-    /// Replies whose run ended because the person's Mac could not answer (a relay `RUN_ERROR`'s
-    /// `code`), by the reply's message id: the thread's last one offers the turn again on the
-    /// server's keys ([`Self::send_on_server`]).
-    relay_failures: HashMap<String, RelayErrorCode>,
+    /// Replies whose run ended because the person's plan could not answer (a `RUN_ERROR`'s
+    /// `code`: the relay's, or `plan_unavailable`), by the reply's message id: the thread's last
+    /// one offers the turn again on the server's keys ([`Self::send_on_server`]).
+    plan_failures: HashMap<String, RunErrorCode>,
     /// Everything the open Bot could be offered and which of it it may be, as its Tools card's
     /// switches show it (opengrok-server#268): the Bot's id and the answer, like
     /// [`Self::coworker_tools`]. Drawn through [`Self::ceiling_card`].
@@ -5493,7 +5494,7 @@ impl AppState {
             relay_starting: None,
             relay_generation: 0,
             relay_keys: Arc::new(crate::relay_key::MemoryKeyStore::default()),
-            relay_failures: HashMap::new(),
+            plan_failures: HashMap::new(),
             coworker_ceiling: None,
             ceiling_generation: 0,
             ceiling_reading: None,
@@ -6571,7 +6572,7 @@ impl AppState {
         // theirs, and is read again for whoever signs in next.
         self.stop_relay();
         self.relay_mac.on = false;
-        self.relay_failures.clear();
+        self.plan_failures.clear();
         self.composer_dictating = false;
         // And any list of models still being asked for was asked as them, and the plan's models
         // listed were their plan's: the gateway's routes are the deployment's and stay.
@@ -8127,6 +8128,21 @@ impl AppState {
         match drained {
             Some(held) => held.inference_source,
             None => self.turn_source_for_send(),
+        }
+    }
+
+    /// The door a turn names as it leaves. One sent again on the server's keys (`on_server`,
+    /// [`Self::send_on_server`]) names them, whatever the Bot's door and the account's, and the
+    /// server lets a turn's own pick win over both for that turn (`local_proxy::route` in
+    /// opengrok-server's `crates/opengrok-harness/src/local_proxy.rs`, PR #304, bot-model-source
+    /// 0ae9f2a). Any other turn names [`Self::turn_inference_source`]'s. Since the composer's
+    /// chip picks the Bot's model and no longer the turn's door, this is the one way a single
+    /// turn goes through another door than the Bot's.
+    fn turn_door(&self, drained: Option<&QueuedSend>, on_server: bool) -> Option<TurnSource> {
+        if on_server {
+            Some(TurnSource::GATEWAY)
+        } else {
+            self.turn_inference_source(drained)
         }
     }
 
@@ -13309,7 +13325,7 @@ impl AppState {
                 return;
             };
             let grafted_id = graft_reply(&mut conversation.messages, &reply);
-            self.note_relay_failure(&grafted_id, reply.relay_failure);
+            self.note_plan_failure(&grafted_id, reply.plan_failure);
             let message_id = grafted_id.clone();
             if reply.live {
                 // Whatever stopped watching this run, the run did not stop. Registering it makes
@@ -13580,7 +13596,7 @@ impl AppState {
         // A row this turn already has takes the badge now; one written later takes it from the
         // bubble.
         self.persist_replayed_badges(conversation_id, badge.into_iter().collect(), cx);
-        self.note_relay_failure(&turn.message_id, relay_failure_of(&replay.events));
+        self.note_plan_failure(&turn.message_id, plan_failure_of(&replay.events));
         if let Some(shot) = parts.iter().rev().find_map(|part| match part {
             ChatPart::Screenshot(spec) => Some(spec.clone()),
             _ => None,
@@ -13944,7 +13960,7 @@ impl AppState {
     /// `recipe` and `skill` are what the message was typed with. `stop_first` is a run this turn
     /// replaces: it is stopped on the wire before the turn is posted. `drained` is the hold this
     /// turn is firing, when it came off `queued_sends`. `on_server` sends it on the server's paid
-    /// keys whatever the Bot's door: the turn the person's Mac could not answer, sent again.
+    /// keys whatever the Bot's door: the turn the person's plan could not answer, sent again.
     #[allow(clippy::too_many_arguments)]
     fn send_opengrok_turn_with(
         &mut self,
@@ -13975,13 +13991,8 @@ impl AppState {
         let pending_id = drained.as_ref().and_then(|held| held.pending_id.clone());
         let queued_message_id = drained.as_ref().map(|held| held.message_id.clone());
         // The Bot's door as the turn leaves, or for a held send the one it had when the message
-        // was sent: see `turn_inference_source`. A turn sent again on the server's keys names
-        // them.
-        let turn_source = if on_server {
-            Some(TurnSource::GATEWAY)
-        } else {
-            self.turn_inference_source(drained.as_ref())
-        };
+        // was sent, or the server's keys for a turn sent again on them: see `turn_door`.
+        let turn_source = self.turn_door(drained.as_ref(), on_server);
 
         // Both ids are minted here, before anything is sent. The run id because the server files
         // every frame under it and this is the app's only handle on the run once the stream is
@@ -14326,14 +14337,14 @@ impl AppState {
                     }
                 }
                 let parked = waiting_approval || waiting_user_form;
-                // A turn the person's Mac could not answer says why, and offers itself again on
+                // A turn the person's plan could not answer says why, and offers itself again on
                 // the server's keys.
-                let relay_failure = result
+                let plan_failure = result
                     .as_ref()
                     .err()
                     .and_then(OpenGrokError::code)
-                    .and_then(RelayErrorCode::from_code);
-                state.note_relay_failure(&reply_id, relay_failure);
+                    .and_then(RunErrorCode::from_code);
+                state.note_plan_failure(&reply_id, plan_failure);
                 let reply = (!parked)
                     .then(|| {
                         state
@@ -14476,23 +14487,24 @@ impl AppState {
         self.send_opengrok_turn(conversation_id, String::new(), cx);
     }
 
-    /// Keep, or let go, why a reply's run ended at the person's Mac.
-    fn note_relay_failure(&mut self, message_id: &str, failure: Option<RelayErrorCode>) {
+    /// Keep, or let go, why the person's plan could not answer a reply's run.
+    fn note_plan_failure(&mut self, message_id: &str, failure: Option<RunErrorCode>) {
         match failure {
             Some(code) => {
-                self.relay_failures.insert(message_id.to_string(), code);
+                self.plan_failures.insert(message_id.to_string(), code);
             }
             None => {
-                self.relay_failures.remove(message_id);
+                self.plan_failures.remove(message_id);
             }
         }
     }
 
-    /// The row of the open thread's last turn when the person's Mac could not answer it
-    /// (`relay_offline`, `relay_timeout`, `relay_failed`), if its last turn is one. Only the last,
-    /// as with Try again: an older one has messages after it, and sending it again would answer
-    /// the newest message rather than the one that went unanswered.
-    pub fn relay_failed_turn(&self) -> Option<String> {
+    /// The row of the open thread's last turn when the person's plan could not answer it, if its
+    /// last turn is one: their Mac could not (`relay_offline`, `relay_timeout`, `relay_failed`),
+    /// or their own setting left the plan nothing to answer with (`plan_unavailable`). Only the
+    /// last, as with Try again: an older one has messages after it, and sending it again would
+    /// answer the newest message rather than the one that went unanswered.
+    pub fn plan_failed_turn(&self) -> Option<String> {
         if self.is_turn_in_flight() || self.session.is_expired() {
             return None;
         }
@@ -14501,15 +14513,15 @@ impl AppState {
             .iter()
             .find(|c| Some(&c.id) == self.active_conversation_id.as_ref())?;
         let last = conversation.messages.iter().rev().find(|m| !m.hidden)?;
-        (!last.is_me && self.relay_failures.contains_key(&last.id)).then(|| last.id.clone())
+        (!last.is_me && self.plan_failures.contains_key(&last.id)).then(|| last.id.clone())
     }
 
-    /// Send this reply on Server instead: the turn the person's Mac could not answer, again, on
-    /// the server's paid keys, this once. The failed row goes and the turn runs from the thread
-    /// as it stands, as Try again's does; the person's message is not sent twice, and the Bot's
-    /// door is left where it was, for the turns after this one.
+    /// Send this reply on Server instead: the turn the person's plan could not answer, again, on
+    /// the server's paid keys, this once ([`Self::turn_door`]). The failed row goes and the turn
+    /// runs from the thread as it stands, as Try again's does; the person's message is not sent
+    /// twice, and the Bot's door is left where it was, for the turns after this one.
     pub fn send_on_server(&mut self, cx: &mut Context<Self>) {
-        let Some(message_id) = self.relay_failed_turn() else {
+        let Some(message_id) = self.plan_failed_turn() else {
             return;
         };
         let Some(conversation_id) = self.active_conversation_id.clone() else {
@@ -14522,7 +14534,7 @@ impl AppState {
         {
             conversation.messages.retain(|m| m.id != message_id);
         }
-        self.relay_failures.remove(&message_id);
+        self.plan_failures.remove(&message_id);
         let recipe = self.active_recipe.as_ref().map(ActiveRecipe::turn);
         self.send_opengrok_turn_with(
             conversation_id,
@@ -15076,12 +15088,12 @@ impl AppState {
                                         cx,
                                     );
                                 }
-                                // A run the person's Mac could not answer offers itself again on
+                                // A run the person's plan could not answer offers itself again on
                                 // the server's keys, followed as it is watched live.
                                 if let Some(painted) = painted.as_deref() {
-                                    state.note_relay_failure(
+                                    state.note_plan_failure(
                                         painted,
-                                        relay_failure_of(&replay.events),
+                                        plan_failure_of(&replay.events),
                                     );
                                 }
                                 match status.as_str() {
@@ -24899,7 +24911,7 @@ mod tests {
             finished_at: Some(SystemTime::UNIX_EPOCH + Duration::from_millis(8_000)),
             run_timing: None,
             reply_source: None,
-            relay_failure: None,
+            plan_failure: None,
         };
 
         let id = graft_reply(&mut messages, &reply);
@@ -33258,7 +33270,7 @@ mod tests {
     /// flight, and a sign-out all take the offer away.
     #[test]
     fn a_turn_the_mac_could_not_answer_is_offered_again_on_the_servers_keys() {
-        use crate::opengrok::RelayErrorCode;
+        use crate::opengrok::RunErrorCode;
         let mut state = signed_in_state();
         state.conversations.push(Conversation {
             id: "cw_1".into(),
@@ -33277,9 +33289,9 @@ mod tests {
             origin: None,
         });
         state.active_conversation_id = Some("cw_1".into());
-        assert_eq!(state.relay_failed_turn(), None, "a failure of another kind");
-        state.note_relay_failure("m_failed", Some(RelayErrorCode::Offline));
-        assert_eq!(state.relay_failed_turn().as_deref(), Some("m_failed"));
+        assert_eq!(state.plan_failed_turn(), None, "a failure of another kind");
+        state.note_plan_failure("m_failed", Some(RunErrorCode::RelayOffline));
+        assert_eq!(state.plan_failed_turn().as_deref(), Some("m_failed"));
         state.live_turns.insert(
             "cw_1".into(),
             LiveTurn {
@@ -33288,26 +33300,22 @@ mod tests {
                 persisting: false,
             },
         );
-        assert_eq!(state.relay_failed_turn(), None, "a turn in flight");
+        assert_eq!(state.plan_failed_turn(), None, "a turn in flight");
         state.live_turns.clear();
         state.conversations[0]
             .messages
             .push(message("m_more", true, "and another thing"));
-        assert_eq!(
-            state.relay_failed_turn(),
-            None,
-            "not the last turn any more"
-        );
+        assert_eq!(state.plan_failed_turn(), None, "not the last turn any more");
         state.conversations[0].messages.pop();
-        state.note_relay_failure("m_failed", None);
+        state.note_plan_failure("m_failed", None);
         assert_eq!(
-            state.relay_failed_turn(),
+            state.plan_failed_turn(),
             None,
             "a later word without the code"
         );
-        state.note_relay_failure("m_failed", Some(RelayErrorCode::Timeout));
+        state.note_plan_failure("m_failed", Some(RunErrorCode::RelayTimeout));
         state.forget_account();
-        assert_eq!(state.relay_failed_turn(), None, "signed out");
+        assert_eq!(state.plan_failed_turn(), None, "signed out");
 
         // Read back: the journal's RUN_ERROR carries the code, and a reply recovered from it
         // brings it.
@@ -33319,11 +33327,11 @@ mod tests {
                 "code": "relay_timeout"}),
         ];
         assert_eq!(
-            super::relay_failure_of(&events),
-            Some(RelayErrorCode::Timeout)
+            super::plan_failure_of(&events),
+            Some(RunErrorCode::RelayTimeout)
         );
         assert_eq!(
-            super::relay_failure_of(&[json!({"type": "RUN_ERROR", "message": "refused"})]),
+            super::plan_failure_of(&[json!({"type": "RUN_ERROR", "message": "refused"})]),
             None
         );
         let run: ThreadRun = serde_json::from_value(json!({
@@ -33333,7 +33341,7 @@ mod tests {
         .expect("a run");
         let recovered = super::missing_replies(&[message("m_ask", true, "summarise it")], &[run]);
         assert_eq!(recovered.len(), 1);
-        assert_eq!(recovered[0].relay_failure, Some(RelayErrorCode::Timeout));
+        assert_eq!(recovered[0].plan_failure, Some(RunErrorCode::RelayTimeout));
         assert!(recovered[0].content.starts_with(RUN_ERROR_PREFIX));
     }
 
@@ -33360,8 +33368,8 @@ mod tests {
         });
         state.active_conversation_id = Some("cw_1".into());
         // Live: the turn's error names no code, so what the ending notes is no relay failure.
-        state.note_relay_failure("m_busy", None);
-        assert_eq!(state.relay_failed_turn(), None);
+        state.note_plan_failure("m_busy", None);
+        assert_eq!(state.plan_failed_turn(), None);
 
         // Read back: the journal's RUN_ERROR, after the run said it went through the Mac, has
         // no code either, and the reply recovered from it is the sentence and nothing to offer.
@@ -33371,7 +33379,7 @@ mod tests {
                 "value": {"kind": "local_proxy", "via": "mac", "model": "gpt-5.5"}}),
             json!({"type": "RUN_ERROR", "message": said}),
         ];
-        assert_eq!(super::relay_failure_of(&events), None);
+        assert_eq!(super::plan_failure_of(&events), None);
         let run: ThreadRun = serde_json::from_value(json!({
             "runId": "run_1", "status": "failed", "startedAtMs": 1_000,
             "failure": said, "events": events
@@ -33379,8 +33387,155 @@ mod tests {
         .expect("a run");
         let recovered = super::missing_replies(&[message("m_ask", true, "summarise it")], &[run]);
         assert_eq!(recovered.len(), 1);
-        assert_eq!(recovered[0].relay_failure, None);
+        assert_eq!(recovered[0].plan_failure, None);
         assert_eq!(recovered[0].content, format!("{RUN_ERROR_PREFIX}{said}"));
+    }
+
+    /// The thread `cw_1`, open, whose last turn the server refused with `said`.
+    fn refused_turn(state: &mut AppState, said: &str) {
+        state.conversations.push(Conversation {
+            id: "cw_1".into(),
+            title: "Ada".into(),
+            created_at: String::new(),
+            updated_at: String::new(),
+            messages: vec![
+                message("m_ask", true, "summarise it"),
+                message("m_failed", false, &format!("{RUN_ERROR_PREFIX}{said}")),
+            ],
+            unread_count: 0,
+            origin: None,
+        });
+        state.active_conversation_id = Some("cw_1".into());
+    }
+
+    /// A turn the person's own setting left their plan nothing to answer with ends
+    /// `plan_unavailable` beside the server's sentence (opengrok-server #304, agreed 2026-09-30,
+    /// not yet recorded): a teammate with no proxy on a shared Bot on the plan, or a proxy turn
+    /// with no address or no model stored. As the thread's last turn it offers itself again on the
+    /// server's keys, as a relay's failure does: live, by the run error's code, and read back, by
+    /// the code on the journal's `RUN_ERROR`. Sent that way it names the gateway for that turn,
+    /// whatever the Bot's own door or the account's, which the turns after it go by again.
+    #[test]
+    fn a_turn_the_plan_was_unavailable_for_is_offered_again_on_the_servers_keys() {
+        use crate::opengrok::RunErrorCode;
+        let said = "You chose your own subscription, but no proxy address is set; set one in your \
+                    inference source (like http://127.0.0.1:8080), or switch this turn to the \
+                    gateway.";
+        let mut state = signed_in_state();
+        with_bot(&mut state, json!("local_proxy"));
+        refused_turn(&mut state, said);
+        assert_eq!(state.plan_failed_turn(), None, "no code noted yet");
+        state.note_plan_failure("m_failed", RunErrorCode::from_code("plan_unavailable"));
+        assert_eq!(state.plan_failed_turn().as_deref(), Some("m_failed"));
+
+        // Sent on Server, the turn names the gateway, where the Bot's own turns name its plan;
+        // and so for a Bot that follows the account onto the plan, whose turns name nothing.
+        assert_eq!(
+            serde_json::to_value(state.turn_door(None, true)).unwrap(),
+            json!("gateway")
+        );
+        assert_eq!(state.turn_door(None, false), Some(TurnSource::plan(None)));
+        with_bot(&mut state, serde_json::Value::Null);
+        read_as(
+            &mut state,
+            kept(InferenceKind::LocalProxy, Some("gpt-5-codex")),
+        );
+        assert_eq!(state.turn_door(None, true), Some(TurnSource::GATEWAY));
+        assert_eq!(state.turn_door(None, false), None);
+
+        // Read back: the journal's RUN_ERROR carries the code, and a reply recovered from it
+        // brings it.
+        let events = vec![
+            json!({"type": "RUN_STARTED", "runId": "run_1", "threadId": "cw_1"}),
+            json!({"type": "RUN_ERROR", "message": said, "code": "plan_unavailable"}),
+        ];
+        assert_eq!(
+            super::plan_failure_of(&events),
+            Some(RunErrorCode::PlanUnavailable)
+        );
+        let run: ThreadRun = serde_json::from_value(json!({
+            "runId": "run_1", "status": "failed", "startedAtMs": 1_000,
+            "failure": said, "events": events
+        }))
+        .expect("a run");
+        let recovered = super::missing_replies(&[message("m_ask", true, "summarise it")], &[run]);
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(
+            recovered[0].plan_failure,
+            Some(RunErrorCode::PlanUnavailable)
+        );
+        assert_eq!(recovered[0].content, format!("{RUN_ERROR_PREFIX}{said}"));
+    }
+
+    /// A reply source the server could not read refuses the turn in words and no code
+    /// (opengrok-server #304, as agreed 2026-09-30): there is nothing of the person's to change,
+    /// and the sentence says to try again in a moment. The reply shows the sentence alone, live
+    /// and read back, and nothing offers the turn on the server's keys.
+    #[test]
+    fn a_reply_source_that_could_not_be_read_offers_nothing_on_server() {
+        let said = "Your reply source could not be read, so the turn was not sent; try again in a \
+                    moment.";
+        let mut state = signed_in_state();
+        with_bot(&mut state, json!("local_proxy"));
+        refused_turn(&mut state, said);
+        state.note_plan_failure("m_failed", None);
+        assert_eq!(state.plan_failed_turn(), None);
+
+        let events = vec![
+            json!({"type": "RUN_STARTED", "runId": "run_1", "threadId": "cw_1"}),
+            json!({"type": "RUN_ERROR", "message": said}),
+        ];
+        assert_eq!(super::plan_failure_of(&events), None);
+        let run: ThreadRun = serde_json::from_value(json!({
+            "runId": "run_1", "status": "failed", "startedAtMs": 1_000,
+            "failure": said, "events": events
+        }))
+        .expect("a run");
+        let recovered = super::missing_replies(&[message("m_ask", true, "summarise it")], &[run]);
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].plan_failure, None);
+        assert_eq!(recovered[0].content, format!("{RUN_ERROR_PREFIX}{said}"));
+    }
+
+    /// On a driver's tree: a turn the person's plan was unavailable for is offered on Server as
+    /// `run-error-send-on-server`, a click that sends it there; a run error with no code has no
+    /// such node, and the click is refused.
+    #[cfg(feature = "agent")]
+    #[test]
+    fn a_driver_is_offered_send_on_server_for_plan_unavailable_and_not_without_a_code() {
+        use crate::agent::{Command, NativeChatHost, ids};
+        use crate::opengrok::RunErrorCode;
+        use gpui_agent::prelude::{AgentHost, Op};
+        let mut state = signed_in_state();
+        with_bot(&mut state, json!("local_proxy"));
+        refused_turn(
+            &mut state,
+            "Choose a model for your own subscription first: your inference source names none, \
+             so the turn was not sent. Pick one your proxy serves, or switch this turn to the \
+             gateway.",
+        );
+        let offer = |state: &AppState| {
+            NativeChatHost::from_app(state)
+                .snapshot()
+                .find(ids::RUN_ERROR_SEND_ON_SERVER)
+                .map(|node| node.name.clone())
+        };
+        state.note_plan_failure("m_failed", RunErrorCode::from_code("plan_unavailable"));
+        assert_eq!(
+            offer(&state).as_deref(),
+            Some("Send this reply on Server instead")
+        );
+        let mut host = NativeChatHost::from_app(&state);
+        host.dispatch(&Op::click(ids::RUN_ERROR_SEND_ON_SERVER))
+            .unwrap();
+        assert!(matches!(host.take_command(), Some(Command::SendOnServer)));
+
+        state.note_plan_failure("m_failed", None);
+        assert_eq!(offer(&state), None);
+        let refused = NativeChatHost::from_app(&state)
+            .dispatch(&Op::click(ids::RUN_ERROR_SEND_ON_SERVER))
+            .unwrap_err();
+        assert!(refused.contains("person's plan"), "{refused}");
     }
 
     /// A teammate on a shared Bot its owner put on the person's plan, with no plan of their own
@@ -33388,7 +33543,9 @@ mod tests {
     /// drives the turn, and the turn is never sent on the server's keys, nor to the owner's plan
     /// (opengrok-server PR #304, bot-model-source 0ae9f2a, recorded at 4059c59, not yet on main).
     /// The recorded replay reads back as a run that failed, the server's sentence under the plan's
-    /// badge, with nothing offered on Server: it is no failure of the relay's.
+    /// badge. It was recorded before #304 agreed `plan_unavailable` for this refusal (2026-09-30),
+    /// so its `RUN_ERROR` names no code and nothing is offered on Server; the recording that
+    /// brings the code offers it, as `plan_unavailable` is read ahead of it.
     #[test]
     fn a_teammate_refused_a_shared_bots_plan_reads_back_as_the_servers_sentence() {
         let recorded: serde_json::Value = serde_json::from_str(include_str!(
@@ -33409,14 +33566,14 @@ mod tests {
                 ended.get("code")
             ),
             (Some("RUN_ERROR"), Some(said.as_str()), None),
-            "a run error in the server's words, naming no relay failure"
+            "a run error in the server's words, recorded before it named a code"
         );
         let recovered = super::missing_replies(&[message("m1", true, "hi")], &replay.runs);
         assert_eq!(recovered.len(), 1);
         assert_eq!(recovered[0].content, format!("{RUN_ERROR_PREFIX}{said}"));
         assert_eq!(
-            recovered[0].relay_failure, None,
-            "nothing to send on Server"
+            recovered[0].plan_failure, None,
+            "no code, so nothing to send on Server"
         );
         let badge = recovered[0]
             .reply_source

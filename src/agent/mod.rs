@@ -287,10 +287,11 @@
 //! model that answered is a fast twin; value = the door, state `via-mac` on one the person's Mac
 //! answered), holding `reply-source-model-{messageId}` (label = the model
 //! the server named, which the badge shows on hover) when it named one. A reply whose run
-//! ended because the person's Mac could not answer (a relay `RUN_ERROR` code) keeps its line, and
-//! while it is the open thread's last turn the page holds `run-error-send-on-server` (`Send this
-//! reply on Server instead`): a click sends the same turn again on the server's paid keys, this
-//! once, as `retry-turn` does for a turn that never left. Under `composer-queued`, a
+//! ended because the person's plan could not answer (a `RUN_ERROR` code: the relay's, where the
+//! Mac could not, or `plan_unavailable`, where the person's own setting left the plan nothing to
+//! answer with) keeps its line, and while it is the open thread's last turn the page holds
+//! `run-error-send-on-server` (`Send this reply on Server instead`): a click sends the same turn
+//! again on the server's paid keys, this once, as `retry-turn` does for a turn that never left. Under `composer-queued`, a
 //! `queued-waiting-{messageId}` (`Waiting for your Mac`) for each held message the server holds
 //! for the person's Mac (`heldFor: "relay_offline"`). In the bot's settings, while the Bot's
 //! replies go through the person's plan, its own door or the account's that it follows,

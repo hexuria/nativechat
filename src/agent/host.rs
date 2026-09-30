@@ -401,7 +401,7 @@ pub mod ids {
         reply_source::relay_model_id(model)
     }
 
-    /// Beside the line of a turn the person's Mac could not answer: the turn again, on the
+    /// Beside the line of a turn the person's plan could not answer: the turn again, on the
     /// server's paid keys.
     pub const RUN_ERROR_SEND_ON_SERVER: &str = crate::components::chat::SEND_ON_SERVER;
 
@@ -906,7 +906,7 @@ pub enum Command {
     SaveReplySource,
     /// Settings → Reply source's third row: the person's plan through their Mac.
     PickReplySourceMac,
-    /// Send this reply on Server instead: the turn the person's Mac could not answer, again, on
+    /// Send this reply on Server instead: the turn the person's plan could not answer, again, on
     /// the server's paid keys.
     SendOnServer,
     /// Answer with this Mac: its switch, which acts at once; and opencodex's address and key on
@@ -2628,7 +2628,7 @@ pub struct NativeChatHost {
     signed_out: Option<String>,
     /// The open thread's last turn did not go through, and the feed is offering it again.
     can_retry_turn: bool,
-    /// The open thread's last turn is one the person's Mac could not answer, and the feed offers
+    /// The open thread's last turn is one the person's plan could not answer, and the feed offers
     /// it again on the server's keys.
     can_send_on_server: bool,
     /// The open thread's held messages the server holds for the person's Mac, by bubble id.
@@ -2894,7 +2894,7 @@ impl NativeChatHost {
                 .session_banner()
                 .map(|(title, detail)| format!("{title} — {detail}")),
             can_retry_turn: state.retryable_turn().is_some(),
-            can_send_on_server: state.relay_failed_turn().is_some(),
+            can_send_on_server: state.plan_failed_turn().is_some(),
             waiting_for_mac: state.sends_waiting_for_mac(),
             replies_on_plan: state.replies_on_plan(),
             model_pick: state.model_pick(),
@@ -6245,7 +6245,7 @@ impl NativeChatHost {
             if !self.can_send_on_server {
                 return Err(
                     "there is no turn to send on the server's keys: the open thread's last turn \
-                     is not one the person's Mac could not answer"
+                     is not one the person's plan could not answer"
                         .to_string(),
                 );
             }
@@ -8845,7 +8845,7 @@ mod tests {
                 .is_none()
         );
         let refused = host.click(ids::RUN_ERROR_SEND_ON_SERVER).unwrap_err();
-        assert!(refused.contains("person's Mac"), "{refused}");
+        assert!(refused.contains("person's plan"), "{refused}");
         host.can_send_on_server = true;
         assert_eq!(
             host.snapshot()
