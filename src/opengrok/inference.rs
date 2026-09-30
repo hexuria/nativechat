@@ -463,7 +463,8 @@ impl RelayErrorCode {
 /// `heldFor` on a queued send's row while the server holds it for the person's Mac: the turn it
 /// names goes through the Mac and no Mac holds the relay (opengrok-server #292: `HELD_FOR` in
 /// `crates/opengrok-server/src/agui/pending.rs`, PR #298, branch mac-relay c7b57e9, recorded at
-/// c3f9521, not yet on main). Absent otherwise.
+/// c3f9521, not yet on main). Absent otherwise. The server sends such a send itself, oldest
+/// first, when a Mac opens the relay, so this app never fires one.
 pub const HELD_FOR_RELAY_OFFLINE: &str = "relay_offline";
 
 /// Whether "My subscription" may be pointed at a model, by the server's own rule, so the picker

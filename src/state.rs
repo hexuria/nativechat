@@ -2587,7 +2587,8 @@ pub struct QueuedSend {
     inference_source: Option<TurnSource>,
     /// The server holds this send until a Mac holds the relay again (`heldFor:
     /// "relay_offline"` on its row, opengrok-server #292): its queue line says it waits for the
-    /// person's Mac rather than for the coworker. The row's word, read with every row.
+    /// person's Mac rather than for the coworker, and the drain passes over it, since the server
+    /// sends it itself when a Mac opens the relay. The row's word, read with every row.
     waits_for_mac: bool,
     /// The `pum_…` row on OpenGrok, once enqueue has landed. Absent while offline, or on an
     /// OpenGrok that has not shipped pending-user-messages yet.
@@ -18195,19 +18196,26 @@ impl AppState {
     ///
     /// A hold whose bubble is hidden is dropped, not returned: hidden means the person took it
     /// back, and a hidden hold never posts, whichever path hid it.
+    ///
+    /// A send the server holds for the person's Mac is passed over, and keeps its place: the
+    /// server sends it itself, oldest first, the moment a Mac opens the relay, and fired from here
+    /// it would only be held again. The send behind it waits for the coworker alone, as its line
+    /// says, and goes.
     fn pop_queued_send(&mut self, conversation_id: &str) -> Option<QueuedSend> {
         loop {
-            let front = self.queued_sends.get(conversation_id)?.front()?;
-            if self.pending_inflight.contains(&front.message_id)
-                || front.stale == StaleRefusal::Parked
-                || front.unsynced
+            let queue = self.queued_sends.get(conversation_id)?;
+            let at = queue.iter().position(|queued| !queued.waits_for_mac)?;
+            let first = &queue[at];
+            if self.pending_inflight.contains(&first.message_id)
+                || first.stale == StaleRefusal::Parked
+                || first.unsynced
             {
                 return None;
             }
             let next = self
                 .queued_sends
                 .get_mut(conversation_id)
-                .and_then(VecDeque::pop_front)?;
+                .and_then(|queue| queue.remove(at))?;
             if self
                 .queued_sends
                 .get(conversation_id)
@@ -18233,9 +18241,10 @@ impl AppState {
     }
 
     fn queued_send_ready_to_drain(&self, conversation_id: &str) -> bool {
+        // Only a send this app may post: one the server holds for the Mac is the server's to send.
         self.queued_sends
             .get(conversation_id)
-            .is_some_and(|queue| !queue.is_empty())
+            .is_some_and(|queue| queue.iter().any(|queued| !queued.waits_for_mac))
             && self.active_conversation_id.as_deref() == Some(conversation_id)
             && self.busy_state(conversation_id) == Busy::Idle
     }
@@ -33472,6 +33481,66 @@ mod tests {
         state.fold_pending_snapshot("cw_1", &[row(None)]);
         assert!(!state.is_send_waiting_for_mac("m_1"));
         assert!(state.is_send_queued("m_1"));
+    }
+
+    /// A held message the server holds for the person's Mac is the server's to send, oldest
+    /// first, when a Mac opens the relay: going idle passes over it, and it keeps its place and
+    /// its line, while the message behind it, which waits only for the coworker, goes. With
+    /// nothing else held there is nothing to post, and once the server no longer holds it, it
+    /// goes like any other.
+    #[test]
+    fn a_message_held_for_the_mac_is_left_for_the_server_to_send() {
+        use crate::opengrok::PendingUserMessage;
+        let row =
+            |id: &str, bubble: &str, door: serde_json::Value, held: bool| -> PendingUserMessage {
+                let mut row = json!({
+                    "v": 1, "id": id, "threadId": "cw_1", "content": bubble,
+                    "clientMessageId": bubble, "status": "pending",
+                    "createdAtMs": 30, "updatedAtMs": 30, "inferenceSource": door
+                });
+                if held {
+                    row["heldFor"] = json!("relay_offline");
+                }
+                serde_json::from_value(row).expect("a row")
+            };
+        let by_mac = || json!({"kind": "local_proxy", "via": "mac"});
+        let mut state = mid_turn(at(message("m_live", false, ""), 20));
+        state.conversations[0]
+            .messages
+            .push(at(message("m_mac", true, "m_mac"), 30));
+        state.conversations[0]
+            .messages
+            .push(at(message("m_next", true, "m_next"), 40));
+        state.fold_pending_snapshot(
+            "cw_1",
+            &[
+                row("pum_1", "m_mac", by_mac(), true),
+                row("pum_2", "m_next", json!("gateway"), false),
+            ],
+        );
+        go_idle(&mut state);
+        assert!(state.queued_send_ready_to_drain("cw_1"));
+        assert_eq!(
+            state.pop_queued_send("cw_1").map(|next| next.message_id),
+            Some("m_next".to_string()),
+            "the message behind the Mac's goes"
+        );
+        assert!(
+            state.is_send_waiting_for_mac("m_mac"),
+            "the Mac's keeps its place and its line"
+        );
+        assert!(
+            !state.queued_send_ready_to_drain("cw_1"),
+            "nothing held is this app's to post"
+        );
+        assert!(state.pop_queued_send("cw_1").is_none());
+
+        // A Mac opened the relay: the server no longer holds it, and it goes as any held one does.
+        state.fold_pending_snapshot("cw_1", &[row("pum_1", "m_mac", by_mac(), false)]);
+        assert_eq!(
+            state.pop_queued_send("cw_1").map(|next| next.message_id),
+            Some("m_mac".to_string())
+        );
     }
 
     /// A server from before reply sources answers the read with a bare 404: the page says it
