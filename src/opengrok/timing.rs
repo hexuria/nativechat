@@ -54,7 +54,8 @@ pub const TURN_TIMELINE_CUSTOM: &str = "turn-timeline";
 /// Schema version this client writes and prefers to read.
 pub const TIMING_SCHEMA_V: u32 = 1;
 
-/// One tool's wall clock inside a turn.
+/// One tool's wall clock inside a turn. Kept with the turn and not drawn: it names a tool, not a
+/// call (see [`TurnTiming::breakdown`]).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolTiming {
     pub name: String,
@@ -161,32 +162,38 @@ impl TurnTiming {
             .and_then(Self::from_value)
     }
 
-    /// Lines under the bubble when Settings → Show turn timing is on.
+    /// What the Timing row under a reply says while it is shut, when Settings → Show turn timing
+    /// is on: how long the run took, and nothing else.
+    pub fn total_line(&self) -> Option<String> {
+        self.total_ms.map(|ms| format!("{} total", format_ms(ms)))
+    }
+
+    /// What opening the Timing row adds: the model's time in each round, how long the run
+    /// waited on its tools, and auto-review.
+    ///
+    /// The tools are not listed one by one. `tools` names a tool, not a call, so "shell 1s" under
+    /// a reply that ran three shells said nothing about which one it was; each call's time is on
+    /// its own row instead (`StepSpec::took_ms`). The rounds stay here because the reply does not
+    /// draw where one round ends and the next begins, and `rounds` is only an order, so a round's
+    /// time could not be put beside what that round did without guessing.
     ///
     /// A phase at zero is left out: the harness always sends `auto_review_ms`,
     /// and a `0ms` line reads as a step that ran.
-    pub fn debug_lines(&self) -> Vec<String> {
+    pub fn breakdown(&self) -> Vec<String> {
         let spent = |ms: Option<u64>| ms.filter(|ms| *ms > 0);
         let mut lines = Vec::new();
-        if let Some(ms) = self.total_ms {
-            lines.push(format!("{} total", format_ms(ms)));
-        }
         if self.rounds.len() > 1 {
             for (i, round) in self.rounds.iter().enumerate() {
-                lines.push(format!("round {}  {}", i + 1, format_ms(round.model_ms)));
+                lines.push(format!(
+                    "model, round {}  {}",
+                    i + 1,
+                    format_ms(round.model_ms)
+                ));
             }
         } else if let Some(ms) =
             spent(self.model_ms).or_else(|| spent(self.rounds.first().map(|r| r.model_ms)))
         {
             lines.push(format!("model  {}", format_ms(ms)));
-        }
-        for tool in &self.tools {
-            let name = if tool.name.is_empty() {
-                "tool"
-            } else {
-                tool.name.as_str()
-            };
-            lines.push(format!("{name}  {}", format_ms(tool.ms)));
         }
         if let Some(ms) = spent(self.tool_wait_ms) {
             let over = match self.tool_rounds {
@@ -359,13 +366,12 @@ mod tests {
         assert_eq!(timing.tools[0].name, "profile.list");
         assert_eq!(timing.tools[0].ms, 350000);
         assert_eq!(timing.rounds.len(), 2);
+        assert_eq!(timing.total_line().as_deref(), Some("6m12s total"));
         assert_eq!(
-            timing.debug_lines(),
+            timing.breakdown(),
             vec![
-                "6m12s total".to_string(),
-                "round 1  4s".to_string(),
-                "round 2  8s".to_string(),
-                "profile.list  5m50s".to_string(),
+                "model, round 1  4s".to_string(),
+                "model, round 2  8s".to_string(),
                 "auto-review  8s".to_string(),
             ]
         );
@@ -399,14 +405,10 @@ mod tests {
         assert_eq!(timing.rounds, vec![RoundTiming { model_ms: 12 }]);
         assert_eq!(timing.tool_wait_ms, Some(3));
         assert_eq!(timing.tool_rounds, Some(1));
+        assert_eq!(timing.total_line().as_deref(), Some("15ms total"));
         assert_eq!(
-            timing.debug_lines(),
-            vec![
-                "15ms total".to_string(),
-                "model  12ms".to_string(),
-                "shell  3ms".to_string(),
-                "tool wait  3ms".to_string(),
-            ]
+            timing.breakdown(),
+            vec!["model  12ms".to_string(), "tool wait  3ms".to_string()]
         );
     }
 
@@ -421,13 +423,60 @@ mod tests {
             "tool_rounds": 1
         }))
         .expect("the harness value");
+        assert_eq!(timing.total_line().as_deref(), Some("60ms total"));
         assert_eq!(
-            timing.debug_lines(),
+            timing.breakdown(),
             vec![
-                "60ms total".to_string(),
-                "round 1  12ms".to_string(),
-                "round 2  40ms".to_string(),
+                "model, round 1  12ms".to_string(),
+                "model, round 2  40ms".to_string(),
             ]
+        );
+    }
+
+    /// The turn the owner reported: under the reply it read "10s total / round 1 2s / round 2 2s
+    /// / shell 1s / tool wait 1s" as one loose block. Shut, the row is the total alone; opened,
+    /// it is the rounds and the wait, and never a tool by its name, whose time is on the call's
+    /// own row now.
+    #[test]
+    fn the_shut_row_is_the_total_and_no_tool_is_listed_by_name() {
+        let timing = TurnTiming::from_value(&json!({
+            "model_ms": [2000, 2000],
+            "tools": [{ "name": "shell", "ms": 1000 }],
+            "tool_wait_ms": 1000,
+            "auto_review_ms": 0,
+            "total_ms": 10000,
+            "tool_rounds": 1
+        }))
+        .expect("the harness value");
+        assert_eq!(timing.total_line().as_deref(), Some("10s total"));
+        assert_eq!(
+            timing.breakdown(),
+            vec![
+                "model, round 1  2s".to_string(),
+                "model, round 2  2s".to_string(),
+                "tool wait  1s".to_string(),
+            ]
+        );
+        assert!(
+            timing
+                .breakdown()
+                .iter()
+                .all(|line| !line.contains("shell")),
+            "a tool by its name says nothing about which call it was"
+        );
+        // Still kept, for a server that one day says which call it was.
+        assert_eq!(timing.tools[0].name, "shell");
+    }
+
+    /// A frame with no total still opens on its phases; the row names itself instead.
+    #[test]
+    fn no_total_is_no_total_line() {
+        let timing = TurnTiming::from_value(&json!({ "tool_wait_ms": 38000, "tool_rounds": 16 }))
+            .expect("the wait reads");
+        assert_eq!(timing.total_line(), None);
+        assert_eq!(
+            timing.breakdown(),
+            vec!["tool wait  38s over 16 rounds".to_string()]
         );
     }
 

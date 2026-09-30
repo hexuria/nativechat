@@ -103,10 +103,18 @@ pub mod ids {
     /// any, and its Thought rows (value = how many), only while it has any.
     pub const REPLY_STEPS: &str = "reply-steps";
     pub const REPLY_REASONING: &str = "reply-reasoning";
+    /// The newest coworker reply's Timing row (value = what it says shut, `10s total`), in the
+    /// tree only while the feed draws one.
+    pub const REPLY_TIMING: &str = "reply-timing";
 
     /// One step of the newest reply, by the call it was.
     pub fn step(call_id: &str) -> String {
         format!("step-{call_id}")
+    }
+
+    /// One line of the newest reply's opened Timing row, counted from 0.
+    pub fn reply_timing_line(n: usize) -> String {
+        format!("reply-timing-line-{n}")
     }
 
     pub fn session(id: &str) -> String {
@@ -1403,6 +1411,9 @@ struct ReplyRunSnap {
     steps: Vec<StepSnap>,
     /// Each Thought row's key, and whether it is open.
     thoughts: Vec<(String, bool)>,
+    /// Its Timing row, from the function that builds the feed's (`steps::timing_row`), while
+    /// the feed draws one.
+    timing: Option<crate::components::steps::RunRow>,
 }
 
 /// One step of that reply.
@@ -1421,14 +1432,22 @@ struct StepSnap {
 }
 
 impl ReplyRunSnap {
-    /// `show_timing` is Settings → Show turn timing, which puts each call's time on its row.
+    /// `show_timing` is Settings → Show turn timing, which puts each call's time on its row and
+    /// the Timing row under the reply.
     fn from_message(
         message: &crate::state::Message,
         open: &std::collections::HashSet<String>,
         show_timing: bool,
     ) -> Self {
         let message_id = message.id.as_str();
-        let mut run = Self::default();
+        let mut run = Self {
+            timing: message
+                .run_timing
+                .as_ref()
+                .filter(|_| show_timing)
+                .and_then(|frame| crate::components::steps::timing_row(message_id, frame, open)),
+            ..Self::default()
+        };
         for part in &message.parts {
             match part {
                 ChatPart::Step(step) => {
@@ -3514,7 +3533,8 @@ impl NativeChatHost {
     /// false` is "this reply did nothing but talk". An open row has state `expanded`; for the
     /// Thought rows that is all of them open, which is what a click on `reply-reasoning` asks for.
     /// A step whose row ends with how long the call took has that as a state, `took-1s`; its
-    /// value stays how it came out.
+    /// value stays how it came out. The Timing row under the reply is `reply-timing`, with its
+    /// lines under it while it is open.
     fn reply_run_nodes(&self) -> Vec<UiNode> {
         let run = &self.reply_run;
         let mut nodes = Vec::new();
@@ -3549,14 +3569,46 @@ impl NativeChatHost {
             }
             nodes.push(node);
         }
+        if let Some(crate::components::steps::RunRow::Timing {
+            total, lines, open, ..
+        }) = &run.timing
+        {
+            let mut node = UiNode::status(ids::REPLY_TIMING, "Timing").with_value(total.clone());
+            if *open {
+                node.states.push("expanded".into());
+                node = node.with_children(
+                    lines
+                        .iter()
+                        .enumerate()
+                        .map(|(n, line)| UiNode::note(ids::reply_timing_line(n), line.clone()))
+                        .collect(),
+                );
+            }
+            nodes.push(node);
+        }
         nodes
     }
 
     /// A click on one of the newest reply's steps opens it, or shuts it if it is open. What
     /// holds it opens with it: an open step keeps its "N steps" line open (see
     /// `components::steps`). A click on `reply-reasoning` opens every Thought row, or shuts
-    /// them all once they all are.
+    /// them all once they all are. A click on `reply-timing` opens or shuts the Timing row, and
+    /// is refused where the row is the total and nothing more, as it does not open.
     fn reply_run_command(&self, target: &str) -> Option<Result<Command, String>> {
+        if target == ids::REPLY_TIMING {
+            return Some(match &self.reply_run.timing {
+                Some(crate::components::steps::RunRow::Timing {
+                    key, lines, open, ..
+                }) if !lines.is_empty() => Ok(Command::SetStepsOpen {
+                    keys: vec![key.clone()],
+                    open: !open,
+                }),
+                Some(_) => {
+                    Err("the newest reply's Timing row is its total and does not open".to_string())
+                }
+                None => Err("the newest reply has no Timing row".to_string()),
+            });
+        }
         if target == ids::REPLY_REASONING {
             let thoughts = &self.reply_run.thoughts;
             if thoughts.is_empty() {
@@ -9040,6 +9092,73 @@ mod tests {
             ("ok".to_string(), vec!["took-1s".to_string()])
         );
         assert_eq!(took(&state, "c2"), ("ok".to_string(), Vec::new()));
+    }
+
+    /// With Settings → Show turn timing on, the Timing row under the newest reply is on the tree
+    /// with what it says shut, and a click opens it on its lines, as a person's does. A row that
+    /// is the total alone does not open, and the click says so. With the setting off, or with no
+    /// `run-timing` frame, it is not there, as it is not drawn.
+    #[test]
+    fn the_timing_row_is_on_the_tree_and_opens_on_click() {
+        use crate::opengrok::TurnTiming;
+        let mut state = one_timed_reply();
+        state.show_turn_timing = true;
+        let timing_node = |state: &AppState| {
+            signed_in_host(state)
+                .snapshot()
+                .find(ids::REPLY_TIMING)
+                .cloned()
+        };
+        assert!(timing_node(&state).is_none(), "no frame came");
+
+        state.conversations[0].messages[0].run_timing =
+            TurnTiming::from_value(&serde_json::json!({
+                "model_ms": [2000, 2000],
+                "tools": [{ "name": "shell", "ms": 1000 }],
+                "tool_wait_ms": 1000,
+                "total_ms": 10000,
+                "tool_rounds": 1
+            }));
+        state.show_turn_timing = false;
+        assert!(timing_node(&state).is_none(), "the setting is off");
+
+        state.show_turn_timing = true;
+        let shut = timing_node(&state).expect("the Timing row");
+        assert_eq!(shut.value.as_deref(), Some("10s total"));
+        assert!(!shut.states.contains(&"expanded".to_string()));
+        assert!(shut.children.is_empty(), "shut, it is the total alone");
+        assert!(signed_in_host(&state).snapshot().ids_are_unique());
+
+        let mut driver = signed_in_host(&state);
+        driver.click(ids::REPLY_TIMING).unwrap();
+        let Some(Command::SetStepsOpen { keys, open }) = driver.take_command() else {
+            panic!("a click on the Timing row opens it");
+        };
+        state.mark_steps_open(&keys, open);
+        let open = timing_node(&state).expect("the Timing row");
+        assert!(open.states.contains(&"expanded".to_string()));
+        let lines: Vec<(String, String)> = open
+            .children
+            .iter()
+            .map(|line| (line.id.clone(), line.name.clone()))
+            .collect();
+        assert_eq!(
+            lines,
+            vec![
+                (ids::reply_timing_line(0), "model, round 1  2s".to_string()),
+                (ids::reply_timing_line(1), "model, round 2  2s".to_string()),
+                (ids::reply_timing_line(2), "tool wait  1s".to_string()),
+            ]
+        );
+
+        // A frame with a total and nothing else is a row that does not open.
+        state.conversations[0].messages[0].run_timing =
+            TurnTiming::from_value(&serde_json::json!({ "total_ms": 10000 }));
+        assert_eq!(
+            timing_node(&state).and_then(|node| node.value),
+            Some("10s total".to_string())
+        );
+        assert!(signed_in_host(&state).click(ids::REPLY_TIMING).is_err());
     }
 
     /// Settings → Computer lists each connected computer's local-exec mode, marks this Mac, and

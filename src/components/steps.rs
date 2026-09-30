@@ -2,11 +2,12 @@
 //! tool call it made, one "N steps" row for a stretch of them, and a "Thought" row for its
 //! reasoning. Every one of them is shut until it is opened, the way Grok Bot's tool-result card
 //! is a `<details>` that starts closed: a computer run of two hundred calls is one line of the
-//! reply until somebody wants to know what those calls were.
+//! reply until somebody wants to know what those calls were. Under it all, while Settings →
+//! Show turn timing is on, a "Timing" row says how long the turn took.
 
 use std::collections::HashSet;
 
-use crate::opengrok::{ChatPart, StepSpec, StepStatus};
+use crate::opengrok::{ChatPart, StepSpec, StepStatus, TurnTiming};
 use crate::state::AppState;
 use gpui_kit::component::{ActiveTheme, Icon, IconName, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder;
@@ -27,6 +28,33 @@ pub(crate) fn thought_key(message_id: &str, n: usize) -> String {
 /// The key of a reply's `n`th stretch of steps (see [`step_runs`]).
 fn steps_key(message_id: &str, n: usize) -> String {
     format!("{message_id}/steps/{n}")
+}
+
+/// The key of a reply's Timing row.
+pub(crate) fn timing_key(message_id: &str) -> String {
+    format!("{message_id}/timing")
+}
+
+/// The Timing row under a reply whose run sent a `run-timing` frame. Shut, it says how long the
+/// turn took and nothing else; opened, it says what the rows above it cannot, the model's time
+/// in each round and the wait on tools ([`TurnTiming::breakdown`]). Each call's own time is at
+/// the end of its row. `None` when the frame had nothing to say.
+pub(crate) fn timing_row(
+    message_id: &str,
+    timing: &TurnTiming,
+    open: &HashSet<String>,
+) -> Option<RunRow> {
+    let lines = timing.breakdown();
+    let total = timing
+        .total_line()
+        .or_else(|| (!lines.is_empty()).then(|| "Timing".to_string()))?;
+    let key = timing_key(message_id);
+    Some(RunRow::Timing {
+        open: !lines.is_empty() && open.contains(&key),
+        key,
+        total,
+        lines,
+    })
 }
 
 /// A stretch of a reply with no words in it: the steps the coworker took there, and what it
@@ -94,20 +122,33 @@ pub(crate) enum RunRow {
         open: bool,
         group: Option<String>,
     },
+    /// How long the turn took, under all of it (see [`timing_row`]).
+    Timing {
+        key: String,
+        /// `10s total`, or `Timing` for a frame that had no total.
+        total: String,
+        /// What opening it shows, a line each. None, and the row does not open.
+        lines: Vec<String>,
+        open: bool,
+    },
 }
 
 impl RunRow {
     pub(crate) fn key(&self) -> &str {
         match self {
-            Self::Steps { key, .. } | Self::Step { key, .. } | Self::Thought { key, .. } => key,
+            Self::Steps { key, .. }
+            | Self::Step { key, .. }
+            | Self::Thought { key, .. }
+            | Self::Timing { key, .. } => key,
         }
     }
 
     pub(crate) fn is_open(&self) -> bool {
         match self {
-            Self::Steps { open, .. } | Self::Step { open, .. } | Self::Thought { open, .. } => {
-                *open
-            }
+            Self::Steps { open, .. }
+            | Self::Step { open, .. }
+            | Self::Thought { open, .. }
+            | Self::Timing { open, .. } => *open,
         }
     }
 }
@@ -277,6 +318,8 @@ impl RunLayout {
 const NESTED_INDENT: f32 = 20.0;
 /// Where an opened row's detail starts: under its label, past the chevron and the mark.
 const DETAIL_INDENT: f32 = 34.0;
+/// Where an opened Timing row's lines start: under its label, past the chevron. It has no mark.
+const TIMING_INDENT: f32 = 24.0;
 /// How wide an opened row's detail gets. The column is as wide as it is for words, and a
 /// shell's output read at that width is lines of two hundred characters.
 const DETAIL_MAX: f32 = 640.0;
@@ -386,6 +429,50 @@ pub(crate) fn render_run_row(row: &RunRow, app: Entity<AppState>, cx: &App) -> A
                         .text_sm()
                         .text_color(theme.muted_foreground)
                         .child(text.clone()),
+                )
+                .into_any_element()
+        }
+        RunRow::Timing {
+            key,
+            total,
+            lines,
+            open,
+        } => {
+            let muted = theme.muted_foreground;
+            if lines.is_empty() {
+                // Nothing more to open: the total is a line, not a control.
+                return div()
+                    .px(px(6.))
+                    .py(px(3.))
+                    .text_xs()
+                    .text_color(muted)
+                    .child(total.clone())
+                    .into_any_element();
+            }
+            let head = heading(
+                key,
+                *open,
+                None,
+                total.clone(),
+                Toggle::row(key, *open, &None),
+                app,
+                cx,
+            )
+            .text_xs();
+            if !*open {
+                return head.into_any_element();
+            }
+            v_flex()
+                .w_full()
+                .gap(px(2.))
+                .child(head)
+                .child(
+                    v_flex()
+                        .pl(px(TIMING_INDENT))
+                        .gap(px(1.))
+                        .text_xs()
+                        .text_color(muted)
+                        .children(lines.iter().map(|line| div().child(line.clone()))),
                 )
                 .into_any_element()
         }
