@@ -1295,6 +1295,7 @@ fn tool_call_start(frame: &Value) -> Check {
             arguments: String::new(),
             result: None,
             ok: None,
+            took_ms: None,
         })],
         Drawn::Widget | Drawn::UserForm => Vec::new(),
     };

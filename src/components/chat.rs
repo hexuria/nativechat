@@ -498,7 +498,12 @@ fn snapshot_rows(state: &AppState) -> Arc<Vec<ChatRow>> {
         } else {
             vec![ChatPart::Text(msg.content.clone())]
         };
-        let runs = RunLayout::new(&msg.id, &display, &state.expanded_steps);
+        let runs = RunLayout::new(
+            &msg.id,
+            &display,
+            &state.expanded_steps,
+            state.show_turn_timing,
+        );
         let mut text_buf = String::new();
         let mut ui_n = 0usize;
         let mut text_n = 0usize;
@@ -2112,7 +2117,16 @@ mod tests {
             arguments: format!("{{\"command\":\"echo {call_id}\"}}"),
             result: result.map(|(content, _)| content.to_string()),
             ok: result.map(|(_, ok)| ok),
+            took_ms: None,
         })
+    }
+
+    /// A step that came back, timed by this app or not.
+    fn timed_step(call_id: &str, took_ms: Option<u64>) -> ChatPart {
+        let ChatPart::Step(step) = step(call_id, Some(("ok", true))) else {
+            unreachable!("a step");
+        };
+        ChatPart::Step(StepSpec { took_ms, ..step })
     }
 
     fn one_reply(parts: Vec<ChatPart>) -> AppState {
@@ -2156,12 +2170,19 @@ mod tests {
                     ..
                 }) => format!("{count} steps {} {}", status.mark(), open_word(*open)),
                 Some(RunRow::Step {
-                    step, open, group, ..
+                    step,
+                    open,
+                    group,
+                    took,
+                    ..
                 }) => format!(
-                    "{}step {} {}",
+                    "{}step {} {}{}",
                     if group.is_some() { "  " } else { "" },
                     step.call_id,
-                    open_word(*open)
+                    open_word(*open),
+                    took.as_ref()
+                        .map(|took| format!(" · {took}"))
+                        .unwrap_or_default()
                 ),
                 Some(RunRow::Thought { open, group, .. }) => format!(
                     "{}thought {}",
@@ -2255,6 +2276,45 @@ mod tests {
         );
         let rows = snapshot_rows(&state);
         assert!(rows.last().is_some_and(|row| row.status_failed));
+    }
+
+    /// With Settings → Show turn timing on, each call this app timed says how long its answer
+    /// took at the end of its own row, and a call it could not time says nothing rather than a
+    /// guess. With the setting off, no row says it.
+    #[test]
+    fn each_call_s_time_is_at_the_end_of_its_own_row() {
+        let mut state = one_reply(vec![
+            ChatPart::Text("Let me look.".into()),
+            timed_step("c1", Some(1000)),
+            ChatPart::Text("Now the other one.".into()),
+            timed_step("c2", None),
+            ChatPart::Text("Done.".into()),
+        ]);
+        assert_eq!(
+            feed(&state),
+            vec![
+                "words Let me look.",
+                "step c1 shut",
+                "words Now the other one.",
+                "step c2 shut",
+                "words Done.",
+            ],
+            "the setting is off"
+        );
+        state.show_turn_timing = true;
+        assert_eq!(
+            feed(&state),
+            vec![
+                "words Let me look.",
+                "step c1 shut · 1s",
+                "words Now the other one.",
+                "step c2 shut",
+                "words Done.",
+            ]
+        );
+        // Open, it still says it: the time is on the line, not in what opening shows.
+        state.mark_steps_open(&[step_key("m1", "c1")], true);
+        assert_eq!(feed(&state)[1], "step c1 open · 1s");
     }
 
     /// Opening a row in the middle of the thread replaces only the rows that changed, so the

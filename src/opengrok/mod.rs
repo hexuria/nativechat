@@ -26,11 +26,11 @@ pub use credential::{
 pub(crate) use gen_ui::capped;
 pub use gen_ui::{
     ApprovalSpec, BarChartSpec, BarItem, ChatPart, ChoiceCard, CompletedUiTool, FormField,
-    FormSpec, LocalExecResolution, MAX_TURN_CONTINUES, ScreenshotSpec, StepSpec, StepStatus,
-    TurnAssembler, UI_TOOL_RESULT, USER_MACHINE_SHELL, UiSpec, agui_tools, approval_from_event,
-    approval_summary, choice_index, choice_letter, collapse_open_approvals, command_from_args,
-    command_from_replay_events, local_exec_outcome, persons_messages,
-    place_hitl_cards_in_document_order, policy_answer,
+    FormSpec, FrameArrivals, LocalExecResolution, MAX_TURN_CONTINUES, ScreenshotSpec, StepSpec,
+    StepStatus, TurnAssembler, UI_TOOL_RESULT, USER_MACHINE_SHELL, UiSpec, agui_tools,
+    approval_from_event, approval_summary, choice_index, choice_letter, collapse_open_approvals,
+    command_from_args, command_from_replay_events, keep_call_times, local_exec_outcome,
+    persons_messages, place_hitl_cards_in_document_order, policy_answer,
 };
 pub use local_exec::{enrol_this_machine, serve_local_exec, stored_machine_id};
 pub(crate) use user_form::USER_FORM_REASON;
