@@ -56,6 +56,9 @@ pub struct MessageBubble {
     timestamps_ok: bool,
     /// Held until the thread is idle: a small "Queued" under the bubble says so.
     queued: bool,
+    /// Held by the server until a Mac holds the relay again: the queued line says it waits for
+    /// the person's Mac instead.
+    waiting_for_mac: bool,
     /// The files the person's message carried (#90), drawn under its words. A message of files
     /// alone draws only them, with the same time, toolbar and queued line a worded one has
     /// (#136).
@@ -95,6 +98,7 @@ impl MessageBubble {
             ts_peek: 0.0,
             timestamps_ok: true,
             queued: false,
+            waiting_for_mac: false,
             files: Vec::new(),
             source_badge: None,
             app: None,
@@ -258,6 +262,11 @@ impl MessageBubble {
 
     pub fn queued(mut self, queued: bool) -> Self {
         self.queued = queued;
+        self
+    }
+
+    pub fn waiting_for_mac(mut self, waiting: bool) -> Self {
+        self.waiting_for_mac = waiting;
         self
     }
 
@@ -479,7 +488,7 @@ impl RenderOnce for MessageBubble {
                                 .text_xs()
                                 .text_color(muted)
                                 .when(is_me, |this| this.text_right())
-                                .child("Queued — sends when the coworker is free"),
+                                .child(queued_line(self.waiting_for_mac)),
                         )
                         .when_some(actions, |this, actions| this.child(actions)),
                 )
@@ -786,6 +795,19 @@ fn find_highlighted_text(text: &str, marks: &[(std::ops::Range<usize>, bool)]) -
     div().text_sm().child(body).into_any_element()
 }
 
+/// The line under a held message: it sends when the coworker is free, or, while the server holds
+/// it for the person's Mac (`heldFor: "relay_offline"`, opengrok-server #292), when their Mac is
+/// answering again.
+pub(crate) fn queued_line(waiting_for_mac: bool) -> &'static str {
+    if waiting_for_mac {
+        WAITING_FOR_YOUR_MAC
+    } else {
+        "Queued — sends when the coworker is free"
+    }
+}
+
+pub(crate) const WAITING_FOR_YOUR_MAC: &str = "Waiting for your Mac";
+
 /// Cancel and Edit under a queued bubble, so they do not wait on hovering the ⋯.
 fn queued_hold_actions(
     source_id: String,
@@ -884,5 +906,23 @@ pub(crate) fn human_size(bytes: u64) -> String {
         format!("{:.0} KB", b / KIB)
     } else {
         format!("{:.1} MB", b / KIB / KIB)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    // Item by item rather than a glob: `use super::*` would drag in gpui_kit's own `test`.
+    use super::{WAITING_FOR_YOUR_MAC, queued_line};
+
+    /// A held message says what it waits for: the coworker to be free, or, while the server
+    /// holds it for the person's Mac, their Mac.
+    #[test]
+    fn a_held_message_says_what_it_waits_for() {
+        assert_eq!(
+            queued_line(false),
+            "Queued — sends when the coworker is free"
+        );
+        assert_eq!(queued_line(true), WAITING_FOR_YOUR_MAC);
+        assert_eq!(WAITING_FOR_YOUR_MAC, "Waiting for your Mac");
     }
 }

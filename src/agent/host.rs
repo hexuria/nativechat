@@ -387,6 +387,16 @@ pub mod ids {
         reply_source::relay_model_id(model)
     }
 
+    /// Beside the line of a turn the person's Mac could not answer: the turn again, on the
+    /// server's paid keys.
+    pub const RUN_ERROR_SEND_ON_SERVER: &str = crate::components::chat::SEND_ON_SERVER;
+
+    /// A held message the server holds until a Mac holds the relay again, by its bubble's id,
+    /// under `composer-queued`.
+    pub fn queued_waiting(message_id: &str) -> String {
+        format!("queued-waiting-{message_id}")
+    }
+
     /// One of the radio's two choices, by the door's wire word.
     pub fn reply_source_kind(kind: crate::opengrok::InferenceKind) -> String {
         reply_source::kind_id(kind)
@@ -871,6 +881,9 @@ pub enum Command {
     ToggleTurnSource,
     /// Settings → Reply source's third row: the person's plan through their Mac.
     PickReplySourceMac,
+    /// Send this reply on Server instead: the turn the person's Mac could not answer, again, on
+    /// the server's paid keys.
+    SendOnServer,
     /// Answer with this Mac: its switch, which acts at once; and opencodex's address and key on
     /// this Mac, and the relay's model, each waiting for Save as on the page.
     SetRelayOn(bool),
@@ -1114,6 +1127,7 @@ impl Command {
             Self::SaveReplySource => state.save_reply_source(cx),
             Self::ToggleTurnSource => state.toggle_turn_source(cx),
             Self::PickReplySourceMac => state.pick_reply_source_mac(cx),
+            Self::SendOnServer => state.send_on_server(cx),
             Self::SetRelayOn(on) => state.set_relay_on(on, cx),
             Self::SetRelayAddress(address) => state.set_relay_address(address, cx),
             Self::SetRelayKey(key) => state.set_relay_key(&key.0, cx),
@@ -2581,6 +2595,11 @@ pub struct NativeChatHost {
     signed_out: Option<String>,
     /// The open thread's last turn did not go through, and the feed is offering it again.
     can_retry_turn: bool,
+    /// The open thread's last turn is one the person's Mac could not answer, and the feed offers
+    /// it again on the server's keys.
+    can_send_on_server: bool,
+    /// The open thread's held messages the server holds for the person's Mac, by bubble id.
+    waiting_for_mac: Vec<String>,
     /// How many routes the Model field can offer, and the server's note about why that is not
     /// more — which is the sentence the person read under the field while the gateway was down.
     model_count: usize,
@@ -2838,6 +2857,8 @@ impl NativeChatHost {
                 .session_banner()
                 .map(|(title, detail)| format!("{title} — {detail}")),
             can_retry_turn: state.retryable_turn().is_some(),
+            can_send_on_server: state.relay_failed_turn().is_some(),
+            waiting_for_mac: state.sends_waiting_for_mac(),
             // What the Bot's Model field offers: the gateway's routes, not the person's plan's.
             model_count: state
                 .model_catalogue
@@ -3397,11 +3418,22 @@ impl NativeChatHost {
                 ));
         }
         if self.queued_sends > 0 {
-            page = page.with_child(UiNode::new(
-                ids::COMPOSER_QUEUED,
-                "status",
-                format!("{} queued", self.queued_sends),
-            ));
+            // Each held message the server holds for the person's Mac says so under it, as its
+            // bubble does.
+            let queued = self.waiting_for_mac.iter().fold(
+                UiNode::new(
+                    ids::COMPOSER_QUEUED,
+                    "status",
+                    format!("{} queued", self.queued_sends),
+                ),
+                |queued, message_id| {
+                    queued.with_child(UiNode::status(
+                        ids::queued_waiting(message_id),
+                        crate::components::message::WAITING_FOR_YOUR_MAC,
+                    ))
+                },
+            );
+            page = page.with_child(queued);
         }
         // What typing produces: the list `/` or `@` opened, the recipe that picking one put on
         // the draft, and the pictures a turn came back with. Each is in the tree only while it
@@ -3556,6 +3588,12 @@ impl NativeChatHost {
         }
         if self.can_retry_turn {
             page = page.with_child(UiNode::button("retry-turn", "Try again"));
+        }
+        if self.can_send_on_server {
+            page = page.with_child(UiNode::button(
+                ids::RUN_ERROR_SEND_ON_SERVER,
+                crate::components::chat::SEND_ON_SERVER_LABEL,
+            ));
         }
         if let Some(question) = &self.computer_confirm {
             page = page.with_child(
@@ -5963,6 +6001,15 @@ impl NativeChatHost {
                 );
             }
             Command::RetryTurn
+        } else if target == ids::RUN_ERROR_SEND_ON_SERVER {
+            if !self.can_send_on_server {
+                return Err(
+                    "there is no turn to send on the server's keys: the open thread's last turn \
+                     is not one the person's Mac could not answer"
+                        .to_string(),
+                );
+            }
+            Command::SendOnServer
         } else if let Some(cmd) = self.reply_run_command(target) {
             cmd?
         } else if let Some(cmd) = self.reply_source_command(target) {
@@ -8595,6 +8642,43 @@ mod tests {
             "`assert --exists false` is how a driver says the app has a session again"
         );
         assert!(tree.find("signed-out-sign-in").is_none());
+    }
+
+    /// A turn the person's Mac could not answer is offered again on the server's keys, and the
+    /// offer is a click a driver can make, only while there is one; each held message the server
+    /// holds for the Mac says so under the queue.
+    #[test]
+    fn a_turn_the_mac_could_not_answer_is_offered_on_the_server_and_a_wait_for_it_is_said() {
+        let mut host = host();
+        assert!(
+            host.snapshot()
+                .find(ids::RUN_ERROR_SEND_ON_SERVER)
+                .is_none()
+        );
+        let refused = host.click(ids::RUN_ERROR_SEND_ON_SERVER).unwrap_err();
+        assert!(refused.contains("person's Mac"), "{refused}");
+        host.can_send_on_server = true;
+        assert_eq!(
+            host.snapshot()
+                .find(ids::RUN_ERROR_SEND_ON_SERVER)
+                .map(|node| node.name.clone())
+                .as_deref(),
+            Some("Send this reply on Server instead")
+        );
+        host.click(ids::RUN_ERROR_SEND_ON_SERVER).unwrap();
+        assert!(matches!(host.take_command(), Some(Command::SendOnServer)));
+
+        host.queued_sends = 2;
+        host.waiting_for_mac = vec!["m_1".into()];
+        let tree = host.snapshot();
+        let queued = tree.find(ids::COMPOSER_QUEUED).unwrap();
+        assert_eq!(queued.name, "2 queued");
+        assert_eq!(
+            tree.find(&ids::queued_waiting("m_1"))
+                .map(|node| node.name.as_str()),
+            Some("Waiting for your Mac")
+        );
+        assert!(tree.find(&ids::queued_waiting("m_2")).is_none());
     }
 
     /// A turn that never left is offered again, and the offer is a click a driver can make.
