@@ -25,6 +25,8 @@
 //!   means to read it, not merely without a panic;
 //! - every route the corpus records has that reading, or is excused in [`REST_NOT_READ`] with
 //!   why this app never asks it;
+//! - a route this app asks before the corpus records it is named in [`REST_NOT_RECORDED_YET`],
+//!   with its reading already waiting, and comes off that list the day its recording arrives;
 //! - the ledger, every wire word this app branches on, is either a word the manifest says the
 //!   server sends or excused in [`NOT_SENT_BY_SERVER`], with the evidence;
 //! - every word the server sends is either in the ledger or excused in [`CLIENT_IGNORES`], so a
@@ -44,11 +46,11 @@ use super::activity::{
     activity_from_replay,
 };
 use super::client::{
-    AnswerReply, AsyncRunResponse, BoxShareScope, CoworkerComputer, CoworkerUsage, DaemonEnrol,
-    DaemonList, LocalExecMode, LocalExecPolicy, OpenGrokClient, QueuedApproval, RecipeDetail,
-    RecipeList, RecipeParameterKind, RecipeRunResult, RunCause, RunReplay, ScheduleKind,
-    ScheduleRow, ScheduleRun, ScheduleRunStarted, ScheduleRunStatus, SkillDetail, SkillSummary,
-    SkillVersion, StopReply, ThreadReplay, ToolListing, host_egress_tunnel_available,
+    AnswerReply, AsyncRunResponse, BoxShareScope, CoworkerCeiling, CoworkerComputer, CoworkerUsage,
+    DaemonEnrol, DaemonList, LocalExecMode, LocalExecPolicy, OpenGrokClient, QueuedApproval,
+    RecipeDetail, RecipeList, RecipeParameterKind, RecipeRunResult, RunCause, RunReplay,
+    ScheduleKind, ScheduleRow, ScheduleRun, ScheduleRunStarted, ScheduleRunStatus, SkillDetail,
+    SkillSummary, SkillVersion, StopReply, ThreadReplay, ToolListing, host_egress_tunnel_available,
     host_egress_tunnel_flag,
 };
 use super::credential::{CREDENTIAL_OFFER_SAVE, SaveLoginSpec};
@@ -510,18 +512,6 @@ const REST_NOT_READ: &[(&str, &str, &str)] = &[
          lands.",
     ),
     (
-        "GET__coworkers__coworker_id__ceiling",
-        "/coworkers/{coworker_id}/ceiling",
-        "A Bot's tool ceiling (opengrok-server#268). This branch does not read it; nativechat#151 does, and takes this entry off when it \
-         lands.",
-    ),
-    (
-        "PUT__coworkers__coworker_id__ceiling",
-        "/coworkers/{coworker_id}/ceiling",
-        "A Bot's tool ceiling (opengrok-server#268). This branch does not read it; nativechat#151 does, and takes this entry off when it \
-         lands.",
-    ),
-    (
         "GET__auth_cursor_dev_session_token",
         "/auth/cursor_dev_session_token",
         "The dev sign-in that stands in for Cursor's OAuth (opengrok-server auth/routes.rs). This \
@@ -623,6 +613,14 @@ const REST_NOT_READ: &[(&str, &str, &str)] = &[
          /local-exec/policy, and no log.",
     ),
 ];
+
+/// Routes this app asks that the corpus does not record yet, by the directory the recorder will
+/// file them under, with the route as the server's router is to write it and where the recording
+/// is to come from. Each already has its reading in [`REST_ROUTES`], held meanwhile to bodies in
+/// the shape agreed with the server, so the recording is read the day it arrives.
+/// [`a_route_asked_before_it_is_recorded_is_on_its_way`] fails that day until the entry comes off,
+/// and fails too for an entry whose route the app no longer asks, so none can linger here.
+const REST_NOT_RECORDED_YET: &[(&str, &str, &str)] = &[];
 
 // ---- the corpus ----
 
@@ -1762,12 +1760,30 @@ fn awaiting(frame: &Value) -> Check {
         let objects: Vec<&Value> = std::iter::once(frame).chain(entry).collect();
         let words: Vec<FormResolution> = objects.iter().copied().filter_map(word).collect();
         let escalated = words.contains(&FormResolution::Escalated);
+        // How an escalation's hand-off ended, stamped on the form's entry once it settles
+        // (#143): any word at all ends it, and none means the computer still needs the person.
+        let handed_off = escalated
+            && objects.iter().any(|object| {
+                object
+                    .get("boxResolution")
+                    .and_then(Value::as_str)
+                    .is_some_and(|word| !word.trim().is_empty())
+            });
         let dismissed = !escalated && objects.iter().copied().any(flag);
-        let settled = !escalated && (!words.is_empty() || dismissed);
+        let settled = handed_off || (!escalated && (!words.is_empty() || dismissed));
         if escalated {
+            let computer = spec.computer_handoff;
             must!(
-                spec.computer_handoff == Some(ComputerHandoffStatus::ActionNeeded),
-                "an escalated form hands the page to the computer: {spec:?}"
+                if handed_off {
+                    matches!(
+                        computer,
+                        Some(ComputerHandoffStatus::Done | ComputerHandoffStatus::Skipped)
+                    )
+                } else {
+                    computer == Some(ComputerHandoffStatus::ActionNeeded)
+                },
+                "an escalated form hands the page to the computer until the hand-off ends: \
+                 {spec:?}"
             );
         }
         must!(
@@ -1951,9 +1967,32 @@ fn settled_form(frame: &Value) -> Check {
     let word = str_at(frame, "formResolution");
     let resolution = FormResolution::parse(word);
     if resolution == FormResolution::Escalated {
+        // Once the hand-off ends, the server stamps the form's entry with the box's word
+        // (opengrok-server #277, #143), read the way the live answer paints it; until then the
+        // Computer card beside the form is live.
+        let ended = [
+            frame.get("boxResolution"),
+            frame.pointer("/value/boxResolution"),
+        ]
+        .into_iter()
+        .flatten()
+        .find_map(Value::as_str)
+        .filter(|word| !word.trim().is_empty());
+        let expected = match ended {
+            None => (None, ComputerHandoffStatus::ActionNeeded),
+            Some("handed_back") => (Some(FormResolution::Dismissed), ComputerHandoffStatus::Done),
+            Some("declined" | "timed_out") => (
+                Some(FormResolution::Skipped),
+                ComputerHandoffStatus::Skipped,
+            ),
+            Some(_) => (
+                Some(FormResolution::Dismissed),
+                ComputerHandoffStatus::Skipped,
+            ),
+        };
         must!(
-            spec.computer_handoff == Some(ComputerHandoffStatus::ActionNeeded),
-            "escalated is a live Computer card beside the form: {spec:?}"
+            (spec.effective_resolution(), spec.computer_handoff) == (expected.0, Some(expected.1)),
+            "escalated, then {ended:?}, should read as {expected:?}: {spec:?}"
         );
     } else {
         must!(
@@ -2050,6 +2089,9 @@ const REST_ROUTES: &[(&str, RestCheck)] = &[
     ("PATCH__coworkers__coworker_id_", coworker_row),
     ("DELETE__coworkers__coworker_id_", coworker_deleted),
     ("GET__coworkers__coworker_id__tools", coworker_tools),
+    // Not recorded yet: see REST_NOT_RECORDED_YET.
+    ("GET__coworkers__coworker_id__ceiling", coworker_ceiling),
+    ("PUT__coworkers__coworker_id__ceiling", coworker_ceiling),
     ("GET__coworkers__coworker_id__usage", coworker_usage),
     ("GET__coworkers__coworker_id__computer", computer),
     ("GET__coworkers__coworker_id__screen", screen),
@@ -2103,6 +2145,8 @@ const REFUSALS: &[(&str, RestCheck)] = &[
     ("POST__ag-ui", turn_refused),
     ("DELETE__coworkers__coworker_id_", coworker_delete_refused),
     ("GET__coworkers__coworker_id__tools", tools_refused),
+    ("GET__coworkers__coworker_id__ceiling", tools_refused),
+    ("PUT__coworkers__coworker_id__ceiling", tools_refused),
     ("POST__ag-ui_user-form_submit", form_refused),
     ("POST__ag-ui_user-form_dismiss", form_refused),
     ("POST__ag-ui_box-handoff_resolve", handoff_refused),
@@ -2372,8 +2416,9 @@ fn coworker_delete_refused(status: u16, body: &Value) -> Check {
     refusal(status, body)
 }
 
-/// A refused tool listing is the server's sentence, and the app reads it as a refusal (a 404 is
-/// "not this person's bot"), so one must never read as a list.
+/// A refused tool listing, or a refused read or write of a ceiling, is the server's sentence, and
+/// the app reads it as a refusal (a 404 is "not this person's bot"; a 422 names what a write asked
+/// for that the server does not list), so one must never read as a list.
 fn tools_refused(status: u16, body: &Value) -> Check {
     must!(
         body.get("tools").is_none(),
@@ -3271,6 +3316,44 @@ fn coworker_tools(_: u16, body: &Value) -> Check {
     Ok(())
 }
 
+/// A bot's tool ceiling (opengrok-server#268), read or as a write's answer: every row comes
+/// through by the name a `PUT` names it by, with its kind, whether it is enabled and whether it is
+/// available, and the words, label and connector the Tools card draws; and the version a switch
+/// sends back, exactly, or none from a server older than it. A row that does not say whether it is
+/// enabled cannot be sent back as it stands, so the parse refuses it; one that drops its kind is
+/// caught here rather than filed with the plugins.
+fn coworker_ceiling(_: u16, body: &Value) -> Check {
+    let ceiling: CoworkerCeiling = parse(body)?;
+    must!(
+        ceiling.version == body["version"].as_i64(),
+        "the version should come through as sent: {:?} from {}",
+        ceiling.version,
+        body["version"]
+    );
+    let raw = body["tools"]
+        .as_array()
+        .ok_or("a ceiling should carry a tools array")?;
+    same_len(&ceiling.tools, raw)?;
+    for (row, raw) in ceiling.tools.iter().zip(raw) {
+        let kind = str_at(raw, "kind");
+        must!(
+            !kind.is_empty(),
+            "each row should say what kind it is: {raw}"
+        );
+        must!(
+            row.name == str_at(raw, "name")
+                && row.is_builtin() == (kind == "builtin")
+                && Some(row.enabled) == raw["enabled"].as_bool()
+                && row.is_available() == (raw["available"].as_bool() != Some(false))
+                && row.label.as_deref() == opt_str(raw, "label")
+                && row.description.as_deref() == opt_str(raw, "description")
+                && row.connector.as_deref() == opt_str(raw, "connector"),
+            "each row should come through as sent: {row:?} from {raw}"
+        );
+    }
+    Ok(())
+}
+
 /// A coworker's computer (`coworker_computer`), which the Computer pane and the tunnel's chrome
 /// are drawn from: whose box it is and where it is shared, its state and its screen, the
 /// person's standing answer to the tunnel's card, and the tunnel's own readiness. A share scope
@@ -3741,6 +3824,17 @@ fn the_ledger_reads_a_park_settlement_as_the_client_does() {
         park(Value::Null, Value::Null),
         // Another spelling of the escalation, as the client's parse reads it.
         park(Value::from("Escalated"), serde_json::json!({"id": "e_1"})),
+        // The hand-off ended (#143): stamped on the entry, and on the frame beside it.
+        park(
+            Value::from("escalated"),
+            serde_json::json!({"id": "e_1", "formResolution": "escalated",
+                "widgetDismissed": true, "boxResolution": "handed_back"}),
+        ),
+        park(
+            Value::from("escalated"),
+            serde_json::json!({"id": "e_1", "formResolution": "escalated",
+                "boxResolution": "declined"}),
+        ),
         // Another card's entry, matched by title and fields: it settles nothing here.
         park(
             Value::Null,
@@ -3753,6 +3847,64 @@ fn the_ledger_reads_a_park_settlement_as_the_client_does() {
     ] {
         awaiting(&frame).unwrap_or_else(|problem| panic!("{problem}: {frame}"));
     }
+}
+
+/// #143 against the server's own recordings: every recorded replay whose form frames carry how
+/// the hand-off ended (handed back, declined, timed out; on the park alone for a form escalated
+/// after its run stopped; read from the run's answer for one settled before the server stamped
+/// forms) leaves nothing waiting on the person. A replay taken while the hand-off was still live
+/// carries no word and is left to the other checks.
+#[test]
+fn a_replayed_hand_off_that_ended_leaves_nothing_waiting() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/wire/rest");
+    let mut ended = BTreeSet::new();
+    for route in ["GET__ag-ui_runs__run_id_", "GET__ag-ui_threads__thread_id_"] {
+        let Ok(files) = std::fs::read_dir(root.join(route)) else {
+            continue;
+        };
+        for file in files.flatten() {
+            let text = std::fs::read_to_string(file.path()).expect("a recording");
+            let fixture: Value = serde_json::from_str(&text).expect("a recording");
+            let body = &fixture["body"];
+            let runs: Vec<&Value> = match body.get("runs").and_then(Value::as_array) {
+                Some(runs) => runs.iter().collect(),
+                None => vec![body],
+            };
+            for run in runs {
+                let events: Vec<&Value> = run["events"]
+                    .as_array()
+                    .map(|events| events.iter().collect())
+                    .unwrap_or_default();
+                let said = events.iter().any(|frame| {
+                    [
+                        frame.get("boxResolution"),
+                        frame.pointer("/value/boxResolution"),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .any(|word| word.as_str().is_some_and(|word| !word.is_empty()))
+                });
+                if !said {
+                    continue;
+                }
+                let assembler = assembled(&events);
+                let (_, parts) = assembler.snapshot();
+                let name = file.file_name().to_string_lossy().into_owned();
+                assert!(
+                    !assembler.waiting_user_form(),
+                    "{route}/{name}: a hand-off that ended leaves nothing waiting: {parts:?}"
+                );
+                ended.insert(name);
+            }
+        }
+    }
+    // The recordings of opengrok-server #277: hand-back, declined, timed out, the park-only case
+    // and the backfill (a form settled before the stamp, its end read from its run's answer).
+    // Fewer means the corpus lost the case this test is about.
+    assert!(
+        ended.len() >= 5,
+        "the recorded hand-offs that ended: {ended:?}"
+    );
 }
 
 /// Every frame goes through the code that handles its type and name, and comes out the way this
@@ -4412,4 +4564,118 @@ fn a_coworker_rows_effort_has_a_reading_in_the_ledger() {
         }),
     )
     .unwrap();
+}
+
+/// A route the app asks before the corpus records it is on its way rather than forgotten: its
+/// reading is waiting in [`REST_ROUTES`], the shipped source asks it ([`source_asks`]) under the
+/// route the recorder will file it by, and it says where its recording is to come from. The day
+/// the corpus holds it, this fails until the entry comes off, and its recording is read like
+/// every other; an entry for a route the app has stopped asking fails too.
+#[test]
+fn a_route_asked_before_it_is_recorded_is_on_its_way() {
+    let corpus = Corpus::load();
+    let recorded: BTreeSet<&str> = corpus
+        .bodies
+        .keys()
+        .filter_map(|file| file.split('/').nth(1))
+        .collect();
+    let mut problems = Vec::new();
+    for (route, pattern, why) in REST_NOT_RECORDED_YET {
+        if recorded.contains(route) {
+            problems.push(format!(
+                "the corpus records {route} now: take it off REST_NOT_RECORDED_YET"
+            ));
+        }
+        if !REST_ROUTES.iter().any(|(dir, _)| dir == route) {
+            problems.push(format!(
+                "{route} is asked before it is recorded and has no reading in REST_ROUTES"
+            ));
+        }
+        if REST_NOT_READ.iter().any(|(dir, _, _)| dir == route) {
+            problems.push(format!(
+                "{route} is excused as never asked and listed as asked at once"
+            ));
+        }
+        if why.trim().is_empty() {
+            problems.push(format!("REST_NOT_RECORDED_YET gives no reason for {route}"));
+        }
+        let method = route.split('_').next().unwrap_or("");
+        let filed = format!("{method}_{}", pattern.replace(['/', '{', '}'], "_"));
+        if filed != *route {
+            problems.push(format!(
+                "REST_NOT_RECORDED_YET names {route} as {method} {pattern}, which the recorder \
+                 files as {filed}"
+            ));
+        }
+        if source_asks(method, pattern).is_empty() {
+            problems.push(format!(
+                "the app does not ask {method} {pattern}: take {route} off REST_NOT_RECORDED_YET"
+            ));
+        }
+    }
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
+}
+
+/// The ceiling's reading, fed bodies in the shape agreed for opengrok-server#268 until the
+/// server's own are recorded, for the read and for the write's answer alike: builtins and a
+/// plugin, `user_machine_shell` unavailable and a plugin the server no longer loads with nothing
+/// but its name, at a version and at none, an empty ceiling, the refusals (not the owner's, a
+/// name it does not list, a version it has moved on from, no grant to change), and the ways a
+/// body could go wrong.
+#[test]
+fn a_bots_ceiling_has_a_reading_in_the_ledger() {
+    use serde_json::json;
+    for (route, verb) in [
+        ("GET__coworkers__coworker_id__ceiling", "GET"),
+        ("PUT__coworkers__coworker_id__ceiling", "PUT"),
+    ] {
+        let read = |status: u16, body: Value| {
+            read_fixture(
+                route,
+                &json!({
+                    "method": verb, "path": "/coworkers/cw_1/ceiling", "status": status, "body": body
+                }),
+            )
+        };
+        let ceiling = json!({"tools": [
+            {"name": "shell", "kind": "builtin", "enabled": true, "description": "Run a shell command."},
+            {"name": "user_machine_shell", "kind": "builtin", "enabled": false, "available": false},
+            {
+                "name": "gmail", "kind": "plugin", "enabled": true, "label": "Gmail",
+                "description": "Read and send mail.", "connector": "gmail"
+            },
+            {"name": "old_crm", "kind": "plugin", "enabled": true, "available": false}
+        ], "version": 7});
+        read(200, ceiling.clone()).unwrap_or_else(|why| panic!("{verb}: {why}"));
+        read(200, json!({"tools": []})).unwrap_or_else(|why| panic!("{verb}: {why}"));
+        read(200, json!({"tools": [], "version": 0})).unwrap_or_else(|why| panic!("{verb}: {why}"));
+        read(404, json!({"error": "no such coworker"}))
+            .unwrap_or_else(|why| panic!("{verb}: {why}"));
+        read(422, json!({"error": "no tool or plugin named nope"}))
+            .unwrap_or_else(|why| panic!("{verb}: {why}"));
+        read(
+            409,
+            json!({"error": "the tools changed since you looked", "code": "ceiling-changed"}),
+        )
+        .unwrap_or_else(|why| panic!("{verb}: {why}"));
+        read(403, json!({"error": "no grant to change"}))
+            .unwrap_or_else(|why| panic!("{verb}: {why}"));
+        assert!(
+            read(404, ceiling).is_err(),
+            "{verb}: a refusal carrying a ceiling"
+        );
+        assert!(read(200, json!({})).is_err(), "{verb}: no tools array");
+        assert!(
+            read(
+                200,
+                json!({"tools": [{"name": "shell", "kind": "builtin"}]})
+            )
+            .is_err(),
+            "{verb}: a row that does not say whether it is enabled"
+        );
+        assert!(
+            read(200, json!({"tools": [{"name": "shell", "enabled": true}]})).is_err(),
+            "{verb}: a row that drops its kind"
+        );
+    }
 }

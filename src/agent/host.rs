@@ -1,7 +1,10 @@
 use gpui_agent::prelude::*;
 use gpui_agent::{DispatchResult, virtual_unavailable};
 
-use crate::components::agent_settings::{effort_choices, effort_label, tools_summary};
+use crate::components::agent_settings::{
+    CeilingCardLine, ShownCeilingRow, ceiling_card_lines, ceiling_line, effort_choices,
+    effort_label, offered_without_switches, shown_ceiling_rows, tools_summary,
+};
 use crate::components::app_settings::{
     NO_LOCAL_RULES, not_in_effect_line, remove_label, rule_list_title,
 };
@@ -27,8 +30,8 @@ use crate::opengrok::{
 };
 use crate::site_login::{SiteLoginRecord, grouped_logins, login_title};
 use crate::state::{
-    ActiveRecipe, AfterRefusal, AppSettingsTab, AppState, LocalRuleRow, LocalRules, RuleKind,
-    SWITCH_IN_FLIGHT, SkillScope, TaughtSkill, ToolList, WRITING_A_LESSON,
+    ActiveRecipe, AfterRefusal, AppSettingsTab, AppState, CeilingCard, LocalRuleRow, LocalRules,
+    RuleKind, SWITCH_IN_FLIGHT, SkillScope, TaughtSkill, ToolCeiling, ToolList, WRITING_A_LESSON,
 };
 
 pub mod ids {
@@ -320,6 +323,75 @@ pub mod ids {
     pub fn local_rule_error(kind: RuleKind, n: usize) -> String {
         format!("settings-local-rule-error-{}-{n}", kind.word())
     }
+
+    /// The Tools card's line about the open Bot's ceiling: how many rows are allowed, or why
+    /// there are no switches. In the tree only once the server has answered, as on screen.
+    pub const AGENT_CEILING: &str = "agent-ceiling";
+    /// Why every switch on the card is dead for good: the server's words for a 403.
+    pub const AGENT_CEILING_READ_ONLY: &str = "agent-ceiling-read-only";
+    /// Why every switch on the card is dead for now: another Bot's switch, or a read of this
+    /// Bot's ceiling, is with the server.
+    pub const AGENT_CEILING_WAIT: &str = "agent-ceiling-wait";
+    /// What the server said about the last switch, when no row on the card is the one it is
+    /// about.
+    pub const AGENT_CEILING_NOTE: &str = "agent-ceiling-note";
+
+    /// Every id under a row of the card is `agent-ceiling-` and one of these words, then the
+    /// row's name, and none of the card's own ids has one of them there. So no name a plugin can
+    /// have (`read-only`, `why-x`, `switch-x`) makes one id another's, and an id is read back
+    /// into its row by cutting the prefix off.
+    const CEILING_SWITCH: &str = "agent-ceiling-switch-";
+    const CEILING_ROW_LINES: [&str; 3] = [
+        "agent-ceiling-why-",
+        "agent-ceiling-connector-",
+        "agent-ceiling-error-",
+    ];
+
+    /// One row's switch on the Tools card, by the server's name for the row, which is what a
+    /// `PUT` of the ceiling names it by.
+    pub fn ceiling_switch(name: &str) -> String {
+        format!("{CEILING_SWITCH}{name}")
+    }
+
+    /// The row a switch's id is for.
+    pub fn ceiling_switch_row(id: &str) -> Option<&str> {
+        id.strip_prefix(CEILING_SWITCH)
+    }
+
+    /// Under a row the server could not offer: why.
+    pub fn ceiling_why(name: &str) -> String {
+        format!("{}{name}", CEILING_ROW_LINES[0])
+    }
+
+    /// Under a plugin that works through a connection: which.
+    pub fn ceiling_connector(name: &str) -> String {
+        format!("{}{name}", CEILING_ROW_LINES[1])
+    }
+
+    /// Under a row: what the card says about its last switch.
+    pub fn ceiling_error(name: &str) -> String {
+        format!("{}{name}", CEILING_ROW_LINES[2])
+    }
+
+    /// A line on the Tools card rather than a switch: one of the card's own, or one under a row.
+    pub fn is_ceiling_line(id: &str) -> bool {
+        [
+            AGENT_CEILING,
+            AGENT_CEILING_READ_ONLY,
+            AGENT_CEILING_WAIT,
+            AGENT_CEILING_NOTE,
+        ]
+        .contains(&id)
+            || CEILING_ROW_LINES
+                .iter()
+                .any(|prefix| id.starts_with(prefix))
+    }
+
+    /// A row of the read-only list of what the next turn is offered, which the Tools card shows
+    /// where it has no switches.
+    pub fn offered_tool(name: &str) -> String {
+        format!("agent-tool-{name}")
+    }
 }
 
 /// A value the driver hands the app that must not show up in any `{:?}` of a command.
@@ -497,6 +569,11 @@ pub enum Command {
     PickEffort(String),
     /// The bot settings' Save.
     SaveAgentSettings,
+    /// A switch on the Tools card: one row of the open Bot's ceiling on or off, sent at once.
+    SetCeilingTool {
+        name: String,
+        enabled: bool,
+    },
     /// Attach a file to the draft by path, as the + would (#90).
     AttachFile(std::path::PathBuf),
     /// Take a file off the draft by its place, as its ✕ would.
@@ -715,6 +792,7 @@ impl Command {
             Self::ToggleAgentUsage => state.toggle_agent_usage(cx),
             Self::PickEffort(word) => state.pick_effort(word, cx),
             Self::SaveAgentSettings => state.request_agent_save(cx),
+            Self::SetCeilingTool { name, enabled } => state.switch_ceiling_tool(name, enabled, cx),
             Self::AttachFile(path) => state.request_attach(path, cx),
             Self::DetachFile(index) => state.request_detach(index, cx),
             Self::UserFormDismiss { card_key } => {
@@ -1474,32 +1552,100 @@ fn agent_effort_node(effort: &crate::state::EffortControl) -> UiNode {
     menu
 }
 
-/// `agent-tools` (value = the card's second line: counts, "Asking the server…", or why there
-/// is no list), with `agent-tools-toggle` while there are tools to show, and one
-/// `agent-tool-{name}` per tool (value `builtin` / `plugin`, the server's `kind`) visible while
-/// the card is open. Read-only: nothing here chooses a bot's tools.
-fn agent_tools_node(tools: &ToolList, open: bool) -> UiNode {
-    let mut card = UiNode::new("agent-tools", "list", "Tools").with_value(tools_summary(tools));
-    if let ToolList::Listed(all) = tools
-        && !all.is_empty()
-    {
-        card = card.with_child(UiNode::button(
-            "agent-tools-toggle",
-            if open { "Hide" } else { "Show" },
-        ));
-        for tool in all {
-            card = card.with_child(
-                UiNode::listitem(format!("agent-tool-{}", tool.name), tool.name.clone())
-                    .with_value(if tool.is_builtin() {
-                        "builtin"
-                    } else {
-                        "plugin"
-                    })
-                    .with_visible(open),
-            );
-        }
+/// The open Bot's Tools card as its settings draw it: what the next turn is offered, and the
+/// switches of its ceiling (opengrok-server#268).
+struct ToolsCardSnap<'a> {
+    tools: Option<&'a ToolList>,
+    ceiling: Option<&'a CeilingCard>,
+    open: bool,
+}
+
+/// `agent-tools` (value = the card's first line: what the next turn is offered, `Asking the
+/// server…`, or why there is no list), `agent-ceiling` (value = `3 of 8 allowed`, or why there
+/// are no switches; in the tree once the server has answered, as on screen), and while there is
+/// anything to show, `agent-tools-toggle`, with under it, visible while the card is open:
+///
+/// - the card's own lines, as on screen above the switches: `agent-ceiling-read-only` (the
+///   server's words for a 403), `agent-ceiling-wait` (another Bot's switch, or a read of this
+///   one's, is with the server) and `agent-ceiling-note` (the server's words about the last
+///   switch when no row is the one they are about);
+/// - one `agent-ceiling-switch-{name}` per row. A row's node is its switch: named by its heading,
+///   value `builtin` / `plugin`, `checked` where it stands (where it was asked to go while that is
+///   with the server), enabled only while a click would send it, with the states `switching` and
+///   `unavailable`. Under it, as under the row on screen: `agent-ceiling-why-{name}`,
+///   `agent-ceiling-connector-{name}` and `agent-ceiling-error-{name}`;
+/// - where the ceiling could not be read, `agent-tool-{name}` per tool the next turn is offered
+///   instead (value `builtin` / `plugin`), read-only.
+///
+/// Every one of them is made from what the screen draws ([`shown_ceiling_rows`],
+/// [`ceiling_card_lines`], [`offered_without_switches`]), so the two cannot disagree.
+fn agent_tools_node(card: &ToolsCardSnap<'_>) -> UiNode {
+    let mut node = UiNode::new("agent-tools", "list", "Tools");
+    if let Some(tools) = card.tools {
+        node = node.with_value(tools_summary(tools));
     }
-    card
+    if let Some(line) = card
+        .ceiling
+        .and_then(|ceiling| ceiling_line(&ceiling.ceiling, ceiling.pending.as_ref()))
+    {
+        node = node.with_child(UiNode::status(ids::AGENT_CEILING, "Allowed").with_value(line));
+    }
+    let rows = card.ceiling.map(shown_ceiling_rows).unwrap_or_default();
+    let offered = offered_without_switches(card.ceiling, card.tools);
+    if rows.is_empty() && offered.is_empty() {
+        return node;
+    }
+    node = node.with_child(UiNode::button(
+        "agent-tools-toggle",
+        if card.open { "Hide" } else { "Show" },
+    ));
+    for line in card.ceiling.map(ceiling_card_lines).unwrap_or_default() {
+        let (id, words) = match line {
+            CeilingCardLine::ReadOnly(words) => (ids::AGENT_CEILING_READ_ONLY, words),
+            CeilingCardLine::Wait(words) => (ids::AGENT_CEILING_WAIT, words),
+            CeilingCardLine::Note(words) => (ids::AGENT_CEILING_NOTE, words),
+        };
+        node = node.with_child(UiNode::status(id, words).with_visible(card.open));
+    }
+    for row in &rows {
+        node = node.with_child(ceiling_switch_node(row).with_visible_deep(card.open));
+    }
+    for tool in offered {
+        node = node.with_child(
+            UiNode::listitem(ids::offered_tool(&tool.name), tool.name.clone())
+                .with_value(if tool.is_builtin() {
+                    "builtin"
+                } else {
+                    "plugin"
+                })
+                .with_visible(card.open),
+        );
+    }
+    node
+}
+
+fn ceiling_switch_node(row: &ShownCeilingRow) -> UiNode {
+    let mut node = UiNode::new(ids::ceiling_switch(&row.name), "switch", row.title.clone())
+        .with_value(if row.builtin { "builtin" } else { "plugin" })
+        .with_checked(row.on)
+        .with_enabled(row.live);
+    if row.switching {
+        node.states.push("switching".to_string());
+    }
+    if let Some(why) = row.unavailable {
+        node.states.push("unavailable".to_string());
+        node = node.with_child(UiNode::status(ids::ceiling_why(&row.name), why));
+    }
+    if let Some(note) = &row.connector {
+        node = node.with_child(UiNode::note(
+            ids::ceiling_connector(&row.name),
+            note.clone(),
+        ));
+    }
+    if let Some(words) = &row.note {
+        node = node.with_child(UiNode::status(ids::ceiling_error(&row.name), words.clone()));
+    }
+    node
 }
 
 fn user_form_node(form: &UserFormSnap) -> UiNode {
@@ -2004,6 +2150,8 @@ pub struct NativeChatHost {
     agent_settings_open: bool,
     /// The open bot's tools as its settings list them, and whether the card is open to them.
     agent_tools: Option<crate::state::ToolList>,
+    /// The open Bot's ceiling as its Tools card draws it: see [`AppState::ceiling_card`].
+    agent_ceiling: Option<CeilingCard>,
     /// The open bot's usage this month, as its settings' Usage card shows it (#138).
     agent_usage: Option<crate::state::UsageReport>,
     agent_usage_open: bool,
@@ -2205,6 +2353,7 @@ impl NativeChatHost {
                 .as_ref()
                 .filter(|(owner, _)| state.active_coworker_id.as_deref() == Some(owner.as_str()))
                 .map(|(_, list)| list.clone()),
+            agent_ceiling: state.ceiling_card(),
             agent_tools_open: state.agent_tools_open,
             agent_usage_open: state.agent_usage_open,
             agent_usage: state
@@ -2968,8 +3117,12 @@ impl NativeChatHost {
         if let Some(effort) = &self.agent_effort {
             settings = settings.with_child(agent_effort_node(effort));
         }
-        if let Some(tools) = &self.agent_tools {
-            settings = settings.with_child(agent_tools_node(tools, self.agent_tools_open));
+        if self.agent_tools.is_some() || self.agent_ceiling.is_some() {
+            settings = settings.with_child(agent_tools_node(&ToolsCardSnap {
+                tools: self.agent_tools.as_ref(),
+                ceiling: self.agent_ceiling.as_ref(),
+                open: self.agent_tools_open,
+            }));
         }
         if let Some(usage) = &self.agent_usage {
             // `agent-usage` (value = the card's second line), with `agent-usage-toggle` while
@@ -4120,6 +4273,77 @@ impl NativeChatHost {
         }))
     }
 
+    /// Whether the Tools card has anything to show when it is opened: switches, or the read-only
+    /// list of what the next turn is offered where the ceiling could not be read.
+    fn tools_card_has_rows(&self) -> bool {
+        self.agent_ceiling
+            .as_ref()
+            .is_some_and(|card| !shown_ceiling_rows(card).is_empty())
+            || !offered_without_switches(self.agent_ceiling.as_ref(), self.agent_tools.as_ref())
+                .is_empty()
+    }
+
+    /// A click on `agent-ceiling-switch-{name}`: that row's switch, moved the other way, which is
+    /// what a person's click does. Only where a person could click it — the settings open, the
+    /// card open to its rows — and only while the screen draws it live: not while the card is
+    /// blocked (a switch with the server, whichever Bot's; a read of this Bot's ceiling; the
+    /// server's 403), and never to switch back on a plugin the server no longer loads. Each of
+    /// those says which it was, and a card with no switches says why it has none.
+    fn ceiling_command(&self, target: &str) -> Result<Command, String> {
+        if !self.agent_settings_open {
+            return Err(format!(
+                "`{target}` is in the bot's settings, which are closed"
+            ));
+        }
+        let Some(name) = ids::ceiling_switch_row(target) else {
+            return Err(if ids::is_ceiling_line(target) {
+                format!("`{target}` is a line on the Tools card, not a switch")
+            } else {
+                format!("no switch `{target}` on this Bot's Tools card")
+            });
+        };
+        let Some(card) = &self.agent_ceiling else {
+            return Err(format!(
+                "`{target}` is not on screen: this Bot's tools have not been asked for"
+            ));
+        };
+        let read = match &card.ceiling {
+            ToolCeiling::Read(read) => read,
+            ToolCeiling::Loading => {
+                return Err(format!(
+                    "`{target}` is not on screen yet: this Bot's tools are still being read"
+                ));
+            }
+            ToolCeiling::Unavailable(why) => {
+                return Err(format!(
+                    "`{target}` is not on screen: the Tools card has no switches, because: {why}"
+                ));
+            }
+        };
+        let rows = shown_ceiling_rows(card);
+        let Some(row) = rows.iter().find(|row| row.name == name) else {
+            return Err(format!("no switch `{target}` on this Bot's Tools card"));
+        };
+        if !self.agent_tools_open {
+            return Err(format!(
+                "`{target}` is on the Tools card, which is shut: open it with \
+                 `agent-tools-toggle`"
+            ));
+        }
+        let enabled = !row.on;
+        read.may_switch(&row.name, enabled, card.blocked.as_ref())
+            .map_err(|why| {
+                format!(
+                    "`{target}` cannot be switched {}: {why}",
+                    if enabled { "on" } else { "off" }
+                )
+            })?;
+        Ok(Command::SetCeilingTool {
+            name: row.name.clone(),
+            enabled,
+        })
+    }
+
     fn click(&mut self, target: &str) -> Result<DispatchResult, String> {
         let cmd = if target == ids::NAV_NEW_CHAT || target == "create-first-bot" {
             Command::NewChat
@@ -4137,12 +4361,19 @@ impl NativeChatHost {
             }
             Command::BackToBotChat
         } else if target == "agent-tools-toggle" {
-            if !matches!(&self.agent_tools, Some(ToolList::Listed(all)) if !all.is_empty()) {
+            if !self.agent_settings_open {
                 return Err(
-                    "`agent-tools-toggle` is only there while the bot has tools listed".into(),
+                    "`agent-tools-toggle` is in the bot's settings, which are closed".into(),
+                );
+            }
+            if !self.tools_card_has_rows() {
+                return Err(
+                    "`agent-tools-toggle` is only there while the bot has tools to show".into(),
                 );
             }
             Command::ToggleAgentTools
+        } else if target.starts_with(ids::AGENT_CEILING) {
+            self.ceiling_command(target)?
         } else if target == "agent-usage-toggle" {
             if !self.agent_settings_open {
                 return Err(
@@ -8647,18 +8878,63 @@ mod tests {
         assert_eq!(plan.keys, vec!["b"]);
     }
 
-    /// The bot's tools are on the tree as its settings show them: the count always, the rows
-    /// only while the card is open, and the toggle only while there is something to show.
+    /// A ceiling as the server gives it: `shell` on, `read_file` off, `user_machine_shell` off
+    /// with no machine to run it, the Gmail plugin off, and `old_crm` a plugin the server no
+    /// longer loads, still on.
+    fn a_ceiling() -> crate::state::CeilingRead {
+        crate::state::CeilingRead {
+            rows: serde_json::from_value(serde_json::json!([
+                {"name": "shell", "kind": "builtin", "enabled": true,
+                    "description": "Run a shell command."},
+                {"name": "read_file", "kind": "builtin", "enabled": false},
+                {"name": "user_machine_shell", "kind": "builtin", "enabled": false,
+                    "available": false},
+                {"name": "gmail", "kind": "plugin", "enabled": false, "label": "Gmail",
+                    "connector": "gmail"},
+                {"name": "old_crm", "kind": "plugin", "enabled": true, "available": false}
+            ]))
+            .unwrap(),
+            version: Some(3),
+        }
+    }
+
+    /// The Tools card for `ceiling`, with nothing with the server and nothing said.
+    fn ceiling_card(ceiling: ToolCeiling) -> CeilingCard {
+        CeilingCard {
+            ceiling,
+            pending: None,
+            blocked: None,
+            note: None,
+        }
+    }
+
+    fn switched(host: &mut NativeChatHost, target: &str) -> (String, bool) {
+        host.dispatch(&Op::click(target)).unwrap();
+        match host.take_command() {
+            Some(Command::SetCeilingTool { name, enabled }) => (name, enabled),
+            other => panic!("expected a switch from {target}, got {other:?}"),
+        }
+    }
+
+    /// The bot's Tools card is on the tree as its settings draw it: what the next turn is offered
+    /// always, the ceiling's line once the server has answered it, the switches only while the
+    /// card is open, and the toggle only while there is something to show. Where the ceiling
+    /// could not be read, what the next turn is offered is listed instead, read-only.
     #[test]
     fn a_bots_tools_are_on_the_tree_and_open_from_it() {
         use crate::opengrok::CoworkerTool;
         let mut host = host();
         host.agent_settings_open = true;
         host.agent_tools = Some(ToolList::Loading);
+        host.agent_ceiling = Some(ceiling_card(ToolCeiling::Loading));
         let tree = host.snapshot();
         assert_eq!(
             tree.find("agent-tools").unwrap().value.as_deref(),
             Some("Asking the server…")
+        );
+        assert!(
+            tree.find(ids::AGENT_CEILING).is_none(),
+            "nothing is said about the ceiling until the server has answered, as on screen"
         );
         assert!(host.dispatch(&Op::click("agent-tools-toggle")).is_err());
 
@@ -8674,21 +8950,362 @@ mod tests {
                 kind: "plugin".into(),
             },
         ]));
+        host.agent_ceiling = Some(ceiling_card(ToolCeiling::Read(a_ceiling())));
         let tree = host.snapshot();
         assert_eq!(
             tree.find("agent-tools").unwrap().value.as_deref(),
-            Some("1 built in · 1 from plugins")
+            Some("1 built in · 1 from plugins"),
+            "what the next turn is offered is still the server's list"
         );
-        let row = tree.find("agent-tool-gmail_api_send").unwrap();
-        assert_eq!(row.value.as_deref(), Some("plugin"));
-        assert!(!row.visible, "closed card: the rows are not on screen");
+        assert_eq!(
+            tree.find(ids::AGENT_CEILING).unwrap().value.as_deref(),
+            Some("2 of 5 allowed")
+        );
+        assert!(
+            tree.find(&ids::offered_tool("shell")).is_none(),
+            "the switches say it"
+        );
+        let shell = tree.find("agent-ceiling-switch-shell").unwrap();
+        assert_eq!(
+            (shell.role.as_str(), shell.value.as_deref(), shell.checked),
+            ("switch", Some("builtin"), Some(true))
+        );
+        assert!(
+            !shell.visible,
+            "closed card: the switches are not on screen"
+        );
+        let gmail = tree.find("agent-ceiling-switch-gmail").unwrap();
+        assert_eq!((gmail.name.as_str(), gmail.checked), ("Gmail", Some(false)));
+        assert_eq!(
+            tree.find("agent-ceiling-connector-gmail").unwrap().name,
+            "Uses your Gmail connection"
+        );
+        let machine = tree
+            .find("agent-ceiling-switch-user_machine_shell")
+            .unwrap();
+        assert!(
+            machine.states.contains(&"unavailable".to_string()) && machine.enabled,
+            "a builtin the server cannot offer now is switched all the same"
+        );
+        assert_eq!(
+            tree.find("agent-ceiling-why-user_machine_shell")
+                .unwrap()
+                .name,
+            "Not available until this Mac runs commands for Bots"
+        );
+        assert_eq!(
+            tree.find("agent-ceiling-why-old_crm").unwrap().name,
+            "No longer on the server"
+        );
+        assert!(tree.ids_are_unique());
+
         host.dispatch(&Op::click("agent-tools-toggle")).unwrap();
         assert!(matches!(
             host.take_command(),
             Some(Command::ToggleAgentTools)
         ));
         host.agent_tools_open = true;
-        assert!(host.snapshot().find("agent-tool-shell").unwrap().visible);
+        assert!(
+            host.snapshot()
+                .find("agent-ceiling-switch-shell")
+                .unwrap()
+                .visible
+        );
+
+        // With the settings closed, the toggle is not on screen to click.
+        host.agent_settings_open = false;
+        assert!(host.dispatch(&Op::click("agent-tools-toggle")).is_err());
+
+        // A ceiling the server would not give has a line and no switches, and the card lists what
+        // the next turn is offered instead, as it did before there were switches.
+        host.agent_settings_open = true;
+        host.agent_ceiling = Some(ceiling_card(ToolCeiling::Unavailable(
+            crate::state::CEILING_NOT_ON_SERVER.into(),
+        )));
+        let tree = host.snapshot();
+        assert_eq!(
+            tree.find(ids::AGENT_CEILING).unwrap().value.as_deref(),
+            Some(crate::state::CEILING_NOT_ON_SERVER)
+        );
+        assert!(tree.find("agent-ceiling-switch-shell").is_none());
+        let offered = tree.find(&ids::offered_tool("gmail_api_send")).unwrap();
+        assert_eq!(
+            (
+                offered.role.as_str(),
+                offered.value.as_deref(),
+                offered.visible
+            ),
+            ("listitem", Some("plugin"), true)
+        );
+        host.dispatch(&Op::click("agent-tools-toggle")).unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::ToggleAgentTools)
+        ));
+
+        // Nothing to list either, and there is nothing to open.
+        host.agent_tools = Some(ToolList::Unavailable(
+            "Only this bot's owner can see its tools.".into(),
+        ));
+        host.agent_ceiling = Some(ceiling_card(ToolCeiling::Unavailable(
+            crate::state::NOT_THE_OWNER.into(),
+        )));
+        assert!(host.dispatch(&Op::click("agent-tools-toggle")).is_err());
+    }
+
+    /// A switch is clicked as a person clicks it — the other way from where it stands — and only
+    /// where a person could: the settings open, the card open to its switches, and the switch
+    /// live. A builtin the server cannot offer now goes either way. A card with no switches says
+    /// why it has none.
+    #[test]
+    fn a_ceiling_switch_is_clicked_only_where_a_person_could() {
+        let mut host = host();
+        host.agent_ceiling = Some(ceiling_card(ToolCeiling::Read(a_ceiling())));
+        assert!(
+            host.dispatch(&Op::click("agent-ceiling-switch-shell"))
+                .unwrap_err()
+                .contains("settings, which are closed")
+        );
+        host.agent_settings_open = true;
+        assert!(
+            host.dispatch(&Op::click("agent-ceiling-switch-shell"))
+                .unwrap_err()
+                .contains("agent-tools-toggle"),
+            "the card is shut, so its switches are not on screen"
+        );
+        host.agent_tools_open = true;
+
+        assert_eq!(
+            switched(&mut host, "agent-ceiling-switch-shell"),
+            ("shell".into(), false)
+        );
+        assert_eq!(
+            switched(&mut host, "agent-ceiling-switch-gmail"),
+            ("gmail".into(), true)
+        );
+        assert_eq!(
+            switched(&mut host, "agent-ceiling-switch-old_crm"),
+            ("old_crm".into(), false),
+            "a plugin the server no longer loads can still be taken off"
+        );
+        assert_eq!(
+            switched(&mut host, "agent-ceiling-switch-user_machine_shell"),
+            ("user_machine_shell".into(), true),
+            "a builtin the server cannot offer now can be allowed for when it can"
+        );
+
+        assert!(
+            host.dispatch(&Op::click("agent-ceiling-why-old_crm"))
+                .unwrap_err()
+                .contains("not a switch")
+        );
+        assert!(
+            host.dispatch(&Op::click(ids::AGENT_CEILING))
+                .unwrap_err()
+                .contains("not a switch")
+        );
+        assert!(
+            host.dispatch(&Op::click("agent-ceiling-switch-nope"))
+                .unwrap_err()
+                .contains("no switch")
+        );
+        assert!(
+            host.dispatch(&Op::click("agent-ceiling-shell"))
+                .unwrap_err()
+                .contains("no switch"),
+            "the old id names nothing"
+        );
+
+        host.agent_ceiling = Some(ceiling_card(ToolCeiling::Unavailable(
+            crate::state::NOT_THE_OWNER.into(),
+        )));
+        let none = host
+            .dispatch(&Op::click("agent-ceiling-switch-shell"))
+            .unwrap_err();
+        assert!(
+            none.contains(crate::state::NOT_THE_OWNER) && !none.contains("have not been"),
+            "{none}"
+        );
+        host.agent_ceiling = Some(ceiling_card(ToolCeiling::Loading));
+        assert!(
+            host.dispatch(&Op::click("agent-ceiling-switch-shell"))
+                .unwrap_err()
+                .contains("still being read")
+        );
+    }
+
+    /// While a switch is with the server its row shows where it was asked to go, and nothing on
+    /// the card can be clicked, whichever Bot the switch is for; the card says why when it is not
+    /// this Bot's own switch holding it. The server's words are under their row, a card note is
+    /// above the switches, and a card the server has made read-only is dead with its words on it.
+    #[test]
+    fn a_blocked_ceiling_card_is_dead_and_says_why() {
+        use crate::state::{CeilingBlock, CeilingNote, CeilingSwitch, NotePlace};
+        let mut host = host();
+        host.agent_settings_open = true;
+        host.agent_tools_open = true;
+        host.agent_ceiling = Some(CeilingCard {
+            pending: Some(CeilingSwitch {
+                coworker_id: "bot-1".into(),
+                name: "read_file".into(),
+                enabled: true,
+                token: 1,
+            }),
+            blocked: Some(CeilingBlock::Switching),
+            ..ceiling_card(ToolCeiling::Read(a_ceiling()))
+        });
+        let tree = host.snapshot();
+        let asked = tree.find("agent-ceiling-switch-read_file").unwrap();
+        assert_eq!(asked.checked, Some(true));
+        assert!(asked.states.contains(&"switching".to_string()) && !asked.enabled);
+        assert!(!tree.find("agent-ceiling-switch-shell").unwrap().enabled);
+        assert!(
+            tree.find(ids::AGENT_CEILING_WAIT).is_none(),
+            "its row says it"
+        );
+        assert_eq!(
+            tree.find(ids::AGENT_CEILING).unwrap().value.as_deref(),
+            Some("3 of 5 allowed")
+        );
+        let busy = host
+            .dispatch(&Op::click("agent-ceiling-switch-shell"))
+            .unwrap_err();
+        assert!(
+            busy.contains(crate::state::CEILING_SWITCH_IN_FLIGHT),
+            "{busy}"
+        );
+
+        // Another Bot's switch, then a read of this one's: nothing of the switch is drawn here,
+        // it still holds every switch, and the card says what it is waiting on.
+        for (blocked, why) in [
+            (CeilingBlock::AnotherBot, crate::state::ANOTHER_BOTS_SWITCH),
+            (CeilingBlock::Reading, crate::state::CEILING_BEING_READ),
+        ] {
+            host.agent_ceiling = Some(CeilingCard {
+                blocked: Some(blocked),
+                ..ceiling_card(ToolCeiling::Read(a_ceiling()))
+            });
+            let tree = host.snapshot();
+            assert_eq!(
+                tree.find("agent-ceiling-switch-read_file").unwrap().checked,
+                Some(false)
+            );
+            assert_eq!(tree.find(ids::AGENT_CEILING_WAIT).unwrap().name, why);
+            let waiting = host
+                .dispatch(&Op::click("agent-ceiling-switch-shell"))
+                .unwrap_err();
+            assert!(waiting.contains(why), "{waiting}");
+        }
+
+        let said = |words: &str, place: NotePlace| {
+            Some(CeilingNote {
+                coworker_id: "bot-1".into(),
+                words: words.into(),
+                place,
+            })
+        };
+        host.agent_ceiling = Some(CeilingCard {
+            note: said(
+                "no tool or plugin named read_file",
+                NotePlace::Row("read_file".into()),
+            ),
+            ..ceiling_card(ToolCeiling::Read(a_ceiling()))
+        });
+        let tree = host.snapshot();
+        assert_eq!(
+            tree.find("agent-ceiling-error-read_file").unwrap().name,
+            "no tool or plugin named read_file"
+        );
+        assert!(tree.find("agent-ceiling-error-shell").is_none());
+        assert!(tree.find(ids::AGENT_CEILING_NOTE).is_none());
+
+        host.agent_ceiling = Some(CeilingCard {
+            note: said("the tools changed since you looked", NotePlace::Card),
+            ..ceiling_card(ToolCeiling::Read(a_ceiling()))
+        });
+        assert_eq!(
+            host.snapshot().find(ids::AGENT_CEILING_NOTE).unwrap().name,
+            "the tools changed since you looked"
+        );
+
+        host.agent_ceiling = Some(CeilingCard {
+            blocked: Some(CeilingBlock::ReadOnly("no grant to change".into())),
+            note: said("no grant to change", NotePlace::ReadOnly),
+            ..ceiling_card(ToolCeiling::Read(a_ceiling()))
+        });
+        let tree = host.snapshot();
+        assert_eq!(
+            tree.find(ids::AGENT_CEILING_READ_ONLY).unwrap().name,
+            "no grant to change"
+        );
+        assert!(tree.find(ids::AGENT_CEILING_NOTE).is_none(), "said once");
+        assert!(!tree.find("agent-ceiling-switch-shell").unwrap().enabled);
+        let theirs = host
+            .dispatch(&Op::click("agent-ceiling-switch-shell"))
+            .unwrap_err();
+        assert!(theirs.contains("no grant to change"), "{theirs}");
+    }
+
+    /// No name a plugin can have makes one of the card's ids another's: a plugin called
+    /// `read-only`, `note`, `why-x`, `error-x`, `connector-x` or `switch-x` is its own switch,
+    /// every id on the card is one node's, and a line is never read as a switch.
+    #[test]
+    fn no_plugins_name_makes_one_ceiling_id_another() {
+        let names = [
+            "x",
+            "read-only",
+            "note",
+            "wait",
+            "why-x",
+            "error-x",
+            "connector-x",
+            "switch-x",
+        ];
+        let rows: Vec<serde_json::Value> = names
+            .iter()
+            .map(|name| {
+                serde_json::json!({"name": name, "kind": "plugin", "enabled": true,
+                    "available": false, "connector": name})
+            })
+            .collect();
+        let read = crate::state::CeilingRead {
+            rows: serde_json::from_value(serde_json::Value::Array(rows)).unwrap(),
+            version: None,
+        };
+        let mut host = host();
+        host.agent_settings_open = true;
+        host.agent_tools_open = true;
+        host.agent_ceiling = Some(CeilingCard {
+            note: Some(crate::state::CeilingNote {
+                coworker_id: "bot-1".into(),
+                words: "the tools changed since you looked".into(),
+                place: crate::state::NotePlace::Card,
+            }),
+            ..ceiling_card(ToolCeiling::Read(read))
+        });
+        let tree = host.snapshot();
+        assert!(tree.ids_are_unique());
+        for name in names {
+            assert_eq!(
+                switched(&mut host, &ids::ceiling_switch(name)),
+                (name.to_string(), false),
+                "{name}"
+            );
+        }
+        for line in [
+            ids::AGENT_CEILING_NOTE,
+            ids::AGENT_CEILING_READ_ONLY,
+            "agent-ceiling-why-x",
+            "agent-ceiling-why-why-x",
+            "agent-ceiling-connector-switch-x",
+        ] {
+            assert!(
+                host.dispatch(&Op::click(line))
+                    .unwrap_err()
+                    .contains("not a switch"),
+                "{line}"
+            );
+        }
     }
 
     /// The draft's chips are on the tree as objects under the composer, in order, with their kind.

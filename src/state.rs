@@ -91,6 +91,327 @@ impl EffortControl {
     }
 }
 
+/// The open Bot's tool ceiling, as far as its settings know it: everything it could be offered
+/// and which of it it may be, which is what the Tools card's switches change (opengrok-server#268).
+#[derive(Debug, Clone, PartialEq)]
+pub enum ToolCeiling {
+    Loading,
+    Read(CeilingRead),
+    /// The server would not give it, in its words or the app's.
+    Unavailable(String),
+}
+
+/// A ceiling the server gave, as the Tools card holds it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CeilingRead {
+    /// The rows as the server last sent them, from a read or from its answer to the last switch.
+    /// Nothing the app decided is ever written here: a switch is drawn where it was asked to go
+    /// from [`CeilingSwitch`] while the server is asked, so a change the server did not take has
+    /// nothing to be rolled back from and cannot stay on screen as though it had been taken.
+    pub rows: Vec<crate::opengrok::CeilingRow>,
+    /// The version these rows came with, which a switch built from them sends back so the server
+    /// can refuse it if somebody changed the ceiling since; `None` from a server that sends none,
+    /// and then the switch sends none either.
+    pub version: Option<i64>,
+}
+
+impl From<crate::opengrok::CoworkerCeiling> for CeilingRead {
+    fn from(ceiling: crate::opengrok::CoworkerCeiling) -> Self {
+        Self {
+            rows: ceiling.tools,
+            version: ceiling.version,
+        }
+    }
+}
+
+/// A ceiling switch that is with the server: which Bot, which row, where it was asked to go, and
+/// which switch it is. Its answer is settled by `token` and by nothing else, so an answer can only
+/// ever settle the switch it answers: one the person signed out from is forgotten with the
+/// session, and its answer, whenever it comes, lands on nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CeilingSwitch {
+    pub coworker_id: String,
+    pub name: String,
+    pub enabled: bool,
+    pub token: u64,
+}
+
+/// What a switch sends: the Bot, every name the ceiling should hold once it is taken, and the
+/// version of the rows that was built from. `token` is the switch its answer settles.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CeilingPut {
+    pub token: u64,
+    pub coworker_id: String,
+    pub enabled: Vec<String>,
+    pub version: Option<i64>,
+}
+
+/// What became of a switch, for what the card says and what is asked next
+/// ([`after_ceiling_switch`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CeilingAnswer {
+    /// The server took it, and its answer is on the card.
+    Taken,
+    /// Nobody knows whether it was taken: nothing came back in time, what came back was from
+    /// something in front of the server that could not reach it (a proxy's 502, 503 or 504), or
+    /// the server answered with a body that is not a ceiling.
+    Unknown,
+    /// The server's ceiling had moved on from the rows the switch was built from, and nothing was
+    /// changed: somebody changed it since they were read (409 `ceiling-changed`), or a name on
+    /// them is one the server does not list any more (422).
+    Outdated,
+    /// The server does not know who is asking (401).
+    SignedOut,
+    /// The server will not let this person change this Bot's tools (403): the card is read-only.
+    ReadOnly,
+    /// Any other refusal: the server's words, or a 404, which a read of the ceiling tells apart as
+    /// a Bot this person does not own or a server with no such route.
+    Refused,
+    /// About a Bot the card is not showing, or to a switch that is not the one with the server
+    /// any more: nothing on screen is about it.
+    Elsewhere,
+}
+
+/// How the answer to a switch reads, from the answer alone.
+///
+/// Out of reach and without a status are the same fact here: no answer from the server about
+/// this switch. That covers a proxy's 502–504 in front of it, which is not the server's word and
+/// must not be shown as its words, and a 2xx whose body would not read as a ceiling, which the
+/// client reports without a status since the status was never in doubt, only the body.
+pub(crate) fn ceiling_answer(
+    result: &Result<crate::opengrok::CoworkerCeiling, OpenGrokError>,
+) -> CeilingAnswer {
+    let Err(error) = result else {
+        return CeilingAnswer::Taken;
+    };
+    if error.unreachable().is_some() || error.status.is_none() {
+        return CeilingAnswer::Unknown;
+    }
+    match error.status {
+        Some(401) => CeilingAnswer::SignedOut,
+        Some(403) => CeilingAnswer::ReadOnly,
+        Some(422) => CeilingAnswer::Outdated,
+        Some(409) if error.is_ceiling_changed() => CeilingAnswer::Outdated,
+        _ => CeilingAnswer::Refused,
+    }
+}
+
+/// What is asked of the server once a switch has settled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AfterSwitch {
+    /// Nothing: a read would not change what the card says.
+    Nothing,
+    /// `GET /coworkers/{id}/tools`: the card holds the server's answer, and what the next turn is
+    /// offered may have changed with it.
+    ReadTools,
+    /// The ceiling, and the tools with it: the rows on the card may not be the server's.
+    ReadCeiling,
+}
+
+/// What is asked after a switch settled as `answer`.
+///
+/// Taken, the ceiling on the card is the server's own answer, and only what the next turn is
+/// offered is left to ask. When nobody knows whether the switch was taken, the server said the
+/// rows it was built from were not its own any more, or it refused for any other reason a read can
+/// explain (a 404 is a Bot this person does not own, or a server without the route, and only a
+/// read tells which), the ceiling is read again, with the tools, since both may have moved. The
+/// person clicks again on the rows that come back. Signed out, read-only, or about a Bot not on
+/// screen: nothing a read would change.
+pub(crate) fn after_ceiling_switch(answer: CeilingAnswer) -> AfterSwitch {
+    match answer {
+        CeilingAnswer::Taken => AfterSwitch::ReadTools,
+        CeilingAnswer::Unknown | CeilingAnswer::Outdated | CeilingAnswer::Refused => {
+            AfterSwitch::ReadCeiling
+        }
+        CeilingAnswer::SignedOut | CeilingAnswer::ReadOnly | CeilingAnswer::Elsewhere => {
+            AfterSwitch::Nothing
+        }
+    }
+}
+
+/// What the Tools card says about the last switch that did not go as it was asked to.
+///
+/// Held beside the rows rather than on them, and by Bot: a read replaces the rows, and the answer
+/// to a switch can land while a read of the same Bot is still out (it was opened again meanwhile),
+/// so words kept on rows about to be replaced would go with them. It goes when the Bot or its
+/// settings are opened again, when the next switch is sent, and with the session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CeilingNote {
+    pub coworker_id: String,
+    pub words: String,
+    pub place: NotePlace,
+}
+
+/// Where a [`CeilingNote`] is said, and what it does there.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NotePlace {
+    /// Under the row it is about, while that row is on the card; on the card while it is not.
+    Row(String),
+    /// Under a row whose switch got no answer, which asked it to go to `enabled`. Nobody knows
+    /// whether it was taken, so the ceiling is read again, and a read that has the row where the
+    /// switch asked says it was: the note goes then, since it is no longer true.
+    Unanswered { name: String, enabled: bool },
+    /// On the card: about the ceiling as a whole, or about a row other than the one switched.
+    Card,
+    /// On the card above every switch, and every switch is dead: the server refused a switch
+    /// with 403, and would refuse any other.
+    ReadOnly,
+}
+
+impl CeilingNote {
+    /// The row the note is said under, when it is said under one.
+    pub fn row(&self) -> Option<&str> {
+        match &self.place {
+            NotePlace::Row(name) | NotePlace::Unanswered { name, .. } => Some(name),
+            NotePlace::Card | NotePlace::ReadOnly => None,
+        }
+    }
+}
+
+/// Why no switch on the open Bot's Tools card can be sent now, when none can.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CeilingBlock {
+    /// The server refused a switch with 403, in these words.
+    ReadOnly(String),
+    /// This Bot's switch is with the server.
+    Switching,
+    /// Another Bot's switch is. One at a time, whichever Bot: the switch with the server is one
+    /// slot, freed only by its own answer.
+    AnotherBot,
+    /// A read of this Bot's ceiling is still out. The rows on the card are about to be replaced,
+    /// and a switch built from them could undo a change the read is bringing.
+    Reading,
+}
+
+impl CeilingBlock {
+    /// Why, in words for the card and for a click that came anyway.
+    pub fn why(&self) -> &str {
+        match self {
+            Self::ReadOnly(words) => words,
+            Self::Switching => CEILING_SWITCH_IN_FLIGHT,
+            Self::AnotherBot => ANOTHER_BOTS_SWITCH,
+            Self::Reading => CEILING_BEING_READ,
+        }
+    }
+}
+
+/// The open Bot's ceiling as its Tools card draws it, and as the driver is told it is drawn. Made
+/// in one place, [`AppState::ceiling_card`], so the screen, the driver and the tests read the
+/// same switch as this Bot's, the same reason for every switch being dead, and the same note.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CeilingCard {
+    pub ceiling: ToolCeiling,
+    /// This Bot's switch with the server, if it has one: its row is drawn where it was asked to go.
+    /// Another Bot's is drawn on nothing here, and blocks every switch all the same.
+    pub pending: Option<CeilingSwitch>,
+    /// Why no switch can be sent now, when none can.
+    pub blocked: Option<CeilingBlock>,
+    pub note: Option<CeilingNote>,
+}
+
+/// What the ceiling's line says to somebody who is not the Bot's owner: the server answers a read
+/// of the ceiling with `{"error": "no such coworker"}` for anybody else.
+pub const NOT_THE_OWNER: &str = "Only this Bot's owner can change its tools.";
+
+/// What the card says when the server has no ceiling route at all: it answers 404 with nothing in
+/// it, which is not the server saying anything about the Bot. What the next turn is offered is
+/// still listed, read-only.
+pub const CEILING_NOT_ON_SERVER: &str = "This server can't change a Bot's tools yet.";
+
+/// Why every switch is dead while this Bot's switch is with the server.
+pub const CEILING_SWITCH_IN_FLIGHT: &str = "A switch on this card is still with the server.";
+
+/// Why every switch is dead while another Bot's switch is with the server.
+pub const ANOTHER_BOTS_SWITCH: &str =
+    "Another Bot's tools are being switched. These can be switched once that is done.";
+
+/// Why every switch is dead while the ceiling is being read again.
+pub const CEILING_BEING_READ: &str = "Checking this Bot's tools with the server…";
+
+/// What a switch on a plugin the server no longer loads is told when it is asked to go on: it may
+/// be kept on, and switched off, and that is all.
+pub const UNAVAILABLE_STAYS_OFF: &str =
+    "This plugin is no longer on the server, so it cannot be switched back on.";
+
+/// Under a switch that got no answer, until a read says whether it was taken.
+pub const SWITCH_UNANSWERED: &str = "The server did not answer, so this may not have changed.";
+
+/// Under a switch whose answer was not a ceiling, until a read says whether it was taken.
+pub const SWITCH_ANSWER_UNREADABLE: &str =
+    "The server's answer could not be read, so this may not have changed.";
+
+/// What a switch or a read is told when the server does not know who is asking.
+pub const SIGN_IN_FOR_TOOLS: &str = "Sign in again to change this Bot's tools.";
+
+impl CeilingRead {
+    /// Where a row's switch stands on screen: where the server has it, or where it was asked to go
+    /// while `pending`, this Bot's switch with the server, is about this row.
+    pub fn shown_on(
+        &self,
+        row: &crate::opengrok::CeilingRow,
+        pending: Option<&CeilingSwitch>,
+    ) -> bool {
+        pending
+            .filter(|switch| switch.name == row.name)
+            .map_or(row.enabled, |switch| switch.enabled)
+    }
+
+    /// How many rows are allowed as the switches show them, out of how many there are.
+    pub fn allowed(&self, pending: Option<&CeilingSwitch>) -> (usize, usize) {
+        let on = self
+            .rows
+            .iter()
+            .filter(|row| self.shown_on(row, pending))
+            .count();
+        (on, self.rows.len())
+    }
+
+    /// Whether `name` may be switched to `enabled` now, and why not when it may not. `blocked`
+    /// is why no switch on the card may be sent now ([`CeilingCard::blocked`]): a switch sends the
+    /// whole ceiling, built from these rows, so one sent while another is with the server, or
+    /// while a read is about to replace them, would be built without a change the server has.
+    pub fn may_switch(
+        &self,
+        name: &str,
+        enabled: bool,
+        blocked: Option<&CeilingBlock>,
+    ) -> Result<&crate::opengrok::CeilingRow, String> {
+        if let Some(blocked) = blocked {
+            return Err(blocked.why().to_string());
+        }
+        let row = self
+            .rows
+            .iter()
+            .find(|row| row.name == name)
+            .ok_or_else(|| format!("This Bot's tools have no `{name}`."))?;
+        // A plugin the server no longer loads is listed only while it is on: it can be kept and
+        // dropped, and once dropped it is not a name the server takes. A builtin the server
+        // cannot offer now is switched either way, since the ceiling records what the owner
+        // allows and the server offers it once it can.
+        if enabled && !row.enabled && !row.is_available() && !row.is_builtin() {
+            return Err(UNAVAILABLE_STAYS_OFF.to_string());
+        }
+        Ok(row)
+    }
+
+    /// The names a `PUT` moving `name` to `enabled` sends: every row the server has on, with this
+    /// one changed, in the server's order. A plugin the server no longer loads but has on is sent
+    /// to keep it, which is the one thing the server lets a request name it for.
+    pub fn enabled_after(&self, name: &str, enabled: bool) -> Vec<String> {
+        self.rows
+            .iter()
+            .filter(|row| {
+                if row.name == name {
+                    enabled
+                } else {
+                    row.enabled
+                }
+            })
+            .map(|row| row.name.clone())
+            .collect()
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Message {
     pub id: String,
@@ -725,6 +1046,87 @@ fn tools_unavailable(error: &OpenGrokError) -> String {
         Some(404) => "Only this bot's owner can see its tools.".to_string(),
         Some(401) => "Sign in again to see this bot's tools.".to_string(),
         _ => format!("Could not load this bot's tools: {}", error.message),
+    }
+}
+
+/// Why the open Bot's ceiling has no switches, in words for its Tools card.
+///
+/// A 404 in the server's own shape (`{"error": "no such coworker"}`) is the server saying this
+/// person does not own the Bot, which is all it tells anybody else; an empty one is a server with
+/// no ceiling route at all, which says nothing about the Bot. Nothing from something in front of
+/// the server is shown as the server's words: out of reach is said as out of reach.
+fn ceiling_unavailable(error: &OpenGrokError) -> String {
+    if error.unreachable().is_some() {
+        return "Could not reach the server to read this Bot's tools.".to_string();
+    }
+    match error.status {
+        None => "The server's answer about this Bot's tools could not be read.".to_string(),
+        Some(404) if error.written_by_opengrok() => NOT_THE_OWNER.to_string(),
+        Some(404) => CEILING_NOT_ON_SERVER.to_string(),
+        Some(401) => SIGN_IN_FOR_TOOLS.to_string(),
+        Some(403) => error.message.clone(),
+        Some(_) => format!(
+            "Could not read which tools this Bot may use: {}",
+            error.message
+        ),
+    }
+}
+
+/// Whether the server's words for a refused switch name the row `name`. Its refusal of a name it
+/// does not list ends with the name (`no tool or plugin named {name}`, opengrok-server
+/// `agui/ceiling.rs`), and a name inside another does not count: `shell` is not named by "no tool
+/// or plugin named user_machine_shell".
+fn words_name_row(words: &str, name: &str) -> bool {
+    let words = words.trim_end().trim_end_matches(['.', '"', '\'', '`']);
+    words
+        .strip_suffix(name)
+        .is_some_and(|before| before.is_empty() || before.ends_with([' ', '"', '\'', '`']))
+}
+
+/// What the card says after a switch that did not go as asked, and where it says it.
+///
+/// The server's words are shown as it wrote them, under the row switched when they are about it
+/// and on the card when they are not: a stale version is about the ceiling as a whole, and a 422
+/// can name a row other than the one clicked (a plugin the rows still had, gone from the server
+/// since). A 403 makes the card read-only in the server's words. Nothing is shown as the server's
+/// words that it did not write: a switch with no answer says so, and an empty 404 is a server
+/// without the route.
+fn ceiling_switch_note(
+    switch: &CeilingSwitch,
+    error: &OpenGrokError,
+    answer: CeilingAnswer,
+) -> CeilingNote {
+    let row = || NotePlace::Row(switch.name.clone());
+    let (words, place) = match answer {
+        CeilingAnswer::Unknown => (
+            if error.unreachable().is_some() {
+                SWITCH_UNANSWERED
+            } else {
+                SWITCH_ANSWER_UNREADABLE
+            }
+            .to_string(),
+            NotePlace::Unanswered {
+                name: switch.name.clone(),
+                enabled: switch.enabled,
+            },
+        ),
+        CeilingAnswer::SignedOut => (SIGN_IN_FOR_TOOLS.to_string(), row()),
+        CeilingAnswer::ReadOnly => (error.message.clone(), NotePlace::ReadOnly),
+        CeilingAnswer::Outdated
+            if !error.is_ceiling_changed() && words_name_row(&error.message, &switch.name) =>
+        {
+            (error.message.clone(), row())
+        }
+        CeilingAnswer::Outdated => (error.message.clone(), NotePlace::Card),
+        _ if error.is_not_found() && !error.written_by_opengrok() => {
+            (CEILING_NOT_ON_SERVER.to_string(), row())
+        }
+        _ => (error.message.clone(), row()),
+    };
+    CeilingNote {
+        coworker_id: switch.coworker_id.clone(),
+        words,
+        place,
     }
 }
 
@@ -3006,6 +3408,26 @@ pub struct AppState {
     /// A driver pressed the bot settings' Save. The button is the pane's, and so are the fields
     /// it sends, so the pane takes this and saves as the button would.
     agent_save_requested: bool,
+    /// Everything the open Bot could be offered and which of it it may be, as its Tools card's
+    /// switches show it (opengrok-server#268): the Bot's id and the answer, like
+    /// [`Self::coworker_tools`]. Drawn through [`Self::ceiling_card`].
+    pub coworker_ceiling: Option<(String, ToolCeiling)>,
+    /// Counts the ceiling reads asked for, so only the newest answer is shown. A switch the server
+    /// took counts one too, so a read asked before its answer cannot land after it and put back
+    /// what the answer replaced.
+    ceiling_generation: u64,
+    /// The newest read of the ceiling, by its generation, while it is out. No switch is sent
+    /// meanwhile: the rows on the card are about to be replaced (the settings opened again on
+    /// rows read a while ago, say), and a switch built from them could undo whatever change the
+    /// read is bringing.
+    ceiling_reading: Option<u64>,
+    /// The one ceiling switch with the server, whichever Bot it is for: see
+    /// [`Self::switch_ceiling_tool`].
+    ceiling_switch: Option<CeilingSwitch>,
+    /// Counts the switches sent, for the token each is settled by.
+    ceiling_switches: u64,
+    /// What the Tools card says about the last switch that did not go as asked.
+    ceiling_note: Option<CeilingNote>,
     /// `egressTunnelAvailable` on `GET /ag-ui/host-settings`: host intent AND the open
     /// coworker's box advertising the tunnel.
     pub host_egress_tunnel_available: bool,
@@ -3529,6 +3951,12 @@ impl AppState {
             tools_generation: 0,
             effort_pick: None,
             agent_save_requested: false,
+            coworker_ceiling: None,
+            ceiling_generation: 0,
+            ceiling_reading: None,
+            ceiling_switch: None,
+            ceiling_switches: 0,
+            ceiling_note: None,
             host_egress_tunnel_available: false,
             egress_policy_pending: None,
             network_policy_open: false,
@@ -4556,6 +4984,9 @@ impl AppState {
         self.host_egress_tunnel_available = false;
         self.egress_tunnel_enabled = true;
         self.coworker_computer = None;
+        // A tool switch still with the server holds every switch until it answers, and it was
+        // this account's: the next account's switches must not wait on it.
+        self.forget_ceilings();
         // The open recipe and the runs the page was waiting on were this account's. Closing the
         // recipe drops its follower too, which would otherwise read on without a session.
         self.recipe_runs_in_flight.clear();
@@ -4876,6 +5307,10 @@ impl AppState {
             // record; opening the sidebar is the moment to make sure it is this bot's and fresh.
             self.refresh_coworker_computer_quietly(cx);
             self.refresh_coworker_tools(cx);
+            // What the Tools card said about a switch was said while it was last open; the read
+            // asked now is what it says from here.
+            self.ceiling_note = None;
+            self.refresh_coworker_ceiling(cx);
             self.refresh_coworker_usage(cx);
         }
     }
@@ -4970,6 +5405,288 @@ impl AppState {
             });
         })
         .detach();
+    }
+
+    /// Ask the server what the open Bot could be offered and which of it it may be. Asked with
+    /// its tools, each time its settings open and when another Bot is opened while they are, and
+    /// after a switch whose answer leaves the rows on the card in doubt
+    /// ([`after_ceiling_switch`]). No switch is sent until it lands.
+    pub fn refresh_coworker_ceiling(&mut self, cx: &mut Context<Self>) {
+        let (Some(client), Some(coworker_id)) =
+            (self.opengrok.clone(), self.active_coworker_id.clone())
+        else {
+            self.coworker_ceiling = None;
+            return;
+        };
+        // The switches read for this Bot stay on screen while it is asked again, so they do not
+        // blink out every time the pane opens. They are dead until the read lands.
+        let read = matches!(
+            &self.coworker_ceiling,
+            Some((id, ToolCeiling::Read(_))) if *id == coworker_id
+        );
+        if !read {
+            self.coworker_ceiling = Some((coworker_id.clone(), ToolCeiling::Loading));
+        }
+        let generation = self.ask_ceiling_read();
+        cx.spawn(async move |this, cx| {
+            let result = client.coworker_ceiling(&coworker_id).await;
+            let _ = this.update(cx, |state, cx| {
+                if state.settle_coworker_ceiling(generation, coworker_id, result) {
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Count a read of the ceiling asked for, and hold every switch until it lands.
+    fn ask_ceiling_read(&mut self) -> u64 {
+        self.ceiling_generation += 1;
+        self.ceiling_reading = Some(self.ceiling_generation);
+        self.ceiling_generation
+    }
+
+    /// Put a read of a Bot's ceiling on its card, unless it is no longer the one wanted: a newer
+    /// read was asked for since, a switch has answered since, or the person has moved to another
+    /// Bot. The card's note stays: a read says where the rows stand, not why a switch was refused.
+    /// The one exception is a switch nobody heard the answer to. The read says whether it was
+    /// taken, and when it was, the note saying nobody knows goes.
+    pub(crate) fn settle_coworker_ceiling(
+        &mut self,
+        generation: u64,
+        coworker_id: String,
+        result: Result<crate::opengrok::CoworkerCeiling, OpenGrokError>,
+    ) -> bool {
+        if self.ceiling_generation != generation {
+            return false;
+        }
+        // The newest read is in, so none is out, whichever Bot it was for.
+        self.ceiling_reading = None;
+        if self.active_coworker_id.as_deref() != Some(coworker_id.as_str()) {
+            return false;
+        }
+        let ceiling = match result {
+            Ok(ceiling) => {
+                // A row the server does not list is off: it lists every builtin and every plugin
+                // it loads, and one it no longer loads only while it is on.
+                let took = |name: &str, enabled: bool| {
+                    ceiling
+                        .tools
+                        .iter()
+                        .find(|row| row.name == name)
+                        .is_some_and(|row| row.enabled)
+                        == enabled
+                };
+                if let Some(CeilingNote {
+                    coworker_id: about,
+                    place: NotePlace::Unanswered { name, enabled },
+                    ..
+                }) = &self.ceiling_note
+                    && *about == coworker_id
+                    && took(name, *enabled)
+                {
+                    self.ceiling_note = None;
+                }
+                ToolCeiling::Read(ceiling.into())
+            }
+            Err(error) => ToolCeiling::Unavailable(ceiling_unavailable(&error)),
+        };
+        self.coworker_ceiling = Some((coworker_id, ceiling));
+        true
+    }
+
+    /// The open Bot's Tools card as far as its ceiling goes, or nothing while nothing has been
+    /// asked for it. The one place the switch with the server is sorted into this Bot's or
+    /// another's, and the reason every switch is dead worked out, for the screen, the driver and
+    /// the tests alike. See [`CeilingCard`].
+    pub fn ceiling_card(&self) -> Option<CeilingCard> {
+        let (coworker_id, ceiling) = self
+            .coworker_ceiling
+            .as_ref()
+            .filter(|(id, _)| self.active_coworker_id.as_deref() == Some(id.as_str()))?;
+        let note = self
+            .ceiling_note
+            .clone()
+            .filter(|note| note.coworker_id == *coworker_id);
+        let blocked = match (&note, &self.ceiling_switch) {
+            (
+                Some(CeilingNote {
+                    words,
+                    place: NotePlace::ReadOnly,
+                    ..
+                }),
+                _,
+            ) => Some(CeilingBlock::ReadOnly(words.clone())),
+            (_, Some(switch)) if switch.coworker_id == *coworker_id => {
+                Some(CeilingBlock::Switching)
+            }
+            (_, Some(_)) => Some(CeilingBlock::AnotherBot),
+            (_, None) if self.ceiling_reading.is_some() => Some(CeilingBlock::Reading),
+            (_, None) => None,
+        };
+        Some(CeilingCard {
+            ceiling: ceiling.clone(),
+            pending: self
+                .ceiling_switch
+                .clone()
+                .filter(|switch| switch.coworker_id == *coworker_id),
+            blocked,
+            note,
+        })
+    }
+
+    /// A switch on the Tools card: `name` on or off in the open Bot's ceiling, sent at once.
+    ///
+    /// The `PUT` carries the whole ceiling — the server's last rows with this one change — and
+    /// the version of those rows, and only one is ever with the server: every switch is dead
+    /// until it answers, or until the client's deadline for it runs out, which is an answer
+    /// nobody knows. The row shows where it was asked to go meanwhile, from the switch itself;
+    /// the rows are only ever written with what the server sends. What is asked next is
+    /// [`after_ceiling_switch`].
+    pub fn switch_ceiling_tool(&mut self, name: String, enabled: bool, cx: &mut Context<Self>) {
+        let Some(client) = self.opengrok.clone() else {
+            return;
+        };
+        let put = match self.begin_ceiling_switch(&name, enabled) {
+            Ok(put) => put,
+            Err(why) => {
+                // Not silence. The screen draws this switch dead whenever it would be refused,
+                // so whatever reached here came from somewhere the screen cannot stop — the
+                // driver, or a click already on its way — and a switch that did nothing and
+                // said nothing reads as one that was taken. A blocked card says why already.
+                self.note_ceiling_refusal(&name, why);
+                cx.notify();
+                return;
+            }
+        };
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = client
+                .set_coworker_ceiling(&put.coworker_id, &put.enabled, put.version)
+                .await;
+            let _ = this.update(cx, |state, cx| {
+                match after_ceiling_switch(state.settle_ceiling_switch(put.token, result)) {
+                    AfterSwitch::Nothing => {}
+                    // The run path reads the ceiling, so what the next turn is offered may have
+                    // changed with it. The card's first line says what the server lists, read
+                    // again, not what the app works out from the switches.
+                    AfterSwitch::ReadTools => state.refresh_coworker_tools(cx),
+                    AfterSwitch::ReadCeiling => {
+                        state.refresh_coworker_ceiling(cx);
+                        state.refresh_coworker_tools(cx);
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Start a switch: what it sends, or why it may not be sent. The rows are not touched — the
+    /// switch in flight is what the row is drawn from until the server answers.
+    pub(crate) fn begin_ceiling_switch(
+        &mut self,
+        name: &str,
+        enabled: bool,
+    ) -> Result<CeilingPut, String> {
+        let (Some(coworker_id), Some(card)) =
+            (self.active_coworker_id.clone(), self.ceiling_card())
+        else {
+            return Err("This Bot's tools have not been read yet.".to_string());
+        };
+        let read = match &card.ceiling {
+            ToolCeiling::Read(read) => read,
+            ToolCeiling::Loading => return Err(CEILING_BEING_READ.to_string()),
+            ToolCeiling::Unavailable(why) => return Err(why.clone()),
+        };
+        read.may_switch(name, enabled, card.blocked.as_ref())?;
+        self.ceiling_switches += 1;
+        let token = self.ceiling_switches;
+        // A note is about the switch it was said of, and this is another one.
+        self.ceiling_note = None;
+        self.ceiling_switch = Some(CeilingSwitch {
+            coworker_id: coworker_id.clone(),
+            name: name.to_string(),
+            enabled,
+            token,
+        });
+        Ok(CeilingPut {
+            token,
+            coworker_id,
+            enabled: read.enabled_after(name, enabled),
+            version: read.version,
+        })
+    }
+
+    /// Say under a row why its switch was not sent, where the row is on screen. Not while the card
+    /// is blocked: it says why already, above its rows or beside the switch being saved, and words
+    /// under the row clicked would outlive the wait they were about.
+    fn note_ceiling_refusal(&mut self, name: &str, why: String) {
+        let (Some(coworker_id), Some(card)) =
+            (self.active_coworker_id.clone(), self.ceiling_card())
+        else {
+            return;
+        };
+        if !matches!(card.ceiling, ToolCeiling::Read(_)) || card.blocked.is_some() {
+            return;
+        }
+        self.ceiling_note = Some(CeilingNote {
+            coworker_id,
+            words: why,
+            place: NotePlace::Row(name.to_string()),
+        });
+    }
+
+    /// Take the server's answer to the switch that was with it, and say what it was.
+    ///
+    /// Only the switch it answers is settled, by its token, and nothing else frees the one slot:
+    /// an answer to a switch the person signed out from lands on nothing. The switch is over
+    /// whatever the answer and whichever Bot is open, and the next may go. The answer lands only
+    /// on the Bot it was about, and only while that Bot is open — the card holds the open Bot's
+    /// ceiling and nothing else — though a read of it may still be out (the Bot opened again
+    /// meanwhile). Taken, the answer IS the ceiling, and a read asked before it is dropped when it
+    /// lands. Otherwise the rows are left as the server last gave them, so the switch is back
+    /// where the server has it with nothing to undo, and the card says why
+    /// ([`ceiling_switch_note`]).
+    pub(crate) fn settle_ceiling_switch(
+        &mut self,
+        token: u64,
+        result: Result<crate::opengrok::CoworkerCeiling, OpenGrokError>,
+    ) -> CeilingAnswer {
+        let Some(switch) = self.ceiling_switch.take_if(|switch| switch.token == token) else {
+            return CeilingAnswer::Elsewhere;
+        };
+        let open = self.active_coworker_id.as_deref() == Some(switch.coworker_id.as_str())
+            && self
+                .coworker_ceiling
+                .as_ref()
+                .is_some_and(|(id, _)| *id == switch.coworker_id);
+        if !open {
+            return CeilingAnswer::Elsewhere;
+        }
+        let answer = ceiling_answer(&result);
+        match result {
+            Ok(ceiling) => {
+                self.ceiling_generation += 1;
+                self.ceiling_reading = None;
+                self.ceiling_note = None;
+                self.coworker_ceiling =
+                    Some((switch.coworker_id, ToolCeiling::Read(ceiling.into())));
+            }
+            Err(error) => self.ceiling_note = Some(ceiling_switch_note(&switch, &error, answer)),
+        }
+        answer
+    }
+
+    /// Everything about ceilings goes with the session that asked for it: the switch with the
+    /// server, whose answer carries a token nothing matches any more; a read still out, which
+    /// lands on nothing; and the card and what it says.
+    fn forget_ceilings(&mut self) {
+        self.coworker_ceiling = None;
+        self.ceiling_switch = None;
+        self.ceiling_note = None;
+        self.ceiling_reading = None;
+        self.ceiling_generation += 1;
     }
 
     pub fn toggle_agent_tools(&mut self, cx: &mut Context<Self>) {
@@ -8433,13 +9150,18 @@ impl AppState {
         self.last_box_shot = None;
         self.computer_confirm = None;
         self.computer_action_error = None;
-        // The last bot's tools and usage must not be shown under this one's name.
+        // The last bot's tools and usage must not be shown under this one's name. A switch still
+        // with the server stays with it: it is about the last bot, and lands on nothing here,
+        // unless this is that bot opened again, where its answer is still this card's to show.
         self.coworker_tools = None;
+        self.coworker_ceiling = None;
+        self.ceiling_note = None;
         self.coworker_usage = None;
         self.agent_tools_open = false;
         self.agent_usage_open = false;
         if self.right_pane == RightPane::Settings {
             self.refresh_coworker_tools(cx);
+            self.refresh_coworker_ceiling(cx);
             self.refresh_coworker_usage(cx);
         }
         if !self.conversations.iter().any(|c| c.id == id) {
@@ -12967,10 +13689,12 @@ impl AppState {
                     &card_key,
                     crate::opengrok::UserFormSpec::settle_form_from_box(*resolution),
                 );
+                // A timeout is the hand-off nobody finished, so it is Skipped, never Done, the
+                // same as a replay reads it (`box_settlement`).
                 let computer = match resolution {
-                    BoxHandoffResolution::Declined => ComputerHandoffStatus::Skipped,
-                    BoxHandoffResolution::HandedBack | BoxHandoffResolution::TimedOut => {
-                        ComputerHandoffStatus::Done
+                    BoxHandoffResolution::HandedBack => ComputerHandoffStatus::Done,
+                    BoxHandoffResolution::Declined | BoxHandoffResolution::TimedOut => {
+                        ComputerHandoffStatus::Skipped
                     }
                 };
                 self.set_computer_handoff(&card_key, computer);
@@ -24281,6 +25005,947 @@ mod tests {
         state.coworker_usage = None;
         assert!(!state.settle_coworker_usage(2, "cw_1".into(), usage(9)));
         assert_eq!(state.coworker_usage, None);
+    }
+
+    // ---- A Bot's tool ceiling, and the Tools card's switches (opengrok-server#268) ------------
+
+    use super::{
+        ANOTHER_BOTS_SWITCH, AfterSwitch, CEILING_BEING_READ, CEILING_NOT_ON_SERVER,
+        CEILING_SWITCH_IN_FLIGHT, CeilingAnswer, CeilingBlock, CeilingCard, CeilingPut,
+        CeilingRead, NOT_THE_OWNER, NotePlace, SIGN_IN_FOR_TOOLS, SWITCH_ANSWER_UNREADABLE,
+        SWITCH_UNANSWERED, ToolCeiling, UNAVAILABLE_STAYS_OFF, after_ceiling_switch,
+        ceiling_answer, ceiling_unavailable, words_name_row,
+    };
+    use crate::components::agent_settings::{
+        CeilingCardLine, ceiling_card_lines, shown_ceiling_rows,
+    };
+    use crate::opengrok::CoworkerCeiling;
+
+    /// A ceiling at `version`, or at none as a server older than the version sends it.
+    fn ceiling_at(version: Option<i64>, rows: serde_json::Value) -> CoworkerCeiling {
+        serde_json::from_value(json!({ "tools": rows, "version": version })).expect("a ceiling")
+    }
+
+    /// The rows of [`served_ceiling`].
+    fn served_rows() -> serde_json::Value {
+        json!([
+            {"name": "shell", "kind": "builtin", "enabled": true},
+            {"name": "read_file", "kind": "builtin", "enabled": false},
+            {"name": "user_machine_shell", "kind": "builtin", "enabled": false, "available": false},
+            {"name": "gmail", "kind": "plugin", "enabled": true, "label": "gmail",
+                "connector": "gmail"},
+            {"name": "old_crm", "kind": "plugin", "enabled": true, "available": false}
+        ])
+    }
+
+    /// A ceiling as the server gives it: `shell` on, `read_file` off, `user_machine_shell` off
+    /// with no machine to run it, `gmail` on, and `old_crm` a plugin the server no longer loads,
+    /// still on; at version 3.
+    fn served_ceiling() -> CoworkerCeiling {
+        ceiling_at(Some(3), served_rows())
+    }
+
+    /// `coworker` open, with its ceiling read.
+    fn with_ceiling_read(coworker: &str) -> AppState {
+        let mut state = AppState::new();
+        state.active_coworker_id = Some(coworker.into());
+        let generation = state.ask_ceiling_read();
+        assert!(state.settle_coworker_ceiling(generation, coworker.into(), Ok(served_ceiling())));
+        state
+    }
+
+    fn card(state: &AppState) -> CeilingCard {
+        state.ceiling_card().expect("the open Bot's card")
+    }
+
+    fn ceiling_read(state: &AppState) -> CeilingRead {
+        match card(state).ceiling {
+            ToolCeiling::Read(read) => read,
+            other => panic!("no ceiling read: {other:?}"),
+        }
+    }
+
+    /// Where every row's switch stands, as the Tools card draws it for the open Bot.
+    fn shown(state: &AppState) -> Vec<(String, bool)> {
+        shown_ceiling_rows(&card(state))
+            .into_iter()
+            .map(|row| (row.name, row.on))
+            .collect()
+    }
+
+    /// The words under each row that has any, as the card draws them.
+    fn row_notes(state: &AppState) -> Vec<(String, String)> {
+        shown_ceiling_rows(&card(state))
+            .into_iter()
+            .filter_map(|row| Some((row.name, row.note?)))
+            .collect()
+    }
+
+    fn on(names: &[&str]) -> Vec<(String, bool)> {
+        [
+            "shell",
+            "read_file",
+            "user_machine_shell",
+            "gmail",
+            "old_crm",
+        ]
+        .iter()
+        .map(|name| (name.to_string(), names.contains(name)))
+        .collect()
+    }
+
+    /// Send `put` as `switch_ceiling_tool` does, to `server`, and settle what comes back.
+    async fn send_switch(
+        state: &mut AppState,
+        server: &wiremock::MockServer,
+        put: CeilingPut,
+    ) -> CeilingAnswer {
+        let client = OpenGrokClient::new(&server.uri()).expect("a URL that parses");
+        let result = client
+            .set_coworker_ceiling(&put.coworker_id, &put.enabled, put.version)
+            .await;
+        state.settle_ceiling_switch(put.token, result)
+    }
+
+    /// The server answers every `PUT` of cw_1's ceiling with `answer`.
+    async fn put_answered(answer: wiremock::ResponseTemplate) -> wiremock::MockServer {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .and(wiremock::matchers::path("/coworkers/cw_1/ceiling"))
+            .respond_with(answer)
+            .mount(&server)
+            .await;
+        server
+    }
+
+    /// What comes after a switch is worked out from its answer alone: taken, the tools line is
+    /// read again; in doubt, outdated or refused, the ceiling is read again with the tools; signed
+    /// out, read-only or about another Bot, nothing is asked. And each answer reads as what it is.
+    #[test]
+    fn what_follows_a_switch_is_its_answers_to_say() {
+        use AfterSwitch::{Nothing, ReadCeiling, ReadTools};
+        use CeilingAnswer::{Elsewhere, Outdated, ReadOnly, Refused, SignedOut, Taken, Unknown};
+        for (answer, after) in [
+            (Taken, ReadTools),
+            (Unknown, ReadCeiling),
+            (Outdated, ReadCeiling),
+            (Refused, ReadCeiling),
+            (SignedOut, Nothing),
+            (ReadOnly, Nothing),
+            (Elsewhere, Nothing),
+        ] {
+            assert_eq!(after_ceiling_switch(answer), after, "{answer:?}");
+        }
+        let read = |error: OpenGrokError| ceiling_answer(&Err(error));
+        assert_eq!(ceiling_answer(&Ok(served_ceiling())), Taken);
+        assert_eq!(
+            read(OpenGrokError::message("error decoding response body")),
+            Unknown,
+            "an answer with no status"
+        );
+        assert_eq!(
+            read(OpenGrokError::from_server(Some(502), "Bad Gateway")),
+            Unknown
+        );
+        assert_eq!(read(OpenGrokError::signed_out("sign in first")), SignedOut);
+        assert_eq!(
+            read(OpenGrokError::from_opengrok(403, "no grant to change")),
+            ReadOnly
+        );
+        assert_eq!(
+            read(OpenGrokError::from_opengrok(
+                422,
+                "no tool or plugin named old_crm"
+            )),
+            Outdated
+        );
+        assert_eq!(
+            read(OpenGrokError::from_opengrok(404, "no such coworker")),
+            Refused
+        );
+        assert_eq!(
+            read(OpenGrokError::from_opengrok(409, "a conflict with no code")),
+            Refused,
+            "only the server's ceiling-changed code says the rows are old"
+        );
+        assert_eq!(
+            read(OpenGrokError::from_opengrok(
+                503,
+                "this coworker's tools could not be read or saved now"
+            )),
+            Refused,
+            "a 503 the server wrote is its word"
+        );
+    }
+
+    /// A read lands only while it is the one wanted: an older read answering after a newer one,
+    /// and a read for a Bot the person has since left, are dropped rather than drawn over the
+    /// newer answer or under the wrong Bot's name.
+    #[test]
+    fn a_late_ceiling_read_is_dropped() {
+        let mut state = AppState::new();
+        state.active_coworker_id = Some("cw_1".into());
+        let only_shell = || {
+            Ok(ceiling_at(
+                Some(1),
+                json!([{"name": "shell", "kind": "builtin", "enabled": true}]),
+            ))
+        };
+        let older = state.ask_ceiling_read();
+        let newer = state.ask_ceiling_read();
+        assert!(state.settle_coworker_ceiling(newer, "cw_1".into(), Ok(served_ceiling())));
+        assert!(
+            !state.settle_coworker_ceiling(older, "cw_1".into(), only_shell()),
+            "an older read answering late"
+        );
+        assert_eq!(ceiling_read(&state).rows.len(), 5);
+
+        // The person moved to another Bot, whose ceiling is not read yet, before the first
+        // Bot's read came back.
+        let for_the_first = state.ask_ceiling_read();
+        state.active_coworker_id = Some("cw_2".into());
+        state.coworker_ceiling = Some(("cw_2".into(), ToolCeiling::Loading));
+        assert!(!state.settle_coworker_ceiling(for_the_first, "cw_1".into(), only_shell()));
+        assert_eq!(
+            state.coworker_ceiling,
+            Some(("cw_2".into(), ToolCeiling::Loading)),
+            "the first Bot's switches are not drawn under the second's name"
+        );
+        assert_eq!(state.ceiling_reading, None, "and nothing waits on it");
+    }
+
+    /// A switch sends the server's last rows with this one change, and the version they came
+    /// with — a plugin the server no longer loads is named to keep it, and a row that is off is
+    /// not named at all — and the row shows where it was asked to go while the rows themselves
+    /// stay as the server gave them. The next switch is built from the answer, at its version.
+    #[test]
+    fn a_switch_sends_the_servers_rows_with_one_change() {
+        let mut state = with_ceiling_read("cw_1");
+        let put = state.begin_ceiling_switch("read_file", true).unwrap();
+        assert_eq!(put.coworker_id, "cw_1");
+        assert_eq!(put.enabled, ["shell", "read_file", "gmail", "old_crm"]);
+        assert_eq!(put.version, Some(3));
+        assert_eq!(
+            shown(&state),
+            on(&["shell", "read_file", "gmail", "old_crm"])
+        );
+        assert!(
+            !ceiling_read(&state).rows[1].enabled,
+            "the rows are the server's until it answers"
+        );
+        let first = put.token;
+        assert_eq!(
+            state.settle_ceiling_switch(first, Ok(ceiling_at(Some(4), served_rows()))),
+            CeilingAnswer::Taken
+        );
+
+        let put = state.begin_ceiling_switch("shell", false).unwrap();
+        assert_eq!(put.enabled, ["gmail", "old_crm"]);
+        assert_eq!(
+            put.version,
+            Some(4),
+            "built from the answer, so at its version"
+        );
+        assert_ne!(put.token, first, "a switch is its own");
+        assert_eq!(shown(&state), on(&["gmail", "old_crm"]));
+    }
+
+    /// A server older than the version still has its ceiling read and switched: rows that came
+    /// with none are sent back with none.
+    #[test]
+    fn a_ceiling_with_no_version_is_switched_without_one() {
+        let mut state = AppState::new();
+        state.active_coworker_id = Some("cw_1".into());
+        let generation = state.ask_ceiling_read();
+        assert!(state.settle_coworker_ceiling(
+            generation,
+            "cw_1".into(),
+            Ok(ceiling_at(None, served_rows()))
+        ));
+        assert_eq!(ceiling_read(&state).version, None);
+        let put = state.begin_ceiling_switch("read_file", true).unwrap();
+        assert_eq!(put.version, None);
+    }
+
+    /// One switch at a time: the second is built from rows that do not have the first's change
+    /// in them, and would undo it. It is refused whichever row, and whichever Bot, until the
+    /// first has answered, and the card says which it is waiting on.
+    #[test]
+    fn a_switch_in_flight_blocks_a_second() {
+        let mut state = with_ceiling_read("cw_1");
+        let first = state.begin_ceiling_switch("read_file", true).unwrap();
+        assert_eq!(card(&state).blocked, Some(CeilingBlock::Switching));
+        assert_eq!(
+            state.begin_ceiling_switch("gmail", false),
+            Err(CEILING_SWITCH_IN_FLIGHT.to_string())
+        );
+        assert_eq!(
+            shown(&state),
+            on(&["shell", "read_file", "gmail", "old_crm"])
+        );
+
+        // Another Bot opened meanwhile, and its ceiling read: its switches wait too, and its card
+        // says on what.
+        state.active_coworker_id = Some("cw_2".into());
+        let generation = state.ask_ceiling_read();
+        assert!(state.settle_coworker_ceiling(generation, "cw_2".into(), Ok(served_ceiling())));
+        assert_eq!(
+            shown(&state),
+            on(&["shell", "gmail", "old_crm"]),
+            "the first Bot's switch is not drawn on the second's rows"
+        );
+        assert_eq!(card(&state).blocked, Some(CeilingBlock::AnotherBot));
+        assert_eq!(
+            ceiling_card_lines(&card(&state)),
+            [CeilingCardLine::Wait(ANOTHER_BOTS_SWITCH.to_string())]
+        );
+        assert_eq!(
+            state.begin_ceiling_switch("gmail", false),
+            Err(ANOTHER_BOTS_SWITCH.to_string())
+        );
+
+        // The first Bot's answer lands on nothing here, and frees the next switch.
+        assert_eq!(
+            state.settle_ceiling_switch(first.token, Ok(served_ceiling())),
+            CeilingAnswer::Elsewhere
+        );
+        assert_eq!(state.ceiling_switch, None);
+        assert_eq!(card(&state).blocked, None);
+        assert_eq!(shown(&state), on(&["shell", "gmail", "old_crm"]));
+        assert!(state.begin_ceiling_switch("gmail", false).is_ok());
+    }
+
+    /// The settings opened again on rows read a while ago: the rows stay on screen and every
+    /// switch is dead until the fresh read lands, since a switch built from them could undo
+    /// whatever the read is bringing. An older read landing frees nothing.
+    #[test]
+    fn a_click_while_the_ceiling_is_read_again_is_refused() {
+        let mut state = with_ceiling_read("cw_1");
+        let older = state.ask_ceiling_read();
+        let newest = state.ask_ceiling_read();
+        assert_eq!(card(&state).blocked, Some(CeilingBlock::Reading));
+        assert_eq!(shown(&state), on(&["shell", "gmail", "old_crm"]));
+        assert!(
+            shown_ceiling_rows(&card(&state))
+                .iter()
+                .all(|row| !row.live)
+        );
+        assert_eq!(
+            ceiling_card_lines(&card(&state)),
+            [CeilingCardLine::Wait(CEILING_BEING_READ.to_string())]
+        );
+        assert_eq!(
+            state.begin_ceiling_switch("read_file", true),
+            Err(CEILING_BEING_READ.to_string())
+        );
+        assert_eq!(state.ceiling_switch, None, "nothing was sent");
+        // A click that came anyway is told by the card's own line, and leaves nothing under the
+        // row to outlive the read.
+        state.note_ceiling_refusal("read_file", CEILING_BEING_READ.to_string());
+        assert_eq!(card(&state).note, None);
+
+        assert!(!state.settle_coworker_ceiling(older, "cw_1".into(), Ok(served_ceiling())));
+        assert_eq!(card(&state).blocked, Some(CeilingBlock::Reading));
+        assert!(state.settle_coworker_ceiling(
+            newest,
+            "cw_1".into(),
+            Ok(ceiling_at(Some(5), served_rows()))
+        ));
+        assert_eq!(card(&state).blocked, None);
+        let put = state.begin_ceiling_switch("read_file", true).unwrap();
+        assert_eq!(put.version, Some(5), "built from the fresh rows");
+    }
+
+    /// Taken, the server's answer is the ceiling, whatever it says; and a read asked before the
+    /// answer landed is older than it, so it holds nothing and cannot put back what the answer
+    /// replaced.
+    #[test]
+    fn a_taken_switch_is_what_the_server_answered() {
+        let mut state = with_ceiling_read("cw_1");
+        let put = state.begin_ceiling_switch("read_file", true).unwrap();
+        let read_before = state.ask_ceiling_read();
+        let answer = ceiling_at(
+            Some(4),
+            json!([
+                {"name": "shell", "kind": "builtin", "enabled": true},
+                {"name": "read_file", "kind": "builtin", "enabled": true}
+            ]),
+        );
+        assert_eq!(
+            state.settle_ceiling_switch(put.token, Ok(answer.clone())),
+            CeilingAnswer::Taken
+        );
+        assert_eq!(ceiling_read(&state).rows, answer.tools);
+        assert_eq!(ceiling_read(&state).version, Some(4));
+        assert_eq!(state.ceiling_switch, None);
+        assert_eq!(card(&state).blocked, None);
+        assert!(
+            !state.settle_coworker_ceiling(read_before, "cw_1".into(), Ok(served_ceiling())),
+            "a read from before the answer"
+        );
+        assert_eq!(ceiling_read(&state).rows, answer.tools);
+    }
+
+    /// Refused, the rows are still the server's, so the switch is back where the server has it
+    /// with nothing to undo, the server's words are under the row that was switched, and the
+    /// ceiling is read again. A read does not take the words away, since it does not answer
+    /// them; the next switch does.
+    #[test]
+    fn a_refused_switch_keeps_the_servers_state_with_its_words() {
+        let mut state = with_ceiling_read("cw_1");
+        let before = ceiling_read(&state).rows.clone();
+        let put = state.begin_ceiling_switch("read_file", true).unwrap();
+        let refused = OpenGrokError::from_opengrok(
+            503,
+            "this coworker's tools could not be read or saved now",
+        );
+        let answer = state.settle_ceiling_switch(put.token, Err(refused));
+        assert_eq!(answer, CeilingAnswer::Refused);
+        assert_eq!(after_ceiling_switch(answer), AfterSwitch::ReadCeiling);
+        assert_eq!(ceiling_read(&state).rows, before);
+        assert_eq!(shown(&state), on(&["shell", "gmail", "old_crm"]));
+        assert_eq!(
+            row_notes(&state),
+            [(
+                "read_file".to_string(),
+                "this coworker's tools could not be read or saved now".to_string()
+            )]
+        );
+        assert_eq!(state.ceiling_switch, None);
+
+        let generation = state.ask_ceiling_read();
+        assert!(state.settle_coworker_ceiling(generation, "cw_1".into(), Ok(served_ceiling())));
+        assert_eq!(row_notes(&state).len(), 1, "a read does not answer them");
+        state.begin_ceiling_switch("gmail", false).unwrap();
+        assert_eq!(card(&state).note, None, "another switch does");
+    }
+
+    /// A 422 is the server saying a name the rows had is not one it lists any more: the rows
+    /// were stale. It is read again, and the server's words go where they are about — on the
+    /// card when they name a row other than the one clicked, under the row when they name it,
+    /// and on the card once the read no longer has that row to say them under.
+    #[test]
+    fn a_refusal_of_stale_rows_reads_the_ceiling_again() {
+        // The rows still have old_crm on, which the server has dropped since. Switching gmail off
+        // sends old_crm with it, and the server refuses that name, not gmail.
+        let mut state = with_ceiling_read("cw_1");
+        let put = state.begin_ceiling_switch("gmail", false).unwrap();
+        assert_eq!(put.enabled, ["shell", "old_crm"]);
+        let stale = OpenGrokError::from_opengrok(422, "no tool or plugin named old_crm");
+        let answer = state.settle_ceiling_switch(put.token, Err(stale));
+        assert_eq!(answer, CeilingAnswer::Outdated);
+        assert_eq!(after_ceiling_switch(answer), AfterSwitch::ReadCeiling);
+        assert!(
+            row_notes(&state).is_empty(),
+            "not under gmail, which it is not about"
+        );
+        assert_eq!(
+            ceiling_card_lines(&card(&state)),
+            [CeilingCardLine::Note(
+                "no tool or plugin named old_crm".to_string()
+            )]
+        );
+
+        // The read has the server's rows, without old_crm, and the next click is built from them.
+        let generation = state.ask_ceiling_read();
+        let without_old_crm = json!([
+            {"name": "shell", "kind": "builtin", "enabled": true},
+            {"name": "read_file", "kind": "builtin", "enabled": false},
+            {"name": "gmail", "kind": "plugin", "enabled": true}
+        ]);
+        assert!(state.settle_coworker_ceiling(
+            generation,
+            "cw_1".into(),
+            Ok(ceiling_at(Some(4), without_old_crm))
+        ));
+        let put = state.begin_ceiling_switch("gmail", false).unwrap();
+        assert_eq!(put.enabled, ["shell"]);
+        assert_eq!((put.version, card(&state).note), (Some(4), None));
+
+        // A refusal that names the row clicked is said under it, until a read without the row.
+        let mut state = with_ceiling_read("cw_1");
+        let put = state.begin_ceiling_switch("read_file", true).unwrap();
+        let gone = OpenGrokError::from_opengrok(422, "no tool or plugin named read_file");
+        state.settle_ceiling_switch(put.token, Err(gone));
+        assert_eq!(
+            row_notes(&state),
+            [(
+                "read_file".to_string(),
+                "no tool or plugin named read_file".to_string()
+            )]
+        );
+        let generation = state.ask_ceiling_read();
+        assert!(state.settle_coworker_ceiling(
+            generation,
+            "cw_1".into(),
+            Ok(ceiling_at(
+                Some(4),
+                json!([{"name": "shell", "kind": "builtin", "enabled": true}])
+            ))
+        ));
+        assert_eq!(
+            ceiling_card_lines(&card(&state)),
+            [CeilingCardLine::Note(
+                "no tool or plugin named read_file".to_string()
+            )]
+        );
+
+        assert!(words_name_row(
+            "no tool or plugin named read_file",
+            "read_file"
+        ));
+        assert!(words_name_row("no tool or plugin named `x`.", "x"));
+        assert!(
+            !words_name_row("no tool or plugin named user_machine_shell", "shell"),
+            "a name inside another is not the row"
+        );
+        assert!(!words_name_row(
+            "the tools changed since you looked",
+            "shell"
+        ));
+    }
+
+    /// A switch built from a version the server has moved on from is refused with 409 and its
+    /// code, and nothing is changed: the version went in the body, the ceiling is read again, and
+    /// the server's words are a line on the card rather than under the row, since they are about
+    /// the ceiling. The person clicks again on the rows the read brings.
+    #[tokio::test]
+    async fn a_changed_ceiling_is_read_again_with_the_servers_words_on_the_card() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .and(wiremock::matchers::path("/coworkers/cw_1/ceiling"))
+            .and(wiremock::matchers::body_json(json!({
+                "enabled": ["shell", "read_file", "gmail", "old_crm"],
+                "version": 3
+            })))
+            .respond_with(wiremock::ResponseTemplate::new(409).set_body_json(json!({
+                "error": "the tools changed since you looked",
+                "code": "ceiling-changed"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut state = with_ceiling_read("cw_1");
+        let put = state.begin_ceiling_switch("read_file", true).unwrap();
+        let answer = send_switch(&mut state, &server, put).await;
+        assert_eq!(answer, CeilingAnswer::Outdated);
+        assert_eq!(after_ceiling_switch(answer), AfterSwitch::ReadCeiling);
+        assert_eq!(shown(&state), on(&["shell", "gmail", "old_crm"]));
+        assert!(row_notes(&state).is_empty());
+        assert_eq!(
+            ceiling_card_lines(&card(&state)),
+            [CeilingCardLine::Note(
+                "the tools changed since you looked".to_string()
+            )]
+        );
+        assert_eq!(card(&state).blocked, None, "the person can click again");
+    }
+
+    /// Something in front of the server answering 502, 503 or 504 is not the server's word on the
+    /// switch, and its page is not shown as the server's words: nobody knows whether the switch
+    /// was taken, so the ceiling is read again. A 503 the server wrote itself is its word.
+    #[tokio::test]
+    async fn a_proxys_answer_is_no_answer_from_the_server() {
+        for status in [502, 503, 504] {
+            let server = put_answered(
+                wiremock::ResponseTemplate::new(status)
+                    .set_body_string("<html><body><h1>Bad Gateway</h1></body></html>"),
+            )
+            .await;
+            let mut state = with_ceiling_read("cw_1");
+            let put = state.begin_ceiling_switch("read_file", true).unwrap();
+            let answer = send_switch(&mut state, &server, put).await;
+            assert_eq!(answer, CeilingAnswer::Unknown, "{status}");
+            assert_eq!(after_ceiling_switch(answer), AfterSwitch::ReadCeiling);
+            assert_eq!(
+                row_notes(&state),
+                [("read_file".to_string(), SWITCH_UNANSWERED.to_string())],
+                "{status}"
+            );
+            assert_eq!(
+                state.ceiling_switch, None,
+                "{status}: the card is free again"
+            );
+        }
+        let server = put_answered(wiremock::ResponseTemplate::new(503).set_body_json(json!({
+            "error": "this coworker's tools could not be read or saved now"
+        })))
+        .await;
+        let mut state = with_ceiling_read("cw_1");
+        let put = state.begin_ceiling_switch("read_file", true).unwrap();
+        assert_eq!(
+            send_switch(&mut state, &server, put).await,
+            CeilingAnswer::Refused
+        );
+        assert_eq!(
+            row_notes(&state),
+            [(
+                "read_file".to_string(),
+                "this coworker's tools could not be read or saved now".to_string()
+            )]
+        );
+    }
+
+    /// A 2xx whose body is not a ceiling is no word on the switch either: the status says the
+    /// server took something, and nothing says what. The ceiling is read again, and the row
+    /// says the answer could not be read, not that the server could not be reached.
+    #[tokio::test]
+    async fn a_2xx_that_is_not_a_ceiling_is_read_again() {
+        let server = put_answered(
+            wiremock::ResponseTemplate::new(200).set_body_json(json!({"tools": "all of them"})),
+        )
+        .await;
+        let mut state = with_ceiling_read("cw_1");
+        let put = state.begin_ceiling_switch("read_file", true).unwrap();
+        let answer = send_switch(&mut state, &server, put).await;
+        assert_eq!(answer, CeilingAnswer::Unknown);
+        assert_eq!(after_ceiling_switch(answer), AfterSwitch::ReadCeiling);
+        assert_eq!(
+            row_notes(&state),
+            [(
+                "read_file".to_string(),
+                SWITCH_ANSWER_UNREADABLE.to_string()
+            )]
+        );
+        assert_eq!(shown(&state), on(&["shell", "gmail", "old_crm"]));
+    }
+
+    /// A switch whose answer does not come in time is over: the card is free again, nobody knows
+    /// whether it was taken, and the ceiling is read again to find out.
+    #[tokio::test]
+    async fn a_switch_out_of_time_frees_the_card_and_is_read_again() {
+        let server = put_answered(
+            wiremock::ResponseTemplate::new(200)
+                .set_body_json(json!({ "tools": served_rows(), "version": 4 }))
+                .set_delay(Duration::from_secs(2)),
+        )
+        .await;
+        let mut state = with_ceiling_read("cw_1");
+        let put = state.begin_ceiling_switch("shell", false).unwrap();
+        let client = OpenGrokClient::new(&server.uri()).expect("a URL that parses");
+        let result = client
+            .ceiling_within(
+                reqwest::Method::PUT,
+                &put.coworker_id,
+                Some(&json!({ "enabled": put.enabled, "version": put.version })),
+                Duration::from_millis(100),
+            )
+            .await;
+        let answer = state.settle_ceiling_switch(put.token, result);
+        assert_eq!(answer, CeilingAnswer::Unknown);
+        assert_eq!(after_ceiling_switch(answer), AfterSwitch::ReadCeiling);
+        assert_eq!(state.ceiling_switch, None);
+        assert_eq!(card(&state).blocked, None);
+        assert_eq!(
+            row_notes(&state),
+            [("shell".to_string(), SWITCH_UNANSWERED.to_string())]
+        );
+    }
+
+    /// A switch that got no answer may or may not have been taken, so the row goes back to where
+    /// the server last had it and says so, and the ceiling is read again. A read that has the
+    /// row where the switch asked says it was taken, and the note goes; one that does not leaves
+    /// it, since it is still true.
+    #[test]
+    fn a_switch_with_no_answer_is_settled_by_the_next_read() {
+        let mut state = with_ceiling_read("cw_1");
+        let put = state.begin_ceiling_switch("shell", false).unwrap();
+        let dropped = OpenGrokError::from_server(Some(504), "Gateway Timeout");
+        assert_eq!(
+            state.settle_ceiling_switch(put.token, Err(dropped)),
+            CeilingAnswer::Unknown
+        );
+        assert_eq!(shown(&state), on(&["shell", "gmail", "old_crm"]));
+        assert_eq!(
+            card(&state).note.map(|note| note.place),
+            Some(NotePlace::Unanswered {
+                name: "shell".into(),
+                enabled: false
+            })
+        );
+        let generation = state.ask_ceiling_read();
+        assert!(state.settle_coworker_ceiling(generation, "cw_1".into(), Ok(served_ceiling())));
+        assert_eq!(
+            row_notes(&state),
+            [("shell".to_string(), SWITCH_UNANSWERED.to_string())],
+            "not taken: the note is still true"
+        );
+        let generation = state.ask_ceiling_read();
+        let taken = json!([
+            {"name": "shell", "kind": "builtin", "enabled": false},
+            {"name": "gmail", "kind": "plugin", "enabled": true}
+        ]);
+        assert!(state.settle_coworker_ceiling(
+            generation,
+            "cw_1".into(),
+            Ok(ceiling_at(Some(4), taken))
+        ));
+        assert_eq!(card(&state).note, None, "taken after all");
+
+        // A plugin the server no longer loads is not listed once it is off, so a read without it
+        // says its switch off was taken.
+        let mut state = with_ceiling_read("cw_1");
+        let put = state.begin_ceiling_switch("old_crm", false).unwrap();
+        state.settle_ceiling_switch(put.token, Err(OpenGrokError::message("connection reset")));
+        let generation = state.ask_ceiling_read();
+        let dropped = json!([{"name": "shell", "kind": "builtin", "enabled": true}]);
+        assert!(state.settle_coworker_ceiling(
+            generation,
+            "cw_1".into(),
+            Ok(ceiling_at(Some(4), dropped))
+        ));
+        assert_eq!(card(&state).note, None);
+    }
+
+    /// Signing out frees the switch with the server: the next account's switches do not wait on
+    /// it, and when its answer comes, it settles nothing — not the next account's switch, and
+    /// not the card. A read still out lands on nothing too.
+    #[test]
+    fn signing_out_frees_the_switch_and_its_late_answer_lands_on_nothing() {
+        let mut state = with_ceiling_read("cw_1");
+        let before = state.begin_ceiling_switch("read_file", true).unwrap();
+        let read_out = state.ask_ceiling_read();
+        state.forget_ceilings();
+        assert_eq!(state.ceiling_switch, None);
+        assert_eq!(state.ceiling_card(), None);
+        assert!(!state.settle_coworker_ceiling(read_out, "cw_1".into(), Ok(served_ceiling())));
+
+        // Signed in again, to the same Bot, with its ceiling read afresh.
+        let generation = state.ask_ceiling_read();
+        assert!(state.settle_coworker_ceiling(generation, "cw_1".into(), Ok(served_ceiling())));
+        let after = state
+            .begin_ceiling_switch("gmail", false)
+            .expect("nothing is held by the switch from before");
+        let answer_to_before = ceiling_at(
+            Some(9),
+            json!([{"name": "read_file", "kind": "builtin", "enabled": true}]),
+        );
+        assert_eq!(
+            state.settle_ceiling_switch(before.token, Ok(answer_to_before)),
+            CeilingAnswer::Elsewhere
+        );
+        assert_eq!(
+            state.ceiling_switch.as_ref().map(|switch| switch.token),
+            Some(after.token),
+            "the switch with the server is still the new one"
+        );
+        assert_eq!(shown(&state), on(&["shell", "old_crm"]));
+        assert_eq!(
+            state.settle_ceiling_switch(after.token, Ok(served_ceiling())),
+            CeilingAnswer::Taken
+        );
+    }
+
+    /// A 404 to a switch after the ceiling was read is not taken as the server saying the person
+    /// is not the owner: the ceiling is read again, and the read says what the 404 was.
+    #[test]
+    fn a_switch_refused_with_404_is_read_again_rather_than_called_not_the_owners() {
+        let mut state = with_ceiling_read("cw_1");
+        let put = state.begin_ceiling_switch("shell", false).unwrap();
+        let answer = state.settle_ceiling_switch(
+            put.token,
+            Err(OpenGrokError::from_opengrok(404, "no such coworker")),
+        );
+        assert_eq!(answer, CeilingAnswer::Refused);
+        assert_eq!(after_ceiling_switch(answer), AfterSwitch::ReadCeiling);
+        assert_eq!(card(&state).blocked, None, "the card is not made read-only");
+
+        let generation = state.ask_ceiling_read();
+        assert!(state.settle_coworker_ceiling(
+            generation,
+            "cw_1".into(),
+            Err(OpenGrokError::from_opengrok(404, "no such coworker"))
+        ));
+        assert_eq!(
+            card(&state).ceiling,
+            ToolCeiling::Unavailable(NOT_THE_OWNER.to_string())
+        );
+
+        // A server without the route answers a switch with an empty 404, which says nothing
+        // about the Bot.
+        let mut state = with_ceiling_read("cw_1");
+        let put = state.begin_ceiling_switch("shell", false).unwrap();
+        state.settle_ceiling_switch(
+            put.token,
+            Err(OpenGrokError::from_server(Some(404), "request failed")),
+        );
+        assert_eq!(
+            row_notes(&state),
+            [("shell".to_string(), CEILING_NOT_ON_SERVER.to_string())]
+        );
+    }
+
+    /// A 403 to a switch is the server refusing this person any change to the ceiling: the card
+    /// is read-only in the server's words, every switch is dead, and nothing is read again, since
+    /// a read would not change it.
+    #[test]
+    fn a_switch_refused_with_403_leaves_the_card_read_only_in_the_servers_words() {
+        let mut state = with_ceiling_read("cw_1");
+        let put = state.begin_ceiling_switch("shell", false).unwrap();
+        let answer = state.settle_ceiling_switch(
+            put.token,
+            Err(OpenGrokError::from_opengrok(403, "no grant to change")),
+        );
+        assert_eq!(answer, CeilingAnswer::ReadOnly);
+        assert_eq!(after_ceiling_switch(answer), AfterSwitch::Nothing);
+        assert_eq!(shown(&state), on(&["shell", "gmail", "old_crm"]));
+        assert_eq!(
+            card(&state).blocked,
+            Some(CeilingBlock::ReadOnly("no grant to change".into()))
+        );
+        assert_eq!(
+            ceiling_card_lines(&card(&state)),
+            [CeilingCardLine::ReadOnly("no grant to change".to_string())]
+        );
+        assert!(
+            shown_ceiling_rows(&card(&state))
+                .iter()
+                .all(|row| !row.live)
+        );
+        assert_eq!(
+            state.begin_ceiling_switch("read_file", true),
+            Err("no grant to change".to_string())
+        );
+        assert_eq!(state.ceiling_switch, None);
+    }
+
+    /// The answer to a switch can land while the same Bot's card is being read afresh (it was
+    /// opened again meanwhile). What it says is kept for the rows the read brings, not dropped
+    /// with the rows it replaced.
+    #[test]
+    fn a_refusal_that_lands_while_the_card_is_read_afresh_is_kept() {
+        for (refused, expected) in [
+            (
+                OpenGrokError::from_opengrok(422, "no tool or plugin named read_file"),
+                NotePlace::Row("read_file".into()),
+            ),
+            (
+                OpenGrokError::from_opengrok(403, "no grant to change"),
+                NotePlace::ReadOnly,
+            ),
+        ] {
+            let mut state = with_ceiling_read("cw_1");
+            let put = state.begin_ceiling_switch("read_file", true).unwrap();
+            // The Bot opened again, as `select_coworker` does it, with its settings open.
+            state.coworker_ceiling = Some(("cw_1".into(), ToolCeiling::Loading));
+            state.ceiling_note = None;
+            let reading = state.ask_ceiling_read();
+            state.settle_ceiling_switch(put.token, Err(refused));
+            assert!(state.settle_coworker_ceiling(reading, "cw_1".into(), Ok(served_ceiling())));
+            assert_eq!(card(&state).note.map(|note| note.place), Some(expected));
+        }
+    }
+
+    /// A plugin the server no longer loads can be kept on and switched off, and once off it is
+    /// gone from the server's answer, so it cannot be switched back on. One listed off, which a
+    /// server may yet do, is refused going on and never sent.
+    #[test]
+    fn a_plugin_no_longer_on_the_server_cannot_be_switched_back_on() {
+        let mut state = with_ceiling_read("cw_1");
+        let put = state.begin_ceiling_switch("old_crm", false).unwrap();
+        assert_eq!(
+            put.enabled,
+            ["shell", "gmail"],
+            "switched off, and not named to keep it"
+        );
+        let answer = ceiling_at(
+            Some(4),
+            json!([
+                {"name": "shell", "kind": "builtin", "enabled": true},
+                {"name": "read_file", "kind": "builtin", "enabled": false},
+                {"name": "user_machine_shell", "kind": "builtin", "enabled": false,
+                    "available": false},
+                {"name": "gmail", "kind": "plugin", "enabled": true}
+            ]),
+        );
+        assert_eq!(
+            state.settle_ceiling_switch(put.token, Ok(answer)),
+            CeilingAnswer::Taken
+        );
+        assert_eq!(
+            state.begin_ceiling_switch("old_crm", true),
+            Err("This Bot's tools have no `old_crm`.".to_string()),
+            "once off it is not a name the server lists"
+        );
+        let listed_off = CeilingRead {
+            rows: serde_json::from_value(json!([
+                {"name": "old_crm", "kind": "plugin", "enabled": false, "available": false}
+            ]))
+            .unwrap(),
+            version: None,
+        };
+        assert_eq!(
+            listed_off.may_switch("old_crm", true, None),
+            Err(UNAVAILABLE_STAYS_OFF.to_string())
+        );
+    }
+
+    /// A builtin the server cannot offer now is switched either way: the ceiling records what
+    /// the owner allows, and `user_machine_shell` is offered once a machine runs commands.
+    #[test]
+    fn a_builtin_the_server_cannot_offer_now_switches_both_ways() {
+        let mut state = with_ceiling_read("cw_1");
+        let put = state
+            .begin_ceiling_switch("user_machine_shell", true)
+            .unwrap();
+        assert_eq!(
+            put.enabled,
+            ["shell", "user_machine_shell", "gmail", "old_crm"]
+        );
+        let answer = ceiling_at(
+            Some(4),
+            json!([
+                {"name": "shell", "kind": "builtin", "enabled": true},
+                {"name": "user_machine_shell", "kind": "builtin", "enabled": true,
+                    "available": false}
+            ]),
+        );
+        assert_eq!(
+            state.settle_ceiling_switch(put.token, Ok(answer)),
+            CeilingAnswer::Taken
+        );
+        let put = state
+            .begin_ceiling_switch("user_machine_shell", false)
+            .unwrap();
+        assert_eq!(put.enabled, ["shell"]);
+    }
+
+    /// Why a ceiling has no switches, in the words the card uses. A 404 the server wrote is a Bot
+    /// this person does not own; an empty one is a server without the route; out of reach and an
+    /// unreadable answer are said as that, and never as the server's words.
+    #[test]
+    fn a_ceiling_the_server_will_not_give_says_why() {
+        assert_eq!(
+            ceiling_unavailable(&OpenGrokError::from_opengrok(404, "no such coworker")),
+            NOT_THE_OWNER
+        );
+        assert_eq!(
+            ceiling_unavailable(&OpenGrokError::from_server(Some(404), "request failed")),
+            CEILING_NOT_ON_SERVER
+        );
+        assert_eq!(
+            ceiling_unavailable(&OpenGrokError::signed_out("sign in first")),
+            SIGN_IN_FOR_TOOLS
+        );
+        assert_eq!(
+            ceiling_unavailable(&OpenGrokError::from_opengrok(403, "no grant to read")),
+            "no grant to read"
+        );
+        assert_eq!(
+            ceiling_unavailable(&OpenGrokError::from_opengrok(503, "busy")),
+            "Could not read which tools this Bot may use: busy"
+        );
+        assert_eq!(
+            ceiling_unavailable(&OpenGrokError::from_server(
+                Some(502),
+                "<html>Bad Gateway</html>"
+            )),
+            "Could not reach the server to read this Bot's tools."
+        );
+        assert_eq!(
+            ceiling_unavailable(&OpenGrokError::message("error decoding response body")),
+            "The server's answer about this Bot's tools could not be read."
+        );
     }
 
     /// A walk, start to landing, the way `sync_server_threads` makes one.

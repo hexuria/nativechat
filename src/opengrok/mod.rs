@@ -55,19 +55,19 @@ pub use user_form::{
 pub use visibility::ImageVisibility;
 
 pub use client::{
-    AsyncRunResponse, BoxShareScope, ConnectedComputer, CoworkerComputer, CoworkerTool,
-    CoworkerUsage, EgressTunnel, ImageStatus, InertRule, LocalExecMode, LocalExecPolicy,
-    MAX_ATTACHMENT_BYTES, ModelUsage, NewSchedule, NewSkill, OpenGrokClient, QueuedApproval,
-    RecipeBot, RecipeDetail, RecipeGrant, RecipeKind, RecipeParameter, RecipeParameterKind,
-    RecipeRelation, RecipeRun, RecipeRunResult, RecipeScreen, RecipeShare, RecipeShareState,
-    RecipeShareTarget, RecipeStep, RecipeSummary, RecipeTape, RecipeTapeEvent, RecipeVersion,
-    RevealedSecrets, RunCause, RunRecipeResponse, RunReplay, SKILL_BODY_CHARS, SKILL_BUNDLE_FILES,
-    SKILL_BUNDLE_LIMIT, ScheduleEdit, ScheduleKind, ScheduleRow, ScheduleRun, ScheduleRunStatus,
-    SiteLoginSave, SiteLoginUpdate, SkillDetail, SkillFile, SkillPatch, SkillSource, SkillSummary,
-    SkillVersion, StopReply, ThreadReplay, ThreadRun, TurnRecipe, UpdateStatus, UsageTotals,
-    WebhookInfo, collapse_computer_roster, collapse_computers_by_machine_id,
-    env_egress_tunnel_enabled, host_egress_tunnel_available, host_egress_tunnel_enabled,
-    host_egress_tunnel_flag, thin_tape,
+    AsyncRunResponse, BoxShareScope, CeilingKind, CeilingRow, ConnectedComputer, CoworkerCeiling,
+    CoworkerComputer, CoworkerTool, CoworkerUsage, EgressTunnel, ImageStatus, InertRule,
+    LocalExecMode, LocalExecPolicy, MAX_ATTACHMENT_BYTES, ModelUsage, NewSchedule, NewSkill,
+    OpenGrokClient, QueuedApproval, RecipeBot, RecipeDetail, RecipeGrant, RecipeKind,
+    RecipeParameter, RecipeParameterKind, RecipeRelation, RecipeRun, RecipeRunResult, RecipeScreen,
+    RecipeShare, RecipeShareState, RecipeShareTarget, RecipeStep, RecipeSummary, RecipeTape,
+    RecipeTapeEvent, RecipeVersion, RevealedSecrets, RunCause, RunRecipeResponse, RunReplay,
+    SKILL_BODY_CHARS, SKILL_BUNDLE_FILES, SKILL_BUNDLE_LIMIT, ScheduleEdit, ScheduleKind,
+    ScheduleRow, ScheduleRun, ScheduleRunStatus, SiteLoginSave, SiteLoginUpdate, SkillDetail,
+    SkillFile, SkillPatch, SkillSource, SkillSummary, SkillVersion, StopReply, ThreadReplay,
+    ThreadRun, TurnRecipe, UpdateStatus, UsageTotals, WebhookInfo, collapse_computer_roster,
+    collapse_computers_by_machine_id, env_egress_tunnel_enabled, host_egress_tunnel_available,
+    host_egress_tunnel_enabled, host_egress_tunnel_flag, thin_tape,
 };
 pub use error::{Failure, OpenGrokError, Unreachable, reads_as_gateway_unreachable, retry_enqueue};
 pub use pending::{
