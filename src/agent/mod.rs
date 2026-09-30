@@ -127,6 +127,31 @@
 //! read (a server without the route, a Bot this person does not own), the card lists what the
 //! next turn is offered instead, read-only: `agent-tool-{name}` (value `builtin` / `plugin`).
 //!
+//! In the bot's settings, below Tools: `agent-skills` (value = the Skills card's line: `2
+//! attached · 1 switched off`, `None attached`, `Asking the server…`, or why there are no
+//! switches, as "Only this Bot's owner can change its skills."), and `agent-skills-toggle` (Show
+//! / Hide, only while there are skills to show). Visible while the card is open: the card's own
+//! lines, `agent-skills-read-only` (the server's words for a 403: every switch is dead),
+//! `agent-skills-wait` (another Bot's skill switch, or a read of this Bot's skills, is with the
+//! server) and `agent-skills-note` (the server's words about the last switch when no skill is the
+//! one they are about: a 409's "the skills changed since you looked", or the 422 over the cap on
+//! attached skills); one `agent-skills-switch-{id}` per skill of the account's library the owner
+//! may attach (opengrok-server#270), by the skill's id and never its name, since one of the
+//! owner's skills and a colleague's can share a name: a switch named by the skill's name, value
+//! `mine` / `org`, `checked` while attached (where it was asked to go while that is with the
+//! server), enabled only while a click would send it, states `switching` and `switched-off`.
+//! Under it: `agent-skills-off-{id}` (switched off in Settings → Skills) and
+//! `agent-skills-error-{id}` (the server's words for a switch it did not take, or that nobody
+//! knows whether it did). And `agent-skills-shared` ("People who use this Bot can read its
+//! attached skills."), only on a Bot the roster says is shared with the owner's organization.
+//! Every id under a skill has its fixed word (`switch`, `off`, `error`) before the skill's id and
+//! the card's own ids have none, so no skill's id makes one id another's. A click attaches or
+//! detaches at once, sending every attached skill's id with the version the skills were read at;
+//! one at a time, so every switch is refused while any skill switch is with the server or the
+//! skills are being read, and a skill switched off in Settings → Skills is refused being
+//! attached, though it can always be detached. The Tools card's switches and these are apart:
+//! neither waits on the other.
+//!
 //! In the bot's settings: `agent-effort` (a menu; value = the effort word it shows, state
 //! `unsaved` while that is a pick Save has not sent; disabled and reading `inherit` from a server
 //! that keeps no effort, one from before opengrok-server#271) with one `agent-effort-{word}` per

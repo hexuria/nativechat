@@ -75,6 +75,12 @@ pub struct Coworker {
     /// change what that server has nowhere to keep.
     #[serde(default)]
     pub effort: Option<String>,
+    /// Who may use this bot: `private`, its owner alone, or `org`, shared with the owner's
+    /// organization. Transcribed from opengrok-server `agui/routes.rs` `coworker_row`, which
+    /// writes it on every row, as `fixtures/wire/rest/GET__coworkers/` records both words. The
+    /// app reads it through [`Self::is_shared`].
+    #[serde(default)]
+    pub visibility: Option<String>,
 }
 
 /// How hard a coworker thinks before it answers, in the server's words and in its order.
@@ -92,6 +98,14 @@ impl Coworker {
     /// The effort its turns run with, in the server's word: `inherit` where the server keeps none.
     pub fn effort(&self) -> &str {
         self.effort.as_deref().unwrap_or(EFFORT_INHERIT)
+    }
+
+    /// Shared with the owner's organization, so the people in it use this bot too, and a bot
+    /// used by others lets them read the skills attached to it (opengrok-server#270). Only the
+    /// server's `org` says so: a row that does not say, or says a word this app does not know,
+    /// is not claimed as shared.
+    pub fn is_shared(&self) -> bool {
+        self.visibility.as_deref() == Some("org")
     }
 }
 
