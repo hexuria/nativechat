@@ -118,8 +118,8 @@ pub(crate) fn badge_model_id(message_id: &str) -> String {
 pub(crate) const ASKING: &str = "Asking the server…";
 pub(crate) const INTRO: &str = "Where your Bots' replies are paid from. Either way the server \
      runs the turn, its tools and its record; this app never calls a model or keeps a key.";
-/// The same, from a server that keeps a door per Bot (opengrok-server `bot-model-source`,
-/// confirmed 2026-09-30, not yet recorded): a Bot picks its own door and model in the model
+/// The same, from a server that keeps a door per Bot (opengrok-server PR #304, bot-model-source
+/// 0ae9f2a, recorded at 4059c59, not yet on main): a Bot picks its own door and model in the model
 /// picker, and this page is what the ones that have not picked follow.
 pub(crate) const INTRO_PER_BOT: &str = "Where replies are paid from for a Bot that hasn't \
      picked its own model in the composer. Either way the server runs the turn, its tools and its \

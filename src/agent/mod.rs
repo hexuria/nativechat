@@ -179,9 +179,9 @@
 //! a line, not a row) and `model-note` (the server's word on why the list is not fuller).
 //! `model-error` is the server's words for the last change it refused. Every change is saved on
 //! the Bot at once, `source`, `model` and `effort` on `PATCH /coworkers/{id}` (opengrok-server
-//! `bot-model-source`, confirmed 2026-09-30, not yet recorded). The card's parts are the chip's
-//! with `agent-` before them: `agent-model-pop`, `agent-model-fast`, `agent-model-effort`,
-//! `agent-model-open-list`, `agent-model-reset`, `agent-model-list`,
+//! PR #304, bot-model-source 0ae9f2a, recorded at 4059c59, not yet on main). The card's parts
+//! are the chip's with `agent-` before them: `agent-model-pop`, `agent-model-fast`,
+//! `agent-model-effort`, `agent-model-open-list`, `agent-model-reset`, `agent-model-list`,
 //! `agent-model-row-{source}-{id}`, `agent-model-plan`, `agent-model-routines`,
 //! `agent-model-note` and `agent-model-error`. Invoke `model.picker`, `model.picker.open` and
 //! `model.picker.close` work the card's popover, and a click on `agent-model-dismiss` shuts

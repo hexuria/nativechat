@@ -5,8 +5,8 @@
 //! No GPUI. The composer's chip and the Bot's card in its settings both draw what is here
 //! (`components::model_picker`), and the gpui-agent tree names it, so the three always agree.
 //!
-//! A Bot's setting is three things its row keeps: the door (`source`, opengrok-server
-//! `bot-model-source`, confirmed 2026-09-30, not yet recorded), the model it is pinned to
+//! A Bot's setting is three things its row keeps: the door (`source`, opengrok-server PR #304,
+//! bot-model-source 0ae9f2a, recorded at 4059c59, not yet on main), the model it is pinned to
 //! (`model`), and how hard it thinks (`effort`, opengrok-server#271). Fast is not a fourth.
 //! opencodex lists a model's fast tier as a twin id, `gpt-6-luna--fast` beside `gpt-6-luna`, and
 //! the server's allowlist takes the tier off before it reads the rest ([`is_subscription_model`]),
@@ -16,12 +16,12 @@
 //! tell, and never a pin the server would ignore. On the person's plan the server asks the Bot's
 //! pin only where the Bot's own door is the plan (`source: "local_proxy"`) and its allowlist takes
 //! the pin, and the account's plan model otherwise (`ahead_of_the_setting` in opengrok-server's
-//! `crates/opengrok-harness/src/local_proxy.rs`, on `bot-model-source`, confirmed 2026-09-30). A
-//! Bot that follows the account (`source: null`), or is on the gateway, runs a turn on the plan
-//! with the account's plan model whatever it is pinned to: every Bot hired by default is pinned
-//! `xai/grok-4.6`, which the allowlist takes, and that pin is a gateway route, not the plan model
-//! the person chose. A server from before per-Bot doors takes the account's plan model for every
-//! Bot on the plan.
+//! `crates/opengrok-harness/src/local_proxy.rs`, PR #304, bot-model-source 0ae9f2a, recorded at
+//! 4059c59, not yet on main). A Bot that follows the account (`source: null`), or is on the
+//! gateway, runs a turn on the plan with the account's plan model whatever it is pinned to: every
+//! Bot hired by default is pinned `xai/grok-4.6`, which the allowlist takes, and that pin is a
+//! gateway route, not the plan model the person chose. A server from before per-Bot doors takes
+//! the account's plan model for every Bot on the plan.
 
 use super::{
     Coworker, CoworkerPatch, CoworkerSource, EFFORT_INHERIT, InferenceKind, InferenceSource,
@@ -364,9 +364,9 @@ pub fn bot_pick(
     let account_model = account.and_then(account_plan_model);
     // On the plan the server asks the pin only of a Bot whose own door is the plan, and only a
     // pin its allowlist takes; any other Bot there runs on the account's plan model
-    // (opengrok-server `bot-model-source`, confirmed 2026-09-30). A Bot that follows the account
-    // may well hold a pin the allowlist takes, as every default hire's `xai/grok-4.6` is, and that
-    // pin is not the plan model the person chose.
+    // (opengrok-server PR #304, bot-model-source 0ae9f2a, recorded at 4059c59, not yet on main).
+    // A Bot that follows the account may well hold a pin the allowlist takes, as every default
+    // hire's `xai/grok-4.6` is, and that pin is not the plan model the person chose.
     let model = match door {
         Some(InferenceKind::LocalProxy)
             if bot_door == Some(InferenceKind::LocalProxy)
@@ -1030,11 +1030,11 @@ mod tests {
     }
 
     /// On the person's plan the server asks a Bot's pin only when the Bot's own door is the plan
-    /// (opengrok-server `bot-model-source`, confirmed 2026-09-30). A Bot that follows the account
-    /// there runs on the account's plan model even with a pin the allowlist takes: the chip names
-    /// that model, the list ticks it, and ⚡ moves to its twin with the Bot's own door, so the
-    /// pick sticks. A pick of the pin's own row sends the door alone. The same Bot on its own
-    /// plan runs on its pin.
+    /// (opengrok-server PR #304, bot-model-source 0ae9f2a, recorded at 4059c59, not yet on main).
+    /// A Bot that follows the account there runs on the account's plan model even with a pin the
+    /// allowlist takes: the chip names that model, the list ticks it, and ⚡ moves to its twin
+    /// with the Bot's own door, so the pick sticks. A pick of the pin's own row sends the door
+    /// alone. The same Bot on its own plan runs on its pin.
     #[test]
     fn a_bot_that_follows_the_account_shows_the_plan_model_and_not_its_pin() {
         const LISTED: &[&str] = &["gpt-6-luna", "gpt-6-luna--fast", "gpt-6-sol"];

@@ -12018,8 +12018,9 @@ impl AppState {
     }
 
     /// The server keeps a door per Bot: some row of the roster carries `source` (opengrok-server
-    /// `bot-model-source`, confirmed 2026-09-30, not yet recorded). Settings → Reply source is
-    /// then the default for the Bots that have picked none, and says so.
+    /// PR #304, bot-model-source 0ae9f2a, recorded at 4059c59, not yet on main, which writes it
+    /// on every row). Settings → Reply source is then the default for the Bots that have picked
+    /// none, and says so.
     pub fn server_keeps_bot_doors(&self) -> bool {
         self.coworkers
             .iter()
@@ -33336,6 +33337,51 @@ mod tests {
         assert_eq!(recovered.len(), 1);
         assert_eq!(recovered[0].relay_failure, None);
         assert_eq!(recovered[0].content, format!("{RUN_ERROR_PREFIX}{said}"));
+    }
+
+    /// A teammate on a shared Bot its owner put on the person's plan, with no plan of their own
+    /// set up, is refused the turn in the server's words: the plan is always the person's who
+    /// drives the turn, and the turn is never sent on the server's keys, nor to the owner's plan
+    /// (opengrok-server PR #304, bot-model-source 0ae9f2a, recorded at 4059c59, not yet on main).
+    /// The recorded replay reads back as a run that failed, the server's sentence under the plan's
+    /// badge, with nothing offered on Server: it is no failure of the relay's.
+    #[test]
+    fn a_teammate_refused_a_shared_bots_plan_reads_back_as_the_servers_sentence() {
+        let recorded: serde_json::Value = serde_json::from_str(include_str!(
+            "../fixtures/wire/rest/GET__ag-ui_threads__thread_id_/200-a_teammate_with_no_proxy_is_refused_in_words_on_a_shared_coworkers_own_plan.json"
+        ))
+        .expect("the recording");
+        let replay: super::ThreadReplay =
+            serde_json::from_value(recorded["body"].clone()).expect("the replay");
+        let said = replay.runs[0]
+            .failure
+            .clone()
+            .expect("the run says why it failed");
+        let ended = replay.runs[0].events.last().expect("the run's frames");
+        assert_eq!(
+            (
+                ended["type"].as_str(),
+                ended["message"].as_str(),
+                ended.get("code")
+            ),
+            (Some("RUN_ERROR"), Some(said.as_str()), None),
+            "a run error in the server's words, naming no relay failure"
+        );
+        let recovered = super::missing_replies(&[message("m1", true, "hi")], &replay.runs);
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].content, format!("{RUN_ERROR_PREFIX}{said}"));
+        assert_eq!(
+            recovered[0].relay_failure, None,
+            "nothing to send on Server"
+        );
+        let badge = recovered[0]
+            .reply_source
+            .as_ref()
+            .expect("the run said which door it asked");
+        assert_eq!(
+            (badge.kind, badge.model.as_deref()),
+            (InferenceKind::LocalProxy, Some("gpt-6-luna"))
+        );
     }
 
     /// A held message the server holds for the person's Mac says so, by its row's word as it
