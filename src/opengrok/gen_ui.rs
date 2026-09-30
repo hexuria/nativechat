@@ -354,7 +354,7 @@ pub const USER_MACHINE_SHELL: &str = "user_machine_shell";
 
 /// The builtin a bot reads one of its attached skills through: `{"name": …}` in, the skill's
 /// `SKILL.md` body out as the call's result, with the skill's files copied onto its box
-/// (opengrok-server#270, as agreed with the server session before that code). It is offered
+/// (opengrok-server#270, merged as #290: `opengrok_tools::skill::USE_SKILL`). It is offered
 /// exactly when the bot has an attached skill that is switched on and the turn's person may use,
 /// and it is no row of the tool ceiling: `GET /coworkers/{id}/tools` lists it while it is offered.
 pub const USE_SKILL: &str = "use_skill";
@@ -1745,9 +1745,9 @@ pub fn approval_summary(tool: &str, arguments: &Value) -> String {
             clip(string_arg(arguments, "recipe").unwrap_or("(unnamed)"), 80)
         ),
         // The server's own builtin for reading an attached skill (#270), named by the skill as a
-        // recipe is. Its `summary_for` has no arm for it yet, and would call it a plugin's tool
-        // with its arguments; a skill's name is 64 characters of letters, digits, dots and dashes
-        // at most, and a long one reads as a key to the plugin rule, which would hide it.
+        // recipe is: opengrok-server `cards.rs` `summary_for` has the same arm (#290), which no
+        // card should ever need, since `use_skill` raises none. Named by the skill rather than by
+        // the plugin rule, which would read a long skill name as a key and hide it.
         USE_SKILL => format!(
             "Read the skill \"{}\"",
             clip(string_arg(arguments, "name").unwrap_or("(unnamed)"), 80)
