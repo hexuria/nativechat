@@ -65,7 +65,7 @@ use super::gen_ui::{
     USER_MACHINE_SHELL, approval_from_event, approval_summary, capped, command_from_replay_events,
     is_ui_tool,
 };
-use super::inference::{INFERENCE_SOURCE_CUSTOM, InferenceKind, InferenceSource};
+use super::inference::{INFERENCE_SOURCE_CUSTOM, InferenceKind, InferenceSource, TurnSource, Via};
 use super::pending::{
     CUSTOM_NAME as PENDING_CUSTOM, PendingCustom, PendingList, PendingMutation, PendingOp,
     PendingUserMessage,
@@ -1683,6 +1683,16 @@ fn inference_source_frame(frame: &Value) -> Check {
         source.kind.word() == str_at(value, "kind") && source.model.as_deref() == model,
         "the badge should be the frame's kind and model as sent: {source:?} from {value}"
     );
+    // The way the plan was reached, from a server with the Mac relay (opengrok-server #292,
+    // contract agreed 2026-09-30, not yet recorded): as sent on the plan's badge, when it is one
+    // this app can name.
+    let via = opt_str(value, "via")
+        .and_then(Via::from_word)
+        .filter(|_| source.kind == InferenceKind::LocalProxy);
+    must!(
+        source.via == via,
+        "the badge should say the way as sent: {source:?} from {value}"
+    );
     Ok(())
 }
 
@@ -1969,11 +1979,16 @@ fn held_as_sent(message: &PendingUserMessage, raw: &Value) -> Check {
         "the send's recipe, skill and reply should come through as sent: {message:?}"
     );
     // The door it was queued with, on the row only when the send named one (opengrok-server
-    // #294: `message_json` in `crates/opengrok-server/src/agui/pending.rs`).
+    // #294: `message_json` in `crates/opengrok-server/src/agui/pending.rs`): the bare word, or
+    // with the Mac relay `{"kind", "via"}` (#292, contract agreed 2026-09-30, not yet recorded).
     must!(
-        message.inference_source()
-            == opt_str(raw, "inferenceSource").and_then(InferenceKind::from_word),
+        message.inference_source() == raw.get("inferenceSource").and_then(TurnSource::from_value),
         "the send's door should come through as sent: {message:?}"
+    );
+    // Held for the person's Mac, while no Mac holds the relay (the same contract).
+    must!(
+        message.waits_for_mac() == (opt_str(raw, "heldFor") == Some("relay_offline")),
+        "whether the send waits for the Mac should come through as sent: {message:?}"
     );
     Ok(())
 }
@@ -3505,6 +3520,31 @@ fn inference_source(_: u16, body: &Value) -> Check {
             && Some(read.has_api_key) == body["hasApiKey"].as_bool(),
         "the reply source should come through as sent: {read:?} from {body}"
     );
+    // From a server with the Mac relay (opengrok-server #292, contract agreed 2026-09-30, not
+    // yet recorded): the account's way as sent, and where the relay stands, field for field; a
+    // server before it sends neither, and the relay is not offered.
+    must!(
+        read.via.as_deref() == opt_str(body, "via"),
+        "the account's way should come through as sent: {read:?} from {body}"
+    );
+    match (
+        &read.relay,
+        body.get("relay").filter(|relay| !relay.is_null()),
+    ) {
+        (None, None) => {}
+        (Some(relay), Some(raw)) => must!(
+            Some(relay.connected) == raw["connected"].as_bool()
+                && relay.machine_id.as_deref() == opt_str(raw, "machineId")
+                && relay.machine_label.as_deref() == opt_str(raw, "machineLabel")
+                && relay.local_model.as_deref() == opt_str(raw, "localModel"),
+            "where the relay stands should come through as sent: {relay:?} from {raw}"
+        ),
+        (read, sent) => {
+            return Err(format!(
+                "the relay should be read exactly when it is sent: {read:?} from {sent:?}"
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -3544,6 +3584,30 @@ fn models_listed(_: u16, body: &Value) -> Check {
         "opencodex's health should come through as sent: {:?} from {body}",
         catalogue.local_proxy
     );
+    // With the Mac relay (opengrok-server #292, contract agreed 2026-09-30, not yet recorded):
+    // each of the plan's models by the way the server reaches it, none named being the server's
+    // own machine, and whether a Mac holds the relay.
+    for (entry, raw) in catalogue.models.iter().zip(raw) {
+        let via = match (entry.is_local_proxy(), opt_str(raw, "via")) {
+            (false, _) => None,
+            (true, None) => Some(Via::Loopback),
+            (true, Some(word)) => Via::from_word(word),
+        };
+        must!(
+            entry.plan_via() == via,
+            "each of the plan's models should say its way as sent: {entry:?} from {raw}"
+        );
+    }
+    let relay = body
+        .get("localProxy")
+        .and_then(|proxy| proxy.get("relayConnected"))
+        .and_then(Value::as_bool);
+    if let Some(proxy) = catalogue.local_proxy {
+        must!(
+            proxy.relay_connected == relay.unwrap_or(false),
+            "whether a Mac holds the relay should come through as sent: {proxy:?} from {body}"
+        );
+    }
     Ok(())
 }
 
@@ -5033,6 +5097,34 @@ fn a_queued_sends_door_is_read_beyond_the_recording() {
     let mut lost: PendingUserMessage = serde_json::from_value(rows[0].clone()).unwrap();
     lost.inference_source = None;
     assert!(held_as_sent(&lost, &rows[0]).is_err());
+    // With the Mac relay (in the shape agreed for opengrok-server #292, not yet recorded): a row
+    // names its way to the plan beside the kind, and one the server holds for the person's Mac
+    // says so; a way this app cannot name reads as no door, and never fails the queue.
+    let mut through_the_mac = row("pum_3", "m4", None);
+    through_the_mac["inferenceSource"] = json!({"kind": "local_proxy", "via": "mac"});
+    through_the_mac["heldFor"] = json!("relay_offline");
+    let mut helper = row("pum_4", "m5", None);
+    helper["inferenceSource"] = json!({"kind": "local_proxy", "via": "helper"});
+    let relayed = [through_the_mac.clone(), helper];
+    let listed = json!({
+        "pendingUserMessages": relayed,
+        "pendingEvents": relayed.iter().cloned().map(snapshot).collect::<Vec<_>>(),
+        "threadId": "th_1",
+        "v": 1
+    });
+    pending_list(200, &listed).unwrap_or_else(|why| panic!("{why}"));
+    let read: PendingUserMessage = serde_json::from_value(through_the_mac.clone()).unwrap();
+    assert_eq!(
+        read.inference_source(),
+        Some(TurnSource::plan(Some(Via::Mac)))
+    );
+    assert!(read.waits_for_mac());
+    let mut forgot: PendingUserMessage = serde_json::from_value(through_the_mac.clone()).unwrap();
+    forgot.held_for = None;
+    assert!(
+        held_as_sent(&forgot, &through_the_mac).is_err(),
+        "a row whose hold the parse lost would not pass"
+    );
     // The queue answers a word it does not know as it answers its other 400s: plain text,
     // which reads as the server's sentence and a verdict, not a server out of reach.
     let said = "inferenceSource must be \"gateway\" or \"local_proxy\"";
@@ -5059,7 +5151,27 @@ fn the_reply_source_routes_are_read_beyond_the_recording() {
         "kind": "gateway", "baseUrl": null, "localModel": null,
         "healthy": false, "hasApiKey": false
     });
-    for body in [&set, &unset] {
+    // From a server with the Mac relay (in the shape agreed for opengrok-server #292, not yet
+    // recorded): the account's way, and where the relay stands, answering or not; a way this
+    // app cannot name still reads.
+    let relayed = json!({
+        "kind": "local_proxy", "baseUrl": null, "localModel": null,
+        "healthy": false, "hasApiKey": false, "via": "mac",
+        "relay": {
+            "connected": true, "machineId": "mac_2",
+            "machineLabel": "NativeChat on studio", "localModel": "gpt-5-codex"
+        }
+    });
+    let nobody = json!({
+        "kind": "gateway", "baseUrl": null, "localModel": null,
+        "healthy": false, "hasApiKey": false, "via": "loopback",
+        "relay": {"connected": false, "machineId": null, "machineLabel": null, "localModel": null}
+    });
+    let helper = json!({
+        "kind": "local_proxy", "healthy": true, "hasApiKey": false, "via": "helper",
+        "relay": {"connected": false}
+    });
+    for body in [&set, &unset, &relayed, &nobody, &helper] {
         inference_source(200, body).unwrap_or_else(|why| panic!("{body}: {why}"));
     }
     for broken in [
@@ -5067,9 +5179,19 @@ fn the_reply_source_routes_are_read_beyond_the_recording() {
         json!({"kind": "byok", "healthy": false, "hasApiKey": false}),
         json!({"baseUrl": null, "healthy": false, "hasApiKey": false}),
         json!({"kind": "gateway", "healthy": "yes", "hasApiKey": false}),
+        json!({"kind": "gateway", "healthy": false, "hasApiKey": false,
+            "relay": {"machineId": "mac_2"}}),
+        json!({"kind": "gateway", "healthy": false, "hasApiKey": false,
+            "relay": {"connected": "yes"}}),
     ] {
         assert!(inference_source(200, &broken).is_err(), "{broken}");
     }
+    // A relay's model the server will not route is refused as the plan's is, in its words.
+    refusal(
+        400,
+        &json!({"error": "relay.localModel: \"claude-opus\" is one of Anthropic's models"}),
+    )
+    .unwrap_or_else(|why| panic!("{why}"));
     // The recording holds one of each refusal; the others the server writes (`apply` in
     // `crates/opengrok-harness/src/local_proxy.rs`) read the same way.
     for said in [
@@ -5234,9 +5356,51 @@ fn the_models_list_is_read_beyond_the_recording() {
         "localProxy": {"healthy": false}
     });
     let before_reply_sources = json!({"models": [{"id": "oag/auto"}], "note": null});
-    for body in [&both, &plan_only, &proxy_down, &before_reply_sources] {
+    // With the Mac relay (in the shape agreed for opengrok-server #292, not yet recorded): each
+    // of the plan's models by its way, and whether a Mac holds the relay.
+    let relayed = json!({
+        "models": [
+            {"id": "xai/grok-4.6", "points": null, "source": "gateway"},
+            {"id": "gpt-5.5", "points": null, "source": "local_proxy", "via": "loopback"},
+            {"id": "grok-4", "points": null, "source": "local_proxy", "via": "mac"}
+        ],
+        "note": null,
+        "localProxy": {"healthy": true, "relayConnected": true}
+    });
+    let relay_down = json!({
+        "models": [], "note": null,
+        "localProxy": {"healthy": false, "relayConnected": false}
+    });
+    for body in [
+        &both,
+        &plan_only,
+        &proxy_down,
+        &before_reply_sources,
+        &relayed,
+        &relay_down,
+    ] {
         models_listed(200, body).unwrap_or_else(|why| panic!("{body}: {why}"));
     }
     let unknown = json!({"models": [{"id": "m", "source": "byok"}], "note": null});
     assert!(models_listed(200, &unknown).is_err());
+}
+
+/// The CUSTOM frame's way, fed frames beyond the ones the server's recording holds (in the shape
+/// agreed for opengrok-server #292, not yet recorded): a reply the person's Mac answered, one the
+/// server's own machine did, one by a way this app cannot name, and the gateway's, each read as
+/// its badge says it.
+#[test]
+fn a_replys_way_is_read_beyond_the_recording() {
+    use serde_json::json;
+    let frame =
+        |value: Value| json!({"type": "CUSTOM", "name": INFERENCE_SOURCE_CUSTOM, "value": value});
+    for value in [
+        json!({"kind": "local_proxy", "via": "mac", "model": "gpt-5-codex"}),
+        json!({"kind": "local_proxy", "via": "loopback", "model": "gpt-5-codex"}),
+        json!({"kind": "local_proxy", "via": "helper", "model": "gpt-5-codex"}),
+        json!({"kind": "gateway", "model": "oag/cheap"}),
+    ] {
+        inference_source_frame(&frame(value.clone()))
+            .unwrap_or_else(|why| panic!("{value}: {why}"));
+    }
 }

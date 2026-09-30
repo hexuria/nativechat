@@ -189,6 +189,12 @@ pub struct ModelEntry {
     /// the word the server sent and read through [`Self::source`].
     #[serde(default)]
     pub source: Option<String>,
+    /// For one of the plan's models, which way the server reaches it: `loopback`, listed by
+    /// opencodex on the server's machine, or `mac`, listed by the opencodex of the Mac holding
+    /// the relay (opengrok-server #292, contract agreed 2026-09-30, not yet recorded). Kept as
+    /// the word sent and read through [`Self::plan_via`].
+    #[serde(default)]
+    pub via: Option<String>,
 }
 
 impl ModelEntry {
@@ -206,6 +212,19 @@ impl ModelEntry {
     /// Model field does not.
     pub fn is_local_proxy(&self) -> bool {
         self.source() == Some(super::InferenceKind::LocalProxy)
+    }
+
+    /// The way the server reaches one of the plan's models: `loopback` when the entry names none,
+    /// as a server before the relay lists only those, and `None` for the gateway's models and for
+    /// a way this app has not heard of, which neither of the plan's pickers offers.
+    pub fn plan_via(&self) -> Option<super::Via> {
+        if !self.is_local_proxy() {
+            return None;
+        }
+        match self.via.as_deref() {
+            None => Some(super::Via::Loopback),
+            Some(word) => super::Via::from_word(word),
+        }
     }
 }
 
@@ -236,6 +255,11 @@ pub struct ModelCatalogue {
 pub struct LocalProxyStatus {
     /// opencodex answered its `/healthz` when the server asked.
     pub healthy: bool,
+    /// A Mac holds the relay, so the models listed through it are its opencodex's word now
+    /// (opengrok-server #292, contract agreed 2026-09-30, not yet recorded). False from a server
+    /// before the relay, which lists none that way.
+    #[serde(default, rename = "relayConnected")]
+    pub relay_connected: bool,
 }
 
 fn proxy_status_or_none<'de, D>(deserializer: D) -> Result<Option<LocalProxyStatus>, D::Error>
@@ -648,14 +672,26 @@ mod tests {
             "note": null,
             "localProxy": {"healthy": true}
         }));
-        assert_eq!(up.local_proxy, Some(LocalProxyStatus { healthy: true }));
+        assert_eq!(
+            up.local_proxy,
+            Some(LocalProxyStatus {
+                healthy: true,
+                relay_connected: false,
+            })
+        );
         assert!(up.models[0].is_local_proxy());
         let down = read(serde_json::json!({
             "models": [{"id": "oag/cheap", "source": "gateway", "points": null}],
             "note": null,
             "localProxy": {"healthy": false}
         }));
-        assert_eq!(down.local_proxy, Some(LocalProxyStatus { healthy: false }));
+        assert_eq!(
+            down.local_proxy,
+            Some(LocalProxyStatus {
+                healthy: false,
+                relay_connected: false,
+            })
+        );
         assert!(!down.models[0].is_local_proxy());
         let none = read(serde_json::json!({"models": [], "note": null}));
         assert_eq!(none.local_proxy, None);
@@ -679,6 +715,52 @@ mod tests {
             assert_eq!(odd.local_proxy, None);
             assert_eq!(odd.models.len(), 1);
         }
+    }
+
+    /// With the Mac relay each of the plan's models says which way the server reaches it, and
+    /// `localProxy` whether a Mac holds the relay (in the shape agreed for opengrok-server #292,
+    /// not yet recorded). A plan's model that names no way is the server's own machine's, as
+    /// every one a server before the relay lists; a way this app has not heard of is neither
+    /// picker's, and the gateway's models have none.
+    #[test]
+    fn a_plans_model_says_which_way_it_is_reached() {
+        use super::super::Via;
+        let catalogue: ModelCatalogue = serde_json::from_value(serde_json::json!({
+            "models": [
+                {"id": "oag/cheap", "source": "gateway", "points": null},
+                {"id": "gpt-5-codex", "source": "local_proxy", "via": "loopback"},
+                {"id": "grok-4", "source": "local_proxy", "via": "mac"},
+                {"id": "gpt-5", "source": "local_proxy"},
+                {"id": "odd", "source": "local_proxy", "via": "helper"},
+                {"id": "stray", "source": "gateway", "via": "mac"}
+            ],
+            "note": null,
+            "localProxy": {"healthy": false, "relayConnected": true}
+        }))
+        .expect("one entry's way never fails the list");
+        let ways: Vec<(&str, Option<Via>)> = catalogue
+            .models
+            .iter()
+            .map(|entry| (entry.id.as_str(), entry.plan_via()))
+            .collect();
+        assert_eq!(
+            ways,
+            vec![
+                ("oag/cheap", None),
+                ("gpt-5-codex", Some(Via::Loopback)),
+                ("grok-4", Some(Via::Mac)),
+                ("gpt-5", Some(Via::Loopback)),
+                ("odd", None),
+                ("stray", None),
+            ]
+        );
+        assert_eq!(
+            catalogue.local_proxy,
+            Some(LocalProxyStatus {
+                healthy: false,
+                relay_connected: true,
+            })
+        );
     }
 
     /// The field is new: a server that has never heard of it must still see the array it saw

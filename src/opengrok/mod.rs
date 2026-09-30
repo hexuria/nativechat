@@ -34,8 +34,9 @@ pub use gen_ui::{
     place_hitl_cards_in_document_order, policy_answer,
 };
 pub use inference::{
-    DEFAULT_PROXY_URL, INFERENCE_SOURCE_CUSTOM, InferenceKind, InferenceSource,
-    InferenceSourceUpdate, ProxyKey, ReplySource, is_loopback, is_subscription_model,
+    DEFAULT_PROXY_URL, HELD_FOR_RELAY_OFFLINE, INFERENCE_SOURCE_CUSTOM, InferenceKind,
+    InferenceSource, InferenceSourceUpdate, ProxyKey, RelayErrorCode, RelayRead, RelayUpdate,
+    ReplySource, TurnSource, Via, is_loopback, is_subscription_model,
 };
 pub use local_exec::{enrol_this_machine, serve_local_exec, stored_machine_id};
 pub(crate) use user_form::USER_FORM_REASON;
