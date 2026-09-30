@@ -1057,11 +1057,11 @@ impl OpenGrokClient {
 
     /// The turn's error from its `RUN_ERROR` frame. The stream itself is a `200`: the run began
     /// and the server ended it badly, and the sentence it ends with is the only thing that says
-    /// whether the model refused or the gateway was never reached. A run through the person's Mac
-    /// names why it ended beside the sentence (`relay_offline`, `relay_timeout`, `relay_failed`:
-    /// opengrok-server #292, server main cad36fd (#303, after #298), pin 47a5d6b), and that code is
-    /// what offers the turn again on the server's keys. Apart from the
-    /// stream so the wire conformance tests read a recorded frame with this very code.
+    /// whether the model refused or the gateway was never reached. A run the person's plan could
+    /// not answer names why beside the sentence ([`crate::opengrok::RunErrorCode`]: the Mac
+    /// relay's `relay_offline`, `relay_timeout` and `relay_failed`, and `plan_unavailable`), and
+    /// that code is what offers the turn again on the server's keys. Apart from the stream so the
+    /// wire conformance tests read a recorded frame with this very code.
     pub(super) fn run_ended_badly(frame: &Value) -> OpenGrokError {
         let message = frame
             .get("message")
@@ -6950,18 +6950,27 @@ mod tests {
         );
     }
 
-    /// A run through the person's Mac that ends badly says why beside its sentence, and the
-    /// turn's error keeps both: the sentence for the person, the code for the app to offer the
-    /// turn again on the server's keys (opengrok-server PR #298, which the ledger reads the
-    /// recorded frames of). A run error with no code has none.
+    /// A run the person's plan could not answer says why beside its sentence, and the turn's
+    /// error keeps both: the sentence for the person, the code for the app to offer the turn
+    /// again on the server's keys. The relay's code (opengrok-server PR #298, which the ledger
+    /// reads the recorded frames of), and `plan_unavailable` where the person's own setting left
+    /// the plan nothing to answer with (#304, agreed 2026-09-30, not yet recorded). A run error
+    /// with no code has none.
     #[tokio::test]
-    async fn a_run_error_keeps_the_relays_code_beside_its_sentence() {
+    async fn a_run_error_keeps_its_code_beside_its_sentence() {
         let server = MockServer::start().await;
+        let no_proxy = "You chose your own subscription, but no proxy address is set; set one in \
+                        your inference source (like http://127.0.0.1:8080), or switch this turn \
+                        to the gateway.";
         for (run, frame) in [
             (
                 "run_relay",
                 json!({"type": "RUN_ERROR", "message": "Your Mac isn't connected.",
                     "code": "relay_offline"}),
+            ),
+            (
+                "run_plan",
+                json!({"type": "RUN_ERROR", "message": no_proxy, "code": "plan_unavailable"}),
             ),
             (
                 "run_plain",
@@ -7000,8 +7009,18 @@ mod tests {
         assert_eq!(
             relay
                 .code()
-                .and_then(crate::opengrok::RelayErrorCode::from_code),
-            Some(crate::opengrok::RelayErrorCode::Offline)
+                .and_then(crate::opengrok::RunErrorCode::from_code),
+            Some(crate::opengrok::RunErrorCode::RelayOffline)
+        );
+        let plan = turn("run_plan").await;
+        assert_eq!(
+            (plan.message.as_str(), plan.code()),
+            (no_proxy, Some("plan_unavailable"))
+        );
+        assert_eq!(
+            plan.code()
+                .and_then(crate::opengrok::RunErrorCode::from_code),
+            Some(crate::opengrok::RunErrorCode::PlanUnavailable)
         );
         let plain = turn("run_plain").await;
         assert_eq!(plain.code(), None);
@@ -7055,7 +7074,7 @@ mod tests {
         assert_eq!(busy.code(), None);
         assert_eq!(
             busy.code()
-                .and_then(crate::opengrok::RelayErrorCode::from_code),
+                .and_then(crate::opengrok::RunErrorCode::from_code),
             None,
             "no relay failure, so nothing to send on the server's keys"
         );

@@ -27,7 +27,7 @@ use crate::state::{
 };
 use crate::tts_text::{looks_like_markdown, map_utf16_range_to_utf8};
 
-/// Beside the line of a turn the person's Mac could not answer: the turn again, on the server's
+/// Beside the line of a turn the person's plan could not answer: the turn again, on the server's
 /// paid keys.
 pub(crate) const SEND_ON_SERVER: &str = "run-error-send-on-server";
 pub(crate) const SEND_ON_SERVER_LABEL: &str = "Send this reply on Server instead";
@@ -93,9 +93,9 @@ struct ChatFeedRev {
     )>,
     /// Every reply's badge: the frame that brings one changes nothing else a row is drawn from.
     sources: Vec<Option<crate::opengrok::ReplySource>>,
-    /// The reply the person's Mac could not answer, which offers itself on the server's keys: a
+    /// The reply the person's plan could not answer, which offers itself on the server's keys: a
     /// run's code arrives with the same words a row already shows.
-    relay_failed: Option<String>,
+    plan_failed: Option<String>,
     /// The held sends the server holds for the person's Mac: a row's `heldFor` changes nothing
     /// else a bubble is drawn from.
     waiting_for_mac: Vec<String>,
@@ -316,7 +316,7 @@ impl ChatFeedRev {
             sources: conv
                 .map(|c| c.messages.iter().map(|m| m.reply_source.clone()).collect())
                 .unwrap_or_default(),
-            relay_failed: state.relay_failed_turn(),
+            plan_failed: state.plan_failed_turn(),
             waiting_for_mac: state.sends_waiting_for_mac(),
         }
     }
@@ -360,7 +360,7 @@ struct ChatRow {
     status_failed: bool,
     /// A status line for a turn that never left, which carries the offer to send it again.
     status_retry: bool,
-    /// A status line for a turn the person's Mac could not answer, which carries the offer to
+    /// A status line for a turn the person's plan could not answer, which carries the offer to
     /// send it again on the server's keys.
     status_send_on_server: bool,
     /// The pictures of one stretch of a turn, which the row paints as one strip and the
@@ -489,8 +489,8 @@ fn snapshot_rows(state: &AppState) -> Arc<Vec<ChatRow>> {
     // The one turn the thread would send again, if it has one. Asked once rather than per row,
     // and by id, because only the thread's last turn is the one a retry would be about.
     let retryable = state.retryable_turn();
-    // And the one the person's Mac could not answer, which goes again on the server's keys.
-    let relay_failed = state.relay_failed_turn();
+    // And the one the person's plan could not answer, which goes again on the server's keys.
+    let plan_failed = state.plan_failed_turn();
     let mut rows = Vec::new();
     for msg in &conv.messages {
         // A message the person hid is still here — it is what keeps the thread from fetching
@@ -565,7 +565,7 @@ fn snapshot_rows(state: &AppState) -> Arc<Vec<ChatRow>> {
                         && text.trim() != STOPPED_TURN_NOTE
                         && !is_unsent_turn_note(&text),
                     status_retry: retryable.as_ref() == Some(&msg.id),
-                    status_send_on_server: relay_failed.as_ref() == Some(&msg.id),
+                    status_send_on_server: plan_failed.as_ref() == Some(&msg.id),
                     content: SharedString::from(text.clone()),
                     status_line: Some(text),
                     ..ChatRow::slot(id, msg.id.clone())
@@ -1342,7 +1342,7 @@ impl Render for ChatTranscript {
                                                 .child("Try again"),
                                         )
                                     })
-                                    // A turn the person's Mac could not answer: the sentence says
+                                    // A turn the person's plan could not answer: the sentence says
                                     // why, and the turn can go again on the server's paid keys,
                                     // this once, without the person's message sent twice.
                                     .when(row.status_send_on_server, |this| {

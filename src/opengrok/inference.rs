@@ -423,35 +423,48 @@ impl ReplySource {
     }
 }
 
-/// Why a turn through the person's Mac ended, as the relay's `RUN_ERROR` says beside its sentence
-/// in `code` (opengrok-server #292: `ModelError::Relay` in `crates/opengrok-harness/src/relay.rs`,
-/// server main cad36fd (#303, after #298), pin 47a5d6b): no Mac held the
-/// relay, the Mac said nothing for the server's sixty seconds (before the first byte, or between
-/// two), or the Mac answered with a failure. The sentence is what the person reads; the code is
-/// what offers the turn again on the server's keys. A refusal with no code, such as a Mac already
-/// carrying all the calls one Mac may at once, is none of these: its sentence stands alone.
+/// Why the person's plan could not answer a turn, as its `RUN_ERROR` says beside its sentence in
+/// `code`: the Mac relay's three (opengrok-server #292: `ModelError::Relay` in
+/// `crates/opengrok-harness/src/relay.rs`, server main cad36fd (#303, after #298), pin 47a5d6b),
+/// and `plan_unavailable` (opengrok-server #304, agreed 2026-09-30, not yet recorded). The
+/// sentence is what the person reads; the code is what offers the turn again on the server's
+/// keys, which could answer it. A refusal with no code is none of these, and its sentence stands
+/// alone: a Mac already carrying all the calls one Mac may at once, or a reply source that could
+/// not be read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum RelayErrorCode {
-    Offline,
-    Timeout,
-    Failed,
+pub enum RunErrorCode {
+    /// No Mac held the relay.
+    RelayOffline,
+    /// The Mac said nothing for the server's sixty seconds, before the first byte or between two.
+    RelayTimeout,
+    /// The Mac answered with a failure.
+    RelayFailed,
+    /// The person's own setting left their plan nothing to answer with: a teammate with no proxy
+    /// on a shared Bot on the plan, or a proxy turn with no address or no model stored.
+    PlanUnavailable,
 }
 
-impl RelayErrorCode {
-    pub const ALL: [Self; 3] = [Self::Offline, Self::Timeout, Self::Failed];
+impl RunErrorCode {
+    pub const ALL: [Self; 4] = [
+        Self::RelayOffline,
+        Self::RelayTimeout,
+        Self::RelayFailed,
+        Self::PlanUnavailable,
+    ];
 
     /// The code word on the frame.
     pub fn word(self) -> &'static str {
         match self {
-            Self::Offline => "relay_offline",
-            Self::Timeout => "relay_timeout",
-            Self::Failed => "relay_failed",
+            Self::RelayOffline => "relay_offline",
+            Self::RelayTimeout => "relay_timeout",
+            Self::RelayFailed => "relay_failed",
+            Self::PlanUnavailable => "plan_unavailable",
         }
     }
 
-    /// The relay's code a run ended with, or `None` for any other code, or none.
+    /// The code a run ended with, or `None` for any other code, or none.
     pub fn from_code(code: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|relay| relay.word() == code)
+        Self::ALL.into_iter().find(|known| known.word() == code)
     }
 }
 
@@ -949,18 +962,31 @@ mod tests {
         }
     }
 
-    /// The relay's codes are the contract's words; any other code, a gateway's say, is not one.
+    /// The relay's codes and `plan_unavailable` are the contracts' words; any other code, a
+    /// gateway's say, is not one.
     #[test]
-    fn a_relay_failure_is_read_off_its_code() {
-        for code in RelayErrorCode::ALL {
-            assert_eq!(RelayErrorCode::from_code(code.word()), Some(code));
+    fn a_plan_that_could_not_answer_is_read_off_its_code() {
+        for code in RunErrorCode::ALL {
+            assert_eq!(RunErrorCode::from_code(code.word()), Some(code));
         }
         assert_eq!(
-            RelayErrorCode::ALL.map(RelayErrorCode::word),
-            ["relay_offline", "relay_timeout", "relay_failed"]
+            RunErrorCode::ALL.map(RunErrorCode::word),
+            [
+                "relay_offline",
+                "relay_timeout",
+                "relay_failed",
+                "plan_unavailable"
+            ]
         );
-        for other in ["already-consumed", "relay", "", "RELAY_OFFLINE"] {
-            assert_eq!(RelayErrorCode::from_code(other), None, "{other:?}");
+        for other in [
+            "already-consumed",
+            "relay",
+            "",
+            "RELAY_OFFLINE",
+            "PLAN_UNAVAILABLE",
+            "plan-unavailable",
+        ] {
+            assert_eq!(RunErrorCode::from_code(other), None, "{other:?}");
         }
     }
 
