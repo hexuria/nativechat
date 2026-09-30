@@ -192,7 +192,7 @@ pub struct ModelEntry {
     /// For one of the plan's models, which way the server reaches it: `loopback`, listed by
     /// opencodex on the server's machine, or `mac`, listed by the opencodex of the Mac holding
     /// the relay (opengrok-server #292: `listed` in `crates/opengrok-harness/src/local_proxy.rs`,
-    /// PR #298, branch mac-relay c7b57e9, recorded at c3f9521, not yet on main). Kept as the word
+    /// PR #298, branch mac-relay 5359e34, recorded at 07a951b, not yet on main). Kept as the word
     /// sent and read through [`Self::plan_via`].
     #[serde(default)]
     pub via: Option<String>,
@@ -257,7 +257,7 @@ pub struct LocalProxyStatus {
     /// opencodex answered its `/healthz` when the server asked.
     pub healthy: bool,
     /// A Mac holds the relay, so the models listed through it are its opencodex's word now
-    /// (opengrok-server #292: PR #298, branch mac-relay c7b57e9, recorded at c3f9521, not yet on
+    /// (opengrok-server #292: PR #298, branch mac-relay 5359e34, recorded at 07a951b, not yet on
     /// main). False from a server before the relay, which lists none that way.
     #[serde(default, rename = "relayConnected")]
     pub relay_connected: bool,
