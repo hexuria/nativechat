@@ -28256,7 +28256,7 @@ mod tests {
         );
         for words in [
             "no skill sk_gone",
-            "a coworker can have at most 20 skills attached",
+            "a coworker takes at most 20 skills, and this is 21",
         ] {
             assert_eq!(
                 read(OpenGrokError::from_opengrok(422, words)),
@@ -28612,7 +28612,7 @@ mod tests {
     /// the next switch does.
     #[tokio::test]
     async fn the_cap_on_attached_skills_is_said_on_the_card() {
-        let said = "a coworker can have at most 20 skills attached";
+        let said = "a coworker takes at most 20 skills, and this is 21";
         let server = skills_put_answered(
             wiremock::ResponseTemplate::new(422).set_body_json(json!({ "error": said })),
         )

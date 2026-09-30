@@ -1644,7 +1644,8 @@ impl OpenGrokClient {
     /// `version` is the one the rows the change was built from came with, and it is left out
     /// when they came with none. A set somebody changed since is refused with 409 and the code
     /// `skills-changed` ([`OpenGrokError::is_skills_changed`]); an id that is not one of the rows
-    /// with 422 (`no skill …`), and a set past the server's cap of 20 with 422 and its sentence.
+    /// with 422 (`no skill …`), and a set past the server's cap of 20 with 422 and its sentence
+    /// (`a coworker takes at most 20 skills, and this is {n}`).
     /// Nothing is written on any of them. A skill switched off is still one of the rows, so naming
     /// it keeps it attached and leaving it out detaches it. Given [`CEILING_TIMEOUT`].
     pub async fn set_coworker_skills(
@@ -3092,10 +3093,9 @@ pub enum CeilingKind {
 /// A bot's skills: every skill of the account's library its owner may use, and which of them are
 /// attached to it, as `GET /coworkers/{id}/skills` gives it and `PUT` answers with.
 ///
-/// Transcribed from the shape agreed with the opengrok-server session for #270 (the server half
-/// of this app's #2) before that code was written, so there is no route in the server's checkout
-/// to hold it to yet: `{"skills": [row…], "version": n}`, the array always there and possibly
-/// empty. The skills are the ones `/skills` makes (opengrok-server `skills.rs`, whose `may` says
+/// Transcribed from opengrok-server `crates/opengrok-server/src/skills.rs` (`attached` and
+/// `attach`, #270, merged as #290 and on the server's main at 4733c0f), whose recordings the
+/// ledger reads: `{"skills": [row…], "version": n}`, the array always there and possibly empty. The skills are the ones `/skills` makes (opengrok-server `skills.rs`, whose `may` says
 /// who may use which); a plugin's are not among them. An attached skill that is switched on is named, with its description, in the
 /// bot's standing system message on every turn, and the bot reads its body through the builtin
 /// [`super::gen_ui::USE_SKILL`] when it needs it. A person's `/name` goes on working for any
@@ -7876,7 +7876,7 @@ mod tests {
                 "cw_2",
                 refuse(
                     422,
-                    json!({"error": "a coworker can have at most 20 skills attached"}),
+                    json!({"error": "a coworker takes at most 20 skills, and this is 21"}),
                 ),
             ),
             (
@@ -7932,7 +7932,10 @@ mod tests {
         let full = put("cw_2").await;
         assert_eq!(
             (full.status, full.message.as_str()),
-            (Some(422), "a coworker can have at most 20 skills attached")
+            (
+                Some(422),
+                "a coworker takes at most 20 skills, and this is 21"
+            )
         );
         let changed = put("cw_3").await;
         assert!(changed.is_skills_changed());

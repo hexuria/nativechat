@@ -10842,14 +10842,14 @@ mod tests {
 
         host.agent_skills = Some(SkillsCard {
             note: said(
-                "a coworker can have at most 20 skills attached",
+                "a coworker takes at most 20 skills, and this is 21",
                 SkillNotePlace::Card,
             ),
             ..skills_card(BotSkills::Read(some_skills()))
         });
         assert_eq!(
             host.snapshot().find(ids::AGENT_SKILLS_NOTE).unwrap().name,
-            "a coworker can have at most 20 skills attached"
+            "a coworker takes at most 20 skills, and this is 21"
         );
 
         host.agent_skills = Some(SkillsCard {

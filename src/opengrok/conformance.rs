@@ -4,8 +4,8 @@
 //! agree. `fixtures/wire/` is the server's side of that, recorded by the server itself: every
 //! AG-UI frame and REST body its own tests drove, teed off its router by the recorder of
 //! opengrok-server#258 and written out by its `examples/wire_corpus.rs`. It is vendored whole
-//! from the server's `tests/fixtures/wire/` at a4a8073 (#264), whose `MANIFEST.json` names
-//! 4bc4095, the commit on the server's main it was recorded at. The layout is
+//! from the server's `tests/fixtures/wire/` at 4733c0f (#291), whose `MANIFEST.json` names
+//! 83da0c4, the commit on the server's main it was recorded at. The layout is
 //! opengrok-server#255's: `agui/<type>/<slug>.json`, a CUSTOM under `agui/custom/<name>/`, and
 //! `rest/<METHOD>_<route>/<status>-<slug>.json` holding `{method, path, status, body}`, one file
 //! per distinct shape, named after the first test that produced it. `MANIFEST.json` names the
@@ -4843,7 +4843,7 @@ fn a_bots_skills_have_a_reading_in_the_ledger() {
             .unwrap_or_else(|why| panic!("{verb}: {why}"));
         read(
             422,
-            json!({"error": "a coworker can have at most 20 skills attached"}),
+            json!({"error": "a coworker takes at most 20 skills, and this is 21"}),
         )
         .unwrap_or_else(|why| panic!("{verb}: {why}"));
         read(
