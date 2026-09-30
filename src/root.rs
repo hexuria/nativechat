@@ -67,6 +67,15 @@ impl RootView {
             }
         })
         .detach();
+        // A service is connected in the person's browser, which comes back to the server and not
+        // to the app, so the app hears of it when the person comes back to the window (#269).
+        cx.observe_window_activation(window, |this, window, cx| {
+            if window.is_window_active() {
+                this.state
+                    .update(cx, |state, cx| state.window_activated(cx));
+            }
+        })
+        .detach();
 
         Self {
             layout,

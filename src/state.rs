@@ -68,26 +68,242 @@ pub enum ToolList {
     Unavailable(String),
 }
 
-/// The open bot's Effort control, as its settings draw it and a driver reads it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EffortControl {
-    /// The word the server keeps for the bot, or `None` from a server that keeps no effort (one
-    /// from before opengrok-server#271). The control is dead then: that server would drop a pick
-    /// without a word, and the control would claim a setting nothing keeps.
-    pub kept: Option<String>,
-    /// The word the control shows: the person's pick while it waits for Save, or the kept one.
-    pub shown: String,
+/// The person's connections, as far as Settings → Connections and a Bot's Connections card know
+/// them (#2).
+#[derive(Debug, Clone, PartialEq)]
+pub enum ConnectionList {
+    Loading,
+    Listed(Vec<crate::opengrok::ConnectionView>),
+    /// The server would not list them, in its words or the app's.
+    Unavailable(String),
 }
 
-impl EffortControl {
-    /// What the bot's turns run with now, in the server's word: `inherit` where it keeps none.
-    pub fn kept_word(&self) -> &str {
-        self.kept.as_deref().unwrap_or(EFFORT_INHERIT)
+/// The services this server can connect, as far as Settings → Connections knows them.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ConnectorList {
+    Loading,
+    Listed(Vec<crate::opengrok::Connector>),
+    /// The server would not list them, in its words or the app's.
+    Unavailable(String),
+}
+
+/// A change to one of the person's connections that is with the server.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConnectionChange {
+    /// Lend it to this Bot.
+    Lend(String),
+    /// Take it back from this Bot.
+    Revoke(String),
+    Disconnect,
+}
+
+/// The start of the line beside a Bot's switch when the server refuses a lend or a revoke, before
+/// the server's own words. It says only that the change did not go through, and not what the
+/// loan is now: the server's reason can make "still lent" untrue (a connection disconnected
+/// meanwhile is lent to nobody), and the read that follows every change is what the switch
+/// shows.
+const NOT_CHANGED: &str = "Could not change this";
+
+/// How long the app keeps waiting on a sign-in the person was sent to their browser for. Past
+/// this they have most likely left it, and coming back to the window stops reading the list
+/// again for it.
+pub const BROWSER_WAIT: Duration = Duration::from_secs(10 * 60);
+
+/// Whether a connection is the person's own: one they signed in to themselves, and so the only
+/// kind they can lend or disconnect. The server answers 404 to a change of any other, and lists
+/// only the person's own today.
+fn is_own_connection(row: &crate::opengrok::ConnectionView) -> bool {
+    matches!(row.owner, crate::opengrok::ConnectionOwner::User(_))
+}
+
+/// A read of the person's connections that has begun and is still to be sent: what to ask with,
+/// and the read's number, which is still the newest when its answer is shown or the answer is
+/// dropped.
+struct ConnectionsRead {
+    client: OpenGrokClient,
+    generation: u64,
+}
+
+/// Settings → Connections and a Bot's Connections card (#2): what the server last said about the
+/// person's connections and the services it can connect, and what the app is doing with them.
+///
+/// A connection lives on the server and nowhere else. The app never sees a token: a person signs
+/// in to a service in their browser, which comes back to the server, and the app reads the list
+/// again. The list only ever holds what the server said: a switch shows what was asked only
+/// while the server has it, and the answer, whichever way it goes, is what shows after.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct AccountConnections {
+    /// What `GET /connections` last said. `None` until it has been asked since sign-in.
+    pub list: Option<ConnectionList>,
+    /// What `GET /connectors` last said.
+    pub connectors: Option<ConnectorList>,
+    /// The change each connection has with the server, by its id. One at a time: its switch and
+    /// its Disconnect are dead until the server has answered, so two answers about one
+    /// connection never land out of order.
+    pub changing: HashMap<String, ConnectionChange>,
+    /// Why a Disconnect did not go through, by the connection's id: under its row on Settings →
+    /// Connections until it is asked again, or the server stops listing the connection.
+    pub not_disconnected: HashMap<String, String>,
+    /// Why a lend or a revoke did not go through, by the connection's id and the Bot's: beside
+    /// the connection's switch on that Bot's card and on no other Bot's, until that switch is
+    /// pressed again or the server stops listing the connection.
+    pub not_changed: HashMap<(String, String), String>,
+    /// Which way each lend or revoke in [`Self::not_changed`] was asked: `true` for a lend. A
+    /// change whose answer was lost past the deadline may still have been taken, and the read
+    /// that follows it settles that: once the server lists the connection lent (or not) to that
+    /// Bot as asked, the line saying it was not is untrue and goes.
+    pub not_changed_asked: HashMap<(String, String), bool>,
+    /// The service whose sign-in page is being asked for.
+    pub opening: Option<String>,
+    /// The services the person was sent to their browser to connect, each with when the app
+    /// stops waiting on it ([`BROWSER_WAIT`]). Each goes as soon as the list has it. Coming back
+    /// to the window reads the list again while any is still waited on.
+    pub waiting: HashMap<String, Instant>,
+    /// Why the last Connect did not open the browser: the service, and why.
+    pub connect_refused: Option<(String, String)>,
+    /// The connection whose Disconnect was pressed and is waiting on Yes or No. A Disconnect takes
+    /// the service from every Bot it is lent to and needs a browser sign-in to undo, so the row
+    /// asks first, naming the Bots that would lose it. One at a time.
+    pub confirming_disconnect: Option<String>,
+}
+
+impl AccountConnections {
+    /// The person's own connections as listed, or none while there is no list. A row of any other
+    /// scope (a Bot's own sign-in, the whole server's, or a scope this app does not know yet) is
+    /// on neither surface: it is not the person's to lend or disconnect, and a control for it
+    /// would only ever be refused.
+    pub fn own_rows(&self) -> Vec<&crate::opengrok::ConnectionView> {
+        match &self.list {
+            Some(ConnectionList::Listed(rows)) => {
+                rows.iter().filter(|row| is_own_connection(row)).collect()
+            }
+            _ => Vec::new(),
+        }
     }
 
-    /// A pick is waiting for Save.
-    pub fn unsaved(&self) -> bool {
-        self.shown != self.kept_word()
+    pub fn is_changing(&self, id: &str) -> bool {
+        self.changing.contains_key(id)
+    }
+
+    /// Whether this row is asking "Disconnect …?" now: pressed, and still one of the person's own
+    /// listed connections with nothing with the server.
+    pub fn is_confirming_disconnect(&self, id: &str) -> bool {
+        self.confirming_disconnect.as_deref() == Some(id)
+            && !self.is_changing(id)
+            && self.own_rows().iter().any(|row| row.id == id)
+    }
+
+    /// Disconnect pressed: the row asks first. Refused for a row that is not the person's own
+    /// or has a change with the server.
+    pub fn ask_to_disconnect(&mut self, id: &str) -> bool {
+        if self.is_changing(id) || !self.own_rows().iter().any(|row| row.id == id) {
+            return false;
+        }
+        self.not_disconnected.remove(id);
+        self.confirming_disconnect = Some(id.to_string());
+        true
+    }
+
+    /// Why the last Disconnect of this connection did not go through.
+    pub fn disconnect_refusal(&self, id: &str) -> Option<&str> {
+        self.not_disconnected.get(id).map(String::as_str)
+    }
+
+    /// Why the last lend or revoke of this connection to this Bot did not go through.
+    pub fn lend_refusal(&self, id: &str, coworker_id: &str) -> Option<&str> {
+        self.not_changed
+            .get(&(id.to_string(), coworker_id.to_string()))
+            .map(String::as_str)
+    }
+
+    /// Whether a connection shows as lent to this Bot: what the server last said, or, while a
+    /// lend or a revoke for this Bot is with the server, what was asked. A refusal takes the ask
+    /// away, and the server's word is what shows again.
+    pub fn shows_lent(&self, row: &crate::opengrok::ConnectionView, coworker_id: &str) -> bool {
+        match self.changing.get(&row.id) {
+            Some(ConnectionChange::Lend(to)) if to == coworker_id => true,
+            Some(ConnectionChange::Revoke(from)) if from == coworker_id => false,
+            _ => row.loans.iter().any(|lent| lent == coworker_id),
+        }
+    }
+
+    /// The Bots a connection shows as lent to, in the server's order: what the server last said,
+    /// with a lend or a revoke that is with the server shown as asked, as [`Self::shows_lent`]
+    /// shows it. Settings → Connections draws its row from this, so the row and the Bot's switch
+    /// never say two things about one loan.
+    pub fn shown_loans(&self, row: &crate::opengrok::ConnectionView) -> Vec<String> {
+        let mut loans = row.loans.clone();
+        match self.changing.get(&row.id) {
+            Some(ConnectionChange::Lend(to)) if !loans.contains(to) => loans.push(to.clone()),
+            Some(ConnectionChange::Revoke(from)) => loans.retain(|lent| lent != from),
+            _ => {}
+        }
+        loans
+    }
+
+    /// Whether the person was sent to their browser to connect this service, and the app is
+    /// still waiting on them.
+    pub fn is_waiting(&self, service: &str, now: Instant) -> bool {
+        self.waiting.get(service).is_some_and(|until| *until > now)
+    }
+
+    /// Stop waiting on every sign-in whose wait has run out, and say whether any is still
+    /// waited on.
+    pub fn still_waiting(&mut self, now: Instant) -> bool {
+        self.waiting.retain(|_, until| *until > now);
+        !self.waiting.is_empty()
+    }
+
+    /// A service as a person reads it: its label from `GET /connectors`, or its name when the
+    /// server gave none or has not said.
+    pub fn connector_label(&self, name: &str) -> String {
+        let label = match &self.connectors {
+            Some(ConnectorList::Listed(all)) => all
+                .iter()
+                .find(|connector| connector.name == name)
+                .map(|connector| connector.label.trim())
+                .filter(|label| !label.is_empty()),
+            _ => None,
+        };
+        label.unwrap_or(name).to_string()
+    }
+
+    /// The services on offer that the person has not connected, in the server's order. Nothing
+    /// while either list is still to come, so a service already connected is never offered in
+    /// the moment before the list of connections arrives. Only the person's own connections
+    /// count: a service connected some other way is still theirs to connect.
+    pub fn connectable(&self) -> Vec<&crate::opengrok::Connector> {
+        let (Some(ConnectorList::Listed(all)), Some(ConnectionList::Listed(_))) =
+            (&self.connectors, &self.list)
+        else {
+            return Vec::new();
+        };
+        let own = self.own_rows();
+        all.iter()
+            .filter(|connector| !own.iter().any(|row| row.connector == connector.name))
+            .collect()
+    }
+
+    /// Put a lend's or a revoke's answer in the list, as the server wrote the row.
+    fn put_row(&mut self, answered: crate::opengrok::ConnectionView) {
+        if let Some(ConnectionList::Listed(rows)) = &mut self.list
+            && let Some(row) = rows.iter_mut().find(|row| row.id == answered.id)
+        {
+            *row = answered;
+        }
+    }
+
+    /// Take a connection the server no longer has off the list, with every line about it.
+    fn drop_row(&mut self, id: &str) {
+        if let Some(ConnectionList::Listed(rows)) = &mut self.list {
+            rows.retain(|row| row.id != id);
+        }
+        self.not_disconnected.remove(id);
+        self.not_changed.retain(|(about, _), _| about != id);
+        self.not_changed_asked.retain(|(about, _), _| about != id);
+        if self.confirming_disconnect.as_deref() == Some(id) {
+            self.confirming_disconnect = None;
+        }
     }
 }
 
@@ -409,6 +625,29 @@ impl CeilingRead {
             })
             .map(|row| row.name.clone())
             .collect()
+    }
+}
+
+/// The open bot's Effort control, as its settings draw it and a driver reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EffortControl {
+    /// The word the server keeps for the bot, or `None` from a server that keeps no effort (one
+    /// from before opengrok-server#271). The control is dead then: that server would drop a pick
+    /// without a word, and the control would claim a setting nothing keeps.
+    pub kept: Option<String>,
+    /// The word the control shows: the person's pick while it waits for Save, or the kept one.
+    pub shown: String,
+}
+
+impl EffortControl {
+    /// What the bot's turns run with now, in the server's word: `inherit` where it keeps none.
+    pub fn kept_word(&self) -> &str {
+        self.kept.as_deref().unwrap_or(EFFORT_INHERIT)
+    }
+
+    /// A pick is waiting for Save.
+    pub fn unsaved(&self) -> bool {
+        self.shown != self.kept_word()
     }
 }
 
@@ -1047,6 +1286,23 @@ fn tools_unavailable(error: &OpenGrokError) -> String {
         Some(401) => "Sign in again to see this bot's tools.".to_string(),
         _ => format!("Could not load this bot's tools: {}", error.message),
     }
+}
+
+/// What Settings → Connections says when a server has no `GET /connectors`: one older than
+/// opengrok-server#269, which can keep a connection but cannot say what it would connect.
+pub(crate) const CONNECTORS_NOT_LISTED: &str =
+    "This server does not list the services it can connect yet.";
+
+/// Why the services on offer are not listed, in words for Settings → Connections. A 404 is a
+/// server without the route, which is not a fault to report.
+fn connectors_unavailable(error: &OpenGrokError) -> String {
+    if error.is_not_found() {
+        return CONNECTORS_NOT_LISTED.to_string();
+    }
+    rules_refusal(
+        "The services this server can connect could not be read",
+        error,
+    )
 }
 
 /// Why the open Bot's ceiling has no switches, in words for its Tools card.
@@ -2912,6 +3168,8 @@ pub enum AppSettingsTab {
     Computer,
     Updates,
     Logins,
+    /// The services the person has signed in to for their Bots, and the ones on offer (#2).
+    Connections,
     Skills,
 }
 
@@ -3400,14 +3658,20 @@ pub struct AppState {
     /// Counts the tool listings asked for, so only the newest answer is shown: two asks for the
     /// same bot can come back out of order, and the older must not replace the newer.
     tools_generation: u64,
-    /// The effort picked in the open bot's settings and not saved yet, with the bot it was picked
-    /// for. The pane's words live in its own fields; a pick lives here so that a driver can make
-    /// one from the menu's choices the way a person does. Save sends it when it differs from what
-    /// the server keeps ([`Self::effort_to_save`]).
-    effort_pick: Option<(String, String)>,
-    /// A driver pressed the bot settings' Save. The button is the pane's, and so are the fields
-    /// it sends, so the pane takes this and saves as the button would.
-    agent_save_requested: bool,
+    /// The person's connections and the services this server can connect, for Settings →
+    /// Connections and every Bot's Connections card (#2). One list for the account: a
+    /// connection is the person's, and a Bot only borrows it.
+    pub connections: AccountConnections,
+    /// Counts the reads of the connections: a read answered after a newer one began is dropped
+    /// rather than put back over the newer word. Every change the server answers begins a read
+    /// of its own, so a read that could have been taken before the change is always overtaken.
+    connections_generation: u64,
+    /// Counts the reads of the services on offer, so only the newest answer is shown.
+    connectors_generation: u64,
+    /// Counts the Connects asked for, and the sign-outs: a sign-in page is opened only for the
+    /// Connect it was asked for. The service's name cannot tell that ask from another for the
+    /// same service, or from one an account that has since signed out made.
+    connect_asks: u64,
     /// Everything the open Bot could be offered and which of it it may be, as its Tools card's
     /// switches show it (opengrok-server#268): the Bot's id and the answer, like
     /// [`Self::coworker_tools`]. Drawn through [`Self::ceiling_card`].
@@ -3428,6 +3692,14 @@ pub struct AppState {
     ceiling_switches: u64,
     /// What the Tools card says about the last switch that did not go as asked.
     ceiling_note: Option<CeilingNote>,
+    /// The effort picked in the open bot's settings and not saved yet, with the bot it was picked
+    /// for. The pane's words live in its own fields; a pick lives here so that a driver can make
+    /// one from the menu's choices the way a person does. Save sends it when it differs from what
+    /// the server keeps ([`Self::effort_to_save`]).
+    effort_pick: Option<(String, String)>,
+    /// A driver pressed the bot settings' Save. The button is the pane's, and so are the fields
+    /// it sends, so the pane takes this and saves as the button would.
+    agent_save_requested: bool,
     /// `egressTunnelAvailable` on `GET /ag-ui/host-settings`: host intent AND the open
     /// coworker's box advertising the tunnel.
     pub host_egress_tunnel_available: bool,
@@ -3949,14 +4221,18 @@ impl AppState {
             agent_tools_open: false,
             agent_usage_open: false,
             tools_generation: 0,
-            effort_pick: None,
-            agent_save_requested: false,
+            connections: AccountConnections::default(),
+            connections_generation: 0,
+            connectors_generation: 0,
+            connect_asks: 0,
             coworker_ceiling: None,
             ceiling_generation: 0,
             ceiling_reading: None,
             ceiling_switch: None,
             ceiling_switches: 0,
             ceiling_note: None,
+            effort_pick: None,
+            agent_save_requested: false,
             host_egress_tunnel_available: false,
             egress_policy_pending: None,
             network_policy_open: false,
@@ -4953,7 +5229,25 @@ impl AppState {
     }
 
     pub fn logout(&mut self, cx: &mut Context<Self>) {
-        let client = self.opengrok.clone();
+        self.forget_account();
+        // Closing the pane and the recipe wants the window, so they close here, after the rest
+        // is forgotten: the place the pane's close records is then one with no bot open and no
+        // Settings.
+        self.close_right_pane(cx);
+        self.close_recipe(cx);
+        cx.notify();
+        if let Some(client) = self.opengrok.clone() {
+            cx.spawn(async move |_, _| {
+                let _ = client.logout().await;
+            })
+            .detach();
+        }
+    }
+
+    /// Everything signing out forgets that needs no window: the whole of what `logout` does to
+    /// the state, apart from closing the pane and the recipe. Apart so that a test runs what
+    /// `logout` runs rather than a copy of it, which no test context here can call whole.
+    fn forget_account(&mut self) {
         self.account = None;
         self.auth_status = AuthStatus::SignedOut;
         self.saved_login_use.clear();
@@ -4974,13 +5268,19 @@ impl AppState {
         self.is_app_settings_open = false;
         self.bot_finder_open = false;
         self.command_palette_open = false;
-        self.close_right_pane(cx);
         self.stop_local_exec();
         self.approval_decisions.clear();
         self.computers.clear();
         // This Mac's rules were this account's, and so is any read of them still out.
         self.local_rules = None;
         self.local_rules_epoch += 1;
+        // So were the connections, and any read, change or Connect of them still out: an answer
+        // that lands after this finds nothing waiting for it and is dropped, and no sign-in page
+        // asked for before it is opened.
+        self.connections = AccountConnections::default();
+        self.connections_generation += 1;
+        self.connectors_generation += 1;
+        self.connect_asks += 1;
         self.host_egress_tunnel_available = false;
         self.egress_tunnel_enabled = true;
         self.coworker_computer = None;
@@ -4990,14 +5290,6 @@ impl AppState {
         // The open recipe and the runs the page was waiting on were this account's. Closing the
         // recipe drops its follower too, which would otherwise read on without a session.
         self.recipe_runs_in_flight.clear();
-        self.close_recipe(cx);
-        cx.notify();
-        if let Some(client) = client {
-            cx.spawn(async move |_, _| {
-                let _ = client.logout().await;
-            })
-            .detach();
-        }
     }
 
     pub fn refresh_coworkers(&mut self, cx: &mut Context<Self>) {
@@ -5312,6 +5604,9 @@ impl AppState {
             self.ceiling_note = None;
             self.refresh_coworker_ceiling(cx);
             self.refresh_coworker_usage(cx);
+            // The Connections card lends the person's connections to this bot, so it is drawn
+            // from what the server says now rather than from whenever the list was last read.
+            self.refresh_connections(cx);
         }
     }
 
@@ -5697,6 +5992,413 @@ impl AppState {
     pub fn toggle_agent_usage(&mut self, cx: &mut Context<Self>) {
         self.agent_usage_open = !self.agent_usage_open;
         cx.notify();
+    }
+
+    /// Ask the server for the person's connections and for the services it can connect: each
+    /// time Settings → Connections or a bot's settings open, and on Refresh. What was listed
+    /// stays on screen while it is asked again.
+    pub fn refresh_connections(&mut self, cx: &mut Context<Self>) {
+        self.read_connections(cx);
+        self.read_connectors(cx);
+    }
+
+    fn read_connections(&mut self, cx: &mut Context<Self>) {
+        if let Some(read) = self.begin_connections_read() {
+            Self::send_connections_read(read, cx);
+        }
+    }
+
+    /// Begin a read of the person's connections, for the caller to send: every read begun before
+    /// it is overtaken, and dropped when it answers. What was listed stays on screen while it is
+    /// asked again. `None` with no server to ask.
+    fn begin_connections_read(&mut self) -> Option<ConnectionsRead> {
+        let client = self.opengrok.clone()?;
+        if !matches!(self.connections.list, Some(ConnectionList::Listed(_))) {
+            self.connections.list = Some(ConnectionList::Loading);
+        }
+        self.connections_generation += 1;
+        Some(ConnectionsRead {
+            client,
+            generation: self.connections_generation,
+        })
+    }
+
+    fn send_connections_read(read: ConnectionsRead, cx: &mut Context<Self>) {
+        let ConnectionsRead { client, generation } = read;
+        cx.spawn(async move |this, cx| {
+            let listed = client.list_connections().await;
+            let _ = this.update(cx, |state, cx| {
+                if state.settle_connections(generation, listed) {
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn read_connectors(&mut self, cx: &mut Context<Self>) {
+        let Some(client) = self.opengrok.clone() else {
+            return;
+        };
+        if !matches!(self.connections.connectors, Some(ConnectorList::Listed(_))) {
+            self.connections.connectors = Some(ConnectorList::Loading);
+        }
+        self.connectors_generation += 1;
+        let generation = self.connectors_generation;
+        cx.spawn(async move |this, cx| {
+            let listed = client.list_connectors().await;
+            let _ = this.update(cx, |state, cx| {
+                if state.settle_connectors(generation, listed) {
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Put a read of the connections on screen, unless something newer has: a read begun since
+    /// (every change the server answers begins one), or a sign out. `false` when it was dropped
+    /// and nothing was touched.
+    fn settle_connections(
+        &mut self,
+        generation: u64,
+        listed: Result<Vec<crate::opengrok::ConnectionView>, OpenGrokError>,
+    ) -> bool {
+        if self.connections_generation != generation {
+            return false;
+        }
+        let connections = &mut self.connections;
+        match listed {
+            Ok(rows) => {
+                let own = |id: &str| {
+                    rows.iter()
+                        .any(|row| row.id == id && is_own_connection(row))
+                };
+                // A refusal is about a connection, and one the server no longer lists as the
+                // person's takes its lines along.
+                connections.not_disconnected.retain(|id, _| own(id));
+                connections.not_changed.retain(|(id, _), _| own(id));
+                // A change the server took after all, its answer lost, is a refusal no longer: the
+                // read shows the loan as it was asked.
+                let asked = &connections.not_changed_asked;
+                connections.not_changed.retain(|(id, bot), _| {
+                    let Some(lend) = asked.get(&(id.clone(), bot.clone())) else {
+                        return true;
+                    };
+                    let lent = rows
+                        .iter()
+                        .any(|row| &row.id == id && row.loans.iter().any(|loan| loan == bot));
+                    lent != *lend
+                });
+                let still = &connections.not_changed;
+                connections
+                    .not_changed_asked
+                    .retain(|key, _| still.contains_key(key));
+                // A "Disconnect …?" is about the row it was asked on. Once the server stops listing
+                // it, the question goes: a reconnect makes a connection under the same id, and it
+                // must come back as a row, not already asking to be deleted.
+                if connections
+                    .confirming_disconnect
+                    .as_deref()
+                    .is_some_and(|id| !own(id))
+                {
+                    connections.confirming_disconnect = None;
+                }
+                // The browser is done with a Connect once the service is one of the person's
+                // connections. Every other wait goes on until it has too, or runs out.
+                connections.waiting.retain(|service, _| {
+                    !rows
+                        .iter()
+                        .any(|row| &row.connector == service && is_own_connection(row))
+                });
+                connections.list = Some(ConnectionList::Listed(rows));
+            }
+            Err(error) => {
+                connections.list = Some(ConnectionList::Unavailable(rules_refusal(
+                    "Your connections could not be read",
+                    &error,
+                )));
+            }
+        }
+        true
+    }
+
+    /// Put a read of the services on offer on screen, unless a newer read has begun or the person
+    /// has signed out since.
+    fn settle_connectors(
+        &mut self,
+        generation: u64,
+        listed: Result<Vec<crate::opengrok::Connector>, OpenGrokError>,
+    ) -> bool {
+        if self.connectors_generation != generation {
+            return false;
+        }
+        self.connections.connectors = Some(match listed {
+            Ok(all) => ConnectorList::Listed(all),
+            Err(error) => ConnectorList::Unavailable(connectors_unavailable(&error)),
+        });
+        true
+    }
+
+    /// The open bot's Connections switch: lend it one of the person's connections, or take it
+    /// back. The switch shows what was asked while the server has it, and the server's answer
+    /// once it comes; a refusal puts back what the server says, with its words beside it.
+    pub fn set_connection_lent(
+        &mut self,
+        connection_id: String,
+        lent: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(coworker_id) = self.active_coworker_id.clone() else {
+            return;
+        };
+        let change = if lent {
+            ConnectionChange::Lend(coworker_id)
+        } else {
+            ConnectionChange::Revoke(coworker_id)
+        };
+        self.change_connection(connection_id, change, cx);
+    }
+
+    /// Settings → Connections' Disconnect. The row stays, dimmed, until the server has said the
+    /// connection is gone, and every loan goes with it.
+    pub fn disconnect_connection(&mut self, connection_id: String, cx: &mut Context<Self>) {
+        self.connections.confirming_disconnect = None;
+        self.change_connection(connection_id, ConnectionChange::Disconnect, cx);
+    }
+
+    /// Settings → Connections' Disconnect, pressed: the row asks "Disconnect …?" before anything
+    /// is sent (see [`AccountConnections::confirming_disconnect`]).
+    pub fn ask_to_disconnect(&mut self, connection_id: String, cx: &mut Context<Self>) {
+        if self.connections.ask_to_disconnect(&connection_id) {
+            cx.notify();
+        }
+    }
+
+    /// No, on the row's "Disconnect …?": nothing is sent and the row is as it was.
+    pub fn keep_connection(&mut self, cx: &mut Context<Self>) {
+        if self.connections.confirming_disconnect.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    fn change_connection(
+        &mut self,
+        connection_id: String,
+        change: ConnectionChange,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(client) = self.opengrok.clone() else {
+            return;
+        };
+        if !self.begin_connection_change(&connection_id, change.clone()) {
+            return;
+        }
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let answer = match &change {
+                ConnectionChange::Lend(coworker) => {
+                    client.lend_connection(&connection_id, coworker).await
+                }
+                ConnectionChange::Revoke(coworker) => {
+                    client.revoke_connection(&connection_id, coworker).await
+                }
+                // A disconnected connection is not listed, so there is no row to answer with.
+                ConnectionChange::Disconnect => client
+                    .disconnect_connection(&connection_id)
+                    .await
+                    .map(|()| None),
+            };
+            let _ = this.update(cx, |state, cx| {
+                if let Some(read) = state.settle_connection_change(&connection_id, &change, answer)
+                {
+                    Self::send_connections_read(read, cx);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Mark a change as with the server. `false` for a connection that is not one of the
+    /// person's own on the list, or one that already has a change out: its controls are dead
+    /// until that one is answered, and a second request would race the first.
+    fn begin_connection_change(&mut self, connection_id: &str, change: ConnectionChange) -> bool {
+        let connections = &mut self.connections;
+        if connections.is_changing(connection_id)
+            || !connections
+                .own_rows()
+                .iter()
+                .any(|row| row.id == connection_id)
+        {
+            return false;
+        }
+        // Asked again, the line about the last time this was asked goes.
+        match &change {
+            ConnectionChange::Disconnect => {
+                connections.not_disconnected.remove(connection_id);
+            }
+            ConnectionChange::Lend(coworker) | ConnectionChange::Revoke(coworker) => {
+                connections
+                    .not_changed
+                    .remove(&(connection_id.to_string(), coworker.clone()));
+            }
+        }
+        connections
+            .changing
+            .insert(connection_id.to_string(), change);
+        true
+    }
+
+    /// What the server said to a change, and the read of the list that follows it whatever it
+    /// said, for the caller to send. `None` when the change is not the one the connection was
+    /// waiting on (the person signed out meanwhile), and nothing was touched.
+    ///
+    /// A lend's or a revoke's row goes into the list as the server wrote it. A 2xx with no row
+    /// in it is the change taken all the same: it is never shown as a refusal, and never taken
+    /// for the connection gone, and the read says what the row is now. A Disconnect the server
+    /// took takes the row, and so does a 404 or a 409 to one, which is the server saying the
+    /// connection is already gone: what the person asked for. Anything else the server refused
+    /// is said where it was asked, in the server's words: under the row for a Disconnect, and
+    /// beside that Bot's switch for a lend or a revoke ([`NOT_CHANGED`]).
+    ///
+    /// The read overtakes any read still out, which may have been taken before the change, and
+    /// is what the list shows from then on. Without it, a list left asking by a Refresh that was
+    /// overtaken would wait on an answer that is never shown.
+    fn settle_connection_change(
+        &mut self,
+        connection_id: &str,
+        change: &ConnectionChange,
+        answer: Result<Option<crate::opengrok::ConnectionView>, OpenGrokError>,
+    ) -> Option<ConnectionsRead> {
+        if self.connections.changing.get(connection_id) != Some(change) {
+            return None;
+        }
+        let connections = &mut self.connections;
+        connections.changing.remove(connection_id);
+        match (change, answer) {
+            (ConnectionChange::Disconnect, Ok(_)) => connections.drop_row(connection_id),
+            (ConnectionChange::Disconnect, Err(error))
+                if matches!(error.status, Some(404 | 409)) =>
+            {
+                connections.drop_row(connection_id);
+            }
+            (ConnectionChange::Disconnect, Err(error)) => {
+                connections.not_disconnected.insert(
+                    connection_id.to_string(),
+                    rules_refusal("Not disconnected", &error),
+                );
+            }
+            (_, Ok(Some(row))) if row.id == connection_id => connections.put_row(row),
+            (_, Ok(_)) => {}
+            (ConnectionChange::Lend(coworker) | ConnectionChange::Revoke(coworker), Err(error)) => {
+                let key = (connection_id.to_string(), coworker.clone());
+                connections
+                    .not_changed_asked
+                    .insert(key.clone(), matches!(change, ConnectionChange::Lend(_)));
+                connections
+                    .not_changed
+                    .insert(key, rules_refusal(NOT_CHANGED, &error));
+            }
+        }
+        self.begin_connections_read()
+    }
+
+    /// Settings → Connections' Connect: ask the server for the service's sign-in page and open it
+    /// in the person's browser (#269). The browser comes back to the server, never to the app, so
+    /// the list is read again when the person comes back to the window, or on Refresh.
+    pub fn connect_service(&mut self, connector: String, cx: &mut Context<Self>) {
+        let Some((client, ask)) = self.begin_connect(&connector) else {
+            return;
+        };
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let link = client.connect_link(&connector, None).await;
+            let _ = this.update(cx, |state, cx| {
+                if let Some(url) = state.settle_connect_link(ask, &connector, link, Instant::now())
+                {
+                    cx.open_url(&url);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Mark a Connect as asking for its sign-in page, and number the ask. `None` while another
+    /// is being asked for (one sign-in page at a time: the buttons are dead meanwhile), and with
+    /// no server to ask.
+    fn begin_connect(&mut self, connector: &str) -> Option<(OpenGrokClient, u64)> {
+        let client = self.opengrok.clone()?;
+        if self.connections.opening.is_some() {
+            return None;
+        }
+        self.connect_asks += 1;
+        self.connections.opening = Some(connector.to_string());
+        self.connections.connect_refused = None;
+        Some((client, self.connect_asks))
+    }
+
+    /// What the server said when asked for a sign-in page: the page to open, or why there is
+    /// none, which is kept to show beside the service.
+    ///
+    /// Only for the Connect this ask was, and only while Settings → Connections is on screen.
+    /// The ask's number tells it from any other, among them one for the same service by an
+    /// account that has signed out since; and a browser opening for a page the person has left
+    /// is a sign-in they did not ask for now. `None` for either, with nothing kept, and whenever
+    /// there is nothing to open.
+    fn settle_connect_link(
+        &mut self,
+        ask: u64,
+        connector: &str,
+        link: Result<String, OpenGrokError>,
+        now: Instant,
+    ) -> Option<String> {
+        if ask != self.connect_asks {
+            return None;
+        }
+        self.connections.opening = None;
+        if !(self.is_app_settings_open && self.app_settings_tab == AppSettingsTab::Connections) {
+            return None;
+        }
+        match link {
+            Ok(url) => {
+                self.connections
+                    .waiting
+                    .insert(connector.to_string(), now + BROWSER_WAIT);
+                Some(url)
+            }
+            Err(error) => {
+                let label = self.connections.connector_label(connector);
+                self.connections.connect_refused = Some((
+                    connector.to_string(),
+                    rules_refusal(&format!("{label} could not be connected"), &error),
+                ));
+                None
+            }
+        }
+    }
+
+    /// The window has come to the front. A Connect finishes in the person's browser, which comes
+    /// back to the server and never to the app, so coming back to the window is when the app
+    /// looks for the new connection: while a sign-in is still waited on, and whenever a
+    /// connections list is on screen, so someone who signed in and came back later than the wait
+    /// still finds it without pressing Refresh.
+    pub fn window_activated(&mut self, cx: &mut Context<Self>) {
+        if self.rereads_connections_on_activation(Instant::now()) {
+            self.read_connections(cx);
+        }
+    }
+
+    /// Whether coming back to the window asks for the person's connections again: a sign-in is
+    /// still waited on, or Settings → Connections or a Bot's settings (with its Connections
+    /// card) is showing.
+    fn rereads_connections_on_activation(&mut self, now: Instant) -> bool {
+        let waiting = self.connections.still_waiting(now);
+        let showing = (self.is_app_settings_open
+            && self.app_settings_tab == AppSettingsTab::Connections)
+            || self.right_pane == RightPane::Settings;
+        waiting || showing
     }
 
     /// The open bot's Effort control: `None` with no bot open.
@@ -9369,6 +10071,9 @@ impl AppState {
         // skills yet" about a library nobody had asked for.
         if self.is_app_settings_open && self.app_settings_tab == AppSettingsTab::Skills {
             self.refresh_skills(cx);
+        }
+        if self.is_app_settings_open && self.app_settings_tab == AppSettingsTab::Connections {
+            self.refresh_connections(cx);
         }
         // A routine's thread is somewhere a person can go back to, while it is still one of
         // this bot's routines' threads and this bot is the one open. Anything else lands on the
@@ -15711,6 +16416,9 @@ impl AppState {
             if self.app_settings_tab == AppSettingsTab::Skills {
                 self.refresh_skills(cx);
             }
+            if self.app_settings_tab == AppSettingsTab::Connections {
+                self.refresh_connections(cx);
+            }
         }
         self.record_nav();
         cx.notify();
@@ -15731,6 +16439,11 @@ impl AppState {
             // is when it is asked for.
             if tab == AppSettingsTab::Skills {
                 self.refresh_skills(cx);
+            }
+            // The connections are the server's, and whatever was last read may be a sign-in in
+            // the browser out of date.
+            if tab == AppSettingsTab::Connections {
+                self.refresh_connections(cx);
             }
             cx.notify();
         }
@@ -15994,6 +16707,9 @@ impl AppState {
         self.refresh_host_egress(cx);
         if tab == AppSettingsTab::Computer {
             self.refresh_computers(cx);
+        }
+        if tab == AppSettingsTab::Connections {
+            self.refresh_connections(cx);
         }
         self.record_nav();
         cx.notify();
@@ -16348,11 +17064,11 @@ fn policy_not_kept(
     })
 }
 
-/// Something Settings → Computer could not do with this Mac's rules, as the page says it: what
-/// did not happen, then the server's own reason when it refused and gave one as a line of plain
-/// text (see [`plain_reason`]). A server out of reach or a session that has gone is already
-/// said by the reconnect pill and the signed-out banner, and here it is only that it did not
-/// happen.
+/// Something Settings → Computer could not do with this Mac's rules, or Settings → Connections
+/// and a bot's Connections card with a connection, as the page says it: what did not happen,
+/// then the server's own reason when it refused and gave one as a line of plain text (see
+/// [`plain_reason`]). A server out of reach or a session that has gone is already said by the
+/// reconnect pill and the signed-out banner, and here it is only that it did not happen.
 fn rules_refusal(what: &str, error: &OpenGrokError) -> String {
     let reason = (error.failure() == Failure::Verdict)
         .then(|| plain_reason(&error.message))
@@ -25005,6 +25721,708 @@ mod tests {
         state.coworker_usage = None;
         assert!(!state.settle_coworker_usage(2, "cw_1".into(), usage(9)));
         assert_eq!(state.coworker_usage, None);
+    }
+
+    use super::{
+        AccountConnections, AppSettingsTab, BROWSER_WAIT, CONNECTORS_NOT_LISTED, ConnectionChange,
+        ConnectionList, ConnectorList,
+    };
+
+    /// One of the person's own connections, as `GET /connections` lists it.
+    fn connection(id: &str, connector: &str, loans: &[&str]) -> crate::opengrok::ConnectionView {
+        crate::opengrok::ConnectionView {
+            id: id.into(),
+            connector: connector.into(),
+            owner: crate::opengrok::ConnectionOwner::User("acct_1".into()),
+            label: format!("{connector} account"),
+            loans: loans.iter().map(|lent| lent.to_string()).collect(),
+            updated_at_ms: 1,
+            expires_at_ms: None,
+        }
+    }
+
+    /// Disconnect takes a service from every Bot it is lent to, so pressing it only asks: nothing
+    /// is with the server until Yes, and only the person's own listed connection can be asked
+    /// about, one at a time.
+    #[test]
+    fn a_disconnect_asks_first_and_sends_nothing_until_yes() {
+        let mut state = listed(vec![
+            connection("conn_1", "gmail", &["cw_1"]),
+            connection("conn_2", "github", &[]),
+        ]);
+        assert!(state.connections.ask_to_disconnect("conn_1"));
+        assert!(state.connections.is_confirming_disconnect("conn_1"));
+        assert!(
+            state.connections.changing.is_empty(),
+            "nothing is sent by asking"
+        );
+        assert!(state.connections.ask_to_disconnect("conn_2"));
+        assert!(
+            !state.connections.is_confirming_disconnect("conn_1"),
+            "one row asks at a time"
+        );
+        assert!(
+            !state.connections.ask_to_disconnect("conn_9"),
+            "not a listed connection"
+        );
+        state
+            .connections
+            .changing
+            .insert("conn_2".into(), ConnectionChange::Disconnect);
+        assert!(
+            !state.connections.is_confirming_disconnect("conn_2"),
+            "a row with a change at the server asks nothing"
+        );
+        assert!(!state.connections.ask_to_disconnect("conn_2"));
+        state.connections.changing.clear();
+        state.connections.list = Some(ConnectionList::Listed(vec![connection(
+            "conn_1",
+            "gmail",
+            &["cw_1"],
+        )]));
+        assert!(
+            !state.connections.is_confirming_disconnect("conn_2"),
+            "a connection no longer listed asks nothing"
+        );
+    }
+
+    /// Signed in, with a server to ask, and the person's connections listed. Nothing is ever
+    /// sent to that server: each test settles every answer itself.
+    fn listed(rows: Vec<crate::opengrok::ConnectionView>) -> AppState {
+        let mut state = AppState::new();
+        state.opengrok =
+            Some(OpenGrokClient::new("http://127.0.0.1:9").expect("a URL that parses"));
+        state.account = Some(
+            serde_json::from_value(serde_json::json!({ "id": "acct_1", "email": "a@b.c" }))
+                .expect("an account"),
+        );
+        state.auth_status = AuthStatus::SignedIn;
+        state.connections.list = Some(ConnectionList::Listed(rows));
+        state
+    }
+
+    fn gmail() -> crate::opengrok::Connector {
+        crate::opengrok::Connector {
+            name: "gmail".into(),
+            label: "Gmail".into(),
+        }
+    }
+
+    /// A lend shows on its switch while the server has it, only for the bot it was asked for. A
+    /// refusal is said beside that bot's switch and nowhere else, without claiming what the
+    /// loan is now, and the switch shows the server's word again. A second change to the same
+    /// connection waits for the first, and a row the server answers with is what the list holds.
+    #[test]
+    fn a_lend_shows_while_it_is_asked_and_a_refusal_is_said_beside_its_bot() {
+        let mut state = listed(vec![connection("conn_1", "gmail", &[])]);
+        let lend = ConnectionChange::Lend("cw_1".into());
+        assert!(state.begin_connection_change("conn_1", lend.clone()));
+        let row = state.connections.own_rows()[0].clone();
+        assert!(state.connections.shows_lent(&row, "cw_1"));
+        assert!(!state.connections.shows_lent(&row, "cw_2"));
+        assert!(
+            !state.begin_connection_change("conn_1", ConnectionChange::Disconnect),
+            "one change at a time"
+        );
+        assert!(
+            !state.begin_connection_change("conn_9", ConnectionChange::Disconnect),
+            "a connection the list does not hold"
+        );
+
+        assert!(
+            state
+                .settle_connection_change(
+                    "conn_1",
+                    &lend,
+                    Err(OpenGrokError::from_server(Some(404), "no such connection")),
+                )
+                .is_some()
+        );
+        assert!(!state.connections.is_changing("conn_1"));
+        assert!(!state.connections.shows_lent(&row, "cw_1"));
+        assert_eq!(
+            state.connections.lend_refusal("conn_1", "cw_1"),
+            Some("Could not change this: no such connection.")
+        );
+        assert_eq!(
+            state.connections.lend_refusal("conn_1", "cw_2"),
+            None,
+            "another bot's card says nothing about it"
+        );
+        assert_eq!(
+            state.connections.disconnect_refusal("conn_1"),
+            None,
+            "nor does the row on Settings → Connections"
+        );
+
+        // Asked again, the old refusal goes, and the row the server answers with is the row.
+        assert!(state.begin_connection_change("conn_1", lend.clone()));
+        assert_eq!(state.connections.lend_refusal("conn_1", "cw_1"), None);
+        let mut answered = connection("conn_1", "gmail", &["cw_1"]);
+        answered.label = "ada@work.com".into();
+        assert!(
+            state
+                .settle_connection_change("conn_1", &lend, Ok(Some(answered.clone())))
+                .is_some()
+        );
+        assert_eq!(state.connections.own_rows(), [&answered]);
+
+        let revoke = ConnectionChange::Revoke("cw_1".into());
+        assert!(state.begin_connection_change("conn_1", revoke.clone()));
+        assert!(
+            !state
+                .connections
+                .shows_lent(state.connections.own_rows()[0], "cw_1"),
+            "a revoke with the server shows as taken back"
+        );
+        assert!(
+            state
+                .settle_connection_change(
+                    "conn_1",
+                    &revoke,
+                    Err(OpenGrokError::from_opengrok(
+                        409,
+                        "that connection has been disconnected"
+                    )),
+                )
+                .is_some()
+        );
+        assert_eq!(
+            state.connections.lend_refusal("conn_1", "cw_1"),
+            Some("Could not change this: that connection has been disconnected."),
+            "not \"Still lent\": a disconnected connection is lent to nobody"
+        );
+    }
+
+    /// A 2xx is a change the server took, whatever came with it. A lend or a revoke answered
+    /// with no row is never said to be refused, and never takes the row off the list: the read
+    /// that follows says what the row is now.
+    #[test]
+    fn a_change_the_server_took_is_never_shown_as_refused() {
+        let mut state = listed(vec![
+            connection("conn_1", "gmail", &[]),
+            connection("conn_2", "github", &["cw_1"]),
+        ]);
+        let lend = ConnectionChange::Lend("cw_1".into());
+        let revoke = ConnectionChange::Revoke("cw_1".into());
+        assert!(state.begin_connection_change("conn_1", lend.clone()));
+        assert!(state.begin_connection_change("conn_2", revoke.clone()));
+        let first = state
+            .settle_connection_change("conn_1", &lend, Ok(None))
+            .expect("the list is read again")
+            .generation;
+        let second = state
+            .settle_connection_change("conn_2", &revoke, Ok(None))
+            .expect("the list is read again")
+            .generation;
+        assert_eq!(state.connections.not_changed, Default::default());
+        assert_eq!(
+            state.connections.own_rows().len(),
+            2,
+            "an empty answer to a lend or a revoke is no disconnect"
+        );
+        assert!(!state.settle_connections(first, Ok(Vec::new())));
+        assert!(state.settle_connections(
+            second,
+            Ok(vec![
+                connection("conn_1", "gmail", &["cw_1"]),
+                connection("conn_2", "github", &[]),
+            ])
+        ));
+        assert!(
+            state
+                .connections
+                .shows_lent(state.connections.own_rows()[0], "cw_1")
+        );
+    }
+
+    /// A Disconnect the server took takes the row, and so does a 404 or a 409 to one: the server
+    /// saying the connection is already gone, which is what the person asked for. Any other
+    /// refusal is said under the row on Settings → Connections, and not beside a bot's switch.
+    #[test]
+    fn a_disconnect_that_finds_the_connection_gone_is_done() {
+        let mut state = listed(vec![
+            connection("conn_1", "gmail", &["cw_1"]),
+            connection("conn_2", "github", &[]),
+            connection("conn_3", "drive", &[]),
+            connection("conn_4", "slack", &[]),
+        ]);
+        let gone = ConnectionChange::Disconnect;
+        for (id, answer) in [
+            ("conn_1", Ok(None)),
+            (
+                "conn_2",
+                Err(OpenGrokError::from_opengrok(404, "no such connection")),
+            ),
+            (
+                "conn_3",
+                Err(OpenGrokError::from_opengrok(
+                    409,
+                    "that connection has been disconnected",
+                )),
+            ),
+            (
+                "conn_4",
+                Err(OpenGrokError::from_opengrok(
+                    503,
+                    "the store is unavailable",
+                )),
+            ),
+        ] {
+            assert!(state.begin_connection_change(id, gone.clone()));
+            assert!(state.settle_connection_change(id, &gone, answer).is_some());
+        }
+        let left: Vec<&str> = state
+            .connections
+            .own_rows()
+            .iter()
+            .map(|row| row.id.as_str())
+            .collect();
+        assert_eq!(left, ["conn_4"]);
+        assert_eq!(
+            state.connections.disconnect_refusal("conn_4"),
+            Some("Not disconnected: the store is unavailable.")
+        );
+        assert_eq!(state.connections.not_changed, Default::default());
+    }
+
+    /// Every change the server answers, taken or refused, is followed by a read of the list, and
+    /// that read overtakes any still out. A read taken before the change cannot put the old
+    /// loans back when it lands late.
+    #[test]
+    fn a_late_read_of_the_connections_does_not_undo_a_change() {
+        let mut state = listed(vec![connection("conn_1", "gmail", &[])]);
+        let before = state.begin_connections_read().expect("a read").generation;
+        let lend = ConnectionChange::Lend("cw_1".into());
+        assert!(state.begin_connection_change("conn_1", lend.clone()));
+        let after = state
+            .settle_connection_change(
+                "conn_1",
+                &lend,
+                Ok(Some(connection("conn_1", "gmail", &["cw_1"]))),
+            )
+            .expect("the list is read again")
+            .generation;
+        assert!(!state.settle_connections(before, Ok(vec![connection("conn_1", "gmail", &[])])));
+        assert_eq!(state.connections.own_rows()[0].loans, ["cw_1"]);
+        assert!(state.settle_connections(
+            after,
+            Ok(vec![connection("conn_1", "gmail", &["cw_1", "cw_2"])])
+        ));
+        assert_eq!(state.connections.own_rows()[0].loans, ["cw_1", "cw_2"]);
+    }
+
+    /// A change in flight, a Refresh that fails, and a Refresh again, which puts the list back to
+    /// asking; then the change lands. The Refresh's read is overtaken by the read the change
+    /// begins, and that read's answer is shown, so the list ends listed instead of asking for
+    /// good. The same when the change is refused.
+    #[test]
+    fn a_change_landing_after_a_second_refresh_leaves_the_list_listed() {
+        for answer in [
+            Ok(Some(connection("conn_1", "gmail", &["cw_1"]))),
+            Err(OpenGrokError::from_opengrok(
+                409,
+                "that connection has been disconnected",
+            )),
+        ] {
+            let mut state = listed(vec![connection("conn_1", "gmail", &[])]);
+            let lend = ConnectionChange::Lend("cw_1".into());
+            assert!(state.begin_connection_change("conn_1", lend.clone()));
+            let first = state
+                .begin_connections_read()
+                .expect("a Refresh")
+                .generation;
+            assert!(state.settle_connections(
+                first,
+                Err(OpenGrokError::from_opengrok(
+                    503,
+                    "the store is unavailable"
+                ))
+            ));
+            let second = state
+                .begin_connections_read()
+                .expect("a Refresh")
+                .generation;
+            assert_eq!(state.connections.list, Some(ConnectionList::Loading));
+
+            let read = state
+                .settle_connection_change("conn_1", &lend, answer)
+                .expect("the list is read again")
+                .generation;
+            assert_eq!(state.connections.list, Some(ConnectionList::Loading));
+            assert!(
+                !state.settle_connections(second, Ok(Vec::new())),
+                "the Refresh's read was overtaken"
+            );
+            assert!(
+                state.settle_connections(read, Ok(vec![connection("conn_1", "gmail", &["cw_1"])]))
+            );
+            assert_eq!(
+                state.connections.list,
+                Some(ConnectionList::Listed(vec![connection(
+                    "conn_1",
+                    "gmail",
+                    &["cw_1"]
+                )]))
+            );
+        }
+    }
+
+    /// Only the person's own connections are shown to lend or disconnect, or count as a service
+    /// connected: one of another scope is not theirs, and the server would refuse a change of it.
+    #[test]
+    fn only_the_persons_own_connections_are_controlled() {
+        use crate::opengrok::ConnectionOwner;
+        let owned_by = |id: &str, connector: &str, owner: ConnectionOwner| {
+            let mut row = connection(id, connector, &[]);
+            row.owner = owner;
+            row
+        };
+        let mut state = listed(vec![
+            connection("conn_1", "gmail", &[]),
+            owned_by("conn_2", "github", ConnectionOwner::Bot("cw_1".into())),
+            owned_by("conn_3", "weather", ConnectionOwner::Global),
+            owned_by("conn_4", "slack", ConnectionOwner::Other),
+        ]);
+        let own: Vec<&str> = state
+            .connections
+            .own_rows()
+            .iter()
+            .map(|row| row.id.as_str())
+            .collect();
+        assert_eq!(own, ["conn_1"]);
+        for id in ["conn_2", "conn_3", "conn_4"] {
+            assert!(!state.begin_connection_change(id, ConnectionChange::Disconnect));
+            assert!(!state.begin_connection_change(id, ConnectionChange::Lend("cw_1".into())));
+        }
+        let service = |name: &str| crate::opengrok::Connector {
+            name: name.into(),
+            label: String::new(),
+        };
+        state.connections.connectors = Some(ConnectorList::Listed(vec![
+            gmail(),
+            service("github"),
+            service("weather"),
+        ]));
+        let offered: Vec<&str> = state
+            .connections
+            .connectable()
+            .iter()
+            .map(|connector| connector.name.as_str())
+            .collect();
+        assert_eq!(
+            offered,
+            ["github", "weather"],
+            "a service connected in another scope is still the person's to connect"
+        );
+    }
+
+    /// Each service the person is sent to their browser for is waited on by itself: it stops
+    /// being waited on once the list has it as the person's own, or once its wait runs out, and
+    /// coming back to the window reads the list again only while one is still waited on.
+    #[test]
+    fn each_browser_sign_in_is_waited_on_until_it_is_listed_or_runs_out() {
+        let mut state = listed(Vec::new());
+        state.is_app_settings_open = true;
+        state.app_settings_tab = AppSettingsTab::Connections;
+        let start = Instant::now();
+        let later = start + Duration::from_secs(5 * 60);
+        for (service, at) in [("gmail", start), ("github", later)] {
+            let (_, ask) = state.begin_connect(service).expect("a Connect");
+            assert!(
+                state
+                    .settle_connect_link(ask, service, Ok("https://example.com/".into()), at)
+                    .is_some()
+            );
+        }
+        assert!(state.connections.is_waiting("gmail", start));
+        assert!(state.connections.is_waiting("github", start));
+        assert!(state.connections.still_waiting(later));
+
+        // A github connection that is a bot's own is not the person's sign-in coming back.
+        let mut bots = connection("conn_2", "github", &[]);
+        bots.owner = crate::opengrok::ConnectionOwner::Bot("cw_1".into());
+        let read = state.begin_connections_read().expect("a read").generation;
+        assert!(state.settle_connections(read, Ok(vec![connection("conn_1", "gmail", &[]), bots])));
+        assert!(!state.connections.is_waiting("gmail", start));
+        assert!(state.connections.is_waiting("github", start));
+
+        // Gmail's ten minutes would be up by now; github's are not.
+        let gmail_over = start + BROWSER_WAIT + Duration::from_secs(1);
+        assert!(state.connections.still_waiting(gmail_over));
+        assert!(state.connections.is_waiting("github", gmail_over));
+        let all_over = later + BROWSER_WAIT + Duration::from_secs(1);
+        assert!(!state.connections.is_waiting("github", all_over));
+        assert!(!state.connections.still_waiting(all_over));
+        assert!(state.connections.waiting.is_empty());
+    }
+
+    /// Coming back to the window reads the connections again while a sign-in is waited on, and
+    /// also, once the wait is over, whenever a connections list is on screen: someone who signed
+    /// in and came back after the ten minutes still finds the new connection.
+    #[test]
+    fn coming_back_to_the_window_reads_the_connections_while_they_are_on_screen() {
+        let mut state = listed(vec![]);
+        let now = Instant::now();
+        assert!(
+            !state.rereads_connections_on_activation(now),
+            "nothing waited on and nothing on screen"
+        );
+        state.is_app_settings_open = true;
+        state.app_settings_tab = AppSettingsTab::Connections;
+        assert!(
+            state.rereads_connections_on_activation(now),
+            "Settings → Connections is on screen, after any wait"
+        );
+        state.app_settings_tab = AppSettingsTab::Logins;
+        assert!(!state.rereads_connections_on_activation(now));
+        state.is_app_settings_open = false;
+        state.right_pane = super::RightPane::Settings;
+        assert!(
+            state.rereads_connections_on_activation(now),
+            "a Bot's settings, with its Connections card, is on screen"
+        );
+    }
+
+    /// A "Disconnect …?" goes when the server stops listing its row: the server makes a
+    /// reconnected service's connection under the same id, and the row must come back as a row,
+    /// not already asking, where Yes would delete the connection just made. A read that fails
+    /// says nothing about the row, and leaves the question as it was.
+    #[test]
+    fn a_disconnect_question_goes_with_its_row_and_does_not_come_back_with_it() {
+        let mut state = listed(vec![connection("conn_1", "gmail", &[])]);
+        assert!(state.connections.ask_to_disconnect("conn_1"));
+        let read = state.begin_connections_read().expect("a read").generation;
+        assert!(state.settle_connections(
+            read,
+            Err(OpenGrokError::from_server(Some(503), "the store is down"))
+        ));
+        assert_eq!(
+            state.connections.confirming_disconnect.as_deref(),
+            Some("conn_1"),
+            "a failed read says nothing about the row"
+        );
+        let read = state.begin_connections_read().expect("a read").generation;
+        assert!(state.settle_connections(read, Ok(vec![])));
+        let read = state.begin_connections_read().expect("a read").generation;
+        assert!(state.settle_connections(read, Ok(vec![connection("conn_1", "gmail", &[])])));
+        assert!(
+            !state.connections.is_confirming_disconnect("conn_1"),
+            "the reconnected row is not asking to be deleted"
+        );
+        assert_eq!(state.connections.confirming_disconnect, None);
+    }
+
+    /// A lend whose answer was lost past the deadline may have been taken. The read that follows
+    /// settles it: listed lent as asked, the line saying it was not goes; not lent, it stays.
+    #[test]
+    fn a_lend_the_read_shows_taken_is_no_longer_said_refused() {
+        let mut state = listed(vec![connection("conn_1", "gmail", &[])]);
+        for (lent_after, line_stays) in [(&[][..], true), (&["cw_1"][..], false)] {
+            state.connections.not_changed.insert(
+                ("conn_1".into(), "cw_1".into()),
+                "Could not change this: could not reach the server".into(),
+            );
+            state
+                .connections
+                .not_changed_asked
+                .insert(("conn_1".into(), "cw_1".into()), true);
+            let read = state.begin_connections_read().expect("a read").generation;
+            assert!(
+                state.settle_connections(read, Ok(vec![connection("conn_1", "gmail", lent_after)]))
+            );
+            assert_eq!(
+                state.connections.lend_refusal("conn_1", "cw_1").is_some(),
+                line_stays,
+                "lent after the read: {lent_after:?}"
+            );
+        }
+    }
+
+    /// A refusal goes with its connection once the server no longer lists it as the person's.
+    #[test]
+    fn a_refusal_goes_with_its_connection() {
+        let mut state = listed(vec![
+            connection("conn_1", "gmail", &[]),
+            connection("conn_2", "github", &[]),
+        ]);
+        let lines = |state: &AppState| {
+            (
+                state.connections.lend_refusal("conn_1", "cw_1").is_some(),
+                state.connections.disconnect_refusal("conn_2").is_some(),
+            )
+        };
+        state.connections.not_changed.insert(
+            ("conn_1".into(), "cw_1".into()),
+            "Could not change this.".into(),
+        );
+        state
+            .connections
+            .not_disconnected
+            .insert("conn_2".into(), "Not disconnected.".into());
+        let read = state.begin_connections_read().expect("a read").generation;
+        assert!(state.settle_connections(
+            read,
+            Ok(vec![
+                connection("conn_1", "gmail", &[]),
+                connection("conn_2", "github", &[]),
+            ])
+        ));
+        assert_eq!(lines(&state), (true, true));
+        let read = state.begin_connections_read().expect("a read").generation;
+        assert!(state.settle_connections(read, Ok(Vec::new())));
+        assert_eq!(lines(&state), (false, false));
+    }
+
+    /// Connect opens the page the server gave, only for the ask it was and only while Settings
+    /// → Connections is on screen, and waits for the browser; a refusal is said beside the
+    /// service, by its label, in the server's words.
+    #[test]
+    fn a_connect_opens_only_the_page_its_own_ask_was_given() {
+        let mut state = listed(Vec::new());
+        state.connections.connectors = Some(ConnectorList::Listed(vec![gmail()]));
+        state.is_app_settings_open = true;
+        state.app_settings_tab = AppSettingsTab::Connections;
+        let now = Instant::now();
+        let url = || Ok("https://accounts.google.com/o".to_string());
+
+        let (_, ask) = state.begin_connect("gmail").expect("a Connect");
+        assert!(
+            state.begin_connect("github").is_none(),
+            "one sign-in page at a time"
+        );
+        assert_eq!(
+            state.settle_connect_link(ask, "gmail", url(), now),
+            Some("https://accounts.google.com/o".to_string())
+        );
+        assert_eq!(state.connections.opening, None);
+        assert!(state.connections.is_waiting("gmail", now));
+
+        let (_, ask) = state.begin_connect("gmail").expect("a Connect");
+        assert_eq!(
+            state.settle_connect_link(
+                ask,
+                "gmail",
+                Err(OpenGrokError::from_server(
+                    Some(404),
+                    "no provider is configured for gmail"
+                )),
+                now,
+            ),
+            None
+        );
+        assert_eq!(
+            state.connections.connect_refused,
+            Some((
+                "gmail".to_string(),
+                "Gmail could not be connected: no provider is configured for gmail.".to_string()
+            ))
+        );
+
+        // The person left the page while it was asked for: nothing opens, and every Connect is
+        // alive again.
+        state.connections.waiting.clear();
+        let (_, ask) = state.begin_connect("gmail").expect("a Connect");
+        state.is_app_settings_open = false;
+        assert_eq!(state.settle_connect_link(ask, "gmail", url(), now), None);
+        assert_eq!(state.connections.opening, None);
+        assert!(!state.connections.is_waiting("gmail", now));
+    }
+
+    /// A Connect asked for by an account that has since signed out is not opened: not when the
+    /// next account is on Settings → Connections asking nothing, and not when it has asked for
+    /// the same service, where the ask's number tells the two apart and the service's name
+    /// cannot. Signing out is `logout`'s own `forget_account`, not a copy of it.
+    #[test]
+    fn a_signed_out_accounts_late_connect_is_not_opened() {
+        let mut state = listed(Vec::new());
+        let now = Instant::now();
+        let url = || Ok("https://accounts.google.com/o".to_string());
+        let sign_out_and_in = |state: &mut AppState| {
+            state.forget_account();
+            assert_eq!(state.connections, AccountConnections::default());
+            state.account = Some(
+                serde_json::from_value(serde_json::json!({ "id": "acct_2", "email": "bo@b.c" }))
+                    .expect("an account"),
+            );
+            state.auth_status = AuthStatus::SignedIn;
+            state.is_app_settings_open = true;
+            state.app_settings_tab = AppSettingsTab::Connections;
+        };
+        state.is_app_settings_open = true;
+        state.app_settings_tab = AppSettingsTab::Connections;
+
+        let (_, theirs) = state.begin_connect("gmail").expect("a Connect");
+        sign_out_and_in(&mut state);
+        assert_eq!(state.settle_connect_link(theirs, "gmail", url(), now), None);
+        assert_eq!(state.connections.opening, None);
+        assert!(!state.connections.is_waiting("gmail", now));
+
+        let (_, theirs) = state.begin_connect("gmail").expect("a Connect");
+        sign_out_and_in(&mut state);
+        let (_, mine) = state.begin_connect("gmail").expect("a Connect");
+        assert_eq!(state.settle_connect_link(theirs, "gmail", url(), now), None);
+        assert_eq!(
+            state.connections.opening.as_deref(),
+            Some("gmail"),
+            "the new account's ask is still out"
+        );
+        assert!(!state.connections.is_waiting("gmail", now));
+        assert!(
+            state
+                .settle_connect_link(mine, "gmail", url(), now)
+                .is_some()
+        );
+    }
+
+    /// A change or a read answered after a sign-out finds nothing waiting on it. Signing out is
+    /// `logout`'s own `forget_account`, not a copy of it.
+    #[test]
+    fn a_connection_answer_after_a_sign_out_is_dropped() {
+        let mut state = listed(vec![connection("conn_1", "gmail", &[])]);
+        let lend = ConnectionChange::Lend("cw_1".into());
+        assert!(state.begin_connection_change("conn_1", lend.clone()));
+        let read = state.begin_connections_read().expect("a read").generation;
+        let connectors = state.connectors_generation;
+        state.forget_account();
+        assert!(
+            state
+                .settle_connection_change(
+                    "conn_1",
+                    &lend,
+                    Ok(Some(connection("conn_1", "gmail", &["cw_1"]))),
+                )
+                .is_none()
+        );
+        assert!(!state.settle_connections(read, Ok(vec![connection("conn_1", "gmail", &[])])));
+        assert!(!state.settle_connectors(connectors, Ok(vec![gmail()])));
+        assert_eq!(state.connections, AccountConnections::default());
+    }
+
+    /// A server with no `GET /connectors` (one older than opengrok-server#269) is not a fault,
+    /// and any other refusal is said in the server's words.
+    #[test]
+    fn a_server_without_the_connectors_route_is_not_a_fault() {
+        let mut state = AppState::new();
+        state.connectors_generation = 1;
+        assert!(state.settle_connectors(1, Err(OpenGrokError::from_server(Some(404), ""))));
+        assert_eq!(
+            state.connections.connectors,
+            Some(ConnectorList::Unavailable(CONNECTORS_NOT_LISTED.into()))
+        );
+        assert!(!state.settle_connectors(0, Ok(Vec::new())), "an older read");
+        state.connectors_generation = 2;
+        assert!(state.settle_connectors(
+            2,
+            Err(OpenGrokError::from_server(Some(500), "the vault is sealed"))
+        ));
+        assert_eq!(
+            state.connections.connectors,
+            Some(ConnectorList::Unavailable(
+                "The services this server can connect could not be read: the vault is sealed."
+                    .into()
+            ))
+        );
     }
 
     // ---- A Bot's tool ceiling, and the Tools card's switches (opengrok-server#268) ------------

@@ -25,8 +25,9 @@
 //!   means to read it, not merely without a panic;
 //! - every route the corpus records has that reading, or is excused in [`REST_NOT_READ`] with
 //!   why this app never asks it;
-//! - a route this app asks before the corpus records it is named in [`REST_NOT_RECORDED_YET`],
-//!   with its reading already waiting, and comes off that list the day its recording arrives;
+//! - a route this app was built to ask ahead of the server's recording of it is owed a reading
+//!   in [`REST_NOT_RECORDED_YET`], which says what brings its fixtures, until the corpus holds
+//!   it;
 //! - the ledger, every wire word this app branches on, is either a word the manifest says the
 //!   server sends or excused in [`NOT_SENT_BY_SERVER`], with the evidence;
 //! - every word the server sends is either in the ledger or excused in [`CLIENT_IGNORES`], so a
@@ -46,12 +47,12 @@ use super::activity::{
     activity_from_replay,
 };
 use super::client::{
-    AnswerReply, AsyncRunResponse, BoxShareScope, CoworkerCeiling, CoworkerComputer, CoworkerUsage,
-    DaemonEnrol, DaemonList, LocalExecMode, LocalExecPolicy, OpenGrokClient, QueuedApproval,
-    RecipeDetail, RecipeList, RecipeParameterKind, RecipeRunResult, RunCause, RunReplay,
-    ScheduleKind, ScheduleRow, ScheduleRun, ScheduleRunStarted, ScheduleRunStatus, SkillDetail,
-    SkillSummary, SkillVersion, StopReply, ThreadReplay, ToolListing, host_egress_tunnel_available,
-    host_egress_tunnel_flag,
+    AnswerReply, AsyncRunResponse, BoxShareScope, ConnectLink, ConnectionOwner, ConnectionView,
+    Connector, CoworkerCeiling, CoworkerComputer, CoworkerUsage, DaemonEnrol, DaemonList,
+    LocalExecMode, LocalExecPolicy, OpenGrokClient, QueuedApproval, RecipeDetail, RecipeList,
+    RecipeParameterKind, RecipeRunResult, RunCause, RunReplay, ScheduleKind, ScheduleRow,
+    ScheduleRun, ScheduleRunStarted, ScheduleRunStatus, SkillDetail, SkillSummary, SkillVersion,
+    StopReply, ThreadReplay, ToolListing, host_egress_tunnel_available, host_egress_tunnel_flag,
 };
 use super::credential::{CREDENTIAL_OFFER_SAVE, SaveLoginSpec};
 use super::error::{Failure, Unreachable, reads_as_gateway_unreachable};
@@ -476,42 +477,6 @@ const FIVE_HUNDRED_SHAPE: &str = "should carry its sentence under error, as JSON
 /// [`every_route_this_app_does_not_read_is_recorded_and_says_why`] fails until it does.
 const REST_NOT_READ: &[(&str, &str, &str)] = &[
     (
-        "GET__connections",
-        "/connections",
-        "A person's connections and Connect (opengrok-server#267/#269). This branch does not read it; nativechat#150 does, and takes this entry off when it \
-         lands.",
-    ),
-    (
-        "POST__connections__id__lend",
-        "/connections/{id}/lend",
-        "A person's connections and Connect (opengrok-server#267/#269). This branch does not read it; nativechat#150 does, and takes this entry off when it \
-         lands.",
-    ),
-    (
-        "POST__connections__id__revoke",
-        "/connections/{id}/revoke",
-        "A person's connections and Connect (opengrok-server#267/#269). This branch does not read it; nativechat#150 does, and takes this entry off when it \
-         lands.",
-    ),
-    (
-        "DELETE__connections__id_",
-        "/connections/{id}",
-        "A person's connections and Connect (opengrok-server#267/#269). This branch does not read it; nativechat#150 does, and takes this entry off when it \
-         lands.",
-    ),
-    (
-        "GET__connectors",
-        "/connectors",
-        "A person's connections and Connect (opengrok-server#267/#269). This branch does not read it; nativechat#150 does, and takes this entry off when it \
-         lands.",
-    ),
-    (
-        "GET__connections__connector__authorize",
-        "/connections/{connector}/authorize",
-        "A person's connections and Connect (opengrok-server#267/#269). This branch does not read it; nativechat#150 does, and takes this entry off when it \
-         lands.",
-    ),
-    (
         "GET__auth_cursor_dev_session_token",
         "/auth/cursor_dev_session_token",
         "The dev sign-in that stands in for Cursor's OAuth (opengrok-server auth/routes.rs). This \
@@ -614,12 +579,17 @@ const REST_NOT_READ: &[(&str, &str, &str)] = &[
     ),
 ];
 
-/// Routes this app asks that the corpus does not record yet, by the directory the recorder will
-/// file them under, with the route as the server's router is to write it and where the recording
-/// is to come from. Each already has its reading in [`REST_ROUTES`], held meanwhile to bodies in
-/// the shape agreed with the server, so the recording is read the day it arrives.
-/// [`a_route_asked_before_it_is_recorded_is_on_its_way`] fails that day until the entry comes off,
-/// and fails too for an entry whose route the app no longer asks, so none can linger here.
+/// Routes this app asks that the corpus does not record yet: the app was built to a shape agreed
+/// with the server session before the server recorded it. Each is named by the directory the
+/// recorder will file it under, with the route as the server's router writes it and what brings
+/// its fixtures. Nothing reads them against the server's evidence yet, so each is owed a
+/// reading: the day the corpus holds one, it gets a reading in [`REST_ROUTES`] and comes off this
+/// list in the same change, and
+/// [`every_route_asked_ahead_of_its_recording_is_asked_and_not_recorded_yet`] fails until it
+/// does.
+///
+/// Only routes built ahead of a recording are listed. Routes this app asks that no test on the
+/// server drives are a different gap, and not this list's.
 const REST_NOT_RECORDED_YET: &[(&str, &str, &str)] = &[];
 
 // ---- the corpus ----
@@ -2089,9 +2059,14 @@ const REST_ROUTES: &[(&str, RestCheck)] = &[
     ("PATCH__coworkers__coworker_id_", coworker_row),
     ("DELETE__coworkers__coworker_id_", coworker_deleted),
     ("GET__coworkers__coworker_id__tools", coworker_tools),
-    // Not recorded yet: see REST_NOT_RECORDED_YET.
     ("GET__coworkers__coworker_id__ceiling", coworker_ceiling),
     ("PUT__coworkers__coworker_id__ceiling", coworker_ceiling),
+    ("GET__connections", connections_listed),
+    ("POST__connections__id__lend", connection_changed),
+    ("POST__connections__id__revoke", connection_changed),
+    ("DELETE__connections__id_", connection_gone),
+    ("GET__connectors", connectors_listed),
+    ("GET__connections__connector__authorize", sign_in_link),
     ("GET__coworkers__coworker_id__usage", coworker_usage),
     ("GET__coworkers__coworker_id__computer", computer),
     ("GET__coworkers__coworker_id__screen", screen),
@@ -3289,6 +3264,93 @@ fn coworker_usage(_: u16, body: &Value) -> Check {
     Ok(())
 }
 
+/// One of the person's connections as the list and a lend or a revoke answer it
+/// (opengrok-server#267 `ConnectionView`): its id, service, whose it is, its label and the Bots
+/// it is lent to come through as sent.
+fn connection_reads_as_sent(row: &ConnectionView, raw: &Value) -> Check {
+    let owner = match (str_at(&raw["owner"], "scope"), opt_str(&raw["owner"], "id")) {
+        ("user", Some(id)) => ConnectionOwner::User(id.to_string()),
+        ("bot", Some(id)) => ConnectionOwner::Bot(id.to_string()),
+        ("global", _) => ConnectionOwner::Global,
+        _ => ConnectionOwner::Other,
+    };
+    let loans: Vec<&str> = raw["loans"]
+        .as_array()
+        .ok_or("a connection should carry its loans")?
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    must!(
+        row.id == str_at(raw, "id")
+            && row.connector == str_at(raw, "connector")
+            && row.owner == owner
+            && row.label == str_at(raw, "label")
+            && row.loans == loans
+            && Some(row.updated_at_ms) == raw.get("updatedAtMs").and_then(Value::as_i64)
+            && row.expires_at_ms == raw.get("expiresAtMs").and_then(Value::as_i64),
+        "a connection came through changed: {row:?} from {raw}"
+    );
+    Ok(())
+}
+
+/// `GET /connectors` (opengrok-server#269): the services this server can connect, always a list,
+/// each by the name Connect asks for and the label its button says.
+fn connectors_listed(_: u16, body: &Value) -> Check {
+    let listed: Vec<Connector> = parse(body)?;
+    let raw = body.as_array().ok_or("the connectors should be a list")?;
+    same_len(&listed, raw)?;
+    for (connector, raw) in listed.iter().zip(raw) {
+        must!(
+            connector.name == str_at(raw, "name") && connector.label == str_at(raw, "label"),
+            "a connector came through changed: {connector:?} from {raw}"
+        );
+    }
+    Ok(())
+}
+
+/// `GET /connections/{connector}/authorize?format=json` (opengrok-server#269): the sign-in page the
+/// app opens in the person's browser, a web address, with when its signed state lapses.
+fn sign_in_link(_: u16, body: &Value) -> Check {
+    let link: ConnectLink = parse(body)?;
+    must!(
+        link.url == str_at(body, "url")
+            && url::Url::parse(&link.url).is_ok_and(|url| matches!(url.scheme(), "https" | "http")),
+        "the sign-in link should be a web address the app opens: {link:?}"
+    );
+    must!(
+        body.get("expiresAtMs").and_then(Value::as_i64).is_some(),
+        "the sign-in link should say when it lapses: {body}"
+    );
+    Ok(())
+}
+
+/// `GET /connections`: always a list, and every row as sent.
+fn connections_listed(_: u16, body: &Value) -> Check {
+    let listed: Vec<ConnectionView> = parse(body)?;
+    let raw = body.as_array().ok_or("the connections should be a list")?;
+    same_len(&listed, raw)?;
+    for (row, raw) in listed.iter().zip(raw) {
+        connection_reads_as_sent(row, raw)?;
+    }
+    Ok(())
+}
+
+/// A lend or a revoke answers with the connection's row as the list has it, which the app puts
+/// in place of the one it listed.
+fn connection_changed(_: u16, body: &Value) -> Check {
+    let row: ConnectionView = parse(body)?;
+    connection_reads_as_sent(&row, body)
+}
+
+/// A disconnect answers 204 with nothing; the app takes any 2xx as the connection gone.
+fn connection_gone(status: u16, body: &Value) -> Check {
+    must!(
+        (200..300).contains(&status) && body_json(body).is_null(),
+        "a disconnect should be a 2xx with no body, not {status} {body}"
+    );
+    Ok(())
+}
+
 /// A bot's tools (opengrok-server `agui/routes.rs` `list_tools`): every tool the server lists
 /// comes through by the name the model is told, with its words and its kind. The kind is what
 /// sorts a tool under the server's own or a plugin's, and the parse defaults a missing one to
@@ -4000,6 +4062,55 @@ fn every_route_this_app_does_not_read_is_recorded_and_says_why() {
     assert!(problems.is_empty(), "{}", problems.join("\n"));
 }
 
+/// The routes this app asks ahead of their recordings ([`REST_NOT_RECORDED_YET`]) are routes
+/// the shipped source does ask, filed under the directory the recorder will file them in, each
+/// saying what brings its fixtures, that the corpus does not hold yet. Once it holds one, the
+/// entry has gone stale: the route gets a reading in [`REST_ROUTES`] and leaves the list.
+#[test]
+fn every_route_asked_ahead_of_its_recording_is_asked_and_not_recorded_yet() {
+    let corpus = Corpus::load();
+    let recorded: BTreeSet<&str> = corpus
+        .bodies
+        .keys()
+        .filter_map(|file| file.split('/').nth(1))
+        .collect();
+    let mut problems = Vec::new();
+    for (route, pattern, why) in REST_NOT_RECORDED_YET {
+        if recorded.contains(route) {
+            problems.push(format!(
+                "the corpus records {route} now: give it a reading in REST_ROUTES and take it off \
+                 REST_NOT_RECORDED_YET"
+            ));
+        }
+        if REST_ROUTES.iter().any(|(dir, _)| dir == route)
+            || REST_NOT_READ.iter().any(|(dir, _, _)| dir == route)
+        {
+            problems.push(format!(
+                "{route} is owed a reading and is in REST_ROUTES or REST_NOT_READ as well"
+            ));
+        }
+        if why.trim().is_empty() {
+            problems.push(format!(
+                "REST_NOT_RECORDED_YET does not say what brings {route}'s fixtures"
+            ));
+        }
+        let method = route.split('_').next().unwrap_or("");
+        let filed = format!("{method}_{}", pattern.replace(['/', '{', '}'], "_"));
+        if filed != *route {
+            problems.push(format!(
+                "REST_NOT_RECORDED_YET names {route} as {method} {pattern}, which the recorder \
+                 files as {filed}"
+            ));
+        }
+        if source_asks(method, pattern).is_empty() {
+            problems.push(format!(
+                "nothing asks {method} {pattern} any more: take {route} off REST_NOT_RECORDED_YET"
+            ));
+        }
+    }
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
+}
+
 /// Every type and name the server sends has a fixture, or the manifest lists it as unrecorded:
 /// no test exercises it yet.
 #[test]
@@ -4500,6 +4611,70 @@ fn a_bots_tool_listing_has_a_reading_in_the_ledger() {
     );
 }
 
+/// The ceiling's reading, fed bodies in the shape agreed for opengrok-server#268 until the
+/// server's own are recorded, for the read and for the write's answer alike: builtins and a
+/// plugin, `user_machine_shell` unavailable and a plugin the server no longer loads with nothing
+/// but its name, at a version and at none, an empty ceiling, the refusals (not the owner's, a
+/// name it does not list, a version it has moved on from, no grant to change), and the ways a
+/// body could go wrong.
+#[test]
+fn a_bots_ceiling_has_a_reading_in_the_ledger() {
+    use serde_json::json;
+    for (route, verb) in [
+        ("GET__coworkers__coworker_id__ceiling", "GET"),
+        ("PUT__coworkers__coworker_id__ceiling", "PUT"),
+    ] {
+        let read = |status: u16, body: Value| {
+            read_fixture(
+                route,
+                &json!({
+                    "method": verb, "path": "/coworkers/cw_1/ceiling", "status": status, "body": body
+                }),
+            )
+        };
+        let ceiling = json!({"tools": [
+            {"name": "shell", "kind": "builtin", "enabled": true, "description": "Run a shell command."},
+            {"name": "user_machine_shell", "kind": "builtin", "enabled": false, "available": false},
+            {
+                "name": "gmail", "kind": "plugin", "enabled": true, "label": "Gmail",
+                "description": "Read and send mail.", "connector": "gmail"
+            },
+            {"name": "old_crm", "kind": "plugin", "enabled": true, "available": false}
+        ], "version": 7});
+        read(200, ceiling.clone()).unwrap_or_else(|why| panic!("{verb}: {why}"));
+        read(200, json!({"tools": []})).unwrap_or_else(|why| panic!("{verb}: {why}"));
+        read(200, json!({"tools": [], "version": 0})).unwrap_or_else(|why| panic!("{verb}: {why}"));
+        read(404, json!({"error": "no such coworker"}))
+            .unwrap_or_else(|why| panic!("{verb}: {why}"));
+        read(422, json!({"error": "no tool or plugin named nope"}))
+            .unwrap_or_else(|why| panic!("{verb}: {why}"));
+        read(
+            409,
+            json!({"error": "the tools changed since you looked", "code": "ceiling-changed"}),
+        )
+        .unwrap_or_else(|why| panic!("{verb}: {why}"));
+        read(403, json!({"error": "no grant to change"}))
+            .unwrap_or_else(|why| panic!("{verb}: {why}"));
+        assert!(
+            read(404, ceiling).is_err(),
+            "{verb}: a refusal carrying a ceiling"
+        );
+        assert!(read(200, json!({})).is_err(), "{verb}: no tools array");
+        assert!(
+            read(
+                200,
+                json!({"tools": [{"name": "shell", "kind": "builtin"}]})
+            )
+            .is_err(),
+            "{verb}: a row that does not say whether it is enabled"
+        );
+        assert!(
+            read(200, json!({"tools": [{"name": "shell", "enabled": true}]})).is_err(),
+            "{verb}: a row that drops its kind"
+        );
+    }
+}
+
 /// A coworker row's `effort` (opengrok-server#271) has a reading in the ledger before any
 /// recording carries one. A row without it is today's corpus and reads as inherit; a row with it
 /// comes through as sent, a word this app has not heard of included; an effort that is not a word
@@ -4564,118 +4739,4 @@ fn a_coworker_rows_effort_has_a_reading_in_the_ledger() {
         }),
     )
     .unwrap();
-}
-
-/// A route the app asks before the corpus records it is on its way rather than forgotten: its
-/// reading is waiting in [`REST_ROUTES`], the shipped source asks it ([`source_asks`]) under the
-/// route the recorder will file it by, and it says where its recording is to come from. The day
-/// the corpus holds it, this fails until the entry comes off, and its recording is read like
-/// every other; an entry for a route the app has stopped asking fails too.
-#[test]
-fn a_route_asked_before_it_is_recorded_is_on_its_way() {
-    let corpus = Corpus::load();
-    let recorded: BTreeSet<&str> = corpus
-        .bodies
-        .keys()
-        .filter_map(|file| file.split('/').nth(1))
-        .collect();
-    let mut problems = Vec::new();
-    for (route, pattern, why) in REST_NOT_RECORDED_YET {
-        if recorded.contains(route) {
-            problems.push(format!(
-                "the corpus records {route} now: take it off REST_NOT_RECORDED_YET"
-            ));
-        }
-        if !REST_ROUTES.iter().any(|(dir, _)| dir == route) {
-            problems.push(format!(
-                "{route} is asked before it is recorded and has no reading in REST_ROUTES"
-            ));
-        }
-        if REST_NOT_READ.iter().any(|(dir, _, _)| dir == route) {
-            problems.push(format!(
-                "{route} is excused as never asked and listed as asked at once"
-            ));
-        }
-        if why.trim().is_empty() {
-            problems.push(format!("REST_NOT_RECORDED_YET gives no reason for {route}"));
-        }
-        let method = route.split('_').next().unwrap_or("");
-        let filed = format!("{method}_{}", pattern.replace(['/', '{', '}'], "_"));
-        if filed != *route {
-            problems.push(format!(
-                "REST_NOT_RECORDED_YET names {route} as {method} {pattern}, which the recorder \
-                 files as {filed}"
-            ));
-        }
-        if source_asks(method, pattern).is_empty() {
-            problems.push(format!(
-                "the app does not ask {method} {pattern}: take {route} off REST_NOT_RECORDED_YET"
-            ));
-        }
-    }
-    assert!(problems.is_empty(), "{}", problems.join("\n"));
-}
-
-/// The ceiling's reading, fed bodies in the shape agreed for opengrok-server#268 until the
-/// server's own are recorded, for the read and for the write's answer alike: builtins and a
-/// plugin, `user_machine_shell` unavailable and a plugin the server no longer loads with nothing
-/// but its name, at a version and at none, an empty ceiling, the refusals (not the owner's, a
-/// name it does not list, a version it has moved on from, no grant to change), and the ways a
-/// body could go wrong.
-#[test]
-fn a_bots_ceiling_has_a_reading_in_the_ledger() {
-    use serde_json::json;
-    for (route, verb) in [
-        ("GET__coworkers__coworker_id__ceiling", "GET"),
-        ("PUT__coworkers__coworker_id__ceiling", "PUT"),
-    ] {
-        let read = |status: u16, body: Value| {
-            read_fixture(
-                route,
-                &json!({
-                    "method": verb, "path": "/coworkers/cw_1/ceiling", "status": status, "body": body
-                }),
-            )
-        };
-        let ceiling = json!({"tools": [
-            {"name": "shell", "kind": "builtin", "enabled": true, "description": "Run a shell command."},
-            {"name": "user_machine_shell", "kind": "builtin", "enabled": false, "available": false},
-            {
-                "name": "gmail", "kind": "plugin", "enabled": true, "label": "Gmail",
-                "description": "Read and send mail.", "connector": "gmail"
-            },
-            {"name": "old_crm", "kind": "plugin", "enabled": true, "available": false}
-        ], "version": 7});
-        read(200, ceiling.clone()).unwrap_or_else(|why| panic!("{verb}: {why}"));
-        read(200, json!({"tools": []})).unwrap_or_else(|why| panic!("{verb}: {why}"));
-        read(200, json!({"tools": [], "version": 0})).unwrap_or_else(|why| panic!("{verb}: {why}"));
-        read(404, json!({"error": "no such coworker"}))
-            .unwrap_or_else(|why| panic!("{verb}: {why}"));
-        read(422, json!({"error": "no tool or plugin named nope"}))
-            .unwrap_or_else(|why| panic!("{verb}: {why}"));
-        read(
-            409,
-            json!({"error": "the tools changed since you looked", "code": "ceiling-changed"}),
-        )
-        .unwrap_or_else(|why| panic!("{verb}: {why}"));
-        read(403, json!({"error": "no grant to change"}))
-            .unwrap_or_else(|why| panic!("{verb}: {why}"));
-        assert!(
-            read(404, ceiling).is_err(),
-            "{verb}: a refusal carrying a ceiling"
-        );
-        assert!(read(200, json!({})).is_err(), "{verb}: no tools array");
-        assert!(
-            read(
-                200,
-                json!({"tools": [{"name": "shell", "kind": "builtin"}]})
-            )
-            .is_err(),
-            "{verb}: a row that does not say whether it is enabled"
-        );
-        assert!(
-            read(200, json!({"tools": [{"name": "shell", "enabled": true}]})).is_err(),
-            "{verb}: a row that drops its kind"
-        );
-    }
 }

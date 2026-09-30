@@ -13,6 +13,7 @@ use crate::components::chat_input::sources::{
     ParameterSource, SkillLibrary, SlashSource, ToolSource, ValueSource,
 };
 use crate::components::composer_panel::ComposerPanelRow;
+use crate::components::connections::{self, ConnectOffer};
 use crate::components::skills::{
     NEVER_UPDATED, NOT_YET_RECORDING, NOT_YET_WITH_BOT, NOTHING_WRITTEN_YET, empty_line,
     short_relative_time, skill_matches, waiting_to_be_read,
@@ -30,11 +31,13 @@ use crate::opengrok::{
 };
 use crate::site_login::{SiteLoginRecord, grouped_logins, login_title};
 use crate::state::{
-    ActiveRecipe, AfterRefusal, AppSettingsTab, AppState, CeilingCard, LocalRuleRow, LocalRules,
-    RuleKind, SWITCH_IN_FLIGHT, SkillScope, TaughtSkill, ToolCeiling, ToolList, WRITING_A_LESSON,
+    ActiveRecipe, AfterRefusal, AppSettingsTab, AppState, CeilingCard, ConnectionList,
+    LocalRuleRow, LocalRules, RuleKind, SWITCH_IN_FLIGHT, SkillScope, TaughtSkill, ToolCeiling,
+    ToolList, WRITING_A_LESSON,
 };
 
 pub mod ids {
+    use crate::components::connections;
     use crate::state::RuleKind;
 
     pub const WINDOW: &str = "app-window";
@@ -324,6 +327,50 @@ pub mod ids {
         format!("settings-local-rule-error-{}-{n}", kind.word())
     }
 
+    // Connections (#2). Each is the id the window's own element carries, from the module that
+    // draws it, so the control a driver presses is the control a person presses.
+    pub const SETTINGS_CONNECTIONS: &str = connections::SETTINGS_TAB;
+    pub const CONNECTIONS_REFRESH: &str = connections::REFRESH;
+    pub const CONNECTIONS: &str = connections::LIST;
+    pub const CONNECTIONS_EMPTY: &str = connections::LIST_EMPTY;
+    pub const CONNECTIONS_ERROR: &str = connections::LIST_ERROR;
+    pub const CONNECTORS: &str = connections::OFFERED;
+    pub const CONNECTORS_EMPTY: &str = connections::OFFERED_EMPTY;
+    pub const CONNECTORS_ERROR: &str = connections::OFFERED_ERROR;
+    pub const AGENT_CONNECTIONS: &str = connections::AGENT_CARD;
+    pub const AGENT_CONNECTIONS_NOTE: &str = connections::AGENT_NOTE;
+
+    /// One connected service on Settings → Connections, by the server's connection id.
+    pub fn connection(id: &str) -> String {
+        connections::row_id(id)
+    }
+
+    pub fn connection_disconnect(id: &str) -> String {
+        connections::disconnect_id(id)
+    }
+
+    pub fn connection_error(id: &str) -> String {
+        connections::row_error_id(id)
+    }
+
+    /// Connect, for a service on offer, by the name the server lists it under.
+    pub fn connect(connector: &str) -> String {
+        connections::connect_id(connector)
+    }
+
+    pub fn connect_error(connector: &str) -> String {
+        connections::connect_error_id(connector)
+    }
+
+    /// A connection's switch on the open bot's Connections card.
+    pub fn connection_lend(id: &str) -> String {
+        connections::lend_id(id)
+    }
+
+    pub fn connection_lend_error(id: &str) -> String {
+        connections::lend_error_id(id)
+    }
+
     /// The Tools card's line about the open Bot's ceiling: how many rows are allowed, or why
     /// there are no switches. In the tree only once the server has answered, as on screen.
     pub const AGENT_CEILING: &str = "agent-ceiling";
@@ -565,15 +612,15 @@ pub enum Command {
     },
     ToggleAgentTools,
     ToggleAgentUsage,
-    /// A choice in the bot settings' Effort menu. It waits for Save, as a person's pick does.
-    PickEffort(String),
-    /// The bot settings' Save.
-    SaveAgentSettings,
     /// A switch on the Tools card: one row of the open Bot's ceiling on or off, sent at once.
     SetCeilingTool {
         name: String,
         enabled: bool,
     },
+    /// A choice in the bot settings' Effort menu. It waits for Save, as a person's pick does.
+    PickEffort(String),
+    /// The bot settings' Save.
+    SaveAgentSettings,
     /// Attach a file to the draft by path, as the + would (#90).
     AttachFile(std::path::PathBuf),
     /// Take a file off the draft by its place, as its ✕ would.
@@ -652,6 +699,22 @@ pub enum Command {
     RemoveLocalRule {
         kind: RuleKind,
         pattern: String,
+    },
+    /// Settings → Connections' Refresh: read the connections and the services on offer again.
+    RefreshConnections,
+    /// Settings → Connections' Connect: ask for the service's sign-in page and open it in the
+    /// person's browser, which is what a person's click does too.
+    ConnectService(String),
+    /// Settings → Connections' Disconnect, by the server's connection id.
+    DisconnectConnection(String),
+    /// Disconnect pressed: the row asks "Disconnect …?" first.
+    AskDisconnect(String),
+    /// No, on that question.
+    KeepConnection,
+    /// The open bot's Connections switch: lend it the connection, or take it back.
+    SetConnectionLent {
+        connection_id: String,
+        lent: bool,
     },
     /// Open or shut rows of what the coworker did and thought, by their keys, which is what a
     /// click on a step row or a Thought row does.
@@ -790,9 +853,9 @@ impl Command {
             Self::ChoiceDismiss { message_id } => state.dismiss_choice(message_id, cx),
             Self::ToggleAgentTools => state.toggle_agent_tools(cx),
             Self::ToggleAgentUsage => state.toggle_agent_usage(cx),
+            Self::SetCeilingTool { name, enabled } => state.switch_ceiling_tool(name, enabled, cx),
             Self::PickEffort(word) => state.pick_effort(word, cx),
             Self::SaveAgentSettings => state.request_agent_save(cx),
-            Self::SetCeilingTool { name, enabled } => state.switch_ceiling_tool(name, enabled, cx),
             Self::AttachFile(path) => state.request_attach(path, cx),
             Self::DetachFile(index) => state.request_detach(index, cx),
             Self::UserFormDismiss { card_key } => {
@@ -869,6 +932,15 @@ impl Command {
                 }
             }
             Self::RemoveLocalRule { kind, pattern } => state.remove_local_rule(kind, pattern, cx),
+            Self::RefreshConnections => state.refresh_connections(cx),
+            Self::ConnectService(connector) => state.connect_service(connector, cx),
+            Self::DisconnectConnection(id) => state.disconnect_connection(id, cx),
+            Self::AskDisconnect(id) => state.ask_to_disconnect(id, cx),
+            Self::KeepConnection => state.keep_connection(cx),
+            Self::SetConnectionLent {
+                connection_id,
+                lent,
+            } => state.set_connection_lent(connection_id, lent, cx),
             Self::SetStepsOpen { keys, open } => state.set_steps_open(&keys, open, cx),
             Self::Shutdown => {}
         }
@@ -2277,6 +2349,11 @@ pub struct NativeChatHost {
     /// This Mac's standing rules, where Settings → Computer draws them: see
     /// [`AppState::this_mac_rules`]. `None` where it draws none.
     local_rules: Option<LocalRules>,
+    /// The person's connections and the services on offer, as Settings → Connections and the
+    /// open bot's Connections card draw them (#2). Bot names come from `sessions`, which is the
+    /// roster while signed in.
+    connections: crate::state::AccountConnections,
+    connections_tab: bool,
     pending: Option<Command>,
     /// Keys the last op asked the window for. The host has no window; the root view presses
     /// them (see [`Self::take_compose`]).
@@ -2783,6 +2860,8 @@ impl NativeChatHost {
             .flatten(),
             network_policy_open: state.network_policy_open,
             local_rules: state.this_mac_rules().cloned(),
+            connections: state.connections.clone(),
+            connections_tab: state.app_settings_tab == AppSettingsTab::Connections,
             pending: None,
             compose: None,
         }
@@ -3153,6 +3232,11 @@ impl NativeChatHost {
             }
             settings = settings.with_child(node);
         }
+        if self.agent_settings_open
+            && let Some(bot) = self.sessions.iter().find(|session| session.active)
+        {
+            settings = settings.with_child(self.agent_connections_node(&bot.id));
+        }
         if let Some(note) = &self.model_note {
             // The server's word about why the list is not fuller, under the field, exactly where
             // the person read it. In the tree only while there is one, so its absence is the
@@ -3181,9 +3265,17 @@ impl NativeChatHost {
                             .with_child(UiNode::button("settings-tab-computer", "Computer"))
                             .with_child(UiNode::button("settings-tab-updates", "Updates"))
                             .with_child(UiNode::button("settings-tab-logins", "Logins"))
+                            .with_child(UiNode::button(ids::SETTINGS_CONNECTIONS, "Connections"))
                             .with_child(UiNode::button(ids::SETTINGS_SKILLS, "Skills"));
                         if self.logins_tab {
                             settings = self.logins_nodes(settings);
+                        }
+                        // Only while the dialog is open on Connections, as with this Mac's rules
+                        // below: a closed dialog's children are still found by id.
+                        if self.account_open && self.connections_tab {
+                            for node in self.connections_nodes() {
+                                settings = settings.with_child(node);
+                            }
                         }
                         if self.skills_tab {
                             settings = self.skills_nodes(settings);
@@ -3711,6 +3803,273 @@ impl NativeChatHost {
             }
         }
         None
+    }
+
+    /// A Bot's name by its id, from the roster (`sessions` is the roster while signed in).
+    fn bot_name(&self, coworker_id: &str) -> Option<String> {
+        self.sessions
+            .iter()
+            .find(|session| session.id == coworker_id)
+            .map(|session| session.title.clone())
+    }
+
+    /// Settings → Connections as the page draws it (#2): Refresh; each of the person's own
+    /// connections, named by its label, valued by the line under it (the service and who it is
+    /// lent to), with its Disconnect and why its last Disconnect did not go through; and a
+    /// Connect for each service on offer that is not connected. A list still being asked for has
+    /// no node at all, so a driver waits for `settings-connections` or one of the lines that
+    /// stand in for it.
+    fn connections_nodes(&self) -> Vec<UiNode> {
+        let connections = &self.connections;
+        let own = connections.own_rows();
+        let mut nodes = vec![UiNode::button(ids::CONNECTIONS_REFRESH, "Refresh")];
+        match &connections.list {
+            None | Some(ConnectionList::Loading) => {}
+            Some(ConnectionList::Unavailable(why)) => {
+                nodes.push(UiNode::status(ids::CONNECTIONS_ERROR, why.clone()));
+            }
+            Some(ConnectionList::Listed(_)) if own.is_empty() => {
+                nodes.push(UiNode::status(
+                    ids::CONNECTIONS_EMPTY,
+                    connections::NOTHING_CONNECTED,
+                ));
+            }
+            Some(ConnectionList::Listed(_)) => {
+                let mut list =
+                    UiNode::list(ids::CONNECTIONS, "Connected").with_value(own.len().to_string());
+                for row in own {
+                    let changing = connections.is_changing(&row.id);
+                    let mut node = UiNode::listitem(ids::connection(&row.id), row.label.clone())
+                        .with_value(connections::row_detail(connections, row, |id| {
+                            self.bot_name(id)
+                        }));
+                    if changing {
+                        node.states.push("changing".into());
+                    }
+                    if connections.is_confirming_disconnect(&row.id) {
+                        // Asked first: the question, and its Yes and No, in place of Disconnect.
+                        node = node
+                            .with_child(UiNode::status(
+                                connections::confirm_question_id(&row.id),
+                                connections::confirm_question(connections, row, |id| {
+                                    self.bot_name(id)
+                                }),
+                            ))
+                            .with_child(UiNode::button(
+                                connections::confirm_yes_id(&row.id),
+                                "Yes, disconnect",
+                            ))
+                            .with_child(UiNode::button(connections::confirm_no_id(&row.id), "No"));
+                    } else {
+                        node = node.with_child(
+                            UiNode::button(
+                                ids::connection_disconnect(&row.id),
+                                connections::disconnect_label(connections, &row.id),
+                            )
+                            .with_enabled(!changing),
+                        );
+                    }
+                    if let Some(why) = connections.disconnect_refusal(&row.id) {
+                        node = node.with_child(UiNode::status(ids::connection_error(&row.id), why));
+                    }
+                    list = list.with_child(node);
+                }
+                nodes.push(list);
+            }
+        }
+        match connections::connect_offer(connections) {
+            ConnectOffer::Asking | ConnectOffer::Unknown => {}
+            ConnectOffer::Unavailable(why) => {
+                nodes.push(UiNode::status(ids::CONNECTORS_ERROR, why));
+            }
+            ConnectOffer::Nothing(line) => nodes.push(UiNode::status(ids::CONNECTORS_EMPTY, line)),
+            ConnectOffer::Offered(open) => {
+                let mut list = UiNode::list(ids::CONNECTORS, "Connect a service")
+                    .with_value(open.len().to_string());
+                for connector in open {
+                    let name = connector.name.as_str();
+                    let mut button = UiNode::button(
+                        ids::connect(name),
+                        connections::connect_label(connections, connector),
+                    )
+                    .with_enabled(connections.opening.is_none());
+                    if connections.opening.as_deref() == Some(name) {
+                        button.states.push("opening".into());
+                    }
+                    if connections.is_waiting(name, std::time::Instant::now()) {
+                        button.states.push("waiting".into());
+                    }
+                    list = list.with_child(button);
+                    if let Some((_, why)) = connections
+                        .connect_refused
+                        .as_ref()
+                        .filter(|(refused, _)| refused == name)
+                    {
+                        list =
+                            list.with_child(UiNode::status(ids::connect_error(name), why.clone()));
+                    }
+                }
+                nodes.push(list);
+            }
+        }
+        nodes
+    }
+
+    /// The open bot's Connections card (#2): its second line, a switch per connection of the
+    /// person's own (named by its label, valued by its service, `checked` while it shows as lent
+    /// to this bot, dead and `changing` while a change to it is with the server), why a lend or
+    /// a revoke of it to this bot did not go through, and the card's sentence about what lending
+    /// does not do yet.
+    fn agent_connections_node(&self, coworker_id: &str) -> UiNode {
+        let connections = &self.connections;
+        let mut card = UiNode::list(ids::AGENT_CONNECTIONS, "Connections")
+            .with_value(connections::agent_summary(connections, coworker_id));
+        for row in connections.own_rows() {
+            let changing = connections.is_changing(&row.id);
+            let mut switch =
+                UiNode::new(ids::connection_lend(&row.id), "switch", row.label.clone())
+                    .with_value(connections.connector_label(&row.connector))
+                    .with_checked(connections.shows_lent(row, coworker_id))
+                    .with_enabled(!changing);
+            if changing {
+                switch.states.push("changing".into());
+            }
+            card = card.with_child(switch);
+            if let Some(why) = connections.lend_refusal(&row.id, coworker_id) {
+                card = card.with_child(UiNode::status(ids::connection_lend_error(&row.id), why));
+            }
+        }
+        card.with_child(UiNode::status(
+            ids::AGENT_CONNECTIONS_NOTE,
+            connections::LEND_NOTE,
+        ))
+    }
+
+    /// One of the Connections controls, on Settings → Connections or the open bot's card, or
+    /// `None` for a target that is not one.
+    ///
+    /// The tab answers from anywhere in Settings, and not while Settings is shut: arriving on it
+    /// reads the connections, and nobody can press it there. Every other control is refused while
+    /// its surface is not on screen, for a row or a service that surface is not showing, and
+    /// while it is dead on screen: a connection whose change is with the server, or a Connect
+    /// while a sign-in page is being asked for.
+    fn connection_command(&self, target: &str) -> Option<Result<Command, String>> {
+        if target == ids::SETTINGS_CONNECTIONS {
+            return Some(if self.account_open {
+                Ok(Command::SetAppSettingsTab(AppSettingsTab::Connections))
+            } else {
+                Err(format!(
+                    "`{target}` is in Settings, which is shut: open it with `{}`",
+                    ids::FOOTER_ACCOUNT
+                ))
+            });
+        }
+        let connections = &self.connections;
+        let on_tab = self.account_open && self.connections_tab;
+        let off_tab = || {
+            Err(format!(
+                "`{target}` is on Settings → Connections, which is not what is on screen: open \
+                 it with `{}`",
+                ids::SETTINGS_CONNECTIONS
+            ))
+        };
+        let busy = |label: &str| {
+            Err(format!(
+                "`{target}` is dead: a change to {label} is with the server"
+            ))
+        };
+        if target == ids::CONNECTIONS_REFRESH {
+            return Some(if on_tab {
+                Ok(Command::RefreshConnections)
+            } else {
+                off_tab()
+            });
+        }
+        let rows = connections.own_rows();
+        if let Some(row) = rows
+            .iter()
+            .find(|row| target == ids::connection_disconnect(&row.id))
+        {
+            return Some(if !on_tab {
+                off_tab()
+            } else if connections.is_changing(&row.id) {
+                busy(&row.label)
+            } else if connections.is_confirming_disconnect(&row.id) {
+                Err(format!(
+                    "`{target}` is asking first: click `{}` or `{}`",
+                    connections::confirm_yes_id(&row.id),
+                    connections::confirm_no_id(&row.id)
+                ))
+            } else {
+                Ok(Command::AskDisconnect(row.id.clone()))
+            });
+        }
+        if let Some(row) = rows.iter().find(|row| {
+            target == connections::confirm_yes_id(&row.id)
+                || target == connections::confirm_no_id(&row.id)
+        }) {
+            return Some(if !on_tab {
+                off_tab()
+            } else if !connections.is_confirming_disconnect(&row.id) {
+                Err(format!(
+                    "`{target}` is only there while the row asks \"Disconnect …?\": click `{}` first",
+                    ids::connection_disconnect(&row.id)
+                ))
+            } else if target == connections::confirm_yes_id(&row.id) {
+                Ok(Command::DisconnectConnection(row.id.clone()))
+            } else {
+                Ok(Command::KeepConnection)
+            });
+        }
+        if let Some(row) = rows
+            .iter()
+            .find(|row| target == ids::connection_lend(&row.id))
+        {
+            let bot = self
+                .sessions
+                .iter()
+                .find(|session| session.active)
+                .filter(|_| self.agent_settings_open);
+            return Some(match bot {
+                None => Err(format!(
+                    "`{target}` is on a bot's settings, which are closed"
+                )),
+                Some(_) if connections.is_changing(&row.id) => busy(&row.label),
+                Some(bot) => Ok(Command::SetConnectionLent {
+                    connection_id: row.id.clone(),
+                    lent: !connections.shows_lent(row, &bot.id),
+                }),
+            });
+        }
+        if let ConnectOffer::Offered(open) = connections::connect_offer(connections)
+            && let Some(connector) = open
+                .iter()
+                .find(|connector| target == ids::connect(&connector.name))
+        {
+            return Some(if !on_tab {
+                off_tab()
+            } else if connections.opening.is_some() {
+                Err(format!(
+                    "`{target}` is dead: a sign-in page is being asked for"
+                ))
+            } else {
+                Ok(Command::ConnectService(connector.name.clone()))
+            });
+        }
+        // Shaped like one of these controls, and naming nothing the surfaces show: a wrong
+        // address rather than an unknown control. A Connect's refusal line shares its prefix
+        // and is no control at all.
+        let shaped = target.starts_with("settings-connection-disconnect-")
+            || target.starts_with("settings-connection-confirm-")
+            || target.starts_with("settings-connection-keep-")
+            || target.starts_with("agent-connection-lend-")
+            || (target.starts_with("settings-connect-")
+                && !target.starts_with("settings-connect-error-"));
+        shaped.then(|| {
+            Err(format!(
+                "no `{target}` on screen: it names no connection or service the page is showing"
+            ))
+        })
     }
 
     /// Settings → Logins as the page draws it: the search field with Add beside it, Import…,
@@ -4514,6 +4873,8 @@ impl NativeChatHost {
         } else if let Some(cmd) = self.taught_skill_command(target) {
             cmd?
         } else if let Some(cmd) = self.local_rule_command(target) {
+            cmd?
+        } else if let Some(cmd) = self.connection_command(target) {
             cmd?
         } else if target == "settings-tab-logins" {
             Command::SetAppSettingsTab(AppSettingsTab::Logins)
@@ -9438,6 +9799,386 @@ mod tests {
         host.agent_usage = Some(crate::state::UsageReport::Loading);
         assert!(host.snapshot().find("agent-usage-toggle").is_none());
         assert!(host.dispatch(&Op::click("agent-usage-toggle")).is_err());
+    }
+
+    /// One of the person's own connections, as `GET /connections` lists it.
+    fn connection(id: &str, connector: &str, loans: &[&str]) -> crate::opengrok::ConnectionView {
+        crate::opengrok::ConnectionView {
+            id: id.into(),
+            connector: connector.into(),
+            owner: crate::opengrok::ConnectionOwner::User("acct_1".into()),
+            label: format!("{connector} account"),
+            loans: loans.iter().map(|lent| lent.to_string()).collect(),
+            updated_at_ms: 1,
+            expires_at_ms: None,
+        }
+    }
+
+    /// A connection that is a bot's own sign-in, and not the person's to lend or disconnect.
+    fn bots_own(id: &str, connector: &str) -> crate::opengrok::ConnectionView {
+        crate::opengrok::ConnectionView {
+            owner: crate::opengrok::ConnectionOwner::Bot("bot-1".into()),
+            ..connection(id, connector, &[])
+        }
+    }
+
+    fn service(name: &str, label: &str) -> crate::opengrok::Connector {
+        crate::opengrok::Connector {
+            name: name.into(),
+            label: label.into(),
+        }
+    }
+
+    /// Settings → Connections is on the tree as the page draws it (#2): each of the person's
+    /// own connections with the line under it (the service, and who it is lent to by name) and
+    /// its Disconnect, a Connect for each service on offer that is not connected, and what a
+    /// refusal said. Each click is the page's own, and refused off the page and while its
+    /// control is dead; the tab itself only while Settings is open.
+    #[test]
+    fn the_connections_page_is_on_the_tree_and_clicks_as_the_page_does() {
+        use crate::state::{BROWSER_WAIT, ConnectionChange, ConnectorList};
+        let mut host = host();
+        // Settings is shut: nobody can press its tab, and arriving on it would read the list.
+        let shut = host.click(ids::SETTINGS_CONNECTIONS).unwrap_err();
+        assert!(shut.contains(ids::FOOTER_ACCOUNT), "{shut}");
+        assert!(host.take_command().is_none());
+        // The tab answers from anywhere in Settings once it is open: it is how the page is
+        // reached. The other tabs are as they were.
+        host.account_open = true;
+        host.click(ids::SETTINGS_CONNECTIONS).unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::SetAppSettingsTab(AppSettingsTab::Connections))
+        ));
+        host.account_open = false;
+        host.click("settings-tab-logins").unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::SetAppSettingsTab(AppSettingsTab::Logins))
+        ));
+
+        host.connections.list = Some(ConnectionList::Listed(vec![
+            connection("conn_1", "gmail", &["bot-1", "cw_gone"]),
+            bots_own("conn_2", "drive"),
+        ]));
+        host.connections.connectors = Some(ConnectorList::Listed(vec![
+            service("gmail", "Gmail"),
+            service("github", "GitHub"),
+        ]));
+        assert!(
+            host.snapshot().find(ids::CONNECTIONS).is_none(),
+            "Settings is not open on Connections"
+        );
+        assert!(host.click(&ids::connection_disconnect("conn_1")).is_err());
+        assert!(host.click(&ids::connect("github")).is_err());
+        assert!(host.click(ids::CONNECTIONS_REFRESH).is_err());
+
+        host.account_open = true;
+        host.connections_tab = true;
+        let tree = host.snapshot();
+        assert_eq!(
+            tree.find(ids::CONNECTIONS).unwrap().value.as_deref(),
+            Some("1"),
+            "only the person's own"
+        );
+        let row = tree.find(&ids::connection("conn_1")).unwrap();
+        assert_eq!(row.name, "gmail account");
+        assert_eq!(
+            row.value.as_deref(),
+            Some("Gmail · Lent to Ada and 1 Bot not on your list")
+        );
+        assert!(tree.find(&ids::connection("conn_2")).is_none());
+        assert!(
+            tree.find(&ids::connect("gmail")).is_none(),
+            "a service already connected is not offered"
+        );
+        assert_eq!(
+            tree.find(ids::CONNECTORS).unwrap().value.as_deref(),
+            Some("1")
+        );
+        assert_eq!(
+            tree.find(&ids::connect("github")).unwrap().name,
+            "Connect GitHub"
+        );
+        assert!(tree.ids_are_unique());
+
+        // Disconnect asks first; its Yes and No are not there until it does.
+        let yes = crate::components::connections::confirm_yes_id("conn_1");
+        let no = crate::components::connections::confirm_no_id("conn_1");
+        assert!(host.click(&yes).is_err(), "nothing to say yes to yet");
+        host.click(&ids::connection_disconnect("conn_1")).unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::AskDisconnect(id)) if id == "conn_1"
+        ));
+        host.connections.confirming_disconnect = Some("conn_1".into());
+        let tree = host.snapshot();
+        assert_eq!(
+            tree.find(&crate::components::connections::confirm_question_id(
+                "conn_1"
+            ))
+            .unwrap()
+            .name,
+            "Disconnect Gmail? Ada and 1 Bot not on your list will lose it."
+        );
+        assert!(tree.find(&ids::connection_disconnect("conn_1")).is_none());
+        assert!(tree.ids_are_unique());
+        host.click(&no).unwrap();
+        assert!(matches!(host.take_command(), Some(Command::KeepConnection)));
+        host.click(&yes).unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::DisconnectConnection(id)) if id == "conn_1"
+        ));
+        host.connections.confirming_disconnect = None;
+        host.click(&ids::connect("github")).unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::ConnectService(name)) if name == "github"
+        ));
+        host.click(ids::CONNECTIONS_REFRESH).unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::RefreshConnections)
+        ));
+        assert!(host.click(&ids::connect("gmail")).is_err());
+        assert!(host.click(&ids::connection_disconnect("conn_9")).is_err());
+        assert!(
+            host.click(&ids::connection_disconnect("conn_2")).is_err(),
+            "a bot's own sign-in is not the person's to disconnect"
+        );
+
+        // A change with the server leaves its row dead and saying so, and a sign-in page being
+        // asked for leaves every Connect dead.
+        host.connections
+            .changing
+            .insert("conn_1".into(), ConnectionChange::Disconnect);
+        host.connections.opening = Some("github".into());
+        let tree = host.snapshot();
+        let row = tree.find(&ids::connection("conn_1")).unwrap();
+        assert!(row.states.contains(&"changing".to_string()));
+        let disconnect = tree.find(&ids::connection_disconnect("conn_1")).unwrap();
+        assert_eq!(
+            (disconnect.name.as_str(), disconnect.enabled),
+            ("Disconnecting…", false)
+        );
+        let connect = tree.find(&ids::connect("github")).unwrap();
+        assert!(connect.states.contains(&"opening".to_string()) && !connect.enabled);
+        assert!(host.click(&ids::connection_disconnect("conn_1")).is_err());
+        assert!(host.click(&ids::connect("github")).is_err());
+
+        // A lend with the server is on the row as it is on the bot's switch.
+        host.connections
+            .changing
+            .insert("conn_1".into(), ConnectionChange::Revoke("bot-1".into()));
+        assert_eq!(
+            host.snapshot()
+                .find(&ids::connection("conn_1"))
+                .unwrap()
+                .value
+                .as_deref(),
+            Some("Gmail · Lent to 1 Bot not on your list")
+        );
+
+        // A refusal of a Disconnect is under its row in the server's words, and a lend's is
+        // not; the browser's wait is on its Connect, and a Connect that could not start says
+        // why beside it.
+        host.connections.changing.clear();
+        host.connections.opening = None;
+        host.connections.not_disconnected.insert(
+            "conn_1".into(),
+            "Not disconnected: the store is unavailable.".into(),
+        );
+        host.connections.not_changed.insert(
+            ("conn_1".into(), "bot-1".into()),
+            "Could not change this: no such connection.".into(),
+        );
+        host.connections
+            .waiting
+            .insert("github".into(), std::time::Instant::now() + BROWSER_WAIT);
+        host.connections.connect_refused = Some((
+            "github".into(),
+            "GitHub could not be connected: no provider is configured for github.".into(),
+        ));
+        let tree = host.snapshot();
+        let row = tree.find(&ids::connection("conn_1")).unwrap();
+        let lines: Vec<&str> = row.children.iter().map(|line| line.name.as_str()).collect();
+        assert_eq!(
+            lines,
+            ["Disconnect", "Not disconnected: the store is unavailable."]
+        );
+        assert!(
+            tree.find(&ids::connect("github"))
+                .unwrap()
+                .states
+                .contains(&"waiting".to_string())
+        );
+        assert_eq!(
+            tree.find(&ids::connect_error("github")).unwrap().name,
+            "GitHub could not be connected: no provider is configured for github."
+        );
+
+        // Each empty list says which it is, and a list that could not be read says why. A list
+        // with none of the person's own in it is nothing connected.
+        host.connections.list = Some(ConnectionList::Listed(vec![bots_own("conn_2", "drive")]));
+        host.connections.connectors = Some(ConnectorList::Listed(Vec::new()));
+        let tree = host.snapshot();
+        assert_eq!(
+            tree.find(ids::CONNECTIONS_EMPTY).unwrap().name,
+            connections::NOTHING_CONNECTED
+        );
+        assert_eq!(
+            tree.find(ids::CONNECTORS_EMPTY).unwrap().name,
+            connections::NO_CONNECTORS
+        );
+        assert!(tree.find(ids::CONNECTIONS).is_none() && tree.find(ids::CONNECTORS).is_none());
+        host.connections.list = Some(ConnectionList::Unavailable(
+            "Your connections could not be read.".into(),
+        ));
+        host.connections.connectors = Some(ConnectorList::Unavailable(
+            crate::state::CONNECTORS_NOT_LISTED.into(),
+        ));
+        let tree = host.snapshot();
+        assert_eq!(
+            tree.find(ids::CONNECTIONS_ERROR).unwrap().name,
+            "Your connections could not be read."
+        );
+        assert_eq!(
+            tree.find(ids::CONNECTORS_ERROR).unwrap().name,
+            crate::state::CONNECTORS_NOT_LISTED
+        );
+    }
+
+    /// The open bot's Connections card is on the tree while its settings are open: a switch
+    /// per connection of the person's own, checked while it is lent to this bot, whose click
+    /// asks for the other way; dead while a change to it is with the server; a refusal about
+    /// this bot beside it, and no other bot's; and the card's sentence about what lending does
+    /// not do yet (opengrok-server#268).
+    #[test]
+    fn a_bots_connections_card_lends_from_the_tree() {
+        use crate::state::ConnectionChange;
+        let mut host = host();
+        host.connections.list = Some(ConnectionList::Listed(vec![
+            connection("conn_1", "gmail", &["bot-1"]),
+            connection("conn_2", "github", &[]),
+            bots_own("conn_3", "drive"),
+        ]));
+        assert!(
+            host.snapshot().find(ids::AGENT_CONNECTIONS).is_none(),
+            "the bot's settings are closed"
+        );
+        assert!(host.click(&ids::connection_lend("conn_1")).is_err());
+
+        host.agent_settings_open = true;
+        let tree = host.snapshot();
+        assert_eq!(
+            tree.find(ids::AGENT_CONNECTIONS).unwrap().value.as_deref(),
+            Some("1 of 2 lent to this Bot"),
+            "only the person's own are counted"
+        );
+        let lent = tree.find(&ids::connection_lend("conn_1")).unwrap();
+        assert_eq!(
+            (lent.role.as_str(), lent.checked, lent.enabled),
+            ("switch", Some(true), true)
+        );
+        assert_eq!(lent.value.as_deref(), Some("gmail"));
+        assert_eq!(
+            tree.find(&ids::connection_lend("conn_2")).unwrap().checked,
+            Some(false)
+        );
+        assert!(tree.find(&ids::connection_lend("conn_3")).is_none());
+        assert_eq!(
+            tree.find(ids::AGENT_CONNECTIONS_NOTE).unwrap().name,
+            connections::LEND_NOTE
+        );
+        assert!(tree.ids_are_unique());
+
+        host.click(&ids::connection_lend("conn_1")).unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::SetConnectionLent { connection_id, lent: false }) if connection_id == "conn_1"
+        ));
+        host.click(&ids::connection_lend("conn_2")).unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::SetConnectionLent { connection_id, lent: true }) if connection_id == "conn_2"
+        ));
+        assert!(host.click(&ids::connection_lend("conn_3")).is_err());
+
+        // With the server, the switch shows what was asked, and is dead.
+        host.connections
+            .changing
+            .insert("conn_2".into(), ConnectionChange::Lend("bot-1".into()));
+        let tree = host.snapshot();
+        let asked = tree.find(&ids::connection_lend("conn_2")).unwrap();
+        assert_eq!((asked.checked, asked.enabled), (Some(true), false));
+        assert!(asked.states.contains(&"changing".to_string()));
+        assert!(host.click(&ids::connection_lend("conn_2")).is_err());
+
+        // Refused, it shows the server's word again, with the server's words beside it; a
+        // refusal about lending it to another bot is that bot's card's.
+        host.connections.changing.clear();
+        host.connections.not_changed.insert(
+            ("conn_2".into(), "bot-1".into()),
+            "Could not change this: no such connection.".into(),
+        );
+        host.connections.not_changed.insert(
+            ("conn_1".into(), "bot-2".into()),
+            "Could not change this: no such connection.".into(),
+        );
+        let tree = host.snapshot();
+        assert_eq!(
+            tree.find(&ids::connection_lend("conn_2")).unwrap().checked,
+            Some(false)
+        );
+        assert_eq!(
+            tree.find(&ids::connection_lend_error("conn_2"))
+                .unwrap()
+                .name,
+            "Could not change this: no such connection."
+        );
+        assert!(tree.find(&ids::connection_lend_error("conn_1")).is_none());
+        assert!(host.click("agent-connection-lend-conn_9").is_err());
+    }
+
+    /// What the app holds is what the tree draws: a state's connections and roster come through
+    /// `from_app`, and the bot's names are the roster's.
+    #[test]
+    fn the_connections_on_the_tree_are_the_apps() {
+        let mut state = AppState::new();
+        // Signed in, or the roster is not what the sidebar lists and no bot has a name.
+        state.auth_status = crate::state::AuthStatus::SignedIn;
+        state.account = Some(
+            serde_json::from_value(serde_json::json!({ "id": "acct_1", "email": "a@b.c" }))
+                .unwrap(),
+        );
+        state.coworkers = vec![
+            serde_json::from_value(serde_json::json!({ "id": "cw_1", "name": "Ada" })).unwrap(),
+            serde_json::from_value(serde_json::json!({ "id": "cw_2", "name": "Bo" })).unwrap(),
+        ];
+        state.active_coworker_id = Some("cw_2".into());
+        state.connections.list = Some(ConnectionList::Listed(vec![connection(
+            "conn_1",
+            "gmail",
+            &["cw_1", "cw_2"],
+        )]));
+        state.is_app_settings_open = true;
+        state.app_settings_tab = AppSettingsTab::Connections;
+        state.right_pane = crate::state::RightPane::Settings;
+        let host = NativeChatHost::from_app(&state);
+        let tree = host.snapshot();
+        assert_eq!(
+            tree.find(ids::AGENT_CONNECTIONS).unwrap().value.as_deref(),
+            Some("1 of 1 lent to this Bot"),
+            "the open bot is Bo, who has it"
+        );
+        assert_eq!(
+            tree.find(&ids::connection("conn_1"))
+                .unwrap()
+                .value
+                .as_deref(),
+            Some("gmail · Lent to Ada and Bo")
+        );
     }
 
     /// The Effort menu is on the tree with the word it shows as its value and one choice per word

@@ -136,6 +136,38 @@
 //! pane, as the Save button does. `agent-settings-error` is the pane's red line over Save: a
 //! refused Save, in the server's words.
 //!
+//! Connections (#2), a connection named by the server's id and a service by the name
+//! `GET /connectors` lists it under. Only the person's own connections are on either surface: a
+//! Bot's own sign-in, the whole server's, or a scope this app does not know is not theirs to
+//! lend or disconnect. `settings-tab-connections` (refused while Settings is shut); while
+//! Settings is open on it, `settings-connections-refresh`, `settings-connections` (value = how
+//! many are connected) with a `settings-connection-{id}` per connection (label = its label,
+//! value = the line under it: the service and who it is lent to, by bot name, a lend or a revoke
+//! with the server shown as asked; state `changing` while a change to it is with the server),
+//! holding `settings-connection-disconnect-{id}` (dead while changing; pressing it only asks,
+//! and while the row asks it is replaced by `settings-connection-ask-{id}`, value = "Disconnect
+//! Gmail? Ada and Bo will lose it.", with `settings-connection-confirm-{id}` to disconnect and
+//! `settings-connection-keep-{id}` to leave it) and
+//! `settings-connection-error-{id}` (why its last Disconnect did not go through);
+//! `settings-connections-empty` / `settings-connections-error` in its place when there is
+//! nothing to list or it could not be read. Then `settings-connectors` (value = how many
+//! services are on offer and not connected) with `settings-connect-{connector}` (label `Connect
+//! Gmail`, or `Opening…` with state `opening` while its sign-in page is asked for, when every
+//! Connect is dead; state `waiting` once the browser has the page, until the service is listed
+//! or ten minutes have gone) and `settings-connect-error-{connector}` (why Connect did not open
+//! the browser); `settings-connectors-empty` (the server offers none, or all are connected) /
+//! `settings-connectors-error` in its place. A click on a Connect opens the person's browser, as
+//! a person's does, once the server answers and only if the page is still on screen.
+//!
+//! In the bot's settings: `agent-connections` (value = the card's second line: `1 of 2 lent to
+//! this Bot`, `Asking the server…`, or why there is nothing to count), and per connection
+//! `agent-connection-lend-{id}` (a switch, label = its label, value = its service, checked while
+//! it shows as lent to this bot; a click asks for the other way; dead and `changing` while a
+//! change is with the server) and `agent-connection-error-{id}` (why a lend or a revoke of it to
+//! this bot did not go through; another bot's is on that bot's card); `agent-connections-note`,
+//! the card's sentence that a lent connection reaches a plugin only once the bot is allowed it in
+//! its Tools (opengrok-server#268).
+//!
 //! Named invokes (parity / gpui-agent): `UserFormContinue`, `UserFormDismiss`,
 //! `UserFormOpenScreen`, `UserFormUseSaved`, `UserFormClearSaved` (also kebab
 //! `user-form.continue` / `user-form.dismiss` / `user-form.screen` /
