@@ -118,6 +118,14 @@ pub(crate) fn badge_model_id(message_id: &str) -> String {
 pub(crate) const ASKING: &str = "Asking the server…";
 pub(crate) const INTRO: &str = "Where your Bots' replies are paid from. Either way the server \
      runs the turn, its tools and its record; this app never calls a model or keeps a key.";
+/// The same, from a server that keeps a door per Bot (the contract proposed 2026-09-30, Part A,
+/// not yet recorded): a Bot picks its own door and model in the model picker, and this page is
+/// what the ones that have not picked follow.
+pub(crate) const INTRO_PER_BOT: &str = "Where replies are paid from for a Bot that hasn't \
+     picked its own model in the composer. Either way the server runs the turn, its tools and its \
+     record; this app never calls a model or keeps a key.";
+/// Over the radio, from a server that keeps a door per Bot.
+pub(crate) const DEFAULT_HEADING: &str = "Default for Bots that haven't picked";
 pub(crate) const RUNNING: &str = "opencodex is running";
 /// The health line while opencodex is not answering, up to the command that starts it, which the
 /// page sets as code.
@@ -182,6 +190,31 @@ pub(crate) const KEEP_KEY_LABEL: &str = "Keep key";
 /// In a Bot's Usage card while its replies go through the person's own plan: a turn there is not
 /// metered and carries no gateway key, so the server's usage report never counts it.
 pub(crate) const PLAN_USAGE_NOTE: &str = "Replies on your own subscription aren't counted here.";
+
+/// The page's opening line: whose door this is.
+pub(crate) fn intro(per_bot: bool) -> &'static str {
+    if per_bot { INTRO_PER_BOT } else { INTRO }
+}
+
+/// The plan's model picker's label. From a server that keeps a door per Bot it is the model a
+/// Bot on the plan runs on when it has picked none of its own; from one before that it is every
+/// Bot's on the plan, as it always was.
+pub(crate) fn model_label(per_bot: bool) -> &'static str {
+    if per_bot {
+        "Plan model when a Bot hasn't chosen one"
+    } else {
+        "Model"
+    }
+}
+
+/// The relay's model picker's label, the same way.
+pub(crate) fn relay_model_label(per_bot: bool) -> &'static str {
+    if per_bot {
+        "Plan model through a Mac when a Bot hasn't chosen one"
+    } else {
+        "Model"
+    }
+}
 
 /// A choice of the radio, as it reads.
 pub(crate) fn kind_label(kind: InferenceKind) -> &'static str {
@@ -269,8 +302,23 @@ fn kind_detail(kind: InferenceKind) -> &'static str {
     }
 }
 
-/// What a reply's badge reads: whose keys paid for it, and for a reply the person's Mac answered
-/// through the relay, that the Mac did.
+/// What a reply's badge reads: whose keys paid for it, that the person's Mac answered it where it
+/// did ([`badge_label`]), and ⚡ where the model that answered is a fast twin, which is all fast
+/// ever is on the wire.
+pub(crate) fn badge_words(source: &ReplySource) -> String {
+    let fast = source
+        .model
+        .as_deref()
+        .is_some_and(crate::opengrok::is_fast);
+    format!(
+        "{}{}",
+        badge_label(source.kind, source.via),
+        if fast { " ⚡" } else { "" }
+    )
+}
+
+/// What a reply's badge reads of its door: whose keys paid for it, and for a reply the person's
+/// Mac answered through the relay, that the Mac did.
 pub(crate) fn badge_label(kind: InferenceKind, via: Option<Via>) -> &'static str {
     match (kind, via) {
         (InferenceKind::Gateway, _) => "paid key",
@@ -710,6 +758,7 @@ impl ReplySourcePage {
         let live = settings.relay_editable();
         let unavailable = relay_unavailable_line(settings.knows_relay(), state.relay_enrolled());
         let switch_live = state.relay_switch_live();
+        let model_words = relay_model_label(state.server_keeps_bot_doors());
         let line = state.relay_line();
         let words = relay_line_words(&line);
         let answering = matches!(line, RelayLine::Answering { .. });
@@ -799,7 +848,7 @@ impl ReplySourcePage {
                     .child(field_input(&self.relay_address).disabled(!live)),
             ))
             .child(labelled(
-                "Model",
+                model_words,
                 muted,
                 v_flex()
                     .items_start()
@@ -869,7 +918,8 @@ impl Render for ReplySourcePage {
         // Read in place: the settings can hold a typed key, and nothing here copies it.
         let state = self.state.read(cx);
         let settings = &state.reply_source;
-        let intro = div().text_xs().text_color(muted).child(INTRO);
+        let per_bot = state.server_keeps_bot_doors();
+        let intro = div().text_xs().text_color(muted).child(intro(per_bot));
         let Some(kept) = settings.kept_source() else {
             let line = unavailable_line(settings).unwrap_or(ASKING).to_string();
             let failed = matches!(settings.kept, Some(ReplySourceRead::Unavailable(_)));
@@ -915,6 +965,9 @@ impl Render for ReplySourcePage {
             .id(SECTION)
             .gap(px(12.))
             .child(intro)
+            .when(per_bot, |this| {
+                this.child(div().text_xs().text_color(muted).child(DEFAULT_HEADING))
+            })
             .child(
                 card()
                     .flex()
@@ -970,7 +1023,7 @@ impl Render for ReplySourcePage {
                             .child(field_input(&self.url).disabled(!plan_live)),
                     ))
                     .child(labelled(
-                        "Model",
+                        model_label(per_bot),
                         muted,
                         v_flex()
                             .items_start()
@@ -1106,8 +1159,8 @@ impl Render for ReplySourcePage {
     }
 }
 
-/// A reply's badge: "paid key", "your plan" or "your plan · Mac", and the model on hover when the
-/// server named one.
+/// A reply's badge: "paid key", "your plan" or "your plan · Mac", with ⚡ for a fast twin, and the
+/// model on hover when the server named one.
 /// One to a reply, on the last row of its words, so it is named by the reply's message id.
 pub(crate) fn reply_badge(
     source: &ReplySource,
@@ -1129,7 +1182,7 @@ pub(crate) fn reply_badge(
         .when_some(model, |this, model| {
             this.tooltip(move |window, cx| Tooltip::new(model.clone()).build(window, cx))
         })
-        .child(badge_label(source.kind, source.via))
+        .child(badge_words(source))
 }
 
 #[cfg(test)]
@@ -1137,7 +1190,7 @@ mod tests {
     // Item by item rather than a glob: `use super::*` would drag in gpui_kit's own `test`.
     use super::{
         MODELS_MAY_BE_OLD, NO_MODELS, NO_MODELS_NOT_RUNNING, NO_MODELS_WITHOUT_ADDRESS,
-        badge_label, health_line, health_word, kind_id, kind_label, models_note,
+        badge_label, badge_words, health_line, health_word, kind_id, kind_label, models_note,
     };
     use crate::opengrok::{InferenceKind, Via};
     use crate::state::ProxyHealth;
@@ -1167,6 +1220,59 @@ mod tests {
                 "settings-reply-source-kind-gateway",
                 "settings-reply-source-kind-local_proxy"
             ]
+        );
+    }
+
+    /// A reply's badge says ⚡ when the model that answered is a fast twin, on either door, and
+    /// nothing of the kind for a plain model or one the server did not name.
+    #[test]
+    fn a_reply_on_a_fast_twin_says_so_on_its_badge() {
+        use crate::opengrok::ReplySource;
+        let badge = |kind, via, model: Option<&str>| {
+            badge_words(&ReplySource {
+                kind,
+                via,
+                model: model.map(str::to_string),
+            })
+        };
+        assert_eq!(
+            badge(InferenceKind::LocalProxy, None, Some("gpt-6-luna--fast")),
+            "your plan ⚡"
+        );
+        assert_eq!(
+            badge(
+                InferenceKind::LocalProxy,
+                Some(Via::Mac),
+                Some("grok-4.7--fast")
+            ),
+            "your plan · Mac ⚡"
+        );
+        assert_eq!(
+            badge(InferenceKind::Gateway, None, Some("oag/fast--fast")),
+            "paid key ⚡"
+        );
+        assert_eq!(
+            badge(InferenceKind::LocalProxy, None, Some("gpt-6-luna")),
+            "your plan"
+        );
+        assert_eq!(badge(InferenceKind::Gateway, None, None), "paid key");
+    }
+
+    /// The page says it is the default for Bots that have not picked their own only to a server
+    /// that keeps a door per Bot; before that it is every Bot's, and reads as it always did.
+    #[test]
+    fn the_page_is_the_default_only_where_bots_pick_their_own() {
+        use super::{INTRO, INTRO_PER_BOT, intro, model_label, relay_model_label};
+        assert_eq!(intro(true), INTRO_PER_BOT);
+        assert_eq!(intro(false), INTRO);
+        assert_eq!(model_label(true), "Plan model when a Bot hasn't chosen one");
+        assert_eq!(
+            relay_model_label(true),
+            "Plan model through a Mac when a Bot hasn't chosen one"
+        );
+        assert_eq!(
+            (model_label(false), relay_model_label(false)),
+            ("Model", "Model")
         );
     }
 

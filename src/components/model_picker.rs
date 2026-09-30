@@ -33,6 +33,8 @@ pub(crate) const EFFORT: &str = "model-effort";
 /// The model's name, which opens the list, and in the list the heading that goes back.
 pub(crate) const OPEN_LIST: &str = "model-open-list";
 pub(crate) const LIST: &str = "model-list";
+/// Before each row's door and id ([`row_id`]).
+pub(crate) const ROW: &str = "model-row-";
 /// In the list, on a server without per-Bot doors while the account is on the person's plan:
 /// the plan's model, which answers for every Bot there.
 pub(crate) const PLAN: &str = "model-plan";
@@ -52,8 +54,14 @@ pub(crate) fn part_id(place: PickerPlace, part: &str) -> String {
 
 /// One row of the list, by its door's wire word and the id a pick of it pins with ⚡ off.
 pub(crate) fn row_id(place: PickerPlace, source: InferenceKind, base_id: &str) -> String {
-    part_id(place, &format!("model-row-{}-{base_id}", source.word()))
+    part_id(place, &format!("{ROW}{}-{base_id}", source.word()))
 }
+
+/// What a driver's tree names ⚡ and ↺ by, which the window draws as their marks alone.
+#[cfg(feature = "agent")]
+pub(crate) const FAST_LABEL: &str = "Fast";
+#[cfg(feature = "agent")]
+pub(crate) const RESET_LABEL: &str = "Reset";
 
 pub(crate) const MODELS_TITLE: &str = "Models";
 /// In the list while it has nothing to offer.

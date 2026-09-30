@@ -15,6 +15,7 @@ use crate::components::chat_input::sources::{
 };
 use crate::components::composer_panel::ComposerPanelRow;
 use crate::components::connections::{self, ConnectOffer};
+use crate::components::model_picker;
 use crate::components::reply_source;
 use crate::components::skills::{
     NEVER_UPDATED, NOT_YET_RECORDING, NOT_YET_WITH_BOT, NOTHING_WRITTEN_YET, empty_line,
@@ -34,13 +35,14 @@ use crate::opengrok::{
 use crate::site_login::{SiteLoginRecord, grouped_logins, login_title};
 use crate::state::{
     ActiveRecipe, AfterRefusal, AppSettingsTab, AppState, BotSkills, CeilingCard, ConnectionList,
-    LocalRuleRow, LocalRules, RuleKind, SWITCH_IN_FLIGHT, SkillScope, SkillsCard, TaughtSkill,
-    ToolCeiling, ToolList, WRITING_A_LESSON,
+    LocalRuleRow, LocalRules, PickerPlace, RuleKind, SWITCH_IN_FLIGHT, SkillScope, SkillsCard,
+    TaughtSkill, ToolCeiling, ToolList, WRITING_A_LESSON,
 };
 
 pub mod ids {
-    use crate::components::{connections, reply_source};
-    use crate::state::RuleKind;
+    use crate::components::{connections, model_picker, reply_source};
+    use crate::opengrok::InferenceKind;
+    use crate::state::{PickerPlace, RuleKind};
 
     pub const WINDOW: &str = "app-window";
     pub const PAGE: &str = "page-chat";
@@ -361,6 +363,23 @@ pub mod ids {
     pub const REPLY_SOURCE_HINT: &str = reply_source::HINT;
     /// In a Bot's Usage card, while its replies go through the person's own plan.
     pub const AGENT_USAGE_PLAN: &str = reply_source::BOT_USAGE_PLAN;
+
+    /// The Bot's model picker: the composer's chip, and the Model card in the Bot's settings.
+    /// Each has a popover whose parts carry the chip's ids, the card's with `agent-` before them.
+    pub const MODEL_CHIP: &str = model_picker::CHIP;
+    pub const AGENT_MODEL_CARD: &str = model_picker::CARD;
+
+    /// One part of the picker's popover in `place`, by the composer's id for it: `model-pop`,
+    /// `model-fast`, `model-effort`, `model-open-list`, `model-reset`, `model-list`,
+    /// `model-plan`, `model-note` or `model-error`.
+    pub fn model_part(place: PickerPlace, part: &str) -> String {
+        model_picker::part_id(place, part)
+    }
+
+    /// One model in the popover's list, by its door's wire word and the id a pick of it pins.
+    pub fn model_row(place: PickerPlace, source: InferenceKind, base_id: &str) -> String {
+        model_picker::row_id(place, source, base_id)
+    }
     /// The radio's third row, from a server that knows the relay: the plan through the person's
     /// Mac (hexuria/nativechat #156, opengrok-server #292).
     pub const REPLY_SOURCE_VIA_MAC: &str = reply_source::VIA_MAC;
@@ -590,8 +609,23 @@ pub enum Command {
     ToggleTheme,
     ToggleAccount,
     ToggleAgentSettings,
-    ToggleModelPicker,
-    SetModelPicker(bool),
+    /// The model picker's chip, or its card: its popover opens, or shuts.
+    ToggleModelPicker(crate::state::PickerPlace),
+    /// The popover opened in one place, or every one shut.
+    SetModelPicker(Option<crate::state::PickerPlace>),
+    /// The model's name in the popover, which opens the list, or the list's heading back.
+    ToggleModelList,
+    /// A model in the list, by its group and its id: the Bot goes onto it at once.
+    PickModel {
+        source: crate::opengrok::InferenceKind,
+        base_id: String,
+    },
+    /// ⚡, on or off, saved at once.
+    SetModelFast(bool),
+    /// A stop of the effort slider, by the server's word, saved at once.
+    SetModelEffort(String),
+    /// ↺: Default effort, and ⚡ off.
+    ResetModelPick,
     ToggleAvatarEditor,
     SetAvatarEditor(bool),
     SetAvatarColor(String),
@@ -897,13 +931,13 @@ impl Command {
             Self::ToggleTheme => state.toggle_theme(cx),
             Self::ToggleAccount => state.toggle_account_settings(cx),
             Self::ToggleAgentSettings => state.toggle_agent_settings(cx),
-            // The Model card's popover in the Bot's settings, as the sidebar's model list was.
-            Self::ToggleModelPicker => {
-                state.toggle_model_picker(crate::state::PickerPlace::Card, cx)
-            }
-            Self::SetModelPicker(open) => {
-                state.set_model_picker(open.then_some(crate::state::PickerPlace::Card), cx)
-            }
+            Self::ToggleModelPicker(place) => state.toggle_model_picker(place, cx),
+            Self::SetModelPicker(place) => state.set_model_picker(place, cx),
+            Self::ToggleModelList => state.toggle_model_list(cx),
+            Self::PickModel { source, base_id } => state.pick_model(source, &base_id, cx),
+            Self::SetModelFast(on) => state.set_model_fast(on, cx),
+            Self::SetModelEffort(word) => state.pick_model_effort(&word, cx),
+            Self::ResetModelPick => state.reset_model_pick(cx),
             Self::ToggleAvatarEditor => {
                 let open = !state.avatar_editor_open;
                 state.set_avatar_editor_open(open, cx);
@@ -1229,6 +1263,35 @@ fn not_editable(target: &str) -> String {
 enum LoginField {
     Email,
     Password,
+}
+
+/// The model picker's place and part a target names: the composer's ids as they are, and the
+/// card's with `agent-` before them; the card itself is named by `agent-model-card`, and stands
+/// for the chip it is the twin of. `None` for anything that is not one of the picker's ids.
+fn picker_part(target: &str) -> Option<(PickerPlace, &str)> {
+    use model_picker::{CHIP, EFFORT, ERROR, FAST, LIST, NOTE, OPEN_LIST, PLAN, POP, RESET, ROW};
+    if target == ids::MODEL_CHIP {
+        return Some((PickerPlace::Composer, CHIP));
+    }
+    if target == ids::AGENT_MODEL_CARD {
+        return Some((PickerPlace::Card, CHIP));
+    }
+    let (place, part) = match target.strip_prefix("agent-") {
+        Some(part) => (PickerPlace::Card, part),
+        None => (PickerPlace::Composer, target),
+    };
+    let known = [POP, FAST, RESET, EFFORT, OPEN_LIST, LIST, PLAN, NOTE, ERROR].contains(&part)
+        || part.starts_with(ROW);
+    known.then_some((place, part))
+}
+
+/// The slider's stops by the server's words, as a refusal names them.
+fn effort_stop_words() -> String {
+    crate::opengrok::EFFORT_STOPS
+        .iter()
+        .map(|(_, word)| *word)
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn login_field(target: &str) -> Option<LoginField> {
@@ -2568,6 +2631,18 @@ pub struct NativeChatHost {
     /// The open Bot's replies go through the person's own plan, which the server meters none of:
     /// the Usage card says so (`AppState::replies_on_plan`).
     replies_on_plan: bool,
+    /// The open Bot's model picker, as both of its places draw it (`AppState::model_pick`).
+    model_pick: Option<crate::opengrok::ModelPick>,
+    /// Where its popover is open, and whether it shows its list.
+    model_picker: Option<crate::state::PickerPlace>,
+    model_list_open: bool,
+    /// The server's words for the picker's last change that did not go through.
+    picker_note: Option<String>,
+    /// `GET /models`' word on why its list is not fuller, which the popover's list shows.
+    model_note: Option<String>,
+    /// The composer is dictating: the picker's chip has given its place to the dictation's
+    /// buttons.
+    composer_dictating: bool,
     /// The Recipes page, when it fills the main slot: its rows, and the recipe open in it.
     recipes_open: bool,
     recipes_filter: &'static str,
@@ -2817,6 +2892,12 @@ impl NativeChatHost {
             can_send_on_server: state.relay_failed_turn().is_some(),
             waiting_for_mac: state.sends_waiting_for_mac(),
             replies_on_plan: state.replies_on_plan(),
+            model_pick: state.model_pick(),
+            model_picker: state.model_picker,
+            model_list_open: state.model_list_open,
+            picker_note: state.picker_note().map(str::to_string),
+            model_note: state.model_catalogue.note.clone(),
+            composer_dictating: state.composer_dictating,
             computer_status: if state.computer_endpoint_missing {
                 "endpoint missing".to_string()
             } else {
@@ -3306,6 +3387,13 @@ impl NativeChatHost {
         for node in self.reply_run_nodes() {
             page = page.with_child(node);
         }
+        // The model picker's chip, beside the send button, while a Bot is open and the composer
+        // is not dictating: see `model_picker_node`.
+        if !self.composer_dictating
+            && let Some(chip) = self.model_picker_node(crate::state::PickerPlace::Composer)
+        {
+            page = page.with_child(chip);
+        }
         // Each reply's badge, as the feed draws it: label as it reads, value the door's wire
         // word, state `via-mac` on a reply the person's Mac answered, and under it the model the
         // server named, which the badge shows on hover: words the window draws, so a node of
@@ -3313,7 +3401,7 @@ impl NativeChatHost {
         for (message_id, source) in &self.reply_sources {
             let mut node = UiNode::status(
                 ids::reply_badge(message_id),
-                reply_source::badge_label(source.kind, source.via),
+                reply_source::badge_words(source),
             )
             .with_value(source.kind.word());
             if source.via == Some(crate::opengrok::Via::Mac) {
@@ -3540,6 +3628,10 @@ impl NativeChatHost {
                 UiNode::new("avatar-editor", "dialog", "Avatar editor")
                     .with_visible(self.avatar_editor_open),
             );
+        // The Model card, the picker's other place: the chip's twin, with `agent-` ids.
+        if let Some(card) = self.model_picker_node(crate::state::PickerPlace::Card) {
+            settings = settings.with_child(card);
+        }
         if self.agent_tools.is_some() || self.agent_ceiling.is_some() {
             settings = settings.with_child(agent_tools_node(&ToolsCardSnap {
                 tools: self.agent_tools.as_ref(),
@@ -4427,6 +4519,112 @@ impl NativeChatHost {
         })
     }
 
+    /// The model picker in `place` as the window draws it, while a Bot is open. Its trigger is
+    /// `model-chip` in the composer and `agent-model-card` in the Bot's settings: a button named
+    /// as the chip reads ("GPT-6 Luna · Medium ⚡") and valued by the model the next turn runs
+    /// on, with its door's wire word as a state, `fast` while ⚡ is on, and `expanded` while its
+    /// popover is open. Under it the popover, `model-pop`, visible while open, holds while it
+    /// shows its controls `model-fast` (a switch, checked while on, dead with why as its value),
+    /// `model-effort` (a slider named as the effort reads and valued by the server's word, dead
+    /// from a server that keeps no effort), `model-open-list` (named by the model) and
+    /// `model-reset` (live while there is something to put back); and while it shows its list,
+    /// `model-open-list` as the heading back (state `expanded`). `model-list` is always there,
+    /// valued by how many models it offers and visible while shown, and holds while shown a
+    /// `model-row-{source}-{id}` per model (valued by its door's word, `selected` on the one that
+    /// answers, `fast` where it has a fast version), `model-plan` where a server without per-Bot
+    /// doors has the account's plan model answer, and `model-note`, the server's word on why the
+    /// list is not fuller. `model-error`, while open: the server's words for the last change it
+    /// refused. The card's are the same with `agent-` before them.
+    fn model_picker_node(&self, place: PickerPlace) -> Option<UiNode> {
+        use model_picker::{
+            EFFORT, ERROR, FAST, LIST, MODELS_TITLE, NOTE, OPEN_LIST, PLAN, POP, RESET,
+        };
+        let pick = self.model_pick.as_ref()?;
+        let open = self.model_picker == Some(place);
+        let list_open = open && self.model_list_open;
+        let part = |name: &str| ids::model_part(place, name);
+        let trigger_id = match place {
+            PickerPlace::Composer => ids::MODEL_CHIP,
+            PickerPlace::Card => ids::AGENT_MODEL_CARD,
+        };
+        let mut trigger = UiNode::button(trigger_id, pick.chip_label())
+            .with_value(pick.model.clone().unwrap_or_default());
+        if let Some(door) = pick.door {
+            trigger.states.push(door.word().into());
+        }
+        if pick.is_fast() {
+            trigger.states.push("fast".into());
+        }
+        if open {
+            trigger.states.push("expanded".into());
+        }
+        let mut pop = UiNode::dialog(part(POP), "Model").with_visible(open);
+        if open && !list_open {
+            let mut fast = UiNode::new(part(FAST), "switch", model_picker::FAST_LABEL)
+                .with_checked(pick.is_fast())
+                .with_enabled(pick.fast_blocked.is_none());
+            if let Some(why) = pick.fast_blocked {
+                fast = fast.with_value(why);
+            }
+            pop = pop
+                .with_child(fast)
+                .with_child(
+                    UiNode::new(
+                        part(EFFORT),
+                        "slider",
+                        crate::opengrok::effort_label(&pick.effort),
+                    )
+                    .with_value(pick.effort.clone())
+                    .with_enabled(pick.effort_kept),
+                )
+                .with_child(UiNode::button(part(OPEN_LIST), pick.model_label()))
+                .with_child(
+                    UiNode::button(part(RESET), model_picker::RESET_LABEL)
+                        .with_enabled(pick.can_reset()),
+                );
+        }
+        let mut list = UiNode::list(part(LIST), MODELS_TITLE)
+            .with_value(pick.rows().count().to_string())
+            .with_visible(list_open);
+        if list_open {
+            let mut back = UiNode::button(part(OPEN_LIST), MODELS_TITLE);
+            back.states.push("expanded".into());
+            pop = pop.with_child(back);
+            if let Some(plan) = &pick.account_plan {
+                let model = plan.model.as_deref().map_or_else(
+                    || crate::opengrok::NO_MODEL.to_string(),
+                    crate::opengrok::base_label,
+                );
+                list = list.with_child(
+                    UiNode::status(part(PLAN), model)
+                        .with_value(plan.model.clone().unwrap_or_default()),
+                );
+            }
+            for row in pick.rows() {
+                let mut item = UiNode::listitem(
+                    ids::model_row(place, row.source, &row.base_id),
+                    row.label.clone(),
+                )
+                .with_value(row.source.word());
+                if pick.is_current(row) {
+                    item.states.push("selected".into());
+                }
+                if row.has_fast {
+                    item.states.push("fast".into());
+                }
+                list = list.with_child(item);
+            }
+            if let Some(note) = &self.model_note {
+                list = list.with_child(UiNode::status(part(NOTE), note.clone()));
+            }
+        }
+        pop = pop.with_child(list);
+        if open && let Some(note) = &self.picker_note {
+            pop = pop.with_child(UiNode::status(part(ERROR), note.clone()));
+        }
+        Some(trigger.with_child(pop))
+    }
+
     /// Settings → Reply source as the page draws it: `settings-reply-source` (value = the door
     /// the server keeps; states `unsaved`, `saving`, `reading`) holding the radio, the line saying
     /// the plan is set up only from the server's own Mac where this is not it, the proxy URL, the
@@ -4706,6 +4904,150 @@ impl NativeChatHost {
             card = card.with_child(remove);
         }
         card
+    }
+
+    /// One of the model picker's controls, in the composer or on the Bot's card, or `None` for a
+    /// target that is none of them ([`picker_part`]).
+    fn model_picker_command(&self, target: &str) -> Option<Result<Command, String>> {
+        let (place, part) = picker_part(target)?;
+        Some(self.model_picker_control(place, part, target))
+    }
+
+    /// A click on one of the picker's parts, refused while it is not on screen: the chip with no
+    /// Bot open or while the composer dictates, the card while the Bot's settings are shut, a part
+    /// of a popover while it is shut, its controls while it shows its list, and a row while it
+    /// does not. ⚡ where it is dead is refused with why, and ↺ with nothing to put back; the
+    /// slider is set with `set_value`, not clicked.
+    fn model_picker_control(
+        &self,
+        place: PickerPlace,
+        part: &str,
+        target: &str,
+    ) -> Result<Command, String> {
+        use model_picker::{
+            CHIP, EFFORT, ERROR, FAST, LIST, NOTE, OPEN_LIST, PLAN, POP, RESET, ROW,
+        };
+        let Some(pick) = &self.model_pick else {
+            return Err(format!("`{target}` is not on screen: no Bot is open"));
+        };
+        let trigger = match place {
+            PickerPlace::Composer => ids::MODEL_CHIP,
+            PickerPlace::Card => ids::AGENT_MODEL_CARD,
+        };
+        if part == CHIP {
+            return match place {
+                PickerPlace::Composer if self.composer_dictating => Err(format!(
+                    "`{target}` is not on screen: the composer is dictating, and its buttons have \
+                     the chip's place"
+                )),
+                PickerPlace::Card if !self.agent_settings_open => Err(format!(
+                    "`{target}` is in the Bot's settings, which are closed"
+                )),
+                _ => Ok(Command::ToggleModelPicker(place)),
+            };
+        }
+        if self.model_picker != Some(place) {
+            return Err(format!(
+                "`{target}` is in the model picker's popover, which is shut: open it with \
+                 `{trigger}`"
+            ));
+        }
+        let opener = ids::model_part(place, OPEN_LIST);
+        let list_open = self.model_list_open;
+        match part {
+            POP => Err(format!(
+                "`{target}` is the popover: click one of its controls"
+            )),
+            OPEN_LIST => Ok(Command::ToggleModelList),
+            PLAN | NOTE | ERROR => Err(format!("`{target}` is a line, not a control")),
+            FAST | EFFORT | RESET if list_open => Err(format!(
+                "`{target}` is not on screen: the popover shows its list, and `{opener}` goes \
+                 back"
+            )),
+            FAST => match pick.fast_blocked {
+                Some(why) => Err(format!("`{target}` is dead: {why}")),
+                None => Ok(Command::SetModelFast(!pick.is_fast())),
+            },
+            EFFORT => Err(format!(
+                "`{target}` is a slider: set_value it to one of {}",
+                effort_stop_words()
+            )),
+            RESET if pick.can_reset() => Ok(Command::ResetModelPick),
+            RESET => Err(format!(
+                "`{target}` has nothing to put back: the effort is Default, and ⚡ is off or \
+                 cannot be switched"
+            )),
+            LIST => Err(format!(
+                "`{target}` is the list: click one of its models, \
+                 `{}{{source}}-{{id}}`",
+                ids::model_part(place, ROW)
+            )),
+            row if !list_open => Err(format!(
+                "`{row}` is not on screen: the popover shows its controls, and `{opener}` opens \
+                 the list"
+            )),
+            row => {
+                let rest = row.strip_prefix(ROW).unwrap_or(row);
+                let found = crate::opengrok::InferenceKind::ALL
+                    .into_iter()
+                    .find_map(|source| {
+                        let base_id = rest.strip_prefix(source.word())?.strip_prefix('-')?;
+                        pick.row(source, base_id)
+                            .map(|row| (source, row.base_id.clone()))
+                    });
+                found
+                    .map(|(source, base_id)| Command::PickModel { source, base_id })
+                    .ok_or_else(|| {
+                        let offered: Vec<String> = pick
+                            .rows()
+                            .map(|row| ids::model_row(place, row.source, &row.base_id))
+                            .collect();
+                        format!(
+                            "no `{target}` in the list, which offers {}",
+                            if offered.is_empty() {
+                                "nothing".to_string()
+                            } else {
+                                offered.join(", ")
+                            }
+                        )
+                    })
+            }
+        }
+    }
+
+    /// `set_value` on the picker's slider: one of its five stops by the server's word, saved at
+    /// once, as letting go of the thumb there is. Refused off screen, as a click is, from a
+    /// server that keeps no effort, and for a word that is no stop (Default is ↺'s).
+    fn set_model_effort(
+        &mut self,
+        place: PickerPlace,
+        target: &str,
+        value: &str,
+    ) -> Result<DispatchResult, String> {
+        let Some(pick) = &self.model_pick else {
+            return Err(format!("`{target}` is not on screen: no Bot is open"));
+        };
+        let trigger = match place {
+            PickerPlace::Composer => ids::MODEL_CHIP,
+            PickerPlace::Card => ids::AGENT_MODEL_CARD,
+        };
+        if self.model_picker != Some(place) {
+            return Err(format!(
+                "`{target}` is in the model picker's popover, which is shut: open it with \
+                 `{trigger}`"
+            ));
+        }
+        if self.model_list_open {
+            return Err(format!(
+                "`{target}` is not on screen: the popover shows its list, and `{}` goes back",
+                ids::model_part(place, model_picker::OPEN_LIST)
+            ));
+        }
+        let word = value.trim();
+        pick.effort_patch(word)
+            .map_err(|why| format!("`{target}`: {why}"))?;
+        self.pending = Some(Command::SetModelEffort(word.to_string()));
+        Ok(DispatchResult::empty())
     }
 
     /// One of Settings → Reply source's controls, or `None` for a target that is none of them. The tab answers from anywhere in Settings, and not while Settings is
@@ -5812,7 +6154,7 @@ impl NativeChatHost {
             }
             Command::SaveAgentSettings
         } else if target == "agent-model-dismiss" {
-            Command::SetModelPicker(false)
+            Command::SetModelPicker(None)
         } else if target == "avatar-trigger" || target == "avatar-editor-dismiss" {
             Command::ToggleAvatarEditor
         } else if target == ids::LOGIN_SUBMIT {
@@ -5901,8 +6243,10 @@ impl NativeChatHost {
         } else if let Some(cmd) = self.reply_run_command(target) {
             cmd?
         } else if let Some(cmd) = self.reply_source_command(target) {
+            cmd?
+        } else if let Some(cmd) = self.model_picker_command(target) {
             // Before the composer's catch-all below: unlike the panel and the draft's chips, the
-            // reply-source chip is clicked, as a person clicks it.
+            // picker's chip is clicked, as a person clicks it.
             cmd?
         } else if target == ids::COMPOSER_SEND {
             if !self.turn_in_flight {
@@ -6024,6 +6368,9 @@ impl NativeChatHost {
         }
         if target == ids::RELAY_ADDR || target == ids::RELAY_KEY {
             return self.set_relay_field(target, value);
+        }
+        if let Some((place, model_picker::EFFORT)) = picker_part(target) {
+            return self.set_model_effort(place, target, value);
         }
         if let Some(refusal) = self.skill_sheet_field(target) {
             return refusal;
@@ -6370,9 +6717,10 @@ impl NativeChatHost {
             "chat.new" => Command::NewChat,
             "sidebar.toggle" => Command::ToggleSidebar,
             "sidebar.mini" => Command::ToggleMiniSidebar,
-            "model.picker" => Command::ToggleModelPicker,
-            "model.picker.open" => Command::SetModelPicker(true),
-            "model.picker.close" => Command::SetModelPicker(false),
+            // The Model card's popover in the Bot's settings, as these once opened its model list.
+            "model.picker" => Command::ToggleModelPicker(crate::state::PickerPlace::Card),
+            "model.picker.open" => Command::SetModelPicker(Some(crate::state::PickerPlace::Card)),
+            "model.picker.close" => Command::SetModelPicker(None),
             "avatar.editor" => Command::ToggleAvatarEditor,
             "avatar.editor.open" => Command::SetAvatarEditor(true),
             "avatar.editor.close" => Command::SetAvatarEditor(false),
@@ -12151,6 +12499,361 @@ mod tests {
             tree.find(&ids::reply_badge("m_2")).is_none(),
             "a status line has no bubble to wear a badge"
         );
+    }
+
+    /// The open Bot's picker as `AppState::model_pick` builds it: the Bot's row with `source`
+    /// as given (missing where `None`), the account on the server's keys, the gateway's two
+    /// routes and a plan that lists GPT-6 Luna with its fast twin.
+    fn a_pick(
+        source: Option<serde_json::Value>,
+        model: &str,
+        effort: &str,
+    ) -> crate::opengrok::ModelPick {
+        let mut row = serde_json::json!({
+            "id": "cw_1", "name": "Ada", "model": model, "effort": effort
+        });
+        if let Some(source) = source {
+            row["source"] = source;
+        }
+        let bot = serde_json::from_value(row).unwrap();
+        let catalogue = crate::opengrok::ModelCatalogue {
+            models: ["oag/cheap", "xai/grok-4.7"]
+                .iter()
+                .map(|id| crate::opengrok::ModelEntry {
+                    id: (*id).into(),
+                    source: Some("gateway".into()),
+                    via: None,
+                })
+                .collect(),
+            note: None,
+            local_proxy: None,
+        };
+        let account = crate::opengrok::InferenceSource {
+            local_model: Some("gpt-5-codex".into()),
+            ..kept_source(crate::opengrok::InferenceKind::Gateway, true)
+        };
+        crate::opengrok::bot_pick(&bot, Some(&account), &catalogue, |_| {
+            vec!["gpt-6-luna".to_string(), "gpt-6-luna--fast".to_string()]
+        })
+    }
+
+    /// The composer's chip is on the tree while a Bot is open, named as it reads and valued by
+    /// the model the next turn runs on, and a driver works its popover by the roads a person's
+    /// clicks take: ⚡, the slider by its words, the list and a model in it. Each control is
+    /// refused while it is not on screen, and the chip while the composer dictates.
+    #[test]
+    fn the_model_chip_opens_its_popover_and_a_driver_works_it() {
+        let mut host = host();
+        assert!(
+            host.snapshot().find(ids::MODEL_CHIP).is_none(),
+            "no Bot open"
+        );
+        assert!(host.click(ids::MODEL_CHIP).is_err());
+        host.model_pick = Some(a_pick(
+            Some(serde_json::json!("local_proxy")),
+            "gpt-6-luna",
+            "inherit",
+        ));
+        let tree = host.snapshot();
+        let chip = tree.find(ids::MODEL_CHIP).unwrap();
+        assert_eq!(
+            (chip.name.as_str(), chip.value.as_deref()),
+            ("GPT-6 Luna · Default", Some("gpt-6-luna"))
+        );
+        assert_eq!(chip.states, ["local_proxy"]);
+        assert!(!tree.find("model-pop").unwrap().visible);
+        assert!(tree.find("model-fast").is_none(), "shut, and no controls");
+        assert!(host.click("model-fast").is_err(), "the popover is shut");
+        host.click(ids::MODEL_CHIP).unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::ToggleModelPicker(PickerPlace::Composer))
+        ));
+
+        host.model_picker = Some(PickerPlace::Composer);
+        let tree = host.snapshot();
+        assert!(tree.find("model-pop").unwrap().visible);
+        assert!(
+            tree.find(ids::MODEL_CHIP)
+                .unwrap()
+                .states
+                .contains(&"expanded".to_string())
+        );
+        let fast = tree.find("model-fast").unwrap();
+        assert_eq!((fast.enabled, fast.checked), (true, Some(false)));
+        let effort = tree.find("model-effort").unwrap();
+        assert_eq!(
+            (effort.name.as_str(), effort.value.as_deref()),
+            ("Default", Some("inherit"))
+        );
+        assert_eq!(tree.find("model-open-list").unwrap().name, "GPT-6 Luna");
+        assert!(
+            !tree.find("model-reset").unwrap().enabled,
+            "Default already, and ⚡ off: nothing to put back"
+        );
+        assert!(!tree.find("model-list").unwrap().visible);
+        host.click("model-fast").unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::SetModelFast(true))
+        ));
+        host.dispatch(&Op::SetValue {
+            target: "model-effort".into(),
+            value: "max".into(),
+        })
+        .unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::SetModelEffort(word)) if word == "max"
+        ));
+        for refused in ["inherit", "none", "Ultra", "extreme"] {
+            assert!(
+                host.dispatch(&Op::SetValue {
+                    target: "model-effort".into(),
+                    value: refused.into(),
+                })
+                .is_err(),
+                "{refused}"
+            );
+        }
+        assert!(
+            host.click("model-effort").is_err(),
+            "a slider is set, not clicked"
+        );
+        assert!(host.click("model-reset").is_err(), "nothing to put back");
+        assert!(
+            host.click("model-row-local_proxy-gpt-6-luna").is_err(),
+            "the list is not showing"
+        );
+        host.click("model-open-list").unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::ToggleModelList)
+        ));
+
+        host.model_list_open = true;
+        let tree = host.snapshot();
+        let list = tree.find("model-list").unwrap();
+        assert!(list.visible);
+        assert_eq!(list.value.as_deref(), Some("3"));
+        let rows: Vec<(&str, &str, &[String])> = list
+            .children
+            .iter()
+            .map(|row| (row.id.as_str(), row.name.as_str(), row.states.as_slice()))
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                (
+                    "model-row-local_proxy-gpt-6-luna",
+                    "GPT-6 Luna",
+                    &["selected".to_string(), "fast".to_string()][..]
+                ),
+                ("model-row-gateway-oag/cheap", "Cheap (auto)", &[][..]),
+                ("model-row-gateway-xai/grok-4.7", "Grok 4.7", &[][..]),
+            ]
+        );
+        assert!(
+            tree.find("model-fast").is_none(),
+            "the list has the controls' place"
+        );
+        assert!(host.click("model-fast").is_err());
+        host.click("model-row-gateway-xai/grok-4.7").unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::PickModel { source: crate::opengrok::InferenceKind::Gateway, base_id })
+                if base_id == "xai/grok-4.7"
+        ));
+        assert!(
+            host.click("model-row-gateway-xai/grok-4.6@sub").is_err(),
+            "not a model the list offers"
+        );
+        assert!(host.click("model-row-local_proxy-oag/cheap").is_err());
+
+        // While the composer dictates, the chip gives its place to the dictation's buttons.
+        host.composer_dictating = true;
+        assert!(host.snapshot().find(ids::MODEL_CHIP).is_none());
+        assert!(host.click(ids::MODEL_CHIP).is_err());
+    }
+
+    /// ⚡ is dead where the list holds no fast version of the model, and says why: on the tree as
+    /// its value, and as the refusal of a driver's click. ↺ puts back what there is to put back.
+    #[test]
+    fn model_fast_refuses_with_its_reason_where_there_is_no_twin() {
+        let mut host = host();
+        host.model_pick = Some(a_pick(
+            Some(serde_json::json!("gateway")),
+            "xai/grok-4.7",
+            "high",
+        ));
+        host.model_picker = Some(PickerPlace::Composer);
+        let tree = host.snapshot();
+        let fast = tree.find("model-fast").unwrap();
+        assert!(!fast.enabled);
+        assert_eq!(fast.value.as_deref(), Some(crate::opengrok::FAST_NO_TWIN));
+        let refused = host.click("model-fast").unwrap_err();
+        assert!(refused.contains(crate::opengrok::FAST_NO_TWIN), "{refused}");
+        assert!(host.take_command().is_none());
+        assert!(tree.find("model-reset").unwrap().enabled);
+        host.click("model-reset").unwrap();
+        assert!(matches!(host.take_command(), Some(Command::ResetModelPick)));
+    }
+
+    /// The Model card in the Bot's settings is the chip's twin: the same words and values, and
+    /// every part of its popover under `agent-`. It is worked only while the settings are open,
+    /// and a part of one popover is not a part of the other.
+    #[test]
+    fn the_model_card_is_the_chips_twin_under_agent() {
+        let mut host = host();
+        host.model_pick = Some(a_pick(
+            Some(serde_json::json!("local_proxy")),
+            "gpt-6-luna--fast",
+            "xhigh",
+        ));
+        let tree = host.snapshot();
+        let (chip, card) = (
+            tree.find(ids::MODEL_CHIP).unwrap(),
+            tree.find(ids::AGENT_MODEL_CARD).unwrap(),
+        );
+        assert_eq!(card.name, "GPT-6 Luna · Extra ⚡");
+        assert_eq!(
+            (&card.name, &card.value, &card.states),
+            (&chip.name, &chip.value, &chip.states)
+        );
+        assert_eq!(chip.states, ["local_proxy", "fast"]);
+        assert!(
+            host.click(ids::AGENT_MODEL_CARD).is_err(),
+            "settings closed"
+        );
+        host.agent_settings_open = true;
+        host.click(ids::AGENT_MODEL_CARD).unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::ToggleModelPicker(PickerPlace::Card))
+        ));
+        host.model_picker = Some(PickerPlace::Card);
+        let tree = host.snapshot();
+        assert!(tree.find("agent-model-pop").unwrap().visible);
+        assert!(
+            !tree.find("model-pop").unwrap().visible,
+            "the chip's is shut"
+        );
+        assert_eq!(tree.find("agent-model-fast").unwrap().checked, Some(true));
+        assert!(
+            host.click("model-fast").is_err(),
+            "the chip's popover is shut"
+        );
+        host.click("agent-model-fast").unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::SetModelFast(false))
+        ));
+        host.dispatch(&Op::SetValue {
+            target: "agent-model-effort".into(),
+            value: "low".into(),
+        })
+        .unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::SetModelEffort(word)) if word == "low"
+        ));
+        host.model_list_open = true;
+        host.click("agent-model-row-gateway-oag/cheap").unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::PickModel { base_id, .. }) if base_id == "oag/cheap"
+        ));
+        assert!(
+            host.click("agent-model-chip").is_err(),
+            "the card is agent-model-card"
+        );
+    }
+
+    /// A server whose rows carry no `source` keeps no door per Bot: the list offers no plan
+    /// models for the Bot, and while the account is on the plan names its plan model, which
+    /// answers for every Bot there, as a line and not a row; ⚡ is dead and says why.
+    #[test]
+    fn a_server_without_per_bot_doors_lists_no_plan_rows_for_a_bot() {
+        let mut host = host();
+        let bot = serde_json::from_value(serde_json::json!({
+            "id": "cw_1", "name": "Ada", "model": "oag/cheap", "effort": "medium"
+        }))
+        .unwrap();
+        let catalogue = crate::opengrok::ModelCatalogue {
+            models: vec![crate::opengrok::ModelEntry {
+                id: "oag/cheap".into(),
+                source: Some("gateway".into()),
+                via: None,
+            }],
+            note: Some("the gateway could not be reached: …".into()),
+            local_proxy: None,
+        };
+        let on_plan = crate::opengrok::InferenceSource {
+            local_model: Some("gpt-5-codex".into()),
+            ..kept_source(crate::opengrok::InferenceKind::LocalProxy, true)
+        };
+        host.model_pick = Some(crate::opengrok::bot_pick(
+            &bot,
+            Some(&on_plan),
+            &catalogue,
+            |_| vec!["gpt-6-luna".to_string()],
+        ));
+        host.model_note = catalogue.note.clone();
+        host.model_picker = Some(PickerPlace::Composer);
+        let tree = host.snapshot();
+        assert_eq!(
+            tree.find(ids::MODEL_CHIP).unwrap().name,
+            "GPT-5 Codex · Medium"
+        );
+        assert_eq!(
+            tree.find("model-fast").unwrap().value.as_deref(),
+            Some(crate::opengrok::FAST_ACCOUNT_PLAN)
+        );
+        host.model_list_open = true;
+        let tree = host.snapshot();
+        let list = tree.find("model-list").unwrap();
+        let ids_in_list: Vec<&str> = list.children.iter().map(|node| node.id.as_str()).collect();
+        assert_eq!(
+            ids_in_list,
+            ["model-plan", "model-row-gateway-oag/cheap", "model-note"]
+        );
+        assert_eq!(
+            tree.find("model-plan").map(|node| node.name.as_str()),
+            Some("GPT-5 Codex")
+        );
+        assert!(host.click("model-plan").is_err(), "a line, not a row");
+    }
+
+    /// From the app: the chip and the card are the open Bot's picker, and the chip leaves the
+    /// tree while the composer dictates.
+    #[test]
+    fn the_picker_on_the_tree_is_the_open_bots() {
+        let mut state = AppState::new();
+        state.auth_status = crate::state::AuthStatus::SignedIn;
+        state.account = Some(
+            serde_json::from_value(serde_json::json!({ "id": "acct_1", "email": "a@b.c" }))
+                .unwrap(),
+        );
+        state.coworkers = vec![
+            serde_json::from_value(serde_json::json!({
+                "id": "cw_1", "name": "Ada", "model": "oag/cheap", "effort": "low",
+                "source": "gateway"
+            }))
+            .unwrap(),
+        ];
+        let tree = NativeChatHost::from_app(&state).snapshot();
+        assert!(tree.find(ids::MODEL_CHIP).is_none(), "no Bot open");
+        state.active_coworker_id = Some("cw_1".into());
+        let tree = NativeChatHost::from_app(&state).snapshot();
+        assert_eq!(
+            tree.find(ids::MODEL_CHIP).map(|node| node.name.as_str()),
+            Some("Cheap (auto) · Light")
+        );
+        assert!(tree.find(ids::AGENT_MODEL_CARD).is_some());
+        state.composer_dictating = true;
+        let tree = NativeChatHost::from_app(&state).snapshot();
+        assert!(tree.find(ids::MODEL_CHIP).is_none());
+        assert!(tree.find(ids::AGENT_MODEL_CARD).is_some(), "the card stays");
     }
 
     /// A bot's skills as the server gives them (opengrok-server#270): the owner's `triage`
