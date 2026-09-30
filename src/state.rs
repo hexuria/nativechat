@@ -15407,22 +15407,17 @@ impl AppState {
         let cancel = Arc::new(AtomicBool::new(false));
         self.local_exec_cancel = Some(cancel.clone());
         // Each credential local-exec enrols this Mac with, for the relay to follow: a relay the
-        // server turned the old token away from starts again with the new one.
+        // server turned the old token away from starts again with the new one. This app follows
+        // it too, for the id it knows this Mac by ([`Self::follow_enrolment`]).
         let (enrolled, enrolment) = tokio::sync::watch::channel(None);
-        self.local_exec_enrolment = Some(enrolment);
-        cx.spawn(async move |this, cx| {
+        self.local_exec_enrolment = Some(enrolment.clone());
+        self.follow_enrolment(enrolment, cx);
+        cx.spawn(async move |_, _| {
             match enrol_this_machine(&client, &config.data_dir).await {
+                // What follows the enrolment takes it from here: this Mac's id, its computers,
+                // and the relay, which opens its stream with the credential held here.
                 Ok(machine) => {
-                    let machine_id = machine.machine_id().to_string();
-                    // Held before the relay is asked for, which opens its stream with it.
                     enrolled.send_replace(Some(machine));
-                    let _ = this.update(cx, |state, cx| {
-                        state.local_exec_machine_id = Some(machine_id);
-                        state.refresh_computers(cx);
-                        // Enrolled: Answer with this Mac can start, if it is switched on.
-                        state.ensure_relay(cx);
-                        cx.notify();
-                    });
                 }
                 Err(error) => {
                     eprintln!("NativeChat local-exec: {error}");
@@ -15431,6 +15426,55 @@ impl AppState {
             serve_local_exec(client, config.data_dir, cancel, enrolled).await;
         })
         .detach();
+    }
+
+    /// Follow local-exec's enrolment for as long as it is the one local-exec runs with: this
+    /// Mac's id, the computers read with it, and the relay, which a Mac enrolled for the first
+    /// time may start. Local-exec enrols this Mac again when the server turns its token away, and
+    /// may come back as another machine. The relay follows the new credential by itself, and the
+    /// id here has to as well: one left at the first enrolment would read the relay the server
+    /// says the new machine holds as another Mac's, under this Mac's own name, and keep a card's
+    /// rule for a machine this Mac no longer is.
+    fn follow_enrolment(&mut self, mut enrolment: Enrolment, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            while enrolment.changed().await.is_ok() {
+                let following = this
+                    .update(cx, |state, cx| {
+                        let moved = state.note_enrolment(&enrolment);
+                        if moved == Some(true) {
+                            state.refresh_computers(cx);
+                            // Enrolled: Answer with this Mac can start, if it is switched on.
+                            state.ensure_relay(cx);
+                            cx.notify();
+                        }
+                        moved.is_some()
+                    })
+                    .unwrap_or(false);
+                if !following {
+                    return;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// This Mac's id, from the credential local-exec holds now: `None` once `enrolment` is not the
+    /// one local-exec runs with (stopped, or started again since), and otherwise whether the id
+    /// moved, at the first enrolment or at one that came back as another machine.
+    fn note_enrolment(&mut self, enrolment: &Enrolment) -> Option<bool> {
+        let held = self
+            .local_exec_enrolment
+            .as_ref()
+            .filter(|held| held.same_channel(enrolment))?;
+        let newest = held
+            .borrow()
+            .as_ref()
+            .map(|machine| machine.machine_id().to_string());
+        if newest.is_none() || newest == self.local_exec_machine_id {
+            return Some(false);
+        }
+        self.local_exec_machine_id = newest;
+        Some(true)
     }
 
     fn stop_local_exec(&mut self) {
@@ -33982,6 +34026,69 @@ mod tests {
             }),
         );
         assert_eq!(state.relay_line(), RelayLine::NotConnected { why: None });
+    }
+
+    /// Local-exec enrols this Mac again when the server turns its token away, and may come back
+    /// as another machine. The id this app knows this Mac by follows the newest enrolment, as the
+    /// relay does, so the relay the server says the new machine holds is this Mac's own, and not
+    /// another Mac's under this Mac's own name. The same credential again moves nothing, and nor
+    /// does the enrolment of a local-exec that is no longer the one running.
+    #[test]
+    fn this_macs_id_follows_its_newest_enrolment() {
+        use super::RelayLine;
+        use crate::opengrok::{MachineCredential, RelayRead, RelayReport, RelayStatus};
+        let mut state = signed_in_state();
+        let (enrolled, enrolment) = tokio::sync::watch::channel(None);
+        state.local_exec_enrolment = Some(enrolment.clone());
+        assert_eq!(state.note_enrolment(&enrolment), Some(false), "none yet");
+        assert!(!state.relay_enrolled());
+        enrolled.send_replace(Some(MachineCredential::new("mac_1", "tok_1")));
+        assert_eq!(state.note_enrolment(&enrolment), Some(true));
+        assert_eq!(state.local_exec_machine_id.as_deref(), Some("mac_1"));
+        assert!(state.relay_enrolled());
+        assert_eq!(
+            state.note_enrolment(&enrolment),
+            Some(false),
+            "the same machine again"
+        );
+
+        // The server turned the token away and local-exec enrolled this Mac again, as a new
+        // machine: the relay opens its stream again with it, and the server says it holds it.
+        enrolled.send_replace(Some(MachineCredential::new("mac_2", "tok_2")));
+        read_as(
+            &mut state,
+            InferenceSource {
+                via: Some("loopback".into()),
+                relay: Some(RelayRead {
+                    connected: true,
+                    machine_id: Some("mac_2".into()),
+                    machine_label: Some("NativeChat on this Mac".into()),
+                    local_model: None,
+                }),
+                ..kept(InferenceKind::Gateway, None)
+            },
+        );
+        state.relay_mac.report = Some(RelayReport {
+            status: RelayStatus::Connecting,
+            in_flight: 0,
+            halted: false,
+        });
+        assert_eq!(state.note_enrolment(&enrolment), Some(true));
+        assert_eq!(state.local_exec_machine_id.as_deref(), Some("mac_2"));
+        assert_eq!(
+            state.relay_line(),
+            RelayLine::Connecting,
+            "this Mac's own relay, not another Mac's"
+        );
+
+        // A local-exec that is no longer the one running: signed out and in again since.
+        let (stale, old) = tokio::sync::watch::channel(None);
+        stale.send_replace(Some(MachineCredential::new("mac_0", "tok_0")));
+        assert_eq!(state.note_enrolment(&old), None);
+        assert_eq!(state.local_exec_machine_id.as_deref(), Some("mac_2"));
+        state.stop_local_exec();
+        assert_eq!(state.note_enrolment(&enrolment), None, "stopped");
+        assert_eq!(state.local_exec_machine_id, None);
     }
 
     /// What a Save would send now, as JSON, without sending it.
