@@ -12017,9 +12017,9 @@ impl AppState {
         ))
     }
 
-    /// The server keeps a door per Bot: some row of the roster carries `source` (the contract
-    /// proposed 2026-09-30, Part A, not yet recorded). Settings → Reply source is then the
-    /// default for the Bots that have picked none, and says so.
+    /// The server keeps a door per Bot: some row of the roster carries `source` (opengrok-server
+    /// `bot-model-source`, confirmed 2026-09-30, not yet recorded). Settings → Reply source is
+    /// then the default for the Bots that have picked none, and says so.
     pub fn server_keeps_bot_doors(&self) -> bool {
         self.coworkers
             .iter()

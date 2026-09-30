@@ -7246,10 +7246,10 @@ mod tests {
     }
 
     /// A change in the model picker goes as one PATCH carrying the Bot's door, its model and its
-    /// effort, each only when it changed (the contract proposed 2026-09-30, Part A, not yet
-    /// recorded), and the answer is the row as the server now keeps it, door and all. A Bot left
-    /// on the person's plan with a model the allowlist does not take is refused with a 400 in the
-    /// server's words, which is what the person is shown.
+    /// effort, each only when it changed (opengrok-server `bot-model-source`, confirmed
+    /// 2026-09-30, not yet recorded), and the answer is the row as the server now keeps it, door
+    /// and all. A Bot left on the person's plan with a model the allowlist does not take is
+    /// refused with a 400 in the server's words, which is what the person is shown.
     #[tokio::test]
     async fn a_picks_patch_carries_the_door_the_model_and_the_effort() {
         use crate::opengrok::{CoworkerSource, InferenceKind};

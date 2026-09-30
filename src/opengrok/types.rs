@@ -89,12 +89,17 @@ pub struct Coworker {
 
 /// Which door a Bot's replies go through, as its row says it: `"source": "gateway" |
 /// "local_proxy" | null`, and `PATCH /coworkers/{id}` takes the same word (opengrok-server
-/// contract proposed 2026-09-30 (Part A), not yet recorded). A server with per-Bot doors writes
-/// the key on every row: `null` is a Bot that follows the account's setting, Settings → Reply
-/// source. A server from before it writes no key at all, and every Bot there goes where the
-/// account's setting says, answering on the person's plan with the account's plan model whatever
-/// the Bot is pinned to. The two are told apart here because the picker offers a Bot its own plan
-/// model only where the server would keep one.
+/// `bot-model-source`, confirmed 2026-09-30, not yet recorded: `coworker_row` in
+/// `crates/opengrok-server/src/agui/routes.rs`). A server with per-Bot doors writes the key, a
+/// word or `null` and never left out, on every row it answers with: the roster's
+/// (`GET /coworkers`), a hire's (`POST /coworkers`) and a PATCH's. It mounts no
+/// `GET /coworkers/{id}`, so those three are where a Bot's door is read. `null` is a Bot that
+/// follows the account's setting, Settings → Reply source, and on the person's plan it answers
+/// with the account's plan model whatever it is pinned to: only a Bot whose own door is
+/// `local_proxy` is answered there with its pin. A server from before it writes no key at all,
+/// and every Bot there goes where the account's setting says, answering on the person's plan with
+/// the account's plan model whatever the Bot is pinned to. The two are told apart here because
+/// the picker offers a Bot its own plan model only where the server would keep one.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum CoworkerSource {
     /// The row carries no `source`: a server from before per-Bot doors.
@@ -180,10 +185,12 @@ pub struct CoworkerPatch {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
     /// The Bot's own door, sent with the model the model picker put it on, and only to a server
-    /// whose rows carry `source` (opengrok-server contract proposed 2026-09-30 (Part A), not yet
-    /// recorded): absent leaves the door alone. The server refuses with a 400 in its own words a
-    /// patch that leaves the Bot on `local_proxy` with a model its subscription allowlist does not
-    /// take, the rule it holds the account's plan model to, and changes nothing.
+    /// whose rows carry `source` (opengrok-server `bot-model-source`, confirmed 2026-09-30, not
+    /// yet recorded): absent leaves the door alone. The server refuses with a 400 in its own words
+    /// a patch that leaves the Bot on `local_proxy` with a model its subscription allowlist does
+    /// not take, the rule it holds the account's plan model to, and a `source` that is neither of
+    /// its two words (`source must be "gateway" or "local_proxy"`), which this app never sends,
+    /// sending only an [`InferenceKind`](super::InferenceKind). Either way it writes nothing.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source: Option<super::InferenceKind>,
 }
@@ -587,8 +594,8 @@ mod tests {
 
     /// Every key a coworker patch can carry is one the server's patch route reads
     /// (opengrok-server `agui/routes.rs`: name, model, role, visibility, hiddenFromSidebar, and
-    /// title/avatarShape/avatarColor; `effort` from opengrok-server#271; `source` from the
-    /// contract proposed 2026-09-30 (Part A), not yet recorded). A key it reads nowhere is a
+    /// title/avatarShape/avatarColor; `effort` from opengrok-server#271; `source` from
+    /// opengrok-server `bot-model-source`, confirmed 2026-09-30). A key it reads nowhere is a
     /// setting that looks saved and is not, and a patch of only that is refused.
     #[test]
     fn a_coworker_patch_names_only_what_the_server_keeps() {
@@ -632,8 +639,8 @@ mod tests {
 
     /// A row's `source` says three different things by being missing, `null` or a word: a server
     /// from before per-Bot doors, a Bot that follows the account's door, and the Bot's own door
-    /// (the contract proposed 2026-09-30, Part A, not yet recorded). A word this app has not heard
-    /// of is kept as sent, and no row's door ever fails the roster.
+    /// (opengrok-server `bot-model-source`, confirmed 2026-09-30, not yet recorded). A word this
+    /// app has not heard of is kept as sent, and no row's door ever fails the roster.
     #[test]
     fn a_rows_door_is_missing_null_or_its_word() {
         use super::super::InferenceKind;
