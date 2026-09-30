@@ -58,16 +58,17 @@ pub struct PendingUserMessage {
     /// `WriteBody` and `consume_for_turn` in `crates/opengrok-server/src/agui/pending.rs`, the
     /// column in `crates/opengrok-store/src/pending.rs`), whose recording the ledger reads. With
     /// the Mac relay a send may name its way to the plan too, and the row keeps the door as
-    /// `{"kind", "via"}` (opengrok-server #292, contract agreed 2026-09-30, not yet recorded).
-    /// Kept as sent, the bare word or the object, and read through [`Self::inference_source`], so
-    /// one row's word never fails the queue.
+    /// `{"kind", "via"}` (opengrok-server #292: PR #298, branch mac-relay c7b57e9, recorded at
+    /// c3f9521, not yet on main). Kept as sent, the bare word or the object, and read through
+    /// [`Self::inference_source`], so one row's word never fails the queue.
     #[serde(default)]
     pub inference_source: Option<Value>,
     /// Why the server is holding this send rather than letting it go: `relay_offline` while the
     /// turn it names goes through the person's Mac and no Mac holds the relay (opengrok-server
-    /// #292, contract agreed 2026-09-30, not yet recorded). Absent otherwise. Kept as sent and
-    /// read through [`Self::waits_for_mac`], so a word in a shape this app does not expect never
-    /// fails the queue.
+    /// #292: `Held` in `crates/opengrok-server/src/agui/pending.rs`, PR #298, branch mac-relay
+    /// c7b57e9, recorded at c3f9521, not yet on main), on a snapshot and on the row a held fire
+    /// is answered with. Absent otherwise. Kept as sent and read through [`Self::waits_for_mac`],
+    /// so a word in a shape this app does not expect never fails the queue.
     #[serde(default)]
     pub held_for: Option<Value>,
 }
@@ -246,7 +247,7 @@ pub struct PendingWrite {
     /// The door the send was queued with, as the composer's chip showed it: the row's
     /// `inferenceSource` (opengrok-server #294: `WriteBody.inference_source` in
     /// `crates/opengrok-server/src/agui/pending.rs`), the bare word or, naming a way to the plan,
-    /// `{"kind", "via"}` (#292, contract agreed 2026-09-30, not yet recorded). An edit
+    /// `{"kind", "via"}` (#292: PR #298 at c7b57e9, recorded at c3f9521, not yet on main). An edit
     /// carries it too, so the row matches the hold whichever machine queued it. Left out when no
     /// chip was drawn: the account's setting decides then, and an edit that leaves it out keeps
     /// the row's.
@@ -523,9 +524,9 @@ mod tests {
         assert_eq!(live, vec![Some(TurnSource::plan(None)), None]);
     }
 
-    /// A row the server holds for the person's Mac says so (`heldFor: "relay_offline"`, in the
-    /// shape agreed for opengrok-server #292, not yet recorded); any other row, and any other
-    /// word, is not waiting for it.
+    /// A row the server holds for the person's Mac says so (`heldFor: "relay_offline"`, as
+    /// opengrok-server PR #298 records it); any other row, and any other word, is not waiting for
+    /// it.
     #[test]
     fn a_row_held_for_the_mac_says_so() {
         let row = |held_for: Option<Value>| -> PendingUserMessage {

@@ -18,10 +18,11 @@
 //! `crates/opengrok-harness/src/local_proxy.rs`, and the door's words and the models a
 //! subscription may answer in `crates/opengrok-core/src/inference.rs`. The conformance ledger
 //! reads the two routes and the CUSTOM frame against the server's recording, vendored in
-//! `fixtures/wire/` from its main at e55a8c8 (pin f56bbde, after #296).
+//! `fixtures/wire/` from opengrok-server PR #298, branch mac-relay c7b57e9, recorded at c3f9521,
+//! not yet on main.
 //!
-//! The Mac relay (opengrok-server #292, contract agreed 2026-09-30, not yet recorded) lifts the
-//! one-machine limit: the server sends a turn's model calls down a stream to the person's Mac,
+//! The Mac relay (opengrok-server #292, built in that PR, whose recording holds its words) lifts
+//! the one-machine limit: the server sends a turn's model calls down a stream to the person's Mac,
 //! whose background helper asks its own opencodex and streams the answer back
 //! (`super::relay`). The window still never calls a model. On the wire it is a second word
 //! beside the kind, the way the plan is reached ([`Via`]): the account keeps one, a turn and a
@@ -92,12 +93,13 @@ impl InferenceKind {
     }
 }
 
-/// The way the person's own plan is reached, in the server's words (opengrok-server #292,
-/// contract agreed 2026-09-30, not yet recorded): `loopback`, the server calling opencodex on its
-/// own machine as it always has; `mac`, the server sending each model call down the relay stream
-/// to the person's Mac, which asks its own opencodex. The contract's third word, `helper`, the
-/// server refuses until its #293, so it is offered nowhere here and reads like any word this app
-/// has not heard of: a way it cannot name, never mistaken for one of these two.
+/// The way the person's own plan is reached, in the server's words (opengrok-server #292: `Via`
+/// in `crates/opengrok-core/src/inference.rs`, PR #298, branch mac-relay c7b57e9, recorded at
+/// c3f9521, not yet on main): `loopback`, the server calling opencodex on its own machine as it
+/// always has; `mac`, the server sending each model call down the relay stream to the person's
+/// Mac, which asks its own opencodex. The contract's third word, `helper`, the server refuses
+/// until its #293, so it is offered nowhere here and reads like any word this app has not heard
+/// of: a way it cannot name, never mistaken for one of these two.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Via {
@@ -125,7 +127,8 @@ impl Via {
 
 /// The door one turn names in `forwardedProps.inferenceSource`, and that a queued send's row
 /// keeps as `inferenceSource`: the kind, and for the person's plan the way to it when this app
-/// names one (opengrok-server #292, contract agreed 2026-09-30, not yet recorded).
+/// names one (opengrok-server #292: `TurnSource` in `crates/opengrok-core/src/inference.rs`,
+/// PR #298, branch mac-relay c7b57e9, recorded at c3f9521, not yet on main).
 ///
 /// It goes as every turn went before the relay, the kind's bare word, when it names no way, and
 /// as `{"kind", "via"}` when it does. A server from before the relay takes only the bare word and
@@ -222,13 +225,15 @@ pub struct InferenceSource {
     /// The server holds a key for the proxy. The key itself never comes back.
     pub has_api_key: bool,
     /// The account's own way to the person's plan, the word as sent: `loopback` until one is saved
-    /// (opengrok-server #292, contract agreed 2026-09-30, not yet recorded). Absent from a server
-    /// before the relay, which has no other. Kept as the word and read through
+    /// (opengrok-server #292: `described` in `crates/opengrok-harness/src/local_proxy.rs`, PR
+    /// #298, branch mac-relay c7b57e9, recorded at c3f9521, not yet on main). Absent from a
+    /// server before the relay, which has no other. Kept as the word and read through
     /// [`Self::default_via`], so a way this app cannot name never fails the read.
     #[serde(default)]
     pub via: Option<String>,
-    /// Where the Mac relay stands, from a server that has one (the same contract); absent from a
-    /// server before it, which is how this app knows not to offer it.
+    /// Where the Mac relay stands, from a server that has one, which sends it on every read, nulls
+    /// and all when no Mac holds it (the same PR); absent from a server before it, which is how
+    /// this app knows not to offer it.
     #[serde(default)]
     pub relay: Option<RelayRead>,
 }
@@ -268,10 +273,11 @@ impl InferenceSource {
 }
 
 /// Where the Mac relay stands, as the account's setting says it: `{"connected", "machineId",
-/// "machineLabel", "localModel"}` (opengrok-server #292, contract agreed 2026-09-30, not yet
-/// recorded). The Mac answering is the account's enrolled machine that most recently opened the
-/// relay stream; `connected` is whether one holds it now. `connected` is always there, so a
-/// relay without it is refused rather than read as no Mac.
+/// "machineLabel", "localModel"}` (opengrok-server #292: `described` in
+/// `crates/opengrok-harness/src/local_proxy.rs`, PR #298, branch mac-relay c7b57e9, recorded at
+/// c3f9521, not yet on main). The Mac answering is the account's enrolled machine that most
+/// recently opened the relay stream; `connected` is whether one holds it now. `connected` is
+/// always there, so a relay without it is refused rather than read as no Mac.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RelayRead {
@@ -314,7 +320,9 @@ pub struct InferenceSourceUpdate {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub api_key: Option<Option<ProxyKey>>,
     /// The account's way to the plan, sent only when the page changed it, and only to a server
-    /// that knows the relay (opengrok-server #292, contract agreed 2026-09-30, not yet recorded).
+    /// that knows the relay (opengrok-server #292: `apply` in
+    /// `crates/opengrok-harness/src/local_proxy.rs`, PR #298, branch mac-relay c7b57e9, recorded
+    /// at c3f9521, not yet on main), which keeps it as the account's way whatever the kind.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub via: Option<Via>,
     /// The relay's half, by the same rules: absent keeps, `null` clears.
@@ -368,8 +376,8 @@ impl std::fmt::Debug for ProxyKey {
 pub struct ReplySource {
     pub kind: InferenceKind,
     /// The way the person's plan was reached, when the frame named one this app knows: `mac` is
-    /// a reply the person's Mac answered (opengrok-server #292, contract agreed 2026-09-30, not
-    /// yet recorded). Never set on the gateway's.
+    /// a reply the person's Mac answered (opengrok-server #292, PR #298, branch mac-relay
+    /// c7b57e9, recorded at c3f9521, not yet on main). Never set on the gateway's.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub via: Option<Via>,
     /// The model that answered, when the server named one.
@@ -422,7 +430,8 @@ impl ReplySource {
 }
 
 /// Why a turn through the person's Mac ended, as the relay's `RUN_ERROR` says beside its sentence
-/// in `code` (opengrok-server #292, contract agreed 2026-09-30, not yet recorded): no Mac held the
+/// in `code` (opengrok-server #292: `ModelError::Relay` in `crates/opengrok-harness/src/relay.rs`,
+/// PR #298, branch mac-relay c7b57e9, recorded at c3f9521, not yet on main): no Mac held the
 /// relay, the Mac said nothing for the server's sixty seconds (before the first byte, or between
 /// two), or the Mac answered with a failure. The sentence is what the person reads; the code is
 /// what offers the turn again on the server's keys.
@@ -452,15 +461,16 @@ impl RelayErrorCode {
 }
 
 /// `heldFor` on a queued send's row while the server holds it for the person's Mac: the turn it
-/// names goes through the Mac and no Mac holds the relay (opengrok-server #292, contract agreed
-/// 2026-09-30, not yet recorded). Absent otherwise.
+/// names goes through the Mac and no Mac holds the relay (opengrok-server #292: `HELD_FOR` in
+/// `crates/opengrok-server/src/agui/pending.rs`, PR #298, branch mac-relay c7b57e9, recorded at
+/// c3f9521, not yet on main). Absent otherwise.
 pub const HELD_FOR_RELAY_OFFLINE: &str = "relay_offline";
 
 /// Whether "My subscription" may be pointed at a model, by the server's own rule, so the picker
 /// never offers what a Save would be refused for, even should a list ever carry one (a list held
 /// from before, or a server that tags a row `local_proxy` without asking): `subscription_model`
-/// in opengrok-server's `crates/opengrok-core/src/inference.rs`, anchored since #296, at the
-/// vendored pin f56bbde.
+/// in opengrok-server's `crates/opengrok-core/src/inference.rs`, anchored since #296 and unchanged
+/// at the vendored pin c3f9521 (PR #298, not yet on main).
 ///
 /// An allowlist, not a denylist: an id it does not recognise is refused, so a provider nobody
 /// has looked at is not offered by being new. With an `openai/` or `xai/` prefix and the `--fast`
