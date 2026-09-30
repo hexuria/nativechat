@@ -651,13 +651,24 @@ impl MessageInput {
                 }
             }
         }
+        self.tell_state_dictating(cx);
         cx.notify();
+    }
+
+    /// The reply-source chip gives its place to the dictation's buttons, and the state is told:
+    /// a chip that is not drawn is not in a driver's tree, and a turn sent meanwhile names no
+    /// door (`AppState::composer_turn_source`).
+    fn tell_state_dictating(&self, cx: &mut Context<Self>) {
+        let dictating = self.voice_mode;
+        self.state
+            .update(cx, |state, cx| state.set_composer_dictating(dictating, cx));
     }
 
     fn confirm_voice_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.voice_mode = false;
         self.audio_input = None;
         self.voice_wave = None;
+        self.tell_state_dictating(cx);
         cx.notify();
 
         // Mock transcription

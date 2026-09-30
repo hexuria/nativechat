@@ -911,11 +911,14 @@ impl OpenGrokClient {
     /// server drains that row atomically before the harness starts so two machines cannot both
     /// post it. Absent, a last user-message id that matches `clientMessageId` still drains.
     ///
-    /// `inference_source` is the door the person picked for this turn with the composer's chip,
-    /// when it is not the account's own: it goes as `forwardedProps.inferenceSource` and wins
-    /// over the account's setting for this turn only (the inference-source contract agreed with
-    /// open-ai-gateway and opengrok-server, 2026-09-30, server PR pending). Absent, the account's
-    /// setting decides, and the turn is the one sent before reply sources existed.
+    /// `inference_source` is the door the composer's chip shows for this turn, the account's own
+    /// included, or for a held send the door its chip showed when it was queued: it goes as
+    /// `forwardedProps.inferenceSource` and wins over the account's setting for this turn only,
+    /// so the turn goes where the chip said even when the setting has moved since it was read
+    /// (the inference-source contract agreed with open-ai-gateway and opengrok-server,
+    /// 2026-09-30, server PR pending: `named` in `crates/opengrok-server/src/inference.rs`,
+    /// `route` in `crates/opengrok-harness/src/local_proxy.rs`). Absent, with no chip drawn,
+    /// the account's setting decides, and the turn is the one sent before reply sources existed.
     ///
     /// The run id is the caller's. The server keeps every frame a run emits under it and will
     /// hand the whole lot back from `GET /ag-ui/runs/{run_id}`, which is of no use whatever to a
@@ -5344,11 +5347,19 @@ mod tests {
         assert!(!error.is_signed_out());
     }
 
+    /// The queue's four routes as the v1 contract writes them. A send queued while the
+    /// composer's chip showed a door carries it (`inferenceSource`, agreed with opengrok-server
+    /// 2026-09-30, server PR pending), and the row the server answers with names it back.
     #[tokio::test]
     async fn enqueue_edit_cancel_and_list_pending_follow_the_v1_contract() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/ag-ui/threads/th_1/pending"))
+            .and(wiremock::matchers::body_partial_json(serde_json::json!({
+                "content": "later",
+                "clientMessageId": "msg_1",
+                "inferenceSource": "local_proxy"
+            })))
             .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
                 "v": 1,
                 "threadId": "th_1",
@@ -5358,7 +5369,8 @@ mod tests {
                     "threadId": "th_1",
                     "content": "later",
                     "clientMessageId": "msg_1",
-                    "status": "pending"
+                    "status": "pending",
+                    "inferenceSource": "local_proxy"
                 },
                 "event": {
                     "type": "CUSTOM",
@@ -5435,6 +5447,7 @@ mod tests {
                     None,
                     None,
                     None,
+                    Some(crate::opengrok::InferenceKind::LocalProxy),
                 ),
             )
             .await
@@ -5442,6 +5455,10 @@ mod tests {
         let created_row = created.row().expect("created row");
         assert_eq!(created_row.id, "pum_1");
         assert_eq!(created_row.bubble_id(), "msg_1");
+        assert_eq!(
+            created_row.inference_source(),
+            Some(crate::opengrok::InferenceKind::LocalProxy)
+        );
         assert_eq!(
             created.custom().map(|custom| custom.op),
             Some(crate::opengrok::PendingOp::Created)
@@ -5488,6 +5505,7 @@ mod tests {
                 "v": 1,
                 "content": "later",
                 "clientMessageId": "msg_1",
+                "inferenceSource": "local_proxy",
             })
         );
         let patch: Value = serde_json::from_slice(&requests[1].body).unwrap();
