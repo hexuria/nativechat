@@ -8,8 +8,8 @@
 //! key the person gave on this Mac, then posts opencodex's answer to
 //! `POST /inference-relay/responses/{requestId}` as it comes. The owner approved the rule this
 //! bends: this background half forwards model calls; the window still never calls a model. Every
-//! shape here is opengrok-server #292's, as built in opengrok-server PR #298, branch mac-relay
-//! 5359e34, recorded at 07a951b, not yet on main (`RelayFrame` in
+//! shape here is opengrok-server #292's, as built in opengrok-server main cad36fd (#303, after
+//! #298), pin 47a5d6b (`RelayFrame` in
 //! `crates/opengrok-wire/src/relay.rs`, the two routes in
 //! `crates/opengrok-server/src/inference.rs`), and the conformance ledger reads every recorded
 //! frame and answer with this code.
