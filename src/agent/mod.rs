@@ -231,11 +231,14 @@
 //! waits for; and the plan's controls are refused where the server is not on this Mac.
 //!
 //! `composer-reply-source` is the composer's chip, in the tree only while there is a choice of
-//! door and the composer is not dictating (label `Server` / `My plan`, value = the door the next
-//! turns go through, which each of them names; state `picked` while that is the person's pick
-//! and not the account's own door). Unlike the composer's panel and chips it is clicked, as a
-//! person clicks it: a click switches the door, which then goes with every turn until it is
-//! switched back, and is gone with a sign-out or a relaunch. `reply-source-{messageId}` is the
+//! door and the composer is not dictating (label as the chip reads: `Server` / `My plan` at the
+//! account's own door, `Server · this message` / `My plan · this message` while overridden;
+//! value = the door the next message goes through, which it names; state `override` while that
+//! is the person's pick for that message and not the account's own door). Unlike the composer's
+//! panel and chips it is clicked, as a person clicks it: a click switches the door for the next
+//! message only, and the chip is back at the account's door once that message is sent or held,
+//! when it is clicked back, and with a switch of Bot or thread, a sign-out or a relaunch; an Edit
+//! of a held send puts the door it was held with back on it. `reply-source-{messageId}` is the
 //! badge of each reply in the open thread that wears one, as the feed draws it (label `paid key`
 //! / `your plan`, value = the door), holding `reply-source-model-{messageId}` (label = the model
 //! the server named, which the badge shows on hover) when it named one. In the bot's settings,

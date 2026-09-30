@@ -1,7 +1,8 @@
 //! Where a Bot's replies are paid from: the server's paid keys, or the person's own subscription
 //! through opencodex, running on the same machine as the server. Three surfaces: Settings → Reply
-//! source, where the account's setting is changed; the composer's chip, which picks a door for the
-//! next turns; and the badge on each reply, which says which door it came through.
+//! source, where the account's setting is changed; the composer's chip, which starts at that
+//! setting and can pick the other door for the next message only; and the badge on each reply,
+//! which says which door it came through.
 //!
 //! Nothing here calls a model or keeps a key. The server keeps the setting, and when a turn goes
 //! through the person's plan it is the server that talks to opencodex. The words and element ids
@@ -154,7 +155,7 @@ pub(crate) fn badge_label(kind: InferenceKind) -> &'static str {
     }
 }
 
-/// What the composer's chip reads.
+/// The door as the composer's chip names it.
 pub(crate) fn chip_label(kind: InferenceKind) -> &'static str {
     match kind {
         InferenceKind::Gateway => "Server",
@@ -162,18 +163,43 @@ pub(crate) fn chip_label(kind: InferenceKind) -> &'static str {
     }
 }
 
-/// What the chip says on hover: where the next turn goes, and that it is the person's pick for
-/// their turns rather than the account's own door, which it stays until it is clicked back.
+/// After the door on the composer's chip while it is overridden: the pick is for the message
+/// being written, and the chip goes back to the account's door once it has gone.
+const THIS_MESSAGE: &str = "this message";
+
+/// What the composer's chip reads: the door, and while it is the person's pick rather than the
+/// account's own door, that it is for this message only. Without that the chip and Settings →
+/// Reply source read as two answers to one question.
+pub(crate) fn chip_text(chip: &TurnSourceChip) -> String {
+    let door = chip_label(chip.kind);
+    if chip.picked {
+        format!("{door} · {THIS_MESSAGE}")
+    } else {
+        door.to_string()
+    }
+}
+
+/// What the chip says on hover: where the next message goes, and whether that is the account's
+/// own door, as Settings → Reply source keeps it, or a pick for that message alone, with the
+/// account's door named, which is where the chip goes back to.
 pub(crate) fn chip_tooltip(chip: &TurnSourceChip) -> String {
     let door = match (chip.kind, chip.local_model.as_deref()) {
-        (InferenceKind::Gateway, _) => "Next replies: the server's paid keys".to_string(),
-        (InferenceKind::LocalProxy, Some(model)) => format!("Next replies: your plan, {model}"),
-        (InferenceKind::LocalProxy, None) => "Next replies: your plan".to_string(),
+        (InferenceKind::Gateway, _) => "the server's paid keys".to_string(),
+        (InferenceKind::LocalProxy, Some(model)) => format!("your plan, {model}"),
+        (InferenceKind::LocalProxy, None) => "your plan".to_string(),
     };
     if chip.picked {
-        format!("{door}, until you switch back. Click to switch.")
+        // There are two doors, so a pick is the one the account is not on.
+        let default = kind_label(chip.kind.other());
+        format!(
+            "Next message only: {door}. Settings → Reply source holds your default, \
+             {default}. Click to switch back."
+        )
     } else {
-        format!("{door}, as in Settings. Click to switch.")
+        format!(
+            "Next replies: {door}, as in Settings → Reply source. Click to switch for the next \
+             message only."
+        )
     }
 }
 
@@ -670,8 +696,10 @@ impl Render for ReplySourcePage {
     }
 }
 
-/// The composer's chip: which door the next turns go through, "Server" or "My plan". A click
-/// switches it; it stays as picked until it is clicked back, and is gone with a relaunch.
+/// The composer's chip: which door the next message goes through, "Server" or "My plan", at the
+/// account's own door as Settings → Reply source keeps it. A click picks the other door for
+/// that message only, and the chip says so ("Server · this message") on a muted tint of the
+/// theme's blue, until the message goes, the thread changes or it is clicked back.
 pub(crate) fn composer_chip(
     chip: &TurnSourceChip,
     app: Entity<AppState>,
@@ -679,6 +707,10 @@ pub(crate) fn composer_chip(
 ) -> impl IntoElement {
     let tooltip = chip_tooltip(chip);
     let secondary = theme.secondary;
+    // An override has to read at a glance as something other than the account's own door, so
+    // it wears the theme's blue, muted to a tint; its words keep the foreground colour, which a
+    // tint this light leaves readable in both modes.
+    let accent = theme.blue;
     div()
         .id(COMPOSER_CHIP)
         .flex_none()
@@ -688,18 +720,26 @@ pub(crate) fn composer_chip(
         .flex()
         .items_center()
         .border_1()
-        .border_color(theme.border)
-        .when(chip.picked, |this| this.bg(secondary))
         .text_xs()
-        .text_color(theme.secondary_foreground)
         .cursor_pointer()
-        .hover(move |style| style.bg(secondary))
+        .map(|this| {
+            if chip.picked {
+                this.border_color(accent.opacity(0.5))
+                    .bg(accent.opacity(0.12))
+                    .text_color(theme.foreground)
+                    .hover(move |style| style.bg(accent.opacity(0.2)))
+            } else {
+                this.border_color(theme.border)
+                    .text_color(theme.secondary_foreground)
+                    .hover(move |style| style.bg(secondary))
+            }
+        })
         .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
         .on_click(move |_, _, cx| {
             cx.stop_propagation();
             app.update(cx, |state, cx| state.toggle_turn_source(cx));
         })
-        .child(chip_label(chip.kind))
+        .child(chip_text(chip))
 }
 
 /// A reply's badge: "paid key" or "your plan", and the model on hover when the server named one.
@@ -732,8 +772,8 @@ mod tests {
     // Item by item rather than a glob: `use super::*` would drag in gpui_kit's own `test`.
     use super::{
         MODELS_MAY_BE_OLD, NO_MODELS, NO_MODELS_NOT_RUNNING, NO_MODELS_WITHOUT_ADDRESS,
-        badge_label, chip_label, chip_tooltip, health_line, health_word, kind_id, kind_label,
-        models_note,
+        badge_label, chip_label, chip_text, chip_tooltip, health_line, health_word, kind_id,
+        kind_label, models_note,
     };
     use crate::opengrok::InferenceKind;
     use crate::state::{ProxyHealth, TurnSourceChip};
@@ -759,27 +799,43 @@ mod tests {
         );
     }
 
-    /// The chip says where the next replies go, and whether that is the person's pick or the
-    /// account's own door.
+    /// The chip says where the next message goes, and whether that is the account's own door or
+    /// an override for that message alone, on its face and on hover, where the override names
+    /// the default Settings holds, which the chip goes back to.
     #[test]
-    fn the_chip_says_where_the_next_replies_go() {
+    fn the_chip_says_where_the_next_message_goes_and_when_it_overrides() {
         let plan = TurnSourceChip {
             kind: InferenceKind::LocalProxy,
             picked: true,
             local_model: Some("gpt-5-codex".into()),
         };
+        assert_eq!(chip_text(&plan), "My plan · this message");
         assert_eq!(
             chip_tooltip(&plan),
-            "Next replies: your plan, gpt-5-codex, until you switch back. Click to switch."
+            "Next message only: your plan, gpt-5-codex. Settings → Reply source holds your \
+             default, Server (paid keys). Click to switch back."
         );
         let server = TurnSourceChip {
             kind: InferenceKind::Gateway,
             picked: false,
             local_model: Some("gpt-5-codex".into()),
         };
+        assert_eq!(chip_text(&server), "Server");
         assert_eq!(
             chip_tooltip(&server),
-            "Next replies: the server's paid keys, as in Settings. Click to switch."
+            "Next replies: the server's paid keys, as in Settings → Reply source. Click to \
+             switch for the next message only."
+        );
+        // The owner's case on #155: Settings on My subscription, the chip clicked to Server.
+        let over = TurnSourceChip {
+            picked: true,
+            ..server
+        };
+        assert_eq!(chip_text(&over), "Server · this message");
+        assert_eq!(
+            chip_tooltip(&over),
+            "Next message only: the server's paid keys. Settings → Reply source holds your \
+             default, My subscription. Click to switch back."
         );
     }
 
