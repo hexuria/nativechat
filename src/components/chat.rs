@@ -13,6 +13,7 @@ use crate::components::message::{MessageBubble, TS_PEEK_MAX};
 use crate::components::persona::PersonaMark;
 use crate::components::save_login::render_save_login;
 use crate::components::steps::{RunLayout, RunRow, render_run_row};
+use crate::components::transcript_scroll::{TranscriptScroll, TranscriptScroller};
 use crate::components::user_form::{
     UserFormInputMap, UserFormTextareaMap, field_key, render_user_form,
 };
@@ -28,7 +29,6 @@ use crate::state::{
 use crate::tts_text::{looks_like_markdown, map_utf16_range_to_utf8};
 use gpui_kit::base::{Align, Placement, Positioner};
 use gpui_kit::component::input::{InputEvent, InputState, TextareaState};
-use gpui_kit::component::message_scroller::{MessageScroller, MessageScrollerState};
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{ActiveTheme, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder;
@@ -418,6 +418,80 @@ fn changed_rows(old: &[ChatRow], new: &[ChatRow]) -> (std::ops::Range<usize>, us
     (head..old.len() - tail, new.len() - tail - head)
 }
 
+/// Whether the rows now end on a message of the person's own that the old rows did not have,
+/// which is what a send looks like from here: the message goes on the end of the thread at
+/// once, whether it went to the coworker then, waits behind a running turn, or steered a card.
+fn just_sent(old: &[ChatRow], new: &[ChatRow]) -> bool {
+    new.last()
+        .is_some_and(|last| last.is_me && !old.iter().any(|row| row.source_id == last.source_id))
+}
+
+/// What changed about the thread besides its rows, for [`apply_rows`].
+#[derive(Clone, Copy, Debug, Default)]
+struct RowsChange {
+    /// Another thread was opened in the transcript.
+    thread_opened: bool,
+    /// A step or a thought was opened or shut, which adds or takes away rows under it.
+    steps_toggled: bool,
+    /// The coworker is replying, so its last row may have grown.
+    responding: bool,
+}
+
+/// Bring the transcript's list up to date with the thread's rows: `old` is what the list was
+/// drawn from, `new` what it is drawn from now.
+///
+/// Rows arriving are no reason to go back to the newest row. A person who went back up the
+/// thread stays where they are while a reply streams in below them, a step arrives or a message
+/// is hidden: only the rows that changed are replaced, and the list keeps its place. Starting
+/// the list over whenever the number of rows changed, as it once did, carried them back down
+/// with every row a turn added. The newest row is taken back only by another thread opening, or
+/// by a message of the person's own: they sent it, and whoever sends wants to see what comes
+/// back.
+fn apply_rows(scroll: &mut TranscriptScroll, old: &[ChatRow], new: &[ChatRow], change: RowsChange) {
+    let count = new.len();
+    // The list and the old rows agree on how many there are, unless something replaced the rows
+    // without telling the list (the read-aloud pump does). A splice would then point into rows
+    // that are not there, so the list starts over at the newest row instead, as it always did.
+    let in_step = scroll.item_count() == old.len();
+    if change.steps_toggled && in_step {
+        // A step opened or shut in the middle of the thread adds or takes away rows there, and a
+        // list reset for that would carry the person off to the bottom of the thread, away from
+        // the very row they clicked. Only the rows that changed are replaced.
+        let (span, added) = changed_rows(old, new);
+        scroll.splice(span, added);
+    } else if change.thread_opened || just_sent(old, new) {
+        scroll.reset(count);
+    } else if count != scroll.item_count() {
+        if scroll.is_following() || !in_step {
+            scroll.reset(count);
+        } else {
+            splice_in_place(scroll, old, new);
+        }
+    } else if change.responding && count > 0 {
+        scroll.remeasure_items(count - 1..count);
+    }
+}
+
+/// Replace the rows that changed while the person reads further up the thread, keeping the row
+/// at the top of their view where it is, and as far into it. A splice keeps that place by
+/// itself unless the row is one of those replaced; then it is found again by its id, where a
+/// splice alone would put the view at the top of the rows replaced.
+fn splice_in_place(scroll: &mut TranscriptScroll, old: &[ChatRow], new: &[ChatRow]) {
+    let (span, added) = changed_rows(old, new);
+    let anchor = scroll.anchor();
+    let held = old
+        .get(anchor.item_ix)
+        .filter(|_| span.contains(&anchor.item_ix))
+        .map(|row| row.id.as_str());
+    scroll.splice(span, added);
+    if let Some(item_ix) = held.and_then(|id| new.iter().position(|row| row.id == id)) {
+        scroll.hold(ListOffset {
+            item_ix,
+            offset_in_item: anchor.offset_in_item,
+        });
+    }
+}
+
 /// Whether a picture belongs to the strip the row before it already holds. Pictures are one
 /// set when they came from the same turn with nothing but pictures between them — that is
 /// what makes a strip, rather than a column of full-width screens nobody scrolls past.
@@ -688,13 +762,14 @@ impl ChatPalette {
 /// The air the transcript keeps at either end: above the first bubble, and between the last
 /// one and the composer floating over it, on top of the composer's own height.
 ///
-/// `MessageScroller` gives its list this much as `py_2`, and the rows have to carry it
-/// instead, because the list must have no padding at all. GPUI measures the list's scroll
-/// twice and only one of the two counts that padding: the wheel reads the offset in the items'
-/// own space, where the floor is `items + padding - viewport`, while the mask that turns the
-/// wheel into an offset clamps against `items - viewport` and writes the clamped value back.
-/// Room held in the padding is therefore a teleport of exactly that much on the first scroll
-/// away from the bottom. Room held inside a row is part of `items` and both readings agree.
+/// `MessageScroller` gave its list this much as `py_2`. The transcript's own scroller gives its
+/// list none, and the rows carry it instead, because the list must have no padding at all. GPUI
+/// measures the list's scroll twice and only one of the two counts that padding: the wheel
+/// reads the offset in the items' own space, where the floor is `items + padding - viewport`,
+/// while the mask that turns the wheel into an offset clamps against `items - viewport` and
+/// writes the clamped value back. Room held in the padding is therefore a teleport of exactly
+/// that much on the first scroll away from the bottom. Room held inside a row is part of
+/// `items` and both readings agree.
 const TRANSCRIPT_EDGE_GAP: f32 = 8.0;
 
 /// The room a row keeps beneath itself, which only the last one has any of.
@@ -709,7 +784,9 @@ fn tail_room(ix: usize, row_count: usize, composer_height: Pixels) -> Option<Pix
 struct ChatTranscript {
     app_state: Entity<AppState>,
     input: Entity<MessageInput>,
-    scroller: Entity<MessageScrollerState>,
+    /// The list, and whether it keeps to the newest row: the person's decision, never the
+    /// list's (see `transcript_scroll`).
+    scroll: TranscriptScroll,
     rows: Arc<Vec<ChatRow>>,
     feed_rev: ChatFeedRev,
     last_conversation_id: Option<String>,
@@ -743,7 +820,7 @@ impl ChatTranscript {
                 app.active_conversation_id.clone(),
             )
         };
-        let scroller = cx.new(|cx| MessageScrollerState::new(rows.len(), cx));
+        let scroll = TranscriptScroll::new(rows.len());
         cx.observe(&state, |this, state, cx| {
             let (feed, rows) = {
                 let app = state.read(cx);
@@ -753,31 +830,21 @@ impl ChatTranscript {
                 }
                 (feed, snapshot_rows(app))
             };
-            let conv_changed = this.feed_rev.conversation_id != feed.conversation_id;
-            // A step opened or shut in the middle of the thread adds or takes away rows there,
-            // and a list reset for that would carry the person off to the bottom of the thread,
-            // away from the very row they clicked. Only the rows that changed are replaced.
-            let opened = (!conv_changed && this.feed_rev.expanded_steps != feed.expanded_steps)
-                .then(|| changed_rows(&this.rows, &rows));
-            let was = this.rows.len();
-            let is_ai_responding = feed.is_ai_responding;
-            this.rows = rows;
+            let thread_opened = this.feed_rev.conversation_id != feed.conversation_id;
+            let change = RowsChange {
+                thread_opened,
+                steps_toggled: !thread_opened
+                    && this.feed_rev.expanded_steps != feed.expanded_steps,
+                responding: feed.is_ai_responding,
+            };
+            let old = std::mem::replace(&mut this.rows, rows);
             this.debug_mode = feed.debug_mode;
             this.can_read_aloud = feed.can_read_aloud;
             this.last_conversation_id = feed.conversation_id.clone();
             this.palette = ChatPalette::from_cx(cx);
             this.feed_rev = feed;
-            let count = this.rows.len();
-            this.scroller.update(cx, |scroller, cx| {
-                let old = scroller.item_count();
-                if let Some((span, added)) = opened.filter(|_| old == was) {
-                    scroller.splice(span, added, cx);
-                } else if conv_changed || count != old {
-                    scroller.reset(count, cx);
-                } else if is_ai_responding && count > 0 {
-                    scroller.remeasure_items(count - 1..count, cx);
-                }
-            });
+            apply_rows(&mut this.scroll, &old, &this.rows, change);
+            this.publish_tail(cx);
             if this.feed_rev.native_speaking_id.is_some() {
                 this.start_highlight_pump(cx);
             }
@@ -789,7 +856,7 @@ impl ChatTranscript {
         let mut this = Self {
             app_state: state,
             input,
-            scroller,
+            scroll,
             rows,
             feed_rev,
             last_conversation_id,
@@ -828,12 +895,18 @@ impl ChatTranscript {
         // The room belongs to the last row's own height, so the list is holding a measurement
         // of that row taken against the composer as it used to stand. Nothing else about the
         // row changed, so only that one is worth taking again.
-        self.scroller.update(cx, |scroller, cx| {
-            if let Some(last) = scroller.item_count().checked_sub(1) {
-                let _ = scroller.remeasure_items(last..last + 1, cx);
-            }
-        });
+        if let Some(last) = self.scroll.item_count().checked_sub(1) {
+            self.scroll.remeasure_items(last..last + 1);
+        }
         cx.notify();
+    }
+
+    /// Say whether the transcript follows its newest row, for a driver (see
+    /// [`AppState::transcript_following`]).
+    fn publish_tail(&self, cx: &mut Context<Self>) {
+        let following = self.scroll.is_following();
+        self.app_state
+            .update(cx, |state, _| state.set_transcript_following(following));
     }
 
     fn set_find_query(&mut self, query: String, cx: &mut Context<Self>) {
@@ -906,10 +979,11 @@ impl ChatTranscript {
             return;
         };
         let row = hit.row;
-        self.scroller.update(cx, |scroller, cx| {
-            scroller.scroll_to_item(row, cx);
-            let _ = scroller.remeasure_items(row..row + 1, cx);
-        });
+        // Going to a hit is the person going somewhere in the thread, so the transcript lets
+        // go of the newest row there, as it does for a step up.
+        self.scroll.scroll_to_item(row);
+        self.scroll.remeasure_items(row..row + 1);
+        self.publish_tail(cx);
     }
 
     fn arm_peek_release(&mut self, cx: &mut Context<Self>) {
@@ -1123,6 +1197,11 @@ impl ChatTranscript {
 impl Render for ChatTranscript {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sync_user_form_fields(window, cx);
+        // The scrollbar moves the list without telling anyone. What it did is read here, before
+        // the list is laid out again, and only a drag of it can take the newest row back.
+        if self.scroll.sync_frame() {
+            self.publish_tail(cx);
+        }
         let rows = self.rows.clone();
         let app_state = self.app_state.clone();
         let user_form_inputs = self.user_form_inputs.clone();
@@ -1192,9 +1271,10 @@ impl Render for ChatTranscript {
                 .inset_0()
             })
             .child(
-                MessageScroller::new(
+                TranscriptScroller::new(
                     "chat-messages",
-                    self.scroller.clone(),
+                    // The list, and whether it keeps to the newest row (see `transcript_scroll`).
+                    &self.scroll,
                     move |ix, window, cx| {
                         // Every row is laid out in the same centred column the transcript used to
                         // sit in, so bubbles and timestamps do not move — only the scrollbar did.
@@ -1462,15 +1542,40 @@ impl Render for ChatTranscript {
                 )
                 // Straight under the title bar, which holds the chat's header.
                 .pt(px(20.0))
-                // No padding on the list. The room at both ends travels with the rows, so
-                // that the height of the items is the whole of the transcript and the two
-                // ways GPUI measures the scroll cannot disagree — see `TRANSCRIPT_EDGE_GAP`.
-                .with_list_style(StyleRefinement::default().py(px(0.)))
                 // The chevron belongs over the chat, not behind the composer, so lift it off
                 // the scroller's floor by exactly what the composer covers; the rem the
                 // scroller already holds it by then reads from the composer's top edge.
-                .with_jump_button_style(StyleRefinement::default().mb(composer_height))
-                .with_jump_button_transition(Duration::ZERO),
+                .jump_lift(composer_height)
+                // Every step of the wheel is heard before the list moves by it: a step toward
+                // older messages lets go of the newest row, however small, and only the person
+                // takes it back (see `transcript_scroll`).
+                .on_wheel({
+                    let this = cx.entity().downgrade();
+                    move |event, line_height, _, cx| {
+                        let Some(this) = this.upgrade() else {
+                            return;
+                        };
+                        this.update(cx, |this, cx| {
+                            if this.scroll.wheel(event, line_height) {
+                                this.publish_tail(cx);
+                                cx.notify();
+                            }
+                        });
+                    }
+                })
+                .on_jump({
+                    let this = cx.entity().downgrade();
+                    move |_, cx| {
+                        let Some(this) = this.upgrade() else {
+                            return;
+                        };
+                        this.update(cx, |this, cx| {
+                            this.scroll.follow();
+                            this.publish_tail(cx);
+                            cx.notify();
+                        });
+                    }
+                }),
             )
     }
 }
@@ -2007,13 +2112,14 @@ fn text_row_id(msg_id: &str, n: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ChatFeedRev, ChatRow, RunRow, ScreenshotSpec, TRANSCRIPT_EDGE_GAP, changed_rows,
-        joins_previous_set, snapshot_rows, tail_room, text_row_id,
+        ChatFeedRev, ChatRow, RowsChange, RunRow, ScreenshotSpec, TRANSCRIPT_EDGE_GAP, apply_rows,
+        changed_rows, joins_previous_set, just_sent, snapshot_rows, tail_room, text_row_id,
     };
     use crate::components::steps::step_key;
+    use crate::components::transcript_scroll::TranscriptScroll;
     use crate::opengrok::{ChatPart, StepSpec};
     use crate::state::AppState;
-    use gpui_kit::px;
+    use gpui_kit::{ListOffset, px};
 
     /// The room is the last bubble's alone: give it to every row and the transcript would be
     /// mostly air, and the rows above the composer would each hold a composer's worth of it.
@@ -2274,6 +2380,163 @@ mod tests {
         assert_eq!(changed_rows(&shut, &open), (1..2, 3));
         assert_eq!(changed_rows(&open, &shut), (1..4, 1));
         assert_eq!(changed_rows(&open, &open), (5..5, 0));
+    }
+
+    /// A message in the thread, said by the person or by the coworker.
+    fn said(id: &str, content: &str, is_me: bool) -> crate::state::Message {
+        crate::state::Message {
+            id: id.into(),
+            sender: if is_me { "Me" } else { "AI" }.into(),
+            content: content.into(),
+            sent_at: std::time::SystemTime::UNIX_EPOCH,
+            finished_at: None,
+            run_timing: None,
+            is_me,
+            reply_preview: None,
+            reply_to_id: None,
+            reply_is_me: false,
+            parts: Vec::new(),
+            run_id: None,
+            hidden: false,
+        }
+    }
+
+    /// Where the view begins: the row at its top, and how far into that row.
+    fn place(scroll: &TranscriptScroll) -> (usize, gpui_kit::Pixels) {
+        let anchor = scroll.anchor();
+        (anchor.item_ix, anchor.offset_in_item)
+    }
+
+    /// A transcript whose reader has gone back up the thread, to `row` and `into` pixels into it.
+    fn read_back(rows: usize, row: usize, into: f32) -> TranscriptScroll {
+        let mut scroll = TranscriptScroll::new(rows);
+        assert!(scroll.scroll_to_item(row));
+        scroll.hold(ListOffset {
+            item_ix: row,
+            offset_in_item: px(into),
+        });
+        scroll
+    }
+
+    /// The reply goes on below the person while they read further up: a step arrives, then the
+    /// words after it. Until this fix every row a turn added started the list over at the newest
+    /// row, and whoever had scrolled up was carried back down with it. Now the rows are spliced
+    /// in and the person stays on the row they were reading, as far into it as they were.
+    #[test]
+    fn rows_that_arrive_while_reading_back_leave_the_reader_where_they_are() {
+        let mut state = one_reply(vec![
+            ChatPart::Text("Let me look.".into()),
+            step("c1", Some(("a", true))),
+        ]);
+        let before = snapshot_rows(&state);
+        let mut scroll = read_back(before.len(), 0, 12.);
+
+        let reply = &mut state.conversations[0].messages[0].parts;
+        reply.push(step("c2", Some(("b", true))));
+        reply.push(ChatPart::Text("Done.".into()));
+        let after = snapshot_rows(&state);
+        assert!(after.len() > before.len(), "the turn added rows");
+        let responding = RowsChange {
+            responding: true,
+            ..RowsChange::default()
+        };
+        apply_rows(&mut scroll, &before, &after, responding);
+
+        assert!(!scroll.is_following(), "the reader was not taken back down");
+        assert!(!scroll.list().is_following_tail(), "nor was GPUI's list");
+        assert_eq!(
+            scroll.item_count(),
+            after.len(),
+            "the list has the new rows"
+        );
+        assert_eq!(
+            place(&scroll),
+            (0, px(12.)),
+            "the reader is where they were"
+        );
+
+        // The coworker's next message is not the person's, so it does not take them down either.
+        state.conversations[0]
+            .messages
+            .push(said("m2", "Anything else?", false));
+        let next = snapshot_rows(&state);
+        apply_rows(&mut scroll, &after, &next, responding);
+        assert!(!scroll.is_following());
+        assert_eq!(place(&scroll), (0, px(12.)));
+    }
+
+    /// At the newest row, rows arriving keep the person there, as they always did.
+    #[test]
+    fn at_the_newest_row_rows_arriving_keep_the_reader_there() {
+        let mut state = one_reply(vec![ChatPart::Text("Let me look.".into())]);
+        let before = snapshot_rows(&state);
+        let mut scroll = TranscriptScroll::new(before.len());
+        state.conversations[0]
+            .messages
+            .push(said("m2", "Found it.", false));
+        let after = snapshot_rows(&state);
+        apply_rows(&mut scroll, &before, &after, RowsChange::default());
+        assert!(scroll.is_following() && scroll.list().is_following_tail());
+        assert_eq!(scroll.item_count(), after.len());
+    }
+
+    /// A message of the person's own takes them to the newest row from wherever they were
+    /// reading: they sent it, and whoever sends wants to see what comes back. So does opening
+    /// another thread.
+    #[test]
+    fn a_send_or_another_thread_takes_the_reader_to_the_newest_row() {
+        let mut state = one_reply(vec![ChatPart::Text("Let me look.".into())]);
+        let before = snapshot_rows(&state);
+        let mut scroll = read_back(before.len(), 0, 12.);
+        state.conversations[0]
+            .messages
+            .push(said("q2", "And the logs?", true));
+        let after = snapshot_rows(&state);
+        apply_rows(&mut scroll, &before, &after, RowsChange::default());
+        assert!(scroll.is_following() && scroll.list().is_following_tail());
+
+        let mut scroll = read_back(after.len(), 0, 12.);
+        let opened = RowsChange {
+            thread_opened: true,
+            ..RowsChange::default()
+        };
+        apply_rows(&mut scroll, &after, &before, opened);
+        assert!(scroll.is_following() && scroll.list().is_following_tail());
+    }
+
+    /// A send is a message of the person's own that is new on the end of the thread. The
+    /// coworker's words there are not one, and neither is the person's message seen again, as
+    /// when a queued send goes out and its row changes.
+    #[test]
+    fn a_send_is_a_new_message_of_the_persons_own_on_the_end() {
+        let row = |id: &str, is_me: bool| ChatRow {
+            is_me,
+            ..ChatRow::slot(id.into(), id.into())
+        };
+        let before = vec![row("m1", false)];
+        let sent = vec![row("m1", false), row("q2", true)];
+        assert!(just_sent(&before, &sent));
+        assert!(!just_sent(&before, &[row("m1", false), row("m2", false)]));
+        assert!(!just_sent(&sent, &sent));
+    }
+
+    /// The row at the top of the reader's view can be one of the rows a change replaces, as when
+    /// a line above it goes and a row arrives at the end in the same change. It is found again
+    /// by its id, so the view stays on it, as far into it as it was, where a plain splice would
+    /// have moved the view to the top of the rows replaced.
+    #[test]
+    fn the_row_being_read_keeps_its_place_when_the_rows_around_it_change() {
+        let rows = |ids: &[&str]| -> Vec<ChatRow> {
+            ids.iter()
+                .map(|id| ChatRow::slot(id.to_string(), "m1".into()))
+                .collect()
+        };
+        let before = rows(&["a", "note", "b", "c"]);
+        let after = rows(&["a", "b", "c", "d", "e"]);
+        let mut scroll = read_back(before.len(), 2, 30.);
+        apply_rows(&mut scroll, &before, &after, RowsChange::default());
+        assert!(!scroll.is_following());
+        assert_eq!(place(&scroll), (1, px(30.)), "still on b, thirty pixels in");
     }
 
     /// A driver's click opens the very row the feed draws: the keys the host's click hands the

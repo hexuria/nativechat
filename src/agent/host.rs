@@ -73,6 +73,11 @@ pub mod ids {
     /// only while one is on the draft, so `assert --exists false` is "this message carries no
     /// skill". Its value is the id the turn will name, because two skills may share a name.
     pub const COMPOSER_SKILL: &str = "composer-skill";
+    /// The chat's transcript, a scroll node whose value says whether it keeps the newest row in
+    /// view: `following`, or `detached` once the person has scrolled back up the thread. A step
+    /// toward older messages, however small, makes it `detached`, and nothing but the person
+    /// makes it `following` again.
+    pub const TRANSCRIPT: &str = "transcript";
     pub const LIGHTBOX: &str = "lightbox";
     pub const PAGE_LOGIN: &str = "page-login";
     pub const LOGIN_EMAIL: &str = "login-email";
@@ -2346,6 +2351,8 @@ pub struct NativeChatHost {
     login_email: String,
     login_password: String,
     last_assistant: String,
+    /// The transcript keeps its newest row in view, as the transcript published it.
+    transcript_following: bool,
     /// The steps and thoughts of that same reply.
     reply_run: ReplyRunSnap,
     /// The open thread's working line, which is that thread's own: it is kept per thread, like
@@ -2557,6 +2564,7 @@ impl NativeChatHost {
                 .and_then(|c| c.messages.iter().rev().find(|m| !m.is_me && !m.hidden))
                 .map(|m| m.content.clone())
                 .unwrap_or_default(),
+            transcript_following: state.transcript_following,
             reply_run: state
                 .conversations
                 .iter()
@@ -3119,6 +3127,13 @@ impl NativeChatHost {
                     "(empty)".to_string()
                 } else {
                     self.last_assistant.chars().take(400).collect()
+                },
+            ))
+            .with_child(UiNode::scroll(ids::TRANSCRIPT, "Transcript").with_value(
+                if self.transcript_following {
+                    "following"
+                } else {
+                    "detached"
                 },
             ));
         if let Some(status) = &self.bot_status {
@@ -9899,6 +9914,31 @@ mod tests {
                 "{line}"
             );
         }
+    }
+
+    /// The transcript says whether it keeps its newest row in view, so a driver that scrolls it
+    /// up can assert that it let go, and that it stayed let go through the redraws after.
+    #[test]
+    fn the_transcript_says_whether_it_follows_its_newest_row() {
+        let mut host = host();
+        host.transcript_following = true;
+        let tree = host.snapshot();
+        let transcript = tree.find(ids::TRANSCRIPT).unwrap();
+        assert_eq!(transcript.role, "scroll");
+        assert_eq!(transcript.value.as_deref(), Some("following"));
+
+        host.transcript_following = false;
+        let tree = host.snapshot();
+        assert_eq!(
+            tree.find(ids::TRANSCRIPT).unwrap().value.as_deref(),
+            Some("detached")
+        );
+
+        // What the host says is what the transcript published, and a thread opens following.
+        let mut state = AppState::new();
+        assert!(NativeChatHost::from_app(&state).transcript_following);
+        state.set_transcript_following(false);
+        assert!(!NativeChatHost::from_app(&state).transcript_following);
     }
 
     /// The draft's chips are on the tree as objects under the composer, in order, with their kind.
