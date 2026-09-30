@@ -7007,6 +7007,60 @@ mod tests {
         assert_eq!(plain.code(), None);
     }
 
+    /// A Mac already carrying all the calls the server lets one Mac carry at once (16) is refused
+    /// a turn in words and no code: `ModelError::Proxy` in opengrok-server's relay broker, not a
+    /// relay failure (PR #298). The turn through the Mac ends with the sentence alone, naming no
+    /// relay failure, so nothing offers it again on the server's keys.
+    #[tokio::test]
+    async fn a_mac_carrying_all_it_may_ends_the_turn_in_words_alone() {
+        let server = MockServer::start().await;
+        let said = "Your Mac is already carrying 16 calls, so this one was not sent; try again \
+                    when one finishes.";
+        let stream: String = [
+            json!({"type": "RUN_STARTED", "threadId": "thread_1", "runId": "run_busy"}),
+            json!({"type": "CUSTOM", "name": "opengrok.inferenceSource",
+                "value": {"kind": "local_proxy", "via": "mac", "model": "gpt-5.5"}}),
+            json!({"type": "RUN_ERROR", "threadId": "thread_1", "runId": "run_busy",
+                "message": said}),
+        ]
+        .iter()
+        .map(|frame| format!("data: {frame}\n\n"))
+        .collect();
+        Mock::given(method("POST"))
+            .and(path("/ag-ui"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(stream),
+            )
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        put_cookie(&client, &live_session());
+        let busy = client
+            .run_turn(
+                "cw_1",
+                "thread_1",
+                "run_busy",
+                &[],
+                None,
+                None,
+                None,
+                Some(TurnSource::plan(Some(crate::opengrok::Via::Mac))),
+                |_| {},
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(busy.message, said);
+        assert_eq!(busy.code(), None);
+        assert_eq!(
+            busy.code()
+                .and_then(crate::opengrok::RelayErrorCode::from_code),
+            None,
+            "no relay failure, so nothing to send on the server's keys"
+        );
+    }
+
     /// A fire of a queued send the server holds for the person's Mac is answered 202 with the row
     /// as it stands (opengrok-server PR #298), and no run starts. The turn is not read as a stream
     /// that said nothing: it is held for the Mac, with the server's sentence and the row, still
