@@ -3638,7 +3638,7 @@ fn replayed_ending(
 }
 
 /// Why a run through the person's Mac ended, when its journal says one did: the code on its
-/// `RUN_ERROR` (opengrok-server #292: PR #298, branch mac-relay c7b57e9, recorded at c3f9521,
+/// `RUN_ERROR` (opengrok-server #292: PR #298, branch mac-relay 5359e34, recorded at 07a951b,
 /// not yet on main), for a replay to offer the turn again on the server's keys as the live
 /// stream does.
 fn relay_failure_of(events: &[serde_json::Value]) -> Option<RelayErrorCode> {
@@ -18214,9 +18214,10 @@ impl AppState {
     /// back, and a hidden hold never posts, whichever path hid it.
     ///
     /// A send the server holds for the person's Mac is passed over, and keeps its place: the
-    /// server sends it itself, oldest first, the moment a Mac opens the relay, and fired from here
-    /// it would only be held again. The send behind it waits for the coworker alone, as its line
-    /// says, and goes.
+    /// server sends it itself, oldest first, once a Mac opens the relay and any turn in flight on
+    /// its thread has ended (`drain_held` in opengrok-server's `agui/pending.rs`, PR #298 at
+    /// 5359e34), and fired from here it would only be held again. The send behind it waits for
+    /// the coworker alone, as its line says, and goes.
     fn pop_queued_send(&mut self, conversation_id: &str) -> Option<QueuedSend> {
         loop {
             let queue = self.queued_sends.get(conversation_id)?;
