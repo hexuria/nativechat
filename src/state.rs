@@ -14285,6 +14285,22 @@ impl AppState {
                     cx.notify();
                     return;
                 }
+                // The server holds the send this turn fired for the person's Mac, and started no
+                // run: it goes back on the queue waiting for the Mac, and the drain goes on to the
+                // sends behind it.
+                if let Err(error) = &result
+                    && error.is_held_for_mac()
+                {
+                    state.put_back_held_for_mac(&conversation_id, &reply_id, drained.clone());
+                    state.release_live_turn(&conversation_id, &run_id);
+                    state.finish_responding(Some(&conversation_id), false);
+                    if let Some(custom) = error.pending_custom() {
+                        state.apply_pending_event(&custom, queued_message_id.as_deref(), cx);
+                    }
+                    state.drain_queued_send(&conversation_id, cx);
+                    cx.notify();
+                    return;
+                }
                 if let Err(error) = &result
                     && (error.is_already_consumed() || error.is_not_pending())
                 {
@@ -19008,6 +19024,48 @@ impl AppState {
         self.canceled_pending
             .retain(|id| !in_this_thread.contains(id.as_str()) || rows.contains_key(id.as_str()));
         fold
+    }
+
+    /// A fired hold the server answered 202: it holds the send for the person's Mac and started
+    /// no run. The reply bubble the turn minted is no answer, and the hold goes back on the
+    /// queue, now waiting for the Mac, ahead of the sends that do not, which is where the drain
+    /// took it from while the waiting ones ahead of it stay put. The queue's CUSTOM, applied
+    /// after, brings the row as it stands. A snapshot that raced the answer and queued the row
+    /// again already put it back.
+    fn put_back_held_for_mac(
+        &mut self,
+        conversation_id: &str,
+        reply_id: &str,
+        held: Option<QueuedSend>,
+    ) {
+        if let Some(conversation) = self
+            .conversations
+            .iter_mut()
+            .find(|conversation| conversation.id == conversation_id)
+        {
+            conversation
+                .messages
+                .retain(|message| message.id != reply_id);
+        }
+        let Some(mut held) = held else {
+            return;
+        };
+        held.waits_for_mac = true;
+        let queue = self
+            .queued_sends
+            .entry(conversation_id.to_string())
+            .or_default();
+        if queue
+            .iter()
+            .any(|queued| queued.message_id == held.message_id)
+        {
+            return;
+        }
+        let at = queue
+            .iter()
+            .position(|queued| !queued.waits_for_mac)
+            .unwrap_or(queue.len());
+        queue.insert(at, held);
     }
 
     /// A drained hold OpenGrok refused as stale. `edited`: the row is still queued, so the hold
@@ -33541,6 +33599,68 @@ mod tests {
             state.pop_queued_send("cw_1").map(|next| next.message_id),
             Some("m_mac".to_string())
         );
+    }
+
+    /// A held message this Mac did not yet know the server holds for the person's Mac is fired,
+    /// and answered 202: no run started. The reply bubble the turn minted goes, the message goes
+    /// back ahead of the one behind it, now waiting for the Mac, and the drain goes on to the one
+    /// behind it. A snapshot that queued it again before the answer landed is not doubled.
+    #[test]
+    fn a_fire_the_server_holds_for_the_mac_goes_back_waiting_for_it() {
+        let mut state = holding("m_mac", "by my Mac");
+        state.conversations[0]
+            .messages
+            .push(at(message("m_next", true, "then this"), 40));
+        let queue = state.queued_sends.get_mut("cw_1").unwrap();
+        queue[0].pending_id = Some("pum_1".into());
+        queue.push_back(super::held_message(
+            "m_next".to_string(),
+            "then this".to_string(),
+            None,
+            None,
+            None,
+            None,
+        ));
+        go_idle(&mut state);
+        let fired = state.pop_queued_send("cw_1").expect("drains");
+        assert_eq!(fired.message_id, "m_mac");
+        state.conversations[0]
+            .messages
+            .push(at(message("r_1", false, ""), 50));
+        let held = pending_custom(
+            "edited",
+            Some(json!({
+                "id": "pum_1", "content": "by my Mac", "clientMessageId": "m_mac",
+                "status": "pending", "inferenceSource": {"kind": "local_proxy", "via": "mac"},
+                "heldFor": "relay_offline"
+            })),
+        );
+
+        state.put_back_held_for_mac("cw_1", "r_1", Some(fired.clone()));
+        state.apply_pending_custom(&held, Some("m_mac"));
+        assert!(
+            state.conversations[0]
+                .messages
+                .iter()
+                .all(|message| message.id != "r_1"),
+            "a turn that never started leaves no reply bubble"
+        );
+        assert!(state.is_send_waiting_for_mac("m_mac"));
+        let order: Vec<&str> = state.queued_sends["cw_1"]
+            .iter()
+            .map(|queued| queued.message_id.as_str())
+            .collect();
+        assert_eq!(order, ["m_mac", "m_next"], "back in its place");
+
+        state.put_back_held_for_mac("cw_1", "r_1", Some(fired));
+        assert_eq!(state.queued_send_count(), 2, "not doubled");
+        assert_eq!(
+            state.pop_queued_send("cw_1").map(|next| next.message_id),
+            Some("m_next".to_string()),
+            "the drain goes on to the one behind it"
+        );
+        assert!(state.pop_queued_send("cw_1").is_none());
+        assert!(state.is_send_waiting_for_mac("m_mac"));
     }
 
     /// A server from before reply sources answers the read with a bare 404: the page says it

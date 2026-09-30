@@ -271,6 +271,14 @@ impl OpenGrokError {
         self.status == Some(409) && self.code() == Some("stale-pending-message")
     }
 
+    /// `POST /ag-ui` fired a queued send the server holds for the person's Mac: no Mac holds the
+    /// relay, so the fire was answered 202, no run started and the row stays queued
+    /// ([`Self::pending_custom`] is the row as it stands, with its `heldFor`). The server sends it
+    /// itself when a Mac opens the relay. Read off the status and the word, never the sentence.
+    pub fn is_held_for_mac(&self) -> bool {
+        self.status == Some(202) && self.code() == Some(super::inference::HELD_FOR_RELAY_OFFLINE)
+    }
+
     /// `PUT /coworkers/{id}/ceiling` named a version of the ceiling that is not the server's
     /// any more: somebody changed it after the rows the switch was built from were read, and
     /// nothing was changed (opengrok-server#268). Read off the code; the sentence beside it ("the
