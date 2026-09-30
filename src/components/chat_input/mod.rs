@@ -241,8 +241,8 @@ pub struct MessageInput {
     /// button. Cached off [`AppState`] like the rest, so the composer draws without reading the
     /// state on every frame.
     turn_in_flight: bool,
-    /// The chip that picks which door the next turns go through, the server's paid keys or the
-    /// person's plan, while there is a choice to make. Cached off [`AppState`] like the rest.
+    /// The chip that says which door the next message goes through, the server's paid keys or
+    /// the person's plan, while there is a choice to make. Cached off [`AppState`] like the rest.
     turn_source: Option<crate::state::TurnSourceChip>,
 }
 
@@ -2478,8 +2478,8 @@ impl Render for MessageInput {
                                         confirm_btn
                                     })
                                 })
-                                // Which door the next turns go through, beside the button that
-                                // sends them. Only while there is a choice: see
+                                // Which door the next message goes through, beside the button
+                                // that sends it. Only while there is a choice: see
                                 // `AppState::composer_turn_source`.
                                 .when_some(
                                     self.turn_source.clone().filter(|_| !self.voice_mode),

@@ -360,7 +360,7 @@ pub mod ids {
     pub const REPLY_SOURCE_REMOVE_KEY: &str = reply_source::REMOVE_KEY;
     pub const REPLY_SOURCE_ELSEWHERE: &str = reply_source::ELSEWHERE;
     pub const REPLY_SOURCE_HINT: &str = reply_source::HINT;
-    /// The composer's chip: which door the next turns go through.
+    /// The composer's chip: which door the next message goes through.
     pub const COMPOSER_REPLY_SOURCE: &str = reply_source::COMPOSER_CHIP;
     /// Under a Bot's Model field, while replies go through the person's own plan.
     pub const AGENT_MODEL_PLAN: &str = reply_source::BOT_MODEL_PLAN;
@@ -847,7 +847,7 @@ pub enum Command {
     /// Remove key, or Keep key to take it back.
     ToggleRemoveReplySourceKey,
     SaveReplySource,
-    /// The composer's chip: the next turns go through the other door.
+    /// The composer's chip: the next message goes through the other door.
     ToggleTurnSource,
     Shutdown,
 }
@@ -3254,17 +3254,15 @@ impl NativeChatHost {
         for node in self.reply_run_nodes() {
             page = page.with_child(node);
         }
-        // Which door the next turns go through, while there is a choice to make: label as the
-        // chip reads, value the door's wire word, state `picked` while it is the person's pick
-        // and not the account's own door.
+        // Which door the next message goes through, while there is a choice to make: label as
+        // the chip reads, value the door's wire word, state `override` while it is the person's
+        // pick for that message and not the account's own door.
         if let Some(chip) = &self.turn_source {
-            let mut node = UiNode::button(
-                ids::COMPOSER_REPLY_SOURCE,
-                reply_source::chip_label(chip.kind),
-            )
-            .with_value(chip.kind.word());
+            let mut node =
+                UiNode::button(ids::COMPOSER_REPLY_SOURCE, reply_source::chip_text(chip))
+                    .with_value(chip.kind.word());
             if chip.picked {
-                node.states.push("picked".into());
+                node.states.push("override".into());
             }
             page = page.with_child(node);
         }
@@ -11606,10 +11604,11 @@ mod tests {
         );
     }
 
-    /// The composer's chip is on the tree while there is a choice of door, valued by the door and
-    /// `picked` while it is the person's pick, and a click works it as a person's does, where the
-    /// composer's panel is worked from the keyboard. Each reply's badge is there as the feed draws
-    /// it: under a reply with words, and not under one that said nothing but its status line.
+    /// The composer's chip is on the tree while there is a choice of door, labelled as it reads,
+    /// valued by the door, and in state `override` while it is the person's pick for the next
+    /// message, when it says so; a click works it as a person's does, where the composer's panel
+    /// is worked from the keyboard. Each reply's badge is there as the feed draws it: under a
+    /// reply with words, and not under one that said nothing but its status line.
     #[test]
     fn the_composer_chip_and_each_replys_badge_are_on_the_tree() {
         use crate::opengrok::{InferenceKind, InferenceSource, ReplySource};
@@ -11647,8 +11646,11 @@ mod tests {
             .find(ids::COMPOSER_REPLY_SOURCE)
             .cloned()
             .unwrap();
-        assert_eq!(chip.name, "Server");
-        assert!(chip.states.contains(&"picked".to_string()));
+        assert_eq!(
+            (chip.name.as_str(), chip.value.as_deref()),
+            ("Server · this message", Some("gateway"))
+        );
+        assert_eq!(chip.states, vec!["override".to_string()]);
 
         // From the app: a reply with words wears its badge, one that said only its status line
         // does not, and the composer's chip is the account's door.
@@ -11720,7 +11722,21 @@ mod tests {
             "a status line has no bubble to wear a badge"
         );
         let chip = tree.find(ids::COMPOSER_REPLY_SOURCE).unwrap();
-        assert_eq!(chip.value.as_deref(), Some("local_proxy"));
+        assert_eq!(
+            (chip.name.as_str(), chip.value.as_deref()),
+            ("My plan", Some("local_proxy"))
+        );
+        assert!(chip.states.is_empty());
+
+        // Clicked, the chip overrides the account's door for the next message, and says so.
+        assert!(state.flip_turn_source());
+        let tree = NativeChatHost::from_app(&state).snapshot();
+        let chip = tree.find(ids::COMPOSER_REPLY_SOURCE).unwrap();
+        assert_eq!(
+            (chip.name.as_str(), chip.value.as_deref()),
+            ("Server · this message", Some("gateway"))
+        );
+        assert_eq!(chip.states, vec!["override".to_string()]);
 
         // While the composer dictates the chip gives its place to the dictation's buttons, and
         // is not in the tree either.
