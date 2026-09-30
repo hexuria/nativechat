@@ -33499,6 +33499,52 @@ mod tests {
         assert!(recovered[0].content.starts_with(RUN_ERROR_PREFIX));
     }
 
+    /// A Mac already carrying all the calls the server lets one Mac carry at once (16) is refused
+    /// a turn in words and no code (`ModelError::Proxy` in opengrok-server's relay broker, PR
+    /// #298): the reply shows the server's sentence alone, and nothing offers the turn again on
+    /// the server's keys, live or read back. The Mac frees up on its own as its calls finish.
+    #[test]
+    fn a_mac_carrying_all_it_may_shows_its_sentence_with_nothing_to_send_on_server() {
+        let said = "Your Mac is already carrying 16 calls, so this one was not sent; try again \
+                    when one finishes.";
+        let mut state = signed_in_state();
+        state.conversations.push(Conversation {
+            id: "cw_1".into(),
+            title: "Ada".into(),
+            created_at: String::new(),
+            updated_at: String::new(),
+            messages: vec![
+                message("m_ask", true, "summarise it"),
+                message("m_busy", false, &format!("{RUN_ERROR_PREFIX}{said}")),
+            ],
+            unread_count: 0,
+            origin: None,
+        });
+        state.active_conversation_id = Some("cw_1".into());
+        // Live: the turn's error names no code, so what the ending notes is no relay failure.
+        state.note_relay_failure("m_busy", None);
+        assert_eq!(state.relay_failed_turn(), None);
+
+        // Read back: the journal's RUN_ERROR, after the run said it went through the Mac, has
+        // no code either, and the reply recovered from it is the sentence and nothing to offer.
+        let events = vec![
+            json!({"type": "RUN_STARTED", "runId": "run_1", "threadId": "cw_1"}),
+            json!({"type": "CUSTOM", "name": "opengrok.inferenceSource",
+                "value": {"kind": "local_proxy", "via": "mac", "model": "gpt-5.5"}}),
+            json!({"type": "RUN_ERROR", "message": said}),
+        ];
+        assert_eq!(super::relay_failure_of(&events), None);
+        let run: ThreadRun = serde_json::from_value(json!({
+            "runId": "run_1", "status": "failed", "startedAtMs": 1_000,
+            "failure": said, "events": events
+        }))
+        .expect("a run");
+        let recovered = super::missing_replies(&[message("m_ask", true, "summarise it")], &[run]);
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].relay_failure, None);
+        assert_eq!(recovered[0].content, format!("{RUN_ERROR_PREFIX}{said}"));
+    }
+
     /// A held message the server holds for the person's Mac says so, by its row's word as it
     /// stands: a snapshot that no longer holds it for the Mac takes the line away, and a message
     /// held here is not held for the Mac until the server says so.

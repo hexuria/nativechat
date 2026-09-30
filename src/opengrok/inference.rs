@@ -434,7 +434,8 @@ impl ReplySource {
 /// PR #298, branch mac-relay c7b57e9, recorded at c3f9521, not yet on main): no Mac held the
 /// relay, the Mac said nothing for the server's sixty seconds (before the first byte, or between
 /// two), or the Mac answered with a failure. The sentence is what the person reads; the code is
-/// what offers the turn again on the server's keys.
+/// what offers the turn again on the server's keys. A refusal with no code, such as a Mac already
+/// carrying all the calls one Mac may at once, is none of these: its sentence stands alone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RelayErrorCode {
     Offline,
