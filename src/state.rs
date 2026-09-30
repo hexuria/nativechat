@@ -13,9 +13,9 @@ pub use crate::cron_spec::{
 use crate::opengrok::{
     Account, ActivityTick, AguiMessage, ApprovalSpec, BotActivity, BoxHandoffReply,
     BoxHandoffResolution, BoxShareScope, ChatPart, ChoiceCard, ComputerHandoffStatus,
-    ConnectedComputer, Coworker, CoworkerComputer, CoworkerPatch, Failure, FormResolution,
-    FormSpec, ImageVisibility, LocalExecMode, LocalExecPolicy, LocalExecResolution, ModelCatalogue,
-    NewSchedule, NewSkill, OpenGrokClient, OpenGrokError, PendingCustom, PendingOp,
+    ConnectedComputer, Coworker, CoworkerComputer, CoworkerPatch, EFFORT_INHERIT, Failure,
+    FormResolution, FormSpec, ImageVisibility, LocalExecMode, LocalExecPolicy, LocalExecResolution,
+    ModelCatalogue, NewSchedule, NewSkill, OpenGrokClient, OpenGrokError, PendingCustom, PendingOp,
     PendingUserMessage, PendingWrite, ProfileUpdate, QueuedApproval, RecipeDetail, RecipeKind,
     RecipeParameter, RecipeRun, RecipeRunResult, RecipeShareTarget, RecipeStep, RecipeSummary,
     ReplyQuote, RunCause, RunRecipeResponse, RunReplay, SKILL_BODY_CHARS, SKILL_BUNDLE_FILES,
@@ -66,6 +66,29 @@ pub enum ToolList {
     Listed(Vec<crate::opengrok::CoworkerTool>),
     /// The server would not list them, in its words or the app's.
     Unavailable(String),
+}
+
+/// The open bot's Effort control, as its settings draw it and a driver reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EffortControl {
+    /// The word the server keeps for the bot, or `None` from a server that keeps no effort (one
+    /// from before opengrok-server#271). The control is dead then: that server would drop a pick
+    /// without a word, and the control would claim a setting nothing keeps.
+    pub kept: Option<String>,
+    /// The word the control shows: the person's pick while it waits for Save, or the kept one.
+    pub shown: String,
+}
+
+impl EffortControl {
+    /// What the bot's turns run with now, in the server's word: `inherit` where it keeps none.
+    pub fn kept_word(&self) -> &str {
+        self.kept.as_deref().unwrap_or(EFFORT_INHERIT)
+    }
+
+    /// A pick is waiting for Save.
+    pub fn unsaved(&self) -> bool {
+        self.shown != self.kept_word()
+    }
 }
 
 /// The open Bot's tool ceiling, as far as its settings know it: everything it could be offered
@@ -3377,6 +3400,14 @@ pub struct AppState {
     /// Counts the tool listings asked for, so only the newest answer is shown: two asks for the
     /// same bot can come back out of order, and the older must not replace the newer.
     tools_generation: u64,
+    /// The effort picked in the open bot's settings and not saved yet, with the bot it was picked
+    /// for. The pane's words live in its own fields; a pick lives here so that a driver can make
+    /// one from the menu's choices the way a person does. Save sends it when it differs from what
+    /// the server keeps ([`Self::effort_to_save`]).
+    effort_pick: Option<(String, String)>,
+    /// A driver pressed the bot settings' Save. The button is the pane's, and so are the fields
+    /// it sends, so the pane takes this and saves as the button would.
+    agent_save_requested: bool,
     /// Everything the open Bot could be offered and which of it it may be, as its Tools card's
     /// switches show it (opengrok-server#268): the Bot's id and the answer, like
     /// [`Self::coworker_tools`]. Drawn through [`Self::ceiling_card`].
@@ -3918,6 +3949,8 @@ impl AppState {
             agent_tools_open: false,
             agent_usage_open: false,
             tools_generation: 0,
+            effort_pick: None,
+            agent_save_requested: false,
             coworker_ceiling: None,
             ceiling_generation: 0,
             ceiling_reading: None,
@@ -5664,6 +5697,69 @@ impl AppState {
     pub fn toggle_agent_usage(&mut self, cx: &mut Context<Self>) {
         self.agent_usage_open = !self.agent_usage_open;
         cx.notify();
+    }
+
+    /// The open bot's Effort control: `None` with no bot open.
+    pub fn effort_control(&self) -> Option<EffortControl> {
+        let id = self.active_coworker_id.as_deref()?;
+        let coworker = self.coworkers.iter().find(|c| c.id == id)?;
+        let pick = self
+            .effort_pick
+            .as_ref()
+            .filter(|(bot, _)| bot == id)
+            .map(|(_, word)| word.clone());
+        Some(EffortControl {
+            kept: coworker.effort.clone(),
+            shown: pick.unwrap_or_else(|| coworker.effort().to_string()),
+        })
+    }
+
+    /// Pick an effort for the open bot, as a choice in its settings' menu does. It waits for
+    /// Save like everything else the pane holds, and picking the word the server already keeps
+    /// takes a pick back.
+    pub fn pick_effort(&mut self, word: String, cx: &mut Context<Self>) {
+        self.note_effort_pick(word);
+        cx.notify();
+    }
+
+    fn note_effort_pick(&mut self, word: String) {
+        let (Some(id), Some(control)) = (self.active_coworker_id.clone(), self.effort_control())
+        else {
+            return;
+        };
+        self.effort_pick = (word != control.kept_word()).then_some((id, word));
+    }
+
+    /// The effort Save sends: the pick, when it differs from what the server keeps. Otherwise the
+    /// key stays off the patch, and the stored effort is left alone.
+    pub fn effort_to_save(&self) -> Option<String> {
+        self.effort_control()
+            .filter(EffortControl::unsaved)
+            .map(|control| control.shown)
+    }
+
+    /// A patch carrying the pick was stored, so the control goes back to showing the roster, which
+    /// now holds the word the server answered with: the pick, or whatever a server that dropped it
+    /// kept instead. A pick made while the patch was out is a newer one, and stays.
+    fn settle_effort_pick(&mut self, coworker_id: &str, sent: &str) {
+        if self
+            .effort_pick
+            .as_ref()
+            .is_some_and(|(bot, word)| bot == coworker_id && word == sent)
+        {
+            self.effort_pick = None;
+        }
+    }
+
+    /// A driver pressing the bot settings' Save, which the pane takes and answers as the button.
+    pub fn request_agent_save(&mut self, cx: &mut Context<Self>) {
+        self.agent_save_requested = true;
+        cx.notify();
+    }
+
+    /// Whether a driver pressed Save since the pane last asked. Each press is answered once.
+    pub fn take_agent_save_request(&mut self) -> bool {
+        std::mem::take(&mut self.agent_save_requested)
     }
 
     pub fn close_right_pane(&mut self, cx: &mut Context<Self>) {
@@ -8648,9 +8744,14 @@ impl AppState {
                 }
                 match result.as_ref() {
                     Ok(_) => {
+                        if let Some(sent) = patch.effort.as_deref() {
+                            state.settle_effort_pick(&id, sent);
+                        }
                         state.auth_error = None;
                         state.note_server_answered(cx);
                     }
+                    // A refused pick stays on the control, as refused words stay in the fields,
+                    // with the server's sentence under them.
                     Err(error) => state.note_failure(error, cx),
                 }
                 cx.notify();
@@ -9035,6 +9136,11 @@ impl AppState {
         let Some(coworker) = self.coworkers.iter().find(|c| c.id == id).cloned() else {
             return;
         };
+        // An effort picked and not saved goes with the switch, as the words typed into the
+        // settings' fields do: those fill afresh with the next bot's own.
+        if self.active_coworker_id.as_deref() != Some(id.as_str()) {
+            self.effort_pick = None;
+        }
         self.active_coworker_id = Some(id.clone());
         // A bot chosen is a chat: the main slot leaves whatever page it was on.
         self.page = MainPage::Chat;
@@ -16427,6 +16533,9 @@ fn apply_patch(coworker: &mut Coworker, patch: &CoworkerPatch) {
     if let Some(color) = patch.avatar_color.as_deref() {
         coworker.avatar_color = some_unless_blank(color);
     }
+    if let Some(effort) = patch.effort.as_ref() {
+        coworker.effort = Some(effort.clone());
+    }
 }
 
 /// The roster's copy of a coworker once the server has answered, for the fields the patch
@@ -16484,6 +16593,11 @@ fn settle_patch(
             answered && some_unless_blank(color).is_none(),
             before.avatar_color.clone(),
         );
+    }
+    // The echo's word, even when it is not the one sent: a server that drops the effort answers
+    // without one, and the settings must go back to saying so rather than keep the pick.
+    if patch.effort.is_some() {
+        coworker.effort = echo.map_or_else(|| before.effort.clone(), |c| c.effort.clone());
     }
 }
 
@@ -19912,7 +20026,7 @@ mod tests {
 
     // The patch reconciliation, apart from the app: what the roster holds for a coworker once
     // the server has answered.
-    use super::{Coworker, CoworkerPatch, apply_patch, settle_patch};
+    use super::{Coworker, CoworkerPatch, EffortControl, apply_patch, settle_patch};
 
     fn bob() -> Coworker {
         Coworker {
@@ -19926,6 +20040,7 @@ mod tests {
             updated_at_ms: 17,
             hidden_from_sidebar: false,
             box_id: None,
+            effort: Some("high".to_string()),
         }
     }
 
@@ -20012,12 +20127,14 @@ mod tests {
             updated_at_ms: 0,
             hidden_from_sidebar: false,
             box_id: None,
+            effort: None,
         };
         settle_patch(&mut roster, &patch, Some(&echo), &before);
         assert_eq!(roster.model, "xai/grok-4.7@sub");
         assert_eq!(roster.name, "Bob", "a partial answer blanks nothing else");
         assert_eq!(roster.title.as_deref(), Some("Analyst"));
         assert_eq!(roster.updated_at_ms, 17);
+        assert_eq!(roster.effort.as_deref(), Some("high"));
     }
 
     /// Clearing is the one thing an answer with nothing in it confirms: the avatar the person
@@ -20040,6 +20157,104 @@ mod tests {
         settle_patch(&mut roster, &patch, Some(&echo), &before);
         assert_eq!(roster.avatar_shape, None);
         assert_eq!(roster.avatar_color, None);
+    }
+
+    /// An effort is the server's once it answers: the word it echoed, even when that is not the
+    /// word sent (a server that dropped it echoes none, and the settings go back to saying so),
+    /// and the word from before when it refused.
+    #[test]
+    fn an_effort_settles_on_the_servers_word() {
+        let before = bob();
+        let patch = CoworkerPatch {
+            effort: Some("max".to_string()),
+            ..Default::default()
+        };
+        let mut roster = before.clone();
+        apply_patch(&mut roster, &patch);
+        assert_eq!(roster.effort(), "max", "the pick is answered at once");
+
+        let mut stored = roster.clone();
+        let echo = Coworker {
+            effort: Some("max".to_string()),
+            ..before.clone()
+        };
+        settle_patch(&mut stored, &patch, Some(&echo), &before);
+        assert_eq!(stored.effort(), "max");
+
+        let mut dropped = roster.clone();
+        let echo = Coworker {
+            effort: None,
+            ..before.clone()
+        };
+        settle_patch(&mut dropped, &patch, Some(&echo), &before);
+        assert_eq!(dropped.effort, None, "the server said it keeps none");
+
+        settle_patch(&mut roster, &patch, None, &before);
+        assert_eq!(roster, before);
+    }
+
+    /// Save carries the effort only when the pick differs from what the server keeps. Picking
+    /// the kept word takes the pick back, a pick is the bot's it was made for and no other's, and
+    /// a stored pick hands the control back to the roster unless a newer one was made meanwhile.
+    #[test]
+    fn save_carries_the_effort_only_when_the_pick_changed_it() {
+        let mut state = AppState::new();
+        state.coworkers = vec![
+            bob(),
+            Coworker {
+                id: "cw_2".to_string(),
+                ..bob()
+            },
+        ];
+        state.active_coworker_id = Some("cw_1".to_string());
+        let untouched = state.effort_control().unwrap();
+        assert_eq!(untouched.shown, "high");
+        assert!(!untouched.unsaved());
+        assert_eq!(state.effort_to_save(), None, "nothing picked, nothing sent");
+
+        state.note_effort_pick("max".to_string());
+        let picked = state.effort_control().unwrap();
+        assert_eq!((picked.kept_word(), picked.shown.as_str()), ("high", "max"));
+        assert!(picked.unsaved());
+        assert_eq!(state.effort_to_save().as_deref(), Some("max"));
+
+        state.note_effort_pick("high".to_string());
+        assert_eq!(state.effort_to_save(), None, "the kept word is no change");
+
+        state.note_effort_pick("low".to_string());
+        state.active_coworker_id = Some("cw_2".to_string());
+        assert_eq!(state.effort_control().unwrap().shown, "high");
+        assert_eq!(state.effort_to_save(), None);
+        state.active_coworker_id = Some("cw_1".to_string());
+
+        state.settle_effort_pick("cw_1", "max");
+        assert_eq!(
+            state.effort_to_save().as_deref(),
+            Some("low"),
+            "a pick made while the patch was out is a newer one"
+        );
+        state.settle_effort_pick("cw_1", "low");
+        assert_eq!(state.effort_to_save(), None);
+    }
+
+    /// A server from before opengrok-server#271 keeps no effort. The control shows what that
+    /// server's turns run with, which is inherit, and Save has nothing to send.
+    #[test]
+    fn a_server_that_keeps_no_effort_shows_inherit() {
+        let mut state = AppState::new();
+        state.coworkers = vec![Coworker {
+            effort: None,
+            ..bob()
+        }];
+        state.active_coworker_id = Some("cw_1".to_string());
+        assert_eq!(
+            state.effort_control(),
+            Some(EffortControl {
+                kept: None,
+                shown: "inherit".to_string(),
+            })
+        );
+        assert_eq!(state.effort_to_save(), None);
     }
 
     // ---- A turn survives looking away -------------------------------------------------------

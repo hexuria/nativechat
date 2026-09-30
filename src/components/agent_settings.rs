@@ -4,15 +4,20 @@ use crate::chrome::{
 };
 use crate::components::fields::field_input;
 use crate::components::persona::PersonaMark;
-use crate::opengrok::{CeilingRow, CoworkerPatch, CoworkerTool, ModelEntry, USER_MACHINE_SHELL};
+use crate::opengrok::{
+    CeilingRow, CoworkerPatch, CoworkerTool, EFFORT_INHERIT, EFFORT_WORDS, ModelEntry,
+    USER_MACHINE_SHELL,
+};
 use crate::state::{
-    AppState, CeilingBlock, CeilingCard, CeilingSwitch, ToolCeiling, ToolList, UsageReport,
+    AppState, CeilingBlock, CeilingCard, CeilingSwitch, EffortControl, ToolCeiling, ToolList,
+    UsageReport,
 };
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{
     IndentInline, Input, InputEvent, InputState, MoveDown, MoveUp, OutdentInline, Textarea,
     TextareaState,
 };
+use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::popover::Popover;
 use gpui_kit::component::{ActiveTheme, Disableable, Icon, IconName, Selectable, v_flex};
 use gpui_kit::prelude::FluentBuilder;
@@ -164,6 +169,15 @@ impl AgentSettings {
                 this.model_query_live = false;
             }
             this.model_open = open;
+            // A driver's Save, which comes by way of the app because the button and the fields
+            // it sends are this pane's. Only for the bot the fields were filled for: a switch the
+            // pane has not drawn yet leaves them holding the last bot's words, and those must
+            // not be saved onto this one.
+            if state.update(cx, |state, _| state.take_agent_save_request())
+                && this.synced_id == state.read(cx).active_coworker_id
+            {
+                this.commit_profile(cx);
+            }
             cx.notify();
         })
         .detach();
@@ -334,6 +348,9 @@ impl AgentSettings {
             title: Some(self.label_input.read(cx).value().to_string()),
             role: Some(self.role_input.read(cx).value().to_string()),
             model: (!model.is_empty()).then_some(model),
+            // Only a pick that changes it. The word the pane last read, sent back with every
+            // Save, would undo an effort set since from another Mac, and nobody here touched it.
+            effort: self.state.read(cx).effort_to_save(),
             ..Default::default()
         };
         self.saving = true;
@@ -477,6 +494,7 @@ impl Render for AgentSettings {
                 state.avatar_editor_open,
             )
         };
+        let effort = self.state.read(cx).effort_control();
         let model_focus = self.model_input.read(cx).focus_handle(cx);
         // The list is what the filter leaves of the catalogue, and the row Enter takes is
         // counted over that rather than over the catalogue behind it.
@@ -806,6 +824,14 @@ impl Render for AgentSettings {
                                                 .text_color(muted)
                                                 .child(note),
                                         )
+                                    })
+                                    .when_some(effort, |this, effort| {
+                                        this.child(effort_card(
+                                            app.clone(),
+                                            effort,
+                                            muted,
+                                            theme.border,
+                                        ))
                                     })
                                     .child(
                                         div()
@@ -1397,6 +1423,138 @@ fn model_picker_panel(
         })
 }
 
+/// What the Effort card says under its name. Some models ignore an effort and the server cannot
+/// know which, so the card says so rather than promise a change the model may not make.
+const EFFORT_LINE: &str = "How hard the Bot thinks before it answers. Some models ignore this.";
+
+/// The same, from a server that keeps no effort (one from before opengrok-server#271). The menu
+/// is dead there: a pick would look saved and change nothing.
+const EFFORT_NOT_KEPT: &str = "How hard the Bot thinks before it answers. Not available yet: \
+                               this server has nowhere to keep it.";
+
+/// What Inherit means, under it in the menu. It is the default, and the one that sends nothing.
+const INHERIT_MEANING: &str = "Let the model decide";
+
+/// The five a person picks from. The server keeps two more, `none` and `xhigh`, which a bot can
+/// carry when something other than this pane set it: the menu shows one of those, as it is,
+/// while the bot has it, and does not offer it otherwise.
+const OFFERED_EFFORTS: [&str; 5] = ["inherit", "low", "medium", "high", "max"];
+
+/// The Effort menu's choices, in the server's order: the five on offer, and the word the bot
+/// already has when it is none of those (`none`, `xhigh`, or one this app has not heard of,
+/// which goes last), so the menu never shows a value the server does not hold.
+pub(crate) fn effort_choices(kept: &str) -> Vec<String> {
+    let mut choices: Vec<String> = EFFORT_WORDS
+        .into_iter()
+        .filter(|word| OFFERED_EFFORTS.contains(word) || *word == kept)
+        .map(str::to_string)
+        .collect();
+    if !choices.iter().any(|word| word == kept) {
+        choices.push(kept.to_string());
+    }
+    choices
+}
+
+/// A choice as the menu names it: the five on offer by name, and any other word as it is, since
+/// this app has no name of its own for it.
+pub(crate) fn effort_label(word: &str) -> String {
+    match word {
+        "inherit" => "Inherit",
+        "low" => "Low",
+        "medium" => "Medium",
+        "high" => "High",
+        "max" => "Max",
+        other => other,
+    }
+    .to_string()
+}
+
+/// The Effort card: what it is, and a menu of how hard the Bot thinks, laid out as Settings →
+/// Computer lays out a mode, the words on the left and the menu on the right. A pick waits for
+/// Save with the rest of the pane.
+fn effort_card(
+    app: Entity<AppState>,
+    effort: EffortControl,
+    muted: Hsla,
+    border: Hsla,
+) -> impl IntoElement {
+    let line = if effort.kept.is_some() {
+        EFFORT_LINE
+    } else {
+        EFFORT_NOT_KEPT
+    };
+    div()
+        .id("agent-effort-card")
+        .mt(px(14.))
+        .px(px(14.))
+        .py(px(12.))
+        .rounded(px(10.))
+        .border_1()
+        .border_color(border)
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap(px(10.))
+                .child(
+                    v_flex()
+                        .flex_1()
+                        .min_w(px(0.))
+                        .gap(px(2.))
+                        .child(div().text_sm().child("Effort"))
+                        .child(div().text_xs().text_color(muted).child(line)),
+                )
+                .child(effort_menu(app, effort, muted)),
+        )
+}
+
+/// The menu: a button naming the word the pane holds, opening onto the choices with that word
+/// ticked. From a server that keeps no effort it is the button alone, and dead.
+fn effort_menu(app: Entity<AppState>, effort: EffortControl, muted: Hsla) -> AnyElement {
+    let button = Button::new("agent-effort")
+        .label(effort_label(&effort.shown))
+        .ghost()
+        .compact()
+        .icon(IconName::ChevronDown);
+    if effort.kept.is_none() {
+        return button.disabled(true).into_any_element();
+    }
+    let choices = effort_choices(effort.kept_word());
+    let shown = effort.shown;
+    button
+        .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, _, _| {
+            choices.iter().fold(menu, |menu, word| {
+                menu.item(effort_item(&app, word, *word == shown, muted))
+            })
+        })
+        .into_any_element()
+}
+
+/// One choice. Its row carries the id a driver clicks, `agent-effort-{word}`, and Inherit says
+/// under its name what it means.
+fn effort_item(app: &Entity<AppState>, word: &str, current: bool, muted: Hsla) -> PopupMenuItem {
+    let id = SharedString::from(format!("agent-effort-{word}"));
+    let label = effort_label(word);
+    let meaning = (word == EFFORT_INHERIT).then_some(INHERIT_MEANING);
+    let app = app.clone();
+    let word = word.to_string();
+    PopupMenuItem::element(move |_, _| {
+        v_flex()
+            .id(id.clone())
+            .gap(px(2.))
+            .child(div().child(label.clone()))
+            .when_some(meaning, |this, meaning| {
+                this.child(div().text_xs().text_color(muted).child(meaning))
+            })
+    })
+    .checked(current)
+    .on_click(move |_, _, cx| {
+        cx.stop_propagation();
+        app.update(cx, |state, cx| state.pick_effort(word.clone(), cx));
+    })
+}
+
 impl AgentSettings {
     fn auto_review_body(&self, mode: AutoReviewMode, cx: &mut Context<Self>) -> impl IntoElement {
         v_flex()
@@ -1451,10 +1609,39 @@ mod tests {
     // Named imports, not a glob: `use super::*` would pull GPUI's `test` attribute in over the
     // one the test harness wants.
     use super::{
-        FIRST_MATCH, current_model_row, filter_text, highlighted_model, matching_models,
-        stepped_highlight,
+        FIRST_MATCH, current_model_row, effort_choices, effort_label, filter_text,
+        highlighted_model, matching_models, stepped_highlight,
     };
     use crate::opengrok::ModelEntry;
+
+    /// The menu offers five, in the server's order, and never hides the word a bot already has:
+    /// `xhigh` is shown as it is, in its place between High and Max, and so is `none`, and a word
+    /// from a newer server goes last. Once the bot has an offered word, the extra one is gone.
+    #[test]
+    fn the_effort_menu_shows_a_kept_word_it_does_not_offer_as_it_is() {
+        let offered = vec!["inherit", "low", "medium", "high", "max"];
+        assert_eq!(effort_choices("inherit"), offered);
+        assert_eq!(effort_choices("high"), offered);
+        assert_eq!(
+            effort_choices("xhigh"),
+            vec!["inherit", "low", "medium", "high", "xhigh", "max"]
+        );
+        assert_eq!(effort_label("xhigh"), "xhigh");
+        assert_eq!(
+            effort_choices("none"),
+            vec!["inherit", "none", "low", "medium", "high", "max"]
+        );
+        assert_eq!(effort_label("none"), "none");
+        assert_eq!(
+            effort_choices("ultra").last().map(String::as_str),
+            Some("ultra")
+        );
+        assert_eq!(effort_label("ultra"), "ultra");
+        assert_eq!(
+            ["inherit", "low", "medium", "high", "max"].map(effort_label),
+            ["Inherit", "Low", "Medium", "High", "Max"]
+        );
+    }
 
     fn catalogue() -> Vec<ModelEntry> {
         [

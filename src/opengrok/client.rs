@@ -6154,6 +6154,102 @@ mod tests {
         assert_eq!(updated.role.as_deref(), Some("Research, marketing, admin"));
     }
 
+    /// A Save that changed the effort carries it as the word, and one that did not leaves the key
+    /// off, which the server reads as "leave it alone" (opengrok-server#271). The answer is the
+    /// row as the server now keeps it, effort and all.
+    #[tokio::test]
+    async fn a_patch_carries_the_effort_only_when_it_changed() {
+        let server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .and(path("/coworkers/cw_1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "cw_1",
+                "name": "Bob",
+                "model": "oag/cheap",
+                "effort": "high"
+            })))
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        let changed = client
+            .patch_coworker(
+                "cw_1",
+                &CoworkerPatch {
+                    name: Some("Bob".into()),
+                    effort: Some("high".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(changed.effort.as_deref(), Some("high"));
+        client
+            .patch_coworker(
+                "cw_1",
+                &CoworkerPatch {
+                    name: Some("Bob".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let requests = server.received_requests().await.expect("both patches went");
+        let bodies: Vec<Value> = requests
+            .iter()
+            .map(|request| serde_json::from_slice(&request.body).unwrap())
+            .collect();
+        assert_eq!(
+            bodies,
+            vec![
+                json!({"name": "Bob", "effort": "high"}),
+                json!({"name": "Bob"}),
+            ]
+        );
+    }
+
+    /// The server's two refusals of an effort reach the pane as the server words them: a word it
+    /// does not know (400, nothing changed), and a coworker shared with the caller, which only its
+    /// owner may change (403). Both are verdicts about what was asked, not an outage.
+    #[tokio::test]
+    async fn a_refused_effort_is_the_servers_sentence() {
+        let unknown = "effort must be one of inherit, none, low, medium, high, xhigh, max";
+        let shared = "only the person who hired this coworker can change it; you can hide it \
+                      from your own sidebar";
+        let server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .and(path("/coworkers/cw_1"))
+            .and(body_json(json!({"effort": "extreme"})))
+            .respond_with(ResponseTemplate::new(400).set_body_json(json!({"error": unknown})))
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path("/coworkers/cw_shared"))
+            .and(body_json(json!({"effort": "high"})))
+            .respond_with(ResponseTemplate::new(403).set_body_json(json!({"error": shared})))
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        for (id, word, status, said) in [
+            ("cw_1", "extreme", 400, unknown),
+            ("cw_shared", "high", 403, shared),
+        ] {
+            let error = client
+                .patch_coworker(
+                    id,
+                    &CoworkerPatch {
+                        effort: Some(word.into()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect_err("the server refused it");
+            assert_eq!(error.status, Some(status));
+            assert_eq!(error.message, said);
+            assert_eq!(error.failure(), Failure::Verdict);
+        }
+    }
+
     #[tokio::test]
     async fn answer_run_posts_call_id_and_approved() {
         let server = MockServer::start().await;

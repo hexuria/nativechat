@@ -2,8 +2,8 @@ use gpui_agent::prelude::*;
 use gpui_agent::{DispatchResult, virtual_unavailable};
 
 use crate::components::agent_settings::{
-    CeilingCardLine, ShownCeilingRow, ceiling_card_lines, ceiling_line, offered_without_switches,
-    shown_ceiling_rows, tools_summary,
+    CeilingCardLine, ShownCeilingRow, ceiling_card_lines, ceiling_line, effort_choices,
+    effort_label, offered_without_switches, shown_ceiling_rows, tools_summary,
 };
 use crate::components::app_settings::{
     NO_LOCAL_RULES, not_in_effect_line, remove_label, rule_list_title,
@@ -565,6 +565,10 @@ pub enum Command {
     },
     ToggleAgentTools,
     ToggleAgentUsage,
+    /// A choice in the bot settings' Effort menu. It waits for Save, as a person's pick does.
+    PickEffort(String),
+    /// The bot settings' Save.
+    SaveAgentSettings,
     /// A switch on the Tools card: one row of the open Bot's ceiling on or off, sent at once.
     SetCeilingTool {
         name: String,
@@ -786,6 +790,8 @@ impl Command {
             Self::ChoiceDismiss { message_id } => state.dismiss_choice(message_id, cx),
             Self::ToggleAgentTools => state.toggle_agent_tools(cx),
             Self::ToggleAgentUsage => state.toggle_agent_usage(cx),
+            Self::PickEffort(word) => state.pick_effort(word, cx),
+            Self::SaveAgentSettings => state.request_agent_save(cx),
             Self::SetCeilingTool { name, enabled } => state.switch_ceiling_tool(name, enabled, cx),
             Self::AttachFile(path) => state.request_attach(path, cx),
             Self::DetachFile(index) => state.request_detach(index, cx),
@@ -1523,6 +1529,29 @@ fn choice_node(choice: &ChoiceSnap) -> UiNode {
     ))
 }
 
+/// `agent-effort` (a menu; value = the word it shows, state `unsaved` while that is a pick Save
+/// has not sent), with one `agent-effort-{word}` per choice it offers (label as the menu reads
+/// it, state `selected` on the one shown). All of it is disabled from a server that keeps no
+/// effort, where the menu is dead.
+fn agent_effort_node(effort: &crate::state::EffortControl) -> UiNode {
+    let live = effort.kept.is_some();
+    let mut menu = UiNode::new("agent-effort", "menu", "Effort")
+        .with_value(effort.shown.clone())
+        .with_enabled(live);
+    if effort.unsaved() {
+        menu.states.push("unsaved".into());
+    }
+    for word in effort_choices(effort.kept_word()) {
+        let mut choice =
+            UiNode::button(format!("agent-effort-{word}"), effort_label(&word)).with_enabled(live);
+        if word == effort.shown {
+            choice.states.push("selected".into());
+        }
+        menu = menu.with_child(choice);
+    }
+    menu
+}
+
 /// The open Bot's Tools card as its settings draw it: what the next turn is offered, and the
 /// switches of its ceiling (opengrok-server#268).
 struct ToolsCardSnap<'a> {
@@ -2127,6 +2156,8 @@ pub struct NativeChatHost {
     agent_usage: Option<crate::state::UsageReport>,
     agent_usage_open: bool,
     agent_tools_open: bool,
+    /// The open bot's Effort menu, as its settings draw it.
+    agent_effort: Option<crate::state::EffortControl>,
     model_picker_open: bool,
     avatar_editor_open: bool,
     approvals: Vec<ApprovalSnap>,
@@ -2330,6 +2361,7 @@ impl NativeChatHost {
                 .as_ref()
                 .filter(|(owner, _)| state.active_coworker_id.as_deref() == Some(owner.as_str()))
                 .map(|(_, report)| report.clone()),
+            agent_effort: state.effort_control(),
             model_picker_open: state.model_picker_open,
             avatar_editor_open: state.avatar_editor_open,
             approvals: state
@@ -3082,6 +3114,9 @@ impl NativeChatHost {
                     .with_value(self.model_count.to_string())
                     .with_visible(self.model_picker_open),
             );
+        if let Some(effort) = &self.agent_effort {
+            settings = settings.with_child(agent_effort_node(effort));
+        }
         if self.agent_tools.is_some() || self.agent_ceiling.is_some() {
             settings = settings.with_child(agent_tools_node(&ToolsCardSnap {
                 tools: self.agent_tools.as_ref(),
@@ -3124,6 +3159,11 @@ impl NativeChatHost {
             // assertion that the gateway answered.
             settings = settings.with_child(UiNode::status("agent-model-note", note.clone()));
         }
+        // The pane's red line over Save, where a refused Save says why in the server's words.
+        if let Some(error) = &self.auth_error {
+            settings = settings.with_child(UiNode::status("agent-settings-error", error.clone()));
+        }
+        settings = settings.with_child(UiNode::button(ids::AGENT_SAVE, "Save"));
 
         UiTree {
             app: "nativechat".into(),
@@ -4347,6 +4387,19 @@ impl NativeChatHost {
                 );
             }
             Command::ToggleAgentUsage
+        } else if target == ids::AGENT_SAVE {
+            if !self.agent_settings_open {
+                return Err("`agent-save` is in the bot's settings, which are closed".into());
+            }
+            Command::SaveAgentSettings
+        } else if target == "agent-effort" {
+            return Err(
+                "`agent-effort` is the menu: a pick is a click on its choice, \
+                 `agent-effort-{word}`"
+                    .into(),
+            );
+        } else if let Some(word) = target.strip_prefix("agent-effort-") {
+            self.effort_command(target, word)?
         } else if target == "agent-model-field" || target == "agent-model-dismiss" {
             Command::ToggleModelPicker
         } else if target == "avatar-trigger" || target == "avatar-editor-dismiss" {
@@ -4742,6 +4795,33 @@ impl NativeChatHost {
             [] => Err("no idle user-form".into()),
             _ => Err("user-form invoke requires arg card_key".into()),
         }
+    }
+
+    /// A choice in the bot settings' Effort menu. Refused while the settings are closed, from a
+    /// server that keeps no effort, where the menu is dead, and for a word the menu does not offer.
+    fn effort_command(&self, target: &str, word: &str) -> Result<Command, String> {
+        if !self.agent_settings_open {
+            return Err(format!(
+                "`{target}` is in the bot's settings, which are closed"
+            ));
+        }
+        let Some(effort) = &self.agent_effort else {
+            return Err(format!("`{target}` is not on screen: no bot is open"));
+        };
+        if effort.kept.is_none() {
+            return Err(format!(
+                "`{target}` is dead: this server keeps no effort (it is from before \
+                 opengrok-server#271)"
+            ));
+        }
+        let choices = effort_choices(effort.kept_word());
+        if !choices.iter().any(|choice| choice == word) {
+            return Err(format!(
+                "no effort `{word}` in the menu, which offers {}",
+                choices.join(", ")
+            ));
+        }
+        Ok(Command::PickEffort(word.to_string()))
     }
 
     /// A button under one connected computer's local-exec mode.
@@ -9358,5 +9438,120 @@ mod tests {
         host.agent_usage = Some(crate::state::UsageReport::Loading);
         assert!(host.snapshot().find("agent-usage-toggle").is_none());
         assert!(host.dispatch(&Op::click("agent-usage-toggle")).is_err());
+    }
+
+    /// The Effort menu is on the tree with the word it shows as its value and one choice per word
+    /// it offers, and a driver picks from it by the road a person's click takes. `xhigh`, which
+    /// the menu does not offer, is shown as it is while the bot has it.
+    #[test]
+    fn the_effort_menu_is_on_the_tree_and_a_driver_picks_from_it() {
+        use crate::state::EffortControl;
+        let mut host = host();
+        host.agent_settings_open = true;
+        host.agent_effort = Some(EffortControl {
+            kept: Some("xhigh".into()),
+            shown: "xhigh".into(),
+        });
+        let tree = host.snapshot();
+        let menu = tree.find("agent-effort").unwrap();
+        assert_eq!(menu.value.as_deref(), Some("xhigh"));
+        assert!(menu.enabled && menu.states.is_empty(), "{menu:?}");
+        let choices: Vec<&str> = menu.children.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(
+            choices,
+            [
+                "agent-effort-inherit",
+                "agent-effort-low",
+                "agent-effort-medium",
+                "agent-effort-high",
+                "agent-effort-xhigh",
+                "agent-effort-max",
+            ]
+        );
+        let kept = tree.find("agent-effort-xhigh").unwrap();
+        assert_eq!(kept.name, "xhigh");
+        assert_eq!(kept.states, vec!["selected".to_string()]);
+        assert_eq!(tree.find("agent-effort-inherit").unwrap().name, "Inherit");
+
+        host.dispatch(&Op::click("agent-effort-high")).unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::PickEffort(word)) if word == "high"
+        ));
+        assert!(
+            host.dispatch(&Op::click("agent-effort-none")).is_err(),
+            "a word the menu does not offer"
+        );
+        assert!(
+            host.dispatch(&Op::click("agent-effort")).is_err(),
+            "the menu is not a choice"
+        );
+
+        // Picked, and not saved yet.
+        host.agent_effort = Some(EffortControl {
+            kept: Some("xhigh".into()),
+            shown: "high".into(),
+        });
+        let tree = host.snapshot();
+        let menu = tree.find("agent-effort").unwrap();
+        assert_eq!(menu.value.as_deref(), Some("high"));
+        assert_eq!(menu.states, vec!["unsaved".to_string()]);
+        assert_eq!(
+            tree.find("agent-effort-high").unwrap().states,
+            vec!["selected".to_string()]
+        );
+        assert!(tree.find("agent-effort-xhigh").unwrap().states.is_empty());
+
+        host.agent_settings_open = false;
+        assert!(
+            host.dispatch(&Op::click("agent-effort-high")).is_err(),
+            "the settings are closed"
+        );
+    }
+
+    /// From a server that keeps no effort the menu is on the tree reading inherit, and dead: a
+    /// click on a choice is refused rather than making a pick nothing would keep.
+    #[test]
+    fn the_effort_menu_is_dead_where_the_server_keeps_no_effort() {
+        use crate::state::EffortControl;
+        let mut host = host();
+        host.agent_settings_open = true;
+        host.agent_effort = Some(EffortControl {
+            kept: None,
+            shown: "inherit".into(),
+        });
+        let tree = host.snapshot();
+        let menu = tree.find("agent-effort").unwrap();
+        assert_eq!(menu.value.as_deref(), Some("inherit"));
+        assert!(!menu.enabled);
+        assert!(!tree.find("agent-effort-high").unwrap().enabled);
+        assert!(host.dispatch(&Op::click("agent-effort-high")).is_err());
+        assert!(host.take_command().is_none());
+    }
+
+    /// Save is on the tree and pressed by way of the app, since the fields it sends are the
+    /// pane's; a refused Save is on the tree in the server's words, where the pane shows it.
+    #[test]
+    fn a_driver_saves_the_bots_settings_and_reads_a_refusal() {
+        let mut host = host();
+        assert!(
+            host.dispatch(&Op::click(ids::AGENT_SAVE)).is_err(),
+            "the settings are closed"
+        );
+        host.agent_settings_open = true;
+        assert!(host.snapshot().find(ids::AGENT_SAVE).is_some());
+        host.dispatch(&Op::click(ids::AGENT_SAVE)).unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::SaveAgentSettings)
+        ));
+
+        assert!(host.snapshot().find("agent-settings-error").is_none());
+        let said = "effort must be one of inherit, none, low, medium, high, xhigh, max";
+        host.auth_error = Some(said.into());
+        assert_eq!(
+            host.snapshot().find("agent-settings-error").unwrap().name,
+            said
+        );
     }
 }
