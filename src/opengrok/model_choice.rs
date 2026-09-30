@@ -5,17 +5,23 @@
 //! No GPUI. The composer's chip and the Bot's card in its settings both draw what is here
 //! (`components::model_picker`), and the gpui-agent tree names it, so the three always agree.
 //!
-//! A Bot's setting is three things its row keeps: the door (`source`, opengrok-server contract
-//! proposed 2026-09-30 (Part A), not yet recorded), the model it is pinned to (`model`), and how
-//! hard it thinks (`effort`, opengrok-server#271). Fast is not a fourth. opencodex lists a model's
-//! fast tier as a twin id, `gpt-6-luna--fast` beside `gpt-6-luna`, and the server's allowlist
-//! takes the tier off before it reads the rest ([`is_subscription_model`]), so ⚡ is the pin moved
-//! to the twin and back, offered only where the list holds both.
+//! A Bot's setting is three things its row keeps: the door (`source`, opengrok-server
+//! `bot-model-source`, confirmed 2026-09-30, not yet recorded), the model it is pinned to
+//! (`model`), and how hard it thinks (`effort`, opengrok-server#271). Fast is not a fourth.
+//! opencodex lists a model's fast tier as a twin id, `gpt-6-luna--fast` beside `gpt-6-luna`, and
+//! the server's allowlist takes the tier off before it reads the rest ([`is_subscription_model`]),
+//! so ⚡ is the pin moved to the twin and back, offered only where the list holds both.
 //!
 //! What the chip says is what the server would run the Bot's next turn on, as far as this app can
-//! tell, and never a pin the server would ignore. On the person's plan the server takes the Bot's
-//! pin only when its allowlist does, and the account's plan model otherwise (the contract above);
-//! a server from before per-Bot doors takes the account's plan model for every Bot on the plan.
+//! tell, and never a pin the server would ignore. On the person's plan the server asks the Bot's
+//! pin only where the Bot's own door is the plan (`source: "local_proxy"`) and its allowlist takes
+//! the pin, and the account's plan model otherwise (`ahead_of_the_setting` in opengrok-server's
+//! `crates/opengrok-harness/src/local_proxy.rs`, on `bot-model-source`, confirmed 2026-09-30). A
+//! Bot that follows the account (`source: null`), or is on the gateway, runs a turn on the plan
+//! with the account's plan model whatever it is pinned to: every Bot hired by default is pinned
+//! `xai/grok-4.6`, which the allowlist takes, and that pin is a gateway route, not the plan model
+//! the person chose. A server from before per-Bot doors takes the account's plan model for every
+//! Bot on the plan.
 
 use super::{
     Coworker, CoworkerPatch, CoworkerSource, EFFORT_INHERIT, InferenceKind, InferenceSource,
@@ -273,11 +279,13 @@ pub struct ModelPick {
     /// offer the plan's models and a pick send a door.
     pub per_bot: bool,
     /// The Bot's own door, when its row names one this app knows. `None` follows the account's.
+    /// Only a Bot whose own door is the plan is answered there with its pin.
     pub bot_door: Option<InferenceKind>,
     /// The door the Bot's next turn goes through, when this app can tell.
     pub door: Option<InferenceKind>,
     /// The model the next turn runs on, when this app can tell: the Bot's pin, or on the
-    /// person's plan the account's plan model wherever the server would not take the pin.
+    /// person's plan the account's plan model, unless the Bot's own door is the plan and the
+    /// allowlist takes its pin.
     pub model: Option<String>,
     /// The Bot's pin, as its row keeps it.
     pub pin: String,
@@ -338,9 +346,15 @@ pub fn bot_pick(
     };
     let pin = Some(bot.model.clone()).filter(|pin| !pin.trim().is_empty());
     let account_model = account.and_then(account_plan_model);
+    // On the plan the server asks the pin only of a Bot whose own door is the plan, and only a
+    // pin its allowlist takes; any other Bot there runs on the account's plan model
+    // (opengrok-server `bot-model-source`, confirmed 2026-09-30). A Bot that follows the account
+    // may well hold a pin the allowlist takes, as every default hire's `xai/grok-4.6` is, and that
+    // pin is not the plan model the person chose.
     let model = match door {
         Some(InferenceKind::LocalProxy)
-            if per_bot && pin.as_deref().is_some_and(is_subscription_model) =>
+            if bot_door == Some(InferenceKind::LocalProxy)
+                && pin.as_deref().is_some_and(is_subscription_model) =>
         {
             pin.clone()
         }
@@ -946,9 +960,9 @@ mod tests {
         assert_eq!(pick.fast_blocked, Some(FAST_DOOR_UNKNOWN));
     }
 
-    /// On the person's plan the server takes a Bot's pin only when its allowlist does. A Bot that
-    /// follows the account onto the plan with a gateway pin runs on the account's plan model, and
-    /// the chip says so; ⚡ and a pick then pin that model with its door, so the pick sticks.
+    /// On the person's plan a Bot that follows the account runs on the account's plan model, a
+    /// gateway pin as much as any, and the chip says so; ⚡ and a pick then pin that model with its
+    /// door, so the pick sticks. On its own plan a Bot runs on a pin the allowlist takes.
     #[test]
     fn a_pin_the_plan_would_not_take_shows_the_accounts_plan_model() {
         let follows = bot(Some(Value::Null), "xai/grok-4.6@sub", Some("medium"));
@@ -967,8 +981,8 @@ mod tests {
             serde_json::to_value(pick.fast_patch(true).unwrap()).unwrap(),
             json!({"model": "gpt-6-luna--fast", "source": "local_proxy"})
         );
-        // A pin the allowlist takes is the Bot's own, and the account's model is not.
-        let pinned = bot(Some(Value::Null), "gpt-5.6-sol", Some("medium"));
+        // On its own plan, a pin the allowlist takes is the Bot's, and the account's model is not.
+        let pinned = bot(Some(json!("local_proxy")), "gpt-5.6-sol", Some("medium"));
         let pick = bot_pick(&pinned, Some(&on_plan), &catalogue(SERVER), plan(PLAN));
         assert_eq!(pick.chip_label(), "GPT-5.6 Sol · Medium");
         // An account with no plan model and a pin it will not take: no model to name.
@@ -979,6 +993,51 @@ mod tests {
             plan(PLAN),
         );
         assert_eq!(pick.chip_label(), "No model · Medium");
+    }
+
+    /// On the person's plan the server asks a Bot's pin only when the Bot's own door is the plan
+    /// (opengrok-server `bot-model-source`, confirmed 2026-09-30). A Bot that follows the account
+    /// there runs on the account's plan model even with a pin the allowlist takes: the chip names
+    /// that model, the list ticks it, and ⚡ moves to its twin with the Bot's own door, so the
+    /// pick sticks. A pick of the pin's own row sends the door alone. The same Bot on its own
+    /// plan runs on its pin.
+    #[test]
+    fn a_bot_that_follows_the_account_shows_the_plan_model_and_not_its_pin() {
+        const LISTED: &[&str] = &["gpt-6-luna", "gpt-6-luna--fast", "gpt-6-sol"];
+        let on_plan = account(InferenceKind::LocalProxy, Some("gpt-6-luna"));
+        let follows = bot(Some(Value::Null), "gpt-6-sol", Some("medium"));
+        let pick = bot_pick(&follows, Some(&on_plan), &catalogue(SERVER), plan(LISTED));
+        assert_eq!(pick.door, Some(InferenceKind::LocalProxy));
+        assert_eq!(pick.model.as_deref(), Some("gpt-6-luna"));
+        assert_eq!(pick.chip_label(), "GPT-6 Luna · Medium");
+        assert_eq!(
+            pick.current.as_ref().map(|row| row.base_id.as_str()),
+            Some("gpt-6-luna")
+        );
+        assert_eq!(pick.fast_blocked, None, "the account's model has a twin");
+        assert_eq!(
+            serde_json::to_value(pick.fast_patch(true).unwrap()).unwrap(),
+            json!({"model": "gpt-6-luna--fast", "source": "local_proxy"})
+        );
+        assert_eq!(
+            serde_json::to_value(
+                pick.pick_patch(InferenceKind::LocalProxy, "gpt-6-sol")
+                    .unwrap()
+            )
+            .unwrap(),
+            json!({"source": "local_proxy"}),
+            "pinned to it already: its own door is what puts the Bot on it"
+        );
+
+        let own = bot(Some(json!("local_proxy")), "gpt-6-sol", Some("medium"));
+        let pick = bot_pick(&own, Some(&on_plan), &catalogue(SERVER), plan(LISTED));
+        assert_eq!(pick.model.as_deref(), Some("gpt-6-sol"));
+        assert_eq!(pick.chip_label(), "GPT-6 Sol · Medium");
+        assert_eq!(
+            pick.current.as_ref().map(|row| row.base_id.as_str()),
+            Some("gpt-6-sol")
+        );
+        assert_eq!(pick.fast_blocked, Some(FAST_NO_TWIN));
     }
 
     /// Where the account's way to the plan is the person's Mac, the plan group is the models a
@@ -1009,6 +1068,10 @@ mod tests {
             "the Mac's models"
         );
         assert_eq!(pick.fast_blocked, None);
+        // Following the account, a pin the allowlist takes is not asked through the Mac either.
+        let pinned = bot(Some(Value::Null), "gpt-6-sol", Some("high"));
+        let pick = bot_pick(&pinned, Some(&relayed("mac")), &catalogue(SERVER), lists);
+        assert_eq!(pick.chip_label(), "Grok 4.7 · High");
 
         let pick = bot_pick(
             &follows,

@@ -637,19 +637,32 @@ const REST_FIELDS_NOT_RECORDED_YET: &[(&str, &str, &str)] = &[
         "GET__coworkers",
         "source",
         "A Bot's own door, `\"gateway\" | \"local_proxy\" | null` on every row, `null` for a Bot \
-         that follows the account's (opengrok-server contract proposed 2026-09-30, Part A, not \
-         yet recorded; coworker_matches reads it, and a row without it is a server that keeps no \
-         door per Bot). Its fixtures come with the server's Part A and the recording after it: a \
-         coworker row carrying `source`.",
+         that follows the account's (opengrok-server `bot-model-source`, confirmed 2026-09-30, \
+         not yet recorded: `coworker_row` writes it on every row the server answers with, and \
+         never leaves it out; coworker_matches reads it, and a row without it is a server that \
+         keeps no door per Bot). The server mounts no GET /coworkers/{id}: this list, a hire's \
+         answer and a PATCH's are where a Bot's door is read. Its fixtures come with the server's \
+         `bot-model-source` and the recording after it: a coworker row carrying `source`.",
+    ),
+    (
+        "POST__coworkers",
+        "source",
+        "A hire answers with the row the roster keeps (the same `coworker_row`), its door and all: \
+         `null` on a new Bot, which follows the account's door until it is given one of its own; \
+         coworker_matches reads it. Its fixtures come with the server's `bot-model-source` and \
+         the recording after it: a hire's row carrying `source`.",
     ),
     (
         "PATCH__coworkers__coworker_id_",
         "source",
-        "The model picker's PATCH sends the Bot's door with its model (the same contract), and the \
-         answer is the row carrying it. The server refuses with a 400 in its own words a patch \
-         that leaves the Bot on `local_proxy` with a model its subscription allowlist does not \
-         take, read as its sentence like every refusal of the route. Its fixtures come with Part \
-         A's recording: the row with its door, and that refusal.",
+        "The model picker's PATCH sends the Bot's door with its model (the same \
+         `bot-model-source`), and the answer is the row carrying it. The server refuses with a 400 \
+         in its own words, and writes nothing of the body, a patch that leaves the Bot on \
+         `local_proxy` with a model its subscription allowlist does not take, and a `source` that \
+         is neither of its two words (`source must be \"gateway\" or \"local_proxy\"`); each is \
+         read as its sentence like every refusal of the route. Its fixtures come with the \
+         server's `bot-model-source` and the recording after it: the row with its door, and those \
+         refusals.",
     ),
 ];
 
@@ -3425,10 +3438,11 @@ fn coworker_matches(coworker: &Coworker, raw: &Value) -> Check {
             && coworker.effort() == opt_str(raw, "effort").unwrap_or(EFFORT_INHERIT)
             && coworker.visibility.as_deref() == opt_str(raw, "visibility")
             && coworker.is_shared() == (opt_str(raw, "visibility") == Some("org"))
-            // `source` arrives with the per-Bot door (the contract proposed 2026-09-30, Part A,
-            // not yet recorded: REST_FIELDS_NOT_RECORDED_YET), and every recording from before it
-            // has none, a server that keeps no door per Bot. Once sent, `null` is the account's
-            // door, and a word is kept as sent, one this app has not heard of included.
+            // `source` arrives with the per-Bot door (opengrok-server `bot-model-source`,
+            // confirmed 2026-09-30, not yet recorded: REST_FIELDS_NOT_RECORDED_YET), and every
+            // recording from before it has none, a server that keeps no door per Bot. Once sent,
+            // `null` is the account's door, and a word is kept as sent, one this app has not
+            // heard of included.
             && coworker.source == door_as_sent(raw),
         "a coworker came through changed: {coworker:?}"
     );
@@ -5549,11 +5563,12 @@ fn every_recorded_setting_is_from_a_server_that_knows_the_relay() {
     assert!(read > 0, "the recording holds the account's setting");
 }
 
-/// A Bot's door, read beyond the recording in the shape proposed for opengrok-server's Part A
-/// (2026-09-30, not yet recorded): the roster's rows and a patch's answer with `source` as each of
-/// its words, `null`, a word this app has not heard of, and missing, each read as sent, and a row
-/// whose parse lost its door caught; and the patch's 400 for a Bot left on the person's plan with
-/// a model the allowlist does not take, read as the server's sentence.
+/// A Bot's door, read beyond the recording in the shape opengrok-server's `bot-model-source`
+/// answers with (confirmed 2026-09-30, not yet recorded): the roster's rows, a hire's answer and a
+/// patch's with `source` as each of its words, `null`, a word this app has not heard of, and
+/// missing, each read as sent, and a row whose parse lost its door caught; and the patch's two
+/// 400s, for a Bot left on the person's plan with a model the allowlist does not take and for a
+/// door that is neither word, each read as the server's sentence.
 #[test]
 fn a_bots_door_is_read_beyond_the_recording() {
     use serde_json::json;
@@ -5578,6 +5593,14 @@ fn a_bots_door_is_read_beyond_the_recording() {
     read_fixture(
         "GET__coworkers",
         &json!({"method": "GET", "path": "/coworkers", "status": 200, "body": roster}),
+    )
+    .unwrap_or_else(|why| panic!("{why}"));
+    read_fixture(
+        "POST__coworkers",
+        &json!({
+            "method": "POST", "path": "/coworkers", "status": 201,
+            "body": row("cw_new", Some(Value::Null))
+        }),
     )
     .unwrap_or_else(|why| panic!("{why}"));
     let answered = row("cw_plan", Some(json!("local_proxy")));
@@ -5605,6 +5628,15 @@ fn a_bots_door_is_read_beyond_the_recording() {
         }),
     )
     .unwrap_or_else(|why| panic!("{said}: {why}"));
+    let unknown = "source must be \"gateway\" or \"local_proxy\"";
+    read_fixture(
+        "PATCH__coworkers__coworker_id_",
+        &json!({
+            "method": "PATCH", "path": "/coworkers/cw_plan", "status": 400,
+            "body": {"error": unknown}
+        }),
+    )
+    .unwrap_or_else(|why| panic!("{unknown}: {why}"));
 }
 
 /// The reply source's reading, fed bodies beyond the ones the server's recording holds: the read and
