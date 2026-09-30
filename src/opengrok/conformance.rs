@@ -4,8 +4,8 @@
 //! agree. `fixtures/wire/` is the server's side of that, recorded by the server itself: every
 //! AG-UI frame and REST body its own tests drove, teed off its router by the recorder of
 //! opengrok-server#258 and written out by its `examples/wire_corpus.rs`. It is vendored whole
-//! from the server's `tests/fixtures/wire/` at d16b10e on its main (#295, after #294, the reply
-//! source's server half), whose `MANIFEST.json` names 7d6e3d0, the commit on the server's main
+//! from the server's `tests/fixtures/wire/` at e55a8c8 on its main (#297, after #296, the reply
+//! source's follow-up), whose `MANIFEST.json` names f56bbde, the commit on the server's main
 //! it was recorded at. The layout is
 //! opengrok-server#255's: `agui/<type>/<slug>.json`, a CUSTOM under `agui/custom/<name>/`, and
 //! `rest/<METHOD>_<route>/<status>-<slug>.json` holding `{method, path, status, body}`, one file

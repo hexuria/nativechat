@@ -18,7 +18,7 @@
 //! `crates/opengrok-harness/src/local_proxy.rs`, and the door's words and the models a
 //! subscription may answer in `crates/opengrok-core/src/inference.rs`. The conformance ledger
 //! reads the two routes and the CUSTOM frame against the server's recording, vendored in
-//! `fixtures/wire/` from its main at d16b10e (pin 7d6e3d0).
+//! `fixtures/wire/` from its main at e55a8c8 (pin f56bbde, after #296).
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -216,9 +216,8 @@ impl ReplySource {
 /// Whether "My subscription" may be pointed at a model, by the server's own rule, so the picker
 /// never offers what a Save would be refused for, even should a list ever carry one (a list held
 /// from before, or a server that tags a row `local_proxy` without asking): `subscription_model`
-/// in opengrok-server's `crates/opengrok-core/src/inference.rs`, anchored as its follow-up to
-/// #294 has it. Main at d16b10e still takes `codex` anywhere in an id, so until that lands the
-/// picker is the stricter of the two.
+/// in opengrok-server's `crates/opengrok-core/src/inference.rs`, anchored since #296, at the
+/// vendored pin f56bbde.
 ///
 /// An allowlist, not a denylist: an id it does not recognise is refused, so a provider nobody
 /// has looked at is not offered by being new. With an `openai/` or `xai/` prefix and the `--fast`
