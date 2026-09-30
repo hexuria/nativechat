@@ -3231,6 +3231,9 @@ fn coworkers(_: u16, body: &Value) -> Check {
 }
 
 /// A hire and an edit answer with the coworker as it now is, which is the row the roster keeps.
+/// The hire's reply also carries the account's `computerError` (opengrok-server
+/// `agui/routes.rs`), which this app does not read off the row: the Computer pane reads the same
+/// record from the computer route, in [`computer`].
 fn coworker_row(_: u16, body: &Value) -> Check {
     coworker_matches(&parse(body)?, body)
 }
@@ -3475,9 +3478,9 @@ fn coworker_skills(_: u16, body: &Value) -> Check {
 
 /// A coworker's computer (`coworker_computer`), which the Computer pane and the tunnel's chrome
 /// are drawn from: whose box it is and where it is shared, its state and its screen, the
-/// person's standing answer to the tunnel's card, and the tunnel's own readiness. A share scope
-/// or an egress policy in a word this app does not know hides its control, so each one sent must
-/// be a word it knows.
+/// person's standing answer to the tunnel's card, the tunnel's own readiness, and why the server
+/// could not give the bot a computer. A share scope or an egress policy in a word this app does
+/// not know hides its control, so each one sent must be a word it knows.
 fn computer(_: u16, body: &Value) -> Check {
     let status: CoworkerComputer = parse(body)?;
     let given = |key: &str| body.get(key).filter(|value| !value.is_null());
@@ -3519,6 +3522,41 @@ fn computer(_: u16, body: &Value) -> Check {
                 == tunnel.and_then(|tunnel| tunnel.get("enabled").and_then(Value::as_bool)),
         "the tunnel should come through as the box reported it: {:?}",
         status.egress_tunnel
+    );
+    // The server's reason comes through word for word, with its code and the stamp it always
+    // carries (opengrok-server `agui/provision.rs` `error_json_at`). The pane says it in place of
+    // "No computer yet" on a status that names no box; beside a box it is a takeover's note
+    // about that box, and no reason to ask for another.
+    let sent = given("computerError");
+    must!(
+        status.computer_error.as_ref().map(|read| (
+            read.code.as_str(),
+            read.message.as_str(),
+            Some(read.updated_at_ms)
+        )) == sent.map(|raw| {
+            (
+                str_at(raw, "code"),
+                str_at(raw, "message"),
+                raw.get("updatedAtMs").and_then(Value::as_i64),
+            )
+        }),
+        "the computer's error should come through as sent, stamped: {:?}",
+        status.computer_error
+    );
+    must!(
+        status
+            .computer_error
+            .as_ref()
+            .is_none_or(|read| !read.code.is_empty() && !read.message.is_empty()),
+        "a recorded error should carry a code and words to show: {:?}",
+        status.computer_error
+    );
+    must!(
+        status.why_no_computer().map(|read| read.message.as_str())
+            == sent
+                .filter(|_| given("boxId").is_none())
+                .map(|raw| str_at(raw, "message")),
+        "the pane should say the server's reason exactly when there is one and no box: {status:?}"
     );
     Ok(())
 }

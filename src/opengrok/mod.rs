@@ -56,7 +56,7 @@ pub use visibility::ImageVisibility;
 
 pub use client::{
     AsyncRunResponse, BotSkillRow, BotSkillScope, BoxShareScope, CeilingKind, CeilingRow,
-    ConnectedComputer, ConnectionOwner, ConnectionView, Connector, CoworkerCeiling,
+    ComputerError, ConnectedComputer, ConnectionOwner, ConnectionView, Connector, CoworkerCeiling,
     CoworkerComputer, CoworkerSkills, CoworkerTool, CoworkerUsage, EgressTunnel, ImageStatus,
     InertRule, LocalExecMode, LocalExecPolicy, MAX_ATTACHMENT_BYTES, ModelUsage, NewSchedule,
     NewSkill, OpenGrokClient, QueuedApproval, RecipeBot, RecipeDetail, RecipeGrant, RecipeKind,

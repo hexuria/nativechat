@@ -1925,7 +1925,7 @@ pub(crate) fn usage_summary(report: &UsageReport) -> String {
 }
 
 /// `text` with its first letter capitalised.
-fn sentence(text: &str) -> String {
+pub(crate) fn sentence(text: &str) -> String {
     let mut chars = text.chars();
     chars.next().map_or_else(String::new, |first| {
         first.to_uppercase().chain(chars).collect()
