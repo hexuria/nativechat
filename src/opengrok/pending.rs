@@ -229,9 +229,10 @@ pub struct PendingWrite {
     pub skill_id: Option<String>,
     /// The door the send was queued with, as the composer's chip showed it: the row's
     /// `inferenceSource` (agreed with opengrok-server 2026-09-30, server PR pending;
-    /// `WriteBody.inference_source` in `crates/opengrok-server/src/agui/pending.rs`). Left out
-    /// when no chip was drawn, which leaves the account's setting to decide, and left out of an
-    /// edit, which keeps the row's.
+    /// `WriteBody.inference_source` in `crates/opengrok-server/src/agui/pending.rs`). An edit
+    /// carries it too, so the row matches the hold whichever machine queued it. Left out when no
+    /// chip was drawn: the account's setting decides then, and an edit that leaves it out keeps
+    /// the row's.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub inference_source: Option<InferenceKind>,
 }
@@ -259,6 +260,12 @@ impl PendingWrite {
     }
 
     pub fn content_patch(content: String) -> Self {
+        Self::edit(content, None)
+    }
+
+    /// An edit of a held send: its new words, and the door it was held with when it has one.
+    /// Every other field is left out, and the server keeps the row's.
+    pub fn edit(content: String, inference_source: Option<InferenceKind>) -> Self {
         Self {
             v: PAYLOAD_V,
             content: Some(content),
@@ -267,7 +274,7 @@ impl PendingWrite {
             recipe_id: None,
             recipe_values: None,
             skill_id: None,
-            inference_source: None,
+            inference_source,
         }
     }
 }
@@ -382,7 +389,8 @@ mod tests {
 
     /// A send queued while the composer's chip showed a door carries it to the server as the
     /// word a live turn names it by, so a machine that drains the row asks through that door.
-    /// An edit leaves it out, and the server keeps the row's.
+    /// An edit carries the hold's door; one with none leaves it out, and the server keeps the
+    /// row's.
     #[test]
     fn a_queued_send_names_the_door_it_was_queued_with() {
         for (kind, word) in [
@@ -404,6 +412,16 @@ mod tests {
         let patch =
             serde_json::to_value(PendingWrite::content_patch("instead".into())).expect("json");
         assert!(patch.get("inferenceSource").is_none(), "{patch}");
+        // An edit carries the door the send was held with, and only that beside the words.
+        let edit = serde_json::to_value(PendingWrite::edit(
+            "instead".into(),
+            Some(InferenceKind::LocalProxy),
+        ))
+        .expect("json");
+        assert_eq!(
+            edit,
+            json!({ "v": 1, "content": "instead", "inferenceSource": "local_proxy" })
+        );
     }
 
     /// The server's snapshot (hand-written in the shape agreed with opengrok-server on

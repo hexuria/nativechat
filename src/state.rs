@@ -17228,13 +17228,10 @@ impl AppState {
             return;
         };
         let local_content = content.clone();
+        let body = self.pending_edit_for(&message_id, content);
         cx.spawn(async move |this, cx| {
             match client
-                .edit_pending_user_message(
-                    &thread_id,
-                    &pending_id,
-                    &PendingWrite::content_patch(content),
-                )
+                .edit_pending_user_message(&thread_id, &pending_id, &body)
                 .await
             {
                 Ok(mutation) => {
@@ -17302,6 +17299,19 @@ impl AppState {
             reply,
             self.turn_source_for_send(),
         )
+    }
+
+    /// The PATCH an edit of a held send makes: its new words, and the door it was held with
+    /// when it has one, so the row the server drains names the door the send was sent under.
+    /// A hold with none leaves it out, and the row keeps its own.
+    fn pending_edit_for(&self, message_id: &str, content: String) -> PendingWrite {
+        let door = self
+            .queued_sends
+            .values()
+            .flatten()
+            .find(|held| held.message_id == message_id)
+            .and_then(|held| held.inference_source);
+        PendingWrite::edit(content, door)
     }
 
     /// POST the hold to OpenGrok while the bubble stays local. 404 / unreachable keep the
@@ -17704,6 +17714,12 @@ impl AppState {
                 };
                 let bubble_id = item.bubble_id().to_string();
                 self.pending_inflight.remove(&bubble_id);
+                // An edit made elsewhere can change the door too; one that names none keeps it.
+                if let Some(door) = item.inference_source()
+                    && let Some(held) = self.hold_mut(&bubble_id)
+                {
+                    held.inference_source = Some(door);
+                }
                 if self.apply_queued_edit(&bubble_id, item.content.clone()) {
                     if let Some(queued) = self
                         .queued_sends
@@ -31520,6 +31536,59 @@ mod tests {
         assert_eq!(state.turn_inference_source(Some(&drained)), None);
     }
 
+    /// An edit of a held send carries the door it was held with, so the row the server drains
+    /// names it; a hold with none sends none, and the row keeps its own. An edit made on another
+    /// Mac that names a door moves this Mac's hold to it, and one that names none leaves it.
+    #[test]
+    fn an_edit_of_a_held_send_carries_its_door() {
+        use crate::opengrok::{PendingCustom, PendingOp};
+        let mut state = signed_in_state();
+        for (id, door) in [("m_1", Some(InferenceKind::LocalProxy)), ("m_2", None)] {
+            state.enqueue_hold(
+                "cw_1".into(),
+                super::held_message(id.into(), "later".into(), None, None, None, door),
+            );
+        }
+        assert_eq!(
+            serde_json::to_value(state.pending_edit_for("m_1", "instead".into())).unwrap(),
+            json!({ "v": 1, "content": "instead", "inferenceSource": "local_proxy" })
+        );
+        assert_eq!(
+            serde_json::to_value(state.pending_edit_for("m_2", "instead".into())).unwrap(),
+            json!({ "v": 1, "content": "instead" })
+        );
+        let edited_elsewhere = |door: Option<&str>| {
+            let mut row = json!({
+                "id": "pum_2", "threadId": "cw_1", "content": "instead",
+                "clientMessageId": "m_2", "status": "pending"
+            });
+            if let Some(door) = door {
+                row["inferenceSource"] = json!(door);
+            }
+            PendingCustom {
+                timestamp: None,
+                v: 1,
+                op: PendingOp::Edited,
+                thread_id: "cw_1".into(),
+                message: Some(serde_json::from_value(row).expect("a row")),
+            }
+        };
+        let door_of = |state: &AppState| {
+            state.queued_sends["cw_1"]
+                .iter()
+                .find(|held| held.message_id == "m_2")
+                .and_then(|held| held.inference_source)
+        };
+        state.apply_pending_custom(&edited_elsewhere(Some("gateway")), None);
+        assert_eq!(door_of(&state), Some(InferenceKind::Gateway));
+        state.apply_pending_custom(&edited_elsewhere(None), None);
+        assert_eq!(
+            door_of(&state),
+            Some(InferenceKind::Gateway),
+            "none named, none changed"
+        );
+    }
+
     /// A held row read back from the server brings the door it was queued with, from this Mac
     /// or another; a server that keeps none on its rows leaves the one this Mac held the send
     /// with, and a refused drain put back with the server's row keeps its door the same way.
@@ -32052,7 +32121,9 @@ mod tests {
     /// A replay backfills the badge: a row written before its run's source was kept takes the
     /// one the server's journal says, a row that already wears one keeps it, and a run whose
     /// journal carries no such frame gives none. A replay painting a run the thread holds gives
-    /// the journal's badge, and one that says nothing leaves what the live stream gave.
+    /// the journal's badge, and one that says nothing leaves what the live stream gave. The
+    /// journal opens each run with the person's message before the frame, as the server's
+    /// replay does.
     #[test]
     fn a_replay_backfills_the_badge_a_row_is_missing() {
         let plan = ReplySource {
@@ -32063,8 +32134,16 @@ mod tests {
             kind: InferenceKind::Gateway,
             model: Some("oag/cheap".into()),
         };
+        // As a replay opens a run: the person's own message first, then the frame that says
+        // which door the run went through.
         let journal = |run: &str, source: Option<serde_json::Value>| {
-            let mut events = vec![json!({"type": "RUN_STARTED", "runId": run, "threadId": "cw_1"})];
+            let asked = format!("{run}_asked");
+            let mut events = vec![
+                json!({"type": "RUN_STARTED", "runId": run, "threadId": "cw_1"}),
+                json!({"type": "TEXT_MESSAGE_START", "messageId": asked, "role": "user"}),
+                json!({"type": "TEXT_MESSAGE_CONTENT", "messageId": asked, "delta": "go on"}),
+                json!({"type": "TEXT_MESSAGE_END", "messageId": asked}),
+            ];
             if let Some(value) = source {
                 events.push(json!({
                     "type": "CUSTOM", "name": "opengrok.inferenceSource", "value": value

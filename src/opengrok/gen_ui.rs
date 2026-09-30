@@ -890,12 +890,15 @@ impl TurnAssembler {
             }
             "CUSTOM" => {
                 let name = event.get("name").and_then(Value::as_str).unwrap_or("");
-                // Which door the run went through, said right after RUN_STARTED, live and in a
-                // replay alike. Read before anything else can take it for a card or a widget,
-                // and never drawn in the reply: it is the reply's badge.
+                // Which door the run went through. Live it comes right after RUN_STARTED; a
+                // replay opens the run with the person's own messages first and the frame after
+                // them, so where it sits is not the rule: the run's first such frame is. The
+                // server sends one a run and none on a carry-on (`local_proxy::route` in
+                // opengrok-server). Read before anything else can take it for a card or a
+                // widget, and never drawn in the reply: it is the reply's badge.
                 if name == INFERENCE_SOURCE_CUSTOM {
-                    if let Some(source) = ReplySource::from_event(event) {
-                        self.source = Some(source);
+                    if self.source.is_none() {
+                        self.source = ReplySource::from_event(event);
                     }
                     return;
                 }
@@ -2223,6 +2226,58 @@ mod tests {
         older.push_event(&json!({"type": "RUN_STARTED", "runId": "r1", "threadId": "cw_1"}));
         older.push_event(&text("Hi."));
         assert_eq!(older.reply_source(), None, "a server before reply sources");
+    }
+
+    /// A replay opens a run with the person's own messages, and the frame that says which door
+    /// the run went through comes after them rather than right after RUN_STARTED: the badge is
+    /// the run's first such frame wherever it sits, the person's words stay the person's, and
+    /// the reply is the coworker's words alone.
+    #[test]
+    fn the_reply_source_is_the_runs_first_frame_wherever_a_replay_puts_it() {
+        use super::super::inference::InferenceKind;
+        let custom = |kind: &str, model: &str| {
+            json!({
+                "type": "CUSTOM", "name": INFERENCE_SOURCE_CUSTOM,
+                "value": {"kind": kind, "model": model}
+            })
+        };
+        let replay = [
+            json!({"type": "RUN_STARTED", "runId": "r2", "threadId": "cw_1"}),
+            json!({"type": "TEXT_MESSAGE_START", "messageId": "m2", "role": "user"}),
+            json!({"type": "TEXT_MESSAGE_CONTENT", "messageId": "m2", "delta": "and the second?"}),
+            json!({"type": "TEXT_MESSAGE_END", "messageId": "m2"}),
+            custom("local_proxy", "gpt-5.5"),
+            json!({"type": "TEXT_MESSAGE_START", "messageId": "a2", "role": "assistant"}),
+            json!({"type": "TEXT_MESSAGE_CONTENT", "messageId": "a2", "delta": "from the proxy"}),
+            json!({"type": "TEXT_MESSAGE_END", "messageId": "a2"}),
+            // Were a second frame ever to come, the run's first stands.
+            custom("gateway", "xai/grok-4.6"),
+            json!({"type": "RUN_FINISHED", "runId": "r2"}),
+        ];
+        let mut read = TurnAssembler::default();
+        for (at, frame) in replay.iter().enumerate() {
+            read.push_event(frame);
+            if at < 4 {
+                assert_eq!(read.reply_source(), None, "not said yet at frame {at}");
+            }
+        }
+        read.finish();
+        assert_eq!(
+            read.reply_source(),
+            Some(&ReplySource {
+                kind: InferenceKind::LocalProxy,
+                model: Some("gpt-5.5".into()),
+            })
+        );
+        assert_eq!(
+            read.snapshot().1,
+            vec![ChatPart::Text("from the proxy".into())],
+            "the reply is the coworker's words"
+        );
+        assert_eq!(
+            persons_messages(&replay),
+            vec![("m2".to_string(), "and the second?".to_string())]
+        );
     }
 
     fn review_card(why: &str) -> ApprovalSpec {
