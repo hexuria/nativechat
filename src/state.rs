@@ -3578,9 +3578,9 @@ fn replayed_ending(
 
 /// Why the person's plan could not answer a run, when its journal says so: the code on its
 /// `RUN_ERROR` ([`RunErrorCode`]), journaled with it for the relay's (opengrok-server #292: server
-/// main cad36fd (#303, after #298), pin 47a5d6b) and for `plan_unavailable` (#304, agreed
-/// 2026-09-30, not yet recorded), for a replay to offer the turn again on the server's keys as
-/// the live stream does.
+/// main cad36fd (#303, after #298), pin 47a5d6b) and for `plan_unavailable` (#304: server main
+/// d6f640e (#307, after #304), pin bf99845), for a replay to offer the turn again on the server's
+/// keys as the live stream does.
 fn plan_failure_of(events: &[serde_json::Value]) -> Option<RunErrorCode> {
     events
         .iter()
@@ -8134,10 +8134,10 @@ impl AppState {
     /// The door a turn names as it leaves. One sent again on the server's keys (`on_server`,
     /// [`Self::send_on_server`]) names them, whatever the Bot's door and the account's, and the
     /// server lets a turn's own pick win over both for that turn (`local_proxy::route` in
-    /// opengrok-server's `crates/opengrok-harness/src/local_proxy.rs`, PR #304, bot-model-source
-    /// 0ae9f2a). Any other turn names [`Self::turn_inference_source`]'s. Since the composer's
-    /// chip picks the Bot's model and no longer the turn's door, this is the one way a single
-    /// turn goes through another door than the Bot's.
+    /// opengrok-server's `crates/opengrok-harness/src/local_proxy.rs`, server main d6f640e (#307,
+    /// after #304), pin bf99845). Any other turn names [`Self::turn_inference_source`]'s. Since
+    /// the composer's chip picks the Bot's model and no longer the turn's door, this is the one
+    /// way a single turn goes through another door than the Bot's.
     fn turn_door(&self, drained: Option<&QueuedSend>, on_server: bool) -> Option<TurnSource> {
         if on_server {
             Some(TurnSource::GATEWAY)
@@ -12034,9 +12034,8 @@ impl AppState {
     }
 
     /// The server keeps a door per Bot: some row of the roster carries `source` (opengrok-server
-    /// PR #304, bot-model-source 0ae9f2a, recorded at 4059c59, not yet on main, which writes it
-    /// on every row). Settings → Reply source is then the default for the Bots that have picked
-    /// none, and says so.
+    /// main d6f640e (#307, after #304), pin bf99845, which writes it on every row). Settings →
+    /// Reply source is then the default for the Bots that have picked none, and says so.
     pub fn server_keeps_bot_doors(&self) -> bool {
         self.coworkers
             .iter()
@@ -33409,8 +33408,8 @@ mod tests {
     }
 
     /// A turn the person's own setting left their plan nothing to answer with ends
-    /// `plan_unavailable` beside the server's sentence (opengrok-server #304, agreed 2026-09-30,
-    /// not yet recorded): a teammate with no proxy on a shared Bot on the plan, or a proxy turn
+    /// `plan_unavailable` beside the server's sentence (opengrok-server main d6f640e (#307, after
+    /// #304), pin bf99845): a teammate with no proxy on a shared Bot on the plan, or a proxy turn
     /// with no address or no model stored. As the thread's last turn it offers itself again on the
     /// server's keys, as a relay's failure does: live, by the run error's code, and read back, by
     /// the code on the journal's `RUN_ERROR`. Sent that way it names the gateway for that turn,
@@ -33467,10 +33466,11 @@ mod tests {
         assert_eq!(recovered[0].content, format!("{RUN_ERROR_PREFIX}{said}"));
     }
 
-    /// A reply source the server could not read refuses the turn in words and no code
-    /// (opengrok-server #304, as agreed 2026-09-30): there is nothing of the person's to change,
-    /// and the sentence says to try again in a moment. The reply shows the sentence alone, live
-    /// and read back, and nothing offers the turn on the server's keys.
+    /// A reply source the server could not read refuses the turn in words and no code (`route` in
+    /// opengrok-server's `crates/opengrok-harness/src/local_proxy.rs`, server main d6f640e (#307,
+    /// after #304), pin bf99845, whose recording holds no such turn): there is nothing of the
+    /// person's to change, and the sentence says to try again in a moment. The reply shows the
+    /// sentence alone, live and read back, and nothing offers the turn on the server's keys.
     #[test]
     fn a_reply_source_that_could_not_be_read_offers_nothing_on_server() {
         let said = "Your reply source could not be read, so the turn was not sent; try again in a \
@@ -33541,13 +33541,14 @@ mod tests {
     /// A teammate on a shared Bot its owner put on the person's plan, with no plan of their own
     /// set up, is refused the turn in the server's words: the plan is always the person's who
     /// drives the turn, and the turn is never sent on the server's keys, nor to the owner's plan
-    /// (opengrok-server PR #304, bot-model-source 0ae9f2a, recorded at 4059c59, not yet on main).
+    /// (opengrok-server main d6f640e (#307, after #304), pin bf99845).
     /// The recorded replay reads back as a run that failed, the server's sentence under the plan's
-    /// badge. It was recorded before #304 agreed `plan_unavailable` for this refusal (2026-09-30),
-    /// so its `RUN_ERROR` names no code and nothing is offered on Server; the recording that
-    /// brings the code offers it, as `plan_unavailable` is read ahead of it.
+    /// badge, and its `RUN_ERROR` names `plan_unavailable` beside the sentence: what is missing is
+    /// the teammate's own to set, so the reply offers the turn again on the server's keys, which
+    /// the turn's own pick takes it to whatever the Bot's door.
     #[test]
     fn a_teammate_refused_a_shared_bots_plan_reads_back_as_the_servers_sentence() {
+        use crate::opengrok::RunErrorCode;
         let recorded: serde_json::Value = serde_json::from_str(include_str!(
             "../fixtures/wire/rest/GET__ag-ui_threads__thread_id_/200-a_teammate_with_no_proxy_is_refused_in_words_on_a_shared_coworkers_own_plan.json"
         ))
@@ -33563,17 +33564,22 @@ mod tests {
             (
                 ended["type"].as_str(),
                 ended["message"].as_str(),
-                ended.get("code")
+                ended["code"].as_str()
             ),
-            (Some("RUN_ERROR"), Some(said.as_str()), None),
-            "a run error in the server's words, recorded before it named a code"
+            (
+                Some("RUN_ERROR"),
+                Some(said.as_str()),
+                Some("plan_unavailable")
+            ),
+            "a run error in the server's words, with the code beside them"
         );
         let recovered = super::missing_replies(&[message("m1", true, "hi")], &replay.runs);
         assert_eq!(recovered.len(), 1);
         assert_eq!(recovered[0].content, format!("{RUN_ERROR_PREFIX}{said}"));
         assert_eq!(
-            recovered[0].plan_failure, None,
-            "no code, so nothing to send on Server"
+            recovered[0].plan_failure,
+            Some(RunErrorCode::PlanUnavailable),
+            "the teammate's own gap, so the turn can be sent on Server"
         );
         let badge = recovered[0]
             .reply_source

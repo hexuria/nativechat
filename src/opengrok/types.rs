@@ -89,7 +89,7 @@ pub struct Coworker {
 
 /// Which door a Bot's replies go through, as its row says it: `"source": "gateway" |
 /// "local_proxy" | null`, and `PATCH /coworkers/{id}` takes the same word (opengrok-server
-/// PR #304, bot-model-source 0ae9f2a, recorded at 4059c59, not yet on main: `coworker_row` in
+/// main d6f640e (#307, after #304), pin bf99845: `coworker_row` in
 /// `crates/opengrok-server/src/agui/routes.rs`). A server with per-Bot doors writes the key, a
 /// word or `null` and never left out, on every row it answers with: the roster's
 /// (`GET /coworkers`), a hire's (`POST /coworkers`) and a PATCH's. It mounts no
@@ -185,8 +185,8 @@ pub struct CoworkerPatch {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
     /// The Bot's own door, sent with the model the model picker put it on, and only to a server
-    /// whose rows carry `source` (opengrok-server PR #304, bot-model-source 0ae9f2a, recorded at
-    /// 4059c59, not yet on main: `repin_coworker` in `crates/opengrok-server/src/agui/routes.rs`):
+    /// whose rows carry `source` (opengrok-server main d6f640e (#307, after #304), pin bf99845:
+    /// `repin_coworker` in `crates/opengrok-server/src/agui/routes.rs`):
     /// absent leaves the door alone. The server refuses with a 400 in its own words, `model: ` and
     /// the sentence its subscription allowlist refuses the account's plan model with, a patch
     /// whose whole body leaves the Bot on `local_proxy` with a model the allowlist does not take;
@@ -598,7 +598,7 @@ mod tests {
     /// Every key a coworker patch can carry is one the server's patch route reads
     /// (opengrok-server `agui/routes.rs`: name, model, role, visibility, hiddenFromSidebar, and
     /// title/avatarShape/avatarColor; `effort` from opengrok-server#271; `source` from
-    /// opengrok-server PR #304, bot-model-source 0ae9f2a, not yet on main). A key it reads nowhere
+    /// opengrok-server main d6f640e (#307, after #304), pin bf99845). A key it reads nowhere
     /// is a setting that looks saved and is not, and a patch of only that is refused.
     #[test]
     fn a_coworker_patch_names_only_what_the_server_keeps() {
@@ -642,7 +642,7 @@ mod tests {
 
     /// A row's `source` says three different things by being missing, `null` or a word: a server
     /// from before per-Bot doors, a Bot that follows the account's door, and the Bot's own door
-    /// (opengrok-server PR #304, bot-model-source 0ae9f2a, recorded at 4059c59, not yet on main).
+    /// (opengrok-server main d6f640e (#307, after #304), pin bf99845).
     /// A word this app has not heard of is kept as sent, and no row's door ever fails the roster.
     #[test]
     fn a_rows_door_is_missing_null_or_its_word() {

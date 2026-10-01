@@ -6954,8 +6954,8 @@ mod tests {
     /// error keeps both: the sentence for the person, the code for the app to offer the turn
     /// again on the server's keys. The relay's code (opengrok-server PR #298, which the ledger
     /// reads the recorded frames of), and `plan_unavailable` where the person's own setting left
-    /// the plan nothing to answer with (#304, agreed 2026-09-30, not yet recorded). A run error
-    /// with no code has none.
+    /// the plan nothing to answer with (server main d6f640e (#307, after #304), pin bf99845, whose
+    /// recorded frame the ledger reads too). A run error with no code has none.
     #[tokio::test]
     async fn a_run_error_keeps_its_code_beside_its_sentence() {
         let server = MockServer::start().await;
@@ -7265,8 +7265,8 @@ mod tests {
     }
 
     /// A change in the model picker goes as one PATCH carrying the Bot's door, its model and its
-    /// effort, each only when it changed (opengrok-server PR #304, bot-model-source 0ae9f2a,
-    /// recorded at 4059c59, not yet on main), and the answer is the row as the server now keeps
+    /// effort, each only when it changed (opengrok-server main d6f640e (#307, after #304), pin
+    /// bf99845), and the answer is the row as the server now keeps
     /// it, door and all. A door and a model the allowlist does not take, sent together, are
     /// refused together with a 400 in the server's words, which is what the person is shown: the
     /// sentence the recording holds for that pair.

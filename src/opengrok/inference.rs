@@ -18,9 +18,9 @@
 //! `crates/opengrok-harness/src/local_proxy.rs`, and the door's words and the models a
 //! subscription may answer in `crates/opengrok-core/src/inference.rs`. The conformance ledger
 //! reads the two routes and the CUSTOM frame against the server's recording, vendored in
-//! `fixtures/wire/` from opengrok-server PR #304, bot-model-source 0ae9f2a, recorded at 4059c59,
-//! not yet on main. That PR changes none of these shapes from its main cad36fd (#303, after
-//! #298): it puts a Bot's own door between a turn's and the account's (`route` in
+//! `fixtures/wire/` from opengrok-server main d6f640e (#307, after #304), pin bf99845. These
+//! shapes are as they were at main cad36fd (#303, after #298): #306 changed no crate, and #304
+//! puts a Bot's own door between a turn's and the account's (`route` in
 //! `crates/opengrok-harness/src/local_proxy.rs`).
 //!
 //! The Mac relay (opengrok-server #292, built in #298, whose recording holds its words) lifts
@@ -426,11 +426,12 @@ impl ReplySource {
 /// Why the person's plan could not answer a turn, as its `RUN_ERROR` says beside its sentence in
 /// `code`: the Mac relay's three (opengrok-server #292: `ModelError::Relay` in
 /// `crates/opengrok-harness/src/relay.rs`, server main cad36fd (#303, after #298), pin 47a5d6b),
-/// and `plan_unavailable` (opengrok-server #304, agreed 2026-09-30, not yet recorded). The
-/// sentence is what the person reads; the code is what offers the turn again on the server's
-/// keys, which could answer it. A refusal with no code is none of these, and its sentence stands
-/// alone: a Mac already carrying all the calls one Mac may at once, or a reply source that could
-/// not be read.
+/// and `plan_unavailable` (opengrok-server main d6f640e (#307, after #304), pin bf99845:
+/// `ModelError::PlanUnavailable` in `crates/opengrok-harness/src/model.rs`). The sentence is what
+/// the person reads; the code is what offers the turn again on the server's keys, which could
+/// answer it. A refusal with no code is none of these, and its sentence stands alone: a Mac
+/// already carrying all the calls one Mac may at once, a reply source that could not be read, or
+/// a proxy key that could not be opened.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RunErrorCode {
     /// No Mac held the relay.
@@ -479,8 +480,8 @@ pub const HELD_FOR_RELAY_OFFLINE: &str = "relay_offline";
 /// never offers what a Save would be refused for, even should a list ever carry one (a list held
 /// from before, or a server that tags a row `local_proxy` without asking): `subscription_model`
 /// in opengrok-server's `crates/opengrok-core/src/inference.rs`, anchored since #296 and unchanged
-/// at the vendored pin 4059c59 (PR #304, bot-model-source 0ae9f2a, not yet on main), where a
-/// Bot's own plan model is held to it too.
+/// at the vendored main d6f640e (#307, after #304), pin bf99845, where a Bot's own plan model is
+/// held to it too.
 ///
 /// An allowlist, not a denylist: an id it does not recognise is refused, so a provider nobody
 /// has looked at is not offered by being new. With an `openai/` or `xai/` prefix and the `--fast`

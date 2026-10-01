@@ -179,7 +179,7 @@
 //! row) and `model-note` (the server's word on why the list is not fuller).
 //! `model-error` is the server's words for the last change it refused. Every change is saved on
 //! the Bot at once, `source`, `model` and `effort` on `PATCH /coworkers/{id}` (opengrok-server
-//! PR #304, bot-model-source 0ae9f2a, recorded at 4059c59, not yet on main). The card's parts
+//! main d6f640e (#307, after #304), pin bf99845). The card's parts
 //! are the chip's with `agent-` before them: `agent-model-pop`, `agent-model-fast`,
 //! `agent-model-effort`, `agent-model-open-list`, `agent-model-reset`, `agent-model-list`,
 //! `agent-model-row-{source}-{id}`, `agent-model-plan`, `agent-model-routines`,
