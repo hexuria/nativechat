@@ -9,10 +9,10 @@ use crate::components::chat_find::find_bar_element;
 use crate::components::chat_input::MessageInput;
 use crate::components::emoji_picker::{full_picker, reaction_strip};
 use crate::components::gen_ui::{render_approval, render_screenshots, render_ui_spec};
-use crate::components::message::{MessageBubble, TS_PEEK_MAX};
+use crate::components::message::{MessageBubble, TS_PEEK_MAX, TimestampPeek, turn_metadata};
 use crate::components::persona::PersonaMark;
 use crate::components::save_login::render_save_login;
-use crate::components::steps::{RunLayout, RunRow, render_run_row, timing_row};
+use crate::components::steps::{RunLayout, RunRow, render_run_row};
 use crate::components::user_form::{
     UserFormInputMap, UserFormTextareaMap, field_key, render_user_form,
 };
@@ -325,6 +325,8 @@ struct ChatRow {
     is_me: bool,
     timestamp: SharedString,
     duration: SharedString,
+    /// One total for the entire reply, beside the final row's timestamp.
+    turn_total: Option<SharedString>,
     is_native_speaking: bool,
     is_native_paused: bool,
     is_native_loading: bool,
@@ -357,7 +359,7 @@ struct ChatRow {
     screenshots: Vec<ScreenshotSpec>,
     user_form: Option<UserFormSpec>,
     save_login: Option<SaveLoginSpec>,
-    /// A step, a stretch of steps, a thought, or how long the turn took. Its `content` stays
+    /// A step, a stretch of steps, or a thought. Its `content` stays
     /// empty: none of it is words, so find, copy and read aloud pass it by.
     run: Option<RunRow>,
     /// The files one of the person's messages carried (#90), drawn as tiles under it.
@@ -374,6 +376,7 @@ impl ChatRow {
             is_me: false,
             timestamp: SharedString::from(""),
             duration: SharedString::from(""),
+            turn_total: None,
             is_native_speaking: false,
             is_native_paused: false,
             is_native_loading: false,
@@ -405,10 +408,12 @@ impl ChatRow {
     }
 
     /// Whether this is the same row, drawn the same way, as `other`: an opened step is a
-    /// different row from the shut one, because it is taller.
+    /// different row from the shut one, because it is taller. Adding or removing total-time
+    /// metadata needs a fresh render of its swipe rail.
     fn same_as(&self, other: &Self) -> bool {
         self.id == other.id
             && self.run.as_ref().map(RunRow::is_open) == other.run.as_ref().map(RunRow::is_open)
+            && self.turn_total.is_some() == other.turn_total.is_some()
     }
 }
 
@@ -630,20 +635,20 @@ fn snapshot_rows(state: &AppState) -> Arc<Vec<ChatRow>> {
             }
         }
         flush_text(&mut rows, &mut text_buf, &mut text_n);
-        // How long the turn took goes under all of it, once, whatever it ended on: each call's
-        // own time is at the end of its row, and this is the rest (Settings → Show turn timing).
+        // Keep the total with the final row's metadata, whether it ends in words or a card.
+        // Never attach a wordless message's total to the preceding message.
         if !msg.is_me
             && state.show_turn_timing
-            && let Some(run) = msg
+            && let Some(total) = msg
                 .run_timing
                 .as_ref()
-                .and_then(|timing| timing_row(&msg.id, timing, &state.expanded_steps))
+                .and_then(crate::opengrok::TurnTiming::total_line)
+            && let Some(last) = rows.last_mut().filter(|row| row.source_id == msg.id)
         {
-            let id = run.key().to_string();
-            rows.push(ChatRow {
-                run: Some(run),
-                ..ChatRow::slot(id, msg.id.clone())
-            });
+            last.turn_total = Some(total.into());
+            last.timestamp = msg.formatted_time().into();
+            // The turn's measured total replaces the older wall-clock duration here.
+            last.duration = "".into();
         }
         // A person's files go on their message's last row of words, under the bubble. A message
         // of files alone gets a row of its own that is otherwise a message like any other: its
@@ -787,7 +792,11 @@ impl ChatTranscript {
             // A step opened or shut in the middle of the thread adds or takes away rows there,
             // and a list reset for that would carry the person off to the bottom of the thread,
             // away from the very row they clicked. Only the rows that changed are replaced.
-            let opened = (!conv_changed && this.feed_rev.expanded_steps != feed.expanded_steps)
+            // Timing arriving or being toggled also needs fresh measurement, even when idle.
+            let opened = (!conv_changed
+                && (this.feed_rev.expanded_steps != feed.expanded_steps
+                    || this.feed_rev.clocks != feed.clocks
+                    || this.feed_rev.show_turn_timing != feed.show_turn_timing))
                 .then(|| changed_rows(&this.rows, &rows));
             let was = this.rows.len();
             let is_ai_responding = feed.is_ai_responding;
@@ -1422,6 +1431,7 @@ impl Render for ChatTranscript {
                                 .text_color(text_color)
                                 .timestamp(row.timestamp.to_string())
                                 .duration(row.duration.to_string())
+                                .turn_total(row.turn_total.as_ref().map(ToString::to_string))
                                 .debug_mode(debug_mode)
                                 .can_read_aloud(can_read_aloud && show_footer)
                                 .is_native_speaking(row.is_native_speaking)
@@ -1470,6 +1480,21 @@ impl Render for ChatTranscript {
                             }
                             bubble.into_any_element()
                         };
+                        let row = &rows[ix];
+                        let body = row_body(ix, window, cx);
+                        let body = if !row.show_footer
+                            && let Some(total) = &row.turn_total
+                        {
+                            let peek = TimestampPeek::new(ts_peek, timestamps_ok);
+                            div()
+                                .relative()
+                                .w_full()
+                                .child(div().w_full().ml(px(-peek.shift)).child(body))
+                                .child(peek.rail(turn_metadata(&row.timestamp, total, cx)))
+                                .into_any_element()
+                        } else {
+                            body
+                        };
                         div()
                             .w_full()
                             .flex()
@@ -1482,12 +1507,7 @@ impl Render for ChatTranscript {
                             .when_some(tail_room(ix, rows.len(), composer_height), |this, room| {
                                 this.pb(room)
                             })
-                            .child(
-                                div()
-                                    .w_full()
-                                    .max_w(px(CHAT_CONTENT_MAX))
-                                    .child(row_body(ix, window, cx)),
-                            )
+                            .child(div().w_full().max_w(px(CHAT_CONTENT_MAX)).child(body))
                     },
                 )
                 // Straight under the title bar, which holds the chat's header.
@@ -2221,6 +2241,7 @@ mod tests {
                         .map(|took| format!(" · {took}"))
                         .unwrap_or_default()
                 ),
+                #[cfg(feature = "agent")]
                 Some(RunRow::Timing { total, .. }) => format!("timing {total} shut"),
                 None => format!("words {}", row.content),
             })
@@ -2258,8 +2279,7 @@ mod tests {
                 "step search shut · 8s",
                 "step write shut · 4s",
                 "step command shut · 8s",
-                "words Done.",
-                "timing 30s total shut"
+                "words Done."
             ]
         );
         let rows = snapshot_rows(&state);
@@ -2270,16 +2290,7 @@ mod tests {
             .collect();
         assert_eq!(
             gaps,
-            [
-                px(4.),
-                px(4.),
-                px(4.),
-                px(4.),
-                px(4.),
-                px(12.),
-                px(12.),
-                px(0.)
-            ]
+            [px(4.), px(4.), px(4.), px(4.), px(4.), px(12.), px(0.)]
         );
         assert_eq!(super::transcript_row_gap(&rows[6], Some(&rows[6])), px(32.));
         let rev = ChatFeedRev::from_state(&state);
@@ -2293,9 +2304,15 @@ mod tests {
         );
         state.mark_steps_open(&[step_key("m1", "command")], true);
         assert_eq!(feed(&state)[5], "step command open · 8s");
+        assert_eq!(feed(&state).last().map(String::as_str), Some("words Done."));
+        let rows = snapshot_rows(&state);
         assert_eq!(
-            feed(&state).last().map(String::as_str),
-            Some("timing 30s total shut")
+            rows.last().unwrap().turn_total.as_deref(),
+            Some("30s total")
+        );
+        assert_eq!(
+            rows.iter().filter(|row| row.turn_total.is_some()).count(),
+            1
         );
     }
 
@@ -2418,12 +2435,10 @@ mod tests {
         assert_eq!(feed(&state)[1], "step c1 open · 1s");
     }
 
-    /// With Settings → Show turn timing on, how long the turn took is one Timing row under the
-    /// whole reply, whatever the reply ended on, and not lines under each bubble of its words,
-    /// where it read as one loose block ("10s total / round 1 2s / round 2 2s / shell 1s / tool
-    /// wait 1s"). It says the total and nothing else, and stale expansion keys cannot open it.
+    /// A total belongs to the final reply row's metadata, not a separate transcript row,
+    /// even when the reply ends with a tool rather than words.
     #[test]
-    fn a_reply_s_timing_is_its_total_under_all_of_it() {
+    fn a_reply_s_total_is_metadata_on_its_last_row() {
         let mut state = one_reply(vec![
             ChatPart::Text("Let me look.".into()),
             timed_step("c1", Some(1000)),
@@ -2447,23 +2462,57 @@ mod tests {
         state.show_turn_timing = true;
         let shut = snapshot_rows(&state);
         assert_eq!(
+            shut.last().unwrap().turn_total.as_deref(),
+            Some("10s total")
+        );
+        assert_eq!(
+            shut.last().unwrap().timestamp,
+            state.conversations[0].messages[0].formatted_time()
+        );
+        assert!(shut.last().unwrap().duration.is_empty());
+        assert!(
+            shut[..shut.len() - 1]
+                .iter()
+                .all(|row| row.turn_total.is_none())
+        );
+        assert_eq!(
             feed(&state),
             vec![
                 "words Let me look.",
                 "step c1 shut · 1s",
                 "words Done.",
                 "step c2 shut",
-                "timing 10s total shut",
             ]
         );
 
         state.mark_steps_open(&[timing_key("m1")], true);
         assert_eq!(
             feed(&state).last().map(String::as_str),
-            Some("timing 10s total shut")
+            Some("step c2 shut")
         );
         let open = snapshot_rows(&state);
-        assert_eq!(changed_rows(&shut, &open), (5..5, 0));
+        assert_eq!(changed_rows(&shut, &open), (4..4, 0));
+        state.show_turn_timing = false;
+        assert!(
+            snapshot_rows(&state)
+                .iter()
+                .all(|row| row.turn_total.is_none())
+        );
+    }
+
+    #[test]
+    fn a_total_arriving_after_the_reply_remeasures_its_metadata_row() {
+        let mut state = one_reply(vec![ChatPart::Text("Done.".into())]);
+        state.show_turn_timing = true;
+        let before = snapshot_rows(&state);
+        state.conversations[0].messages[0].run_timing =
+            TurnTiming::from_value(&serde_json::json!({"total_ms":30000}));
+        let after = snapshot_rows(&state);
+        assert_eq!(after.len(), before.len(), "no separate total row");
+        assert_eq!(changed_rows(&before, &after), (0..1, 1));
+        assert_eq!(after[0].turn_total.as_deref(), Some("30s total"));
+        state.show_turn_timing = false;
+        assert_eq!(changed_rows(&after, &snapshot_rows(&state)), (0..1, 1));
     }
 
     /// Opening a row in the middle of the thread replaces only the rows that changed, so the

@@ -32,6 +32,7 @@ pub struct MessageBubble {
     is_me: bool,
     timestamp: Option<String>,
     duration: Option<String>,
+    turn_total: Option<String>,
     message_id: String,
     source_id: String,
     debug_mode: bool,
@@ -71,6 +72,7 @@ impl MessageBubble {
             is_me: false,
             timestamp: None,
             duration: None,
+            turn_total: None,
             message_id,
             source_id: String::new(),
             debug_mode: false,
@@ -207,6 +209,15 @@ impl MessageBubble {
         self
     }
 
+    pub fn turn_total(mut self, total: Option<String>) -> Self {
+        self.turn_total = total;
+        self
+    }
+
+    fn metadata_peek(&self) -> TimestampPeek {
+        TimestampPeek::new(self.ts_peek, self.timestamps_ok)
+    }
+
     pub fn debug_mode(mut self, enabled: bool) -> Self {
         self.debug_mode = enabled;
         self
@@ -286,17 +297,8 @@ impl RenderOnce for MessageBubble {
             cx,
             |_, _| false,
         );
-        let peek = if self.timestamps_ok {
-            self.ts_peek.clamp(0.0, TS_PEEK_MAX)
-        } else {
-            0.0
-        };
-        let peeking = peek > 0.5;
-        let progress = if TS_PEEK_MAX > 0.0 {
-            peek / TS_PEEK_MAX
-        } else {
-            0.0
-        };
+        let peek = self.metadata_peek();
+        let peeking = peek.shift > 0.5;
         let hovered = *hover_state.read(cx)
             || self.picker_open
             || *menu_state.read(cx)
@@ -587,47 +589,36 @@ impl RenderOnce for MessageBubble {
         let text = self.copy_text.clone();
         let hover_state_row = hover_state.clone();
 
-        // Grok: --sand-ts-peek shifts every row together; timestamps slide in from
-        // the right with --sand-ts-progress. The time shows only while peeking, never on
-        // hover: the space beside the bubble is the toolbar's alone.
+        // Timestamp and total share the same swipe rail. Nothing is reserved or shown at
+        // rest, and the hover toolbar gives way while the person is peeking.
+        let metadata = if let Some(total) = &self.turn_total {
+            turn_metadata(&time_label, total, cx)
+        } else {
+            v_flex()
+                .items_end()
+                .gap_0()
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(muted)
+                        .whitespace_nowrap()
+                        .child(time_label),
+                )
+                .when_some(duration_label, |this, duration| {
+                    this.child(
+                        div()
+                            .text_xs()
+                            .text_color(muted.opacity(0.85))
+                            .whitespace_nowrap()
+                            .child(duration),
+                    )
+                })
+        };
         let body_row = div()
             .relative()
             .w_full()
-            .child(div().w_full().ml(px(-peek)).child(main))
-            .child(
-                div()
-                    .absolute()
-                    .top_0()
-                    .bottom_0()
-                    .right_0()
-                    .w(px(TIMESTAMP_W))
-                    .flex()
-                    .items_center()
-                    .justify_end()
-                    .pl(px(10.))
-                    .opacity(if peeking { progress } else { 0. })
-                    .child(
-                        v_flex()
-                            .items_end()
-                            .gap(px(0.))
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(muted)
-                                    .whitespace_nowrap()
-                                    .child(time_label),
-                            )
-                            .when_some(duration_label, |this, duration| {
-                                this.child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(muted.opacity(0.85))
-                                        .whitespace_nowrap()
-                                        .child(duration),
-                                )
-                            }),
-                    ),
-            );
+            .child(div().w_full().ml(px(-peek.shift)).child(main))
+            .child(peek.rail(metadata));
 
         div()
             .id(ElementId::Name(format!("msg-row-{row_key}").into()))
@@ -656,6 +647,19 @@ impl RenderOnce for MessageBubble {
     }
 }
 
+/// The final reply's total stays directly beneath its timestamp in the swipe rail.
+pub(super) fn turn_metadata(timestamp: &str, total: &str, cx: &App) -> Div {
+    v_flex()
+        .w_full()
+        .items_end()
+        .gap_0()
+        .text_xs()
+        .text_color(cx.theme().muted_foreground)
+        .whitespace_nowrap()
+        .child(timestamp.to_string())
+        .child(total.to_string())
+}
+
 fn truncate_preview(text: &str, max: usize) -> String {
     let trimmed = text.trim().replace('\n', " ");
     if trimmed.chars().count() <= max {
@@ -663,6 +667,46 @@ fn truncate_preview(text: &str, max: usize) -> String {
     } else {
         let cut: String = trimmed.chars().take(max.saturating_sub(1)).collect();
         format!("{cut}…")
+    }
+}
+
+/// Shared swipe progress for reply words and replies ending with an action or card.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct TimestampPeek {
+    pub shift: f32,
+    pub opacity: f32,
+}
+
+impl TimestampPeek {
+    pub fn new(requested: f32, timestamps_ok: bool) -> Self {
+        let shift = if timestamps_ok {
+            requested.clamp(0.0, TS_PEEK_MAX)
+        } else {
+            0.0
+        };
+        Self {
+            shift,
+            opacity: if shift > 0.5 {
+                shift / TS_PEEK_MAX
+            } else {
+                0.0
+            },
+        }
+    }
+
+    pub fn rail(self, metadata: Div) -> Div {
+        div()
+            .absolute()
+            .top_0()
+            .bottom_0()
+            .right_0()
+            .w(px(TIMESTAMP_W))
+            .flex()
+            .items_center()
+            .justify_end()
+            .pl(px(10.))
+            .opacity(self.opacity)
+            .child(metadata)
     }
 }
 
@@ -839,5 +883,51 @@ pub(crate) fn human_size(bytes: u64) -> String {
         format!("{:.0} KB", b / KIB)
     } else {
         format!("{:.1} MB", b / KIB / KIB)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MessageBubble, TS_PEEK_MAX, TimestampPeek};
+
+    #[test]
+    fn a_timed_reply_preserves_the_timestamp_swipe() {
+        let reply = MessageBubble::new("Done.".into())
+            .turn_total(Some("30s total".into()))
+            .ts_peek(TS_PEEK_MAX);
+        assert_eq!(
+            reply.metadata_peek(),
+            TimestampPeek {
+                shift: TS_PEEK_MAX,
+                opacity: 1.0
+            }
+        );
+    }
+
+    #[test]
+    fn reply_metadata_is_hidden_before_and_after_the_swipe() {
+        let reply = MessageBubble::new("Done.".into()).turn_total(Some("30s total".into()));
+        assert_eq!(
+            reply.metadata_peek(),
+            TimestampPeek {
+                shift: 0.0,
+                opacity: 0.0
+            }
+        );
+    }
+
+    #[test]
+    fn narrow_replies_do_not_reveal_either_metadata_line() {
+        let reply = MessageBubble::new("Done.".into())
+            .turn_total(Some("30s total".into()))
+            .ts_peek(TS_PEEK_MAX)
+            .timestamps_ok(false);
+        assert_eq!(
+            reply.metadata_peek(),
+            TimestampPeek {
+                shift: 0.0,
+                opacity: 0.0
+            }
+        );
     }
 }
