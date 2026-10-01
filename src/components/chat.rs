@@ -80,6 +80,7 @@ struct ChatFeedRev {
     steps: (usize, usize),
     expanded_steps: Vec<String>,
     show_turn_timing: bool,
+    action_times: Vec<Option<u64>>,
     /// Every row's, not the last one's: a resumed run finishes on a bubble that a later
     /// message may already sit below.
     clocks: Vec<(
@@ -280,7 +281,7 @@ impl ChatFeedRev {
                                     + step.result.as_ref().map_or(0, String::len),
                                 settled + usize::from(step.result.is_some()),
                             ),
-                            ChatPart::Reasoning(thought) => (held + thought.len(), settled),
+                            ChatPart::Reasoning(thought) => (held + thought.text.len(), settled),
                             _ => (held, settled),
                         },
                     )
@@ -292,6 +293,19 @@ impl ChatFeedRev {
                 keys
             },
             show_turn_timing: state.show_turn_timing,
+            action_times: conv
+                .map(|c| {
+                    c.messages
+                        .iter()
+                        .flat_map(|m| m.parts.iter())
+                        .filter_map(|part| match part {
+                            ChatPart::Step(step) => Some(step.took_ms),
+                            ChatPart::Reasoning(thought) => Some(thought.took_ms),
+                            _ => None,
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
             clocks: conv
                 .map(|c| {
                     c.messages
@@ -414,6 +428,17 @@ fn changed_rows(old: &[ChatRow], new: &[ChatRow]) -> (std::ops::Range<usize>, us
         .take_while(|(old, new)| old.same_as(new))
         .count();
     (head..old.len() - tail, new.len() - tail - head)
+}
+
+/// Actions read as one compact sequence, not separate message bubbles. The scroller's
+/// default 32px message gap belongs only between ordinary transcript rows.
+fn transcript_row_gap(row: &ChatRow, next: Option<&ChatRow>) -> Pixels {
+    match next {
+        None => px(0.),
+        Some(next) if row.run.is_some() && next.run.is_some() => px(4.),
+        Some(next) if row.run.is_some() || next.run.is_some() => px(12.),
+        Some(_) => px(32.),
+    }
 }
 
 /// Whether a picture belongs to the strip the row before it already holds. Pictures are one
@@ -1450,6 +1475,7 @@ impl Render for ChatTranscript {
                             .flex()
                             .justify_center()
                             .px_4()
+                            .pb(transcript_row_gap(&rows[ix], rows.get(ix + 1)))
                             // The transcript's own edges, carried by the rows that sit against
                             // them rather than by the list's padding (see `tail_room`).
                             .when(ix == 0, |this| this.pt(px(TRANSCRIPT_EDGE_GAP)))
@@ -1470,6 +1496,8 @@ impl Render for ChatTranscript {
                 // that the height of the items is the whole of the transcript and the two
                 // ways GPUI measures the scroll cannot disagree — see `TRANSCRIPT_EDGE_GAP`.
                 .with_list_style(StyleRefinement::default().py(px(0.)))
+                // Override its message-sized gap: action sequences use the compact gap above.
+                .with_row_style(StyleRefinement::default().pb(px(0.)))
                 // The chevron belongs over the chat, not behind the composer, so lift it off
                 // the scroller's floor by exactly what the composer covers; the rem the
                 // scroller already holds it by then reads from the composer's top edge.
@@ -2183,20 +2211,17 @@ mod tests {
                         .map(|took| format!(" · {took}"))
                         .unwrap_or_default()
                 ),
-                Some(RunRow::Thought { open, group, .. }) => format!(
-                    "{}thought {}",
+                Some(RunRow::Thought {
+                    open, group, took, ..
+                }) => format!(
+                    "{}thought {}{}",
                     if group.is_some() { "  " } else { "" },
-                    open_word(*open)
+                    open_word(*open),
+                    took.as_ref()
+                        .map(|took| format!(" · {took}"))
+                        .unwrap_or_default()
                 ),
-                Some(RunRow::Timing {
-                    total, lines, open, ..
-                }) => {
-                    if *open {
-                        format!("timing {total} open: {}", lines.join(" | "))
-                    } else {
-                        format!("timing {total} shut")
-                    }
-                }
+                Some(RunRow::Timing { total, .. }) => format!("timing {total} shut"),
                 None => format!("words {}", row.content),
             })
             .collect()
@@ -2204,6 +2229,74 @@ mod tests {
 
     fn open_word(open: bool) -> &'static str {
         if open { "open" } else { "shut" }
+    }
+
+    #[test]
+    fn timing_keeps_each_action_visible_and_each_detail_collapsed() {
+        let mut state = one_reply(vec![
+            ChatPart::Reasoning(crate::opengrok::ThoughtSpec {
+                text: "Look first.".into(),
+                took_ms: Some(5000),
+            }),
+            timed_step("read-1", Some(2000)),
+            timed_step("read-2", Some(3000)),
+            timed_step("search", Some(8000)),
+            timed_step("write", Some(4000)),
+            timed_step("command", Some(8000)),
+            ChatPart::Text("Done.".into()),
+        ]);
+        state.show_turn_timing = true;
+        state.conversations[0].messages[0].run_timing = crate::opengrok::TurnTiming::from_value(
+            &serde_json::json!({"total_ms":30000,"model_ms":[5000],"tool_wait_ms":25000}),
+        );
+        assert_eq!(
+            feed(&state),
+            [
+                "thought shut · 5s",
+                "step read-1 shut · 2s",
+                "step read-2 shut · 3s",
+                "step search shut · 8s",
+                "step write shut · 4s",
+                "step command shut · 8s",
+                "words Done.",
+                "timing 30s total shut"
+            ]
+        );
+        let rows = snapshot_rows(&state);
+        let gaps: Vec<_> = rows
+            .iter()
+            .enumerate()
+            .map(|(ix, row)| super::transcript_row_gap(row, rows.get(ix + 1)))
+            .collect();
+        assert_eq!(
+            gaps,
+            [
+                px(4.),
+                px(4.),
+                px(4.),
+                px(4.),
+                px(4.),
+                px(12.),
+                px(12.),
+                px(0.)
+            ]
+        );
+        assert_eq!(super::transcript_row_gap(&rows[6], Some(&rows[6])), px(32.));
+        let rev = ChatFeedRev::from_state(&state);
+        let ChatPart::Reasoning(thought) = &mut state.conversations[0].messages[0].parts[0] else {
+            panic!("thought");
+        };
+        thought.took_ms = Some(6000);
+        assert!(
+            rev != ChatFeedRev::from_state(&state),
+            "a timing-only update repaints"
+        );
+        state.mark_steps_open(&[step_key("m1", "command")], true);
+        assert_eq!(feed(&state)[5], "step command open · 8s");
+        assert_eq!(
+            feed(&state).last().map(String::as_str),
+            Some("timing 30s total shut")
+        );
     }
 
     /// Steps with no words between them are one "N steps" row until it is opened, a thought
@@ -2328,8 +2421,7 @@ mod tests {
     /// With Settings → Show turn timing on, how long the turn took is one Timing row under the
     /// whole reply, whatever the reply ended on, and not lines under each bubble of its words,
     /// where it read as one loose block ("10s total / round 1 2s / round 2 2s / shell 1s / tool
-    /// wait 1s"). Shut, it says the total and nothing else; opened, the model's rounds and the
-    /// wait on tools, and no tool by its name. Opening it measures that row again and no other.
+    /// wait 1s"). It says the total and nothing else, and stale expansion keys cannot open it.
     #[test]
     fn a_reply_s_timing_is_its_total_under_all_of_it() {
         let mut state = one_reply(vec![
@@ -2368,10 +2460,10 @@ mod tests {
         state.mark_steps_open(&[timing_key("m1")], true);
         assert_eq!(
             feed(&state).last().map(String::as_str),
-            Some("timing 10s total open: model, round 1  2s | model, round 2  2s | tool wait  1s")
+            Some("timing 10s total shut")
         );
         let open = snapshot_rows(&state);
-        assert_eq!(changed_rows(&shut, &open), (4..5, 1));
+        assert_eq!(changed_rows(&shut, &open), (5..5, 0));
     }
 
     /// Opening a row in the middle of the thread replaces only the rows that changed, so the

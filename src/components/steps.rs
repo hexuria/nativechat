@@ -1,9 +1,8 @@
 //! What the coworker did and thought on the way to a reply, drawn between its words: a row per
-//! tool call it made, one "N steps" row for a stretch of them, and a "Thought" row for its
-//! reasoning. Every one of them is shut until it is opened, the way Grok Bot's tool-result card
-//! is a `<details>` that starts closed: a computer run of two hundred calls is one line of the
-//! reply until somebody wants to know what those calls were. Under it all, while Settings →
-//! Show turn timing is on, a "Timing" row says how long the turn took.
+//! tool call it made, one "N steps" row for a stretch of them while timing is off, and a
+//! "Thinking" row for its reasoning. Every detail starts closed: a computer run of two hundred
+//! calls is one line until somebody wants to know what those calls were. While Settings → Show turn timing
+//! is on, every action stays visible with its own observed duration and a plain total underneath.
 
 use std::collections::HashSet;
 
@@ -35,26 +34,16 @@ pub(crate) fn timing_key(message_id: &str) -> String {
     format!("{message_id}/timing")
 }
 
-/// The Timing row under a reply whose run sent a `run-timing` frame. Shut, it says how long the
-/// turn took and nothing else; opened, it says what the rows above it cannot, the model's time
-/// in each round and the wait on tools ([`TurnTiming::breakdown`]). Each call's own time is at
-/// the end of its row. `None` when the frame had nothing to say.
+/// The non-interactive total under a reply. Individual durations belong to their action rows,
+/// not a second, detached list. Old expansion keys are deliberately ignored.
 pub(crate) fn timing_row(
     message_id: &str,
     timing: &TurnTiming,
-    open: &HashSet<String>,
+    _open: &HashSet<String>,
 ) -> Option<RunRow> {
-    let lines = timing.breakdown();
-    let total = timing
-        .total_line()
-        .or_else(|| (!lines.is_empty()).then(|| "Timing".to_string()))?;
+    let total = timing.total_line()?;
     let key = timing_key(message_id);
-    Some(RunRow::Timing {
-        open: !lines.is_empty() && open.contains(&key),
-        key,
-        total,
-        lines,
-    })
+    Some(RunRow::Timing { key, total })
 }
 
 /// A stretch of a reply with no words in it: the steps the coworker took there, and what it
@@ -121,15 +110,13 @@ pub(crate) enum RunRow {
         text: String,
         open: bool,
         group: Option<String>,
+        took: Option<String>,
     },
     /// How long the turn took, under all of it (see [`timing_row`]).
     Timing {
         key: String,
-        /// `10s total`, or `Timing` for a frame that had no total.
+        /// `10s total`. Model/tool aggregate phases are not another disclosure.
         total: String,
-        /// What opening it shows, a line each. None, and the row does not open.
-        lines: Vec<String>,
-        open: bool,
     },
 }
 
@@ -145,10 +132,10 @@ impl RunRow {
 
     pub(crate) fn is_open(&self) -> bool {
         match self {
-            Self::Steps { open, .. }
-            | Self::Step { open, .. }
-            | Self::Thought { open, .. }
-            | Self::Timing { open, .. } => *open,
+            Self::Steps { open, .. } | Self::Step { open, .. } | Self::Thought { open, .. } => {
+                *open
+            }
+            Self::Timing { .. } => false,
         }
     }
 }
@@ -273,7 +260,9 @@ impl RunLayout {
             return Vec::new();
         };
         let (n, run) = run;
-        let grouped = run.steps >= 2;
+        // With timing visible, hiding the action rows would hide the very breakdown the
+        // person asked to read. Their contents still start collapsed.
+        let grouped = run.steps >= 2 && !self.timing;
         let mut rows = Vec::new();
         if grouped && run.first == at {
             rows.push(RunRow::Steps {
@@ -299,12 +288,13 @@ impl RunLayout {
                     group,
                 });
             }
-            ChatPart::Reasoning(text) => {
+            ChatPart::Reasoning(thought) => {
                 let key = thought_key(&self.message_id, self.thought_of[at]);
                 rows.push(RunRow::Thought {
                     open: self.open.contains(&key),
                     key,
-                    text,
+                    text: thought.text.clone(),
+                    took: self.timing.then(|| thought.took()).flatten(),
                     group,
                 });
             }
@@ -314,12 +304,6 @@ impl RunLayout {
     }
 }
 
-/// How far rows inside an open "N steps" stand in under its line.
-const NESTED_INDENT: f32 = 20.0;
-/// Where an opened row's detail starts: under its label, past the chevron and the mark.
-const DETAIL_INDENT: f32 = 34.0;
-/// Where an opened Timing row's lines start: under its label, past the chevron. It has no mark.
-const TIMING_INDENT: f32 = 24.0;
 /// How wide an opened row's detail gets. The column is as wide as it is for words, and a
 /// shell's output read at that width is lines of two hundred characters.
 const DETAIL_MAX: f32 = 640.0;
@@ -380,12 +364,7 @@ pub(crate) fn render_run_row(row: &RunRow, app: Entity<AppState>, cx: &App) -> A
             if !*open {
                 return head.into_any_element();
             }
-            let nested = group.is_some();
-            let mut detail = v_flex()
-                .gap(px(6.))
-                .pl(px(indent(nested) + DETAIL_INDENT))
-                .w_full()
-                .max_w(px(DETAIL_MAX + indent(nested) + DETAIL_INDENT));
+            let mut detail = v_flex().gap(px(6.)).w_full().max_w(px(DETAIL_MAX));
             if let Some(arguments) = step.shown_arguments() {
                 detail = detail.child(mono_block(arguments, cx));
             }
@@ -394,6 +373,7 @@ pub(crate) fn render_run_row(row: &RunRow, app: Entity<AppState>, cx: &App) -> A
             }
             v_flex()
                 .w_full()
+                .items_start()
                 .gap(px(4.))
                 .child(head)
                 .child(detail)
@@ -404,83 +384,48 @@ pub(crate) fn render_run_row(row: &RunRow, app: Entity<AppState>, cx: &App) -> A
             text,
             open,
             group,
+            took,
         } => {
             let head = heading(
                 key,
                 *open,
                 None,
-                "Thought".to_string(),
+                "Thinking".to_string(),
                 Toggle::row(key, *open, group),
                 app,
                 cx,
-            );
+            )
+            .when_some(took.clone(), |this, took| {
+                this.child(
+                    div()
+                        .text_color(theme.muted_foreground.opacity(0.7))
+                        .child(format!("· {took}")),
+                )
+            });
             if !*open {
                 return head.into_any_element();
             }
-            let nested = group.is_some();
             v_flex()
                 .w_full()
+                .items_start()
                 .gap(px(4.))
                 .child(head)
                 .child(
                     div()
-                        .pl(px(indent(nested) + DETAIL_INDENT))
-                        .max_w(px(DETAIL_MAX + indent(nested) + DETAIL_INDENT))
+                        .max_w(px(DETAIL_MAX))
                         .text_sm()
                         .text_color(theme.muted_foreground)
                         .child(text.clone()),
                 )
                 .into_any_element()
         }
-        RunRow::Timing {
-            key,
-            total,
-            lines,
-            open,
-        } => {
-            let muted = theme.muted_foreground;
-            if lines.is_empty() {
-                // Nothing more to open: the total is a line, not a control.
-                return div()
-                    .px(px(6.))
-                    .py(px(3.))
-                    .text_xs()
-                    .text_color(muted)
-                    .child(total.clone())
-                    .into_any_element();
-            }
-            let head = heading(
-                key,
-                *open,
-                None,
-                total.clone(),
-                Toggle::row(key, *open, &None),
-                app,
-                cx,
-            )
-            .text_xs();
-            if !*open {
-                return head.into_any_element();
-            }
-            v_flex()
-                .w_full()
-                .gap(px(2.))
-                .child(head)
-                .child(
-                    v_flex()
-                        .pl(px(TIMING_INDENT))
-                        .gap(px(1.))
-                        .text_xs()
-                        .text_color(muted)
-                        .children(lines.iter().map(|line| div().child(line.clone()))),
-                )
-                .into_any_element()
-        }
+        RunRow::Timing { total, .. } => div()
+            .py(px(3.))
+            .text_xs()
+            .text_color(theme.muted_foreground)
+            .child(total.clone())
+            .into_any_element(),
     }
-}
-
-fn indent(nested: bool) -> f32 {
-    if nested { NESTED_INDENT } else { 0.0 }
 }
 
 /// What a click on a row's line does: sets `keys` open or shut and, for a row inside an open
@@ -516,18 +461,20 @@ fn heading(
 ) -> Stateful<Div> {
     let theme = cx.theme();
     let muted = theme.muted_foreground;
+    let hover_group = SharedString::from(format!("{key}/hover"));
     h_flex()
         .id(ElementId::Name(format!("{key}/heading").into()))
-        .ml(px(indent(toggle.group.is_some())))
+        .group(hover_group.clone())
+        // A disclosure is a text control, not a full-width button. Its hit target follows
+        // its content even when the surrounding reply column stretches.
+        .flex_none()
+        .self_start()
         .gap(px(6.))
-        .px(px(6.))
         .py(px(3.))
-        .rounded(px(6.))
         .items_center()
         .text_sm()
         .text_color(muted)
         .cursor_pointer()
-        .hover(|style| style.bg(theme.secondary))
         .on_mouse_down(MouseButton::Left, move |_, _, cx| {
             app.update(cx, |state, cx| {
                 if let Some(group) = &toggle.group {
@@ -556,7 +503,15 @@ fn heading(
                     .child(status.mark()),
             )
         })
-        .child(label)
+        .child(
+            div()
+                // Keep the label's hover state through layout so its text colour, not just
+                // paint-only styles, updates when entering the disclosure's hit target.
+                .id(SharedString::from(format!("{key}/label")))
+                .text_color(muted)
+                .group_hover(hover_group, |style| style.text_color(theme.foreground))
+                .child(label),
+        )
 }
 
 /// A step's arguments or its result, exactly as they are kept, in the font code is read in.

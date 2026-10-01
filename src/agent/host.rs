@@ -112,11 +112,6 @@ pub mod ids {
         format!("step-{call_id}")
     }
 
-    /// One line of the newest reply's opened Timing row, counted from 0.
-    pub fn reply_timing_line(n: usize) -> String {
-        format!("reply-timing-line-{n}")
-    }
-
     pub fn session(id: &str) -> String {
         format!("session-{id}")
     }
@@ -1410,7 +1405,7 @@ struct RecipeDetailSnap {
 struct ReplyRunSnap {
     steps: Vec<StepSnap>,
     /// Each Thought row's key, and whether it is open.
-    thoughts: Vec<(String, bool)>,
+    thoughts: Vec<(String, bool, Option<String>)>,
     /// Its Timing row, from the function that builds the feed's (`steps::timing_row`), while
     /// the feed draws one.
     timing: Option<crate::components::steps::RunRow>,
@@ -1461,9 +1456,13 @@ impl ReplyRunSnap {
                         took: show_timing.then(|| step.took()).flatten(),
                     });
                 }
-                ChatPart::Reasoning(_) => {
+                ChatPart::Reasoning(thought) => {
                     let key = crate::components::steps::thought_key(message_id, run.thoughts.len());
-                    run.thoughts.push((key.clone(), open.contains(&key)));
+                    run.thoughts.push((
+                        key.clone(),
+                        open.contains(&key),
+                        show_timing.then(|| thought.took()).flatten(),
+                    ));
                 }
                 _ => {}
             }
@@ -3564,27 +3563,29 @@ impl NativeChatHost {
         if !run.thoughts.is_empty() {
             let mut node = UiNode::status(ids::REPLY_REASONING, "Thought")
                 .with_value(run.thoughts.len().to_string());
-            if run.thoughts.iter().all(|(_, open)| *open) {
+            if run.thoughts.iter().all(|(_, open, _)| *open) {
                 node.states.push("expanded".into());
             }
+            node = node.with_children(
+                run.thoughts
+                    .iter()
+                    .enumerate()
+                    .map(|(n, (_, open, took))| {
+                        let mut thought = UiNode::status(format!("reply-thought-{n}"), "Thinking");
+                        if *open {
+                            thought.states.push("expanded".into());
+                        }
+                        if let Some(took) = took {
+                            thought.states.push(format!("took-{took}"));
+                        }
+                        thought
+                    })
+                    .collect(),
+            );
             nodes.push(node);
         }
-        if let Some(crate::components::steps::RunRow::Timing {
-            total, lines, open, ..
-        }) = &run.timing
-        {
-            let mut node = UiNode::status(ids::REPLY_TIMING, "Timing").with_value(total.clone());
-            if *open {
-                node.states.push("expanded".into());
-                node = node.with_children(
-                    lines
-                        .iter()
-                        .enumerate()
-                        .map(|(n, line)| UiNode::note(ids::reply_timing_line(n), line.clone()))
-                        .collect(),
-                );
-            }
-            nodes.push(node);
+        if let Some(crate::components::steps::RunRow::Timing { total, .. }) = &run.timing {
+            nodes.push(UiNode::status(ids::REPLY_TIMING, "Timing").with_value(total.clone()));
         }
         nodes
     }
@@ -3592,17 +3593,10 @@ impl NativeChatHost {
     /// A click on one of the newest reply's steps opens it, or shuts it if it is open. What
     /// holds it opens with it: an open step keeps its "N steps" line open (see
     /// `components::steps`). A click on `reply-reasoning` opens every Thought row, or shuts
-    /// them all once they all are. A click on `reply-timing` opens or shuts the Timing row, and
-    /// is refused where the row is the total and nothing more, as it does not open.
+    /// them all once they all are. The `reply-timing` footer is plain text and refuses clicks.
     fn reply_run_command(&self, target: &str) -> Option<Result<Command, String>> {
         if target == ids::REPLY_TIMING {
             return Some(match &self.reply_run.timing {
-                Some(crate::components::steps::RunRow::Timing {
-                    key, lines, open, ..
-                }) if !lines.is_empty() => Ok(Command::SetStepsOpen {
-                    keys: vec![key.clone()],
-                    open: !open,
-                }),
                 Some(_) => {
                     Err("the newest reply's Timing row is its total and does not open".to_string())
                 }
@@ -3615,8 +3609,8 @@ impl NativeChatHost {
                 return Some(Err("the newest reply has no Thought row".to_string()));
             }
             return Some(Ok(Command::SetStepsOpen {
-                keys: thoughts.iter().map(|(key, _)| key.clone()).collect(),
-                open: !thoughts.iter().all(|(_, open)| *open),
+                keys: thoughts.iter().map(|(key, _, _)| key.clone()).collect(),
+                open: !thoughts.iter().all(|(_, open, _)| *open),
             }));
         }
         let call_id = target.strip_prefix("step-")?;
@@ -9099,7 +9093,7 @@ mod tests {
     /// is the total alone does not open, and the click says so. With the setting off, or with no
     /// `run-timing` frame, it is not there, as it is not drawn.
     #[test]
-    fn the_timing_row_is_on_the_tree_and_opens_on_click() {
+    fn the_timing_footer_is_on_the_tree_but_never_opens() {
         use crate::opengrok::TurnTiming;
         let mut state = one_timed_reply();
         state.show_turn_timing = true;
@@ -9130,26 +9124,17 @@ mod tests {
         assert!(signed_in_host(&state).snapshot().ids_are_unique());
 
         let mut driver = signed_in_host(&state);
-        driver.click(ids::REPLY_TIMING).unwrap();
-        let Some(Command::SetStepsOpen { keys, open }) = driver.take_command() else {
-            panic!("a click on the Timing row opens it");
-        };
-        state.mark_steps_open(&keys, open);
+        assert!(driver.click(ids::REPLY_TIMING).is_err());
+        assert!(driver.take_command().is_none());
+        state.mark_steps_open(&[crate::components::steps::timing_key("m1")], true);
         let open = timing_node(&state).expect("the Timing row");
-        assert!(open.states.contains(&"expanded".to_string()));
+        assert!(!open.states.contains(&"expanded".to_string()));
         let lines: Vec<(String, String)> = open
             .children
             .iter()
             .map(|line| (line.id.clone(), line.name.clone()))
             .collect();
-        assert_eq!(
-            lines,
-            vec![
-                (ids::reply_timing_line(0), "model, round 1  2s".to_string()),
-                (ids::reply_timing_line(1), "model, round 2  2s".to_string()),
-                (ids::reply_timing_line(2), "tool wait  1s".to_string()),
-            ]
-        );
+        assert_eq!(lines, Vec::<(String, String)>::new());
 
         // A frame with a total and nothing else is a row that does not open.
         state.conversations[0].messages[0].run_timing =

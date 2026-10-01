@@ -45,11 +45,11 @@
 //! are; a click opens or shuts it, and an open step holds its "N steps" line open),
 //! `reply-reasoning` (value = how many Thought rows that reply has, in the tree only while it has
 //! any; state `expanded` while all are open; a click opens them all, or shuts them once they all
-//! are), `reply-timing` (the Timing row under that reply, value = what it says shut, `10s total`;
-//! in the tree only while Show turn timing is on and the run sent a `run-timing` frame; state
-//! `expanded` while open, with `reply-timing-line-{n}` under it, one per line it shows, name =
-//! the line, e.g. `model, round 1  2s`; a click opens or shuts it, and is refused where the row
-//! is the total alone and does not open),
+//! are), with `reply-thought-{n}` underneath (name = Thinking, state `took-{time}` when that
+//! segment was timed). `reply-timing` is the plain total under that reply, value = `10s total`;
+//! in the tree only while Show turn timing is on and the run sent a total in `run-timing`.
+//! It has no children or expanded state, and refuses clicks: durations belong to action rows,
+//! not a second breakdown under the total.
 //! `recipe-run` (on the open recipe: value = the bot it plays on, disabled while it cannot run
 //! or a run is going; invoke `recipe.run {bot?}`), `recipe-run-result` (value `running` / `ok`
 //! / `failed` / `interrupted`), `recipe-error` (what the page says went wrong, e.g. a
