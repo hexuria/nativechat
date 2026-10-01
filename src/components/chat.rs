@@ -448,6 +448,9 @@ struct RowsChange {
 /// by a message of the person's own: they sent it, and whoever sends wants to see what comes
 /// back.
 fn apply_rows(scroll: &mut TranscriptScroll, old: &[ChatRow], new: &[ChatRow], change: RowsChange) {
+    // A scrollbar movement can arrive before the next render. Hear it before a row update
+    // decides whether the person still wants to follow the newest row.
+    scroll.sync_frame();
     let count = new.len();
     // The list and the old rows agree on how many there are, unless something replaced the rows
     // without telling the list (the read-aloud pump does). A splice would then point into rows
@@ -2478,6 +2481,64 @@ mod tests {
         apply_rows(&mut scroll, &before, &after, RowsChange::default());
         assert!(scroll.is_following() && scroll.list().is_following_tail());
         assert_eq!(scroll.item_count(), after.len());
+    }
+
+    /// The scrollbar moves GPUI's list before the transcript's next render hears about it. A
+    /// reply can add a row in between, and must leave the reader where the scrollbar put them.
+    #[test]
+    fn rows_arriving_before_the_next_frame_preserve_the_scrollbar_position() {
+        let before: Vec<_> = (0..12)
+            .map(|ix| ChatRow::slot(format!("row-{ix}"), format!("message-{ix}")))
+            .collect();
+        let mut after = before.clone();
+        after.push(ChatRow::slot("new-row".into(), "new-message".into()));
+        let mut scroll = TranscriptScroll::new(before.len());
+        // Height hints give the list scrollable content without drawing a window. Moving the
+        // list directly models the scrollbar's off-bottom result before render synchronizes it.
+        scroll.list().clone().with_uniform_item_height(px(100.));
+        scroll.list().scroll_to(ListOffset {
+            item_ix: 3,
+            offset_in_item: px(12.),
+        });
+        assert!(!scroll.list().is_following_tail());
+        assert!(scroll.is_following(), "the transcript has not rendered yet");
+
+        apply_rows(&mut scroll, &before, &after, RowsChange::default());
+
+        assert_eq!(place(&scroll), (3, px(12.)), "still on the row being read");
+        assert!(!scroll.is_following() && !scroll.list().is_following_tail());
+        assert_eq!(scroll.item_count(), after.len());
+    }
+
+    /// Streaming can grow a row without adding one. It still has to hear a scrollbar movement
+    /// before it publishes whether the transcript follows, so a later row cannot reset it.
+    #[test]
+    fn a_growing_reply_before_the_next_frame_hears_the_scrollbar_position() {
+        let mut state = one_reply(vec![ChatPart::Text("Let me look.".into())]);
+        let before = snapshot_rows(&state);
+        let mut scroll = TranscriptScroll::new(before.len());
+        scroll.list().clone().with_uniform_item_height(px(100.));
+        scroll.list().scroll_to(ListOffset {
+            item_ix: 0,
+            offset_in_item: px(12.),
+        });
+        state.conversations[0].messages[0].parts =
+            vec![ChatPart::Text("Let me look at the logs.".into())];
+        let after = snapshot_rows(&state);
+        assert_eq!(before.len(), after.len());
+
+        apply_rows(
+            &mut scroll,
+            &before,
+            &after,
+            RowsChange {
+                responding: true,
+                ..RowsChange::default()
+            },
+        );
+
+        assert!(!scroll.is_following() && !scroll.list().is_following_tail());
+        assert_eq!(place(&scroll), (0, px(12.)));
     }
 
     /// A message of the person's own takes them to the newest row from wherever they were
