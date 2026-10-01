@@ -162,8 +162,7 @@ impl TurnTiming {
             .and_then(Self::from_value)
     }
 
-    /// What the Timing row under a reply says while it is shut, when Settings → Show turn timing
-    /// is on: how long the run took, and nothing else.
+    /// The final reply's total-time metadata when Settings → Show turn timing is on.
     pub fn total_line(&self) -> Option<String> {
         self.total_ms.map(|ms| format!("{} total", format_ms(ms)))
     }

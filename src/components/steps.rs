@@ -2,11 +2,14 @@
 //! tool call it made, one "N steps" row for a stretch of them while timing is off, and a
 //! "Thinking" row for its reasoning. Every detail starts closed: a computer run of two hundred
 //! calls is one line until somebody wants to know what those calls were. While Settings → Show turn timing
-//! is on, every action stays visible with its own observed duration and a plain total underneath.
+//! is on, every action stays visible with its own observed duration. The total belongs to the
+//! final reply's swipe-revealed timestamp metadata.
 
 use std::collections::HashSet;
 
-use crate::opengrok::{ChatPart, StepSpec, StepStatus, TurnTiming};
+#[cfg(feature = "agent")]
+use crate::opengrok::TurnTiming;
+use crate::opengrok::{ChatPart, StepSpec, StepStatus};
 use crate::state::AppState;
 use gpui_kit::component::{ActiveTheme, Icon, IconName, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder;
@@ -29,13 +32,15 @@ fn steps_key(message_id: &str, n: usize) -> String {
     format!("{message_id}/steps/{n}")
 }
 
-/// The key of a reply's Timing row.
+/// The stable key of a reply's total-time metadata.
+#[cfg(any(feature = "agent", test))]
 pub(crate) fn timing_key(message_id: &str) -> String {
     format!("{message_id}/timing")
 }
 
-/// The non-interactive total under a reply. Individual durations belong to their action rows,
-/// not a second, detached list. Old expansion keys are deliberately ignored.
+/// The agent's non-interactive total-time metadata. It is not a separate transcript row.
+/// Old expansion keys are deliberately ignored.
+#[cfg(feature = "agent")]
 pub(crate) fn timing_row(
     message_id: &str,
     timing: &TurnTiming,
@@ -112,7 +117,8 @@ pub(crate) enum RunRow {
         group: Option<String>,
         took: Option<String>,
     },
-    /// How long the turn took, under all of it (see [`timing_row`]).
+    /// Agent representation of the final reply's total-time metadata (see [`timing_row`]).
+    #[cfg(feature = "agent")]
     Timing {
         key: String,
         /// `10s total`. Model/tool aggregate phases are not another disclosure.
@@ -123,10 +129,9 @@ pub(crate) enum RunRow {
 impl RunRow {
     pub(crate) fn key(&self) -> &str {
         match self {
-            Self::Steps { key, .. }
-            | Self::Step { key, .. }
-            | Self::Thought { key, .. }
-            | Self::Timing { key, .. } => key,
+            Self::Steps { key, .. } | Self::Step { key, .. } | Self::Thought { key, .. } => key,
+            #[cfg(feature = "agent")]
+            Self::Timing { key, .. } => key,
         }
     }
 
@@ -135,6 +140,7 @@ impl RunRow {
             Self::Steps { open, .. } | Self::Step { open, .. } | Self::Thought { open, .. } => {
                 *open
             }
+            #[cfg(feature = "agent")]
             Self::Timing { .. } => false,
         }
     }
@@ -419,6 +425,7 @@ pub(crate) fn render_run_row(row: &RunRow, app: Entity<AppState>, cx: &App) -> A
                 )
                 .into_any_element()
         }
+        #[cfg(feature = "agent")]
         RunRow::Timing { total, .. } => div()
             .py(px(3.))
             .text_xs()
