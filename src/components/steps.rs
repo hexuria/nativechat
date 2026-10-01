@@ -314,6 +314,12 @@ impl RunLayout {
 /// shell's output read at that width is lines of two hundred characters.
 const DETAIL_MAX: f32 = 640.0;
 
+/// Disclosure contents share the transcript's left edge, not the label's inset.
+/// Group membership affects toggling only; it must not add a nested visual gutter.
+fn flat_column(gap: f32) -> Div {
+    v_flex().w_full().items_start().gap(px(gap))
+}
+
 /// One row of what the coworker did or thought, and what a click on it opens or shuts.
 pub(crate) fn render_run_row(row: &RunRow, app: Entity<AppState>, cx: &App) -> AnyElement {
     let theme = cx.theme();
@@ -370,20 +376,14 @@ pub(crate) fn render_run_row(row: &RunRow, app: Entity<AppState>, cx: &App) -> A
             if !*open {
                 return head.into_any_element();
             }
-            let mut detail = v_flex().gap(px(6.)).w_full().max_w(px(DETAIL_MAX));
+            let mut detail = flat_column(6.).max_w(px(DETAIL_MAX));
             if let Some(arguments) = step.shown_arguments() {
                 detail = detail.child(mono_block(arguments, cx));
             }
             if let Some(result) = &step.result {
                 detail = detail.child(mono_block(result.clone(), cx));
             }
-            v_flex()
-                .w_full()
-                .items_start()
-                .gap(px(4.))
-                .child(head)
-                .child(detail)
-                .into_any_element()
+            flat_column(4.).child(head).child(detail).into_any_element()
         }
         RunRow::Thought {
             key,
@@ -411,10 +411,7 @@ pub(crate) fn render_run_row(row: &RunRow, app: Entity<AppState>, cx: &App) -> A
             if !*open {
                 return head.into_any_element();
             }
-            v_flex()
-                .w_full()
-                .items_start()
-                .gap(px(4.))
+            flat_column(4.)
                 .child(head)
                 .child(
                     div()
@@ -534,4 +531,24 @@ fn mono_block(text: String, cx: &App) -> Div {
         .font_family(theme.mono_font_family.clone())
         .text_color(theme.secondary_foreground)
         .child(text)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::flat_column;
+    use gpui_kit::{AlignItems, Styled, px};
+
+    #[test]
+    fn expanded_disclosures_do_not_indent_their_contents() {
+        // Both the header/content stack and the arguments/result stack use this
+        // production builder. Keep the outer gutter at zero; mono blocks still
+        // retain their own internal padding for readable command text.
+        for gap in [4., 6.] {
+            let mut column = flat_column(gap);
+            let style = column.style();
+            assert_eq!(style.padding.left.unwrap_or_default(), px(0.).into());
+            assert_eq!(style.margin.left.unwrap_or_default(), px(0.).into());
+            assert_eq!(style.align_items, Some(AlignItems::FlexStart));
+        }
+    }
 }
