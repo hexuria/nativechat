@@ -4,10 +4,9 @@
 //! agree. `fixtures/wire/` is the server's side of that, recorded by the server itself: every
 //! AG-UI frame and REST body its own tests drove, teed off its router by the recorder of
 //! opengrok-server#258 and written out by its `examples/wire_corpus.rs`. It is vendored whole from
-//! the server's `tests/fixtures/wire/` at opengrok-server PR #304, bot-model-source 0ae9f2a (a
-//! Bot's own door and the model line, on the server's main cad36fd, #303, after the Mac relay's
-//! #298), recorded at 4059c59, the commit its `MANIFEST.json` names, and not yet on main. The
-//! layout is opengrok-server#255's: `agui/<type>/<slug>.json`, a CUSTOM under
+//! the server's `tests/fixtures/wire/` at server main d6f640e (#307, after #304, a Bot's own door
+//! and the model line), pin bf99845, the commit its `MANIFEST.json` names as the one it was
+//! recorded at. The layout is opengrok-server#255's: `agui/<type>/<slug>.json`, a CUSTOM under
 //! `agui/custom/<name>/`, and `rest/<METHOD>_<route>/<status>-<slug>.json` holding
 //! `{method, path, status, body}`, one file per distinct shape, named after the first test that
 //! produced it; and since the relay, the frames of its stream under `relay/<type>/<slug>.json`,
@@ -493,16 +492,7 @@ const CLIENT_IGNORES: &[(Slot, &str, &str)] = &[
 /// arm waiting for them in [`check_frame`];
 /// [`every_word_read_ahead_of_its_recording_is_matched_and_not_sent_yet`] fails until it does,
 /// and meanwhile holds that arm to the frames [`frames_read_ahead`] writes in the agreed shape.
-const WORDS_NOT_RECORDED_YET: &[(Slot, &str, &str)] = &[(
-    Slot::RunErrorCode,
-    "plan_unavailable",
-    "opengrok-server #304, agreed 2026-09-30, not yet recorded. A turn refused for the person's \
-     own setting ends with this code beside its sentence, journaled like the relay's codes: a \
-     teammate with no proxy on a shared Bot on the plan, or a proxy turn with no address or no \
-     model stored. A reply source that could not be read is refused with no code. The reply's \
-     line offers the turn again on the server's keys, live and in a replay \
-     (`RunErrorCode::PlanUnavailable`). The PR's recording brings its frames.",
-)];
+const WORDS_NOT_RECORDED_YET: &[(Slot, &str, &str)] = &[];
 
 /// Fixtures this app still reads wrongly, with the words their check fails with and why. The
 /// check has to fail with those words: one that passes means the drift is fixed and the entry
@@ -1041,8 +1031,13 @@ fn run_ended(corpus: &Corpus, frame: &Value) -> Check {
 /// `Projection::failing_with`. No Mac held the relay, the Mac started no answer or went quiet for
 /// the door's clock, or the Mac answered with a failure in its own words. A refusal of the Mac's
 /// own making, such as one Mac carrying all the calls it may at once, is `ModelError::Proxy`,
-/// with a sentence and no code. And `plan_unavailable`, read ahead of its recording
-/// ([`WORDS_NOT_RECORDED_YET`]): the person's own setting left the plan nothing to answer with.
+/// with a sentence and no code. And `plan_unavailable` (opengrok-server main d6f640e (#307, after
+/// #304), pin bf99845: `ModelError::PlanUnavailable` in `crates/opengrok-harness/src/model.rs`,
+/// made by `refused` in `local_proxy.rs`): the person's own setting left the plan nothing to
+/// answer with, no proxy address or no model for the way the turn goes. A reply source the server
+/// could not read and a proxy key it could not open are the server's own faults, and a routine
+/// refused for a Bot on its own plan has no reply to send anywhere else: each ends with a sentence
+/// and no code.
 const RUN_ERROR_CODES: &[&str] = &[
     "relay_offline",
     "relay_timeout",
@@ -3445,11 +3440,11 @@ fn coworker_matches(coworker: &Coworker, raw: &Value) -> Check {
             && coworker.effort() == opt_str(raw, "effort").unwrap_or(EFFORT_INHERIT)
             && coworker.visibility.as_deref() == opt_str(raw, "visibility")
             && coworker.is_shared() == (opt_str(raw, "visibility") == Some("org"))
-            // `source` arrives with the per-Bot door (opengrok-server PR #304, bot-model-source
-            // 0ae9f2a, recorded at 4059c59, not yet on main: `coworker_row` writes it on every
-            // row, `null` and all), and every recording from before it has none, a server that
-            // keeps no door per Bot. Once sent, `null` is the account's door, and a word is kept
-            // as sent, one this app has not heard of included.
+            // `source` arrives with the per-Bot door (opengrok-server main d6f640e (#307, after
+            // #304), pin bf99845: `coworker_row` writes it on every row, `null` and all), and every
+            // recording from before it has none, a server that keeps no door per Bot. Once sent,
+            // `null` is the account's door, and a word is kept as sent, one this app has not heard
+            // of included.
             && coworker.source == door_as_sent(raw),
         "a coworker came through changed: {coworker:?}"
     );
@@ -5388,53 +5383,7 @@ fn a_coworker_rows_effort_has_a_reading_in_the_ledger() {
 /// holds every entry of [`WORDS_NOT_RECORDED_YET`] to these, so a word added there comes with
 /// its frames here, and leaves with it when the recording brings the real ones.
 #[allow(clippy::type_complexity)]
-const FRAMES_READ_AHEAD: &[(Slot, &str, fn() -> Vec<(Value, bool)>)] = &[(
-    Slot::RunErrorCode,
-    "plan_unavailable",
-    plan_unavailable_frames,
-)];
-
-/// A turn refused for the person's own setting, in the shape agreed for opengrok-server #304 (not
-/// yet recorded): the server's sentence for each refusal the code is for, with `code:
-/// "plan_unavailable"` beside it as the relay's codes sit, each read as the turn's error with
-/// the code that offers it again on the server's keys; and the code misspelt, which nothing here
-/// reads.
-fn plan_unavailable_frames() -> Vec<(Value, bool)> {
-    let frame = |message: &str, code: &str| {
-        serde_json::json!({
-            "type": "RUN_ERROR",
-            "threadId": "thr-0199bb4e000070008000000000000001",
-            "runId": "0199bb4e-0000-7000-8000-000000000002",
-            "message": message,
-            "code": code
-        })
-    };
-    let no_proxy = "You chose your own subscription, but no proxy address is set; set one in \
-                    your inference source (like http://127.0.0.1:8080), or switch this turn to \
-                    the gateway.";
-    vec![
-        (frame(no_proxy, "plan_unavailable"), true),
-        (
-            frame(
-                "Choose a model for your own subscription first: your inference source names \
-                 none, so the turn was not sent. Pick one your proxy serves, or switch this turn \
-                 to the gateway.",
-                "plan_unavailable",
-            ),
-            true,
-        ),
-        (
-            frame(
-                "Choose a model for your Mac first: your inference source names none for it, so \
-                 the turn was not sent. Pick one your Mac's opencodex serves, or switch this \
-                 turn to the gateway.",
-                "plan_unavailable",
-            ),
-            true,
-        ),
-        (frame(no_proxy, "plan-unavailable"), false),
-    ]
-}
+const FRAMES_READ_AHEAD: &[(Slot, &str, fn() -> Vec<(Value, bool)>)] = &[];
 
 /// [`FRAMES_READ_AHEAD`]'s frames for one word, none when it has none.
 fn frames_read_ahead(slot: Slot, word: &str) -> Vec<(Value, bool)> {
@@ -5497,6 +5446,69 @@ fn every_word_read_ahead_of_its_recording_is_matched_and_not_sent_yet() {
         }
     }
     assert!(problems.is_empty(), "{}", problems.join("\n"));
+}
+
+/// `plan_unavailable` as the server recorded it (opengrok-server main d6f640e (#307, after #304),
+/// pin bf99845), where this app read it ahead of the recording: a teammate with no proxy, on a
+/// shared Bot on its own plan, is refused in the server's words with the code beside them, live and
+/// journaled in the thread's replay. Live, the frame is the turn's error with the code that offers
+/// it again on the server's keys; read back, the replay's run failed in those words, and its
+/// `RUN_ERROR` carries the same code. The refusals for no model on the person's plan are the same
+/// shape, of which the recorder keeps this one file. A code spelt otherwise is one nothing here
+/// reads, and is caught.
+#[test]
+fn a_turn_the_plan_was_unavailable_for_is_recorded_with_its_code() {
+    let corpus = Corpus::load();
+    let refused: Vec<&Value> = corpus
+        .frames_of("RUN_ERROR")
+        .filter(|frame| opt_str(frame, "code") == Some("plan_unavailable"))
+        .collect();
+    assert!(
+        !refused.is_empty(),
+        "the recording holds a turn refused with plan_unavailable"
+    );
+    for frame in &refused {
+        check_frame(&corpus, frame).unwrap_or_else(|why| panic!("{why}: {frame}"));
+        let error = OpenGrokClient::run_ended_badly(frame);
+        assert_eq!(
+            error.code().and_then(RunErrorCode::from_code),
+            Some(RunErrorCode::PlanUnavailable),
+            "{frame}"
+        );
+    }
+    let mut journaled = 0;
+    for (file, fixture) in &corpus.bodies {
+        if !file.starts_with("rest/GET__ag-ui_threads__thread_id_/") || fixture["status"] != 200 {
+            continue;
+        }
+        let replay: ThreadReplay = serde_json::from_value(fixture["body"].clone())
+            .unwrap_or_else(|error| panic!("{file}: {error}"));
+        for run in &replay.runs {
+            let ended = run
+                .events
+                .iter()
+                .rev()
+                .find(|frame| str_at(frame, "type") == "RUN_ERROR");
+            let Some(ended) =
+                ended.filter(|ended| opt_str(ended, "code") == Some("plan_unavailable"))
+            else {
+                continue;
+            };
+            assert_eq!(
+                (run.status.as_str(), run.failure.as_deref()),
+                ("failed", opt_str(ended, "message")),
+                "{file}: the run failed in the words its RUN_ERROR says"
+            );
+            journaled += 1;
+        }
+    }
+    assert!(journaled > 0, "the recording journals the code in a replay");
+    let mut misspelt = refused[0].clone();
+    misspelt["code"] = Value::String("plan-unavailable".into());
+    assert!(
+        check_frame(&corpus, &misspelt).is_err(),
+        "a code nothing here reads is caught"
+    );
 }
 
 /// The queue's reading of the door a send was queued with, fed bodies beyond the ones the
@@ -5618,8 +5630,8 @@ fn every_recorded_setting_is_from_a_server_that_knows_the_relay() {
 
 /// The server that made the recording keeps a door per Bot, and writes it on every coworker row it
 /// answers with, `null` and all (`coworker_row` in opengrok-server's
-/// `crates/opengrok-server/src/agui/routes.rs`, PR #304, bot-model-source 0ae9f2a, recorded at
-/// 4059c59, not yet on main): the roster's, a hire's and a PATCH's. So every recorded row reads
+/// `crates/opengrok-server/src/agui/routes.rs`, server main d6f640e (#307, after #304), pin
+/// bf99845): the roster's, a hire's and a PATCH's. So every recorded row reads
 /// as one from a server that keeps a door per Bot, which is what lets a Bot's model picker offer
 /// the person's plan and send the Bot's door with a pick; a server from before per-Bot doors
 /// writes no `source`, and is taken to keep none. A hire answers `null`, a Bot that follows the
@@ -5674,8 +5686,8 @@ fn every_recorded_coworker_row_is_from_a_server_that_keeps_a_door_per_bot() {
 
 /// A Bot's door, read beyond the recording, which holds rows with `null` and each of the server's
 /// two words, a hire's and a PATCH's among them, and the PATCH's 400s for a Bot left on the
-/// person's plan with a model the allowlist does not take (opengrok-server PR #304,
-/// bot-model-source 0ae9f2a, recorded at 4059c59, not yet on main): a row whose door is a word
+/// person's plan with a model the allowlist does not take (opengrok-server main d6f640e (#307,
+/// after #304), pin bf99845): a row whose door is a word
 /// this app has not heard of, and one from a server before per-Bot doors, with no `source` at
 /// all, each read as sent, and a row whose parse lost its door caught; and the 400 for a `source`
 /// that is neither word, which the recorder keeps no file of, having one 400 of that shape

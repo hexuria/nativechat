@@ -5,8 +5,8 @@
 //! No GPUI. The composer's chip and the Bot's card in its settings both draw what is here
 //! (`components::model_picker`), and the gpui-agent tree names it, so the three always agree.
 //!
-//! A Bot's setting is three things its row keeps: the door (`source`, opengrok-server PR #304,
-//! bot-model-source 0ae9f2a, recorded at 4059c59, not yet on main), the model it is pinned to
+//! A Bot's setting is three things its row keeps: the door (`source`, opengrok-server main
+//! d6f640e (#307, after #304), pin bf99845), the model it is pinned to
 //! (`model`), and how hard it thinks (`effort`, opengrok-server#271). Fast is not a fourth.
 //! opencodex lists a model's fast tier as a twin id, `gpt-6-luna--fast` beside `gpt-6-luna`, and
 //! the server's allowlist takes the tier off before it reads the rest ([`is_subscription_model`]),
@@ -16,8 +16,8 @@
 //! tell, and never a pin the server would ignore. On the person's plan the server asks the Bot's
 //! pin only where the Bot's own door is the plan (`source: "local_proxy"`) and its allowlist takes
 //! the pin, and the account's plan model otherwise (`ahead_of_the_setting` in opengrok-server's
-//! `crates/opengrok-harness/src/local_proxy.rs`, PR #304, bot-model-source 0ae9f2a, recorded at
-//! 4059c59, not yet on main). A Bot that follows the account (`source: null`), or is on the
+//! `crates/opengrok-harness/src/local_proxy.rs`, server main d6f640e (#307, after #304), pin
+//! bf99845). A Bot that follows the account (`source: null`), or is on the
 //! gateway, runs a turn on the plan with the account's plan model whatever it is pinned to: every
 //! Bot hired by default is pinned `xai/grok-4.6`, which the allowlist takes, and that pin is a
 //! gateway route, not the plan model the person chose. A server from before per-Bot doors takes
@@ -310,7 +310,9 @@ pub struct ModelPick {
     /// The line that says this Bot's routines won't run ([`ROUTINES_ON_PLAN`]). A routine runs
     /// on the server's keys, and the person chose their own plan for a Bot whose own door is the
     /// plan, so the server refuses every routine of such a Bot, in words, before any model call
-    /// and with nothing billed (opengrok-server #304, the owner's decision). It is said for every
+    /// and with nothing billed (the owner's decision: `Route::for_routine` in opengrok-server's
+    /// `crates/opengrok-harness/src/local_proxy.rs`, server main d6f640e (#307, after #304), pin
+    /// bf99845, whose recording holds the refusal). It is said for every
     /// such Bot, whatever it is pinned to and whatever the gateway lists: a pin the gateway has
     /// is refused as much as one it lacks. A Bot that follows the account (`source: null`), or
     /// is on the gateway, runs its routines through the gateway on its pin as before
@@ -362,7 +364,7 @@ pub fn bot_pick(
     let account_model = account.and_then(account_plan_model);
     // On the plan the server asks the pin only of a Bot whose own door is the plan, and only a
     // pin its allowlist takes; any other Bot there runs on the account's plan model
-    // (opengrok-server PR #304, bot-model-source 0ae9f2a, recorded at 4059c59, not yet on main).
+    // (opengrok-server main d6f640e (#307, after #304), pin bf99845).
     // A Bot that follows the account may well hold a pin the allowlist takes, as every default
     // hire's `xai/grok-4.6` is, and that pin is not the plan model the person chose.
     let model = match door {
@@ -1015,7 +1017,7 @@ mod tests {
     }
 
     /// On the person's plan the server asks a Bot's pin only when the Bot's own door is the plan
-    /// (opengrok-server PR #304, bot-model-source 0ae9f2a, recorded at 4059c59, not yet on main).
+    /// (opengrok-server main d6f640e (#307, after #304), pin bf99845).
     /// A Bot that follows the account there runs on the account's plan model even with a pin the
     /// allowlist takes: the chip names that model, the list ticks it, and ⚡ moves to its twin
     /// with the Bot's own door, so the pick sticks. A pick of the pin's own row sends the door
@@ -1129,7 +1131,9 @@ mod tests {
     }
 
     /// The server refuses every routine of a Bot whose own door is `local_proxy`, before any
-    /// model call (opengrok-server #304, the owner's decision). Such a Bot is always told its
+    /// model call (the owner's decision: opengrok-server main d6f640e (#307, after #304), pin
+    /// bf99845, whose recording holds the refusal as the routine's failed last run, in words and
+    /// with no code). Such a Bot is always told its
     /// routines won't run: pinned to a plan model the gateway lacks, to one the gateway lists,
     /// fast tier or not, or to nothing; before the gateway's models are listed, and whatever the
     /// account's door.
