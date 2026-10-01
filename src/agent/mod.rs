@@ -15,8 +15,11 @@
 //! `computer-handoff-takeover-{key}`, `computer-handoff-done-{key}`,
 //! `computer-handoff-skip-{key}`,
 //! `save-login-{entry}`, `save-login-save-{entry}`, `save-login-skip-{entry}`,
-//! `user-form-use-saved-{key}-{login}` (one per saved account for the card's site),
-//! `user-form-saved-note-{key}`, `user-form-saved-clear-{key}`,
+//! `user-form-use-saved-{key}-{login}` (one per saved account for the card's site; a sign-in
+//! that asks for the name and the password on two pages is two cards, each with a row per
+//! password login, and on the password page the login picked on the name page in that thread
+//! is the first row), `user-form-saved-note-{key}`, `user-form-saved-clear-{key}` (Change, on
+//! the password row, or on the name row of a name page),
 //! `settings-tab-logins`, `settings-logins-search` (value = the query), `settings-login-add`,
 //! `settings-login-import`, `settings-logins-notice`, `settings-logins-error`,
 //! `settings-logins-empty`, `settings-logins-group-passwords|passkeys|codes|security` (a
