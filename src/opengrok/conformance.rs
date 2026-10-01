@@ -4,8 +4,9 @@
 //! agree. `fixtures/wire/` is the server's side of that, recorded by the server itself: every
 //! AG-UI frame and REST body its own tests drove, teed off its router by the recorder of
 //! opengrok-server#258 and written out by its `examples/wire_corpus.rs`. It is vendored whole
-//! from the server's `tests/fixtures/wire/` at 4733c0f (#291), whose `MANIFEST.json` names
-//! 83da0c4, the commit on the server's main it was recorded at. The layout is
+//! from the server's `tests/fixtures/wire/` at e55a8c8 on its main (#297, after #296, the reply
+//! source's follow-up), whose `MANIFEST.json` names f56bbde, the commit on the server's main
+//! it was recorded at. The layout is
 //! opengrok-server#255's: `agui/<type>/<slug>.json`, a CUSTOM under `agui/custom/<name>/`, and
 //! `rest/<METHOD>_<route>/<status>-<slug>.json` holding `{method, path, status, body}`, one file
 //! per distinct shape, named after the first test that produced it. `MANIFEST.json` names the
@@ -29,7 +30,8 @@
 //!   in [`REST_NOT_RECORDED_YET`], which says what brings its fixtures, until the corpus holds
 //!   it;
 //! - the ledger, every wire word this app branches on, is either a word the manifest says the
-//!   server sends or excused in [`NOT_SENT_BY_SERVER`], with the evidence;
+//!   server sends, excused in [`NOT_SENT_BY_SERVER`] with the evidence, or read ahead of the
+//!   server's recording in [`WORDS_NOT_RECORDED_YET`], which says what brings it;
 //! - every word the server sends is either in the ledger or excused in [`CLIENT_IGNORES`], so a
 //!   name the server starts sending fails here before a person finds it missing on screen;
 //! - [`KNOWN_DRIFT`] names the fixtures this app still reads wrongly. Their checks must fail, so
@@ -63,13 +65,14 @@ use super::gen_ui::{
     USER_MACHINE_SHELL, approval_from_event, approval_summary, capped, command_from_replay_events,
     is_ui_tool,
 };
+use super::inference::{INFERENCE_SOURCE_CUSTOM, InferenceKind, InferenceSource};
 use super::pending::{
     CUSTOM_NAME as PENDING_CUSTOM, PendingCustom, PendingList, PendingMutation, PendingOp,
     PendingUserMessage,
 };
 use super::timing::{RUN_TIMING_CUSTOM, TURN_TIMELINE_CUSTOM, TurnTiming};
 use super::types::{
-    Account, ArtifactListing, Attachment, Coworker, EFFORT_INHERIT, ThreadListing,
+    Account, ArtifactListing, Attachment, Coworker, EFFORT_INHERIT, ModelCatalogue, ThreadListing,
     assistant_text_from_sse,
 };
 use super::user_form::{
@@ -200,6 +203,8 @@ fn ledger() -> Vec<(Slot, &'static str)> {
         TURN_TIMELINE_CUSTOM,
         CREDENTIAL_OFFER_SAVE,
         UI_CUSTOM_NAME,
+        // `TurnAssembler::push_event` reads which door a run went through, for the reply's badge.
+        INFERENCE_SOURCE_CUSTOM,
         // `UiSpec::from_custom` reads a CUSTOM with no name as a widget that names itself.
         "",
     ]
@@ -461,6 +466,15 @@ const CLIENT_IGNORES: &[(Slot, &str, &str)] = &[
         "Shown as the default permission card, allow or deny once; nothing branches on the word.",
     ),
 ];
+
+/// Words this app reads ahead of the server's recording of them: built to a shape agreed with the
+/// server session before the server sends it, so the manifest does not list it yet. Each says
+/// what brings it. It is no dead word, which is what [`NOT_SENT_BY_SERVER`] records: the day the
+/// manifest lists it, it comes off this list, and its frames are read like every other by the
+/// arm waiting for them in [`check_frame`];
+/// [`every_word_read_ahead_of_its_recording_is_matched_and_not_sent_yet`] fails until it does,
+/// and meanwhile holds that arm to the frames [`frames_read_ahead`] writes in the agreed shape.
+const WORDS_NOT_RECORDED_YET: &[(Slot, &str, &str)] = &[];
 
 /// Fixtures this app still reads wrongly, with the words their check fails with and why. The
 /// check has to fail with those words: one that passes means the drift is fixed and the entry
@@ -1639,11 +1653,37 @@ fn custom(frame: &Value) -> Check {
         PENDING_CUSTOM => pending(frame),
         USER_FORM_CUSTOM => settled_form(frame),
         CREDENTIAL_OFFER_SAVE => offer_save(frame),
+        INFERENCE_SOURCE_CUSTOM => inference_source_frame(frame),
         name if is_excused(CLIENT_IGNORES, Slot::CustomName, name) => ignored(frame),
         name => Err(format!(
             "no check for a CUSTOM {name:?}: say here what this app does with one"
         )),
     }
+}
+
+/// Which door a run goes through (`opengrok.inferenceSource`): it says nothing on the status line
+/// and paints nothing among the reply's words, and the reply's badge is the frame's own kind and
+/// model, as the assembler reads it live and in a replay alike.
+fn inference_source_frame(frame: &Value) -> Check {
+    must!(
+        tick(frame) == ActivityTick::Keep,
+        "which door a run goes through is not something the coworker is doing: {:?}",
+        tick(frame)
+    );
+    nothing_painted(frame)?;
+    let assembler = assembled(&[frame]);
+    let source = assembler
+        .reply_source()
+        .ok_or("the frame should give the reply its badge")?;
+    let value = &frame["value"];
+    let model = opt_str(value, "model")
+        .map(str::trim)
+        .filter(|model| !model.is_empty());
+    must!(
+        source.kind.word() == str_at(value, "kind") && source.model.as_deref() == model,
+        "the badge should be the frame's kind and model as sent: {source:?} from {value}"
+    );
+    Ok(())
 }
 
 /// A frame this app has no arm for leaves the turn as it was.
@@ -1928,6 +1968,13 @@ fn held_as_sent(message: &PendingUserMessage, raw: &Value) -> Check {
             && message.reply_to.as_ref() == given("replyTo"),
         "the send's recipe, skill and reply should come through as sent: {message:?}"
     );
+    // The door it was queued with, on the row only when the send named one (opengrok-server
+    // #294: `message_json` in `crates/opengrok-server/src/agui/pending.rs`).
+    must!(
+        message.inference_source()
+            == opt_str(raw, "inferenceSource").and_then(InferenceKind::from_word),
+        "the send's door should come through as sent: {message:?}"
+    );
     Ok(())
 }
 
@@ -2117,6 +2164,11 @@ const REST_ROUTES: &[(&str, RestCheck)] = &[
     ("PUT__skills__id_", skill_detail),
     ("DELETE__skills__id_", read_as_done),
     ("POST__skills__id__versions", skill_version),
+    // Where the account's replies are paid from, and the models a Bot and the person's own plan
+    // can answer with.
+    ("GET__account_inference-source", inference_source),
+    ("PUT__account_inference-source", inference_source),
+    ("GET__models", models_listed),
 ];
 
 /// Routes whose refusals the client reads its own way rather than with `read_error`, and how.
@@ -3436,6 +3488,65 @@ fn coworker_ceiling(_: u16, body: &Value) -> Check {
     Ok(())
 }
 
+/// The account's reply source, read or as a Save's answer (opengrok-server #294: `described` in
+/// `crates/opengrok-harness/src/local_proxy.rs`, behind `crates/opengrok-server/src/inference.rs`):
+/// the door, the proxy's URL and the model as sent, `null` for none, and the two flags the page
+/// acts on. A body without a flag is not read as that flag being false, and a door this app has
+/// not heard of is not read as one it has. Its refusals are read as every other: a 400 in the
+/// server's words for an address or a model it will not keep, a 503 for a key with no vault to
+/// keep it in, and a 401 as the session gone.
+fn inference_source(_: u16, body: &Value) -> Check {
+    let read: InferenceSource = parse(body)?;
+    must!(
+        read.kind.word() == str_at(body, "kind")
+            && read.base_url.as_deref() == opt_str(body, "baseUrl")
+            && read.local_model.as_deref() == opt_str(body, "localModel")
+            && Some(read.healthy) == body["healthy"].as_bool()
+            && Some(read.has_api_key) == body["hasApiKey"].as_bool(),
+        "the reply source should come through as sent: {read:?} from {body}"
+    );
+    Ok(())
+}
+
+/// `GET /models` (`list_models` in opengrok-server `agui/routes.rs`, #294), which the Bot's Model
+/// field and Settings → Reply source's picker are drawn from: every entry through by its id and
+/// its door as sent (`gateway`, `local_proxy`, or none from a server before reply sources, read
+/// as the gateway's; a word this app does not know is caught here rather than offered by
+/// neither picker unseen), the note as sent, and opencodex's health (`localProxy.healthy`) as
+/// sent, or none while no proxy address is kept.
+fn models_listed(_: u16, body: &Value) -> Check {
+    let catalogue: ModelCatalogue = parse(body)?;
+    let raw = body["models"]
+        .as_array()
+        .ok_or("the list should carry a models array")?;
+    same_len(&catalogue.models, raw)?;
+    for (entry, raw) in catalogue.models.iter().zip(raw) {
+        let door = match opt_str(raw, "source") {
+            None => Some(InferenceKind::Gateway),
+            Some(word) => InferenceKind::from_word(word),
+        };
+        must!(
+            door.is_some() && entry.id == str_at(raw, "id") && entry.source() == door,
+            "each model should come through by its id and its door as sent: {entry:?} from {raw}"
+        );
+    }
+    must!(
+        catalogue.note.as_deref() == opt_str(body, "note"),
+        "the note should come through as sent: {:?} from {body}",
+        catalogue.note
+    );
+    let healthy = body
+        .get("localProxy")
+        .and_then(|proxy| proxy.get("healthy"))
+        .and_then(Value::as_bool);
+    must!(
+        catalogue.local_proxy.map(|proxy| proxy.healthy) == healthy,
+        "opencodex's health should come through as sent: {:?} from {body}",
+        catalogue.local_proxy
+    );
+    Ok(())
+}
+
 /// A bot's skills (opengrok-server#270), read or as a write's answer: every skill comes through
 /// by the id a `PUT` names it by, with its name, its words, whose it is, whether it is attached
 /// and whether it is switched on; and the version a switch sends back, exactly, or none. A row
@@ -4234,12 +4345,18 @@ fn every_word_this_app_matches_is_sent_or_excused() {
     for (slot, word) in &ledger {
         let sent = emits.words(*slot).iter().any(|sent| sent.as_str() == *word);
         let excused = is_excused(NOT_SENT_BY_SERVER, *slot, word);
+        let ahead = is_excused(WORDS_NOT_RECORDED_YET, *slot, word);
         if sent && excused {
             problems.push(format!(
                 "{} {word:?} is sent now: take it off NOT_SENT_BY_SERVER",
                 slot.field()
             ));
-        } else if !sent && !excused {
+        } else if sent && ahead {
+            problems.push(format!(
+                "{} {word:?} is recorded now: take it off WORDS_NOT_RECORDED_YET",
+                slot.field()
+            ));
+        } else if !sent && !excused && !ahead {
             problems.push(format!(
                 "{} {word:?} is matched here and the server does not send it: find out why, and \
                  say so in NOT_SENT_BY_SERVER",
@@ -4798,6 +4915,174 @@ fn a_coworker_rows_effort_has_a_reading_in_the_ledger() {
     .unwrap();
 }
 
+/// Frames in the shape agreed for each word read ahead of its recording, hand-written until the
+/// server's own are recorded, each with whether this app's reading takes it. The guard below
+/// holds every entry of [`WORDS_NOT_RECORDED_YET`] to these, so a word added there comes with
+/// its frames here, and leaves with it when the recording brings the real ones.
+#[allow(clippy::type_complexity)]
+const FRAMES_READ_AHEAD: &[(Slot, &str, fn() -> Vec<(Value, bool)>)] = &[];
+
+/// [`FRAMES_READ_AHEAD`]'s frames for one word, none when it has none.
+fn frames_read_ahead(slot: Slot, word: &str) -> Vec<(Value, bool)> {
+    FRAMES_READ_AHEAD
+        .iter()
+        .find(|(at, read_ahead, _)| *at == slot && *read_ahead == word)
+        .map(|(_, _, frames)| frames())
+        .unwrap_or_default()
+}
+
+/// The words this app reads ahead of the server's recording ([`WORDS_NOT_RECORDED_YET`]) are
+/// words it does match, which the manifest does not list yet, each saying what brings it; and
+/// every one of them has its reading waiting in [`check_frame`], held to frames in its agreed
+/// shape ([`frames_read_ahead`]), so the recording is read the day it arrives. Once the manifest
+/// lists one, the entry has gone stale.
+#[test]
+fn every_word_read_ahead_of_its_recording_is_matched_and_not_sent_yet() {
+    let corpus = Corpus::load();
+    let emits = &corpus.manifest.emits;
+    let ledger = ledger();
+    let mut problems = Vec::new();
+    for (slot, word, why) in WORDS_NOT_RECORDED_YET {
+        if !ledger.contains(&(*slot, *word)) {
+            problems.push(format!(
+                "WORDS_NOT_RECORDED_YET lists the {} {word:?}, which nothing here matches",
+                slot.field()
+            ));
+        }
+        if emits.words(*slot).iter().any(|sent| sent == word) {
+            problems.push(format!(
+                "the manifest lists the {} {word:?} now: take it off WORDS_NOT_RECORDED_YET",
+                slot.field()
+            ));
+        }
+        if is_excused(NOT_SENT_BY_SERVER, *slot, word) || is_excused(CLIENT_IGNORES, *slot, word) {
+            problems.push(format!(
+                "the {} {word:?} is read ahead of its recording and excused as well",
+                slot.field()
+            ));
+        }
+        if why.trim().is_empty() {
+            problems.push(format!(
+                "WORDS_NOT_RECORDED_YET does not say what brings {word:?}"
+            ));
+        }
+        let frames = frames_read_ahead(*slot, word);
+        if !frames.iter().any(|(_, reads)| *reads) {
+            problems.push(format!(
+                "WORDS_NOT_RECORDED_YET lists the {} {word:?}, and frames_read_ahead writes no \
+                 frame in its agreed shape for its reading to wait on",
+                slot.field()
+            ));
+        }
+        for (frame, reads) in frames {
+            match (check_frame(&corpus, &frame), reads) {
+                (Err(why), true) => problems.push(format!("{frame}: {why}")),
+                (Ok(()), false) => problems.push(format!("{frame} should not read, and does")),
+                _ => {}
+            }
+        }
+    }
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
+}
+
+/// The queue's reading of the door a send was queued with, fed bodies beyond the ones the
+/// server's recording holds: a row that names one and a row that names none, listed and as a write's
+/// answer, a row whose parse lost the door, and the route's plain-text 400 for a word it does not
+/// know, read as the server's own sentence like the route's other 400s.
+#[test]
+fn a_queued_sends_door_is_read_beyond_the_recording() {
+    use serde_json::json;
+    let row = |id: &str, bubble: &str, door: Option<&str>| {
+        let mut row = json!({
+            "v": 1, "id": id, "threadId": "th_1", "content": "queued",
+            "replyTo": null, "recipeId": null, "recipeValues": null, "skillId": null,
+            "clientMessageId": bubble, "status": "pending", "createdAtMs": 10,
+            "updatedAtMs": 10, "drainedAtMs": null, "drainedRunId": null
+        });
+        if let Some(door) = door {
+            row["inferenceSource"] = json!(door);
+        }
+        row
+    };
+    let snapshot = |row: Value| {
+        json!({
+            "type": "CUSTOM", "name": PENDING_CUSTOM, "timestamp": 1,
+            "value": {"v": 1, "op": "snapshot", "threadId": "th_1", "message": row}
+        })
+    };
+    let rows = [
+        row("pum_1", "m2", Some("local_proxy")),
+        row("pum_2", "m3", None),
+    ];
+    let listed = json!({
+        "pendingUserMessages": rows,
+        "pendingEvents": rows.iter().cloned().map(snapshot).collect::<Vec<_>>(),
+        "threadId": "th_1",
+        "v": 1
+    });
+    pending_list(200, &listed).unwrap_or_else(|why| panic!("{why}"));
+    let created = json!({
+        "v": 1, "threadId": "th_1", "pendingUserMessage": rows[0].clone(),
+        "event": {
+            "type": "CUSTOM", "name": PENDING_CUSTOM, "timestamp": 1,
+            "value": {"v": 1, "op": "created", "threadId": "th_1", "message": rows[0].clone()}
+        }
+    });
+    pending_created(201, &created).unwrap_or_else(|why| panic!("{why}"));
+    // A row whose door the parse lost would not pass.
+    let mut lost: PendingUserMessage = serde_json::from_value(rows[0].clone()).unwrap();
+    lost.inference_source = None;
+    assert!(held_as_sent(&lost, &rows[0]).is_err());
+    // The queue answers a word it does not know as it answers its other 400s: plain text,
+    // which reads as the server's sentence and a verdict, not a server out of reach.
+    let said = "inferenceSource must be \"gateway\" or \"local_proxy\"";
+    refusal(400, &json!(said)).unwrap_or_else(|why| panic!("{said}: {why}"));
+    let error = OpenGrokClient::refusal(400, said);
+    assert_eq!(
+        (error.status, error.message.as_str(), error.failure()),
+        (Some(400), said, Failure::Verdict)
+    );
+}
+
+/// The reply source's reading, fed bodies beyond the ones the server's recording holds: the read and
+/// the Save's answer alike, set and unset, the Save's refusals in the server's words (a URL that
+/// is not loopback, a provider it will not route), and the ways a body could go wrong.
+#[test]
+fn the_reply_source_routes_are_read_beyond_the_recording() {
+    use serde_json::json;
+    // The read and a Save's answer are the same body, and read the same way.
+    let set = json!({
+        "kind": "local_proxy", "baseUrl": "http://127.0.0.1:8080",
+        "localModel": "gpt-5-codex", "healthy": true, "hasApiKey": true
+    });
+    let unset = json!({
+        "kind": "gateway", "baseUrl": null, "localModel": null,
+        "healthy": false, "hasApiKey": false
+    });
+    for body in [&set, &unset] {
+        inference_source(200, body).unwrap_or_else(|why| panic!("{body}: {why}"));
+    }
+    for broken in [
+        json!({"kind": "gateway", "baseUrl": null, "localModel": null, "hasApiKey": false}),
+        json!({"kind": "byok", "healthy": false, "hasApiKey": false}),
+        json!({"baseUrl": null, "healthy": false, "hasApiKey": false}),
+        json!({"kind": "gateway", "healthy": "yes", "hasApiKey": false}),
+    ] {
+        assert!(inference_source(200, &broken).is_err(), "{broken}");
+    }
+    // The recording holds one of each refusal; the others the server writes (`apply` in
+    // `crates/opengrok-harness/src/local_proxy.rs`) read the same way.
+    for said in [
+        "baseUrl: that is not a URL; give the address of the proxy on this server's own \
+         machine, with no path, like http://127.0.0.1:8080",
+        "localModel: \"llama-3\" is not a model this server knows to be OpenAI's or xAI's, and \
+         only theirs (gpt-*, o1, o3, o4, codex, grok-*) may use your own subscription",
+        "apiKey must be printable ASCII, 512 at most",
+    ] {
+        refusal(400, &json!({ "error": said })).unwrap_or_else(|why| panic!("{said}: {why}"));
+    }
+}
+
 /// A bot's skills' reading, fed bodies in the shape agreed for opengrok-server#270 beyond the ones
 /// the corpus records (#290), for the read and for the write's answer alike: skills of both
 /// scopes, attached and not, one switched off and still attached, at a version and at none, an
@@ -4922,4 +5207,36 @@ fn use_skill_reads_as_the_servers_own_tool() {
     kept_as_the_card_allows(USE_SKILL, &sent, &kept).unwrap();
     assert_eq!(kept, sent);
     assert_eq!(step.shown_arguments().as_deref(), Some(name));
+}
+
+/// `/models`' reading, fed bodies beyond the ones the server's recording holds (it records the
+/// gateway's routes alone, with and without opencodex's word on itself): both doors' entries,
+/// opencodex answering and not, a plan-only list with `note: null`, a server from before reply
+/// sources, and the one shape it must not take quietly, a door this app does not know.
+#[test]
+fn the_models_list_is_read_beyond_the_recording() {
+    use serde_json::json;
+    let both = json!({
+        "models": [
+            {"id": "xai/grok-4.6", "points": null, "source": "gateway"},
+            {"id": "gpt-5.5", "points": null, "source": "local_proxy"}
+        ],
+        "note": null,
+        "localProxy": {"healthy": true}
+    });
+    let plan_only = json!({
+        "models": [{"id": "grok-4", "points": null, "source": "local_proxy"}],
+        "note": null,
+        "localProxy": {"healthy": true}
+    });
+    let proxy_down = json!({
+        "models": [], "note": "the gateway could not be reached: timed out",
+        "localProxy": {"healthy": false}
+    });
+    let before_reply_sources = json!({"models": [{"id": "oag/auto"}], "note": null});
+    for body in [&both, &plan_only, &proxy_down, &before_reply_sources] {
+        models_listed(200, body).unwrap_or_else(|why| panic!("{body}: {why}"));
+    }
+    let unknown = json!({"models": [{"id": "m", "source": "byok"}], "note": null});
+    assert!(models_listed(200, &unknown).is_err());
 }

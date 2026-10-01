@@ -11,6 +11,7 @@ use serde_json::Value;
 
 use super::client::LocalExecMode;
 use super::credential::SaveLoginSpec;
+use super::inference::{INFERENCE_SOURCE_CUSTOM, ReplySource};
 use super::user_form::{
     ComputerHandoffSpec, UserFormSpec, is_user_form_awaiting, is_user_form_tool,
 };
@@ -694,6 +695,10 @@ pub struct TurnAssembler {
     /// Thoughts still being said, in the order they began. Each becomes a part when its message
     /// ends, when a call starts while it is being said, or when the run ends.
     reasoning: Vec<OpenThought>,
+    /// Which door the run's model calls go through, from its `opengrok.inferenceSource` CUSTOM
+    /// ([`ReplySource`]). It is not a part: it paints nothing in the reply, and is the reply's
+    /// badge.
+    source: Option<ReplySource>,
 }
 
 /// A thought still being said: its message id, and as much of it as is kept (see
@@ -885,6 +890,18 @@ impl TurnAssembler {
             }
             "CUSTOM" => {
                 let name = event.get("name").and_then(Value::as_str).unwrap_or("");
+                // Which door the run went through. Live it comes right after RUN_STARTED; a
+                // replay opens the run with the person's own messages first and the frame after
+                // them, so where it sits is not the rule: the run's first such frame is. The
+                // server sends one a run and none on a carry-on (`local_proxy::route` in
+                // opengrok-server). Read before anything else can take it for a card or a
+                // widget, and never drawn in the reply: it is the reply's badge.
+                if name == INFERENCE_SOURCE_CUSTOM {
+                    if self.source.is_none() {
+                        self.source = ReplySource::from_event(event);
+                    }
+                    return;
+                }
                 if is_user_form_awaiting(event) {
                     self.flush_text();
                     let call_id = event
@@ -1070,6 +1087,12 @@ impl TurnAssembler {
 
     pub fn waiting_approval(&self) -> bool {
         self.waiting_approval
+    }
+
+    /// Which door the run's reply came through, once its `opengrok.inferenceSource` CUSTOM has
+    /// arrived. A server from before reply sources sends none, and a reply of its has no badge.
+    pub fn reply_source(&self) -> Option<&ReplySource> {
+        self.source.as_ref()
     }
 
     /// An unresolved user-form card or live Computer sibling is on the turn.
@@ -2156,6 +2179,105 @@ mod tests {
 
     fn text(delta: &str) -> Value {
         json!({"type":"TEXT_MESSAGE_CONTENT","delta":delta})
+    }
+
+    /// The badge comes from the live stream's own frame, the CUSTOM the server sends right after
+    /// RUN_STARTED, and from that frame alone: it is on the reply from the moment it arrives,
+    /// paints nothing among the reply's words, and a run with no such frame has no badge.
+    #[test]
+    fn the_reply_source_comes_from_the_custom_frame_and_paints_nothing() {
+        use super::super::inference::InferenceKind;
+        let mut live = TurnAssembler::default();
+        live.push_event(&json!({"type": "RUN_STARTED", "runId": "r1", "threadId": "cw_1"}));
+        assert_eq!(live.reply_source(), None, "nothing said yet");
+        live.push_event(&json!({
+            "type": "CUSTOM",
+            "name": INFERENCE_SOURCE_CUSTOM,
+            "value": {"kind": "local_proxy", "model": "gpt-5-codex"}
+        }));
+        assert_eq!(
+            live.reply_source(),
+            Some(&ReplySource {
+                kind: InferenceKind::LocalProxy,
+                model: Some("gpt-5-codex".into()),
+            }),
+            "on the reply before a word of it has come"
+        );
+        assert_eq!(live.snapshot(), (String::new(), Vec::new()));
+        live.push_event(&text("Done."));
+        live.push_event(&json!({"type": "RUN_FINISHED", "runId": "r1"}));
+        live.finish();
+        assert_eq!(live.snapshot().1, vec![ChatPart::Text("Done.".into())]);
+        assert_eq!(
+            live.reply_source().map(|source| source.kind),
+            Some(InferenceKind::LocalProxy)
+        );
+
+        // A frame of a door this app cannot name leaves the badge off rather than guessing.
+        let mut odd = TurnAssembler::default();
+        odd.push_event(&json!({
+            "type": "CUSTOM", "name": INFERENCE_SOURCE_CUSTOM, "value": {"kind": "byok"}
+        }));
+        odd.push_event(&text("Hi."));
+        assert_eq!(odd.reply_source(), None);
+        assert_eq!(odd.snapshot().1, vec![ChatPart::Text("Hi.".into())]);
+
+        let mut older = TurnAssembler::default();
+        older.push_event(&json!({"type": "RUN_STARTED", "runId": "r1", "threadId": "cw_1"}));
+        older.push_event(&text("Hi."));
+        assert_eq!(older.reply_source(), None, "a server before reply sources");
+    }
+
+    /// A replay opens a run with the person's own messages, and the frame that says which door
+    /// the run went through comes after them rather than right after RUN_STARTED: the badge is
+    /// the run's first such frame wherever it sits, the person's words stay the person's, and
+    /// the reply is the coworker's words alone.
+    #[test]
+    fn the_reply_source_is_the_runs_first_frame_wherever_a_replay_puts_it() {
+        use super::super::inference::InferenceKind;
+        let custom = |kind: &str, model: &str| {
+            json!({
+                "type": "CUSTOM", "name": INFERENCE_SOURCE_CUSTOM,
+                "value": {"kind": kind, "model": model}
+            })
+        };
+        let replay = [
+            json!({"type": "RUN_STARTED", "runId": "r2", "threadId": "cw_1"}),
+            json!({"type": "TEXT_MESSAGE_START", "messageId": "m2", "role": "user"}),
+            json!({"type": "TEXT_MESSAGE_CONTENT", "messageId": "m2", "delta": "and the second?"}),
+            json!({"type": "TEXT_MESSAGE_END", "messageId": "m2"}),
+            custom("local_proxy", "gpt-5.5"),
+            json!({"type": "TEXT_MESSAGE_START", "messageId": "a2", "role": "assistant"}),
+            json!({"type": "TEXT_MESSAGE_CONTENT", "messageId": "a2", "delta": "from the proxy"}),
+            json!({"type": "TEXT_MESSAGE_END", "messageId": "a2"}),
+            // Were a second frame ever to come, the run's first stands.
+            custom("gateway", "xai/grok-4.6"),
+            json!({"type": "RUN_FINISHED", "runId": "r2"}),
+        ];
+        let mut read = TurnAssembler::default();
+        for (at, frame) in replay.iter().enumerate() {
+            read.push_event(frame);
+            if at < 4 {
+                assert_eq!(read.reply_source(), None, "not said yet at frame {at}");
+            }
+        }
+        read.finish();
+        assert_eq!(
+            read.reply_source(),
+            Some(&ReplySource {
+                kind: InferenceKind::LocalProxy,
+                model: Some("gpt-5.5".into()),
+            })
+        );
+        assert_eq!(
+            read.snapshot().1,
+            vec![ChatPart::Text("from the proxy".into())],
+            "the reply is the coworker's words"
+        );
+        assert_eq!(
+            persons_messages(&replay),
+            vec![("m2".to_string(), "and the second?".to_string())]
+        );
     }
 
     fn review_card(why: &str) -> ApprovalSpec {

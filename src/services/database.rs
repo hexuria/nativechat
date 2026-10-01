@@ -12,12 +12,15 @@ use std::time::SystemTime;
 /// `sent_at` is the thread's order: a run is placed by when it began, so a
 /// turn recovered after a restart still sits after the message it answers.
 /// `finished_at` is the other end of the wait, for the peek stamp. Timing
-/// JSON is the harness CUSTOM payload, when one arrived.
+/// JSON is the harness CUSTOM payload, when one arrived. Source JSON is the
+/// run's `opengrok.inferenceSource` CUSTOM, when one arrived: which door the
+/// reply came through, for its badge.
 #[derive(Debug, Clone)]
 pub struct SaveStamp {
     pub sent_at: SystemTime,
     pub finished_at: Option<SystemTime>,
     pub timing_json: Option<String>,
+    pub source_json: Option<String>,
 }
 
 impl SaveStamp {
@@ -26,6 +29,7 @@ impl SaveStamp {
             sent_at,
             finished_at: None,
             timing_json: None,
+            source_json: None,
         }
     }
 }
@@ -160,8 +164,13 @@ impl DatabaseService {
             // write that comes later never clears a mark that is already there. The person
             // can hide a reply while it is still being typed out, and the row for it does not
             // exist until the turn settles.
-            "INSERT INTO chat_messages (id, session_id, role, content, model, provider, reply_to_id, reply_preview, reply_is_me, run_id, deleted_at, created_at, finished_at, run_timing)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            //
+            // The badge is the run's, not the row's. A second write for the same run that knows
+            // no source keeps the one there; a write that files the row under another run takes
+            // that run's source, or none, because the door the old run went through says nothing
+            // about the new one. (Every `chat_messages.*` in the SET is the row before this write.)
+            "INSERT INTO chat_messages (id, session_id, role, content, model, provider, reply_to_id, reply_preview, reply_is_me, run_id, deleted_at, created_at, finished_at, run_timing, inference_source)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(id) DO UPDATE SET
                content = excluded.content,
                model = excluded.model,
@@ -169,7 +178,12 @@ impl DatabaseService {
                run_id = excluded.run_id,
                deleted_at = coalesce(chat_messages.deleted_at, excluded.deleted_at),
                finished_at = coalesce(excluded.finished_at, chat_messages.finished_at),
-               run_timing = coalesce(excluded.run_timing, chat_messages.run_timing)",
+               run_timing = coalesce(excluded.run_timing, chat_messages.run_timing),
+               inference_source = CASE
+                 WHEN chat_messages.run_id IS excluded.run_id
+                   THEN coalesce(excluded.inference_source, chat_messages.inference_source)
+                 ELSE excluded.inference_source
+               END",
         )
         .bind(id)
         .bind(session_id)
@@ -187,6 +201,7 @@ impl DatabaseService {
         .bind(Self::stamp(stamp.sent_at).unwrap_or_else(Self::hidden_now))
         .bind(stamp.finished_at.and_then(Self::stamp))
         .bind(stamp.timing_json.as_deref())
+        .bind(stamp.source_json.as_deref())
         .execute(&mut *tx)
         .await?;
 
@@ -214,6 +229,30 @@ impl DatabaseService {
         }
         tx.commit().await?;
         Ok(())
+    }
+
+    /// Write down which door a reply came through, learned from a replay of its run, on the
+    /// reply's row. Only a row still filed under that run takes it: the badge is the run's, as in
+    /// `save_message`, and a row since written under another run keeps the source that write
+    /// gave it, or none. Nothing else of the row is touched, and a reply not written down yet has
+    /// no row to take it; the write that makes one carries the badge from its bubble. Reports
+    /// whether a row took it.
+    pub async fn keep_reply_source(
+        &self,
+        id: &str,
+        run_id: &str,
+        source_json: &str,
+    ) -> Result<bool> {
+        let written = sqlx::query(
+            "UPDATE chat_messages SET inference_source = ? WHERE id = ? AND run_id = ?",
+        )
+        .bind(source_json)
+        .bind(id)
+        .bind(run_id)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        Ok(written == 1)
     }
 
     /// Write down something the person said that a replay brought back, under the id it was
@@ -294,7 +333,7 @@ impl DatabaseService {
     /// pieces were kept has none, and reads back as the words in `content`.
     pub async fn get_messages(&self, session_id: &str) -> Result<Vec<ChatMessage>> {
         let mut rows = sqlx::query_as::<_, ChatMessage>(
-            "SELECT id, session_id, role, content, created_at, model, provider, reply_to_id, reply_preview, reply_is_me, run_id, deleted_at, finished_at, run_timing FROM chat_messages WHERE session_id = ? ORDER BY created_at ASC, id ASC",
+            "SELECT id, session_id, role, content, created_at, model, provider, reply_to_id, reply_preview, reply_is_me, run_id, deleted_at, finished_at, run_timing, inference_source FROM chat_messages WHERE session_id = ? ORDER BY created_at ASC, id ASC",
         )
         .bind(session_id)
         .fetch_all(&self.pool)
@@ -354,6 +393,9 @@ pub struct ChatMessage {
     pub finished_at: Option<String>,
     /// Harness CUSTOM `run-timing` JSON (`v:1`), when the turn sent one.
     pub run_timing: Option<String>,
+    /// The run's `opengrok.inferenceSource` CUSTOM, `{"kind", "model"}`, when the server sent
+    /// one: which door the reply came through.
+    pub inference_source: Option<String>,
     /// The pieces of the message, in the order they were seen. They live in a table of their own
     /// so the picture bytes stay off this row; `get_messages` is what fills this in.
     #[sqlx(skip)]

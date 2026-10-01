@@ -8,6 +8,7 @@ mod conformance;
 mod credential;
 mod error;
 mod gen_ui;
+mod inference;
 mod local_exec;
 mod pending;
 mod timing;
@@ -31,6 +32,10 @@ pub use gen_ui::{
     approval_summary, choice_index, choice_letter, collapse_open_approvals, command_from_args,
     command_from_replay_events, local_exec_outcome, persons_messages,
     place_hitl_cards_in_document_order, policy_answer,
+};
+pub use inference::{
+    DEFAULT_PROXY_URL, INFERENCE_SOURCE_CUSTOM, InferenceKind, InferenceSource,
+    InferenceSourceUpdate, ProxyKey, ReplySource, is_loopback, is_subscription_model,
 };
 pub use local_exec::{enrol_this_machine, serve_local_exec, stored_machine_id};
 pub(crate) use user_form::USER_FORM_REASON;
@@ -78,6 +83,6 @@ pub use pending::{
 pub use timing::{TurnTiming, stamp_duration};
 pub use types::{
     Account, AguiMessage, Attachment, Coworker, CoworkerPatch, EFFORT_INHERIT, EFFORT_WORDS,
-    ModelCatalogue, ModelEntry, ProfileUpdate, ReplyQuote, SentAttachment, ThreadListing,
-    assistant_text_from_sse,
+    LocalProxyStatus, ModelCatalogue, ModelEntry, ProfileUpdate, ReplyQuote, SentAttachment,
+    ThreadListing, assistant_text_from_sse,
 };

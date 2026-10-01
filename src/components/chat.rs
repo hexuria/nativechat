@@ -86,6 +86,8 @@ struct ChatFeedRev {
         Option<std::time::SystemTime>,
         Option<crate::opengrok::TurnTiming>,
     )>,
+    /// Every reply's badge: the frame that brings one changes nothing else a row is drawn from.
+    sources: Vec<Option<crate::opengrok::ReplySource>>,
 }
 
 impl ChatFeedRev {
@@ -300,6 +302,9 @@ impl ChatFeedRev {
                         .collect()
                 })
                 .unwrap_or_default(),
+            sources: conv
+                .map(|c| c.messages.iter().map(|m| m.reply_source.clone()).collect())
+                .unwrap_or_default(),
         }
     }
 }
@@ -349,6 +354,8 @@ struct ChatRow {
     run: Option<RunRow>,
     /// The files one of the person's messages carried (#90), drawn as tiles under it.
     files: Vec<crate::opengrok::Attachment>,
+    /// Which door a coworker's reply came through, on the last row of its words.
+    source_badge: Option<crate::opengrok::ReplySource>,
 }
 
 impl ChatRow {
@@ -389,6 +396,7 @@ impl ChatRow {
             user_form: None,
             save_login: None,
             run: None,
+            source_badge: None,
         }
     }
 
@@ -513,6 +521,17 @@ fn timing_debug(state: &AppState, msg: &crate::state::Message) -> String {
         .as_ref()
         .map(|timing| timing.debug_lines().join("\n"))
         .unwrap_or_default()
+}
+
+/// The replies in the open thread that wear a badge, as the feed draws them, oldest first: the
+/// reply's message id and which door it came through. For the gpui-agent tree, which names what
+/// the window shows: a reply that said nothing but a status line has no bubble, and no badge.
+#[cfg(feature = "agent")]
+pub(crate) fn reply_badges(state: &AppState) -> Vec<(String, crate::opengrok::ReplySource)> {
+    snapshot_rows(state)
+        .iter()
+        .filter_map(|row| Some((row.source_id.clone(), row.source_badge.clone()?)))
+        .collect()
 }
 
 fn snapshot_rows(state: &AppState) -> Arc<Vec<ChatRow>> {
@@ -692,6 +711,18 @@ fn snapshot_rows(state: &AppState) -> Arc<Vec<ChatRow>> {
             }
         }
         flush_text(&mut rows, &mut text_buf, &mut text_n);
+        // A reply's badge goes on its last row of words, once, where the reply ends. A reply that
+        // said nothing but a status line has no bubble to wear one.
+        if !msg.is_me
+            && let Some(source) = msg.reply_source.as_ref()
+            && let Some(row) = rows
+                .iter_mut()
+                .rev()
+                .take_while(|row| row.source_id == msg.id)
+                .find(|row| row.show_footer)
+        {
+            row.source_badge = Some(source.clone());
+        }
         // A person's files go on their message's last row of words, under the bubble. A message
         // of files alone gets a row of its own that is otherwise a message like any other: its
         // time, its toolbar (reply, delete), its queued line (#136).
@@ -1487,6 +1518,7 @@ impl Render for ChatTranscript {
                                 .is_cached(row.is_cached)
                                 .queued(row.queued)
                                 .files(row.files.clone())
+                                .source_badge(row.source_badge.clone())
                                 .highlight_range(row.highlight_range.clone())
                                 .highlight_color(highlight_color)
                                 .find_marks(marks_for_row(ix, &find_hits, find_current))
@@ -2239,6 +2271,7 @@ mod tests {
                 sent_at: std::time::SystemTime::UNIX_EPOCH,
                 finished_at: None,
                 run_timing: None,
+                reply_source: None,
                 is_me: false,
                 reply_preview: None,
                 reply_to_id: None,
@@ -2400,6 +2433,7 @@ mod tests {
             reply_is_me: false,
             parts: Vec::new(),
             run_id: None,
+            reply_source: None,
             hidden: false,
         }
     }

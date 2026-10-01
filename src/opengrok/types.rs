@@ -181,6 +181,32 @@ pub struct ThreadListing {
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct ModelEntry {
     pub id: String,
+    /// Which door serves it, `gateway` or `local_proxy` (the inference-source contract agreed
+    /// with open-ai-gateway and opengrok-server, 2026-09-30, built in opengrok-server #294:
+    /// `list_models` in `crates/opengrok-server/src/agui/routes.rs`, `listed` in
+    /// `crates/opengrok-harness/src/local_proxy.rs`): a `local_proxy` entry is one of
+    /// opencodex's models, as the server lists them for the person's own subscription. Kept as
+    /// the word the server sent and read through [`Self::source`].
+    #[serde(default)]
+    pub source: Option<String>,
+}
+
+impl ModelEntry {
+    /// The door this model is served through. A server from before reply sources sends no
+    /// `source`, and every model it lists is the gateway's. A word this app has not heard of is
+    /// `None`, and such a model is offered by neither picker rather than guessed into one.
+    pub fn source(&self) -> Option<super::InferenceKind> {
+        match self.source.as_deref() {
+            None => Some(super::InferenceKind::Gateway),
+            Some(word) => super::InferenceKind::from_word(word),
+        }
+    }
+
+    /// One of the person's own plan's models, which Settings → Reply source offers and a Bot's
+    /// Model field does not.
+    pub fn is_local_proxy(&self) -> bool {
+        self.source() == Some(super::InferenceKind::LocalProxy)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -189,6 +215,35 @@ pub struct ModelCatalogue {
     pub models: Vec<ModelEntry>,
     #[serde(default)]
     pub note: Option<String>,
+    /// Whether opencodex answered the server as it listed these, `"localProxy": {"healthy"}`:
+    /// there whenever the account keeps a proxy address, whatever its reply source, and absent
+    /// while it keeps none (the inference-source contract agreed with opengrok-server
+    /// 2026-09-30, built in its #294: `list_models` in
+    /// `crates/opengrok-server/src/agui/routes.rs`, `listed` in
+    /// `crates/opengrok-harness/src/local_proxy.rs`). A proxy that is down lists nothing, and
+    /// this is how that reads apart from a plan with nothing to offer. One this app cannot read
+    /// is none: the list the Bot's Model field is drawn from never fails for it.
+    #[serde(
+        default,
+        rename = "localProxy",
+        deserialize_with = "proxy_status_or_none"
+    )]
+    pub local_proxy: Option<LocalProxyStatus>,
+}
+
+/// `GET /models`' word on the person's own proxy (see [`ModelCatalogue::local_proxy`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+pub struct LocalProxyStatus {
+    /// opencodex answered its `/healthz` when the server asked.
+    pub healthy: bool,
+}
+
+fn proxy_status_or_none<'de, D>(deserializer: D) -> Result<Option<LocalProxyStatus>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(raw.and_then(|raw| serde_json::from_value(raw).ok()))
 }
 
 /// The message a reply points at, carried beside the message that answers it.
@@ -544,6 +599,86 @@ mod tests {
             serde_json::to_value(&effort).unwrap(),
             serde_json::json!({"effort": "inherit"})
         );
+    }
+
+    /// A `/models` entry says which door serves it. A server from before reply sources sends
+    /// none, and its models are the gateway's; a word this app has not heard of names neither
+    /// door, and one entry's word never fails the list.
+    #[test]
+    fn a_models_source_reads_as_sent_and_a_missing_one_as_the_gateway() {
+        use super::super::InferenceKind;
+        let catalogue: ModelCatalogue = serde_json::from_value(serde_json::json!({
+            "models": [
+                {"id": "oag/cheap"},
+                {"id": "oag/fast", "source": "gateway", "points": null},
+                {"id": "gpt-5-codex", "source": "local_proxy"},
+                {"id": "odd", "source": "byok"},
+                {"id": "nulled", "source": null}
+            ],
+            "note": null
+        }))
+        .expect("one entry's source never fails the list");
+        let sources: Vec<(&str, Option<InferenceKind>)> = catalogue
+            .models
+            .iter()
+            .map(|entry| (entry.id.as_str(), entry.source()))
+            .collect();
+        assert_eq!(
+            sources,
+            vec![
+                ("oag/cheap", Some(InferenceKind::Gateway)),
+                ("oag/fast", Some(InferenceKind::Gateway)),
+                ("gpt-5-codex", Some(InferenceKind::LocalProxy)),
+                ("odd", None),
+                ("nulled", Some(InferenceKind::Gateway)),
+            ]
+        );
+    }
+
+    /// `localProxy` says whether opencodex answered as the server listed its models: read when
+    /// there, none when the account keeps no proxy address, and none, not a failed list, when it
+    /// is in a shape this app cannot read.
+    #[test]
+    fn a_models_list_says_whether_the_proxy_answered() {
+        let read = |body: serde_json::Value| -> ModelCatalogue {
+            serde_json::from_value(body).expect("the list is read whatever localProxy says")
+        };
+        let up = read(serde_json::json!({
+            "models": [{"id": "gpt-5-codex", "source": "local_proxy", "points": null}],
+            "note": null,
+            "localProxy": {"healthy": true}
+        }));
+        assert_eq!(up.local_proxy, Some(LocalProxyStatus { healthy: true }));
+        assert!(up.models[0].is_local_proxy());
+        let down = read(serde_json::json!({
+            "models": [{"id": "oag/cheap", "source": "gateway", "points": null}],
+            "note": null,
+            "localProxy": {"healthy": false}
+        }));
+        assert_eq!(down.local_proxy, Some(LocalProxyStatus { healthy: false }));
+        assert!(!down.models[0].is_local_proxy());
+        let none = read(serde_json::json!({"models": [], "note": null}));
+        assert_eq!(none.local_proxy, None);
+        // `?source=local_proxy` as the server builds it: the plan's models, `note: null`.
+        let plan_only = read(serde_json::json!({
+            "models": [{"id": "grok-4", "points": null, "source": "local_proxy"}],
+            "note": null,
+            "localProxy": {"healthy": true}
+        }));
+        assert_eq!(plan_only.note, None);
+        assert!(plan_only.models[0].is_local_proxy());
+        for odd in [
+            serde_json::json!(null),
+            serde_json::json!({}),
+            serde_json::json!({"healthy": "yes"}),
+            serde_json::json!(true),
+        ] {
+            let odd = read(serde_json::json!({
+                "models": [{"id": "oag/cheap"}], "note": null, "localProxy": odd
+            }));
+            assert_eq!(odd.local_proxy, None);
+            assert_eq!(odd.models.len(), 1);
+        }
     }
 
     /// The field is new: a server that has never heard of it must still see the array it saw
