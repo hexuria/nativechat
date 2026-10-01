@@ -35,6 +35,13 @@ pub const FAST_SUFFIX: &str = "--fast";
 /// The Server group is the server's paid keys, and a seat is not one, so it is not listed there.
 const SEAT_SUFFIX: &str = "@sub";
 
+/// What a gateway id ends with when it pins that same model to an API-key credential
+/// (`xai/grok-4.6@api`). The unqualified id is the one the gateway routes: the cheapest live
+/// credential (open-ai-gateway `docs/02-cost-routing.md`). Listing both is the same model twice,
+/// so the pin is not a row of its own where the unqualified id is listed, and a pick goes to
+/// that id. A pin whose unqualified id is absent stays, as the only spelling the list offers.
+const API_SUFFIX: &str = "@api";
+
 /// The Bot's list's two groups, as they read.
 pub const PLAN_GROUP: &str = "Your plan · opencodex";
 pub const SERVER_GROUP: &str = "Server · paid keys";
@@ -141,17 +148,39 @@ pub fn fold<'a>(source: InferenceKind, ids: impl IntoIterator<Item = &'a str>) -
 }
 
 /// The Server group: the gateway's routes as `GET /models` lists them, in its order, less the
-/// seats billed to a subscription.
+/// seats billed to a subscription and less an `@api` pin of a model the list also names
+/// without one.
 pub fn server_choices(catalogue: &ModelCatalogue) -> Vec<ModelChoice> {
+    let ids: Vec<&str> = catalogue
+        .models
+        .iter()
+        .filter(|entry| entry.source() == Some(InferenceKind::Gateway))
+        .map(|entry| entry.id.as_str())
+        .filter(|id| !ends_with_pin(without_fast(id), SEAT_SUFFIX))
+        .collect();
     fold(
         InferenceKind::Gateway,
-        catalogue
-            .models
-            .iter()
-            .filter(|entry| entry.source() == Some(InferenceKind::Gateway))
-            .map(|entry| entry.id.as_str())
-            .filter(|id| !without_fast(id).to_ascii_lowercase().ends_with(SEAT_SUFFIX)),
+        ids.iter()
+            .copied()
+            .filter(|id| !api_pin_of_a_listed_model(id, &ids)),
     )
+}
+
+/// Whether `id` ends with a credential pin (`@sub`, `@api`), ignoring the pin's case.
+fn ends_with_pin(id: &str, suffix: &str) -> bool {
+    id.len() >= suffix.len() && id[id.len() - suffix.len()..].eq_ignore_ascii_case(suffix)
+}
+
+/// An `@api` id whose unqualified model is also listed: the same model, not a second row.
+fn api_pin_of_a_listed_model(id: &str, listed: &[&str]) -> bool {
+    let plain = without_fast(id);
+    if !ends_with_pin(plain, API_SUFFIX) {
+        return false;
+    }
+    let unqualified = &plain[..plain.len() - API_SUFFIX.len()];
+    listed
+        .iter()
+        .any(|other| without_fast(other).eq_ignore_ascii_case(unqualified))
 }
 
 /// The plan group: the person's plan's models as `AppState::plan_models` gives them for the
@@ -161,10 +190,11 @@ pub fn plan_choices(ids: &[String]) -> Vec<ModelChoice> {
 }
 
 /// A model as a person reads it: `gpt-6-luna` is "GPT-6 Luna", `openai/gpt-6.1-sol` "GPT-6.1
-/// Sol", `xai/grok-4.7` "Grok 4.7", and a route of the gateway's own, `oag/cheap`, "Cheap
-/// (auto)", since the gateway picks the model behind it. A fast tier reads with ⚡ after it. Any
-/// other id is shown as it is: a name made up for a model this app does not know would be a name
-/// nobody could look up.
+/// Sol", `xai/grok-4.7` "Grok 4.7", `zai/glm-4.6` "GLM 4.6", `claude-3-5-haiku` "Claude 3.5
+/// Haiku", and a route of the gateway's own, `oag/cheap`, "Cheap (auto)", since the gateway
+/// picks the model behind it. A reseller's id, `merge/xai/grok-4.6`, reads as the maker's model.
+/// A fast tier reads with ⚡ after it. Any other id is shown as it is: a name made up for a model
+/// this app does not know would be a name nobody could look up.
 pub fn model_label(id: &str) -> String {
     match id.strip_suffix(FAST_SUFFIX) {
         Some(plain) => format!("{} ⚡", base_label(plain)),
@@ -180,6 +210,12 @@ pub fn base_label(id: &str) -> String {
 
 fn readable(id: &str) -> Option<String> {
     let lower = id.to_ascii_lowercase();
+    // `merge/` is a reseller (open-ai-gateway `docs/02-cost-routing.md`): the id is
+    // `merge/<upstream id>`, and the upstream is the model. An upstream this app does not know
+    // is left as the whole id, reseller and all, so it can be looked up.
+    if let Some(upstream) = lower.strip_prefix("merge/") {
+        return readable(upstream);
+    }
     let (provider, name) = match lower.split_once('/') {
         Some((provider, name)) => (Some(provider), name),
         None => (None, lower.as_str()),
@@ -206,8 +242,50 @@ fn readable(id: &str) -> Option<String> {
         (None | Some("xai"), ["grok", rest @ ..]) if !rest.is_empty() => {
             Some(format!("Grok{}", spaced(rest)))
         }
+        (Some("zai"), ["glm", rest @ ..]) if !rest.is_empty() => {
+            Some(format!("GLM{}", spaced(rest)))
+        }
+        (None | Some("anthropic"), ["claude", rest @ ..]) => claude_name(rest),
         _ => None,
     }
+}
+
+/// Claude as a person says it: `claude-3-5-haiku` is "Claude 3.5 Haiku", `claude-opus-4`
+/// "Claude Opus 4", `claude-sonnet-5-5` "Claude Sonnet 5.5". A snapshot date (`20250929`) is
+/// not a version, and the id is left as it is so the snapshot can be looked up.
+fn claude_name(rest: &[&str]) -> Option<String> {
+    if rest.is_empty() || rest.iter().copied().any(is_snapshot_date) {
+        return None;
+    }
+    let mut parts = Vec::with_capacity(rest.len());
+    let mut ix = 0;
+    while ix < rest.len() {
+        if is_number(rest[ix]) {
+            let mut version = String::new();
+            while ix < rest.len() && is_number(rest[ix]) {
+                if !version.is_empty() {
+                    version.push('.');
+                }
+                version.push_str(rest[ix]);
+                ix += 1;
+            }
+            parts.push(version);
+        } else {
+            parts.push(capitalised(rest[ix]));
+            ix += 1;
+        }
+    }
+    Some(format!("Claude {}", parts.join(" ")))
+}
+
+/// A version token that is only digits, so `3` and `5` in `claude-3-5-haiku` join as `3.5`.
+fn is_number(word: &str) -> bool {
+    !word.is_empty() && word.chars().all(|c| c.is_ascii_digit())
+}
+
+/// A dated snapshot, `claude-sonnet-4-5-20250929`, which is not a version of the model.
+fn is_snapshot_date(word: &str) -> bool {
+    word.len() == 8 && is_number(word)
 }
 
 /// A model family's version, as `6`, `5.6` or `4o` are.
@@ -665,7 +743,8 @@ mod tests {
         );
     }
 
-    /// Ids read as a person says the model's name, and any other id as it is.
+    /// Ids read as a person says the model's name, and any other id as it is. A model the gateway
+    /// reaches through a reseller whose own ids carry the maker reads as the maker's model.
     #[test]
     fn a_model_reads_as_a_person_says_it() {
         for (id, read) in [
@@ -680,18 +759,60 @@ mod tests {
             ("grok-code-fast-1", "Grok Code Fast 1"),
             ("oag/cheap", "Cheap (auto)"),
             ("gpt-6-luna--fast", "GPT-6 Luna ⚡"),
+            ("zai/glm-4.6", "GLM 4.6"),
+            ("anthropic/claude-opus-4", "Claude Opus 4"),
+            ("claude-3-5-haiku", "Claude 3.5 Haiku"),
+            // The gateway's routes through a reseller, as its list names them.
+            ("merge/zai/glm-5.3-flash", "GLM 5.3 Flash"),
+            ("merge/xai/grok-4.6", "Grok 4.6"),
+            ("merge/anthropic/claude-sonnet-5-5", "Claude Sonnet 5.5"),
+            ("merge/openai/gpt-6-luna", "GPT-6 Luna"),
             // Nobody's family this app knows: as it is.
             ("o3-mini", "o3-mini"),
-            ("anthropic/claude-opus-4", "anthropic/claude-opus-4"),
+            ("google/gemini-3-pro", "google/gemini-3-pro"),
+            (
+                "merge/mistral/mistral-large-3",
+                "merge/mistral/mistral-large-3",
+            ),
             ("xai/grok-4.6@sub", "xai/grok-4.6@sub"),
             ("xai/gpt-5", "xai/gpt-5"),
+            ("merge/zai/grok-4.6", "merge/zai/grok-4.6"),
+            // A snapshot's date is no version of the model's.
+            (
+                "anthropic/claude-sonnet-4-5-20250929",
+                "anthropic/claude-sonnet-4-5-20250929",
+            ),
             ("gpt-oss-120b", "gpt-oss-120b"),
             ("grok", "grok"),
+            ("claude", "claude"),
             ("", ""),
         ] {
             assert_eq!(model_label(id), read, "{id:?}");
         }
         assert_eq!(base_label("gpt-6-luna--fast"), "GPT-6 Luna");
+    }
+
+    /// `@api` is the same model pinned to an API key. The unqualified id is the one the gateway
+    /// routes, so the two are one row, that id, wherever the pin sits in the list. A pin with no
+    /// unqualified id beside it stays, and a seat still does not.
+    #[test]
+    fn an_api_key_pin_of_a_listed_model_is_that_models_row() {
+        let listed = catalogue(&[
+            "xai/grok-4.6@api",
+            "xai/grok-4.6",
+            "xai/grok-4.6@sub",
+            "anthropic/claude-sonnet-5-5@api",
+            "XAI/GROK-4.7@API",
+            "xai/grok-4.7",
+        ]);
+        assert_eq!(
+            ids(&server_choices(&listed)),
+            [
+                ("xai/grok-4.6", false),
+                ("anthropic/claude-sonnet-5-5@api", false),
+                ("xai/grok-4.7", false),
+            ]
+        );
     }
 
     /// The Server group is the gateway's routes, in the server's order, less the seats billed to
