@@ -60,6 +60,9 @@ pub struct MessageBubble {
     /// alone draws only them, with the same time, toolbar and queued line a worded one has
     /// (#136).
     files: Vec<crate::opengrok::Attachment>,
+    /// Which door a coworker's reply came through, for the badge under it: "paid key" or "your
+    /// plan", with the model on hover.
+    source_badge: Option<crate::opengrok::ReplySource>,
     app: Option<Entity<AppState>>,
 }
 
@@ -93,6 +96,7 @@ impl MessageBubble {
             timestamps_ok: true,
             queued: false,
             files: Vec::new(),
+            source_badge: None,
             app: None,
         }
     }
@@ -254,6 +258,11 @@ impl MessageBubble {
 
     pub fn queued(mut self, queued: bool) -> Self {
         self.queued = queued;
+        self
+    }
+
+    pub fn source_badge(mut self, source: Option<crate::opengrok::ReplySource>) -> Self {
+        self.source_badge = source;
         self
     }
 }
@@ -433,6 +442,16 @@ impl RenderOnce for MessageBubble {
         // a row narrower than chat_w says. The chip sits on the bubble's bottom edge: half of
         // its 22px is on the fill.
         let tiles = (!self.files.is_empty()).then(|| sent_file_tiles(&self.files, is_me, cx));
+        // Under the reply rather than in it: which door the reply came through is the server's
+        // word about the turn, not the coworker's.
+        let badge = self.source_badge.as_ref().map(|source| {
+            crate::components::reply_source::reply_badge(
+                source,
+                &source_id,
+                muted,
+                cx.theme().border,
+            )
+        });
         let bubble_stack = div()
             .relative()
             .flex_shrink(1.)
@@ -464,6 +483,9 @@ impl RenderOnce for MessageBubble {
                         )
                         .when_some(actions, |this, actions| this.child(actions)),
                 )
+            })
+            .when_some(badge, |this, badge| {
+                this.child(h_flex().mt(px(4.)).child(badge))
             })
             .when_some(self.timing_debug.clone(), |this, timing| {
                 this.child(
