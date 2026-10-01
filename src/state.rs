@@ -4539,6 +4539,10 @@ pub struct AppState {
     pending_save: HashMap<String, PendingSave>,
     /// A "Use saved login" press on a card, keyed by card key, until the form settles.
     pub saved_login_use: HashMap<String, SavedLoginUse>,
+    /// The login whose name was sent from the name page of a two-step sign-in, by thread and
+    /// site, so the password page after it offers that login first. A row id, never a secret;
+    /// in memory only, and a sign-out forgets it.
+    name_page_picks: HashMap<(String, String), String>,
     /// Ids of the saved logins whose password is in this Mac's keychain. The others are on
     /// the server only and are fetched, after Touch ID, the first time they are used here.
     pub site_logins_on_this_mac: HashSet<String>,
@@ -5179,6 +5183,7 @@ impl AppState {
             site_login_vault: None,
             pending_save: HashMap::new(),
             saved_login_use: HashMap::new(),
+            name_page_picks: HashMap::new(),
             site_logins_on_this_mac: HashSet::new(),
             site_logins_with_code: HashSet::new(),
             user_form_list_open: HashSet::new(),
@@ -6247,6 +6252,7 @@ impl AppState {
         self.account = None;
         self.auth_status = AuthStatus::SignedOut;
         self.saved_login_use.clear();
+        self.name_page_picks.clear();
         self.pending_save.clear();
         self.auth_error = None;
         // A person who has just signed out is not somebody who needs telling they are signed
@@ -15310,8 +15316,10 @@ impl AppState {
         .detach();
     }
 
-    /// The rows a card can take: the vault has loaded, the card has a target (a login, a
-    /// code, a passkey), and the row is of that kind for the card's site.
+    /// The rows a card can take: the vault has loaded, the card has a target (a login, a page
+    /// of a two-step sign-in, a code, a passkey), and the row is of that kind for the card's
+    /// site. On the password page of a two-step sign-in, the login picked on the name page
+    /// before it, in the same thread, comes first.
     pub fn saved_logins_for_form(
         &self,
         spec: &crate::opengrok::UserFormSpec,
@@ -15325,11 +15333,15 @@ impl AppState {
         let Some(origin) = login_origin(spec) else {
             return Vec::new();
         };
-        self.site_logins
+        let mut rows: Vec<SiteLoginRecord> = self
+            .site_logins
             .iter()
             .filter(|row| login_matches_request(&row.origin, &row.username, &origin, None))
             .filter(|row| match &target {
-                CardTarget::Login(_) => row.kind == crate::site_login::KIND_PASSWORD,
+                // Either page of a two-step sign-in takes half of a password login.
+                CardTarget::Login(_)
+                | CardTarget::Username { .. }
+                | CardTarget::Password { .. } => row.kind == crate::site_login::KIND_PASSWORD,
                 // A code can sit beside a password or on a row of its own; either way the
                 // seed has to be on this Mac (or the row on the server) to be offered.
                 // Only a row that really carries a code: its seed is on this Mac, or the
@@ -15347,14 +15359,62 @@ impl AppState {
                 CardTarget::Passkey { register: true } => false,
             })
             .cloned()
-            .collect()
+            .collect();
+        // The password page does not ask who is signing in: the name page before it did. The
+        // login picked there leads, so the person does not have to remember which account
+        // they chose a moment ago; the others stay listed for a name typed by hand.
+        if matches!(target, CardTarget::Password { .. })
+            && let Some(picked) = self.name_page_pick(spec.card_key(), &origin)
+        {
+            rows.sort_by_key(|row| row.id != picked);
+        }
+        rows
+    }
+
+    /// The login picked on the name page of a two-step sign-in to `origin`, in the thread this
+    /// card is in.
+    fn name_page_pick(&self, card_key: &str, origin: &str) -> Option<String> {
+        if self.name_page_picks.is_empty() {
+            return None;
+        }
+        let (_, _, thread, _) = self.user_form_context(card_key)?;
+        self.name_page_picks
+            .get(&(thread, origin.to_string()))
+            .cloned()
+    }
+
+    /// What a name page leaves for the password page after it: the login whose name it sent,
+    /// or, for a name typed by hand, nothing, so an earlier pick in the thread is not offered
+    /// first for a name that is not its own. Any other card leaves nothing.
+    fn remember_name_page_pick(&mut self, card_key: &str, login_id: Option<String>) {
+        let Some(spec) = self.user_form_mut_ref(card_key) else {
+            return;
+        };
+        if !matches!(card_target(spec), Some(CardTarget::Username { .. })) {
+            return;
+        }
+        let Some(origin) = login_origin(spec) else {
+            return;
+        };
+        let Some((_, _, thread, _)) = self.user_form_context(card_key) else {
+            return;
+        };
+        match login_id {
+            Some(login_id) => {
+                self.name_page_picks.insert((thread, origin), login_id);
+            }
+            None => {
+                self.name_page_picks.remove(&(thread, origin));
+            }
+        }
     }
 
     /// A pick from the card's list: Touch ID first, then what the row holds is fetched for
     /// the card — the password from this Mac's keychain (or once from the server), the code
     /// seed the same way, nothing at all for a passkey (its key stays on the server, in the
-    /// box's browser) — and held for the press of the button. The name goes into its field;
-    /// a secret is never painted and never put in an input, and the Bot never sees it.
+    /// box's browser) or for the name page of a two-step sign-in (it takes the name alone) —
+    /// and held for the press of the button. The name goes into its field, where the card has
+    /// one; a secret is never painted and never put in an input, and the Bot never sees it.
     pub fn pick_saved_login(&mut self, card_key: String, login_id: String, cx: &mut Context<Self>) {
         let Some(spec) = self.user_form_mut(&card_key).map(|spec| spec.clone()) else {
             return;
@@ -15390,19 +15450,20 @@ impl AppState {
                 username: username.clone(),
             },
         );
-        if let CardTarget::Login(fields) = &target {
+        if let Some(name_id) = target.name_field() {
             // The name shows in its field at once (the driver reads it from here; the view
             // sets its input too).
             self.user_form_typed
                 .entry(card_key.clone())
                 .or_default()
-                .insert(fields.username_id.clone(), username.clone());
+                .insert(name_id.to_string(), username.clone());
         }
         cx.notify();
         let client = self.opengrok.clone();
         let wants = match &target {
-            CardTarget::Login(_) => HeldSecret::Password,
+            CardTarget::Login(_) | CardTarget::Password { .. } => HeldSecret::Password,
             CardTarget::Code { .. } => HeldSecret::CodeSeed,
+            CardTarget::Username { .. } => HeldSecret::Name,
             CardTarget::Passkey { .. } => HeldSecret::None,
         };
         cx.spawn(async move |this, cx| {
@@ -15418,7 +15479,7 @@ impl AppState {
                             crate::site_login::touch_id::TouchIdOutcome::Verified => Ok(match wants {
                                 HeldSecret::Password => vault.secret_for_fill(&row_id),
                                 HeldSecret::CodeSeed => vault.code_for(&row_id),
-                                HeldSecret::None => Ok(Some(String::new())),
+                                HeldSecret::Name | HeldSecret::None => Ok(Some(String::new())),
                             }),
                             other => Err(other),
                         }
@@ -15461,7 +15522,7 @@ impl AppState {
                             Ok(Ok(match wants {
                                 HeldSecret::Password => secrets.password,
                                 HeldSecret::CodeSeed => secrets.otpauth,
-                                HeldSecret::None => Some(String::new()),
+                                HeldSecret::Name | HeldSecret::None => Some(String::new()),
                             }))
                         }
                         Err(error) => Ok(Err(crate::site_login::StoreError::Secret(format!(
@@ -15508,6 +15569,11 @@ impl AppState {
                                     "The code seed for {username} is not readable. Import it \
                                      again, or type the code."
                                 ),
+                            })
+                        } else if wants == HeldSecret::Name {
+                            Some(SavedLoginUse::NameReady {
+                                login_id: row.id.clone(),
+                                username: username.clone(),
                             })
                         } else {
                             Some(SavedLoginUse::Ready {
@@ -15626,10 +15692,11 @@ impl AppState {
         cx.notify();
     }
 
-    /// A submit with a held secret: for a login the name and the password ride along; for a
-    /// code the digits are minted now, from the held seed; for a passkey nothing is added,
-    /// the row's id is enough. The submit is marked as a saved login for the server's
-    /// own-computer rule.
+    /// A submit with a held secret: for a login the name and the password ride along; for
+    /// the two pages of a two-step sign-in, the name alone on the first and the password alone
+    /// on the second; for a code the digits are minted now, from the held seed; for a passkey
+    /// nothing is added, the row's id is enough. The submit is marked as a saved login for the
+    /// server's own-computer rule.
     /// `false` when the card must not be sent: a held code seed this Mac cannot read is
     /// said so on the card instead of sending an empty field to the box.
     fn fold_held_saved_login(&mut self, card_key: &str, values: &mut UserFormValues) -> bool {
@@ -15647,10 +15714,14 @@ impl AppState {
                         username,
                         password,
                     } => Some((login_id.clone(), username.clone(), password.clone())),
+                    SavedLoginUse::NameReady { login_id, username } => {
+                        Some((login_id.clone(), username.clone(), String::new()))
+                    }
                     _ => None,
                 })
         else {
             // Nothing is held: an ordinary typed submit.
+            self.remember_name_page_pick(card_key, None);
             return true;
         };
         let Some(target) = self
@@ -15665,6 +15736,13 @@ impl AppState {
                 // is the name that goes with the picked password.
                 values.by_id.insert(fields.username_id, username.clone());
                 values.by_id.insert(fields.password_id, secret);
+            }
+            CardTarget::Username { username_id } => {
+                values.by_id.insert(username_id, username.clone());
+                self.remember_name_page_pick(card_key, Some(login_id.clone()));
+            }
+            CardTarget::Password { password_id } => {
+                values.by_id.insert(password_id, secret);
             }
             CardTarget::Code { code_id } => {
                 let Ok(totp) = crate::site_login::totp::parse(&secret) else {
@@ -16096,8 +16174,9 @@ impl AppState {
     }
 
     /// The cursor is in the field the accounts belong to, so the list comes up. Only that
-    /// field: the password field is not where an account is chosen, and a card that has
-    /// just arrived shows nothing until the person asks.
+    /// field: the password field is not where an account is chosen, except on the password
+    /// page of a two-step sign-in, which has no other; and a card that has just arrived shows
+    /// nothing until the person asks.
     pub fn open_saved_login_list(
         &mut self,
         card_key: String,
@@ -16110,11 +16189,7 @@ impl AppState {
         let belongs = self
             .user_form_mut_ref(&card_key)
             .and_then(card_target)
-            .is_some_and(|target| match target {
-                CardTarget::Login(fields) => fields.username_id == field_id,
-                CardTarget::Code { code_id } => code_id == field_id,
-                CardTarget::Passkey { .. } => false,
-            });
+            .is_some_and(|target| target.list_field() == Some(field_id));
         if belongs {
             self.user_form_list_open.insert(card_key);
             cx.notify();
@@ -19320,6 +19395,9 @@ fn settled_option(echo: Option<String>, cleared: bool, before: Option<String>) -
 enum HeldSecret {
     Password,
     CodeSeed,
+    /// Nothing: the name page of a two-step sign-in takes the name alone, so no password is
+    /// read out of the keychain for it.
+    Name,
     None,
 }
 
@@ -21374,6 +21452,254 @@ mod tests {
             }
             other => panic!("expected grafted settle, got {other:?}"),
         }
+    }
+
+    /// A row of Settings → Logins, as the vault lists it.
+    fn saved_login(
+        id: &str,
+        origin: &str,
+        username: &str,
+        kind: &str,
+    ) -> crate::site_login::SiteLoginRecord {
+        crate::site_login::SiteLoginRecord {
+            id: id.into(),
+            origin: origin.into(),
+            username: username.into(),
+            label: String::new(),
+            kind: kind.into(),
+            notes: String::new(),
+            last_used_at_ms: None,
+            created_at: "2026-09-30T10:00:00+00:00".into(),
+            updated_at: "2026-09-30T10:00:00+00:00".into(),
+        }
+    }
+
+    /// A card the Bot raised on Google's sign-in page, with the fields given.
+    fn google_card(entry_id: &str, fields: serde_json::Value) -> crate::opengrok::UserFormSpec {
+        crate::opengrok::UserFormSpec::parse(
+            &json!({
+                "entryId": entry_id,
+                "formRequest": {
+                    "title": "Google sign-in",
+                    "domain": "accounts.google.com",
+                    "liveHost": "accounts.google.com",
+                    "fields": fields
+                }
+            }),
+            None,
+        )
+        .expect("form")
+    }
+
+    /// The ids of the saved logins a card offers, in the order it lists them.
+    fn offered(state: &AppState, spec: &crate::opengrok::UserFormSpec) -> Vec<String> {
+        state
+            .saved_logins_for_form(spec)
+            .into_iter()
+            .map(|row| row.id)
+            .collect()
+    }
+
+    /// The owner's report: Google asked for the email alone, the Bot raised a card with one
+    /// "Email or phone" field, and the card offered nothing, although a login for google.com
+    /// was saved. A card had to hold a name and a password to take a login, and neither page of
+    /// a two-step sign-in holds both. Each page now offers the site's password logins, found
+    /// from accounts.google.com under the google.com they were saved as; another site's logins
+    /// and a passkey are not offered, and a sign-up still takes nothing.
+    #[test]
+    fn both_pages_of_a_two_step_sign_in_offer_the_sites_saved_logins() {
+        let mut state = AppState::new();
+        state.site_logins = vec![
+            saved_login("sl_fb", "facebook.com", "ada@example.com", "password"),
+            saved_login("sl_ada", "google.com", "ada@example.com", "password"),
+            saved_login("sl_key", "google.com", "ada@example.com", "passkey"),
+        ];
+        state.site_logins_ready = true;
+        let email = google_card(
+            "e_email",
+            json!([{"id": "email", "label": "Email or phone", "type": "email", "required": true}]),
+        );
+        assert_eq!(offered(&state, &email), ["sl_ada"]);
+        let password = google_card(
+            "e_password",
+            json!([{"id": "password", "label": "Enter your password", "type": "password", "required": true}]),
+        );
+        assert_eq!(offered(&state, &password), ["sl_ada"]);
+        let sign_up = google_card(
+            "e_sign_up",
+            json!([
+                {"id": "email", "label": "Email", "type": "email", "required": true},
+                {"id": "password", "label": "Password", "type": "password", "required": true},
+                {"id": "confirm", "label": "Confirm password", "type": "password", "required": true}
+            ]),
+        );
+        assert!(offered(&state, &sign_up).is_empty());
+    }
+
+    /// The password page does not ask who is signing in; the name page before it did. Once a
+    /// saved login's name has gone into the name page, the password page in the same thread
+    /// offers that login first, so the person is not left to remember which account they chose.
+    /// Another thread's sign-in to the same site is its own, and a name typed by hand on a later
+    /// name page is not the earlier pick's, so that pick stops leading. Each page is sent its
+    /// half of the login and nothing else.
+    #[test]
+    fn the_password_page_offers_first_the_login_picked_on_the_name_page() {
+        let mut state = AppState::new();
+        state.site_logins = vec![
+            saved_login("sl_ada", "google.com", "ada@example.com", "password"),
+            saved_login("sl_bea", "google.com", "bea@example.com", "password"),
+        ];
+        state.site_logins_ready = true;
+        let email_field =
+            json!([{"id": "email", "label": "Email or phone", "type": "email", "required": true}]);
+        let password_field = json!([
+            {"id": "password", "label": "Enter your password", "type": "password", "required": true}
+        ]);
+        let email = google_card("e_email", email_field.clone());
+        let password = google_card("e_password", password_field.clone());
+        let elsewhere = google_card("e_elsewhere", password_field);
+        let mut sign_in = message("m1", false, "");
+        sign_in.parts = vec![
+            ChatPart::UserForm(email),
+            ChatPart::UserForm(password.clone()),
+        ];
+        let mut other = message("m2", false, "");
+        other.parts = vec![ChatPart::UserForm(elsewhere.clone())];
+        state.conversations.push(thread("cw_1", vec![sign_in]));
+        state.conversations.push(thread("cw_2", vec![other]));
+        assert_eq!(
+            offered(&state, &password),
+            ["sl_ada", "sl_bea"],
+            "nothing picked yet: the vault's own order"
+        );
+
+        // Touch ID passed for bea on the name page; Continue sends her name, and only it.
+        state.saved_login_use.insert(
+            "e_email".into(),
+            crate::site_login::SavedLoginUse::NameReady {
+                login_id: "sl_bea".into(),
+                username: "bea@example.com".into(),
+            },
+        );
+        let mut sent = crate::opengrok::UserFormValues::default();
+        assert!(state.fold_held_saved_login("e_email", &mut sent));
+        assert_eq!(
+            sent.by_id,
+            std::collections::HashMap::from([("email".to_string(), "bea@example.com".to_string())])
+        );
+        assert_eq!(
+            state
+                .saved_login_use
+                .get("e_email")
+                .and_then(crate::site_login::SavedLoginUse::filling_id),
+            Some("sl_bea"),
+            "sent as a saved login, which keeps it off a shared computer and stamps its use"
+        );
+        assert_eq!(offered(&state, &password), ["sl_bea", "sl_ada"]);
+        assert_eq!(
+            offered(&state, &elsewhere),
+            ["sl_ada", "sl_bea"],
+            "another thread's sign-in"
+        );
+
+        // Her password, picked on the password page, is sent alone.
+        state.saved_login_use.insert(
+            "e_password".into(),
+            crate::site_login::SavedLoginUse::Ready {
+                login_id: "sl_bea".into(),
+                username: "bea@example.com".into(),
+                password: "s3cret-pass".into(),
+            },
+        );
+        let mut sent = crate::opengrok::UserFormValues::default();
+        assert!(state.fold_held_saved_login("e_password", &mut sent));
+        assert_eq!(
+            sent.by_id,
+            std::collections::HashMap::from([("password".to_string(), "s3cret-pass".to_string())])
+        );
+
+        // Signing in again later, with a name typed by hand: bea no longer leads.
+        let mut again = message("m3", false, "");
+        again.parts = vec![ChatPart::UserForm(google_card("e_email_2", email_field))];
+        state.conversations[0].messages.push(again);
+        let mut typed = crate::opengrok::UserFormValues::default();
+        typed.by_id.insert("email".into(), "ada@example.com".into());
+        assert!(state.fold_held_saved_login("e_email_2", &mut typed));
+        assert_eq!(offered(&state, &password), ["sl_ada", "sl_bea"]);
+    }
+
+    /// A driver finds each page's saved logins where a person does, by the ids the one-page
+    /// login card uses: a `user-form-use-saved-{card}-{login}` row per login on the name page
+    /// and on the password page, the password page's in the order the card lists them. A
+    /// click on one is a pick of that login on that card.
+    #[cfg(feature = "agent")]
+    #[test]
+    fn a_driver_picks_a_saved_login_on_either_page_of_a_two_step_sign_in() {
+        use crate::agent::{Command, NativeChatHost};
+        use gpui_agent::prelude::{AgentHost, Op};
+        let mut state = AppState::new();
+        state.auth_status = super::AuthStatus::SignedIn;
+        state.account = serde_json::from_value(json!({
+            "id": "acct_1",
+            "email": "ada@example.com"
+        }))
+        .ok();
+        state.coworkers.push(bob());
+        state.site_logins = vec![
+            saved_login("sl_ada", "google.com", "ada@example.com", "password"),
+            saved_login("sl_bea", "google.com", "bea@example.com", "password"),
+        ];
+        state.site_logins_ready = true;
+        let mut sign_in = message("m1", false, "");
+        sign_in.parts = vec![
+            ChatPart::UserForm(google_card(
+                "e_email",
+                json!([{"id": "email", "label": "Email or phone", "type": "email", "required": true}]),
+            )),
+            ChatPart::UserForm(google_card(
+                "e_password",
+                json!([{"id": "password", "label": "Enter your password", "type": "password", "required": true}]),
+            )),
+        ];
+        state.conversations.push(thread("cw_1", vec![sign_in]));
+        state.active_conversation_id = Some("cw_1".into());
+        state
+            .name_page_picks
+            .insert(("cw_1".into(), "google.com".into()), "sl_bea".into());
+        let mut host = NativeChatHost::from_app(&state);
+        let tree = host.snapshot();
+        let rows = |card: &str| -> Vec<String> {
+            tree.find(&format!("user-form-{card}"))
+                .map(|node| {
+                    node.children
+                        .iter()
+                        .map(|child| child.id.clone())
+                        .filter(|id| id.starts_with("user-form-use-saved-"))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        assert_eq!(
+            rows("e_email"),
+            [
+                "user-form-use-saved-e_email-sl_ada",
+                "user-form-use-saved-e_email-sl_bea"
+            ]
+        );
+        assert_eq!(
+            rows("e_password"),
+            [
+                "user-form-use-saved-e_password-sl_bea",
+                "user-form-use-saved-e_password-sl_ada"
+            ]
+        );
+        host.dispatch(&Op::click("user-form-use-saved-e_password-sl_bea"))
+            .unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::UserFormUseSaved { card_key, login_id })
+                if card_key == "e_password" && login_id == "sl_bea"
+        ));
     }
 
     #[test]

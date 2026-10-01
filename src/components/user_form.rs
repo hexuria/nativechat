@@ -107,7 +107,7 @@ fn render_idle(
     let live = collect_submit_values(spec, inputs, textareas, &picks, cx);
     let saved = SavedLoginContext::for_card(spec, app.as_ref(), cx);
     let saved_busy = saved.current.as_ref().is_some_and(SavedLoginUse::is_busy);
-    let held: Vec<&str> = saved.held_password_field().into_iter().collect();
+    let held: Vec<&str> = saved.held_field().into_iter().collect();
     // A passkey card has no fields: the button lives once Touch ID passed.
     let ready = saved.current.as_ref().is_some_and(|c| c.ready().is_some());
     let can_continue = can_post
@@ -776,7 +776,7 @@ fn fill_failed_actions(
 }
 
 /// What the card knows about the person's vault for its site: what the card takes (a login,
-/// a code, a passkey), the rows to list, and where a pick is.
+/// a page of a two-step sign-in, a code, a passkey), the rows to list, and where a pick is.
 #[derive(Default)]
 struct SavedLoginContext {
     rows: Vec<crate::site_login::SiteLoginRecord>,
@@ -813,48 +813,47 @@ impl SavedLoginContext {
         }
     }
 
-    fn login_fields(&self) -> Option<&crate::site_login::LoginFields> {
-        match &self.target {
-            Some(crate::site_login::CardTarget::Login(fields)) => Some(fields),
-            _ => None,
-        }
+    /// The field the list sits under: the name field of a login or of a name page, the code
+    /// field of a code card, the password field of a password page.
+    fn list_field(&self) -> Option<&str> {
+        self.target.as_ref()?.list_field()
     }
 
-    /// The field the list sits under: the name field of a login, the code field of a code
-    /// card.
-    fn list_field(&self) -> Option<&str> {
-        match &self.target {
-            Some(crate::site_login::CardTarget::Login(f)) => Some(f.username_id.as_str()),
-            Some(crate::site_login::CardTarget::Code { code_id }) => Some(code_id.as_str()),
-            _ => None,
-        }
+    /// The field a pick's name goes in: a login's, or a name page's only field.
+    fn name_field(&self) -> Option<&str> {
+        self.target.as_ref()?.name_field()
     }
 
     fn is_name_field(&self, field_id: &str) -> bool {
-        self.login_fields()
-            .is_some_and(|f| f.username_id == field_id)
+        self.name_field() == Some(field_id)
     }
 
-    /// The secret field: the password of a login, the code field of a code card.
+    /// The secret field: the password of a login or of a password page, the code field of a
+    /// code card.
     fn is_secret_field(&self, field_id: &str) -> bool {
-        match &self.target {
-            Some(crate::site_login::CardTarget::Login(f)) => f.password_id == field_id,
-            Some(crate::site_login::CardTarget::Code { code_id }) => code_id == field_id,
-            _ => false,
-        }
+        self.target
+            .as_ref()
+            .and_then(crate::site_login::CardTarget::secret_field)
+            == Some(field_id)
     }
 
-    /// The secret field's id while a pick is held for the submit.
-    fn held_password_field(&self) -> Option<&str> {
+    /// The field a held pick fills, while one is held for the submit: the secret field, or on
+    /// the name page of a two-step sign-in, which holds no secret, the name.
+    fn held_field(&self) -> Option<&str> {
         let ready = self.current.as_ref()?.ready().is_some();
         if !ready {
             return None;
         }
-        match &self.target {
-            Some(crate::site_login::CardTarget::Login(f)) => Some(f.password_id.as_str()),
-            Some(crate::site_login::CardTarget::Code { code_id }) => Some(code_id.as_str()),
-            _ => None,
-        }
+        let target = self.target.as_ref()?;
+        target.secret_field().or_else(|| target.name_field())
+    }
+
+    /// The name page of a two-step sign-in: the name alone, with the password on the next card.
+    fn is_name_page(&self) -> bool {
+        matches!(
+            self.target,
+            Some(crate::site_login::CardTarget::Username { .. })
+        )
     }
 
     fn is_passkey_card(&self) -> bool {
@@ -886,6 +885,7 @@ impl SavedLoginContext {
                 self.current,
                 Some(SavedLoginUse::Confirming { .. })
                     | Some(SavedLoginUse::Ready { .. })
+                    | Some(SavedLoginUse::NameReady { .. })
                     | Some(SavedLoginUse::Filling { .. })
             )
     }
@@ -909,12 +909,12 @@ fn render_field(
         field.label.clone()
     };
     let key = field_key(spec.card_key(), &field.id);
-    if saved.held_password_field().is_some() {
+    if saved.held_field().is_some() {
         if saved.is_secret_field(&field.id) {
             return render_locked_password(spec.card_key(), &label, saved, app, cx);
         }
         if saved.is_name_field(&field.id) {
-            return render_locked_name(spec.card_key(), &field.id, &label, saved, cx);
+            return render_locked_name(spec.card_key(), &field.id, &label, saved, app, cx);
         }
     }
     let control = match field.kind {
@@ -1186,13 +1186,15 @@ fn render_passkey_block(
     .into_any_element()
 }
 
-/// The name field once a saved password is held: the picked name, read-only, so the name
-/// that is sent is the one the password belongs to. Change (on the password row) frees both.
+/// The name field once a pick is held: the picked name, read-only, so the name that is sent
+/// is the one the pick belongs to. On a login, Change (on the password row) frees both; the
+/// name page of a two-step sign-in has no password row, so its Change is here.
 fn render_locked_name(
     card_key: &str,
     field_id: &str,
     label: &str,
     saved: &SavedLoginContext,
+    app: Option<Entity<AppState>>,
     cx: &App,
 ) -> AnyElement {
     let theme = cx.theme();
@@ -1202,6 +1204,7 @@ fn render_locked_name(
         .and_then(SavedLoginUse::ready)
         .map(|(u, _)| u.to_string())
         .unwrap_or_default();
+    let key = card_key.to_string();
     v_flex()
         .gap(px(6.))
         .child(
@@ -1230,7 +1233,28 @@ fn render_locked_name(
                         .size(px(14.))
                         .text_color(theme.muted_foreground),
                 )
-                .child(div().flex_1().text_sm().child(username)),
+                .child(div().flex_1().text_sm().child(username))
+                .when(saved.is_name_page(), |row| {
+                    row.child(
+                        div()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child("From your saved logins"),
+                    )
+                    .child(
+                        Button::new(user_form_saved_clear_id(&key))
+                            .label("Change")
+                            .ghost()
+                            .xsmall()
+                            .on_click(move |_, _, cx| {
+                                if let Some(app) = &app {
+                                    app.update(cx, |state, cx| {
+                                        state.clear_saved_login_pick(key.clone(), cx);
+                                    });
+                                }
+                            }),
+                    )
+                }),
         )
         .into_any_element()
 }
@@ -1319,8 +1343,9 @@ fn floating_account_list(
 }
 
 /// The accounts saved for this site, listed under the name field the way a browser's
-/// autofill does: pick one, confirm with Touch ID, and the fields fill. The password never
-/// appears here.
+/// autofill does (under the one field of a code card or a password page): pick one, confirm
+/// with Touch ID, and the fields fill. The password never appears here; each row is the
+/// account's name, so on a password page the person knows whose password they are choosing.
 fn render_account_list(
     spec: &UserFormSpec,
     saved: &SavedLoginContext,
@@ -1330,10 +1355,10 @@ fn render_account_list(
 ) -> AnyElement {
     let theme = cx.theme();
     let card_key = spec.card_key().to_string();
+    // The password page has no name field: a pick there puts nothing in an input.
     let name_input = saved
-        .login_fields()
-        .and_then(|f| inputs.get(&field_key(&card_key, &f.username_id)).cloned());
-    let is_code = saved.is_code_card();
+        .name_field()
+        .and_then(|id| inputs.get(&field_key(&card_key, id)).cloned());
     let mut list = v_flex()
         .id(ElementId::Name(user_form_saved_list_id(&card_key).into()))
         .w_full()
@@ -1405,10 +1430,17 @@ fn render_account_list(
             .py(px(6.))
             .text_xs()
             .text_color(theme.muted_foreground)
-            .child(if is_code {
-                "Choose an account. Touch ID fills in its code."
-            } else {
-                "Choose an account. Touch ID fills it in."
+            .child(match &saved.target {
+                Some(crate::site_login::CardTarget::Code { .. }) => {
+                    "Choose an account. Touch ID fills in its code."
+                }
+                Some(crate::site_login::CardTarget::Username { .. }) => {
+                    "Choose an account. Touch ID fills in its name; the password comes next."
+                }
+                Some(crate::site_login::CardTarget::Password { .. }) => {
+                    "Choose an account. Touch ID fills in its password."
+                }
+                _ => "Choose an account. Touch ID fills it in.",
             }),
     )
     .into_any_element()
