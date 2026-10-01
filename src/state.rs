@@ -1137,7 +1137,7 @@ fn saved_parts(parts: &[ChatPart]) -> Vec<MessagePart> {
             }
             ChatPart::Reasoning(thought) => {
                 close_text_run(&mut words, &mut saved);
-                saved.push(MessagePart::Reasoning(thought.clone()));
+                saved.push(MessagePart::Reasoning(thought.stored()));
             }
         }
     }
@@ -1214,9 +1214,9 @@ fn restored_parts(content: &str, saved: Vec<MessagePart>) -> Vec<ChatPart> {
                 .and_then(|value| crate::opengrok::StepSpec::from_value(call_id, &value))
                 .map(ChatPart::Step),
             // Held to the size a thought is kept at, whichever build wrote it.
-            MessagePart::Reasoning(thought) => {
-                Some(ChatPart::Reasoning(crate::opengrok::capped(&thought)))
-            }
+            MessagePart::Reasoning(thought) => Some(ChatPart::Reasoning(
+                crate::opengrok::ThoughtSpec::from_stored(&thought),
+            )),
         })
         .collect()
 }
@@ -12039,7 +12039,7 @@ impl AppState {
                             recipe.as_ref(),
                             skill.as_deref(),
                             pending_id.as_deref(),
-                            |event| {
+                            |event, arrived_at| {
                                 match tracker.tick(event) {
                                     ActivityTick::Keep => {}
                                     tick => {
@@ -12065,7 +12065,7 @@ impl AppState {
                                 }
                                 // When each frame came is how a call's row knows how long its
                                 // answer took: nothing on the wire says.
-                                assembler.push_event_at(event, Some(Instant::now()));
+                                assembler.push_event_at(event, Some(arrived_at));
                                 let timing = TurnTiming::from_event(event);
                                 let (plain, parts) = assembler.snapshot();
                                 let box_shot = assembler.latest_screenshot().cloned();
@@ -20356,7 +20356,7 @@ mod tests {
                     "step {} {} {} {:?} {:?}",
                     step.call_id, step.tool, step.arguments, step.result, step.ok
                 ),
-                ChatPart::Reasoning(thought) => format!("thought {thought}"),
+                ChatPart::Reasoning(thought) => format!("thought {}", thought.text),
             })
             .collect()
     }
@@ -22332,13 +22332,13 @@ mod tests {
         match raw.as_slice() {
             [ChatPart::Step(step), ChatPart::Reasoning(thought)] => {
                 assert_eq!(step.arguments, "{\"recipe\":\"Gmail login\"}");
-                assert!(thought.len() < "思".repeat(3_500).len());
+                assert!(thought.text.len() < "思".repeat(3_500).len());
                 assert_eq!(
-                    &crate::opengrok::capped(thought),
-                    thought,
+                    &crate::opengrok::capped(&thought.text),
+                    &thought.text,
                     "read back already kept to the cap"
                 );
-                assert!(thought.ends_with('…'));
+                assert!(thought.text.ends_with('…'));
             }
             other => panic!("expected a step and a thought, got {other:?}"),
         }

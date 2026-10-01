@@ -37,7 +37,61 @@ pub enum ChatPart {
     Step(StepSpec),
     /// What the coworker thought on the way (`REASONING_MESSAGE_*`), as a collapsed "Thought"
     /// row. It is never part of the reply's words.
-    Reasoning(String),
+    Reasoning(ThoughtSpec),
+}
+
+/// A visible reasoning segment and its locally observed duration, never a guessed model round.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ThoughtSpec {
+    pub text: String,
+    pub took_ms: Option<u64>,
+}
+
+impl From<String> for ThoughtSpec {
+    fn from(text: String) -> Self {
+        Self {
+            text,
+            took_ms: None,
+        }
+    }
+}
+
+impl From<&str> for ThoughtSpec {
+    fn from(text: &str) -> Self {
+        text.to_string().into()
+    }
+}
+
+impl ThoughtSpec {
+    pub fn took(&self) -> Option<String> {
+        self.took_ms.map(super::timing::format_ms)
+    }
+
+    /// Versioned local storage preserves existing plain-text reasoning rows.
+    pub fn stored(&self) -> String {
+        serde_json::json!({"nativechat_reasoning_v": 1, "text": self.text,
+            "took_ms": self.took_ms})
+        .to_string()
+    }
+
+    pub fn from_stored(stored: &str) -> Self {
+        if let Ok(value) = serde_json::from_str::<Value>(stored)
+            && value["nativechat_reasoning_v"].as_u64() == Some(1)
+            && let Some(text) = value["text"].as_str()
+        {
+            return Self {
+                text: capped(text),
+                took_ms: value["took_ms"].as_u64(),
+            };
+        }
+        capped(stored).into()
+    }
+}
+
+fn observed_ms(start: Option<Instant>, end: Option<Instant>) -> Option<u64> {
+    let ms = end?.checked_duration_since(start?)?.as_millis();
+    // A shared delivery boundary says nothing about the duration inside a buffered batch.
+    (ms > 0).then(|| u64::try_from(ms).unwrap_or(u64::MAX))
 }
 
 /// One tool call as the reply shows it, from what the server sent for it: `TOOL_CALL_START`
@@ -242,15 +296,18 @@ impl FrameArrivals {
     }
 }
 
-/// The frames a call's clock reads, by kind and call: its end and its answer. The same call's
-/// answer can come twice, the gate's word and then the tool's, and the first is the one that
-/// stops the clock.
+/// Boundaries read by the action clocks, keyed by kind and action. The same call's answer can
+/// come twice, the gate's word and then the tool's, and the first stops the tool clock.
 fn clock_frame_key(event: &Value) -> Option<String> {
     let kind = event.get("type").and_then(Value::as_str)?;
-    if !matches!(kind, "TOOL_CALL_END" | "TOOL_CALL_RESULT") {
-        return None;
+    let id = match kind {
+        "TOOL_CALL_START" | "TOOL_CALL_END" | "TOOL_CALL_RESULT" => event.get("toolCallId"),
+        "REASONING_MESSAGE_START" | "REASONING_MESSAGE_END" | "RUN_FINISHED" | "RUN_ERROR" => {
+            event.get("messageId").or_else(|| event.get("runId"))
+        }
+        _ => return None,
     }
-    let id = event.get("toolCallId").and_then(Value::as_str)?;
+    .and_then(Value::as_str)?;
     Some(format!("{kind}/{id}"))
 }
 
@@ -266,14 +323,37 @@ pub fn keep_call_times(before: &[ChatPart], after: &mut [ChatPart]) {
             _ => None,
         })
         .collect();
-    if times.is_empty() {
-        return;
-    }
+    let blocked: HashSet<String> = after
+        .iter()
+        .filter_map(|part| match part {
+            ChatPart::Approval(spec) => Some(spec.call_id.clone()),
+            ChatPart::UserForm(spec) => Some(spec.call_id.clone()),
+            _ => None,
+        })
+        .collect();
+    let thoughts: Vec<&ThoughtSpec> = before
+        .iter()
+        .filter_map(|part| match part {
+            ChatPart::Reasoning(thought) => Some(thought),
+            _ => None,
+        })
+        .collect();
+    let mut thought_n = 0;
     for part in after {
         if let ChatPart::Step(step) = part
             && step.took_ms.is_none()
+            && !blocked.contains(&step.call_id)
         {
             step.took_ms = times.get(step.call_id.as_str()).copied();
+        }
+        if let ChatPart::Reasoning(thought) = part {
+            if let Some(before) = thoughts.get(thought_n)
+                && before.text == thought.text
+                && thought.took_ms.is_none()
+            {
+                thought.took_ms = before.took_ms;
+            }
+            thought_n += 1;
         }
     }
 }
@@ -809,6 +889,7 @@ struct OpenThought {
     id: String,
     said: String,
     seen: usize,
+    since: Option<Instant>,
 }
 
 #[derive(Debug)]
@@ -892,11 +973,15 @@ impl TurnAssembler {
     /// call's row can say how long its answer took ([`StepSpec::took_ms`]). A replay comes in
     /// through [`Self::push_event`] and times nothing.
     pub fn push_event_at(&mut self, event: &Value, at: Option<Instant>) {
-        self.push_event(event);
+        self.push_frame(event, at);
         self.time_call(event, at);
     }
 
     pub fn push_event(&mut self, event: &Value) {
+        self.push_frame(event, None);
+    }
+
+    fn push_frame(&mut self, event: &Value, arrived_at: Option<Instant>) {
         let kind = event.get("type").and_then(Value::as_str).unwrap_or("");
         match kind {
             "TEXT_MESSAGE_START" => {
@@ -930,7 +1015,7 @@ impl TurnAssembler {
                 // The model reached for a tool: what it thought up to here came before the
                 // call, and what it goes on to think comes after.
                 if !name.is_empty() {
-                    self.settle_thoughts();
+                    self.settle_thoughts(arrived_at);
                 }
                 if kind == "TOOL_CALL_CHUNK" {
                     if let Some(delta) = event.get("delta").and_then(Value::as_str)
@@ -1061,6 +1146,7 @@ impl TurnAssembler {
                 if !self.reasoning.iter().any(|thought| thought.id == id) {
                     self.reasoning.push(OpenThought {
                         id,
+                        since: arrived_at,
                         ..OpenThought::default()
                     });
                 }
@@ -1087,12 +1173,12 @@ impl TurnAssembler {
                 let id = message_id(event);
                 if let Some(at) = self.reasoning.iter().position(|thought| thought.id == id) {
                     let thought = self.reasoning.remove(at);
-                    self.push_reasoning(&thought.said);
+                    self.push_reasoning(&thought.said, observed_ms(thought.since, arrived_at));
                 }
             }
             "RUN_FINISHED" | "RUN_ERROR" => {
                 self.waiting_approval = false;
-                self.close_reasoning();
+                self.close_reasoning(arrived_at);
             }
             _ => {}
         }
@@ -1136,12 +1222,11 @@ impl TurnAssembler {
                 // Strictly later: an answer that came in the same delivery as its call's end, as
                 // two frames of one poll of a followed run do, says only that it took less than
                 // a poll, and "0ms" would be a guess.
-                let took = match (clock.since, at) {
-                    (Some(since), Some(at)) if !clock.shared && at > since => at - since,
-                    _ => return,
-                };
+                if clock.shared {
+                    return;
+                }
                 if let Some(step) = step_mut(&mut self.committed, id) {
-                    step.took_ms = Some(u64::try_from(took.as_millis()).unwrap_or(u64::MAX));
+                    step.took_ms = observed_ms(clock.since, at);
                 }
             }
             "CUSTOM"
@@ -1205,39 +1290,49 @@ impl TurnAssembler {
     /// A thought that has ended joins the thought just before it, if that is where it ends up:
     /// two blocks back to back are one thing the coworker thought, and one row. Kept to the cap
     /// either way.
-    fn push_reasoning(&mut self, said: &str) {
+    fn push_reasoning(&mut self, said: &str, took_ms: Option<u64>) {
         let said = said.trim();
         if said.is_empty() {
             return;
         }
         if let Some(ChatPart::Reasoning(before)) = self.committed.last_mut() {
-            *before = capped(&format!("{before}\n\n{said}"));
+            before.text = capped(&format!("{}\n\n{said}", before.text));
+            before.took_ms = before
+                .took_ms
+                .zip(took_ms)
+                .map(|(a, b)| a.saturating_add(b));
             return;
         }
-        self.committed.push(ChatPart::Reasoning(capped(said)));
+        self.committed.push(ChatPart::Reasoning(ThoughtSpec {
+            text: capped(said),
+            took_ms,
+        }));
     }
 
     /// Whatever the coworker is in the middle of thinking goes into the reply as far as it has
     /// got, where it has got to. A thought still being said stays open, and what it goes on to
     /// say is kept as a thought of its own.
-    fn settle_thoughts(&mut self) {
-        let settled: Vec<String> = self
+    fn settle_thoughts(&mut self, at: Option<Instant>) {
+        let settled: Vec<(String, Option<u64>)> = self
             .reasoning
             .iter_mut()
             .map(|thought| {
                 thought.seen = 0;
-                std::mem::take(&mut thought.said)
+                (
+                    std::mem::take(&mut thought.said),
+                    observed_ms(thought.since.take(), at),
+                )
             })
             .collect();
-        for said in settled {
-            self.push_reasoning(&said);
+        for (said, took_ms) in settled {
+            self.push_reasoning(&said, took_ms);
         }
     }
 
     /// The run is over: a thought it was still in the middle of is kept as far as it got.
-    fn close_reasoning(&mut self) {
+    fn close_reasoning(&mut self, at: Option<Instant>) {
         for thought in std::mem::take(&mut self.reasoning) {
-            self.push_reasoning(&thought.said);
+            self.push_reasoning(&thought.said, observed_ms(thought.since, at));
         }
     }
 
@@ -1335,7 +1430,7 @@ impl TurnAssembler {
     /// Pins the last computer PNG when `image.visibility` is not `agent` (turn-end
     /// `end` / untagged heuristic). Tagged `agent` stays Computer-pane only.
     pub fn finish(&mut self) {
-        self.close_reasoning();
+        self.close_reasoning(None);
         // A call whose end never came keeps what of its arguments did.
         let unsettled: Vec<String> = self.step_args.keys().cloned().collect();
         for call_id in unsettled {
@@ -4425,6 +4520,92 @@ mod tests {
             .collect()
     }
 
+    #[test]
+    fn reasoning_duration_follows_its_own_segment_and_survives_storage_and_replay() {
+        let t0 = Instant::now();
+        let mut turn = TurnAssembler::default();
+        for (ms, event) in [
+            (
+                0,
+                json!({"type":"REASONING_MESSAGE_START","messageId":"r1"}),
+            ),
+            (
+                200,
+                json!({"type":"REASONING_MESSAGE_CONTENT","messageId":"r1","delta":"Check the file."}),
+            ),
+            (
+                5000,
+                json!({"type":"REASONING_MESSAGE_END","messageId":"r1"}),
+            ),
+        ] {
+            turn.push_event_at(&event, Some(t0 + std::time::Duration::from_millis(ms)));
+        }
+        let (_, before) = turn.snapshot();
+        let [ChatPart::Reasoning(thought)] = before.as_slice() else {
+            panic!("one thought");
+        };
+        assert_eq!(thought.took(), Some("5s".into()));
+        assert_eq!(ThoughtSpec::from_stored(&thought.stored()), *thought);
+        assert_eq!(
+            ThoughtSpec::from_stored("older plain text"),
+            "older plain text".into()
+        );
+        let mut replay = vec![ChatPart::Reasoning(thought.text.clone().into())];
+        keep_call_times(&before, &mut replay);
+        assert_eq!(replay, before);
+        let mut changed = vec![ChatPart::Reasoning("A different thought".into())];
+        keep_call_times(&before, &mut changed);
+        assert!(matches!(&changed[0], ChatPart::Reasoning(thought) if thought.took_ms.is_none()));
+    }
+
+    #[test]
+    fn reasoning_with_missing_or_buffered_boundaries_has_no_guessed_time() {
+        let t0 = Instant::now();
+        for opening in [None, Some(t0)] {
+            let mut turn = TurnAssembler::default();
+            turn.push_event_at(
+                &json!({"type":"REASONING_MESSAGE_START","messageId":"r1"}),
+                opening,
+            );
+            turn.push_event_at(
+                &json!({"type":"REASONING_MESSAGE_CONTENT","messageId":"r1","delta":"Check."}),
+                Some(t0),
+            );
+            turn.push_event_at(
+                &json!({"type":"REASONING_MESSAGE_END","messageId":"r1"}),
+                Some(t0),
+            );
+            let (_, parts) = turn.snapshot();
+            assert!(matches!(&parts[0], ChatPart::Reasoning(thought) if thought.took_ms.is_none()));
+        }
+    }
+
+    #[test]
+    fn a_tool_boundary_settles_thinking_before_the_tool_instead_of_timing_the_model_round() {
+        let t0 = Instant::now();
+        let mut turn = TurnAssembler::default();
+        turn.push_event_at(
+            &json!({"type":"REASONING_MESSAGE_START","messageId":"r1"}),
+            Some(t0),
+        );
+        turn.push_event_at(
+            &json!({"type":"REASONING_MESSAGE_CONTENT","messageId":"r1","delta":"Read it."}),
+            Some(t0),
+        );
+        turn.push_event_at(
+            &json!({"type":"TOOL_CALL_START","toolCallId":"c1","toolCallName":"shell"}),
+            Some(t0 + std::time::Duration::from_secs(2)),
+        );
+        turn.push_event_at(
+            &json!({"type":"RUN_FINISHED"}),
+            Some(t0 + std::time::Duration::from_secs(30)),
+        );
+        let (_, parts) = turn.snapshot();
+        assert!(
+            matches!(&parts[0], ChatPart::Reasoning(thought) if thought.took() == Some("2s".into()))
+        );
+    }
+
     /// A live turn that ran two calls, one per round, as the harness runs them: each call's row
     /// says how long its own answer took, from its arguments being all in to its result. The
     /// model's time writing the arguments, and the time between the rounds, are not the call's.
@@ -4618,6 +4799,34 @@ mod tests {
                 step("c3", Some(700))
             ]
         );
+    }
+
+    #[test]
+    fn a_rebuilt_reply_does_not_restore_a_person_wait_as_tool_time() {
+        let mut before = TurnAssembler::default();
+        let t0 = Instant::now();
+        for event in call("c1", "shell", "{\"command\":\"make\"}") {
+            before.push_event_at(&event, Some(t0));
+        }
+        before.push_event_at(
+            &answer("c1", "waiting for approval"),
+            Some(t0 + std::time::Duration::from_secs(1)),
+        );
+        let (_, before_parts) = before.snapshot();
+        assert!(matches!(&before_parts[0], ChatPart::Step(step) if step.took_ms == Some(1000)));
+        let mut replay = TurnAssembler::default();
+        for event in call("c1", "shell", "{\"command\":\"make\"}") {
+            replay.push_event(&event);
+        }
+        replay.push_event(&answer("c1", "waiting for approval"));
+        replay.push_event(
+            &json!({"type":"CUSTOM","name":"run-awaiting-approval","runId":"r1","callId":"c1",
+                    "tool":"shell","arguments":{"command":"make"},"reason":"exec-consent"}),
+        );
+        replay.push_event(&answer("c1", "built"));
+        let (_, mut replay_parts) = replay.snapshot();
+        keep_call_times(&before_parts, &mut replay_parts);
+        assert_eq!(steps_in(&replay_parts)[0].took_ms, None);
     }
 
     /// A step's time is kept with its database row and read back; a row written before there
@@ -4975,9 +5184,9 @@ mod tests {
         let [ChatPart::Reasoning(kept)] = parts.as_slice() else {
             panic!("expected one thought, got {} parts", parts.len());
         };
-        assert!(kept.len() <= STEP_TEXT_CAP, "{}", kept.len());
-        assert!(kept.ends_with('…'));
-        assert!(kept.trim_end_matches('…').chars().all(|c| c == '思'));
+        assert!(kept.text.len() <= STEP_TEXT_CAP, "{}", kept.text.len());
+        assert!(kept.text.ends_with('…'));
+        assert!(kept.text.trim_end_matches('…').chars().all(|c| c == '思'));
     }
 
     /// A thought the model was in the middle of when it reached for a tool comes before that
@@ -5004,7 +5213,7 @@ mod tests {
                     ChatPart::Step(step),
                     ChatPart::Reasoning(after),
                     ChatPart::Text(_),
-                ] if before == "Size it first." && step.call_id == "c1" && after == "Then say so."
+                ] if before.text == "Size it first." && step.call_id == "c1" && after.text == "Then say so."
             ),
             "{parts:?}"
         );
