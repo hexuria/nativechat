@@ -642,7 +642,25 @@ const MACHINE_TOKEN_ROUTES: &[&str] = &[
 /// written in the agreed shape. The day a recorded body of the route carries the key, the entry
 /// has gone stale and comes off this list, and
 /// [`every_key_asked_ahead_of_its_recording_is_read_and_not_recorded_yet`] fails until it does.
-const REST_FIELDS_NOT_RECORDED_YET: &[(&str, &str, &str)] = &[];
+const REST_FIELDS_NOT_RECORDED_YET: &[(&str, &str, &str)] = &[
+    (
+        "GET__account_inference-source",
+        "newBotDefault",
+        "opengrok-server PR #322 new-bot-default, not yet on main: `described` in \
+         crates/opengrok-harness/src/local_proxy.rs sends the account's default for new Bots on \
+         every read, null until set, and Settings → Relay's Default for new Bots is live only \
+         where the read carries the key. Its recording comes with the corpus re-vendored from a \
+         main that has #322.",
+    ),
+    (
+        "PUT__account_inference-source",
+        "newBotDefault",
+        "opengrok-server PR #322 new-bot-default, not yet on main: `apply` in \
+         crates/opengrok-harness/src/local_proxy.rs takes newBotDefault whole, null clears it, \
+         and the answer carries it as a read does. Default for new Bots' picker sends it at \
+         once. Its recording comes with the corpus re-vendored from a main that has #322.",
+    ),
+];
 
 // ---- the corpus ----
 
@@ -3727,6 +3745,24 @@ fn inference_source(_: u16, body: &Value) -> Check {
         (read, sent) => {
             return Err(format!(
                 "the relay should be read exactly when it is sent: {read:?} from {sent:?}"
+            ));
+        }
+    }
+    // The default for new Bots, from a server that keeps one (opengrok-server PR #322
+    // new-bot-default, not yet on main: `described` in the same file): read exactly when the key
+    // is sent, null as none set, and an object field for field, an effort left out as `inherit`.
+    match (&read.new_bot_default, body.get("newBotDefault")) {
+        (None, None) | (Some(None), Some(Value::Null)) => {}
+        (Some(Some(default)), Some(raw)) => must!(
+            default.source.word() == str_at(raw, "source")
+                && default.model == str_at(raw, "model")
+                && default.effort == opt_str(raw, "effort").unwrap_or(EFFORT_INHERIT),
+            "the default for new Bots should come through as sent: {default:?} from {raw}"
+        ),
+        (read, sent) => {
+            return Err(format!(
+                "the default for new Bots should be read exactly as it is sent: {read:?} from \
+                 {sent:?}"
             ));
         }
     }

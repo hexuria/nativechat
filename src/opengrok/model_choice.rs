@@ -25,7 +25,7 @@
 
 use super::{
     Coworker, CoworkerPatch, CoworkerSource, EFFORT_INHERIT, InferenceKind, InferenceSource,
-    ModelCatalogue, Via, is_subscription_model,
+    ModelCatalogue, NewBotDefault, Via, is_subscription_model,
 };
 
 /// What opencodex puts after a model's id for its fast tier.
@@ -62,6 +62,14 @@ pub const EFFORT_NOT_KEPT: &str = "This server has nowhere to keep an effort yet
 /// What the card names while there is no model to name: a Bot with no pin, or on a plan that
 /// keeps no model.
 pub const NO_MODEL: &str = "No model";
+/// What Default for new Bots' card names while the person has set none, and the list's row that
+/// sets none: a new Bot is then left to the server's own default, the deployment's model on the
+/// account's door (opengrok-server PR #322, branch `new-bot-default`, not yet on main:
+/// `hire_model` in `crates/opengrok-server/src/inference.rs`).
+pub const NEW_BOTS_NONE: &str = "None";
+/// Why ⚡ and the slider are dead in Default for new Bots while it holds none: the server keeps a
+/// default whole, its model with its door and effort, and there is no model yet to go with them.
+pub const NEW_BOTS_PICK_FIRST: &str = "Pick a model first: a default for new Bots starts with one.";
 /// What the list says under its rows for a Bot whose own door is the person's plan
 /// ([`ModelPick::routines`]).
 pub const ROUTINES_ON_PLAN: &str = "This Bot's routines won't run while it answers on your own \
@@ -432,9 +440,11 @@ pub struct AccountPlan {
 }
 
 /// The open Bot's model, effort and fast tier as its picker shows them, what the list offers,
-/// and what each change sends ([`bot_pick`]).
+/// and what each change sends ([`bot_pick`]); or the same of Default for new Bots
+/// ([`new_bots_pick`]), which the same card and popover show.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelPick {
+    /// The Bot's id, or [`NEW_BOTS_PICK_ID`] for Default for new Bots.
     pub bot_id: String,
     /// The server keeps a door per Bot: the Bot's row carries `source`. Only then does the list
     /// offer the plan's models and a pick send a door.
@@ -456,8 +466,9 @@ pub struct ModelPick {
     pub fast_blocked: Option<&'static str>,
     /// The Bot's effort, in the server's word: `inherit` where it keeps none.
     pub effort: String,
-    /// The server keeps an effort: the Bot's row carries one (opengrok-server#271).
-    pub effort_kept: bool,
+    /// Why the slider takes no stop, when it takes none: a server that keeps no effort
+    /// (opengrok-server#271), and Default for new Bots while it holds no model.
+    pub effort_dead: Option<&'static str>,
     /// The list, the Subscription group first, each group only while it has rows.
     pub groups: Vec<ChoiceGroup>,
     /// The line that takes the Subscription group's place on a server without per-Bot doors,
@@ -474,7 +485,13 @@ pub struct ModelPick {
     /// is on the gateway, runs its routines through the gateway on its pin as before
     /// (opengrok-server #294, `autonomy/mod.rs`), and is told nothing.
     pub routines: Option<String>,
+    /// What the card names while there is no model to name: [`NO_MODEL`] for a Bot, and
+    /// [`NEW_BOTS_NONE`] for Default for new Bots, where none is the server's own default.
+    pub unset: &'static str,
 }
+
+/// [`ModelPick::bot_id`] for Default for new Bots, which is no Bot's.
+pub const NEW_BOTS_PICK_ID: &str = "new-bots";
 
 /// The way to the account's plan a turn that names none goes: the account's own where the server
 /// knows the relay, which is `None` for one this app cannot name, and the server's own machine
@@ -533,33 +550,8 @@ pub fn bot_pick(
         Some(InferenceKind::LocalProxy) => account_model.clone(),
         _ => pin.clone(),
     };
-    // A Bot is offered its own plan model only where the server keeps a door per Bot: anywhere
-    // else the server would run the account's plan model and ignore the pick.
-    let plan = match (per_bot, account.and_then(account_via)) {
-        (true, Some(via)) => plan_choices(&plan_models(via)),
-        _ => Vec::new(),
-    };
-    let groups: Vec<ChoiceGroup> = [
-        ChoiceGroup {
-            source: InferenceKind::LocalProxy,
-            rows: plan,
-        },
-        ChoiceGroup {
-            source: InferenceKind::Gateway,
-            rows: server_choices(catalogue),
-        },
-    ]
-    .into_iter()
-    .filter(|group| !group.rows.is_empty())
-    .collect();
-    let current = door.zip(model.as_deref()).and_then(|(door, model)| {
-        groups
-            .iter()
-            .filter(|group| group.source == door)
-            .flat_map(|group| &group.rows)
-            .find(|row| row.takes(model))
-            .cloned()
-    });
+    let groups = choice_groups(per_bot, account, catalogue, plan_models);
+    let current = current_row(&groups, door, model.as_deref());
     let fast_blocked = match (door, &current) {
         (None, _) => Some(FAST_DOOR_UNKNOWN),
         (Some(InferenceKind::LocalProxy), _) if !per_bot => Some(FAST_ACCOUNT_PLAN),
@@ -584,10 +576,101 @@ pub fn bot_pick(
         current,
         fast_blocked,
         effort: bot.effort().to_string(),
-        effort_kept: bot.effort.is_some(),
+        effort_dead: bot.effort.is_none().then_some(EFFORT_NOT_KEPT),
         groups,
         account_plan,
         routines,
+        unset: NO_MODEL,
+    }
+}
+
+/// The list a picker offers: the Subscription group first, the plan's models for the account's
+/// way to it, and the Gateway group, the gateway's routes; each only while it has rows. The plan's
+/// models are offered only where the server keeps a door per Bot (`per_bot`): anywhere else the
+/// server would run the account's plan model and ignore the pick.
+fn choice_groups(
+    per_bot: bool,
+    account: Option<&InferenceSource>,
+    catalogue: &ModelCatalogue,
+    plan_models: impl Fn(Via) -> Vec<String>,
+) -> Vec<ChoiceGroup> {
+    let plan = match (per_bot, account.and_then(account_via)) {
+        (true, Some(via)) => plan_choices(&plan_models(via)),
+        _ => Vec::new(),
+    };
+    [
+        ChoiceGroup {
+            source: InferenceKind::LocalProxy,
+            rows: plan,
+        },
+        ChoiceGroup {
+            source: InferenceKind::Gateway,
+            rows: server_choices(catalogue),
+        },
+    ]
+    .into_iter()
+    .filter(|group| !group.rows.is_empty())
+    .collect()
+}
+
+/// The row that is `model` through `door`: the one the list ticks.
+fn current_row(
+    groups: &[ChoiceGroup],
+    door: Option<InferenceKind>,
+    model: Option<&str>,
+) -> Option<ModelChoice> {
+    let (door, model) = door.zip(model)?;
+    groups
+        .iter()
+        .filter(|group| group.source == door)
+        .flat_map(|group| &group.rows)
+        .find(|row| row.takes(model))
+        .cloned()
+}
+
+/// Default for new Bots as the same card and popover show it (opengrok-server PR #322, branch
+/// `new-bot-default`, not yet on main: `NewBotDefault` in `crates/opengrok-core/src/inference.rs`):
+/// the default the server keeps, `None` while the person has set none, read as a Bot on its own
+/// door would be, from the same list a Bot's picker offers. A default always names its door, so
+/// the plan's models are offered as they are to a Bot on a server that keeps a door per Bot, which
+/// every server that keeps a default does. It is no Bot, so there are no routines to speak of.
+/// With none set there is no model to tick, nor one to move to its fast twin or give an effort:
+/// the server keeps a default whole, and a pick in the list is what starts one.
+pub fn new_bots_pick(
+    default: Option<&NewBotDefault>,
+    account: Option<&InferenceSource>,
+    catalogue: &ModelCatalogue,
+    plan_models: impl Fn(Via) -> Vec<String>,
+) -> ModelPick {
+    let groups = choice_groups(true, account, catalogue, plan_models);
+    let door = default.map(|default| default.source);
+    let model = default
+        .map(|default| default.model.clone())
+        .filter(|model| !model.trim().is_empty());
+    let current = current_row(&groups, door, model.as_deref());
+    let fast_blocked = match (default, &current) {
+        (None, _) => Some(NEW_BOTS_PICK_FIRST),
+        (Some(_), Some(row)) if row.has_fast => None,
+        (Some(_), _) => Some(FAST_NO_TWIN),
+    };
+    ModelPick {
+        bot_id: NEW_BOTS_PICK_ID.to_string(),
+        per_bot: true,
+        bot_door: door,
+        door,
+        model,
+        pin: default.map_or_else(String::new, |default| default.model.clone()),
+        current,
+        fast_blocked,
+        effort: default.map_or_else(
+            || EFFORT_INHERIT.to_string(),
+            |default| default.effort.clone(),
+        ),
+        effort_dead: default.is_none().then_some(NEW_BOTS_PICK_FIRST),
+        groups,
+        account_plan: None,
+        routines: None,
+        unset: NEW_BOTS_NONE,
     }
 }
 
@@ -601,7 +684,7 @@ impl ModelPick {
     pub fn model_label(&self) -> String {
         self.model
             .as_deref()
-            .map_or_else(|| NO_MODEL.to_string(), base_label)
+            .map_or_else(|| self.unset.to_string(), base_label)
     }
 
     /// The picker in a line, as a driver's tree names the card: "GPT-6 Luna · Medium ⚡".
@@ -718,8 +801,8 @@ impl ModelPick {
     /// What a stop of the slider sends: its word, where it is not the Bot's already. Refused from
     /// a server that keeps no effort, and for a word that is not one of the five stops.
     pub fn effort_patch(&self, word: &str) -> Result<Option<CoworkerPatch>, String> {
-        if !self.effort_kept {
-            return Err(EFFORT_NOT_KEPT.to_string());
+        if let Some(why) = self.effort_dead {
+            return Err(why.to_string());
         }
         if effort_stop(word).is_none() {
             let stops: Vec<&str> = EFFORT_STOPS.iter().map(|(_, word)| *word).collect();
@@ -738,8 +821,8 @@ impl ModelPick {
     /// is on and can be switched. The model itself is left where it is. Nothing when there is
     /// nothing to put back.
     pub fn reset_patch(&self) -> Option<CoworkerPatch> {
-        let effort =
-            (self.effort_kept && self.effort != EFFORT_INHERIT).then(|| EFFORT_INHERIT.to_string());
+        let effort = (self.effort_dead.is_none() && self.effort != EFFORT_INHERIT)
+            .then(|| EFFORT_INHERIT.to_string());
         let fast_off = if self.is_fast() {
             self.fast_patch(false).ok().flatten()
         } else {
@@ -750,6 +833,25 @@ impl ModelPick {
             ..fast_off.unwrap_or_default()
         };
         (!patch.is_empty()).then_some(patch)
+    }
+
+    /// What a change the picker makes, as a Bot's patch would carry it, makes of Default for new
+    /// Bots: the whole default, the patch's door, model and effort over the ones kept, since the
+    /// server keeps the default whole and takes it whole (`apply` in opengrok-server PR #322's
+    /// `crates/opengrok-harness/src/local_proxy.rs`). `None` while that names no door or no model,
+    /// which a default cannot be without.
+    pub fn new_bots_default(&self, patch: &CoworkerPatch) -> Option<NewBotDefault> {
+        let source = patch.source.or(self.bot_door)?;
+        let model = patch.model.clone().unwrap_or_else(|| self.pin.clone());
+        if model.trim().is_empty() {
+            return None;
+        }
+        let effort = patch.effort.clone().unwrap_or_else(|| self.effort.clone());
+        Some(NewBotDefault {
+            source,
+            model,
+            effort,
+        })
     }
 }
 
@@ -799,6 +901,7 @@ mod tests {
             has_api_key: false,
             via: None,
             relay: None,
+            new_bot_default: None,
         }
     }
 
@@ -1558,6 +1661,91 @@ mod tests {
         assert_eq!(pick.summary(), "No model · High");
     }
 
+    /// Default for new Bots is the Bot's picker over the same list, read as a Bot on its own door
+    /// would be (opengrok-server PR #322 new-bot-default, not yet on main): set, the card names
+    /// its model, door, effort and ⚡, the list ticks its row, and every change makes the whole
+    /// default anew, the kept door, model and effort under the change, since the server keeps it
+    /// whole. With none set the card says None, nothing is ticked, ⚡ and the slider are dead and
+    /// say why, and a pick of a row starts a whole default, on its door and the Default effort.
+    #[test]
+    fn the_default_for_new_bots_is_picked_whole_in_the_bots_picker() {
+        let kept = NewBotDefault {
+            source: InferenceKind::LocalProxy,
+            model: "gpt-6-luna--fast".into(),
+            effort: "high".into(),
+        };
+        let default = |source, model: &str, effort: &str| {
+            Some(NewBotDefault {
+                source,
+                model: model.into(),
+                effort: effort.into(),
+            })
+        };
+        let on_keys = account(InferenceKind::Gateway, None);
+        let pick = new_bots_pick(Some(&kept), Some(&on_keys), &catalogue(SERVER), plan(PLAN));
+        assert_eq!(pick.summary(), "GPT-6 Luna · High ⚡");
+        assert_eq!(pick.door, Some(InferenceKind::LocalProxy));
+        assert_eq!(
+            pick.groups
+                .iter()
+                .map(ChoiceGroup::title)
+                .collect::<Vec<_>>(),
+            [SUBSCRIPTION_GROUP, GATEWAY_GROUP]
+        );
+        assert_eq!(
+            pick.current.as_ref().map(|row| row.base_id.as_str()),
+            Some("gpt-6-luna")
+        );
+        assert_eq!((pick.routines.as_deref(), pick.effort_dead), (None, None));
+        let whole = |patch: Option<CoworkerPatch>| pick.new_bots_default(&patch.expect("a change"));
+        assert_eq!(
+            whole(pick.fast_patch(false).unwrap()),
+            default(InferenceKind::LocalProxy, "gpt-6-luna", "high"),
+            "⚡ off: the plain twin, on the kept door and effort"
+        );
+        assert_eq!(
+            whole(
+                pick.pick_patch(InferenceKind::Gateway, "xai/grok-4.7")
+                    .unwrap()
+            ),
+            default(InferenceKind::Gateway, "xai/grok-4.7", "high"),
+            "another door's model, with the kept effort"
+        );
+        assert_eq!(
+            whole(pick.effort_patch("low").unwrap()),
+            default(InferenceKind::LocalProxy, "gpt-6-luna--fast", "low")
+        );
+        assert_eq!(
+            whole(pick.reset_patch()),
+            default(InferenceKind::LocalProxy, "gpt-6-luna", "inherit")
+        );
+
+        let none = new_bots_pick(None, Some(&on_keys), &catalogue(SERVER), plan(PLAN));
+        assert_eq!(none.summary(), "None · Default");
+        assert_eq!(none.model_label(), NEW_BOTS_NONE);
+        assert!(none.current.is_none() && none.door.is_none());
+        assert_eq!(none.fast_blocked, Some(NEW_BOTS_PICK_FIRST));
+        assert_eq!(none.effort_dead, Some(NEW_BOTS_PICK_FIRST));
+        assert!(none.effort_patch("high").is_err());
+        assert!(!none.can_reset());
+        let first = none
+            .pick_patch(InferenceKind::LocalProxy, "gpt-5.6-sol")
+            .unwrap()
+            .expect("a change");
+        assert_eq!(
+            none.new_bots_default(&first),
+            default(InferenceKind::LocalProxy, "gpt-5.6-sol", "inherit")
+        );
+        assert_eq!(
+            none.new_bots_default(&CoworkerPatch {
+                effort: Some("high".into()),
+                ..Default::default()
+            }),
+            None,
+            "an effort alone makes no default"
+        );
+    }
+
     /// From a server that keeps no effort (before opengrok-server#271) the Bot reads Default and
     /// the slider takes no stop; ↺ has only ⚡ to put back.
     #[test]
@@ -1569,7 +1757,7 @@ mod tests {
             &catalogue(SERVER),
             plan(PLAN),
         );
-        assert!(!pick.effort_kept);
+        assert_eq!(pick.effort_dead, Some(EFFORT_NOT_KEPT));
         assert_eq!(pick.summary(), "GPT-6 Luna · Default ⚡");
         assert_eq!(pick.effort_patch("high"), Err(EFFORT_NOT_KEPT.to_string()));
         assert_eq!(

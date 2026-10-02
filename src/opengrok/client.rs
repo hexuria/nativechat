@@ -6964,6 +6964,7 @@ mod tests {
             .set_inference_source(&InferenceSourceUpdate {
                 kind: InferenceKind::Gateway,
                 via: Some(Via::Mac),
+                new_bot_default: None,
             })
             .await
             .unwrap();
@@ -6993,6 +6994,7 @@ mod tests {
             .set_inference_source(&InferenceSourceUpdate {
                 kind: InferenceKind::LocalProxy,
                 via: Some(Via::Mac),
+                new_bot_default: None,
             })
             .await
             .unwrap_err();
@@ -7027,6 +7029,7 @@ mod tests {
                 .set_inference_source(&InferenceSourceUpdate {
                     kind: InferenceKind::Gateway,
                     via: None,
+                    new_bot_default: None,
                 })
                 .await
                 .map(drop),

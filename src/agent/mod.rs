@@ -341,12 +341,26 @@
 //! it waits for. An id the page does not draw is refused as not on the page.
 //!
 //! Last on the page, whatever the setting, `settings-new-bots`: Default for new Bots, where a
-//! newly hired Bot starts (state `unavailable` while the server keeps no default for new Bots,
-//! which it does not yet: the contract is being agreed with opengrok-server, and nothing of it is
-//! sent or read). It holds `settings-new-bots-unavailable` ("Coming soon: the server can't keep a
-//! default for new Bots yet.") and `settings-new-bots-card`, the picker's card (a button named as
-//! it reads, `No model · Default`, disabled; a click is refused with why). Both are refused off
-//! the page.
+//! newly hired Bot starts (opengrok-server PR #322 new-bot-default, not yet on main: the
+//! account's `newBotDefault` on `/account/inference-source`). It is live only where the server's
+//! read carries that key, `null` or not. Otherwise (state `unavailable`) it holds
+//! `settings-new-bots-unavailable` ("Coming soon: the server can't keep a default for new Bots
+//! yet.") and `settings-new-bots-card`, the picker's card (a button named as it reads, `No model ·
+//! Default`, disabled; a click is refused with why). Live, `settings-new-bots-card` is the Bot's
+//! card and popover, every part of `agent-model-*` above as `settings-new-bots-*`: the card
+//! (named as the default reads in a line, `None · Default` while none is set, valued by its
+//! model; states its door's word, `fast`, `expanded`, and `saving` while a change is with the
+//! server), `settings-new-bots-pop`, `-fast`, `-effort` (`set_value` a stop's word), `-reset`,
+//! `-open-list`, `-search` (`set_value`, `type`, `key` as the Bot's), `-list`,
+//! `-group-{source}`, `-row-{source}-{id}`, `-no-match`, `-note` and `-error` (the server's
+//! words for a refused change, or that nobody knows whether one was kept: in the popover while
+//! open, under the card while shut). Over the list's models, `settings-new-bots-none` (`None`,
+//! valued `the server's default`, state `selected` while none is set; a click takes the kept
+//! default away). While none is set ⚡ and the slider are dead and say why: a default starts with
+//! a model. Every pick is kept on the account at once, whole, as `PUT /account/inference-source`
+//! `{kind, newBotDefault}` with the kind the server keeps (None sends `null`), one at a time:
+//! every control that sends one is dead while one is out. `settings-new-bots-dismiss` shuts the
+//! popover, as `agent-model-dismiss` shuts the Bot's. All of it is refused off the page.
 //!
 //! The relay (hexuria/nativechat #156, opengrok-server #292), from a server that knows it (its
 //! setting carries `relay`), in words for any computer: the wire's `via: "mac"` and the drivers'

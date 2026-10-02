@@ -15,16 +15,16 @@ use crate::opengrok::{
     BoxHandoffResolution, BoxShareScope, ChatPart, ChoiceCard, ComputerHandoffStatus,
     ConnectedComputer, Coworker, CoworkerComputer, CoworkerPatch, CoworkerSource, Enrolment,
     Failure, FormResolution, FormSpec, ImageVisibility, InferenceKind, InferenceSource,
-    LocalExecMode, LocalExecPolicy, LocalExecResolution, LocalExecStopped, ModelCatalogue,
-    ModelEntry, ModelPick, NewSchedule, NewSkill, OpenGrokClient, OpenGrokError, PendingCustom,
-    PendingOp, PendingUserMessage, PendingWrite, ProfileUpdate, QueuedApproval, RecipeDetail,
-    RecipeKind, RecipeParameter, RecipeRun, RecipeRunResult, RecipeShareTarget, RecipeStep,
-    RecipeSummary, RelayHandle, RelayKey, RelayReport, RelayStatus, RelayTarget, RelayTimings,
-    ReplyQuote, ReplySource, RunCause, RunErrorCode, RunRecipeResponse, RunReplay,
-    SKILL_BODY_CHARS, SKILL_BUNDLE_FILES, SKILL_BUNDLE_LIMIT, SaveLoginSpec, ScheduleEdit,
-    ScheduleKind, ScheduleRow, ScheduleRun, ScheduleRunStatus, ScreenshotSpec, SkillDetail,
-    SkillFile, SkillPatch, SkillSource, SkillSummary, ThreadListing, ThreadReplay, ThreadRun,
-    ToolCallTracker, TurnAssembler, TurnRecipe, TurnSource, TurnTiming,
+    InferenceSourceUpdate, LocalExecMode, LocalExecPolicy, LocalExecResolution, LocalExecStopped,
+    ModelCatalogue, ModelEntry, ModelPick, NewBotDefault, NewSchedule, NewSkill, OpenGrokClient,
+    OpenGrokError, PendingCustom, PendingOp, PendingUserMessage, PendingWrite, ProfileUpdate,
+    QueuedApproval, RecipeDetail, RecipeKind, RecipeParameter, RecipeRun, RecipeRunResult,
+    RecipeShareTarget, RecipeStep, RecipeSummary, RelayHandle, RelayKey, RelayReport, RelayStatus,
+    RelayTarget, RelayTimings, ReplyQuote, ReplySource, RunCause, RunErrorCode, RunRecipeResponse,
+    RunReplay, SKILL_BODY_CHARS, SKILL_BUNDLE_FILES, SKILL_BUNDLE_LIMIT, SaveLoginSpec,
+    ScheduleEdit, ScheduleKind, ScheduleRow, ScheduleRun, ScheduleRunStatus, ScreenshotSpec,
+    SkillDetail, SkillFile, SkillPatch, SkillSource, SkillSummary, ThreadListing, ThreadReplay,
+    ThreadRun, ToolCallTracker, TurnAssembler, TurnRecipe, TurnSource, TurnTiming,
     USER_FORM_SERVER_FILL_AVAILABLE, Unreachable, UserFormDismissMode, UserFormHttpSettle,
     UserFormValues, UserFormVerb, Via, WAITING_FOR_YOU, activity_from_replay, approval_summary,
     box_handoff_resolve_entry_id, collapse_computer_roster, command_from_args,
@@ -351,6 +351,14 @@ pub struct ReplySourceSettings {
     /// A key for this computer's opencodex typed here went when the page was left before a Save,
     /// and the page asks for it again, until one is typed or kept.
     pub relay_retype_key: bool,
+    /// The change sent at once that is with the server, by its number and what it is about
+    /// ([`AppState::begin_account_change`]). While it is out no other is sent and no read
+    /// begins: its answer is the newest word there will be.
+    pub changing: Option<(u64, AccountChange)>,
+    /// What became of the last change sent at once that did not go as asked, by what it was
+    /// about. A refusal stays until the next change of its kind; a change nobody heard back from
+    /// goes with the read that answers it.
+    pub change_note: Option<(AccountChange, ChangeNote)>,
 }
 
 /// What Settings → Relay says, under Save, about the last thing that did not go as asked.
@@ -501,26 +509,115 @@ impl ReplySourceSettings {
             relay_key_draft: None,
             relay_remove_key: self.relay_remove_key,
             relay_retype_key: self.relay_retype_key,
+            changing: self.changing,
+            change_note: self.change_note.clone(),
+        }
+    }
+
+    /// What the page says, where a change of `about`'s kind was asked, of the last one that did
+    /// not go as asked.
+    pub fn change_note(&self, about: AccountChange) -> Option<&str> {
+        self.change_note
+            .as_ref()
+            .filter(|(was, _)| *was == about)
+            .map(|(_, note)| note.line())
+    }
+}
+
+/// A change Settings → Relay sends the server at once, with no Save: what it is about, so what
+/// becomes of it is said where it was asked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccountChange {
+    /// A pick in Default for new Bots' picker, or None.
+    NewBots,
+}
+
+/// What became of a change sent at once that did not go as asked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChangeNote {
+    /// The server refused it, in its own words, and kept nothing. It stays until the next change
+    /// of its kind.
+    Refused(String),
+    /// It went out and no answer came back: the server may have kept it or not, and the setting
+    /// is read again to find out. The read's answer clears it. Not trouble yet.
+    Unknown,
+}
+
+impl ChangeNote {
+    /// The line the page shows.
+    pub fn line(&self) -> &str {
+        match self {
+            Self::Refused(said) => said,
+            Self::Unknown => ACCOUNT_CHANGE_UNKNOWN,
         }
     }
 }
 
+/// What the page says when a change went out and no answer came back: the server may have kept it
+/// or not, and the page reads the setting again to find out.
+pub(crate) const ACCOUNT_CHANGE_UNKNOWN: &str =
+    "The server did not answer, so the change may or may not have been kept. Checking again…";
+
 /// Settings → Relay's Default for new Bots: where a newly hired Bot starts, its model, and with it
-/// its door and fast tier, and its effort, which the section shows in the picker's card.
+/// its door and fast tier, and its effort, which the section shows in the picker's card
+/// ([`AppState::default_for_new_bots`]).
 ///
-/// TODO(opengrok-server, the account's default for new Bots): the server keeps no default for new
-/// Bots yet. Its contract (the route, the fields, and how a hire reads them) is being agreed with
-/// the server now, so nothing here is a wire shape and nothing is sent or read. Until it lands
-/// this is always `NotOnServer`: the section says it is coming
-/// (`reply_source::NEW_BOTS_COMING_SOON`) and its card takes no click, since a control that
-/// changes nothing on the server must not look as if it does. When it lands, a variant carrying
-/// what the server keeps joins this one, read with the reply source, and the card opens the same
-/// popover a Bot's does.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// It is the account's (opengrok-server PR #322 new-bot-default, not yet on main:
+/// `NewBotDefault` in `crates/opengrok-core/src/inference.rs`), read with the reply source, which
+/// carries it as `newBotDefault` on every read from a server that keeps one, `null` until the
+/// person sets one. A server without it sends no such key, and the section then says the default
+/// is coming and its card takes no click, since a control that changes nothing on the server must
+/// not look as if it does.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum DefaultForNewBots {
-    /// The server keeps no default for new Bots.
+    /// The server keeps no default for new Bots, or the setting has not been read.
     #[default]
     NotOnServer,
+    /// The server keeps one: the person's, or `None` while they have set none, which leaves a new
+    /// Bot to the server's own default.
+    Kept(Option<NewBotDefault>),
+}
+
+/// Which model picker: the open Bot's, on the Model card in its settings, or Default for new
+/// Bots', on Settings → Relay. The two are the same card and popover
+/// (`components::model_picker`); what differs is what they show and where a change goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PickerFor {
+    Bot,
+    NewBots,
+}
+
+/// Where a picker's popover is.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PickerView {
+    /// The popover is open under the card.
+    pub open: bool,
+    /// The open popover shows its list of models, grouped by door, instead of its controls.
+    pub list_open: bool,
+    /// What is typed in the list's search box: the list shows only the models whose name or id
+    /// holds it, whatever the case (`ModelPick::search`). Emptied whenever the list opens or
+    /// shuts, so it opens afresh each time.
+    pub search: String,
+    /// The first model in the list's window, among those the search leaves: the list shows
+    /// `opengrok::LIST_ROWS` from it (`opengrok::list_window`), and the wheel moves it.
+    pub list_start: usize,
+}
+
+/// A change sent at once that has begun: what to send, and what it is, for its answer.
+struct AccountChangeSend {
+    client: OpenGrokClient,
+    generation: u64,
+    about: AccountChange,
+    update: InferenceSourceUpdate,
+}
+
+/// What follows a change's answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AfterChange {
+    /// Nothing more to ask.
+    Done,
+    /// Read the setting again: nobody knows whether the change was kept.
+    ReadAgain,
 }
 
 /// What a Save keeps on this computer ([`ReplySourceSettings::take_changes_here`]): opencodex's
@@ -1896,6 +1993,19 @@ fn connectors_unavailable(error: &OpenGrokError) -> String {
         "The services this server can connect could not be read",
         error,
     )
+}
+
+/// A refused change of the account's setting, as the page says it where it was asked: the
+/// server's own sentence when it wrote one (a model a plan may not answer, an effort it does not
+/// know), as it wrote it.
+fn account_change_refusal(error: &OpenGrokError) -> String {
+    if error.is_signed_out() {
+        return "Sign in again to change it.".to_string();
+    }
+    if error.written_by_opengrok() && !error.message.trim().is_empty() {
+        return error.message.clone();
+    }
+    rules_refusal("Not saved", error)
 }
 
 /// Why the account's reply source could not be read, in words for Settings → Relay. Nothing
@@ -4778,18 +4888,11 @@ pub struct AppState {
     /// the thread's id and the run's. Set by a line of the Run history; let go once shown, or
     /// once the person is in another thread.
     pub reveal_run: Option<(String, String)>,
-    /// The Bot's model picker has its popover open under the Model card in the Bot's settings,
-    /// the one place a Bot's model is picked (`components::model_picker`).
-    pub model_picker_open: bool,
-    /// The open popover shows its list of models, grouped by door, instead of its controls.
-    pub model_list_open: bool,
-    /// What is typed in the list's search box: the list shows only the models whose name or id
-    /// holds it, whatever the case (`ModelPick::search`). Emptied whenever the list opens or
-    /// shuts, so it opens afresh each time.
-    pub model_search: String,
-    /// The first model in the list's window, among those the search leaves: the list shows
-    /// `opengrok::LIST_ROWS` from it (`opengrok::list_window`), and the wheel moves it.
-    pub model_list_start: usize,
+    /// The Bot's model picker's popover, under the Model card in the Bot's settings, the one
+    /// place a Bot's model is picked (`components::model_picker`).
+    pub model_picker: PickerView,
+    /// Default for new Bots' picker's popover, under its card on Settings → Relay.
+    pub new_bots_picker: PickerView,
     /// The server's words for the last change the picker made that did not go through, with the
     /// Bot it was for. The popover says it under its controls until the next change is sent.
     pub model_pick_note: Option<(String, String)>,
@@ -4935,9 +5038,6 @@ pub struct AppState {
     /// unsaved changes to this computer's half of the relay. A Bot that has picked no door of its
     /// own follows the kind the server keeps, which the page does not switch.
     pub reply_source: ReplySourceSettings,
-    /// Settings → Relay's Default for new Bots: what the server keeps as where a newly hired Bot
-    /// starts, which is nothing yet ([`DefaultForNewBots`]).
-    pub default_for_new_bots: DefaultForNewBots,
     /// Numbers the reads of the reply source, so an answer that is not the newest, or that lands
     /// after a sign-out, is dropped.
     reply_source_generation: u64,
@@ -5493,10 +5593,8 @@ impl AppState {
             wake_opens: 0,
             routine_delete_prompt: None,
             reveal_run: None,
-            model_picker_open: false,
-            model_list_open: false,
-            model_search: String::new(),
-            model_list_start: 0,
+            model_picker: PickerView::default(),
+            new_bots_picker: PickerView::default(),
             model_pick_note: None,
             avatar_editor_open: false,
             hiring: false,
@@ -5557,7 +5655,6 @@ impl AppState {
             connectors_generation: 0,
             connect_asks: 0,
             reply_source: ReplySourceSettings::default(),
-            default_for_new_bots: DefaultForNewBots::default(),
             reply_source_generation: 0,
             models_generation: 0,
             reply_source_page_shown: false,
@@ -6638,15 +6735,15 @@ impl AppState {
         self.connections_generation += 1;
         self.connectors_generation += 1;
         self.connect_asks += 1;
-        // So was the reply source, and whatever read or Save of it is still out, and the
-        // account's default for new Bots.
+        // So was the reply source, its default for new Bots, and whatever read or change of it
+        // is still out.
         self.reply_source = ReplySourceSettings::default();
-        self.default_for_new_bots = DefaultForNewBots::default();
         self.reply_source_page_shown = false;
         self.reply_source_generation += 1;
-        // The picker was open on one of their Bots, and what it last said was about theirs.
-        self.model_picker_open = false;
-        self.shut_model_list();
+        // The pickers were open on one of their Bots and on their default for new Bots, and what
+        // the Bot's last said was about theirs.
+        self.model_picker = PickerView::default();
+        self.new_bots_picker = PickerView::default();
         self.model_pick_note = None;
         // The relay answered for them, and stops with every call it was answering; the switch was
         // theirs, and is read again for whoever signs in next.
@@ -7738,10 +7835,11 @@ impl AppState {
     }
 
     /// Begin a read of the reply source: every read begun before it is overtaken, and dropped
-    /// when it answers. None with nobody signed in to ask for.
+    /// when it answers. None while a change is out, whose answer is the newest word there will
+    /// be, and none with nobody signed in to ask for.
     fn begin_reply_source_read(&mut self) -> Option<(OpenGrokClient, u64)> {
         let client = self.opengrok.clone()?;
-        if !self.is_signed_in() {
+        if !self.is_signed_in() || self.reply_source.changing.is_some() {
             return None;
         }
         if self.reply_source.kept_source().is_none() {
@@ -7767,10 +7865,14 @@ impl AppState {
         match read {
             Ok(source) => {
                 settings.kept = Some(ReplySourceRead::Read(source));
-                // What the server says now answers a read that failed. What the Keychain said is
-                // about this computer, and stays until the next Save.
+                // What the server says now answers a read that failed, and a change nobody heard
+                // back from. What the Keychain said is about this computer, and stays until the
+                // next Save; a refusal is about its change, and stays until the next.
                 if matches!(settings.note, Some(ReplySourceNote::ReadFailed(_))) {
                     settings.note = None;
+                }
+                if matches!(settings.change_note, Some((_, ChangeNote::Unknown))) {
+                    settings.change_note = None;
                 }
             }
             // A bare 404 is a server from before the route; the server's own 404 is not that.
@@ -7812,6 +7914,108 @@ impl AppState {
         Some(self.reply_source.take_changes_here())
     }
 
+    /// Begin a change Settings → Relay sends the server at once, for the caller to send: the
+    /// `PUT` `update` makes of the kind the server keeps, which goes back as it is, since the
+    /// server takes no `PUT` without one. `None` with nobody signed in, before the setting is
+    /// read, and while another change is out: one at a time. A read out now is overtaken, and its
+    /// answer dropped when it comes: this change's answer is the newest word there will be.
+    fn begin_account_change(
+        &mut self,
+        about: AccountChange,
+        update: impl FnOnce(InferenceKind) -> InferenceSourceUpdate,
+    ) -> Option<AccountChangeSend> {
+        let client = self.opengrok.clone()?;
+        if !self.is_signed_in() || self.reply_source.changing.is_some() {
+            return None;
+        }
+        let kind = self.reply_source.kept_source()?.kind;
+        self.reply_source_generation += 1;
+        let generation = self.reply_source_generation;
+        let settings = &mut self.reply_source;
+        settings.changing = Some((generation, about));
+        settings.reading = None;
+        // A new change is a new answer to wait for, and what was said of the last one of its
+        // kind goes with it.
+        if settings
+            .change_note
+            .as_ref()
+            .is_some_and(|(was, _)| *was == about)
+        {
+            settings.change_note = None;
+        }
+        Some(AccountChangeSend {
+            client,
+            generation,
+            about,
+            update: update(kind),
+        })
+    }
+
+    /// Send a change that has begun, and put its answer on the page.
+    fn send_account_change(&mut self, send: AccountChangeSend, cx: &mut Context<Self>) {
+        let AccountChangeSend {
+            client,
+            generation,
+            about,
+            update,
+        } = send;
+        cx.spawn(async move |this, cx| {
+            let answer = client.set_inference_source(&update).await;
+            let _ = this.update(cx, |state, cx| {
+                match state.settle_account_change(generation, about, answer) {
+                    None | Some(AfterChange::Done) => {}
+                    Some(AfterChange::ReadAgain) => state.read_reply_source(cx),
+                }
+                state.ensure_relay(cx);
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// Put a change's answer on the page, and say what to ask next. `None` when the answer is not
+    /// the change's that is out (the person signed out since) and nothing was touched. Kept, the
+    /// answer is the account's setting as the server now keeps it; refused, nothing was kept, and
+    /// the server's words are said where the change was asked; unanswered, nobody knows, and the
+    /// setting is read again to find out.
+    fn settle_account_change(
+        &mut self,
+        generation: u64,
+        about: AccountChange,
+        answer: Result<InferenceSource, OpenGrokError>,
+    ) -> Option<AfterChange> {
+        let settings = &mut self.reply_source;
+        if settings.changing != Some((generation, about)) {
+            return None;
+        }
+        settings.changing = None;
+        Some(match answer {
+            Ok(kept) => {
+                settings.kept = Some(ReplySourceRead::Read(kept));
+                AfterChange::Done
+            }
+            // A bare 404 is a server from before the route; the server's own 404 is not that.
+            Err(error) if error.is_not_found() && !error.written_by_opengrok() => {
+                settings.forget_picks();
+                settings.note = None;
+                settings.kept = Some(ReplySourceRead::NotOnServer);
+                AfterChange::Done
+            }
+            // No answer at all, or one that could not be read: the server may have kept it, and
+            // only asking again can say.
+            Err(error) if error.unreachable().is_some() || error.status.is_none() => {
+                settings.change_note = Some((about, ChangeNote::Unknown));
+                AfterChange::ReadAgain
+            }
+            Err(error) => {
+                settings.change_note =
+                    Some((about, ChangeNote::Refused(account_change_refusal(&error))));
+                AfterChange::Done
+            }
+        })
+    }
+
     /// Settings has changed what it shows. Relay coming on screen reads the setting, for where the
     /// relay stands and in case it changed on another computer, and the models, which a computer
     /// relaying lists for every picker's Subscription group; leaving it drops a key typed there
@@ -7832,6 +8036,10 @@ impl AppState {
         self.reply_source_page_shown = shown;
         if !shown && self.reply_source.relay_key_draft.take().is_some() {
             self.reply_source.relay_retype_key = true;
+        }
+        // Default for new Bots' popover goes with the page it hangs from.
+        if !shown {
+            self.new_bots_picker = PickerView::default();
         }
         arrived
     }
@@ -8759,8 +8967,7 @@ impl AppState {
         }
         self.set_right_pane(RightPane::Closed, cx);
         self.computer_view = ComputerView::Overview;
-        self.model_picker_open = false;
-        self.shut_model_list();
+        self.model_picker = PickerView::default();
         self.avatar_editor_open = false;
         self.record_nav();
         cx.notify();
@@ -8802,8 +9009,7 @@ impl AppState {
         self.set_right_pane(RightPane::Computer, cx);
         self.computer_view = ComputerView::Overview;
         // The Model card goes with the Bot's settings, and its popover with it.
-        self.model_picker_open = false;
-        self.shut_model_list();
+        self.model_picker = PickerView::default();
         self.avatar_editor_open = false;
         self.record_nav();
         cx.notify();
@@ -11779,11 +11985,10 @@ impl AppState {
     }
 
     pub fn dismiss_popovers(&mut self, cx: &mut Context<Self>) {
-        if !self.model_picker_open && !self.avatar_editor_open && self.emoji_picker.is_none() {
+        if !self.model_picker.open && !self.avatar_editor_open && self.emoji_picker.is_none() {
             return;
         }
-        self.model_picker_open = false;
-        self.shut_model_list();
+        self.model_picker = PickerView::default();
         self.avatar_editor_open = false;
         self.emoji_picker = None;
         self.hidden_bots_open = false;
@@ -12105,15 +12310,14 @@ impl AppState {
     }
 
     pub fn set_avatar_editor_open(&mut self, open: bool, cx: &mut Context<Self>) {
-        if self.avatar_editor_open == open && (!open || !self.model_picker_open) {
+        if self.avatar_editor_open == open && (!open || !self.model_picker.open) {
             return;
         }
         self.avatar_editor_open = open;
         // The avatar editor and the Model card's popover share the settings pane, and one opens
         // over the other.
         if open {
-            self.model_picker_open = false;
-            self.shut_model_list();
+            self.model_picker = PickerView::default();
         }
         cx.notify();
     }
@@ -12192,7 +12396,7 @@ impl AppState {
         .detach();
     }
 
-    // ---- The Bot's model picker: its door, model, fast tier and effort ----------------------------
+    // ---- The model picker: a Bot's, and Default for new Bots' -----------------------------------
 
     /// The open Bot's picker, as its card draws it and a driver reads it: `None` with no Bot
     /// open.
@@ -12207,158 +12411,251 @@ impl AppState {
         ))
     }
 
+    /// Default for new Bots' picker, as its card on Settings → Relay draws it: `None` while the
+    /// server keeps no default for new Bots, when the card is dead and opens nothing.
+    pub fn new_bots_pick(&self) -> Option<ModelPick> {
+        let DefaultForNewBots::Kept(default) = self.default_for_new_bots() else {
+            return None;
+        };
+        Some(crate::opengrok::new_bots_pick(
+            default.as_ref(),
+            self.reply_source.kept_source(),
+            &self.model_catalogue,
+            |via| self.plan_models(via),
+        ))
+    }
+
+    /// A picker as its card draws it.
+    pub fn picker_pick(&self, which: PickerFor) -> Option<ModelPick> {
+        match which {
+            PickerFor::Bot => self.model_pick(),
+            PickerFor::NewBots => self.new_bots_pick(),
+        }
+    }
+
+    /// Where a picker's popover is: open or shut, its list or its controls, its search and its
+    /// window.
+    pub fn picker_view(&self, which: PickerFor) -> &PickerView {
+        match which {
+            PickerFor::Bot => &self.model_picker,
+            PickerFor::NewBots => &self.new_bots_picker,
+        }
+    }
+
+    fn picker_view_mut(&mut self, which: PickerFor) -> &mut PickerView {
+        match which {
+            PickerFor::Bot => &mut self.model_picker,
+            PickerFor::NewBots => &mut self.new_bots_picker,
+        }
+    }
+
+    /// Default for new Bots, as the account's setting last read says it: kept by a server whose
+    /// read carries `newBotDefault`, `null` or not (opengrok-server PR #322, branch
+    /// `new-bot-default`, not yet on main), and not kept by one whose read carries no such key, or
+    /// before the setting is read.
+    pub fn default_for_new_bots(&self) -> DefaultForNewBots {
+        match self
+            .reply_source
+            .kept_source()
+            .and_then(|kept| kept.new_bot_default.as_ref())
+        {
+            Some(default) => DefaultForNewBots::Kept(default.clone()),
+            None => DefaultForNewBots::NotOnServer,
+        }
+    }
+
     /// The server keeps a door per Bot: some row of the roster carries `source` (opengrok-server
     /// main d6f640e (#307, after #304), pin bf99845, which writes it on every row). Settings →
-    /// Reply source is then the default for the Bots that have picked none, and says so.
+    /// Relay is then the place a Bot's Subscription model answers through, and says so.
     pub fn server_keeps_bot_doors(&self) -> bool {
         self.coworkers
             .iter()
             .any(|bot| bot.source != CoworkerSource::NotKept)
     }
 
-    /// Open the picker's popover under the Model card, or shut it. Opening it shuts the avatar
-    /// editor, which shares the settings pane with the card; and the popover opens on its
-    /// controls, not on the list it was last left at.
-    pub fn set_model_picker_open(&mut self, open: bool, cx: &mut Context<Self>) {
-        if self.model_picker_open == open {
+    /// Open a picker's popover under its card, or shut it. Opening the Bot's shuts the avatar
+    /// editor, which shares the settings pane with the card; and a popover opens on its controls,
+    /// not on the list it was last left at.
+    pub fn set_picker_open(&mut self, which: PickerFor, open: bool, cx: &mut Context<Self>) {
+        if self.picker_view(which).open == open {
             return;
         }
-        self.model_picker_open = open;
-        self.shut_model_list();
-        if open {
+        self.picker_view_mut(which).open = open;
+        self.shut_picker_list(which);
+        if open && which == PickerFor::Bot {
             self.avatar_editor_open = false;
         }
         cx.notify();
     }
 
-    /// A click on the card.
-    pub fn toggle_model_picker(&mut self, cx: &mut Context<Self>) {
-        self.set_model_picker_open(!self.model_picker_open, cx);
+    /// A click on a card.
+    pub fn toggle_picker(&mut self, which: PickerFor, cx: &mut Context<Self>) {
+        let open = !self.picker_view(which).open;
+        self.set_picker_open(which, open, cx);
     }
 
-    /// The model's name in the popover opens its list; the list's heading goes back.
-    pub fn toggle_model_list(&mut self, cx: &mut Context<Self>) {
-        if self.note_model_list_toggled() {
+    /// The model's name in a popover opens its list; the list's heading goes back.
+    pub fn toggle_picker_list(&mut self, which: PickerFor, cx: &mut Context<Self>) {
+        if self.note_picker_list_toggled(which) {
             cx.notify();
         }
     }
 
-    /// [`Self::toggle_model_list`] without the repaint: `false` while the popover is shut. The list
-    /// opens with nothing typed in its search box and the model that answers in view, wherever it
-    /// was left.
-    fn note_model_list_toggled(&mut self) -> bool {
-        if !self.model_picker_open {
+    /// [`Self::toggle_picker_list`] without the repaint: `false` while the popover is shut. The
+    /// list opens with nothing typed in its search box and the model that answers in view,
+    /// wherever it was left.
+    fn note_picker_list_toggled(&mut self, which: PickerFor) -> bool {
+        if !self.picker_view(which).open {
             return false;
         }
-        if self.model_list_open {
-            self.shut_model_list();
+        if self.picker_view(which).list_open {
+            self.shut_picker_list(which);
         } else {
-            self.model_list_open = true;
-            self.model_search.clear();
-            self.model_list_start = self
-                .model_pick()
+            let start = self
+                .picker_pick(which)
                 .map_or(0, |pick| pick.opening_window_start());
+            let view = self.picker_view_mut(which);
+            view.list_open = true;
+            view.search.clear();
+            view.list_start = start;
         }
         true
     }
 
-    /// The list goes back to the controls, and what was typed in its search box and how far it
-    /// was scrolled go with it.
-    fn shut_model_list(&mut self) {
-        self.model_list_open = false;
-        self.model_search.clear();
-        self.model_list_start = 0;
+    /// A list goes back to the controls, and what was typed in its search box and how far it was
+    /// scrolled go with it.
+    fn shut_picker_list(&mut self, which: PickerFor) {
+        let view = self.picker_view_mut(which);
+        view.list_open = false;
+        view.search.clear();
+        view.list_start = 0;
     }
 
-    /// What the list's search box holds now. The list shows only the models it leaves, from the
+    /// What a list's search box holds now. The list shows only the models it leaves, from the
     /// top.
-    pub fn set_model_search(&mut self, query: String, cx: &mut Context<Self>) {
-        if self.note_model_search(query) {
+    pub fn set_picker_search(&mut self, which: PickerFor, query: String, cx: &mut Context<Self>) {
+        if self.note_picker_search(which, query) {
             cx.notify();
         }
     }
 
     /// Only while the list shows, as the box is only there then: a field put back to empty as the
     /// list shuts is no search.
-    fn note_model_search(&mut self, query: String) -> bool {
-        if !self.model_list_open || self.model_search == query {
+    fn note_picker_search(&mut self, which: PickerFor, query: String) -> bool {
+        let view = self.picker_view_mut(which);
+        if !view.list_open || view.search == query {
             return false;
         }
-        self.model_search = query;
-        self.model_list_start = 0;
+        view.search = query;
+        view.list_start = 0;
         true
     }
 
-    /// The wheel moved the list's window by `rows` models, toward the end above zero. It stops at
+    /// The wheel moved a list's window by `rows` models, toward the end above zero. It stops at
     /// either end of what the search leaves.
-    pub fn scroll_model_list(&mut self, rows: isize, cx: &mut Context<Self>) {
-        if self.note_model_list_scroll(rows) {
+    pub fn scroll_picker_list(&mut self, which: PickerFor, rows: isize, cx: &mut Context<Self>) {
+        if self.note_picker_list_scroll(which, rows) {
             cx.notify();
         }
     }
 
-    fn note_model_list_scroll(&mut self, rows: isize) -> bool {
-        if !self.model_list_open {
+    fn note_picker_list_scroll(&mut self, which: PickerFor, rows: isize) -> bool {
+        if !self.picker_view(which).list_open {
             return false;
         }
-        let Some(pick) = self.model_pick() else {
+        let Some(pick) = self.picker_pick(which) else {
             return false;
         };
+        let view = self.picker_view_mut(which);
         let last = crate::opengrok::last_window_start(crate::opengrok::row_count(
-            &pick.search(&self.model_search),
+            &pick.search(&view.search),
         ));
-        let start = self
-            .model_list_start
+        let start = view
+            .list_start
             .min(last)
             .saturating_add_signed(rows)
             .min(last);
-        let moved = start != self.model_list_start;
-        self.model_list_start = start;
+        let moved = start != view.list_start;
+        view.list_start = start;
         moved
     }
 
-    /// A row of the list picked: the Bot goes onto its model at once, with its door, and the
-    /// popover goes back to its controls, where that model's effort and ⚡ are.
-    pub fn pick_model(&mut self, source: InferenceKind, base_id: &str, cx: &mut Context<Self>) {
+    /// A row of a list picked: the Bot, or the default for new Bots, goes onto its model at once,
+    /// with its door, and the popover goes back to its controls, where that model's effort and ⚡
+    /// are.
+    pub fn pick_model(
+        &mut self,
+        which: PickerFor,
+        source: InferenceKind,
+        base_id: &str,
+        cx: &mut Context<Self>,
+    ) {
         let patch = self
-            .model_pick()
+            .picker_pick(which)
             .and_then(|pick| pick.pick_patch(source, base_id).ok().flatten());
-        self.shut_model_list();
+        self.shut_picker_list(which);
         match patch {
-            Some(patch) => self.save_model_pick(patch, cx),
+            Some(patch) => self.save_picker_change(which, patch, cx),
             None => cx.notify(),
         }
     }
 
     /// ⚡ switched: the pin moves to the model's fast twin, or back.
-    pub fn set_model_fast(&mut self, on: bool, cx: &mut Context<Self>) {
+    pub fn set_model_fast(&mut self, which: PickerFor, on: bool, cx: &mut Context<Self>) {
         if let Some(patch) = self
-            .model_pick()
+            .picker_pick(which)
             .and_then(|pick| pick.fast_patch(on).ok().flatten())
         {
-            self.save_model_pick(patch, cx);
+            self.save_picker_change(which, patch, cx);
         }
     }
 
     /// A stop of the slider, by the server's word for it.
-    pub fn pick_model_effort(&mut self, word: &str, cx: &mut Context<Self>) {
+    pub fn pick_model_effort(&mut self, which: PickerFor, word: &str, cx: &mut Context<Self>) {
         if let Some(patch) = self
-            .model_pick()
+            .picker_pick(which)
             .and_then(|pick| pick.effort_patch(word).ok().flatten())
         {
-            self.save_model_pick(patch, cx);
+            self.save_picker_change(which, patch, cx);
         }
     }
 
     /// ↺: the effort back to Default and ⚡ off, the model left where it is.
-    pub fn reset_model_pick(&mut self, cx: &mut Context<Self>) {
-        if let Some(patch) = self.model_pick().and_then(|pick| pick.reset_patch()) {
-            self.save_model_pick(patch, cx);
+    pub fn reset_model_pick(&mut self, which: PickerFor, cx: &mut Context<Self>) {
+        if let Some(patch) = self.picker_pick(which).and_then(|pick| pick.reset_patch()) {
+            self.save_picker_change(which, patch, cx);
         }
     }
 
-    /// Send a change the picker made, at once, as a pick from the old model list always was: the
-    /// roster takes it before the server answers so the card follows the click, and a
+    /// Send a change a picker made, at once: a Bot's as a patch of the Bot
+    /// ([`Self::save_model_pick`]), and Default for new Bots' as the whole default it makes, kept
+    /// on the account ([`Self::begin_new_bots_change`]).
+    fn save_picker_change(
+        &mut self,
+        which: PickerFor,
+        patch: CoworkerPatch,
+        cx: &mut Context<Self>,
+    ) {
+        match which {
+            PickerFor::Bot => self.save_model_pick(patch, cx),
+            PickerFor::NewBots => {
+                if let Some(send) = self.begin_new_bots_pick(&patch) {
+                    self.send_account_change(send, cx);
+                }
+            }
+        }
+    }
+
+    /// Begin what a change Default for new Bots' picker made sends: the whole default `patch`
+    /// makes of the kept one ([`ModelPick::new_bots_default`]). `None` where it makes none, or
+    /// no change can begin.
+    fn begin_new_bots_pick(&mut self, patch: &CoworkerPatch) -> Option<AccountChangeSend> {
+        let default = self.new_bots_pick()?.new_bots_default(patch)?;
+        self.begin_new_bots_change(Some(default))
+    }
+
+    /// Send a change the Bot's picker made, at once, as a pick from the old model list always
+    /// was: the roster takes it before the server answers so the card follows the click, and a
     /// refusal puts the roster back ([`Self::patch_active_agent_then`]) and is said in the popover
     /// in the server's words, as well as on the settings pane's red line.
     fn save_model_pick(&mut self, patch: CoworkerPatch, cx: &mut Context<Self>) {
@@ -12382,10 +12679,62 @@ impl AppState {
         );
     }
 
-    /// What the popover says about the open Bot's last change that did not go through.
-    pub fn picker_note(&self) -> Option<&str> {
-        let (bot, said) = self.model_pick_note.as_ref()?;
-        (self.active_coworker_id.as_deref() == Some(bot.as_str())).then_some(said.as_str())
+    /// None, Default for new Bots' first row: the default the server keeps goes, and a new Bot is
+    /// left to the server's own.
+    pub fn clear_new_bots_default(&mut self, cx: &mut Context<Self>) {
+        self.shut_picker_list(PickerFor::NewBots);
+        match self.begin_new_bots_none() {
+            Some(send) => self.send_account_change(send, cx),
+            None => cx.notify(),
+        }
+    }
+
+    /// Begin None: `None` while none is kept, which is nothing to send, as well as where no
+    /// change can begin.
+    fn begin_new_bots_none(&mut self) -> Option<AccountChangeSend> {
+        if !matches!(
+            self.default_for_new_bots(),
+            DefaultForNewBots::Kept(Some(_))
+        ) {
+            return None;
+        }
+        self.begin_new_bots_change(None)
+    }
+
+    /// Begin keeping Default for new Bots on the account at once, whole, with the kind the server
+    /// keeps sent back as it is: `PUT /account/inference-source` `{kind, newBotDefault}`
+    /// (opengrok-server PR #322 new-bot-default, not yet on main: `apply` in
+    /// `crates/opengrok-harness/src/local_proxy.rs`, which replaces the default whole, and clears
+    /// it on `null`). The card shows what the server answers; a refusal is said in its words.
+    fn begin_new_bots_change(
+        &mut self,
+        default: Option<NewBotDefault>,
+    ) -> Option<AccountChangeSend> {
+        self.begin_account_change(AccountChange::NewBots, |kind| InferenceSourceUpdate {
+            kind,
+            via: None,
+            new_bot_default: Some(default),
+        })
+    }
+
+    /// What a picker's popover says about its last change that did not go through: the open
+    /// Bot's, in the server's words, and Default for new Bots', in the server's words or that
+    /// nobody knows whether it was kept.
+    pub fn picker_note(&self, which: PickerFor) -> Option<&str> {
+        match which {
+            PickerFor::Bot => {
+                let (bot, said) = self.model_pick_note.as_ref()?;
+                (self.active_coworker_id.as_deref() == Some(bot.as_str())).then_some(said.as_str())
+            }
+            PickerFor::NewBots => self.reply_source.change_note(AccountChange::NewBots),
+        }
+    }
+
+    /// A picker takes no change now: Default for new Bots' while a change of the account's is
+    /// with the server, one at a time, since each sends the default whole and two crossing on the
+    /// wire could land in either order. A Bot's never waits.
+    pub fn picker_busy(&self, which: PickerFor) -> bool {
+        which == PickerFor::NewBots && self.reply_source.changing.is_some()
     }
 
     /// A patch that never left the app. The settings pane paints the reason, and whoever is
@@ -34496,6 +34845,7 @@ mod tests {
             has_api_key: false,
             via: None,
             relay: None,
+            new_bot_default: None,
         }
     }
 
@@ -35726,6 +36076,7 @@ mod tests {
     /// was. None of it moves while the popover or the list is shut.
     #[test]
     fn the_model_list_opens_on_the_model_that_answers_and_a_search_starts_from_the_top() {
+        use super::PickerFor;
         use crate::opengrok::{ListLine, list_window};
         let mut state = signed_in_state();
         let routes: Vec<String> = (0..9).map(|at| format!("oag/route-{at}")).collect();
@@ -35749,21 +36100,27 @@ mod tests {
             note: None,
             local_proxy: None,
         };
-        assert!(!state.note_model_list_toggled(), "the popover is shut");
-        assert!(!state.note_model_search("route".into()));
-        state.model_picker_open = true;
-        assert!(state.note_model_list_toggled());
-        assert!(state.model_list_open);
-        assert_eq!(state.model_search, "");
+        assert!(
+            !state.note_picker_list_toggled(PickerFor::Bot),
+            "the popover is shut"
+        );
+        assert!(!state.note_picker_search(PickerFor::Bot, "route".into()));
+        state.model_picker.open = true;
+        assert!(state.note_picker_list_toggled(PickerFor::Bot));
+        assert!(state.model_picker.list_open);
+        assert_eq!(state.model_picker.search, "");
         let pick = state.model_pick().expect("a Bot is open");
         let in_view = |state: &AppState| -> Vec<String> {
-            list_window(&pick.search(&state.model_search), state.model_list_start)
-                .into_iter()
-                .filter_map(|line| match line {
-                    ListLine::Row(row) => Some(row.base_id.clone()),
-                    ListLine::Heading(_) => None,
-                })
-                .collect()
+            list_window(
+                &pick.search(&state.model_picker.search),
+                state.model_picker.list_start,
+            )
+            .into_iter()
+            .filter_map(|line| match line {
+                ListLine::Row(row) => Some(row.base_id.clone()),
+                ListLine::Heading(_) => None,
+            })
+            .collect()
         };
         assert!(
             in_view(&state).contains(&"oag/route-7".to_string()),
@@ -35772,30 +36129,39 @@ mod tests {
         );
 
         // The wheel: a model at a time, and no further than the last five.
-        state.model_list_start = 0;
-        assert!(state.note_model_list_scroll(3));
-        assert_eq!(state.model_list_start, 3);
-        assert!(state.note_model_list_scroll(10));
-        assert_eq!(state.model_list_start, 4, "the last whole window");
-        assert!(!state.note_model_list_scroll(1), "at the end already");
-        assert!(state.note_model_list_scroll(-10));
-        assert_eq!(state.model_list_start, 0);
+        state.model_picker.list_start = 0;
+        assert!(state.note_picker_list_scroll(PickerFor::Bot, 3));
+        assert_eq!(state.model_picker.list_start, 3);
+        assert!(state.note_picker_list_scroll(PickerFor::Bot, 10));
+        assert_eq!(state.model_picker.list_start, 4, "the last whole window");
+        assert!(
+            !state.note_picker_list_scroll(PickerFor::Bot, 1),
+            "at the end already"
+        );
+        assert!(state.note_picker_list_scroll(PickerFor::Bot, -10));
+        assert_eq!(state.model_picker.list_start, 0);
 
         // A search starts from the top of what it leaves.
-        state.model_list_start = 4;
-        assert!(state.note_model_search("ROUTE-1".into()));
-        assert_eq!(state.model_list_start, 0);
+        state.model_picker.list_start = 4;
+        assert!(state.note_picker_search(PickerFor::Bot, "ROUTE-1".into()));
+        assert_eq!(state.model_picker.list_start, 0);
         assert_eq!(in_view(&state), ["oag/route-1"]);
-        assert!(!state.note_model_list_scroll(1), "nothing more to show");
+        assert!(
+            !state.note_picker_list_scroll(PickerFor::Bot, 1),
+            "nothing more to show"
+        );
 
         // Shut, the list forgets the search and the window; it opens afresh.
-        assert!(state.note_model_list_toggled());
-        assert!(!state.model_list_open);
+        assert!(state.note_picker_list_toggled(PickerFor::Bot));
+        assert!(!state.model_picker.list_open);
         assert_eq!(
-            (state.model_search.as_str(), state.model_list_start),
+            (
+                state.model_picker.search.as_str(),
+                state.model_picker.list_start
+            ),
             ("", 0)
         );
-        assert!(!state.note_model_list_scroll(1));
+        assert!(!state.note_picker_list_scroll(PickerFor::Bot, 1));
     }
 
     // ---- The relay: this computer's half of Settings → Relay ------------------------------------
@@ -35915,6 +36281,288 @@ mod tests {
         assert!(state.reply_source.relay_retype_key);
         assert!(state.note_relay_key("opencodex-test-key"));
         assert!(!state.reply_source.relay_retype_key);
+    }
+
+    // ---- Default for new Bots: the account's, kept at once (opengrok-server PR #322) ------------
+
+    /// A read from a server that keeps a default for new Bots, as given, `None` being `null`.
+    fn with_new_bots(default: Option<crate::opengrok::NewBotDefault>) -> InferenceSource {
+        InferenceSource {
+            new_bot_default: Some(default),
+            ..relay_kept(InferenceKind::Gateway, "loopback", None)
+        }
+    }
+
+    fn luna(effort: &str) -> crate::opengrok::NewBotDefault {
+        crate::opengrok::NewBotDefault {
+            source: InferenceKind::LocalProxy,
+            model: "gpt-6-luna".into(),
+            effort: effort.into(),
+        }
+    }
+
+    /// The setting as the server answers it, as JSON, with `newBotDefault` as given.
+    fn answered_with(default: serde_json::Value) -> serde_json::Value {
+        json!({
+            "kind": "gateway", "via": "loopback", "baseUrl": null, "localModel": null,
+            "healthy": false, "hasApiKey": false,
+            "relay": {"connected": false, "machineId": null, "machineLabel": null,
+                      "localModel": null},
+            "newBotDefault": default
+        })
+    }
+
+    /// The bodies of the `PUT`s of the account's setting `server` was sent, in order.
+    async fn puts_sent(server: &wiremock::MockServer) -> Vec<serde_json::Value> {
+        server
+            .received_requests()
+            .await
+            .expect("the recorder is on")
+            .iter()
+            .filter(|request| {
+                request.method.as_str() == "PUT"
+                    && request.url.path() == "/account/inference-source"
+            })
+            .map(|request| serde_json::from_slice(&request.body).expect("a JSON body"))
+            .collect()
+    }
+
+    /// Default for new Bots is live only where the server's read carries its key, `null` or not
+    /// (opengrok-server PR #322 new-bot-default, not yet on main): before the setting is read,
+    /// and from a server whose read has no such key, it is not on the server, it has no picker,
+    /// and nothing of it can be sent. Signing out forgets it with the setting.
+    #[test]
+    fn the_default_for_new_bots_is_live_only_where_the_read_carries_its_key() {
+        use super::{DefaultForNewBots, PickerFor};
+        let mut state = signed_in_state();
+        assert_eq!(
+            state.default_for_new_bots(),
+            DefaultForNewBots::NotOnServer,
+            "not read"
+        );
+        read_as(
+            &mut state,
+            relay_kept(InferenceKind::Gateway, "loopback", None),
+        );
+        assert_eq!(
+            state.default_for_new_bots(),
+            DefaultForNewBots::NotOnServer,
+            "no key on the read"
+        );
+        assert!(state.picker_pick(PickerFor::NewBots).is_none());
+        assert!(state.begin_new_bots_none().is_none());
+
+        read_as(&mut state, with_new_bots(None));
+        assert_eq!(state.default_for_new_bots(), DefaultForNewBots::Kept(None));
+        let pick = state.picker_pick(PickerFor::NewBots).expect("live");
+        assert_eq!(pick.summary(), "None · Default");
+        assert!(
+            state.begin_new_bots_none().is_none(),
+            "none kept: nothing to send"
+        );
+
+        read_as(&mut state, with_new_bots(Some(luna("high"))));
+        assert_eq!(
+            state.default_for_new_bots(),
+            DefaultForNewBots::Kept(Some(luna("high")))
+        );
+        assert_eq!(
+            state.new_bots_pick().map(|pick| pick.summary()),
+            Some("GPT-6 Luna · High".to_string())
+        );
+        state.forget_account();
+        assert_eq!(state.default_for_new_bots(), DefaultForNewBots::NotOnServer);
+    }
+
+    /// A pick in Default for new Bots' list is kept on the account at once, whole: one `PUT` of
+    /// the kind the server keeps and `newBotDefault`, the row's door and model with the Default
+    /// effort, and nothing of the plan on the server's own machine or a model of the relay's.
+    /// While it is out the picker takes no other change and no read begins, and a read already
+    /// out is overtaken; what the server answers is what the card shows after.
+    #[tokio::test]
+    async fn a_pick_for_new_bots_puts_the_whole_default_at_once() {
+        use super::{AfterChange, DefaultForNewBots, PickerFor};
+        let server = wiremock::MockServer::start().await;
+        let picked = json!({"source": "local_proxy", "model": "gpt-6-luna", "effort": "inherit"});
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .and(wiremock::matchers::path("/account/inference-source"))
+            .and(wiremock::matchers::body_json(
+                json!({"kind": "gateway", "newBotDefault": picked}),
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(answered_with(picked.clone())),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut state = signed_in_state();
+        state.opengrok = Some(client_signed_in_to(&server).await);
+        read_as(&mut state, with_new_bots(None));
+        state.model_catalogue = ModelCatalogue {
+            models: vec![ModelEntry {
+                id: "gpt-6-luna".into(),
+                source: Some("local_proxy".into()),
+                via: None,
+            }],
+            note: None,
+            local_proxy: None,
+        };
+        let (_, reading) = state.begin_reply_source_read().expect("a read begins");
+        let patch = state
+            .new_bots_pick()
+            .and_then(|pick| {
+                pick.pick_patch(InferenceKind::LocalProxy, "gpt-6-luna")
+                    .ok()
+                    .flatten()
+            })
+            .expect("a row of the list");
+        let send = state.begin_new_bots_pick(&patch).expect("a change begins");
+        assert!(state.picker_busy(PickerFor::NewBots));
+        assert!(state.begin_new_bots_pick(&patch).is_none(), "one at a time");
+        assert!(
+            state.begin_reply_source_read().is_none(),
+            "no read overtakes it"
+        );
+        assert!(
+            !state.settle_reply_source_read(reading, Ok(with_new_bots(None))),
+            "the read already out is overtaken"
+        );
+
+        let answer = send.client.set_inference_source(&send.update).await;
+        assert_eq!(
+            state.settle_account_change(send.generation, send.about, answer),
+            Some(AfterChange::Done)
+        );
+        assert_eq!(
+            state.default_for_new_bots(),
+            DefaultForNewBots::Kept(Some(luna("inherit")))
+        );
+        assert!(!state.picker_busy(PickerFor::NewBots));
+        assert_eq!(state.picker_note(PickerFor::NewBots), None);
+        assert_eq!(
+            puts_sent(&server).await,
+            [json!({"kind": "gateway", "newBotDefault": picked})]
+        );
+    }
+
+    /// A pick the server refuses is said under the picker in the server's own words, its 400
+    /// `{error}` as #322 words it, and nothing changes: the card still shows what the server
+    /// keeps, and the picker takes the next pick. A read that lands meanwhile leaves the words;
+    /// the next change of the default takes them away.
+    #[tokio::test]
+    async fn a_refused_pick_for_new_bots_shows_the_servers_words() {
+        use super::{AfterChange, DefaultForNewBots, PickerFor};
+        let said = "newBotDefault.model: \"xai/grok-4.6@sub\" is not a model this server knows to \
+                    be OpenAI's or xAI's, and only theirs (gpt-*, o1*, o3*, o4*, codex*, grok-*) \
+                    may use your own subscription";
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .and(wiremock::matchers::path("/account/inference-source"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(400).set_body_json(json!({"error": said})),
+            )
+            .mount(&server)
+            .await;
+        let mut state = signed_in_state();
+        state.opengrok = Some(client_signed_in_to(&server).await);
+        read_as(&mut state, with_new_bots(None));
+        let send = state
+            .begin_new_bots_change(Some(luna("high")))
+            .expect("a change begins");
+        let answer = send.client.set_inference_source(&send.update).await;
+        assert_eq!(
+            state.settle_account_change(send.generation, send.about, answer),
+            Some(AfterChange::Done)
+        );
+        assert_eq!(state.picker_note(PickerFor::NewBots), Some(said));
+        assert_eq!(
+            state.picker_note(PickerFor::Bot),
+            None,
+            "said only where it was asked"
+        );
+        assert_eq!(
+            state.default_for_new_bots(),
+            DefaultForNewBots::Kept(None),
+            "nothing was kept, and nothing claims it was"
+        );
+        assert!(!state.picker_busy(PickerFor::NewBots));
+        read_as(&mut state, with_new_bots(None));
+        assert_eq!(state.picker_note(PickerFor::NewBots), Some(said));
+        assert!(state.begin_new_bots_change(Some(luna("low"))).is_some());
+        assert_eq!(state.picker_note(PickerFor::NewBots), None, "a new change");
+    }
+
+    /// None takes the kept default away: one `PUT` of the kind the server keeps and
+    /// `newBotDefault: null`, which leaves a new Bot to the server's own default.
+    #[tokio::test]
+    async fn none_sends_null_and_takes_the_default_for_new_bots_away() {
+        use super::{AfterChange, DefaultForNewBots};
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .and(wiremock::matchers::path("/account/inference-source"))
+            .and(wiremock::matchers::body_json(
+                json!({"kind": "gateway", "newBotDefault": null}),
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(answered_with(serde_json::Value::Null)),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut state = signed_in_state();
+        state.opengrok = Some(client_signed_in_to(&server).await);
+        read_as(&mut state, with_new_bots(Some(luna("high"))));
+        let send = state.begin_new_bots_none().expect("a default to take away");
+        let answer = send.client.set_inference_source(&send.update).await;
+        assert_eq!(
+            state.settle_account_change(send.generation, send.about, answer),
+            Some(AfterChange::Done)
+        );
+        assert_eq!(state.default_for_new_bots(), DefaultForNewBots::Kept(None));
+        assert_eq!(
+            puts_sent(&server).await,
+            [json!({"kind": "gateway", "newBotDefault": null})]
+        );
+    }
+
+    /// A change nobody heard back from says so where it was asked, not as trouble, and the
+    /// setting is read again, whose answer clears it; a change the person signed out from lands
+    /// on nothing when it answers.
+    #[test]
+    fn a_change_nobody_heard_back_from_is_read_again() {
+        use super::{ACCOUNT_CHANGE_UNKNOWN, AfterChange, PickerFor};
+        let mut state = signed_in_state();
+        read_as(&mut state, with_new_bots(None));
+        let send = state
+            .begin_new_bots_change(Some(luna("high")))
+            .expect("a change begins");
+        assert_eq!(
+            state.settle_account_change(
+                send.generation,
+                send.about,
+                Err(OpenGrokError::message("error sending request"))
+            ),
+            Some(AfterChange::ReadAgain)
+        );
+        assert_eq!(
+            state.picker_note(PickerFor::NewBots),
+            Some(ACCOUNT_CHANGE_UNKNOWN)
+        );
+        read_as(&mut state, with_new_bots(Some(luna("high"))));
+        assert_eq!(
+            state.picker_note(PickerFor::NewBots),
+            None,
+            "the read answers it"
+        );
+
+        let send = state.begin_new_bots_none().expect("a change begins");
+        state.forget_account();
+        assert_eq!(
+            state.settle_account_change(send.generation, send.about, Ok(with_new_bots(None))),
+            None
+        );
+        assert_eq!(state.reply_source.kept, None);
     }
 
     /// The relay runs only for somebody signed in, with its switch on for them, on an enrolled

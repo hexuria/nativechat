@@ -313,7 +313,7 @@ impl Render for SidebarView {
             .overflow_hidden()
             .on_mouse_down(MouseButton::Left, move |_, _, cx| {
                 app.update(cx, |state, cx| {
-                    if state.model_picker_open || state.avatar_editor_open {
+                    if state.model_picker.open || state.avatar_editor_open {
                         state.dismiss_popovers(cx);
                     }
                 });

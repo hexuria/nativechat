@@ -10,8 +10,8 @@ use crate::opengrok::{
     BotSkillRow, BotSkillScope, CeilingRow, CoworkerPatch, CoworkerTool, USER_MACHINE_SHELL,
 };
 use crate::state::{
-    AppState, BotSkills, CeilingBlock, CeilingCard, CeilingSwitch, SkillSwitch, SkillsBlock,
-    SkillsCard, ToolCeiling, ToolList, UsageReport,
+    AppState, BotSkills, CeilingBlock, CeilingCard, CeilingSwitch, PickerFor, SkillSwitch,
+    SkillsBlock, SkillsCard, ToolCeiling, ToolList, UsageReport,
 };
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputState, Textarea, TextareaState};
@@ -83,7 +83,7 @@ impl AgentSettings {
             state.set_auto_grow(3, 7, cx);
             state
         });
-        let model_card = cx.new(|cx| ModelPicker::new(window, state.clone(), cx));
+        let model_card = cx.new(|cx| ModelPicker::new(window, state.clone(), PickerFor::Bot, cx));
         cx.observe(&state, |this, state, cx| {
             // A driver's Save, which comes by way of the app because the button and the fields
             // it sends are this pane's. Only for the bot the fields were filled for: a switch the

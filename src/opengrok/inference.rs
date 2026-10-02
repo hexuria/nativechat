@@ -241,6 +241,61 @@ pub struct InferenceSource {
     /// this app knows not to offer it.
     #[serde(default)]
     pub relay: Option<RelayRead>,
+    /// Default for new Bots, from a server that keeps one, which sends the key on every read,
+    /// `null` until the person sets one (opengrok-server PR #322 new-bot-default, not yet on
+    /// main: `described` in `crates/opengrok-harness/src/local_proxy.rs`). `None` is the key left
+    /// out, a server before it, which keeps no such default; `Some(None)` is `null`, none set.
+    #[serde(default, deserialize_with = "keyed")]
+    pub new_bot_default: Option<Option<NewBotDefault>>,
+}
+
+/// A key that is there, `null` or not: `Some(None)` for `null` and `Some(Some(_))` for a value,
+/// so the field's default, `None`, is the key left out.
+fn keyed<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer).map(Some)
+}
+
+/// A person's default for new Bots, as opengrok-server PR #322 (new-bot-default, not yet on
+/// main) writes it: `NewBotDefault` in `crates/opengrok-core/src/inference.rs`,
+/// `{"source", "model", "effort"}`. A Bot hired with no model of its own, and none from its
+/// template, is born on it whole, its door, the model it is pinned to and how hard it thinks
+/// written onto the Bot at its hire, so a changed default moves only the Bots hired after it
+/// (`hire_model` in `crates/opengrok-server/src/inference.rs`). Fast is the model's `--fast` id,
+/// not a field.
+///
+/// The server holds a `PUT` of it to what its parts are held to elsewhere, and refuses the whole
+/// body with a 400 and `{"error"}` in their words (`NewBotDefault::named`): a `source` that is not
+/// one of its two words (`newBotDefault.source must be "gateway" or "local_proxy"`), an effort
+/// that is not a Bot's (`newBotDefault.effort must be one of inherit, none, low, medium, high,
+/// xhigh, max`), and a model refused as a hire's is on the gateway (`newBotDefault.model: a
+/// coworker needs a model to think with`) or as a plan's is on the person's plan
+/// (`newBotDefault.model: ` and the allowlist's sentence).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NewBotDefault {
+    /// The door a new Bot is born on: `gateway` or `local_proxy`.
+    pub source: InferenceKind,
+    /// The id it is pinned to.
+    pub model: String,
+    /// One of a Bot's effort words (`types::EFFORT_WORDS`); left out or `null`, `inherit`.
+    #[serde(default = "effort_inherit", deserialize_with = "effort_word")]
+    pub effort: String,
+}
+
+fn effort_inherit() -> String {
+    super::EFFORT_INHERIT.to_string()
+}
+
+/// An effort as a default for new Bots carries it: `null` is `inherit`, as the server reads it.
+fn effort_word<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<String>::deserialize(deserializer)?.unwrap_or_else(effort_inherit))
 }
 
 impl InferenceSource {
@@ -298,7 +353,8 @@ pub struct RelayRead {
     pub local_model: Option<String>,
 }
 
-/// A `PUT /account/inference-source` body, as this app sends one: `{"kind", "via"?}`.
+/// A `PUT /account/inference-source` body, as this app sends one: `{"kind", "via"?,
+/// "newBotDefault"?}`.
 ///
 /// The server takes no `PUT` without a kind (`apply` in
 /// `crates/opengrok-harness/src/local_proxy.rs`), and this app switches no kind, so `kind` is the
@@ -320,6 +376,12 @@ pub struct InferenceSourceUpdate {
     /// 47a5d6b), which keeps it as the account's way whatever the kind.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub via: Option<Via>,
+    /// Default for new Bots, sent whole when the app changes it, only to a server whose read
+    /// carries the key, and `null` to take it away (opengrok-server PR #322 new-bot-default, not
+    /// yet on main: `apply` in `crates/opengrok-harness/src/local_proxy.rs`): absent keeps it,
+    /// `null` clears it, and a value replaces it whole.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub new_bot_default: Option<Option<NewBotDefault>>,
 }
 
 /// Which door one reply came through, as the run's `opengrok.inferenceSource` CUSTOM says:
@@ -524,6 +586,7 @@ mod tests {
                 has_api_key: false,
                 via: None,
                 relay: None,
+                new_bot_default: None,
             }
         );
         let unset: InferenceSource = serde_json::from_value(json!({
@@ -551,7 +614,11 @@ mod tests {
     #[test]
     fn a_put_body_carries_no_loopback_field_and_no_relay_model() {
         for kind in InferenceKind::ALL {
-            let bare = InferenceSourceUpdate { kind, via: None };
+            let bare = InferenceSourceUpdate {
+                kind,
+                via: None,
+                new_bot_default: None,
+            };
             assert_eq!(
                 serde_json::to_value(&bare).unwrap(),
                 json!({"kind": kind.word()}),
@@ -561,6 +628,7 @@ mod tests {
         let moved = InferenceSourceUpdate {
             kind: InferenceKind::Gateway,
             via: Some(Via::Mac),
+            new_bot_default: None,
         };
         let body = serde_json::to_value(&moved).unwrap();
         assert_eq!(body, json!({"kind": "gateway", "via": "mac"}));
@@ -687,6 +755,79 @@ mod tests {
         for unknown in ["helper", "Mac", "", "relay", "Computer"] {
             assert_eq!(Via::from_word(unknown), None, "{unknown:?}");
         }
+    }
+
+    /// The default for new Bots reads as opengrok-server PR #322 (new-bot-default, not yet on
+    /// main) writes it on the account's setting: left out by a server that keeps none, `null`
+    /// while none is set, and whole once set, an effort left out or `null` read as `inherit`. A
+    /// `PUT` names it only when the app changes it: whole, or `null` to take it away, with the
+    /// kind the server keeps and nothing else.
+    #[test]
+    fn the_default_for_new_bots_reads_and_puts_as_the_server_writes_it() {
+        let read = |default: Option<Value>| -> InferenceSource {
+            let mut body = json!({
+                "kind": "gateway", "via": "loopback", "baseUrl": null, "localModel": null,
+                "healthy": false, "hasApiKey": false,
+                "relay": {"connected": false, "machineId": null, "machineLabel": null,
+                          "localModel": null}
+            });
+            if let Some(default) = default {
+                body["newBotDefault"] = default;
+            }
+            serde_json::from_value(body).expect("a setting")
+        };
+        assert_eq!(read(None).new_bot_default, None, "a server that keeps none");
+        assert_eq!(read(Some(Value::Null)).new_bot_default, Some(None));
+        // As the branch's own recording of a pick words it
+        // (`PUT__account_inference-source/200-a_person_names_the_model_new_bots_are_born_on`).
+        let luna = NewBotDefault {
+            source: InferenceKind::LocalProxy,
+            model: "gpt-6-sol--fast".into(),
+            effort: "high".into(),
+        };
+        assert_eq!(
+            read(Some(
+                json!({"source": "local_proxy", "model": "gpt-6-sol--fast", "effort": "high"})
+            ))
+            .new_bot_default,
+            Some(Some(luna.clone()))
+        );
+        for left in [
+            json!({"source": "gateway", "model": "xai/grok-4.7"}),
+            json!({"source": "gateway", "model": "xai/grok-4.7", "effort": null}),
+        ] {
+            assert_eq!(
+                read(Some(left.clone()))
+                    .new_bot_default
+                    .flatten()
+                    .map(|default| default.effort),
+                Some("inherit".to_string()),
+                "{left}"
+            );
+        }
+
+        let put = |new_bot_default| {
+            serde_json::to_value(InferenceSourceUpdate {
+                kind: InferenceKind::Gateway,
+                via: None,
+                new_bot_default,
+            })
+            .unwrap()
+        };
+        assert_eq!(put(None), json!({"kind": "gateway"}), "left alone, kept");
+        assert_eq!(
+            put(Some(None)),
+            json!({"kind": "gateway", "newBotDefault": null}),
+            "taken away"
+        );
+        assert_eq!(
+            put(Some(Some(luna))),
+            json!({
+                "kind": "gateway",
+                "newBotDefault": {"source": "local_proxy", "model": "gpt-6-sol--fast", "effort": "high"}
+            }),
+            "whole"
+        );
     }
 
     /// `computer`, the name the server is being asked to take for `mac`, reads as the relay
