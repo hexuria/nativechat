@@ -82,7 +82,7 @@ impl AgentSettings {
             state.set_auto_grow(3, 7, cx);
             state
         });
-        let model_card = cx.new(|cx| ModelPicker::new(state.clone(), cx));
+        let model_card = cx.new(|cx| ModelPicker::new(window, state.clone(), cx));
         cx.observe(&state, |this, state, cx| {
             // A driver's Save, which comes by way of the app because the button and the fields
             // it sends are this pane's. Only for the bot the fields were filled for: a switch the

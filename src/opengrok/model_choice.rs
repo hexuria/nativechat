@@ -32,7 +32,7 @@ use super::{
 pub const FAST_SUFFIX: &str = "--fast";
 
 /// What a gateway id ends with when it is a seat billed to a subscription (`xai/grok-4.6@sub`).
-/// The Server group is the server's paid keys, and a seat is not one, so it is not listed there.
+/// The Gateway group is the server's paid keys, and a seat is not one, so it is not listed there.
 const SEAT_SUFFIX: &str = "@sub";
 
 /// What a gateway id ends with when it pins that same model to an API-key credential
@@ -42,9 +42,10 @@ const SEAT_SUFFIX: &str = "@sub";
 /// that id. A pin whose unqualified id is absent stays, as the only spelling the list offers.
 const API_SUFFIX: &str = "@api";
 
-/// The Bot's list's two groups, as they read.
-pub const PLAN_GROUP: &str = "Your plan · opencodex";
-pub const SERVER_GROUP: &str = "Server · paid keys";
+/// The Bot's list's two groups, as they read: the person's own plan, which opencodex serves
+/// (`local_proxy`), and the server's paid keys, through its gateway.
+pub const SUBSCRIPTION_GROUP: &str = "Subscription";
+pub const GATEWAY_GROUP: &str = "Gateway";
 
 /// Why ⚡ is dead: the list holds no fast twin of the model, or does not hold the model at all.
 pub const FAST_NO_TWIN: &str = "The server lists no fast version of this model.";
@@ -64,7 +65,7 @@ pub const NO_MODEL: &str = "No model";
 /// What the list says under its rows for a Bot whose own door is the person's plan
 /// ([`ModelPick::routines`]).
 pub const ROUTINES_ON_PLAN: &str = "This Bot's routines won't run while it answers on your own \
-                                    plan: routines run on the server's keys. Pick a Server model \
+                                    plan: routines run on the server's keys. Pick a Gateway model \
                                     to run it on a schedule.";
 
 /// Whether an id is a model's fast tier.
@@ -106,6 +107,22 @@ impl ModelChoice {
         id == self.base_id
             || (self.has_fast && id.strip_suffix(FAST_SUFFIX) == Some(self.base_id.as_str()))
     }
+
+    /// The row is one a search for `query` leaves: its name as the list reads it, or its id,
+    /// holds what was typed, whatever the case. Nothing typed leaves every row.
+    pub fn matches(&self, query: &str) -> bool {
+        holds_query(&[&self.label, &self.base_id], query)
+    }
+}
+
+/// Whether any of `texts` holds `query`, whatever the case and without the spaces around what was
+/// typed. Nothing typed is held by everything.
+fn holds_query(texts: &[&str], query: &str) -> bool {
+    let query = query.trim().to_lowercase();
+    query.is_empty()
+        || texts
+            .iter()
+            .any(|text| text.to_lowercase().contains(&query))
 }
 
 /// One group of the list: the models of one door, in the server's order.
@@ -118,11 +135,72 @@ pub struct ChoiceGroup {
 impl ChoiceGroup {
     /// The group's heading.
     pub fn title(&self) -> &'static str {
-        match self.source {
-            InferenceKind::LocalProxy => PLAN_GROUP,
-            InferenceKind::Gateway => SERVER_GROUP,
+        group_title(self.source)
+    }
+}
+
+/// A group's heading, by the door its models are served through.
+pub fn group_title(source: InferenceKind) -> &'static str {
+    match source {
+        InferenceKind::LocalProxy => SUBSCRIPTION_GROUP,
+        InferenceKind::Gateway => GATEWAY_GROUP,
+    }
+}
+
+/// How many models the groups hold between them.
+pub fn row_count(groups: &[ChoiceGroup]) -> usize {
+    groups.iter().map(|group| group.rows.len()).sum()
+}
+
+/// How many models the list shows at a time. A group's heading is not one of them: it is drawn
+/// over the first of its group's models in view, and the window still shows this many models.
+pub const LIST_ROWS: usize = 5;
+
+/// One line of the list's window ([`list_window`]): a group's heading, or a model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListLine<'a> {
+    Heading(InferenceKind),
+    Row(&'a ModelChoice),
+}
+
+/// The furthest the window can start among `rows` models: where it shows the last [`LIST_ROWS`].
+pub fn last_window_start(rows: usize) -> usize {
+    rows.saturating_sub(LIST_ROWS)
+}
+
+/// The list's window from its `start`th model, counting through the groups in order: at most
+/// [`LIST_ROWS`] models, and over the first of each group's models in view the group's heading,
+/// which is not counted, so the window shows as many models wherever a group begins. A start
+/// past the last whole window is taken back to it, so a list that shrank under the window still
+/// fills it.
+pub fn list_window(groups: &[ChoiceGroup], start: usize) -> Vec<ListLine<'_>> {
+    let start = start.min(last_window_start(row_count(groups)));
+    let in_view = start..start + LIST_ROWS;
+    let mut lines = Vec::new();
+    let mut at = 0;
+    for group in groups {
+        let mut headed = false;
+        for row in &group.rows {
+            if in_view.contains(&at) {
+                if !headed {
+                    lines.push(ListLine::Heading(group.source));
+                    headed = true;
+                }
+                lines.push(ListLine::Row(row));
+            }
+            at += 1;
         }
     }
+    lines
+}
+
+/// Where the window starts as the list opens, among `rows` models, with the one at `selected`
+/// ticked: with that model in view, as near the window's middle as the list allows, and at the
+/// top where none is ticked.
+pub fn window_opening_on(rows: usize, selected: Option<usize>) -> usize {
+    selected
+        .map_or(0, |at| at.saturating_sub(LIST_ROWS / 2))
+        .min(last_window_start(rows))
 }
 
 /// The rows a list of ids makes, in the list's order: a model and its fast twin are one row, at
@@ -147,7 +225,7 @@ pub fn fold<'a>(source: InferenceKind, ids: impl IntoIterator<Item = &'a str>) -
     rows
 }
 
-/// The Server group: the gateway's routes as `GET /models` lists them, in its order, less the
+/// The Gateway group: the gateway's routes as `GET /models` lists them, in its order, less the
 /// seats billed to a subscription and less an `@api` pin of a model the list also names
 /// without one.
 pub fn server_choices(catalogue: &ModelCatalogue) -> Vec<ModelChoice> {
@@ -183,8 +261,8 @@ fn api_pin_of_a_listed_model(id: &str, listed: &[&str]) -> bool {
         .any(|other| without_fast(other).eq_ignore_ascii_case(unqualified))
 }
 
-/// The plan group: the person's plan's models as `AppState::plan_models` gives them for the
-/// account's way to the plan, already held to the server's allowlist.
+/// The Subscription group: the person's plan's models as `AppState::plan_models` gives them for
+/// the account's way to the plan, already held to the server's allowlist.
 pub fn plan_choices(ids: &[String]) -> Vec<ModelChoice> {
     fold(InferenceKind::LocalProxy, ids.iter().map(String::as_str))
 }
@@ -380,10 +458,10 @@ pub struct ModelPick {
     pub effort: String,
     /// The server keeps an effort: the Bot's row carries one (opengrok-server#271).
     pub effort_kept: bool,
-    /// The list, the plan's group first, each group only while it has rows.
+    /// The list, the Subscription group first, each group only while it has rows.
     pub groups: Vec<ChoiceGroup>,
-    /// The line that takes the plan group's place on a server without per-Bot doors, while the
-    /// account is on the person's plan.
+    /// The line that takes the Subscription group's place on a server without per-Bot doors,
+    /// while the account is on the person's plan.
     pub account_plan: Option<AccountPlan>,
     /// The line that says this Bot's routines won't run ([`ROUTINES_ON_PLAN`]). A routine runs
     /// on the server's keys, and the person chose their own plan for a Bot whose own door is the
@@ -545,6 +623,46 @@ impl ModelPick {
     pub fn row(&self, source: InferenceKind, base_id: &str) -> Option<&ModelChoice> {
         self.rows()
             .find(|row| row.source == source && row.base_id == base_id)
+    }
+
+    /// The list as a search for `query` leaves it, the Subscription group first: each group with
+    /// only the models the search leaves ([`ModelChoice::matches`]), and no group with none.
+    /// Nothing typed leaves the whole list.
+    pub fn search(&self, query: &str) -> Vec<ChoiceGroup> {
+        self.groups
+            .iter()
+            .map(|group| ChoiceGroup {
+                source: group.source,
+                rows: group
+                    .rows
+                    .iter()
+                    .filter(|row| row.matches(query))
+                    .cloned()
+                    .collect(),
+            })
+            .filter(|group| !group.rows.is_empty())
+            .collect()
+    }
+
+    /// The account's plan line ([`Self::account_plan`]) while a search for `query` leaves it: the
+    /// model's name as the line reads it, or its id, holds what was typed. It is no row to pick,
+    /// but it stands where the Subscription group would, and goes as the group's rows would.
+    pub fn plan_line(&self, query: &str) -> Option<&AccountPlan> {
+        self.account_plan.as_ref().filter(|plan| {
+            let id = plan.model.as_deref().unwrap_or_default();
+            let name = plan
+                .model
+                .as_deref()
+                .map_or_else(|| NO_MODEL.to_string(), base_label);
+            holds_query(&[&name, id], query)
+        })
+    }
+
+    /// Where the list's window starts as it opens, before anything is typed: with the model that
+    /// answers in view ([`window_opening_on`]).
+    pub fn opening_window_start(&self) -> usize {
+        let selected = self.rows().position(|row| self.is_current(row));
+        window_opening_on(self.rows().count(), selected)
     }
 
     /// Whether the list ticks this row.
@@ -815,8 +933,8 @@ mod tests {
         );
     }
 
-    /// The Server group is the gateway's routes, in the server's order, less the seats billed to
-    /// a subscription, and never one of the plan's models.
+    /// The Gateway group is the gateway's routes, in the server's order, less the seats billed
+    /// to a subscription, and never one of the plan's models.
     #[test]
     fn a_seat_billed_to_a_subscription_is_not_a_server_model() {
         let mut listed = catalogue(&[
@@ -843,6 +961,215 @@ mod tests {
                 ("oag/fast", true)
             ]
         );
+    }
+
+    /// The list's two groups are named for whose they are, exactly: "Subscription", the person's
+    /// own plan through opencodex (`local_proxy`), and "Gateway", the server's paid keys; the
+    /// Subscription group first.
+    #[test]
+    fn the_groups_are_subscription_and_gateway() {
+        assert_eq!(
+            [
+                group_title(InferenceKind::LocalProxy),
+                group_title(InferenceKind::Gateway)
+            ],
+            ["Subscription", "Gateway"]
+        );
+        let own = bot(Some(json!("local_proxy")), "gpt-6-luna", Some("medium"));
+        let pick = bot_pick(
+            &own,
+            Some(&account(InferenceKind::Gateway, None)),
+            &catalogue(SERVER),
+            plan(PLAN),
+        );
+        assert_eq!(
+            pick.groups
+                .iter()
+                .map(ChoiceGroup::title)
+                .collect::<Vec<_>>(),
+            [SUBSCRIPTION_GROUP, GATEWAY_GROUP]
+        );
+    }
+
+    /// A Bot on its own plan whose plan lists the same Grok as the gateway, for a search to find
+    /// in both groups.
+    fn searched_pick() -> ModelPick {
+        let own = bot(Some(json!("local_proxy")), "gpt-6-luna", Some("medium"));
+        bot_pick(
+            &own,
+            Some(&account(InferenceKind::Gateway, None)),
+            &catalogue(&["oag/cheap", "xai/grok-4.7"]),
+            plan(&["gpt-6-luna", "gpt-6-luna--fast", "gpt-5.6-sol", "grok-4.7"]),
+        )
+    }
+
+    /// The search filters both groups at once, whatever the case, by the name a row reads as and
+    /// by its raw id; a group the search leaves nothing of goes, heading and all; and nothing
+    /// typed, or only spaces, leaves the whole list.
+    #[test]
+    fn a_search_filters_both_groups_by_name_and_id_whatever_the_case() {
+        let pick = searched_pick();
+        let found = |query: &str| -> Vec<(InferenceKind, Vec<String>)> {
+            pick.search(query)
+                .into_iter()
+                .map(|group| {
+                    (
+                        group.source,
+                        group.rows.into_iter().map(|row| row.base_id).collect(),
+                    )
+                })
+                .collect()
+        };
+        let both = vec![
+            (InferenceKind::LocalProxy, vec!["grok-4.7".to_string()]),
+            (InferenceKind::Gateway, vec!["xai/grok-4.7".to_string()]),
+        ];
+        assert_eq!(found("grok"), both, "by name, in both groups at once");
+        assert_eq!(found("GROK 4.7"), both, "whatever the case");
+        assert_eq!(
+            found("xai/"),
+            [(InferenceKind::Gateway, vec!["xai/grok-4.7".to_string()])],
+            "by the raw id, which the name does not hold"
+        );
+        assert_eq!(
+            found("Luna"),
+            [(InferenceKind::LocalProxy, vec!["gpt-6-luna".to_string()])]
+        );
+        assert_eq!(
+            found("cheap (auto)"),
+            [(InferenceKind::Gateway, vec!["oag/cheap".to_string()])]
+        );
+        assert_eq!(
+            found("gpt"),
+            [(
+                InferenceKind::LocalProxy,
+                vec!["gpt-6-luna".to_string(), "gpt-5.6-sol".to_string()]
+            )],
+            "a group with nothing left goes"
+        );
+        assert!(found("claude").is_empty());
+        for nothing in ["", "   "] {
+            assert_eq!(pick.search(nothing), pick.groups, "{nothing:?}");
+        }
+    }
+
+    /// A list of `plan` Subscription models and `keys` Gateway ones, named by their places.
+    fn long_list(plan: usize, keys: usize) -> Vec<ChoiceGroup> {
+        let rows = |source, count: usize, word: &str| -> Vec<ModelChoice> {
+            (0..count)
+                .map(|at| ModelChoice {
+                    source,
+                    base_id: format!("{word}-{at}"),
+                    has_fast: false,
+                    label: format!("{word} {at}"),
+                })
+                .collect()
+        };
+        vec![
+            ChoiceGroup {
+                source: InferenceKind::LocalProxy,
+                rows: rows(InferenceKind::LocalProxy, plan, "s"),
+            },
+            ChoiceGroup {
+                source: InferenceKind::Gateway,
+                rows: rows(InferenceKind::Gateway, keys, "g"),
+            },
+        ]
+    }
+
+    /// The window shows five models at a time, whatever the headings: each group's heading is
+    /// drawn over its first model in view, the group's first or not, and is never one of the
+    /// five. A start past the last whole window shows the last five.
+    #[test]
+    fn the_window_shows_five_models_and_its_headings_are_not_among_them() {
+        let groups = long_list(4, 6);
+        let shown = |start: usize| -> Vec<String> {
+            list_window(&groups, start)
+                .into_iter()
+                .map(|line| match line {
+                    ListLine::Heading(source) => group_title(source).to_string(),
+                    ListLine::Row(row) => row.base_id.clone(),
+                })
+                .collect()
+        };
+        assert_eq!(LIST_ROWS, 5);
+        assert_eq!(
+            shown(0),
+            ["Subscription", "s-0", "s-1", "s-2", "s-3", "Gateway", "g-0"]
+        );
+        assert_eq!(
+            shown(3),
+            ["Subscription", "s-3", "Gateway", "g-0", "g-1", "g-2", "g-3"]
+        );
+        assert_eq!(
+            shown(5),
+            ["Gateway", "g-1", "g-2", "g-3", "g-4", "g-5"],
+            "headed by its group, though not at the group's first model"
+        );
+        assert_eq!(shown(9), shown(5), "the last whole window");
+        for start in 0..=9 {
+            let models = list_window(&groups, start)
+                .into_iter()
+                .filter(|line| matches!(line, ListLine::Row(_)))
+                .count();
+            assert_eq!(models, LIST_ROWS, "from {start}");
+        }
+        // A list of five or fewer shows them all, from the top, wherever the window was.
+        let short = long_list(2, 1);
+        assert_eq!(list_window(&short, 4), list_window(&short, 0));
+        assert_eq!(
+            list_window(&short, 0).len(),
+            5,
+            "three models, two headings"
+        );
+        assert_eq!(last_window_start(3), 0);
+        assert!(list_window(&[], 0).is_empty());
+    }
+
+    /// The list opens with the model that answers in view, as near the window's middle as the
+    /// list allows, and at the top where none answers.
+    #[test]
+    fn the_list_opens_with_the_ticked_model_in_view() {
+        assert_eq!(window_opening_on(10, None), 0);
+        assert_eq!(window_opening_on(10, Some(0)), 0);
+        assert_eq!(window_opening_on(10, Some(1)), 0);
+        assert_eq!(window_opening_on(10, Some(4)), 2, "in the middle");
+        assert_eq!(
+            window_opening_on(10, Some(9)),
+            5,
+            "at the bottom of the last"
+        );
+        assert_eq!(window_opening_on(4, Some(3)), 0, "all in view");
+
+        // A Bot on the eighth of nine gateway models opens on a window that holds it.
+        let ids: Vec<String> = (0..9).map(|at| format!("oag/route-{at}")).collect();
+        let listed: Vec<&str> = ids.iter().map(String::as_str).collect();
+        let pinned = bot(Some(json!("gateway")), "oag/route-7", Some("medium"));
+        let pick = bot_pick(&pinned, None, &catalogue(&listed), plan(PLAN));
+        let start = pick.opening_window_start();
+        assert_eq!(start, 4);
+        let groups = pick.search("");
+        let in_view: Vec<&str> = list_window(&groups, start)
+            .into_iter()
+            .filter_map(|line| match line {
+                ListLine::Row(row) => Some(row.base_id.as_str()),
+                ListLine::Heading(_) => None,
+            })
+            .collect();
+        assert!(in_view.contains(&"oag/route-7"), "{in_view:?}");
+    }
+
+    /// On a server without per-Bot doors the account's plan line stands where the Subscription
+    /// group would, and a search leaves it or takes it away as it would the group's rows.
+    #[test]
+    fn a_search_takes_the_accounts_plan_line_as_it_would_a_row() {
+        let old = bot(None, "oag/cheap", Some("medium"));
+        let on_plan = account(InferenceKind::LocalProxy, Some("gpt-5-codex"));
+        let pick = bot_pick(&old, Some(&on_plan), &catalogue(SERVER), plan(PLAN));
+        assert!(pick.plan_line("").is_some());
+        assert!(pick.plan_line("codex").is_some(), "by its name");
+        assert!(pick.plan_line("GPT-5-CODEX").is_some(), "by its id");
+        assert!(pick.plan_line("cheap").is_none());
     }
 
     /// The slider's five stops are the server's words, both ways; Default is `inherit`, and a
@@ -900,7 +1227,7 @@ mod tests {
                 .iter()
                 .map(ChoiceGroup::title)
                 .collect::<Vec<_>>(),
-            [PLAN_GROUP, SERVER_GROUP]
+            [SUBSCRIPTION_GROUP, GATEWAY_GROUP]
         );
         let ticked: Vec<&str> = pick
             .rows()
@@ -946,7 +1273,7 @@ mod tests {
 
     /// A pick of a row sends its model with its door, and only what changes: the door the Bot
     /// is on already is not sent again. ⚡ stays on where the new model has a twin and goes where
-    /// it has none, and a Server model has no ⚡ to offer.
+    /// it has none, and a Gateway model has no ⚡ to offer.
     #[test]
     fn a_pick_sends_the_rows_door_and_model_and_keeps_fast_where_it_can() {
         let fast = bot(Some(json!("local_proxy")), "gpt-6-luna--fast", Some("high"));
@@ -990,7 +1317,7 @@ mod tests {
             "not in that group"
         );
 
-        // On a Server model: no twin in the list, so ⚡ is dead and says why.
+        // On a Gateway model: no twin in the list, so ⚡ is dead and says why.
         let keys = bot(Some(json!("gateway")), "xai/grok-4.7", Some("high"));
         let pick = bot_pick(
             &keys,
@@ -1182,9 +1509,9 @@ mod tests {
         assert_eq!(pick.fast_blocked, Some(FAST_NO_TWIN));
     }
 
-    /// Where the account's way to the plan is the person's Mac, the plan group is the models a
-    /// Mac lists and the account's plan model is the relay's; a way this app cannot name offers
-    /// no plan group at all rather than guess one.
+    /// Where the account's way to the plan is the person's Mac, the Subscription group is the
+    /// models a Mac lists and the account's plan model is the relay's; a way this app cannot name
+    /// offers no Subscription group at all rather than guess one.
     #[test]
     fn through_the_mac_the_plan_is_the_macs_models_and_model() {
         let relayed = |via: &str| InferenceSource {
@@ -1263,7 +1590,7 @@ mod tests {
         assert_eq!(
             ROUTINES_ON_PLAN,
             "This Bot's routines won't run while it answers on your own plan: routines run on \
-             the server's keys. Pick a Server model to run it on a schedule."
+             the server's keys. Pick a Gateway model to run it on a schedule."
         );
         let on_plan = account(InferenceKind::LocalProxy, Some("gpt-6-luna"));
         let on_keys = account(InferenceKind::Gateway, None);

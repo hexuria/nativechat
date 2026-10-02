@@ -167,17 +167,28 @@
 //! `agent-model-open-list` (named by the model; it opens the list) and `agent-model-reset` (↺:
 //! Default effort and ⚡ off, the model left alone; live while there is something to put back).
 //! While the list shows, those give way to `agent-model-open-list` as the heading back (state
-//! `expanded`) and to the rows of `agent-model-list` (always in the tree, valued by how many
-//! models it offers): an `agent-model-row-{source}-{id}` per model, by its door's wire word and
-//! the id a pick pins with ⚡ off (valued by its door's word, state `selected` on the one that
-//! answers and `fast` where the list holds its fast twin; a click puts the Bot on it, fast where
-//! ⚡ is on and it has a twin, and goes back to the controls), `agent-model-plan` (on a server
-//! whose rows carry no `source`, while the account is on the person's plan: the account's plan
-//! model, which answers for every Bot there; a line, not a row), `agent-model-routines` (on a Bot
-//! whose own door is the person's plan, whatever it is pinned to: the line saying its routines
-//! won't run, since they run on the server's paid keys and the server refuses every routine of
-//! such a Bot (opengrok-server #304), and to pick a Server model to run it on a schedule; a line,
-//! not a row) and `agent-model-note` (the server's word on why the list is not fuller).
+//! `expanded`), `agent-model-search` (the search box at the top of the list, a textbox valued by
+//! what is typed: `set_value` writes it, `type` adds to it, `key` takes Backspace and Enter; it
+//! filters both groups at once, whatever the case, by a model's name and by its raw id, and the
+//! list opens with it empty) and `agent-model-list` (always in the tree, valued by how many
+//! models the search leaves, all of them while nothing is typed). The list holds what its window
+//! draws: at most five models at a time, an `agent-model-row-{source}-{id}` each, by its door's
+//! wire word and the id a pick pins with ⚡ off (valued by its door's word, state `selected` on
+//! the one that answers and `fast` where the list holds its fast twin; a click puts the Bot on
+//! it, fast where ⚡ is on and it has a twin, and goes back to the controls), with an
+//! `agent-model-group-{source}` heading over each group's first model in view, which is not one
+//! of the five: `agent-model-group-local_proxy` is "Subscription", the person's own plan, and
+//! `agent-model-group-gateway` is "Gateway", the server's paid keys. The window opens with the
+//! model that answers in view, and the wheel scrolls it; a model out of view, or one the search
+//! leaves out, is refused, and the search box brings it into view. Then `agent-model-plan` (on a
+//! server whose rows carry no `source`, while the account is on the person's plan: the account's
+//! plan model, which answers for every Bot there; a line, not a row, which the search leaves or
+//! takes away as it would a row), `agent-model-no-match` ("No model matches", while the search
+//! leaves nothing of a list that has some), `agent-model-routines` (on a Bot whose own door is
+//! the person's plan, whatever it is pinned to: the line saying its routines won't run, since
+//! they run on the server's paid keys and the server refuses every routine of such a Bot
+//! (opengrok-server #304), and to pick a Gateway model to run it on a schedule; a line, not a
+//! row) and `agent-model-note` (the server's word on why the list is not fuller).
 //! `agent-model-error` is the server's words for the last change it refused. Every change is
 //! saved on the Bot at once, `source`, `model` and `effort` on `PATCH /coworkers/{id}`
 //! (opengrok-server main d6f640e (#307, after #304), pin bf99845). Invoke `model.picker`,

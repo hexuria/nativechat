@@ -2882,8 +2882,9 @@ fn apply_reload(
 /// An empty catalogue with no note is a real answer — this key routes to nothing — and is taken.
 ///
 /// Each door's list is kept by the same rule, apart, because `/models` answers for two machines
-/// at once: the gateway's routes, the Server group of a Bot's model picker, and the person's own
-/// plan's, listed by opencodex, which Settings → Reply source and the picker's plan group offer.
+/// at once: the gateway's routes, the Gateway group of a Bot's model picker, and the person's own
+/// plan's, listed by opencodex, which Settings → Reply source and the picker's Subscription group
+/// offer.
 /// Either can be down while the other
 /// answers, and a list that came back with only the other's entries must not empty this one's.
 /// The gateway's reason is the note; opencodex's is `localProxy.healthy: false`. A plan list that
@@ -4733,6 +4734,13 @@ pub struct AppState {
     pub model_picker_open: bool,
     /// The open popover shows its list of models, grouped by door, instead of its controls.
     pub model_list_open: bool,
+    /// What is typed in the list's search box: the list shows only the models whose name or id
+    /// holds it, whatever the case (`ModelPick::search`). Emptied whenever the list opens or
+    /// shuts, so it opens afresh each time.
+    pub model_search: String,
+    /// The first model in the list's window, among those the search leaves: the list shows
+    /// `opengrok::LIST_ROWS` from it (`opengrok::list_window`), and the wheel moves it.
+    pub model_list_start: usize,
     /// The server's words for the last change the picker made that did not go through, with the
     /// Bot it was for. The popover says it under its controls until the next change is sent.
     pub model_pick_note: Option<(String, String)>,
@@ -5413,6 +5421,8 @@ impl AppState {
             routine_resyncs: HashMap::new(),
             model_picker_open: false,
             model_list_open: false,
+            model_search: String::new(),
+            model_list_start: 0,
             model_pick_note: None,
             avatar_editor_open: false,
             hiring: false,
@@ -6551,7 +6561,7 @@ impl AppState {
         self.reply_source_generation += 1;
         // The picker was open on one of their Bots, and what it last said was about theirs.
         self.model_picker_open = false;
-        self.model_list_open = false;
+        self.shut_model_list();
         self.model_pick_note = None;
         // The relay answered for them, and stops with every call it was answering; the switch was
         // theirs, and is read again for whoever signs in next.
@@ -8997,7 +9007,7 @@ impl AppState {
         self.set_right_pane(RightPane::Closed, cx);
         self.computer_view = ComputerView::Overview;
         self.model_picker_open = false;
-        self.model_list_open = false;
+        self.shut_model_list();
         self.avatar_editor_open = false;
         self.record_nav();
         cx.notify();
@@ -9040,7 +9050,7 @@ impl AppState {
         self.computer_view = ComputerView::Overview;
         // The Model card goes with the Bot's settings, and its popover with it.
         self.model_picker_open = false;
-        self.model_list_open = false;
+        self.shut_model_list();
         self.avatar_editor_open = false;
         self.record_nav();
         cx.notify();
@@ -11586,7 +11596,7 @@ impl AppState {
             return;
         }
         self.model_picker_open = false;
-        self.model_list_open = false;
+        self.shut_model_list();
         self.avatar_editor_open = false;
         self.emoji_picker = None;
         self.hidden_bots_open = false;
@@ -11909,7 +11919,7 @@ impl AppState {
         // over the other.
         if open {
             self.model_picker_open = false;
-            self.model_list_open = false;
+            self.shut_model_list();
         }
         cx.notify();
     }
@@ -12020,7 +12030,7 @@ impl AppState {
             return;
         }
         self.model_picker_open = open;
-        self.model_list_open = false;
+        self.shut_model_list();
         if open {
             self.avatar_editor_open = false;
         }
@@ -12034,10 +12044,83 @@ impl AppState {
 
     /// The model's name in the popover opens its list; the list's heading goes back.
     pub fn toggle_model_list(&mut self, cx: &mut Context<Self>) {
-        if self.model_picker_open {
-            self.model_list_open = !self.model_list_open;
+        if self.note_model_list_toggled() {
             cx.notify();
         }
+    }
+
+    /// [`Self::toggle_model_list`] without the repaint: `false` while the popover is shut. The list
+    /// opens with nothing typed in its search box and the model that answers in view, wherever it
+    /// was left.
+    fn note_model_list_toggled(&mut self) -> bool {
+        if !self.model_picker_open {
+            return false;
+        }
+        if self.model_list_open {
+            self.shut_model_list();
+        } else {
+            self.model_list_open = true;
+            self.model_search.clear();
+            self.model_list_start = self
+                .model_pick()
+                .map_or(0, |pick| pick.opening_window_start());
+        }
+        true
+    }
+
+    /// The list goes back to the controls, and what was typed in its search box and how far it
+    /// was scrolled go with it.
+    fn shut_model_list(&mut self) {
+        self.model_list_open = false;
+        self.model_search.clear();
+        self.model_list_start = 0;
+    }
+
+    /// What the list's search box holds now. The list shows only the models it leaves, from the
+    /// top.
+    pub fn set_model_search(&mut self, query: String, cx: &mut Context<Self>) {
+        if self.note_model_search(query) {
+            cx.notify();
+        }
+    }
+
+    /// Only while the list shows, as the box is only there then: a field put back to empty as the
+    /// list shuts is no search.
+    fn note_model_search(&mut self, query: String) -> bool {
+        if !self.model_list_open || self.model_search == query {
+            return false;
+        }
+        self.model_search = query;
+        self.model_list_start = 0;
+        true
+    }
+
+    /// The wheel moved the list's window by `rows` models, toward the end above zero. It stops at
+    /// either end of what the search leaves.
+    pub fn scroll_model_list(&mut self, rows: isize, cx: &mut Context<Self>) {
+        if self.note_model_list_scroll(rows) {
+            cx.notify();
+        }
+    }
+
+    fn note_model_list_scroll(&mut self, rows: isize) -> bool {
+        if !self.model_list_open {
+            return false;
+        }
+        let Some(pick) = self.model_pick() else {
+            return false;
+        };
+        let last = crate::opengrok::last_window_start(crate::opengrok::row_count(
+            &pick.search(&self.model_search),
+        ));
+        let start = self
+            .model_list_start
+            .min(last)
+            .saturating_add_signed(rows)
+            .min(last);
+        let moved = start != self.model_list_start;
+        self.model_list_start = start;
+        moved
     }
 
     /// A row of the list picked: the Bot goes onto its model at once, with its door, and the
@@ -12046,7 +12129,7 @@ impl AppState {
         let patch = self
             .model_pick()
             .and_then(|pick| pick.pick_patch(source, base_id).ok().flatten());
-        self.model_list_open = false;
+        self.shut_model_list();
         match patch {
             Some(patch) => self.save_model_pick(patch, cx),
             None => cx.notify(),
@@ -33765,7 +33848,9 @@ mod tests {
     /// no door per Bot, where the account's plan model answers.
     #[test]
     fn the_open_bots_picker_is_its_row_the_accounts_door_and_the_lists() {
-        use crate::opengrok::{CoworkerSource, FAST_ACCOUNT_PLAN, PLAN_GROUP, SERVER_GROUP};
+        use crate::opengrok::{
+            CoworkerSource, FAST_ACCOUNT_PLAN, GATEWAY_GROUP, SUBSCRIPTION_GROUP,
+        };
         let mut state = signed_in_state();
         assert!(state.model_pick().is_none(), "no Bot open");
         state.coworkers = vec![
@@ -33814,8 +33899,8 @@ mod tests {
         assert_eq!(
             groups,
             vec![
-                (PLAN_GROUP, vec!["gpt-6-luna"]),
-                (SERVER_GROUP, vec!["oag/cheap"]),
+                (SUBSCRIPTION_GROUP, vec!["gpt-6-luna"]),
+                (GATEWAY_GROUP, vec!["oag/cheap"]),
             ]
         );
         assert_eq!(pick.fast_blocked, None);
@@ -33830,10 +33915,88 @@ mod tests {
                 .iter()
                 .map(|group| group.title())
                 .collect::<Vec<_>>(),
-            [SERVER_GROUP]
+            [GATEWAY_GROUP]
         );
         assert_eq!(pick.fast_blocked, Some(FAST_ACCOUNT_PLAN));
         assert!(pick.account_plan.is_some());
+    }
+
+    /// The list opens with nothing typed and the model that answers in view, however far down
+    /// it is; a search starts it from the top; the wheel moves it a model at a time and stops at
+    /// either end of what the search leaves; and shutting the list forgets the search and where it
+    /// was. None of it moves while the popover or the list is shut.
+    #[test]
+    fn the_model_list_opens_on_the_model_that_answers_and_a_search_starts_from_the_top() {
+        use crate::opengrok::{ListLine, list_window};
+        let mut state = signed_in_state();
+        let routes: Vec<String> = (0..9).map(|at| format!("oag/route-{at}")).collect();
+        state.coworkers = vec![
+            serde_json::from_value(json!({
+                "id": "cw_1", "name": "Ada", "model": "oag/route-7", "effort": "low",
+                "source": "gateway"
+            }))
+            .expect("a row"),
+        ];
+        state.active_coworker_id = Some("cw_1".into());
+        state.model_catalogue = ModelCatalogue {
+            models: routes
+                .iter()
+                .map(|id| ModelEntry {
+                    id: id.clone(),
+                    source: Some("gateway".into()),
+                    via: None,
+                })
+                .collect(),
+            note: None,
+            local_proxy: None,
+        };
+        assert!(!state.note_model_list_toggled(), "the popover is shut");
+        assert!(!state.note_model_search("route".into()));
+        state.model_picker_open = true;
+        assert!(state.note_model_list_toggled());
+        assert!(state.model_list_open);
+        assert_eq!(state.model_search, "");
+        let pick = state.model_pick().expect("a Bot is open");
+        let in_view = |state: &AppState| -> Vec<String> {
+            list_window(&pick.search(&state.model_search), state.model_list_start)
+                .into_iter()
+                .filter_map(|line| match line {
+                    ListLine::Row(row) => Some(row.base_id.clone()),
+                    ListLine::Heading(_) => None,
+                })
+                .collect()
+        };
+        assert!(
+            in_view(&state).contains(&"oag/route-7".to_string()),
+            "{:?}",
+            in_view(&state)
+        );
+
+        // The wheel: a model at a time, and no further than the last five.
+        state.model_list_start = 0;
+        assert!(state.note_model_list_scroll(3));
+        assert_eq!(state.model_list_start, 3);
+        assert!(state.note_model_list_scroll(10));
+        assert_eq!(state.model_list_start, 4, "the last whole window");
+        assert!(!state.note_model_list_scroll(1), "at the end already");
+        assert!(state.note_model_list_scroll(-10));
+        assert_eq!(state.model_list_start, 0);
+
+        // A search starts from the top of what it leaves.
+        state.model_list_start = 4;
+        assert!(state.note_model_search("ROUTE-1".into()));
+        assert_eq!(state.model_list_start, 0);
+        assert_eq!(in_view(&state), ["oag/route-1"]);
+        assert!(!state.note_model_list_scroll(1), "nothing more to show");
+
+        // Shut, the list forgets the search and the window; it opens afresh.
+        assert!(state.note_model_list_toggled());
+        assert!(!state.model_list_open);
+        assert_eq!(
+            (state.model_search.as_str(), state.model_list_start),
+            ("", 0)
+        );
+        assert!(!state.note_model_list_scroll(1));
     }
 
     // ---- Answer with this Mac: the relay's half of the page -------------------------------------
