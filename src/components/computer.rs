@@ -173,10 +173,12 @@ impl Render for ComputerPane {
             )
         };
 
-        // Chat's window-level controls replace the pane close button. Other pages
-        // still need their own header when the pane floats over their content.
+        // On the chat page the pane reaches the window's top edge, under the floating title bar,
+        // so its header is the bar's row over the pane: one row, overview and routine editor
+        // alike, which drags the window as a title bar does. The bar's window-level pane toggle
+        // replaces the row's close control there. Other pages still need their own header,
+        // close control and all, when the pane floats over their content.
         let chat_page = app.read(cx).page == crate::state::MainPage::Chat;
-        let editor_header = matches!(view, ComputerView::Editor { .. });
         v_flex()
             .id("computer-pane")
             .h_full()
@@ -186,10 +188,7 @@ impl Render for ComputerPane {
             .border_color(theme.border)
             .bg(theme.sidebar)
             .text_color(theme.foreground)
-            .when(chat_page, |this| {
-                this.child(div().h(px(TITLE_BAR_H)).flex_shrink_0())
-                    .when(editor_header, |this| this.child(self.header(cx, false)))
-            })
+            .when(chat_page, |this| this.child(self.header(cx, false)))
             .when(
                 !chat_page && chrome_floats(f32::from(window.viewport_size().width)),
                 |this| this.child(self.header(cx, true)),
@@ -256,15 +255,17 @@ impl ComputerPane {
         })
     }
 
-    /// The pane's header row. In the title bar over the pane while the pane is docked (then
-    /// its title and empty run drag the window), in the pane itself while it floats.
-    /// Overview: close chevron (Update / Reset sit next to the screen). Routine: back, title,
-    /// close.
-    pub fn header(&self, cx: &App, drag: bool) -> AnyElement {
+    /// The pane's header row, whose title and empty run drag the window: in the title bar over
+    /// the pane while it is docked beside another page, and at the top of the pane itself on the
+    /// chat page or while it floats. With `close`, the row ends in the control that closes the
+    /// pane; the chat page leaves it off, because the chat's title bar floats its one
+    /// window-level pane toggle over that end of the row.
+    /// Overview: nothing else (Update / Reset sit next to the screen). Routine: back and title.
+    pub fn header(&self, cx: &App, close: bool) -> AnyElement {
         let app = self.state.clone();
         let state = self.state.read(cx);
         match state.computer_view.clone() {
-            ComputerView::Overview => pane_header(None, "", None, app, drag).into_any_element(),
+            ComputerView::Overview => pane_header(None, "", None, app, close).into_any_element(),
             ComputerView::Editor { id } => {
                 let coworker_id = state.active_coworker_id.clone().unwrap_or_default();
                 let persist = self.persist_routine(app.clone(), coworker_id, id);
@@ -275,7 +276,7 @@ impl ComputerPane {
                         app.update(cx, |state, cx| state.back_to_computer(cx));
                     }) as Rc<dyn Fn(&mut App)>
                 };
-                pane_header(Some(back), "Routine", None, app, drag).into_any_element()
+                pane_header(Some(back), "Routine", None, app, close).into_any_element()
             }
         }
     }
@@ -1248,8 +1249,9 @@ fn pane_header(
     title: &'static str,
     actions: Option<&ComputerControls>,
     app: Entity<AppState>,
-    drag: bool,
+    close: bool,
 ) -> impl IntoElement {
+    use crate::components::title_bar::window_drag;
     // Routine back remains in the pane. Update / Reset sit next to the screen
     // in `box_chrome` so they are visible on the right sidebar, not only in
     // an empty title-bar strip.
@@ -1263,6 +1265,7 @@ fn pane_header(
     });
     h_flex()
         .id("computer-header")
+        .debug_selector(|| "computer-header".into())
         .w_full()
         .px(px(HEADER_PX))
         .h(px(TITLE_BAR_H))
@@ -1281,17 +1284,12 @@ fn pane_header(
                     ))
                 })
                 .when(!title.is_empty(), |this| {
-                    this.child(
+                    this.child(window_drag(
                         div()
                             .text_sm()
                             .font_weight(FontWeight::SEMIBOLD)
-                            .child(title)
-                            .when(drag, |this| {
-                                this.on_mouse_down(MouseButton::Left, |_, window, _| {
-                                    window.start_window_move()
-                                })
-                            }),
-                    )
+                            .child(title),
+                    ))
                 })
                 .when_some(actions, |this, (can_update, can_reset, stale)| {
                     let update_app = actions_app.clone();
@@ -1324,12 +1322,9 @@ fn pane_header(
                     ))
                 }),
         )
-        // The empty run between the controls: in the title bar, the handle to drag the
-        // window by.
-        .child(div().flex_1().h_full().when(drag, |this| {
-            this.on_mouse_down(MouseButton::Left, |_, window, _| window.start_window_move())
-        }))
-        .when(drag, |this| {
+        // The empty run between the controls: a handle to drag the window by.
+        .child(window_drag(div().flex_1().h_full()))
+        .when(close, |this| {
             this.child(icon_btn(
                 "computer-close",
                 "icons/panel-right.svg",

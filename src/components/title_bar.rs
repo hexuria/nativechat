@@ -631,7 +631,7 @@ mod tests {
         use crate::components::chat::ChatView;
         use crate::components::computer::ComputerPane;
         use crate::components::recipes::RecipesView;
-        use crate::state::{AppState, AuthStatus, RightPane};
+        use crate::state::{AppState, AuthStatus, ComputerView, RightPane};
         use gpui_kit::prelude::FluentBuilder as _;
         use gpui_kit::{
             AppContext as _, Context, Entity, InteractiveElement as _, IntoElement, Modifiers,
@@ -797,6 +797,56 @@ mod tests {
                         "the fade beside a {left}px sidebar with the right pane {pane:?}"
                     );
                 }
+            }
+        }
+
+        /// On the chat page the right pane reaches the window's top edge, under the title bar.
+        /// Its header is one row, level with the bar, and a press on the row moves the window as
+        /// a title bar's would: Settings, the computer, and a routine being edited alike.
+        #[gpui_kit::test]
+        fn a_pane_beside_the_chat_has_one_header_row_that_moves_the_window(
+            cx: &mut TestAppContext,
+        ) {
+            let (view, cx) = chat_page(cx, 1200.);
+            for (pane, computer, header) in [
+                (
+                    RightPane::Settings,
+                    ComputerView::Overview,
+                    "agent-settings-header",
+                ),
+                (
+                    RightPane::Computer,
+                    ComputerView::Overview,
+                    "computer-header",
+                ),
+                (
+                    RightPane::Computer,
+                    ComputerView::Editor { id: None },
+                    "computer-header",
+                ),
+            ] {
+                view.update(cx, |page, cx| {
+                    page.app.update(cx, |state, cx| {
+                        state.right_pane = pane;
+                        state.computer_view = computer.clone();
+                        cx.notify();
+                    });
+                });
+                let row = cx
+                    .debug_bounds(header)
+                    .unwrap_or_else(|| panic!("no {header} in {pane:?} {computer:?}"));
+                assert_eq!(
+                    (row.top(), row.size.height),
+                    (px(0.), px(TITLE_BAR_H)),
+                    "{header} in {pane:?} {computer:?} is not one row at the top"
+                );
+                let moves = WINDOW_MOVES.get();
+                press(cx, point(row.left() + px(60.), row.center().y));
+                assert_eq!(
+                    WINDOW_MOVES.get(),
+                    moves + 1,
+                    "a press on {header} in {pane:?} {computer:?} did not move the window"
+                );
             }
         }
     }
