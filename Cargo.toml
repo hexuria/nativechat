@@ -72,6 +72,7 @@ totp-rs = { version = "6", features = ["otpauth"] }
 zip = { version = "8", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
+gpui-kit = { version = "0.6", features = ["test-support"] }
 wiremock = "0.6"
 tokio = { version = "1.36", features = ["full", "test-util"] }
 # A real folder on disk, for the one part of this app that reads the person's own files: a

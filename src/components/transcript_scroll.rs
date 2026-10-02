@@ -390,14 +390,12 @@ impl RenderOnce for TranscriptScroller {
         } = self;
         // Read before the rows are: the list holds its own state borrowed while it renders them,
         // so the row closure must not ask it anything.
-        let item_count = list_state.item_count();
         let rows = list(list_state.clone(), move |index, window, cx| {
             div()
                 .w_full()
                 .min_w_0()
                 .px_3()
-                // The space between rows, like a CSS gap: every row but the last carries it.
-                .when(index + 1 < item_count, |this| this.pb_8())
+                // The row renderer owns spacing: actions are compact, messages are not.
                 .child(render_row(index, window, cx))
                 .into_any_element()
         })
@@ -435,8 +433,9 @@ impl RenderOnce for TranscriptScroller {
                         .bottom(rems(1.))
                         .flex()
                         .justify_center()
-                        .child(
+                        .child(super::transcript_chrome::jump_button(
                             Button::new((id, "jump-to-latest"))
+                                .debug_selector(|| "transcript-jump".into())
                                 .secondary()
                                 .icon(IconName::ArrowDown)
                                 .tooltip("Jump to latest")
@@ -449,7 +448,7 @@ impl RenderOnce for TranscriptScroller {
                                 .when_some(on_jump, |button, on_jump| {
                                     button.on_click(move |_, window, cx| on_jump(window, cx))
                                 }),
-                        ),
+                        )),
                 )
             })
             .refine_style(&style)

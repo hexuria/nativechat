@@ -176,14 +176,10 @@ impl Render for ComputerPane {
             )
         };
 
-        // Floating over the chat (a narrow window), the pane carries its own header; docked,
-        // the title bar shows it over the pane.
-        let floats = chrome_floats(f32::from(window.viewport_size().width));
-        let floating_header = if floats {
-            Some(self.header(cx, false))
-        } else {
-            None
-        };
+        // Chat's window-level controls replace the pane close button. Other pages
+        // still need their own header when the pane floats over their content.
+        let chat_page = app.read(cx).page == crate::state::MainPage::Chat;
+        let editor_header = matches!(view, ComputerView::Editor { .. });
         v_flex()
             .id("computer-pane")
             .h_full()
@@ -193,7 +189,14 @@ impl Render for ComputerPane {
             .border_color(theme.border)
             .bg(theme.sidebar)
             .text_color(theme.foreground)
-            .children(floating_header)
+            .when(chat_page, |this| {
+                this.child(div().h(px(TITLE_BAR_H)).flex_shrink_0())
+                    .when(editor_header, |this| this.child(self.header(cx, false)))
+            })
+            .when(
+                !chat_page && chrome_floats(f32::from(window.viewport_size().width)),
+                |this| this.child(self.header(cx, true)),
+            )
             .child(match view {
                 ComputerView::Overview => self
                     .overview(
@@ -1324,7 +1327,7 @@ fn pane_header(
     app: Entity<AppState>,
     drag: bool,
 ) -> impl IntoElement {
-    // Close chevron (and Routine back). Update / Reset sit next to the screen
+    // Routine back remains in the pane. Update / Reset sit next to the screen
     // in `box_chrome` so they are visible on the right sidebar, not only in
     // an empty title-bar strip.
     let actions_app = app.clone();
@@ -1403,13 +1406,15 @@ fn pane_header(
         .child(div().flex_1().h_full().when(drag, |this| {
             this.on_mouse_down(MouseButton::Left, |_, window, _| window.start_window_move())
         }))
-        .child(icon_btn(
-            "computer-close",
-            "icons/chevrons-right.svg",
-            move |cx| {
-                app.update(cx, |state, cx| state.close_right_pane(cx));
-            },
-        ))
+        .when(drag, |this| {
+            this.child(icon_btn(
+                "computer-close",
+                "icons/panel-right.svg",
+                move |cx| {
+                    app.update(cx, |state, cx| state.close_right_pane(cx));
+                },
+            ))
+        })
 }
 
 /// `icon_btn` that can be greyed out: no hover, no click, until there is something to do.

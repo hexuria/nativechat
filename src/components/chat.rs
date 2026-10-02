@@ -1665,15 +1665,17 @@ impl Render for ChatTranscript {
                             .pb(transcript_row_gap(&rows[ix], rows.get(ix + 1)))
                             // The transcript's own edges, carried by the rows that sit against
                             // them rather than by the list's padding (see `tail_room`).
-                            .when(ix == 0, |this| this.pt(px(TRANSCRIPT_EDGE_GAP)))
+                            .when(ix == 0, |this| {
+                                this.pt(px(crate::chrome::TITLE_BAR_H + TRANSCRIPT_EDGE_GAP))
+                            })
                             .when_some(tail_room(ix, rows.len(), composer_height), |this, room| {
                                 this.pb(room)
                             })
                             .child(div().w_full().max_w(px(CHAT_CONTENT_MAX)).child(body))
                     },
                 )
-                // Straight under the title bar, which holds the chat's header.
-                .pt(px(20.0))
+                // Only the first row reserves room for the floating header; scrolled
+                // messages use the full viewport behind its fade.
                 // The chevron belongs over the chat, not behind the composer, so lift it off
                 // the scroller's floor by exactly what the composer covers; the rem the
                 // scroller already holds it by then reads from the composer's top edge.
