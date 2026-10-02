@@ -1,8 +1,8 @@
-//! Settings → Relay: the person's ChatGPT or Grok plan, relayed to the server from this computer,
-//! and where a newly hired Bot starts. And the badge on each reply, which says which door it came
-//! through. A Bot's door is picked with its model, on its card in its settings
-//! (`components::model_picker`), and nowhere else: the page switches no door, and the server keeps
-//! the account's as it is for the Bots that have picked none of their own.
+//! Settings → Relay: the person's ChatGPT or Grok plan, relayed to the server from this computer.
+//! And the badge on each reply, which says which door it came through. A Bot's door is picked
+//! with its model, on its card in its settings (`components::model_picker`), and nowhere else: the
+//! page switches no door, and the server keeps the account's as it is for the Bots that have
+//! picked none of their own.
 //!
 //! The relay (opengrok-server #292): while it is on and the app is open, the server sends each
 //! model call on the person's plan down a stream to this computer, whose background helper asks
@@ -16,30 +16,22 @@
 //! The page no longer sets up the plan on the server's own machine, the proxy address and key the
 //! server dials on its loopback, and sends neither: whatever the account keeps there stays as the
 //! server keeps it, and the Bots that go that way keep going as the server decides. Nor does it
-//! pick a model of the relay's own: each Bot picks its own, and new Bots start on the default
-//! below.
+//! pick a model of the relay's own: each Bot picks its own, and new Bots start on their default,
+//! which is on Settings → General (`components::default_models`) and no longer here.
 //!
 //! The words say "this computer". The relay is the app on the person's computer passing their
 //! plan's replies to the server, which is not an idea only a Mac can have; the wire still calls
 //! the way `via: "mac"`, and the code keeps its names.
 //!
-//! The page ends with Default for new Bots, where a newly hired Bot will start: the same card and
-//! popover a Bot's model is picked in (`components::model_picker`), its model, effort and ⚡, with
-//! None over the list. A server that keeps such a default says so by the key on its read
-//! (opengrok-server PR #322 new-bot-default, not yet on main), and every pick is kept on the
-//! account at once; on one that keeps none the section says it is coming and its card takes no
-//! click (`state::DefaultForNewBots`).
-//!
 //! The words and element ids live here so the gpui-agent tree (`agent/host.rs`) says what the
 //! window says and names what the window names.
 
 use crate::components::fields::field_input;
-use crate::components::model_picker::{self, ModelPicker};
 use crate::components::switch::Switch;
 use crate::opengrok::{DEFAULT_PROXY_URL, InferenceKind, RelayStatus, ReplySource, Via};
 use crate::state::{
-    AccountChange, AppState, DefaultForNewBots, PickerFor, REPLY_SOURCE_NOT_ON_SERVER, RelayLine,
-    RelayMac, ReplySourceNote, ReplySourceRead, ReplySourceSettings,
+    AccountChange, AppState, REPLY_SOURCE_NOT_ON_SERVER, RelayLine, RelayMac, ReplySourceNote,
+    ReplySourceRead, ReplySourceSettings,
 };
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{InputEvent, InputState};
@@ -82,11 +74,6 @@ pub(crate) const RELAY_KEY: &str = "settings-relay-key";
 pub(crate) const RELAY_KEY_REMOVE: &str = "settings-relay-key-remove";
 /// Why the relay takes no change: a server without the relay, or a computer not enrolled.
 pub(crate) const RELAY_UNAVAILABLE: &str = "settings-relay-unavailable";
-/// Default for new Bots: the section, the line saying why it takes no change, and the picker's
-/// card in it, whose popover's parts are `model_picker::NEW_BOTS_IDS`.
-pub(crate) const NEW_BOTS: &str = "settings-new-bots";
-pub(crate) const NEW_BOTS_UNAVAILABLE: &str = "settings-new-bots-unavailable";
-pub(crate) const NEW_BOTS_CARD: &str = "settings-new-bots-card";
 
 /// A reply's badge, by the reply's message id.
 pub(crate) fn badge_id(message_id: &str) -> String {
@@ -134,14 +121,6 @@ pub(crate) const NOT_SAVED: &str = "Not saved yet";
 /// In a Bot's Usage card while its replies go through the person's own plan: a turn there is not
 /// metered and carries no gateway key, so the server's usage report never counts it.
 pub(crate) const PLAN_USAGE_NOTE: &str = "Replies on your own subscription aren't counted here.";
-pub(crate) const NEW_BOTS_TITLE: &str = "Default for new Bots";
-/// The line under Default for new Bots' title while the server keeps one.
-pub(crate) const NEW_BOTS_LINE: &str = "A newly hired Bot starts on this model, effort and ⚡. \
-     None leaves it to the server's default.";
-/// Why Default for new Bots takes no change: the server keeps no default for new Bots yet
-/// (`state::DefaultForNewBots`).
-pub(crate) const NEW_BOTS_COMING_SOON: &str =
-    "Coming soon: the server can't keep a default for new Bots yet.";
 
 /// The page's opening line, which says a Bot picks a Subscription model, and with it the plan,
 /// only to a server that keeps a door per Bot.
@@ -257,8 +236,6 @@ pub struct ReplySourcePage {
     /// The relay's two fields: opencodex's address on this computer, and its key.
     relay_address: Entity<InputState>,
     relay_key: Entity<InputState>,
-    /// Default for new Bots' picker: the Bot's card and popover, for the account's default.
-    new_bots: Entity<ModelPicker>,
 }
 
 impl ReplySourcePage {
@@ -314,12 +291,10 @@ impl ReplySourcePage {
             },
         )
         .detach();
-        let new_bots = cx.new(|cx| ModelPicker::new(window, state.clone(), PickerFor::NewBots, cx));
         let mut page = Self {
             state,
             relay_address,
             relay_key,
-            new_bots,
         };
         page.sync_inputs(window, cx);
         page
@@ -521,53 +496,6 @@ impl ReplySourcePage {
     }
 }
 
-impl ReplySourcePage {
-    /// Default for new Bots: where a newly hired Bot starts, in the picker's card. While the
-    /// server keeps a default for new Bots the card is the Bot's, opening the same popover, and
-    /// what a refusal said is under it while the popover is shut; while it keeps none the section
-    /// says it is coming and the card is dimmed and takes no click, since a pick here would change
-    /// nothing on the server.
-    fn new_bots_section(&self, state: &AppState, theme: &Theme) -> AnyElement {
-        let muted = theme.muted_foreground;
-        let section = v_flex()
-            .id(NEW_BOTS)
-            .gap(px(8.))
-            .child(div().text_xs().text_color(muted).child(NEW_BOTS_TITLE));
-        match state.default_for_new_bots() {
-            DefaultForNewBots::NotOnServer => section
-                .child(
-                    div()
-                        .id(NEW_BOTS_UNAVAILABLE)
-                        .text_sm()
-                        .text_color(muted)
-                        .child(NEW_BOTS_COMING_SOON),
-                )
-                .child(model_picker::dead_card(NEW_BOTS_CARD, theme))
-                .into_any_element(),
-            DefaultForNewBots::Kept(_) => {
-                let note = state
-                    .reply_source
-                    .change_note(AccountChange::NewBots)
-                    .filter(|_| !state.new_bots_picker.open)
-                    .map(str::to_string);
-                section
-                    .child(div().text_sm().text_color(muted).child(NEW_BOTS_LINE))
-                    .child(self.new_bots.clone())
-                    .when_some(note, |this, note| {
-                        this.child(
-                            div()
-                                .id(model_picker::NEW_BOTS_IDS.error)
-                                .text_xs()
-                                .text_color(theme.danger)
-                                .child(note),
-                        )
-                    })
-                    .into_any_element()
-            }
-        }
-    }
-}
-
 impl Render for ReplySourcePage {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sync_inputs(window, cx);
@@ -579,24 +507,19 @@ impl Render for ReplySourcePage {
         let settings = &state.reply_source;
         let per_bot = state.server_keeps_bot_doors();
         let intro = div().text_xs().text_color(muted).child(intro(per_bot));
-        // Its own section, whatever the reply source: the default for new Bots is a setting of
-        // its own, and says so whether or not the reply source could be read.
-        let new_bots = self.new_bots_section(state, &theme);
         let error = error_line(settings).map(str::to_string);
         let trouble = error_is_trouble(settings);
         let section = v_flex().id(SECTION).gap(px(12.)).child(intro);
         if settings.kept_source().is_none() {
             let line = unavailable_line(settings).unwrap_or(ASKING).to_string();
             let failed = matches!(settings.kept, Some(ReplySourceRead::Unavailable(_)));
-            return section
-                .child(
-                    div()
-                        .id(UNAVAILABLE)
-                        .text_sm()
-                        .text_color(if failed { theme.danger } else { muted })
-                        .child(line),
-                )
-                .child(new_bots);
+            return section.child(
+                div()
+                    .id(UNAVAILABLE)
+                    .text_sm()
+                    .text_color(if failed { theme.danger } else { muted })
+                    .child(line),
+            );
         }
         // A server from before the relay has nothing for this computer to relay to, and the card
         // would be a switch that changes nothing: the page says so in its place, and there is
@@ -618,16 +541,15 @@ impl Render for ReplySourcePage {
                             .text_color(if trouble { theme.danger } else { muted })
                             .child(line),
                     )
-                })
-                .child(new_bots);
+                });
         }
         let hint = state.reply_source_hint();
         let can_save = state.reply_source_can_save();
         let unsaved = settings.is_unsaved();
-        // The relay, Save for its address and key, and the default for new Bots. There is no
-        // radio and nothing of the plan on the server's own machine: where a Bot's replies go is
-        // picked with its model on its card, and the account's setting stays as the server keeps
-        // it.
+        // The relay, and Save for its address and key. There is no radio and nothing of the plan
+        // on the server's own machine: where a Bot's replies go is picked with its model on its
+        // card, and the account's setting stays as the server keeps it. The default for new Bots
+        // is on Settings → General.
         section
             .child(self.relay_card(state, &theme))
             .when_some(error, |this, line| {
@@ -669,8 +591,6 @@ impl Render for ReplySourcePage {
                             }),
                     ),
             )
-            // After Save, which does not keep it: a pick for new Bots is kept at once.
-            .child(new_bots)
     }
 }
 
@@ -794,11 +714,10 @@ mod tests {
     #[test]
     fn the_page_and_the_relays_sentences_say_computer_and_never_mac() {
         use super::{
-            ASKING, INTRO, INTRO_PER_BOT, KEEP_KEY_LABEL, NEW_BOTS_COMING_SOON, NEW_BOTS_LINE,
-            NEW_BOTS_TITLE, NOT_SAVED, RELAY_ADDR_LABEL, RELAY_INTRO, RELAY_KEY_GOES,
-            RELAY_KEY_KEPT, RELAY_KEY_LABEL, RELAY_KEY_PLACEHOLDER, RELAY_NOT_ENROLLED,
-            RELAY_NOT_ON_SERVER, RELAY_RETYPE_KEY, RELAY_TAKE_BACK, RELAY_TITLE, REMOVE_KEY_LABEL,
-            SAVE_LABEL, TAB_LABEL, relay_line_words,
+            ASKING, INTRO, INTRO_PER_BOT, KEEP_KEY_LABEL, NOT_SAVED, RELAY_ADDR_LABEL, RELAY_INTRO,
+            RELAY_KEY_GOES, RELAY_KEY_KEPT, RELAY_KEY_LABEL, RELAY_KEY_PLACEHOLDER,
+            RELAY_NOT_ENROLLED, RELAY_NOT_ON_SERVER, RELAY_RETYPE_KEY, RELAY_TAKE_BACK,
+            RELAY_TITLE, REMOVE_KEY_LABEL, SAVE_LABEL, TAB_LABEL, relay_line_words,
         };
         use crate::opengrok::{
             SERVER_QUIET, SERVER_UNREACHED, SERVER_WITHOUT_RELAY, TOKEN_REFUSED,
@@ -833,9 +752,6 @@ mod tests {
             KEEP_KEY_LABEL,
             SAVE_LABEL,
             NOT_SAVED,
-            NEW_BOTS_TITLE,
-            NEW_BOTS_COMING_SOON,
-            NEW_BOTS_LINE,
             ASKING,
             RELAY_ADDRESS_NOT_HERE,
             TOKEN_REFUSED,
@@ -874,30 +790,6 @@ mod tests {
             RELAY_KEY_LABEL,
             "opencodex key (kept in this computer's secure storage)"
         );
-    }
-
-    /// Default for new Bots says it is coming, in the owner's words, while the server keeps no
-    /// such default, which is also before the setting is read: the picker's card in it names no
-    /// model and the effort a Bot with none of its own reads as, and takes no click. Where the
-    /// server keeps one, the section says what the card is, and that None leaves it to the
-    /// server.
-    #[test]
-    fn the_default_for_new_bots_is_coming_and_its_card_is_dead() {
-        use super::{NEW_BOTS_COMING_SOON, NEW_BOTS_LINE, NEW_BOTS_TITLE};
-        use crate::components::model_picker::dead_card_words;
-        use crate::state::DefaultForNewBots;
-        assert_eq!(NEW_BOTS_TITLE, "Default for new Bots");
-        assert_eq!(
-            NEW_BOTS_COMING_SOON,
-            "Coming soon: the server can't keep a default for new Bots yet."
-        );
-        assert_eq!(DefaultForNewBots::default(), DefaultForNewBots::NotOnServer);
-        assert_eq!(
-            crate::state::AppState::new().default_for_new_bots(),
-            DefaultForNewBots::NotOnServer
-        );
-        assert_eq!(dead_card_words(), ("No model", "Default"));
-        assert!(NEW_BOTS_LINE.contains("None leaves it to the server's default"));
     }
 
     /// The relay tab says who is relaying and nothing of what the relay is doing: no count of the

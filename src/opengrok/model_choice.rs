@@ -64,8 +64,8 @@ pub const EFFORT_NOT_KEPT: &str = "This server has nowhere to keep an effort yet
 pub const NO_MODEL: &str = "No model";
 /// What Default for new Bots' card names while the person has set none, and the list's row that
 /// sets none: a new Bot is then left to the server's own default, the deployment's model on the
-/// account's door (opengrok-server PR #322, branch `new-bot-default`, not yet on main:
-/// `hire_model` in `crates/opengrok-server/src/inference.rs`).
+/// account's door (opengrok-server #322, on main c0bb6ae: `hire_model` in
+/// `crates/opengrok-server/src/inference.rs`).
 pub const NEW_BOTS_NONE: &str = "None";
 /// Why ⚡ and the slider are dead in Default for new Bots while it holds none: the server keeps a
 /// default whole, its model with its door and effort, and there is no model yet to go with them.
@@ -628,8 +628,8 @@ fn current_row(
         .cloned()
 }
 
-/// Default for new Bots as the same card and popover show it (opengrok-server PR #322, branch
-/// `new-bot-default`, not yet on main: `NewBotDefault` in `crates/opengrok-core/src/inference.rs`):
+/// Default for new Bots as the same card and popover show it (opengrok-server #322, on main
+/// c0bb6ae: `NewBotDefault` in `crates/opengrok-core/src/inference.rs`):
 /// the default the server keeps, `None` while the person has set none, read as a Bot on its own
 /// door would be, from the same list a Bot's picker offers. A default always names its door, so
 /// the plan's models are offered as they are to a Bot on a server that keeps a door per Bot, which
@@ -837,9 +837,9 @@ impl ModelPick {
 
     /// What a change the picker makes, as a Bot's patch would carry it, makes of Default for new
     /// Bots: the whole default, the patch's door, model and effort over the ones kept, since the
-    /// server keeps the default whole and takes it whole (`apply` in opengrok-server PR #322's
-    /// `crates/opengrok-harness/src/local_proxy.rs`). `None` while that names no door or no model,
-    /// which a default cannot be without.
+    /// server keeps the default whole and takes it whole (`apply` in opengrok-server #322's
+    /// `crates/opengrok-harness/src/local_proxy.rs`, on main c0bb6ae). `None` while that names no
+    /// door or no model, which a default cannot be without.
     pub fn new_bots_default(&self, patch: &CoworkerPatch) -> Option<NewBotDefault> {
         let source = patch.source.or(self.bot_door)?;
         let model = patch.model.clone().unwrap_or_else(|| self.pin.clone());
@@ -1663,7 +1663,7 @@ mod tests {
     }
 
     /// Default for new Bots is the Bot's picker over the same list, read as a Bot on its own door
-    /// would be (opengrok-server PR #322 new-bot-default, not yet on main): set, the card names
+    /// would be (opengrok-server #322, on main c0bb6ae): set, the card names
     /// its model, door, effort and ⚡, the list ticks its row, and every change makes the whole
     /// default anew, the kept door, model and effort under the change, since the server keeps it
     /// whole. With none set the card says None, nothing is ticked, ⚡ and the slider are dead and

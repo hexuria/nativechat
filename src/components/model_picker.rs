@@ -9,8 +9,8 @@
 //! is the Bot's setting, changed where the Bot's other settings are, and every turn goes through
 //! the door the card shows.
 //!
-//! The same card and popover are Default for new Bots on Settings → Relay ([`PickerFor`]), where a
-//! newly hired Bot starts: the same controls and the same list, with None over it, which leaves a
+//! The same card and popover are Default for new Bots on Settings → General ([`PickerFor`]), where
+//! a newly hired Bot starts: the same controls and the same list, with None over it, which leaves a
 //! new Bot to the server's own default. Its ids are the Bot's with `settings-new-bots-` for
 //! `agent-model-` ([`NEW_BOTS_IDS`]).
 //!
@@ -118,7 +118,8 @@ pub(crate) const BOT_IDS: PickerIds = PickerIds {
     popover: "agent-model-picker",
 };
 
-/// Default for new Bots' picker's ids, on Settings → Relay: the Bot's, under `settings-new-bots-`.
+/// Default for new Bots' picker's ids, on Settings → General: the Bot's, under
+/// `settings-new-bots-`.
 pub(crate) const NEW_BOTS_IDS: PickerIds = PickerIds {
     card: "settings-new-bots-card",
     pop: "settings-new-bots-pop",
@@ -272,7 +273,7 @@ impl Snap {
     }
 }
 
-/// A picker: the Bot's on its card, or Default for new Bots' on Settings → Relay. Its own view,
+/// A picker: the Bot's on its card, or Default for new Bots' on Settings → General. Its own view,
 /// because the slider's state and the search box's are entities of their own that have to
 /// outlive every frame, and what is done to them is heard here.
 pub struct ModelPicker {
@@ -458,10 +459,12 @@ impl RenderOnce for CardAnchor {
     }
 }
 
-/// The frame a card is drawn in: the Bot's, and the dead one in Default for new Bots.
+/// The frame a card is drawn in: the Bot's, and the dead one in Default for new Bots. Found by
+/// its id in a test window's drawn frame, too.
 fn card_frame(id: &'static str, theme: &Theme) -> Stateful<Div> {
     div()
         .id(id)
+        .debug_selector(move || id.to_string())
         .w_full()
         .px(px(14.))
         .py(px(12.))
@@ -497,7 +500,7 @@ pub(crate) fn dead_card_words() -> (&'static str, &'static str) {
     (NO_MODEL, DEFAULT_EFFORT_LABEL)
 }
 
-/// The picker's card, dimmed and opening nothing: Settings → Relay's Default for new Bots while
+/// The picker's card, dimmed and opening nothing: Settings → General's Default for new Bots while
 /// the server keeps no default for new Bots (`state::DefaultForNewBots`). It is the Bot's card to
 /// look at, so the section shows what it will hold, and it takes no click, since a pick in it
 /// would change nothing on the server.
@@ -1132,7 +1135,7 @@ mod tests {
         }
         assert_eq!(
             NEW_BOTS_IDS.card,
-            crate::components::reply_source::NEW_BOTS_CARD
+            crate::components::default_models::NEW_BOTS_CARD
         );
         assert_eq!(NEW_BOTS_IDS.none, Some("settings-new-bots-none"));
         assert_eq!(BOT_IDS.none, None, "a Bot always has a model");

@@ -312,6 +312,32 @@
 //! the card's sentence that a lent connection reaches a plugin only once the bot is allowed it in
 //! its Tools (opengrok-server#268).
 //!
+//! General, Settings' first page: `settings-tab-general` (named `General`; refused while Settings
+//! is shut). While Settings is open on it, its first section, over Chat, is
+//! `settings-default-models` (named `Default models`; a section, not a control), which holds
+//! `settings-new-bots`: Default for new Bots, where a newly hired Bot starts (opengrok-server
+//! #322, on main c0bb6ae: the account's `newBotDefault` on `/account/inference-source`), which was
+//! on Relay and kept its ids. It is live only where the server's read carries that key, `null` or
+//! not. Otherwise (state `unavailable`) it holds `settings-new-bots-unavailable` ("Coming soon:
+//! the server can't keep a default for new Bots yet.") and `settings-new-bots-card`, the picker's
+//! card (a button named as it reads, `No model · Default`, disabled; a click is refused with
+//! why). Live, `settings-new-bots-card` is the Bot's card and popover, every part of
+//! `agent-model-*` above as `settings-new-bots-*`: the card
+//! (named as the default reads in a line, `None · Default` while none is set, valued by its
+//! model; states its door's word, `fast`, `expanded`, and `saving` while a change is with the
+//! server), `settings-new-bots-pop`, `-fast`, `-effort` (`set_value` a stop's word), `-reset`,
+//! `-open-list`, `-search` (`set_value`, `type`, `key` as the Bot's), `-list`,
+//! `-group-{source}`, `-row-{source}-{id}`, `-no-match`, `-note` and `-error` (the server's
+//! words for a refused change, or that nobody knows whether one was kept: in the popover while
+//! open, under the card while shut). Over the list's models, `settings-new-bots-none` (`None`,
+//! valued `the server's default`, state `selected` while none is set; a click takes the kept
+//! default away). While none is set ⚡ and the slider are dead and say why: a default starts with
+//! a model. Every pick is kept on the account at once, whole, as `PUT /account/inference-source`
+//! `{kind, newBotDefault}` with the kind the server keeps (None sends `null`), one at a time:
+//! every control that sends one is dead while one is out. `settings-new-bots-dismiss` shuts the
+//! popover, as `agent-model-dismiss` shuts the Bot's. All of it is refused off General, saying to
+//! open it with `settings-tab-general`.
+//!
 //! Relay, Settings' page for the person's ChatGPT or Grok plan relayed to the server from this
 //! computer, which was Reply source and keeps its ids. The page switches no door: a Bot's door is
 //! picked with its model on `agent-model-card`, and the account's kind stays as the server keeps
@@ -329,9 +355,10 @@
 //! the plan is the person's computer). Until the setting has been read, on a server without reply
 //! sources, or when it could not be read, the section holds only
 //! `settings-reply-source-unavailable`, the line the page draws in place of the page (`Asking the
-//! server…` while the section has state `asking`), and Default for new Bots. From a server without
-//! the relay it holds `settings-relay-unavailable` (that this server can't take replies from a
-//! computer yet) in the card's place, the line under Save, and Default for new Bots. Once read
+//! server…` while the section has state `asking`). From a server without the relay it holds
+//! `settings-relay-unavailable` (that this server can't take replies from a computer yet) in the
+//! card's place, and the line under Save. Default for new Bots is not on it: it is General's,
+//! below. Once read
 //! from a server with the relay it holds the relay's card, `settings-reply-source-error` (a read
 //! that failed, state `trouble`, or what the Keychain said when it did not keep a key),
 //! `settings-reply-source-hint` (what Save waits for: an opencodex address on this computer) and
@@ -339,28 +366,6 @@
 //! opencodex's address and key on this computer and sends the server nothing. Every control is
 //! refused off the page and before the setting is read, and Save while a read is out, saying what
 //! it waits for. An id the page does not draw is refused as not on the page.
-//!
-//! Last on the page, whatever the setting, `settings-new-bots`: Default for new Bots, where a
-//! newly hired Bot starts (opengrok-server PR #322 new-bot-default, not yet on main: the
-//! account's `newBotDefault` on `/account/inference-source`). It is live only where the server's
-//! read carries that key, `null` or not. Otherwise (state `unavailable`) it holds
-//! `settings-new-bots-unavailable` ("Coming soon: the server can't keep a default for new Bots
-//! yet.") and `settings-new-bots-card`, the picker's card (a button named as it reads, `No model ·
-//! Default`, disabled; a click is refused with why). Live, `settings-new-bots-card` is the Bot's
-//! card and popover, every part of `agent-model-*` above as `settings-new-bots-*`: the card
-//! (named as the default reads in a line, `None · Default` while none is set, valued by its
-//! model; states its door's word, `fast`, `expanded`, and `saving` while a change is with the
-//! server), `settings-new-bots-pop`, `-fast`, `-effort` (`set_value` a stop's word), `-reset`,
-//! `-open-list`, `-search` (`set_value`, `type`, `key` as the Bot's), `-list`,
-//! `-group-{source}`, `-row-{source}-{id}`, `-no-match`, `-note` and `-error` (the server's
-//! words for a refused change, or that nobody knows whether one was kept: in the popover while
-//! open, under the card while shut). Over the list's models, `settings-new-bots-none` (`None`,
-//! valued `the server's default`, state `selected` while none is set; a click takes the kept
-//! default away). While none is set ⚡ and the slider are dead and say why: a default starts with
-//! a model. Every pick is kept on the account at once, whole, as `PUT /account/inference-source`
-//! `{kind, newBotDefault}` with the kind the server keeps (None sends `null`), one at a time:
-//! every control that sends one is dead while one is out. `settings-new-bots-dismiss` shuts the
-//! popover, as `agent-model-dismiss` shuts the Bot's. All of it is refused off the page.
 //!
 //! The relay (hexuria/nativechat #156, opengrok-server #292), from a server that knows it (its
 //! setting carries `relay`), in words for any computer: the wire's `via: "mac"` and the drivers'

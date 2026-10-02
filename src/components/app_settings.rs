@@ -1,5 +1,6 @@
 use crate::actions::CloseSettings;
 use crate::chrome::TITLE_BAR_H;
+use crate::components::default_models::DefaultModels;
 use crate::components::logins::LoginsPage;
 use crate::components::reply_source::ReplySourcePage;
 use crate::components::skills::SkillsPage;
@@ -21,6 +22,9 @@ pub struct AppSettings {
     skills: Option<Entity<SkillsPage>>,
     /// Settings → Relay, made on the first render of that tab, for the same reason.
     reply_source: Option<Entity<ReplySourcePage>>,
+    /// Settings → General's Default models, made on the first render of that tab: its pickers
+    /// need a window too.
+    default_models: Option<Entity<DefaultModels>>,
 }
 
 impl AppSettings {
@@ -31,6 +35,7 @@ impl AppSettings {
             logins: None,
             skills: None,
             reply_source: None,
+            default_models: None,
         }
     }
 
@@ -66,6 +71,20 @@ impl AppSettings {
         let page = cx.new(|cx| ReplySourcePage::new(window, state, cx));
         self.reply_source = Some(page.clone());
         page
+    }
+
+    fn default_models(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<DefaultModels> {
+        if let Some(section) = &self.default_models {
+            return section.clone();
+        }
+        let state = self.state.clone();
+        let section = cx.new(|cx| DefaultModels::new(window, state, cx));
+        self.default_models = Some(section.clone());
+        section
     }
 }
 
@@ -110,8 +129,15 @@ impl Render for AppSettings {
         // to edge, like a passwords app: each takes the whole body and scrolls on its own.
         let cards: Option<AnyElement> = match tab {
             AppSettingsTab::General => Some(
-                general_page(chord, on_send, show_turn_timing, muted, app.clone())
-                    .into_any_element(),
+                general_page(
+                    self.default_models(window, cx),
+                    chord,
+                    on_send,
+                    show_turn_timing,
+                    muted,
+                    app.clone(),
+                )
+                .into_any_element(),
             ),
             AppSettingsTab::Profile => Some(
                 profile_page(account_name, account_email, muted, app.clone()).into_any_element(),
@@ -446,7 +472,10 @@ fn nav_item(
         .child(div().text_sm().child(label))
 }
 
+/// Settings → General: Default models first, where a Bot's model starts out, then how a message
+/// is sent, what a send does while the coworker is busy, and the turn timing switch.
 fn general_page(
+    default_models: Entity<DefaultModels>,
     chord: SubmitChord,
     on_send: OnSend,
     show_turn_timing: bool,
@@ -464,6 +493,7 @@ fn general_page(
     let divider = || div().h(px(1.)).bg(rgb(0x777777).opacity(0.16));
     v_flex()
         .gap(px(12.))
+        .child(default_models)
         .child(div().text_xs().text_color(muted).child("Chat"))
         .child(
             card()
@@ -585,6 +615,7 @@ fn choice_row(
 ) -> impl IntoElement {
     h_flex()
         .id(id)
+        .debug_selector(move || id.to_string())
         .w_full()
         .px(px(16.))
         .py(px(14.))
@@ -1296,6 +1327,51 @@ fn shortcuts_page(
 #[cfg(test)]
 mod tests {
     use super::not_in_effect_line;
+
+    /// Settings → General opens with Default models, over Chat: the default for new Bots in the
+    /// same card a Bot's model is picked in, drawn dead while the server keeps none. Settings →
+    /// Relay no longer holds it.
+    #[gpui_kit::test]
+    fn general_opens_with_the_default_models_and_relay_holds_none(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        use crate::state::{AppSettingsTab, AppState};
+        use gpui_kit::AppContext as _;
+        cx.update(gpui_kit::init);
+        let (settings, cx) = cx.add_window_view(|_, cx| {
+            let state = cx.new(|_| {
+                let mut state = AppState::new();
+                state.is_app_settings_open = true;
+                state.app_settings_tab = AppSettingsTab::General;
+                state
+            });
+            super::AppSettings::new(state, cx)
+        });
+        let drawn = |cx: &mut gpui_kit::VisualTestContext, id: &'static str| {
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            cx.debug_bounds(id)
+        };
+        let models = drawn(cx, "settings-default-models").expect("Default models is on General");
+        let chat = drawn(cx, "settings-send-enter").expect("so is Chat");
+        assert!(models.bottom() <= chat.top(), "{models:?} over {chat:?}");
+        let card = drawn(cx, "settings-new-bots-card").expect("the default for new Bots");
+        assert!(
+            models.top() <= card.top() && card.bottom() <= models.bottom(),
+            "{card:?} in {models:?}"
+        );
+
+        settings.update(cx, |settings, cx| {
+            settings.state.update(cx, |state, cx| {
+                state.app_settings_tab = AppSettingsTab::ReplySource;
+                cx.notify();
+            });
+        });
+        assert!(drawn(cx, "settings-default-models").is_none());
+        assert!(
+            drawn(cx, "settings-new-bots-card").is_none(),
+            "not on Relay any more"
+        );
+    }
 
     /// An allow the gate never reads says so, in the server's sentence given whole and closed
     /// with a full stop: the long one lists everything a plain command may not have in it, and

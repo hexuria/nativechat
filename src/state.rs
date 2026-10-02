@@ -315,17 +315,17 @@ impl AccountConnections {
 
 /// Settings → Relay: the account's reply source as the server keeps it, whose kind is the door
 /// every Bot that has picked none of its own follows, and this computer's half of the relay as the
-/// person has changed it on the page and not saved.
+/// person has changed it on the page and not saved. Settings → General's Default models read and
+/// change the same setting.
 ///
 /// The setting is the server's and lives nowhere else: this app never keeps it, and never calls a
 /// model either way. What the page shows as kept is only ever what the server last said. Of it,
 /// the page changes only the way to the plan, which the relay switch points at this computer as
-/// it goes on ([`AppState::begin_relay_change`]), and the default for new Bots: not the door or
-/// the plan's model (a Bot's model, and with it its door, is picked on its card in its settings),
-/// and not the plan on the server's own machine, whose address and key the server keeps as they
-/// are. What else the page changes is this computer's: opencodex's address and key for the relay,
-/// which wait on the page, marked unsaved, until Save keeps them here. Nothing here is written to
-/// disk.
+/// it goes on ([`AppState::begin_relay_change`]): not the door or the plan's model (a Bot's model,
+/// and with it its door, is picked on its card in its settings), and not the plan on the server's
+/// own machine, whose address and key the server keeps as they are. What else the page changes is
+/// this computer's: opencodex's address and key for the relay, which wait on the page, marked
+/// unsaved, until Save keeps them here. Nothing here is written to disk.
 ///
 /// Not `Clone`: it can hold a key the person typed, and nothing copies that. The gpui-agent tree
 /// takes [`Self::without_key`].
@@ -567,16 +567,16 @@ impl ChangeNote {
 pub(crate) const ACCOUNT_CHANGE_UNKNOWN: &str =
     "The server did not answer, so the change may or may not have been kept. Checking again…";
 
-/// Settings → Relay's Default for new Bots: where a newly hired Bot starts, its model, and with it
-/// its door and fast tier, and its effort, which the section shows in the picker's card
+/// Settings → General's Default for new Bots: where a newly hired Bot starts, its model, and with
+/// it its door and fast tier, and its effort, which the section shows in the picker's card
 /// ([`AppState::default_for_new_bots`]).
 ///
-/// It is the account's (opengrok-server PR #322 new-bot-default, not yet on main:
-/// `NewBotDefault` in `crates/opengrok-core/src/inference.rs`), read with the reply source, which
-/// carries it as `newBotDefault` on every read from a server that keeps one, `null` until the
-/// person sets one. A server without it sends no such key, and the section then says the default
-/// is coming and its card takes no click, since a control that changes nothing on the server must
-/// not look as if it does.
+/// It is the account's (opengrok-server #322, on main c0bb6ae: `NewBotDefault` in
+/// `crates/opengrok-core/src/inference.rs`), read with the reply source, which carries it as
+/// `newBotDefault` on every read from a server that keeps one, `null` until the person sets one. A
+/// server without it sends no such key, and the section then says the default is coming and its
+/// card takes no click, since a control that changes nothing on the server must not look as if it
+/// does.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum DefaultForNewBots {
     /// The server keeps no default for new Bots, or the setting has not been read.
@@ -588,7 +588,7 @@ pub enum DefaultForNewBots {
 }
 
 /// Which model picker: the open Bot's, on the Model card in its settings, or Default for new
-/// Bots', on Settings → Relay. The two are the same card and popover
+/// Bots', on Settings → General. The two are the same card and popover
 /// (`components::model_picker`); what differs is what they show and where a change goes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PickerFor {
@@ -4513,8 +4513,9 @@ pub enum AppSettingsTab {
     Logins,
     /// The services the person has signed in to for their Bots, and the ones on offer (#2).
     Connections,
-    /// Relay: the person's own plan, relayed to the server from this computer, and the default
-    /// for new Bots. Named for the reply source it was, as its stable id still is.
+    /// Relay: the person's own plan, relayed to the server from this computer. Named for the
+    /// reply source it was, as its stable id still is. The default for new Bots, which was here,
+    /// is General's.
     ReplySource,
     Skills,
 }
@@ -4919,7 +4920,7 @@ pub struct AppState {
     /// The Bot's model picker's popover, under the Model card in the Bot's settings, the one
     /// place a Bot's model is picked (`components::model_picker`).
     pub model_picker: PickerView,
-    /// Default for new Bots' picker's popover, under its card on Settings → Relay.
+    /// Default for new Bots' picker's popover, under its card on Settings → General.
     pub new_bots_picker: PickerView,
     /// The server's words for the last change the picker made that did not go through, with the
     /// Bot it was for. The popover says it under its controls until the next change is sent.
@@ -5075,6 +5076,9 @@ pub struct AppState {
     /// Settings → Relay was on screen when Settings last changed what it shows, so its arrival
     /// and its leaving are each told once ([`Self::settle_reply_source_page`]).
     reply_source_page_shown: bool,
+    /// The same of Settings → General, whose Default models read the setting and the models as
+    /// it arrives ([`Self::settle_default_models_page`]).
+    default_models_page_shown: bool,
     /// The time zone a `PUT /account` is out with, or that the server refused: it is not sent
     /// again until this computer's zone moves off it ([`Self::begin_time_zone`]).
     time_zone_sent: Option<String>,
@@ -5694,6 +5698,7 @@ impl AppState {
             reply_source_generation: 0,
             models_generation: 0,
             reply_source_page_shown: false,
+            default_models_page_shown: false,
             relay_mac: RelayMac::default(),
             relay_worker: None,
             relay_starting: None,
@@ -6887,6 +6892,7 @@ impl AppState {
         // is still out.
         self.reply_source = ReplySourceSettings::default();
         self.reply_source_page_shown = false;
+        self.default_models_page_shown = false;
         self.reply_source_generation += 1;
         // The time-zone watch was for them, and so is a PUT of it still out.
         self.time_zone_epoch += 1;
@@ -8242,12 +8248,28 @@ impl AppState {
     /// Settings has changed what it shows. Relay coming on screen reads the setting, for where the
     /// relay stands and in case it changed on another computer, and the models, which a computer
     /// relaying lists for every picker's Subscription group; leaving it drops a key typed there
-    /// and not saved ([`Self::settle_reply_source_page`]).
+    /// and not saved ([`Self::settle_reply_source_page`]). General coming on screen reads both
+    /// too, for Default models' pickers, and leaving it shuts their popovers
+    /// ([`Self::settle_default_models_page`]).
     fn reply_source_page_moved(&mut self, cx: &mut Context<Self>) {
-        if self.settle_reply_source_page() {
+        let relay = self.settle_reply_source_page();
+        let general = self.settle_default_models_page();
+        if relay || general {
             self.read_reply_source(cx);
             self.refresh_models(cx);
         }
+    }
+
+    /// Whether Settings → General, whose first section is Default models, has just come on
+    /// screen. Off screen, the popovers of its pickers go with the page they hang from.
+    fn settle_default_models_page(&mut self) -> bool {
+        let shown = self.default_models_on_screen();
+        let arrived = shown && !self.default_models_page_shown;
+        self.default_models_page_shown = shown;
+        if !shown {
+            self.new_bots_picker = PickerView::default();
+        }
+        arrived
     }
 
     /// Whether Settings → Relay has just come on screen. Off screen, a key for this computer's
@@ -8259,10 +8281,6 @@ impl AppState {
         self.reply_source_page_shown = shown;
         if !shown && self.reply_source.relay_key_draft.take().is_some() {
             self.reply_source.relay_retype_key = true;
-        }
-        // Default for new Bots' popover goes with the page it hangs from.
-        if !shown {
-            self.new_bots_picker = PickerView::default();
         }
         arrived
     }
@@ -8507,8 +8525,8 @@ impl AppState {
 
     /// A report from the relay, `false` once it is not this relay's to give. Where the relay
     /// stands is the server's word too: when this Mac starts answering, or another takes over,
-    /// the setting is read again for which Mac holds it, and while the page is on screen the
-    /// models, which a Mac answering lists.
+    /// the setting is read again for which Mac holds it, and while the page, or General with its
+    /// Default models, is on screen the models, which a Mac answering lists.
     fn take_relay_report(
         &mut self,
         generation: u64,
@@ -8530,7 +8548,7 @@ impl AppState {
         self.relay_mac.report = Some(report);
         if turned {
             self.read_reply_source(cx);
-            if self.reply_source_on_screen() {
+            if self.reply_source_on_screen() || self.default_models_on_screen() {
                 self.refresh_models(cx);
             }
         }
@@ -9153,17 +9171,23 @@ impl AppState {
             // is also Settings → Reply source's health line, which changes outside the app: the
             // person starts opencodex in a terminal and comes back to see it running.
             reply_source: self.is_signed_in(),
-            // And while that page is on screen, the plan's models with it, as arriving on the
-            // page reads them: opencodex that has just been started lists them for the first
-            // time, and the health line and the pickers should not wait for the page to be left
-            // and come back to.
-            models: self.is_signed_in() && self.reply_source_on_screen(),
+            // And while that page, or General with its Default models, is on screen, the plan's
+            // models with it, as arriving on the page reads them: opencodex that has just been
+            // started lists them for the first time, and the health line and the pickers should
+            // not wait for the page to be left and come back to.
+            models: self.is_signed_in()
+                && (self.reply_source_on_screen() || self.default_models_on_screen()),
         }
     }
 
     /// Settings is open on Relay.
     fn reply_source_on_screen(&self) -> bool {
         self.is_app_settings_open && self.app_settings_tab == AppSettingsTab::ReplySource
+    }
+
+    /// Settings is open on General, whose first section is Default models.
+    fn default_models_on_screen(&self) -> bool {
+        self.is_app_settings_open && self.app_settings_tab == AppSettingsTab::General
     }
 
     /// Whether coming back to the window asks for the person's connections again: a sign-in is
@@ -12638,7 +12662,7 @@ impl AppState {
         ))
     }
 
-    /// Default for new Bots' picker, as its card on Settings → Relay draws it: `None` while the
+    /// Default for new Bots' picker, as its card on Settings → General draws it: `None` while the
     /// server keeps no default for new Bots, when the card is dead and opens nothing.
     pub fn new_bots_pick(&self) -> Option<ModelPick> {
         let DefaultForNewBots::Kept(default) = self.default_for_new_bots() else {
@@ -12677,9 +12701,8 @@ impl AppState {
     }
 
     /// Default for new Bots, as the account's setting last read says it: kept by a server whose
-    /// read carries `newBotDefault`, `null` or not (opengrok-server PR #322, branch
-    /// `new-bot-default`, not yet on main), and not kept by one whose read carries no such key, or
-    /// before the setting is read.
+    /// read carries `newBotDefault`, `null` or not (opengrok-server #322, on main c0bb6ae), and
+    /// not kept by one whose read carries no such key, or before the setting is read.
     pub fn default_for_new_bots(&self) -> DefaultForNewBots {
         match self
             .reply_source
@@ -12930,7 +12953,7 @@ impl AppState {
 
     /// Begin keeping Default for new Bots on the account at once, whole, with the kind the server
     /// keeps sent back as it is: `PUT /account/inference-source` `{kind, newBotDefault}`
-    /// (opengrok-server PR #322 new-bot-default, not yet on main: `apply` in
+    /// (opengrok-server #322, on main c0bb6ae: `apply` in
     /// `crates/opengrok-harness/src/local_proxy.rs`, which replaces the default whole, and clears
     /// it on `null`). The card shows what the server answers; a refusal is said in its words.
     fn begin_new_bots_change(
@@ -36512,7 +36535,7 @@ mod tests {
         assert!(!state.reply_source.relay_retype_key);
     }
 
-    // ---- Default for new Bots: the account's, kept at once (opengrok-server PR #322) ------------
+    // ---- Default for new Bots: the account's, kept at once (opengrok-server #322) ---------------
 
     /// A read from a server that keeps a default for new Bots, as given, `None` being `null`.
     fn with_new_bots(default: Option<crate::opengrok::NewBotDefault>) -> InferenceSource {
@@ -36557,7 +36580,7 @@ mod tests {
     }
 
     /// Default for new Bots is live only where the server's read carries its key, `null` or not
-    /// (opengrok-server PR #322 new-bot-default, not yet on main): before the setting is read,
+    /// (opengrok-server #322, on main c0bb6ae): before the setting is read,
     /// and from a server whose read has no such key, it is not on the server, it has no picker,
     /// and nothing of it can be sent. Signing out forgets it with the setting.
     #[test]
@@ -37484,6 +37507,38 @@ mod tests {
             state.reply_source.relay_key_draft, None,
             "gone with the account"
         );
+    }
+
+    /// Settings → General coming on screen is told once, which is when the setting and the
+    /// models are read for its Default models; while it is on screen, coming back to the window
+    /// reads the models again. Leaving it shuts Default for new Bots' popover, which hangs from
+    /// it; Settings → Relay coming on screen does not.
+    #[test]
+    fn the_general_page_reads_when_it_arrives_and_shuts_its_pickers_when_it_goes() {
+        use super::PickerView;
+        let mut state = signed_in_state();
+        assert!(!state.settle_default_models_page(), "Settings is shut");
+        state.is_app_settings_open = true;
+        state.app_settings_tab = AppSettingsTab::General;
+        assert!(state.settle_default_models_page(), "arrived: read");
+        assert!(!state.settle_default_models_page(), "still there");
+        assert!(state.reads_on_activation(Instant::now()).models);
+        state.new_bots_picker.open = true;
+        assert!(!state.settle_reply_source_page(), "Relay is not on screen");
+        assert!(state.new_bots_picker.open, "and has no say in it");
+
+        state.app_settings_tab = AppSettingsTab::ReplySource;
+        assert!(!state.settle_default_models_page());
+        assert_eq!(
+            state.new_bots_picker,
+            PickerView::default(),
+            "shut with the page"
+        );
+        state.app_settings_tab = AppSettingsTab::General;
+        assert!(state.settle_default_models_page(), "back: read again");
+        state.is_app_settings_open = false;
+        assert!(!state.settle_default_models_page());
+        assert!(!state.reads_on_activation(Instant::now()).models);
     }
 
     /// Only the newest read of the setting lands: an older one answered late, or one that lands

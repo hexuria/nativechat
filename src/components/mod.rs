@@ -14,6 +14,7 @@ pub mod computer;
 #[cfg(target_os = "macos")]
 pub mod computer_screen;
 pub mod connections;
+pub mod default_models;
 pub mod emoji_picker;
 pub mod fields;
 pub mod gen_ui;

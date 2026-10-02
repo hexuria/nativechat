@@ -242,9 +242,9 @@ pub struct InferenceSource {
     #[serde(default)]
     pub relay: Option<RelayRead>,
     /// Default for new Bots, from a server that keeps one, which sends the key on every read,
-    /// `null` until the person sets one (opengrok-server PR #322 new-bot-default, not yet on
-    /// main: `described` in `crates/opengrok-harness/src/local_proxy.rs`). `None` is the key left
-    /// out, a server before it, which keeps no such default; `Some(None)` is `null`, none set.
+    /// `null` until the person sets one (opengrok-server #322, on main c0bb6ae: `described` in
+    /// `crates/opengrok-harness/src/local_proxy.rs`). `None` is the key left out, a server before
+    /// it, which keeps no such default; `Some(None)` is `null`, none set.
     #[serde(default, deserialize_with = "keyed")]
     pub new_bot_default: Option<Option<NewBotDefault>>,
     /// Whether the relay is switched on for the account, from a server that keeps it, which sends
@@ -265,8 +265,8 @@ where
     Option::<T>::deserialize(deserializer).map(Some)
 }
 
-/// A person's default for new Bots, as opengrok-server PR #322 (new-bot-default, not yet on
-/// main) writes it: `NewBotDefault` in `crates/opengrok-core/src/inference.rs`,
+/// A person's default for new Bots, as opengrok-server #322 (on main c0bb6ae) writes it:
+/// `NewBotDefault` in `crates/opengrok-core/src/inference.rs`,
 /// `{"source", "model", "effort"}`. A Bot hired with no model of its own, and none from its
 /// template, is born on it whole, its door, the model it is pinned to and how hard it thinks
 /// written onto the Bot at its hire, so a changed default moves only the Bots hired after it
@@ -389,9 +389,9 @@ pub struct InferenceSourceUpdate {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub relay_enabled: Option<bool>,
     /// Default for new Bots, sent whole when the app changes it, only to a server whose read
-    /// carries the key, and `null` to take it away (opengrok-server PR #322 new-bot-default, not
-    /// yet on main: `apply` in `crates/opengrok-harness/src/local_proxy.rs`): absent keeps it,
-    /// `null` clears it, and a value replaces it whole.
+    /// carries the key, and `null` to take it away (opengrok-server #322, on main c0bb6ae:
+    /// `apply` in `crates/opengrok-harness/src/local_proxy.rs`): absent keeps it, `null` clears
+    /// it, and a value replaces it whole.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub new_bot_default: Option<Option<NewBotDefault>>,
 }
@@ -772,8 +772,8 @@ mod tests {
         }
     }
 
-    /// The default for new Bots reads as opengrok-server PR #322 (new-bot-default, not yet on
-    /// main) writes it on the account's setting: left out by a server that keeps none, `null`
+    /// The default for new Bots reads as opengrok-server #322 (on main c0bb6ae) writes it on the
+    /// account's setting: left out by a server that keeps none, `null`
     /// while none is set, and whole once set, an effort left out or `null` read as `inherit`. A
     /// `PUT` names it only when the app changes it: whole, or `null` to take it away, with the
     /// kind the server keeps and nothing else.

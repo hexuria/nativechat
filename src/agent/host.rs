@@ -15,6 +15,7 @@ use crate::components::chat_input::sources::{
 };
 use crate::components::composer_panel::ComposerPanelRow;
 use crate::components::connections::{self, ConnectOffer};
+use crate::components::default_models;
 use crate::components::model_picker;
 use crate::components::reply_source;
 use crate::components::skills::{
@@ -40,7 +41,7 @@ use crate::state::{
 };
 
 pub mod ids {
-    use crate::components::{connections, model_picker, reply_source};
+    use crate::components::{connections, default_models, model_picker, reply_source};
     use crate::opengrok::InferenceKind;
     use crate::state::RuleKind;
 
@@ -473,6 +474,11 @@ pub mod ids {
     pub const AGENT_CONNECTIONS: &str = connections::AGENT_CARD;
     pub const AGENT_CONNECTIONS_NOTE: &str = connections::AGENT_NOTE;
 
+    /// Settings → General, and its first section, Default models, which holds Default for new
+    /// Bots.
+    pub const SETTINGS_GENERAL: &str = "settings-tab-general";
+    pub const DEFAULT_MODELS: &str = default_models::SECTION;
+
     /// Settings → Relay, by the tab's id from when it was Reply source, and the section it holds
     /// once the setting has been read.
     pub const SETTINGS_REPLY_SOURCE: &str = reply_source::SETTINGS_TAB;
@@ -504,11 +510,11 @@ pub mod ids {
     pub const RELAY_KEY: &str = reply_source::RELAY_KEY;
     pub const RELAY_KEY_REMOVE: &str = reply_source::RELAY_KEY_REMOVE;
     pub const RELAY_UNAVAILABLE: &str = reply_source::RELAY_UNAVAILABLE;
-    /// Default for new Bots, on Settings → Relay: the section, the line saying it is coming, and
-    /// the picker's card in it, which is dead until the server keeps such a default.
-    pub const NEW_BOTS: &str = reply_source::NEW_BOTS;
-    pub const NEW_BOTS_UNAVAILABLE: &str = reply_source::NEW_BOTS_UNAVAILABLE;
-    pub const NEW_BOTS_CARD: &str = reply_source::NEW_BOTS_CARD;
+    /// Default for new Bots, on Settings → General: the section, the line saying it is coming,
+    /// and the picker's card in it, which is dead until the server keeps such a default.
+    pub const NEW_BOTS: &str = default_models::NEW_BOTS;
+    pub const NEW_BOTS_UNAVAILABLE: &str = default_models::NEW_BOTS_UNAVAILABLE;
+    pub const NEW_BOTS_CARD: &str = default_models::NEW_BOTS_CARD;
     /// Shuts Default for new Bots' popover, as `agent-model-dismiss` shuts the Bot's.
     pub const NEW_BOTS_DISMISS: &str = "settings-new-bots-dismiss";
 
@@ -3283,6 +3289,8 @@ pub struct NativeChatHost {
     /// Settings → Relay as the page draws it, without the typed key.
     reply_source: ReplySourceSnap,
     reply_source_tab: bool,
+    /// Settings is on General, whose first section is Default models.
+    general_tab: bool,
     /// The badges on the open thread's replies, oldest first: (message id, source).
     reply_sources: Vec<(String, crate::opengrok::ReplySource)>,
     pending: Option<Command>,
@@ -3858,6 +3866,7 @@ impl NativeChatHost {
             connections: state.connections.clone(),
             reply_source: ReplySourceSnap::from_state(state),
             reply_source_tab: state.app_settings_tab == AppSettingsTab::ReplySource,
+            general_tab: state.app_settings_tab == AppSettingsTab::General,
             reply_sources: crate::components::chat::reply_badges(state),
             connections_tab: state.app_settings_tab == AppSettingsTab::Connections,
             pending: None,
@@ -4356,6 +4365,7 @@ impl NativeChatHost {
                         let mut settings = UiNode::dialog(ids::DIALOG_ACCOUNT, "Settings")
                             .with_visible(self.account_open)
                             .with_child(UiNode::button("app-settings-back", "← Back to app"))
+                            .with_child(UiNode::button(ids::SETTINGS_GENERAL, "General"))
                             .with_child(UiNode::button("settings-tab-computer", "Computer"))
                             .with_child(UiNode::button("settings-tab-updates", "Updates"))
                             .with_child(UiNode::button("settings-tab-logins", "Logins"))
@@ -4376,9 +4386,12 @@ impl NativeChatHost {
                             }
                         }
                         // The same for Relay: its section is in the tree only while the dialog
-                        // is open on it.
+                        // is open on it. And for General's Default models.
                         if self.account_open && self.reply_source_tab {
                             settings = settings.with_child(self.reply_source_node());
+                        }
+                        if self.account_open && self.general_tab {
+                            settings = settings.with_child(self.default_models_node());
                         }
                         if self.skills_tab {
                             settings = self.skills_nodes(settings);
@@ -5395,12 +5408,12 @@ impl NativeChatHost {
     /// Settings → Relay as the page draws it: `settings-reply-source` (value = the door the
     /// server keeps, which the page does not switch; states `unsaved`, `reading`, and `via-mac`
     /// while the account's way is the person's computer) holding the relay's card, the line under
-    /// Save, the line beside it, Save, and Default for new Bots. From a server without the relay
-    /// it holds the line saying so in the card's place, the line under Save, and Default for new
-    /// Bots. Before the setting has been read, on a server without reply sources, or when it
-    /// could not be read, the section holds only the line the page draws in place of the page
-    /// (state `asking` while that is the server being asked) and Default for new Bots. Nothing of
-    /// the plan on the server's own machine is on it, nor a model of the relay's own.
+    /// Save, the line beside it, and Save. From a server without the relay it holds the line
+    /// saying so in the card's place, and the line under Save. Before the setting has been read,
+    /// on a server without reply sources, or when it could not be read, the section holds only
+    /// the line the page draws in place of the page (state `asking` while that is the server
+    /// being asked). Nothing of the plan on the server's own machine is on it, nor a model of the
+    /// relay's own, nor Default for new Bots, which is on General.
     fn reply_source_node(&self) -> UiNode {
         let snap = &self.reply_source;
         let settings = &snap.settings;
@@ -5410,9 +5423,7 @@ impl NativeChatHost {
             if line == reply_source::ASKING {
                 section.states.push("asking".into());
             }
-            return section
-                .with_child(UiNode::status(ids::REPLY_SOURCE_UNAVAILABLE, line))
-                .with_child(self.new_bots_node());
+            return section.with_child(UiNode::status(ids::REPLY_SOURCE_UNAVAILABLE, line));
         };
         section = section.with_value(kept.kind.word());
         for (on, state) in [
@@ -5450,7 +5461,14 @@ impl NativeChatHost {
                     .with_enabled(snap.can_save),
             );
         }
-        section.with_child(self.new_bots_node())
+        section
+    }
+
+    /// Settings → General's first section as the page draws it: `settings-default-models`
+    /// (named `Default models`), holding Default for new Bots.
+    fn default_models_node(&self) -> UiNode {
+        UiNode::new(ids::DEFAULT_MODELS, "group", default_models::TITLE)
+            .with_child(self.new_bots_node())
     }
 
     /// Default for new Bots as the page draws it: `settings-new-bots`. While the server keeps no
@@ -5460,14 +5478,14 @@ impl NativeChatHost {
     /// the live card and its popover ([`Self::picker_node`]), and while the popover is shut,
     /// `settings-new-bots-error`: what the last change that did not go as asked came to.
     fn new_bots_node(&self) -> UiNode {
-        let section = UiNode::new(ids::NEW_BOTS, "group", reply_source::NEW_BOTS_TITLE);
+        let section = UiNode::new(ids::NEW_BOTS, "group", default_models::NEW_BOTS_TITLE);
         match &self.reply_source.new_bots {
             crate::state::DefaultForNewBots::NotOnServer => {
                 let (model, detail) = model_picker::dead_card_words();
                 let mut section = section
                     .with_child(UiNode::status(
                         ids::NEW_BOTS_UNAVAILABLE,
-                        reply_source::NEW_BOTS_COMING_SOON,
+                        default_models::NEW_BOTS_COMING_SOON,
                     ))
                     .with_child(
                         UiNode::button(ids::NEW_BOTS_CARD, format!("{model} · {detail}"))
@@ -5579,7 +5597,7 @@ impl NativeChatHost {
     /// default for new Bots, where its card is dead.
     fn picker_absent(&self, which: PickerFor, target: &str) -> Option<String> {
         if which == PickerFor::NewBots
-            && let Some(off) = self.off_the_relay_page(target)
+            && let Some(off) = self.off_the_general_page(target)
         {
             return Some(off);
         }
@@ -5589,7 +5607,10 @@ impl NativeChatHost {
         Some(match which {
             PickerFor::Bot => format!("`{target}` is not on screen: no Bot is open"),
             PickerFor::NewBots => {
-                format!("`{target}` is dead: {}", reply_source::NEW_BOTS_COMING_SOON)
+                format!(
+                    "`{target}` is dead: {}",
+                    default_models::NEW_BOTS_COMING_SOON
+                )
             }
         })
     }
@@ -5836,8 +5857,7 @@ impl NativeChatHost {
     /// One of Settings → Relay's controls, or `None` for a target that is none of them. The tab
     /// answers from anywhere in Settings, and not while Settings is shut. Every control on the
     /// page is refused while the page is not on screen, before the setting has been read, and
-    /// while it is dead there. Default for new Bots' card is dead while the server keeps no
-    /// default for new Bots.
+    /// while it is dead there.
     fn reply_source_command(&self, target: &str) -> Option<Result<Command, String>> {
         if target == ids::SETTINGS_REPLY_SOURCE {
             return Some(if self.account_open {
@@ -5852,13 +5872,46 @@ impl NativeChatHost {
         if target.starts_with(ids::RELAY) {
             return Some(self.relay_control(target));
         }
-        if target.starts_with(ids::NEW_BOTS) {
-            return Some(self.new_bots_control(target));
-        }
         if !target.starts_with(ids::REPLY_SOURCE) {
             return None;
         }
         Some(self.reply_source_control(target))
+    }
+
+    /// One of Settings → General's Default models, or `None` for a target that is none of them.
+    /// The tab answers from anywhere in Settings, and not while Settings is shut; the section is
+    /// a line; Default for new Bots' parts are its own ([`Self::new_bots_control`]).
+    fn default_models_command(&self, target: &str) -> Option<Result<Command, String>> {
+        if target == ids::SETTINGS_GENERAL {
+            return Some(if self.account_open {
+                Ok(Command::SetAppSettingsTab(AppSettingsTab::General))
+            } else {
+                Err(format!(
+                    "`{target}` is in Settings, which is shut: open it with `{}`",
+                    ids::FOOTER_ACCOUNT
+                ))
+            });
+        }
+        if target == ids::DEFAULT_MODELS {
+            return Some(Err(self.off_the_general_page(target).unwrap_or_else(
+                || format!("`{target}` is a section of the page, not a control"),
+            )));
+        }
+        if target.starts_with(ids::NEW_BOTS) {
+            return Some(self.new_bots_control(target));
+        }
+        None
+    }
+
+    /// Why a control of Settings → General is not on screen: Settings is not open on the page.
+    fn off_the_general_page(&self, target: &str) -> Option<String> {
+        (!(self.account_open && self.general_tab)).then(|| {
+            format!(
+                "`{target}` is on Settings → General, which is not what is on screen: open it \
+                 with `{}`",
+                ids::SETTINGS_GENERAL
+            )
+        })
     }
 
     /// Why a control of Settings → Relay is not on screen: Settings is not open on the page.
@@ -5881,12 +5934,15 @@ impl NativeChatHost {
         if target == ids::NEW_BOTS_DISMISS {
             return Ok(PickerCommand::SetOpen(false).sent_to(PickerFor::NewBots));
         }
-        if let Some(off) = self.off_the_relay_page(target) {
+        if let Some(off) = self.off_the_general_page(target) {
             return Err(off);
         }
         match &self.reply_source.new_bots {
             crate::state::DefaultForNewBots::NotOnServer => Err(if target == ids::NEW_BOTS_CARD {
-                format!("`{target}` is dead: {}", reply_source::NEW_BOTS_COMING_SOON)
+                format!(
+                    "`{target}` is dead: {}",
+                    default_models::NEW_BOTS_COMING_SOON
+                )
             } else {
                 format!("`{target}` is a line on the page, not a control")
             }),
@@ -6944,6 +7000,8 @@ impl NativeChatHost {
         } else if let Some(cmd) = self.reply_run_command(target) {
             cmd?
         } else if let Some(cmd) = self.reply_source_command(target) {
+            cmd?
+        } else if let Some(cmd) = self.default_models_command(target) {
             cmd?
         } else if let Some(cmd) = self.model_picker_command(target) {
             cmd?
@@ -13435,14 +13493,15 @@ mod tests {
 
     /// Settings → Relay is on the tree as the page draws it: the line standing in for the page
     /// until the server has answered, then the section valued by the door the server keeps, the
-    /// relay's card, the lines by Save, Save, and Default for new Bots; and from a server without
-    /// the relay, the line saying so in the card's place and nothing to save. The tab is named
-    /// Relay and answers by the id it always had, only while Settings is open. Each control is
-    /// the page's own, and refused off the page and before the setting is read.
+    /// relay's card, the lines by Save, and Save; and from a server without the relay, the line
+    /// saying so in the card's place and nothing to save. Default for new Bots is not on it: it
+    /// is on General. The tab is named Relay and answers by the id it always had, only while
+    /// Settings is open. Each control is the page's own, and refused off the page and before the
+    /// setting is read.
     #[test]
     fn the_relay_page_is_on_the_tree_and_clicks_as_the_page_does() {
         use crate::components::reply_source::{
-            ASKING, NEW_BOTS_TITLE, RELAY_NOT_ON_SERVER, RELAY_TITLE, TAB_LABEL,
+            ASKING, RELAY_NOT_ON_SERVER, RELAY_TITLE, TAB_LABEL,
         };
         use crate::opengrok::InferenceKind;
         use crate::state::{REPLY_SOURCE_NOT_ON_SERVER, ReplySourceNote, ReplySourceRead};
@@ -13469,8 +13528,8 @@ mod tests {
         let off = host.click(ids::REPLY_SOURCE_SAVE).unwrap_err();
         assert!(off.contains(ids::SETTINGS_REPLY_SOURCE), "{off}");
 
-        // On the page, before the server has answered: the section, asking, the line the page
-        // draws meanwhile, and Default for new Bots; nothing to press.
+        // On the page, before the server has answered: the section, asking, and the line the page
+        // draws meanwhile; nothing to press, and no default for new Bots, which is on General.
         host.reply_source_tab = true;
         let tree = host.snapshot();
         let section = tree.find(ids::REPLY_SOURCE).unwrap();
@@ -13482,10 +13541,7 @@ mod tests {
                 .iter()
                 .map(|node| (node.id.as_str(), node.name.as_str()))
                 .collect::<Vec<_>>(),
-            [
-                (ids::REPLY_SOURCE_UNAVAILABLE, ASKING),
-                (ids::NEW_BOTS, NEW_BOTS_TITLE)
-            ],
+            [(ids::REPLY_SOURCE_UNAVAILABLE, ASKING)],
             "as drawn"
         );
         assert!(host.click(ids::REPLY_SOURCE_SAVE).is_err());
@@ -13514,16 +13570,13 @@ mod tests {
                 .iter()
                 .map(|node| (node.id.as_str(), node.name.as_str()))
                 .collect::<Vec<_>>(),
-            [
-                (ids::RELAY_UNAVAILABLE, RELAY_NOT_ON_SERVER),
-                (ids::NEW_BOTS, NEW_BOTS_TITLE)
-            ]
+            [(ids::RELAY_UNAVAILABLE, RELAY_NOT_ON_SERVER)]
         );
         let no_save = host.click(ids::REPLY_SOURCE_SAVE).unwrap_err();
         assert!(no_save.contains(RELAY_NOT_ON_SERVER), "{no_save}");
 
-        // A server with the relay: the card, Save, and Default for new Bots; the section valued
-        // by the door the server keeps, which nothing here switches.
+        // A server with the relay: the card and Save; the section valued by the door the server
+        // keeps, which nothing here switches.
         host.reply_source.settings.kept = relay_read("loopback");
         let tree = host.snapshot();
         let section = tree.find(ids::REPLY_SOURCE).unwrap();
@@ -13535,8 +13588,8 @@ mod tests {
                 .iter()
                 .map(|node| node.id.as_str())
                 .collect::<Vec<_>>(),
-            [ids::RELAY, ids::REPLY_SOURCE_SAVE, ids::NEW_BOTS],
-            "the relay, its Save, and the default for new Bots: nothing else"
+            [ids::RELAY, ids::REPLY_SOURCE_SAVE],
+            "the relay and its Save: nothing else"
         );
         assert_eq!(tree.find(ids::RELAY).unwrap().name, RELAY_TITLE);
         let save = tree.find(ids::REPLY_SOURCE_SAVE).unwrap();
@@ -13756,12 +13809,44 @@ mod tests {
         assert!(host.take_compose().is_none() && host.take_command().is_none());
     }
 
-    /// Default for new Bots says it is coming and its card is dead, the picker's card with no
-    /// model, and refused with why; off the page it is refused for that first. From the app, as
-    /// the state holds it.
+    /// Settings → General answers by its tab's id from anywhere in Settings, and not while
+    /// Settings is shut; on it, Default models is a section of the page, and a line, not a
+    /// control.
     #[test]
-    fn the_relay_pages_default_for_new_bots_is_coming() {
-        use crate::components::reply_source::NEW_BOTS_COMING_SOON;
+    fn the_general_tab_is_on_the_tree_and_holds_default_models() {
+        use crate::components::default_models::TITLE;
+        let mut host = host();
+        let tree = host.snapshot();
+        assert_eq!(tree.find(ids::SETTINGS_GENERAL).unwrap().name, "General");
+        let shut = host.click(ids::SETTINGS_GENERAL).unwrap_err();
+        assert!(shut.contains(ids::FOOTER_ACCOUNT), "{shut}");
+        host.account_open = true;
+        host.click(ids::SETTINGS_GENERAL).unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::SetAppSettingsTab(AppSettingsTab::General))
+        ));
+        assert!(
+            host.snapshot().find(ids::DEFAULT_MODELS).is_none(),
+            "Settings is not open on General"
+        );
+        host.general_tab = true;
+        let tree = host.snapshot();
+        assert_eq!(tree.find(ids::DEFAULT_MODELS).unwrap().name, TITLE);
+        assert_eq!(TITLE, "Default models");
+        assert!(tree.ids_are_unique());
+        let line = host.click(ids::DEFAULT_MODELS).unwrap_err();
+        assert!(line.contains("not a control"), "{line}");
+        assert!(host.take_command().is_none());
+    }
+
+    /// Settings → General opens with Default models, which holds Default for new Bots: while
+    /// the server keeps no such default it says it is coming and its card is dead, the picker's
+    /// card with no model, and refused with why; off the page it is refused for that first, and
+    /// Settings → Relay does not hold it. From the app, as the state holds it.
+    #[test]
+    fn the_general_pages_default_for_new_bots_is_coming() {
+        use crate::components::default_models::{NEW_BOTS_COMING_SOON, TITLE};
         use crate::opengrok::InferenceKind;
         use crate::state::ReplySourceRead;
         let mut state = AppState::new();
@@ -13775,17 +13860,17 @@ mod tests {
             serde_json::from_value(serde_json::json!({ "id": "cw_1", "name": "Ada" })).unwrap(),
         ];
         state.is_app_settings_open = true;
-        state.app_settings_tab = AppSettingsTab::ReplySource;
+        state.app_settings_tab = AppSettingsTab::General;
         state.reply_source.kept = Some(ReplySourceRead::Read(kept_source(
             InferenceKind::LocalProxy,
             true,
         )));
         let mut host = NativeChatHost::from_app(&state);
         let tree = host.snapshot();
+        let models = tree.find(ids::DEFAULT_MODELS).expect("Default models");
         assert_eq!(
-            tree.find(ids::REPLY_SOURCE)
-                .and_then(|section| section.value.as_deref()),
-            Some("local_proxy")
+            (models.name.as_str(), models.children[0].id.as_str()),
+            (TITLE, ids::NEW_BOTS)
         );
         let new_bots = tree.find(ids::NEW_BOTS).unwrap();
         assert_eq!(
@@ -13807,9 +13892,13 @@ mod tests {
         assert!(line.contains("not a control"), "{line}");
         assert!(host.take_command().is_none());
 
-        host.reply_source_tab = false;
+        state.app_settings_tab = AppSettingsTab::ReplySource;
+        let mut host = NativeChatHost::from_app(&state);
+        let tree = host.snapshot();
+        assert!(tree.find(ids::REPLY_SOURCE).is_some());
+        assert!(tree.find(ids::DEFAULT_MODELS).is_none() && tree.find(ids::NEW_BOTS).is_none());
         let off = host.click(ids::NEW_BOTS_CARD).unwrap_err();
-        assert!(off.contains(ids::SETTINGS_REPLY_SOURCE), "{off}");
+        assert!(off.contains(ids::SETTINGS_GENERAL), "{off}");
     }
 
     /// Default for new Bots' picker, from the default as given, over a list of two plan models
@@ -13836,7 +13925,7 @@ mod tests {
     }
 
     /// Where the server keeps a default for new Bots, Default for new Bots is the Bot's picker on
-    /// Settings → Relay, every part of it under `settings-new-bots-` for `agent-model-`, and a
+    /// Settings → General, every part of it under `settings-new-bots-` for `agent-model-`, and a
     /// driver works it by the same roads: the card, ⚡, the slider, the list with None over its
     /// models, the search box, a model, and the popover's dismiss. Each change is sent as the
     /// default's, and every control that sends one is dead while one is with the server. What a
@@ -13848,7 +13937,7 @@ mod tests {
         use crate::state::DefaultForNewBots;
         let mut host = host();
         host.account_open = true;
-        host.reply_source_tab = true;
+        host.general_tab = true;
         host.reply_source.settings.kept = relay_read("loopback");
         host.reply_source.new_bots = DefaultForNewBots::Kept(None);
         host.new_bots_pick = Some(a_new_bots_pick(None));
@@ -14035,12 +14124,14 @@ mod tests {
         assert!(line.contains("a line"), "{line}");
         assert!(host.take_command().is_none());
 
-        // Off the page, nothing of it answers; the Bot's picker is a picker of its own.
-        host.reply_source_tab = false;
+        // Off the page, nothing of it answers, on Relay as anywhere else; the Bot's picker is a
+        // picker of its own.
+        host.general_tab = false;
+        host.reply_source_tab = true;
         let off = host.click(ids::NEW_BOTS_CARD).unwrap_err();
-        assert!(off.contains(ids::SETTINGS_REPLY_SOURCE), "{off}");
+        assert!(off.contains(ids::SETTINGS_GENERAL), "{off}");
         let off = host.set_value("settings-new-bots-search", "x").unwrap_err();
-        assert!(off.contains(ids::SETTINGS_REPLY_SOURCE), "{off}");
+        assert!(off.contains(ids::SETTINGS_GENERAL), "{off}");
         assert!(!is_picker_part(ids::NEW_BOTS_CARD));
     }
 
@@ -14048,7 +14139,7 @@ mod tests {
     /// tree, and one without the key the dead card that says it is coming.
     #[test]
     fn the_default_for_new_bots_is_live_from_the_app_only_where_the_server_keeps_one() {
-        use crate::components::reply_source::NEW_BOTS_COMING_SOON;
+        use crate::components::default_models::NEW_BOTS_COMING_SOON;
         use crate::state::ReplySourceRead;
         let mut state = AppState::new();
         state.auth_status = crate::state::AuthStatus::SignedIn;
@@ -14060,7 +14151,7 @@ mod tests {
             serde_json::from_value(serde_json::json!({ "id": "cw_1", "name": "Ada" })).unwrap(),
         ];
         state.is_app_settings_open = true;
-        state.app_settings_tab = AppSettingsTab::ReplySource;
+        state.app_settings_tab = AppSettingsTab::General;
         let mut kept = kept_source(crate::opengrok::InferenceKind::Gateway, true);
         state.reply_source.kept = Some(ReplySourceRead::Read(kept.clone()));
         let tree = NativeChatHost::from_app(&state).snapshot();
