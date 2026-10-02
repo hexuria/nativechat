@@ -278,6 +278,12 @@ pub mod ids {
         format!("routine-{id}-rotate")
     }
 
+    /// The Active switch on the routine's editor: checked while the routine runs on its own,
+    /// labelled `Active`, or `Paused` while it does not. A click asks for the other way.
+    pub fn routine_active(id: &str) -> String {
+        format!("routine-{id}-active")
+    }
+
     /// Test run: the server starts the routine now. Only on a routine the server has.
     pub fn routine_test(id: &str) -> String {
         format!("routine-{id}-test")
@@ -807,6 +813,11 @@ pub enum Command {
     RunRoutineNow {
         routine_id: String,
     },
+    /// The Active switch: pause the routine, or let it run on its own again.
+    SetRoutineActive {
+        routine_id: String,
+        active: bool,
+    },
     OpenRoutineThread {
         routine_id: String,
     },
@@ -1062,6 +1073,11 @@ impl Command {
             Self::RunRoutineNow { routine_id } => {
                 if let Some(coworker_id) = state.active_coworker_id.clone() {
                     state.run_routine_now(&coworker_id, &routine_id, cx);
+                }
+            }
+            Self::SetRoutineActive { routine_id, active } => {
+                if let Some(coworker_id) = state.active_coworker_id.clone() {
+                    state.set_routine_active(&coworker_id, &routine_id, active, cx);
                 }
             }
             Self::EditRoutine {
@@ -2098,6 +2114,14 @@ fn routine_node(routine: &RoutineSnap) -> UiNode {
     if let Some(cron) = &routine.cron {
         node = node.with_value(cron.clone());
     }
+    node = node.with_child(
+        UiNode::new(
+            ids::routine_active(&routine.id),
+            "switch",
+            if routine.active { "Active" } else { "Paused" },
+        )
+        .with_checked(routine.active),
+    );
     if routine.kind == "draft" {
         node = node
             .with_child(UiNode::button(
@@ -6181,6 +6205,17 @@ impl NativeChatHost {
                 });
             }
         }
+        // The switch asks for the other way from where it stands, so it is read off the row
+        // and not off the id alone.
+        if let Some(routine) = rest
+            .strip_suffix("-active")
+            .and_then(|id| self.routines.iter().find(|routine| routine.id == id))
+        {
+            return Some(Command::SetRoutineActive {
+                routine_id: routine.id.clone(),
+                active: !routine.active,
+            });
+        }
         let mut cmd: Option<(&str, fn(String) -> Command)> = None;
         for (tail, make) in [
             (
@@ -6747,6 +6782,35 @@ mod tests {
         assert!(matches!(
             host.take_command().unwrap(),
             Command::RunRoutineNow { routine_id } if routine_id == "sch-1-2"
+        ));
+    }
+
+    /// The Active switch is on the tree where it stands, labelled as the editor labels it, and a
+    /// click asks for the other way: a paused routine is switched back on, an active one paused.
+    #[test]
+    fn a_routines_active_switch_reads_where_it_stands_and_flips() {
+        let mut host = host();
+        host.computer_open = true;
+        let mut paused = routine("sch-1-2", "cron");
+        paused.active = false;
+        host.routines = vec![routine("sch_1", "cron"), paused];
+        let tree = host.snapshot();
+        let on = tree.find(&ids::routine_active("sch_1")).unwrap();
+        assert_eq!(on.name, "Active");
+        assert!(on.checked == Some(true), "{on:?}");
+        let off = tree.find(&ids::routine_active("sch-1-2")).unwrap();
+        assert_eq!(off.name, "Paused");
+        assert!(off.checked == Some(false), "{off:?}");
+
+        host.click(&ids::routine_active("sch-1-2")).unwrap();
+        assert!(matches!(
+            host.take_command().unwrap(),
+            Command::SetRoutineActive { routine_id, active: true } if routine_id == "sch-1-2"
+        ));
+        host.click(&ids::routine_active("sch_1")).unwrap();
+        assert!(matches!(
+            host.take_command().unwrap(),
+            Command::SetRoutineActive { routine_id, active: false } if routine_id == "sch_1"
         ));
     }
 

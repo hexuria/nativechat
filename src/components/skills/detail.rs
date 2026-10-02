@@ -5,11 +5,11 @@
 
 use super::{NEVER_UPDATED, NOTHING_WRITTEN_YET, chip, short_relative_time, skill_icon, use_line};
 use crate::chrome::TITLE_BAR_H;
+use crate::components::switch::Switch;
 use crate::opengrok::SkillDetail;
 use crate::state::AppState;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::switch::Switch;
-use gpui_kit::component::{Disableable as _, Icon, IconName, Sizable as _, Theme, h_flex, v_flex};
+use gpui_kit::component::{Icon, IconName, Sizable as _, Theme, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 
