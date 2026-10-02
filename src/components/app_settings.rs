@@ -19,7 +19,7 @@ pub struct AppSettings {
     logins: Option<Entity<LoginsPage>>,
     /// Settings → Skills, made on the first render of that tab, for the same reason.
     skills: Option<Entity<SkillsPage>>,
-    /// Settings → Reply source, made on the first render of that tab, for the same reason.
+    /// Settings → Relay, made on the first render of that tab, for the same reason.
     reply_source: Option<Entity<ReplySourcePage>>,
 }
 
@@ -309,7 +309,7 @@ impl AppSettings {
             ))
             .child(nav_item(
                 crate::components::reply_source::SETTINGS_TAB,
-                "Reply source",
+                crate::components::reply_source::TAB_LABEL,
                 tab == AppSettingsTab::ReplySource,
                 AppSettingsTab::ReplySource,
                 cx,
@@ -334,7 +334,7 @@ fn tab_title(tab: AppSettingsTab) -> &'static str {
         AppSettingsTab::Updates => "Updates",
         AppSettingsTab::Logins => "Logins",
         AppSettingsTab::Connections => "Connections",
-        AppSettingsTab::ReplySource => "Reply source",
+        AppSettingsTab::ReplySource => crate::components::reply_source::TAB_LABEL,
         AppSettingsTab::Skills => "Skills",
     }
 }

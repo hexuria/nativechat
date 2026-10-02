@@ -124,12 +124,6 @@ impl OpenGrokClient {
         })
     }
 
-    /// The server runs on this Mac: its address is loopback ([`super::is_loopback`]). The person's
-    /// own plan is set up only from there, because the server calls opencodex on its own machine.
-    pub fn is_on_this_machine(&self) -> bool {
-        super::is_loopback(&self.base)
-    }
-
     pub fn with_session_file(mut self, path: PathBuf) -> Self {
         self.session_path = Some(path);
         self
@@ -856,13 +850,13 @@ impl OpenGrokClient {
         Self::json_or_error(response).await
     }
 
-    /// `PUT /account/inference-source` — keep a new reply source, answered with the setting as
-    /// the server now keeps it, with a fresh `healthy` (the same contract: `put_source` in
-    /// `crates/opengrok-server/src/inference.rs`, `apply` in
+    /// `PUT /account/inference-source` — keep a change to the account's setting, answered with the
+    /// setting as the server now keeps it, with a fresh `healthy` (the same contract: `put_source`
+    /// in `crates/opengrok-server/src/inference.rs`, `apply` in
     /// `crates/opengrok-harness/src/local_proxy.rs`). A field left out is kept and a `null`
-    /// clears it ([`InferenceSourceUpdate`]). A `baseUrl` that is not literal loopback, or a
-    /// `localModel` from a provider the server will not route a subscription to, is refused with
-    /// a 400 and `{"error": sentence}`, and nothing is kept. Given [`INFERENCE_SOURCE_TIMEOUT`].
+    /// clears it ([`InferenceSourceUpdate`]). A body the server will not keep is refused whole,
+    /// with a 400 and `{"error": sentence}`, and nothing is kept. Given
+    /// [`INFERENCE_SOURCE_TIMEOUT`].
     pub async fn set_inference_source(
         &self,
         update: &InferenceSourceUpdate,
@@ -6932,13 +6926,12 @@ mod tests {
         assert_eq!(cat.models[0].id, "xai/grok-4.6@sub");
     }
 
-    /// The account's reply source as the contract writes it: `GET` reads the setting, and a
-    /// Save is one `PUT` of the door and what changed, key and all when one was typed, answered
-    /// with the setting as the server now keeps it. A field emptied on the page goes as `null`,
-    /// and so does Remove key.
+    /// The account's setting as the contract writes it: `GET` reads it, and a change is one
+    /// `PUT` of the kind the server keeps and what changed, answered with the setting as the
+    /// server now keeps it. Nothing of the plan on the server's own machine goes with it.
     #[tokio::test]
-    async fn the_reply_source_is_read_and_a_save_puts_what_changed() {
-        use crate::opengrok::{InferenceKind, InferenceSourceUpdate, ProxyKey};
+    async fn the_reply_source_is_read_and_a_put_carries_the_kind_and_what_changed() {
+        use crate::opengrok::{InferenceKind, InferenceSourceUpdate, Via};
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/account/inference-source"))
@@ -6951,27 +6944,12 @@ mod tests {
             .await;
         Mock::given(method("PUT"))
             .and(path("/account/inference-source"))
-            .and(body_json(json!({
-                "kind": "local_proxy",
-                "baseUrl": "http://127.0.0.1:8080",
-                "localModel": "gpt-5-codex",
-                "apiKey": "sk-proxy-1"
-            })))
+            .and(body_json(json!({"kind": "gateway", "via": "mac"})))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "kind": "local_proxy", "baseUrl": "http://127.0.0.1:8080",
-                "localModel": "gpt-5-codex", "healthy": true, "hasApiKey": true
-            })))
-            .expect(1)
-            .mount(&server)
-            .await;
-        Mock::given(method("PUT"))
-            .and(path("/account/inference-source"))
-            .and(body_json(json!({
-                "kind": "gateway", "baseUrl": null, "localModel": null, "apiKey": null
-            })))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "kind": "gateway", "baseUrl": null, "localModel": null,
-                "healthy": false, "hasApiKey": false
+                "kind": "gateway", "baseUrl": "http://127.0.0.1:8080",
+                "localModel": "gpt-5-codex", "healthy": true, "hasApiKey": true, "via": "mac",
+                "relay": {"connected": false, "machineId": null, "machineLabel": null,
+                          "localModel": null}
             })))
             .expect(1)
             .mount(&server)
@@ -6984,42 +6962,26 @@ mod tests {
         );
         let kept = client
             .set_inference_source(&InferenceSourceUpdate {
-                kind: InferenceKind::LocalProxy,
-                base_url: Some(Some("http://127.0.0.1:8080".into())),
-                local_model: Some(Some("gpt-5-codex".into())),
-                api_key: Some(ProxyKey::new("sk-proxy-1")),
-                via: None,
-                relay: None,
-            })
-            .await
-            .unwrap();
-        assert_eq!(kept.kind, InferenceKind::LocalProxy);
-        assert_eq!(kept.local_model.as_deref(), Some("gpt-5-codex"));
-        assert!(kept.healthy && kept.has_api_key);
-        let cleared = client
-            .set_inference_source(&InferenceSourceUpdate {
                 kind: InferenceKind::Gateway,
-                base_url: Some(None),
-                local_model: Some(None),
-                api_key: Some(None),
-                via: None,
-                relay: None,
+                via: Some(Via::Mac),
             })
             .await
             .unwrap();
+        assert_eq!(kept.default_via(), Some(Via::Mac));
         assert_eq!(
-            (cleared.base_url, cleared.local_model, cleared.has_api_key),
-            (None, None, false)
+            kept.base_url.as_deref(),
+            Some("http://127.0.0.1:8080"),
+            "what the server keeps of its own machine stays as it keeps it"
         );
     }
 
-    /// A URL that is not literal loopback is refused with a 400 and the server's sentence, and
-    /// the person is shown that sentence as it was written: a verdict about what they typed,
-    /// not a server out of reach.
+    /// A `PUT` the server will not keep is refused with a 400 and the server's sentence, and the
+    /// person is shown that sentence as it was written: a verdict about what was asked, not a
+    /// server out of reach.
     #[tokio::test]
-    async fn a_url_that_is_not_loopback_is_refused_in_the_servers_words() {
-        use crate::opengrok::{InferenceKind, InferenceSourceUpdate};
-        let said = "baseUrl must be a literal loopback address such as http://127.0.0.1:8080";
+    async fn a_refused_put_is_the_servers_words() {
+        use crate::opengrok::{InferenceKind, InferenceSourceUpdate, Via};
+        let said = "via \"helper\" is not built yet (#293); use \"loopback\" or \"mac\"";
         let server = MockServer::start().await;
         Mock::given(method("PUT"))
             .and(path("/account/inference-source"))
@@ -7030,11 +6992,7 @@ mod tests {
         let refused = client
             .set_inference_source(&InferenceSourceUpdate {
                 kind: InferenceKind::LocalProxy,
-                base_url: Some(Some("http://my-mac.example.com:8080".into())),
-                local_model: None,
-                api_key: None,
-                via: None,
-                relay: None,
+                via: Some(Via::Mac),
             })
             .await
             .unwrap_err();
@@ -7068,11 +7026,7 @@ mod tests {
             client
                 .set_inference_source(&InferenceSourceUpdate {
                     kind: InferenceKind::Gateway,
-                    base_url: None,
-                    local_model: None,
-                    api_key: None,
                     via: None,
-                    relay: None,
                 })
                 .await
                 .map(drop),

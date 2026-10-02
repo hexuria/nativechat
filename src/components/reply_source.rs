@@ -1,97 +1,84 @@
-//! Where a Bot's replies are paid from: the server's paid keys, or the person's own subscription
-//! through opencodex, running on the same machine as the server. Two surfaces: Settings → Reply
-//! source, where the subscription's connection is set up; and the badge on each reply, which says
-//! which door it came through. A Bot's door is picked with its model, on its card in its settings
-//! (`components::model_picker`), and nowhere else: the page no longer switches the account's
-//! door, which the server keeps as it is for the Bots that have picked none of their own.
+//! Settings → Relay: the person's ChatGPT or Grok plan, relayed to the server from this computer,
+//! and where a newly hired Bot starts. And the badge on each reply, which says which door it came
+//! through. A Bot's door is picked with its model, on its card in its settings
+//! (`components::model_picker`), and nowhere else: the page switches no door, and the server keeps
+//! the account's as it is for the Bots that have picked none of their own.
 //!
-//! Nothing here calls a model or keeps a key. The server keeps the setting, and when a turn goes
-//! through the person's plan it is the server that talks to opencodex. The words and element ids
-//! live here so the gpui-agent tree (`agent/host.rs`) says what the window says and names what
-//! the window names.
+//! The relay (opengrok-server #292): while it is on and the app is open, the server sends each
+//! model call on the person's plan down a stream to this computer, whose background helper asks
+//! its own opencodex and streams the answer back (`opengrok::relay`). The page has the switch that
+//! makes this computer the relay, where the relay stands, and opencodex's address and key here,
+//! which Save keeps on this computer, the key in its secure storage (the Keychain). The window
+//! still calls no model, and the key never goes to the server.
 //!
-//! The Mac relay adds a way to the plan (opengrok-server #292): through the person's Mac, whose
-//! background helper calls its own opencodex for the server (`opengrok::relay`). The page has a
-//! card for it, Answer with this Mac: the switch that makes this Mac the relay, opencodex's
-//! address and key on this Mac, the model a turn through a Mac runs on, and where the relay
-//! stands. The window still calls no model; the key goes to this Mac's Keychain.
+//! The page no longer sets up the plan on the server's own machine, the proxy address and key the
+//! server dials on its loopback, and sends neither: whatever the account keeps there stays as the
+//! server keeps it, and the Bots that go that way keep going as the server decides. Nor does it
+//! pick a model of the relay's own: each Bot picks its own, and new Bots start on the default
+//! below.
+//!
+//! The words say "this computer". The relay is the app on the person's computer passing their
+//! plan's replies to the server, which is not an idea only a Mac can have; the wire still calls
+//! the way `via: "mac"`, and the code keeps its names.
 //!
 //! The page ends with Default for new Bots, where a newly hired Bot will start: the picker's card,
 //! its model, effort and ⚡. The server keeps no such default yet (`state::DefaultForNewBots`), so
 //! the section says it is coming and its card takes no click.
+//!
+//! The words and element ids live here so the gpui-agent tree (`agent/host.rs`) says what the
+//! window says and names what the window names.
 
 use crate::components::fields::field_input;
 use crate::components::model_picker;
 use crate::components::switch::Switch;
 use crate::opengrok::{DEFAULT_PROXY_URL, InferenceKind, RelayStatus, ReplySource, Via};
 use crate::state::{
-    AppState, DefaultForNewBots, ProxyHealth, REPLY_SOURCE_NOT_ON_SERVER, REPLY_SOURCE_RETYPE_KEY,
-    RelayLine, RelayMac, ReplySourceNote, ReplySourceRead, ReplySourceSettings,
+    AppState, DefaultForNewBots, REPLY_SOURCE_NOT_ON_SERVER, RelayLine, RelayMac, ReplySourceNote,
+    ReplySourceRead, ReplySourceSettings,
 };
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{InputEvent, InputState};
-use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
 use gpui_kit::component::tooltip::Tooltip;
-use gpui_kit::component::{
-    ActiveTheme, Disableable, IconName, Sizable as _, Theme, h_flex, v_flex,
-};
+use gpui_kit::component::{ActiveTheme, Disableable, Sizable as _, Theme, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 
-/// Settings → Reply source, in the settings' own list of pages.
+/// Settings → Relay, in the settings' own list of pages. The id is the one the tab has always
+/// had, so a driver that opened it by name still does.
 pub(crate) const SETTINGS_TAB: &str = "settings-tab-reply-source";
-/// The section: the whole form, once the setting has been read.
+/// What the tab, and the page's title, are called.
+pub(crate) const TAB_LABEL: &str = "Relay";
+/// The section: the whole page, once the setting has been read.
 pub(crate) const SECTION: &str = "settings-reply-source";
-pub(crate) const URL: &str = "settings-reply-source-url";
-pub(crate) const KEY: &str = "settings-reply-source-key";
-/// Beside the key field while the server holds a key: Remove key, and Keep key to take it back.
-pub(crate) const REMOVE_KEY: &str = "settings-reply-source-remove-key";
-/// Whether opencodex answered the server.
-pub(crate) const HEALTH: &str = "settings-reply-source-health";
-/// Why the Subscription group offers no Claude or Gemini model.
-pub(crate) const PROVIDERS: &str = "settings-reply-source-providers";
-/// Where the app's server is not on this Mac: why the plan's half of the page takes no change.
-pub(crate) const ELSEWHERE: &str = "settings-reply-source-elsewhere";
 pub(crate) const SAVE: &str = "settings-reply-source-save";
-/// Beside Save: what it will not send as the page stands, or what it keeps.
+/// Beside Save: what it will not keep as the page stands.
 pub(crate) const HINT: &str = "settings-reply-source-hint";
-/// Under Save: a refusal in the server's words, a Save nobody knows the fate of, a read that
-/// failed, and a key to type again.
+/// Under Save: a read that failed, and what the Keychain said when it did not keep a key.
 pub(crate) const ERROR: &str = "settings-reply-source-error";
-/// In place of the form: asking the server, a server without reply sources, or a setting that
+/// In place of the page: asking the server, a server without reply sources, or a setting that
 /// could not be read.
 pub(crate) const UNAVAILABLE: &str = "settings-reply-source-unavailable";
 /// In a Bot's Usage card, while replies go through the person's own plan.
 pub(crate) const BOT_USAGE_PLAN: &str = "agent-usage-plan";
-/// Answer with this Mac: the card, and each of its controls and lines.
+/// Relay your plan from this computer: the card, and each of its controls and lines.
 pub(crate) const RELAY: &str = "settings-relay";
 pub(crate) const RELAY_SWITCH: &str = "settings-relay-switch";
-/// Where the relay stands: this Mac answering, another Mac, connecting, or not connected.
+/// Where the relay stands: this computer relaying, another computer, connecting, or not
+/// connected.
 pub(crate) const RELAY_STATUS: &str = "settings-relay-status";
-/// Under the status line: why this Mac is not connected, or how it takes the relay back.
+/// Under the status line: why this computer is not connected, or how it takes the relay back.
 pub(crate) const RELAY_DETAIL: &str = "settings-relay-detail";
 pub(crate) const RELAY_ADDR: &str = "settings-relay-addr";
 pub(crate) const RELAY_KEY: &str = "settings-relay-key";
 /// Beside the key field while the Keychain holds a key: Remove key, and Keep key to take it back.
 pub(crate) const RELAY_KEY_REMOVE: &str = "settings-relay-key-remove";
-/// The relay's model picker, with one choice per model a Mac lists.
-pub(crate) const RELAY_MODEL: &str = "settings-relay-model";
-/// The picker's first choice while a model is shown: none, which takes the kept one away.
-pub(crate) const RELAY_NO_MODEL: &str = "settings-relay-no-model";
-/// Under the picker: why it offers nothing, or that what it offers may be old.
-pub(crate) const RELAY_MODELS_NOTE: &str = "settings-relay-models-note";
-/// Why the card takes no change: a server without the relay, or a Mac not enrolled.
+/// Why the relay takes no change: a server without the relay, or a computer not enrolled.
 pub(crate) const RELAY_UNAVAILABLE: &str = "settings-relay-unavailable";
 /// Default for new Bots: the section, the line saying why it takes no change, and the picker's
 /// card in it.
 pub(crate) const NEW_BOTS: &str = "settings-new-bots";
 pub(crate) const NEW_BOTS_UNAVAILABLE: &str = "settings-new-bots-unavailable";
 pub(crate) const NEW_BOTS_CARD: &str = "settings-new-bots-card";
-
-/// One model in the relay's picker, by the id the server lists it under.
-pub(crate) fn relay_model_id(model: &str) -> String {
-    format!("{RELAY_MODEL}-{model}")
-}
 
 /// A reply's badge, by the reply's message id.
 pub(crate) fn badge_id(message_id: &str) -> String {
@@ -106,111 +93,73 @@ pub(crate) fn badge_model_id(message_id: &str) -> String {
 }
 
 pub(crate) const ASKING: &str = "Asking the server…";
-/// The page's opening line: how the server reaches the person's own subscription.
-pub(crate) const INTRO: &str = "How the server reaches your own subscription, through opencodex. \
-     The server runs every turn, its tools and its record; this app never calls a model or keeps \
-     a key.";
+/// The page's opening line, as the approved design words it: what the relay is for.
+pub(crate) const INTRO: &str = "Your ChatGPT or Grok plan answers through this computer.";
 /// The same, from a server that keeps a door per Bot (opengrok-server main d6f640e (#307, after
-/// #304), pin bf99845), where each Bot picks its own model, and with it its door, on its card.
-pub(crate) const INTRO_PER_BOT: &str = "How the server reaches your own subscription, through \
-     opencodex. Each Bot picks its model in its settings, from your subscription or the server's \
-     paid keys. The server runs every turn, its tools and its record; this app never calls a \
-     model or keeps a key.";
-pub(crate) const RUNNING: &str = "opencodex is running";
-/// The health line while opencodex is not answering, up to the command that starts it, which the
-/// page sets as code.
-const NOT_RUNNING_LEAD: &str = "Not running — start it with";
-pub(crate) const START_COMMAND: &str = "ocx start";
-/// The health line while opencodex is not answering a server on another machine, where a
-/// command typed on this Mac would start nothing the server can reach.
-pub(crate) const NOT_RUNNING_THERE: &str = "Not running on the server's machine";
-/// The health line while the server keeps no proxy address: nothing to ask, which is not the
-/// same as opencodex being down.
-pub(crate) const NO_ADDRESS: &str = "No address saved";
-/// Why the Subscription group offers only OpenAI's and xAI's models.
-pub(crate) const PROVIDERS_NOTE: &str = "Only Codex/OpenAI and Grok/xAI models are offered: \
-     Claude's and Gemini's terms forbid routing a consumer subscription through a third-party \
-     app.";
-/// Where the app's server is not on this Mac. The server calls opencodex on its own machine, so
-/// the person's plan is set up from the Mac the server runs on.
-pub(crate) const ELSEWHERE_LINE: &str =
-    "Your own subscription works only when this app's server runs on this Mac.";
-/// The same, from a server that knows the relay: the plan on the server's machine is still set
-/// up there, and this Mac can answer for the plan instead.
-pub(crate) const ELSEWHERE_RELAY_LINE: &str = "The plan on the server's own machine is set up \
-     from that machine. From this Mac, your plan can answer through Answer with this Mac below.";
-pub(crate) const RELAY_TITLE: &str = "Answer with this Mac";
+/// #304), pin bf99845), where a Bot picks its plan's model, and with it its door, on its card.
+pub(crate) const INTRO_PER_BOT: &str = "Your ChatGPT or Grok plan answers through this computer. \
+     Bots use it when they pick a Subscription model.";
+pub(crate) const RELAY_TITLE: &str = "Relay your plan from this computer";
 pub(crate) const RELAY_INTRO: &str = "While this is on and the app is open, the server sends \
-     replies meant for your Mac here, and this Mac asks its own opencodex. Its key stays in this \
-     Mac's Keychain.";
-/// Why the switch is dead: the server has no relay.
-pub(crate) const RELAY_NOT_ON_SERVER: &str = "This server can't take replies from a Mac yet.";
-/// Why the switch is dead: this Mac has no machine token to open the stream with.
-pub(crate) const RELAY_NOT_ENROLLED: &str =
-    "This Mac isn't enrolled with the server yet, so it can't answer. It enrols when you sign in.";
+     your plan's replies here, and this computer asks its own opencodex.";
+/// Why the switch is dead: the server has no relay. The relay's own sentence for the same.
+pub(crate) const RELAY_NOT_ON_SERVER: &str = crate::opengrok::SERVER_WITHOUT_RELAY;
+/// Why the switch is dead: this computer has no machine token to open the stream with.
+pub(crate) const RELAY_NOT_ENROLLED: &str = "This computer isn't enrolled with the server yet, so \
+     it can't relay. It enrols when you sign in.";
+pub(crate) const RELAY_ADDR_LABEL: &str = "opencodex address";
+pub(crate) const RELAY_KEY_LABEL: &str = "opencodex key (kept in this computer's secure storage)";
 pub(crate) const RELAY_KEY_PLACEHOLDER: &str = "opencodex key, if it asks for one";
-pub(crate) const RELAY_KEY_KEPT: &str = "This Mac's Keychain holds a key. Type one to replace it.";
-pub(crate) const RELAY_KEY_GOES: &str = "The key leaves the Keychain when you save.";
+pub(crate) const RELAY_KEY_KEPT: &str =
+    "This computer's secure storage holds a key. Type one to replace it.";
+pub(crate) const RELAY_KEY_GOES: &str =
+    "The key leaves this computer's secure storage when you save.";
 /// Where the relay's key was typed and the page left before a Save.
-pub(crate) const RELAY_RETYPE_KEY: &str = "Type the key again to keep it on this Mac.";
-pub(crate) const RELAY_NO_MODELS: &str =
-    "No Mac lists your plan's models yet. They come once a Mac is answering.";
-pub(crate) const RELAY_MODELS_MAY_BE_OLD: &str =
-    "No Mac is answering; these are the models one listed last.";
-/// Under the status line once another Mac took the relay from this one.
-pub(crate) const RELAY_TAKE_BACK: &str = "Turn this off and on to answer from this Mac instead.";
-pub(crate) const PICK_MODEL: &str = "Pick a model";
-pub(crate) const NO_MODEL_LABEL: &str = "No model";
-pub(crate) const KEY_PLACEHOLDER: &str = "Proxy key, if opencodex asks for one";
-pub(crate) const KEY_SET: &str = "The server holds a key. Type one to replace it.";
-pub(crate) const KEY_GOES: &str = "The server's key goes when you save.";
+pub(crate) const RELAY_RETYPE_KEY: &str = "Type the key again to keep it on this computer.";
+/// Under the status line once another computer took the relay from this one.
+pub(crate) const RELAY_TAKE_BACK: &str =
+    "Turn this off and on to relay from this computer instead.";
 pub(crate) const REMOVE_KEY_LABEL: &str = "Remove key";
 pub(crate) const KEEP_KEY_LABEL: &str = "Keep key";
+pub(crate) const SAVE_LABEL: &str = "Save";
+pub(crate) const NOT_SAVED: &str = "Not saved yet";
 /// In a Bot's Usage card while its replies go through the person's own plan: a turn there is not
 /// metered and carries no gateway key, so the server's usage report never counts it.
 pub(crate) const PLAN_USAGE_NOTE: &str = "Replies on your own subscription aren't counted here.";
 pub(crate) const NEW_BOTS_TITLE: &str = "Default for new Bots";
-/// Why Default for new Bots takes no change: the server keeps no such default yet
+/// Why Default for new Bots takes no change: the server keeps no default for new Bots yet
 /// (`state::DefaultForNewBots`).
 pub(crate) const NEW_BOTS_COMING_SOON: &str =
     "Coming soon: the server can't keep a default for new Bots yet.";
 
-/// The page's opening line, which says a Bot picks its own model, and with it its door, only to a
-/// server that keeps a door per Bot.
+/// The page's opening line, which says a Bot picks a Subscription model, and with it the plan,
+/// only to a server that keeps a door per Bot.
 pub(crate) fn intro(per_bot: bool) -> &'static str {
     if per_bot { INTRO_PER_BOT } else { INTRO }
 }
 
-/// The relay's model picker's label. From a server that keeps a door per Bot it is the model a
-/// Bot on the plan through a Mac runs on when it has picked none of its own; from one before that
-/// it is every Bot's there, as it always was.
-pub(crate) fn relay_model_label(per_bot: bool) -> &'static str {
-    if per_bot {
-        "Plan model through a Mac when a Bot hasn't chosen one"
-    } else {
-        "Model"
-    }
-}
-
-/// Answer with this Mac's status line, as it reads.
+/// The relay's status line, as it reads.
 pub(crate) fn relay_line_words(line: &RelayLine) -> String {
     match line {
-        RelayLine::Answering { in_flight: 0 } => "This Mac is answering".to_string(),
+        RelayLine::Answering { in_flight: 0 } => "This computer is relaying".to_string(),
         RelayLine::Answering { in_flight: 1 } => {
-            "This Mac is answering · 1 reply in progress".to_string()
+            "This computer is relaying · 1 reply in progress".to_string()
         }
         RelayLine::Answering { in_flight } => {
-            format!("This Mac is answering · {in_flight} replies in progress")
+            format!("This computer is relaying · {in_flight} replies in progress")
         }
-        RelayLine::Another { label: Some(label) } => format!("Another Mac ({label}) is answering"),
-        RelayLine::Another { label: None } => "Another Mac is answering".to_string(),
+        RelayLine::Another { label: Some(label) } => {
+            format!("Another computer ({label}) is relaying")
+        }
+        RelayLine::Another { label: None } => "Another computer is relaying".to_string(),
         RelayLine::Connecting => "Connecting…".to_string(),
         RelayLine::NotConnected { .. } => "Not connected".to_string(),
     }
 }
 
 /// The status line's word for a driver: `answering`, `another-mac`, `connecting` or
-/// `not-connected`.
+/// `not-connected`. A driver's words, kept as they were when the page said "Mac", so a script
+/// that asserts them still does.
 #[cfg(any(feature = "agent", test))]
 pub(crate) fn relay_line_word(line: &RelayLine) -> &'static str {
     match line {
@@ -221,8 +170,8 @@ pub(crate) fn relay_line_word(line: &RelayLine) -> &'static str {
     }
 }
 
-/// Under the status line: why this Mac is not connected, in the relay's words, or, once another
-/// Mac took the relay from this one, how to take it back.
+/// Under the status line: why this computer is not connected, in the relay's words, or, once
+/// another computer took the relay from this one, how to take it back.
 pub(crate) fn relay_detail(line: &RelayLine, relay: &RelayMac) -> Option<String> {
     match line {
         RelayLine::NotConnected { why } => why.clone(),
@@ -238,8 +187,8 @@ pub(crate) fn relay_detail(line: &RelayLine, relay: &RelayMac) -> Option<String>
     }
 }
 
-/// Why Answer with this Mac takes no change, if it takes none: a server without the relay, or a
-/// Mac not enrolled with it.
+/// Why the relay takes no change, if it takes none: a server without the relay, or a computer not
+/// enrolled with it.
 pub(crate) fn relay_unavailable_line(knows_relay: bool, enrolled: bool) -> Option<&'static str> {
     if !knows_relay {
         Some(RELAY_NOT_ON_SERVER)
@@ -247,16 +196,6 @@ pub(crate) fn relay_unavailable_line(knows_relay: bool, enrolled: bool) -> Optio
         Some(RELAY_NOT_ENROLLED)
     } else {
         None
-    }
-}
-
-/// The line under the relay's picker: why it offers nothing, or that what it offers is what a
-/// Mac listed last, while none is answering.
-pub(crate) fn relay_models_note(has_models: bool, relay_connected: bool) -> Option<&'static str> {
-    match (has_models, relay_connected) {
-        (false, _) => Some(RELAY_NO_MODELS),
-        (true, false) => Some(RELAY_MODELS_MAY_BE_OLD),
-        (true, true) => None,
     }
 }
 
@@ -285,38 +224,7 @@ pub(crate) fn badge_label(kind: InferenceKind, via: Option<Via>) -> &'static str
     }
 }
 
-/// The health line ([`AppState::proxy_health`]): its words, and where opencodex is down beside
-/// this Mac, the command that starts it, which the page sets as code after them. `here` is the
-/// server running on this Mac, where that command would reach it.
-pub(crate) fn health_line(health: ProxyHealth, here: bool) -> (&'static str, Option<&'static str>) {
-    match health {
-        ProxyHealth::NoAddress => (NO_ADDRESS, None),
-        ProxyHealth::Running => (RUNNING, None),
-        ProxyHealth::NotRunning if here => (NOT_RUNNING_LEAD, Some(START_COMMAND)),
-        ProxyHealth::NotRunning => (NOT_RUNNING_THERE, None),
-    }
-}
-
-/// The health line's word for a driver: `running`, `not-running` or `no-address`.
-#[cfg(any(feature = "agent", test))]
-pub(crate) fn health_word(health: ProxyHealth) -> &'static str {
-    match health {
-        ProxyHealth::NoAddress => "no-address",
-        ProxyHealth::Running => "running",
-        ProxyHealth::NotRunning => "not-running",
-    }
-}
-
-/// What Save reads while it is with the server, and otherwise.
-pub(crate) fn save_label(settings: &ReplySourceSettings) -> &'static str {
-    if settings.saving.is_some() {
-        "Saving…"
-    } else {
-        "Save"
-    }
-}
-
-/// The line in place of the form, while there is no form to show: `None` once it has been read.
+/// The line in place of the page, while there is no page to show: `None` once it has been read.
 pub(crate) fn unavailable_line(settings: &ReplySourceSettings) -> Option<&str> {
     match &settings.kept {
         None | Some(ReplySourceRead::Loading) => Some(ASKING),
@@ -326,46 +234,28 @@ pub(crate) fn unavailable_line(settings: &ReplySourceSettings) -> Option<&str> {
     }
 }
 
-/// The line under Save: the note about the last thing that did not go as asked, and a key to
-/// type again after it, or alone once the note has gone.
-pub(crate) fn error_line(settings: &ReplySourceSettings) -> Option<String> {
-    let note = settings.note.as_ref().map(ReplySourceNote::line);
-    let retype = settings.retype_key.then_some(REPLY_SOURCE_RETYPE_KEY);
-    match (note, retype) {
-        (Some(note), Some(retype)) => Some(format!("{note} {retype}")),
-        (Some(line), None) | (None, Some(line)) => Some(line.to_string()),
-        (None, None) => None,
-    }
+/// The line under Save: the note about the last thing that did not go as asked.
+pub(crate) fn error_line(settings: &ReplySourceSettings) -> Option<&str> {
+    settings.note.as_ref().map(ReplySourceNote::line)
 }
 
-/// The line under Save is trouble, drawn in the danger colour: a refusal or a failed read. A Save
-/// whose fate is being checked, and a key to type again, are not, and are drawn muted.
+/// The line under Save is trouble, drawn in the danger colour: a failed read. What the Keychain
+/// said is drawn muted, as it always has been.
 pub(crate) fn error_is_trouble(settings: &ReplySourceSettings) -> bool {
-    matches!(
-        settings.note,
-        Some(ReplySourceNote::Refused(_) | ReplySourceNote::ReadFailed(_))
-    )
+    matches!(settings.note, Some(ReplySourceNote::ReadFailed(_)))
 }
 
-/// Settings → Reply source. Its fields need a window, so it is made on the first render of the
-/// tab, as Settings → Logins is.
+/// Settings → Relay. Its fields need a window, so it is made on the first render of the tab, as
+/// Settings → Logins is.
 pub struct ReplySourcePage {
     state: Entity<AppState>,
-    url: Entity<InputState>,
-    key: Entity<InputState>,
-    /// Answer with this Mac's two fields: opencodex's address on this Mac, and its key.
+    /// The relay's two fields: opencodex's address on this computer, and its key.
     relay_address: Entity<InputState>,
     relay_key: Entity<InputState>,
 }
 
 impl ReplySourcePage {
     pub fn new(window: &mut Window, state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
-        let url = cx.new(|cx| InputState::new(window, cx).placeholder(DEFAULT_PROXY_URL));
-        let key = cx.new(|cx| {
-            InputState::new(window, cx)
-                .placeholder(KEY_PLACEHOLDER)
-                .masked(true)
-        });
         let relay_address = cx.new(|cx| InputState::new(window, cx).placeholder(DEFAULT_PROXY_URL));
         let relay_key = cx.new(|cx| {
             InputState::new(window, cx)
@@ -380,45 +270,11 @@ impl ReplySourcePage {
             cx.notify();
         })
         .detach();
-        // What is typed is the form: the state keeps the copy Save sends and a driver writes. A
+        // What is typed is the form: the state keeps the copy Save keeps and a driver writes. A
         // field takes typing only while the page draws it editable, as Remove key takes a click
         // only then. Keys that reach one the page has just made read-only, before it is drawn
         // so, change no draft, and the field is put back to what the page holds rather than left
         // showing what nothing took.
-        cx.subscribe_in(
-            &url,
-            window,
-            |this, input, event: &InputEvent, window, cx| {
-                if !matches!(event, InputEvent::Change) {
-                    return;
-                }
-                if this.state.read(cx).reply_source.plan_editable() {
-                    let url = input.read(cx).value().to_string();
-                    this.state
-                        .update(cx, |state, cx| state.set_reply_source_url(url, cx));
-                }
-                this.sync_inputs(window, cx);
-            },
-        )
-        .detach();
-        cx.subscribe_in(
-            &key,
-            window,
-            |this, input, event: &InputEvent, window, cx| {
-                if !matches!(event, InputEvent::Change) {
-                    return;
-                }
-                if this.state.read(cx).reply_source.key_editable() {
-                    let typed = input.read(cx).value().to_string();
-                    this.state
-                        .update(cx, |state, cx| state.set_reply_source_key(&typed, cx));
-                }
-                this.sync_inputs(window, cx);
-            },
-        )
-        .detach();
-        // Answer with this Mac's fields, the same way: each takes typing only while the card
-        // draws it editable, and what it holds waits for Save.
         cx.subscribe_in(
             &relay_address,
             window,
@@ -453,8 +309,6 @@ impl ReplySourcePage {
         .detach();
         let mut page = Self {
             state,
-            url,
-            key,
             relay_address,
             relay_key,
         };
@@ -462,20 +316,13 @@ impl ReplySourcePage {
         page
     }
 
-    /// The fields follow the state: a URL a driver wrote and the server's own after a Save; and
-    /// the key field holds the key waiting for Save, drawn masked, one a driver wrote included,
-    /// and nothing once it has gone to the server, been dropped, or never was.
+    /// The fields follow the state: an address a driver wrote, and the one kept after a Save;
+    /// and the key field holds the key waiting for Save, drawn masked, one a driver wrote
+    /// included, and nothing once it is in the Keychain, dropped, or never was.
     fn sync_inputs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let (url, key, relay_address, relay_key) = {
+        let (relay_address, relay_key) = {
             let state = self.state.read(cx);
             let settings = &state.reply_source;
-            let field = self.key.read(cx).value();
-            let key = match settings.key_draft.as_ref() {
-                None => (!field.trim().is_empty()).then(String::new),
-                Some(key) => (field.trim() != key.as_str()).then(|| key.as_str().to_string()),
-            };
-            // This Mac's opencodex key the same way: the key waiting for Save, drawn masked, and
-            // nothing once it is in the Keychain, dropped, or never was.
             let field = self.relay_key.read(cx).value();
             let relay_key = match settings.relay_key_draft.as_ref() {
                 None => (!field.trim().is_empty()).then(String::new),
@@ -485,16 +332,8 @@ impl ReplySourcePage {
                 .relay_address_draft
                 .clone()
                 .unwrap_or_else(|| state.relay_mac.shown_address());
-            (settings.shown_url(), key, relay_address, relay_key)
+            (relay_address, relay_key)
         };
-        if self.url.read(cx).value().as_ref() != url.as_str() {
-            self.url
-                .update(cx, |input, cx| input.set_value(url, window, cx));
-        }
-        if let Some(key) = key {
-            self.key
-                .update(cx, |input, cx| input.set_value(key, window, cx));
-        }
         if self.relay_address.read(cx).value().as_ref() != relay_address.as_str() {
             self.relay_address
                 .update(cx, |input, cx| input.set_value(relay_address, window, cx));
@@ -522,58 +361,10 @@ fn labelled(label: &'static str, muted: Hsla, control: impl IntoElement) -> impl
         .child(control)
 }
 
-/// The relay's model picker: the models a Mac lists, and No model while one is shown.
-fn relay_model_picker(
-    shown: Option<String>,
-    models: Vec<String>,
-    live: bool,
-    app: Entity<AppState>,
-) -> impl IntoElement {
-    let label = shown.clone().unwrap_or_else(|| PICK_MODEL.to_string());
-    let clearable = shown.is_some();
-    Button::new(RELAY_MODEL)
-        .label(label)
-        .ghost()
-        .compact()
-        .icon(IconName::ChevronDown)
-        .disabled(!live || (models.is_empty() && !clearable))
-        .dropdown_menu(move |menu, _, _| {
-            let menu = if clearable {
-                let app = app.clone();
-                menu.item(
-                    PopupMenuItem::element(|_, _| div().id(RELAY_NO_MODEL).child(NO_MODEL_LABEL))
-                        .on_click(move |_, _, cx| {
-                            cx.stop_propagation();
-                            app.update(cx, |state, cx| state.clear_relay_model(cx));
-                        }),
-                )
-            } else {
-                menu
-            };
-            models.iter().fold(menu, |menu, model| {
-                let app = app.clone();
-                let picked = model.clone();
-                // Its row carries the id a driver clicks, `settings-relay-model-{id}`.
-                let id = SharedString::from(relay_model_id(model));
-                let label = model.clone();
-                menu.item(
-                    PopupMenuItem::element(move |_, _| div().id(id.clone()).child(label.clone()))
-                        .checked(shown.as_deref() == Some(model.as_str()))
-                        .on_click(move |_, _, cx| {
-                            cx.stop_propagation();
-                            app.update(cx, |state, cx| {
-                                state.pick_relay_model(picked.clone(), cx);
-                            });
-                        }),
-                )
-            })
-        })
-}
-
 impl ReplySourcePage {
-    /// Answer with this Mac: the switch that makes this Mac the relay, where the relay stands,
-    /// opencodex's address on this Mac, the model a turn through a Mac runs on, and opencodex's
-    /// key. The switch acts at once and is this Mac's; the rest waits for Save like the page.
+    /// Relay your plan from this computer: the switch that makes this computer the relay, where
+    /// the relay stands, and opencodex's address and key here. The switch acts at once and is this
+    /// computer's; the address and the key wait for Save.
     fn relay_card(&self, state: &AppState, theme: &Theme) -> impl IntoElement {
         let muted = theme.muted_foreground;
         let app = self.state.clone();
@@ -582,21 +373,11 @@ impl ReplySourcePage {
         let live = settings.relay_editable();
         let unavailable = relay_unavailable_line(settings.knows_relay(), state.relay_enrolled());
         let switch_live = state.relay_switch_live();
-        let model_words = relay_model_label(state.server_keeps_bot_doors());
         let line = state.relay_line();
         let words = relay_line_words(&line);
         let answering = matches!(line, RelayLine::Answering { .. });
         let detail = relay_detail(&line, relay);
         let failed = matches!(line, RelayLine::NotConnected { why: Some(_) });
-        let models = state.relay_models();
-        let shown_model = settings.shown_relay_model().map(str::to_string);
-        let models_line = relay_models_note(
-            !models.is_empty(),
-            state
-                .model_catalogue
-                .local_proxy
-                .is_some_and(|proxy| proxy.relay_connected),
-        );
         let has_key = relay.has_key;
         let removing = settings.relay_remove_key;
         let key_live = settings.relay_key_editable();
@@ -664,31 +445,14 @@ impl ReplySourcePage {
                 )
             })
             .child(labelled(
-                "opencodex address",
+                RELAY_ADDR_LABEL,
                 muted,
                 div()
                     .id(RELAY_ADDR)
                     .child(field_input(&self.relay_address).disabled(!live)),
             ))
             .child(labelled(
-                model_words,
-                muted,
-                v_flex()
-                    .items_start()
-                    .gap(px(4.))
-                    .child(relay_model_picker(shown_model, models, live, app.clone()))
-                    .when_some(models_line, |this, line| {
-                        this.child(
-                            div()
-                                .id(RELAY_MODELS_NOTE)
-                                .text_xs()
-                                .text_color(muted)
-                                .child(line),
-                        )
-                    }),
-            ))
-            .child(labelled(
-                "opencodex key",
+                RELAY_KEY_LABEL,
                 muted,
                 v_flex()
                     .gap(px(4.))
@@ -767,13 +531,13 @@ impl Render for ReplySourcePage {
         // Its own section, whatever the reply source: the default for new Bots is a setting of
         // its own, and says so whether or not the reply source could be read.
         let new_bots = new_bots_section(state.default_for_new_bots, &theme);
-        let Some(kept) = settings.kept_source() else {
+        let error = error_line(settings).map(str::to_string);
+        let trouble = error_is_trouble(settings);
+        let section = v_flex().id(SECTION).gap(px(12.)).child(intro);
+        if settings.kept_source().is_none() {
             let line = unavailable_line(settings).unwrap_or(ASKING).to_string();
             let failed = matches!(settings.kept, Some(ReplySourceRead::Unavailable(_)));
-            return v_flex()
-                .id(SECTION)
-                .gap(px(12.))
-                .child(intro)
+            return section
                 .child(
                     div()
                         .id(UNAVAILABLE)
@@ -782,136 +546,39 @@ impl Render for ReplySourcePage {
                         .child(line),
                 )
                 .child(new_bots);
-        };
-        let health = state.proxy_health().unwrap_or(ProxyHealth::NoAddress);
+        }
+        // A server from before the relay has nothing for this computer to relay to, and the card
+        // would be a switch that changes nothing: the page says so in its place, and there is
+        // nothing to save.
+        if !settings.knows_relay() {
+            return section
+                .child(
+                    div()
+                        .id(RELAY_UNAVAILABLE)
+                        .text_sm()
+                        .text_color(muted)
+                        .child(RELAY_NOT_ON_SERVER),
+                )
+                .when_some(error, |this, line| {
+                    this.child(
+                        div()
+                            .id(ERROR)
+                            .text_sm()
+                            .text_color(if trouble { theme.danger } else { muted })
+                            .child(line),
+                    )
+                })
+                .child(new_bots);
+        }
         let hint = state.reply_source_hint();
         let can_save = state.reply_source_can_save();
-        let here = settings.server_on_this_mac;
-        let plan_live = settings.plan_editable();
-        let has_key = kept.has_api_key;
-        let removing = settings.remove_key;
-        let key_live = settings.key_editable();
-        let unsaved = settings.is_unsaved() && settings.saving.is_none();
-        let error = error_line(settings);
-        let trouble = error_is_trouble(settings);
-        let save_words = save_label(settings);
-        let (health_words, command) = health_line(health, here);
-        let knows_relay = settings.knows_relay();
-        let elsewhere = if knows_relay {
-            ELSEWHERE_RELAY_LINE
-        } else {
-            ELSEWHERE_LINE
-        };
-        let relay_card = knows_relay.then(|| self.relay_card(state, &theme));
-        // The plan's connection, the Mac relay, Save for both, and the default for new Bots.
-        // There is no radio: where a Bot's replies go is picked with its model on its card, and
-        // the account's kind stays as the server keeps it, for the Bots that have picked none.
-        v_flex()
-            .id(SECTION)
-            .gap(px(12.))
-            .child(intro)
-            .child(div().text_xs().text_color(muted).child("Your subscription"))
-            .child(
-                card()
-                    .flex()
-                    .flex_col()
-                    .px(px(16.))
-                    .py(px(14.))
-                    .gap(px(12.))
-                    .when(!here, |this| {
-                        this.child(
-                            div()
-                                .id(ELSEWHERE)
-                                .text_sm()
-                                .text_color(muted)
-                                .child(elsewhere),
-                        )
-                    })
-                    .child(labelled(
-                        "Proxy URL",
-                        muted,
-                        div()
-                            .id(URL)
-                            .child(field_input(&self.url).disabled(!plan_live)),
-                    ))
-                    .child(labelled(
-                        "Proxy key",
-                        muted,
-                        v_flex()
-                            .gap(px(4.))
-                            .child(
-                                div()
-                                    .id(KEY)
-                                    .child(field_input(&self.key).disabled(!key_live)),
-                            )
-                            .when(has_key, |this| {
-                                let app = app.clone();
-                                this.child(
-                                    h_flex()
-                                        .gap(px(8.))
-                                        .items_center()
-                                        .child(
-                                            div().text_xs().text_color(muted).child(if removing {
-                                                KEY_GOES
-                                            } else {
-                                                KEY_SET
-                                            }),
-                                        )
-                                        .child(
-                                            Button::new(REMOVE_KEY)
-                                                .label(if removing {
-                                                    KEEP_KEY_LABEL
-                                                } else {
-                                                    REMOVE_KEY_LABEL
-                                                })
-                                                .ghost()
-                                                .small()
-                                                .disabled(!plan_live)
-                                                .on_click(move |_, _, cx| {
-                                                    app.update(cx, |state, cx| {
-                                                        state.toggle_remove_reply_source_key(cx)
-                                                    });
-                                                }),
-                                        ),
-                                )
-                            }),
-                    ))
-                    .child(
-                        h_flex()
-                            .id(HEALTH)
-                            .gap(px(8.))
-                            .items_center()
-                            .child(div().size(px(8.)).rounded_full().bg(
-                                if health == ProxyHealth::Running {
-                                    theme.green
-                                } else {
-                                    muted
-                                },
-                            ))
-                            .child(
-                                h_flex()
-                                    .gap(px(4.))
-                                    .text_sm()
-                                    .child(health_words)
-                                    .when_some(command, |this, command| {
-                                        this.child(div().font_family("monospace").child(command))
-                                    }),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .id(PROVIDERS)
-                            .text_xs()
-                            .text_color(muted)
-                            .child(PROVIDERS_NOTE),
-                    ),
-            )
-            // Answer with this Mac, from a server that knows the relay. A server before it has
-            // no relay to answer for, and the card would be a switch that changes nothing.
-            .when_some(relay_card, |this, relay| {
-                this.child(div().text_xs().text_color(muted).child(RELAY_TITLE))
-                    .child(relay)
-            })
+        let unsaved = settings.is_unsaved();
+        // The relay, Save for its address and key, and the default for new Bots. There is no
+        // radio and nothing of the plan on the server's own machine: where a Bot's replies go is
+        // picked with its model on its card, and the account's setting stays as the server keeps
+        // it.
+        section
+            .child(self.relay_card(state, &theme))
             .when_some(error, |this, line| {
                 this.child(
                     div()
@@ -939,11 +606,11 @@ impl Render for ReplySourcePage {
                         )
                     })
                     .when(unsaved, |this| {
-                        this.child(div().text_xs().text_color(muted).child("Not saved yet"))
+                        this.child(div().text_xs().text_color(muted).child(NOT_SAVED))
                     })
                     .child(
                         Button::new(SAVE)
-                            .label(save_words)
+                            .label(SAVE_LABEL)
                             .small()
                             .disabled(!can_save)
                             .on_click(move |_, _, cx| {
@@ -951,7 +618,7 @@ impl Render for ReplySourcePage {
                             }),
                     ),
             )
-            // After Save, which does not send it: the section's card saves nothing until the
+            // After Save, which does not keep it: the section's card saves nothing until the
             // server keeps a default for new Bots.
             .child(new_bots)
     }
@@ -986,9 +653,8 @@ pub(crate) fn reply_badge(
 #[cfg(test)]
 mod tests {
     // Item by item rather than a glob: `use super::*` would drag in gpui_kit's own `test`.
-    use super::{badge_label, badge_words, health_line, health_word};
+    use super::{badge_label, badge_words};
     use crate::opengrok::{InferenceKind, Via};
-    use crate::state::ProxyHealth;
 
     /// The words a reply's badge says, as the contract's doors: the server's keys, the plan on the
     /// server's own machine, and the plan the person's Mac answers through the relay. A way never
@@ -1042,27 +708,125 @@ mod tests {
         assert_eq!(badge(InferenceKind::Gateway, None, None), "paid key");
     }
 
-    /// The page is the subscription's connection, and switches no door: it says a Bot picks its
-    /// model, and with it its door, in its settings only to a server that keeps a door per Bot,
-    /// and before that says nothing of it. Neither offers a radio's words, nor a model of the
-    /// plan's own; the relay's picker still says whose model it is.
+    /// The tab is Relay, and the page opens with what the relay is for, in the approved words:
+    /// that a Bot uses the plan when it picks a Subscription model only to a server that keeps a
+    /// door per Bot. Neither offers a radio's words, nor a model of the plan's or the relay's
+    /// own.
     #[test]
-    fn the_page_is_the_subscriptions_connection_and_switches_no_door() {
-        use super::{INTRO, INTRO_PER_BOT, intro, relay_model_label};
+    fn the_page_is_relay_and_switches_no_door() {
+        use super::{INTRO, INTRO_PER_BOT, RELAY_TITLE, TAB_LABEL, intro};
+        assert_eq!(TAB_LABEL, "Relay");
+        assert_eq!(RELAY_TITLE, "Relay your plan from this computer");
         assert_eq!(intro(true), INTRO_PER_BOT);
         assert_eq!(intro(false), INTRO);
-        assert!(INTRO_PER_BOT.contains("Each Bot picks its model in its settings"));
-        assert!(!INTRO.contains("Each Bot picks"));
+        assert_eq!(
+            INTRO_PER_BOT,
+            "Your ChatGPT or Grok plan answers through this computer. Bots use it when they \
+             pick a Subscription model."
+        );
+        assert!(!INTRO.contains("Bots use it"));
         for words in [INTRO, INTRO_PER_BOT] {
-            for radio in ["Server (paid keys)", "My subscription", "haven't picked"] {
-                assert!(!words.contains(radio), "{words:?} says {radio:?}");
+            for gone in [
+                "Server (paid keys)",
+                "My subscription",
+                "haven't picked",
+                "hasn't chosen",
+            ] {
+                assert!(!words.contains(gone), "{words:?} says {gone:?}");
             }
         }
+    }
+
+    /// Every word the page says, and every sentence of the relay's it shows, says "computer"
+    /// where it said "Mac": the relay is the app on the person's computer, which need not be a
+    /// Mac. The relay's own sentences are among them, as its status and its errors are drawn on
+    /// the page under the status line.
+    #[test]
+    fn the_page_and_the_relays_sentences_say_computer_and_never_mac() {
+        use super::{
+            ASKING, INTRO, INTRO_PER_BOT, KEEP_KEY_LABEL, NEW_BOTS_COMING_SOON, NEW_BOTS_TITLE,
+            NOT_SAVED, RELAY_ADDR_LABEL, RELAY_INTRO, RELAY_KEY_GOES, RELAY_KEY_KEPT,
+            RELAY_KEY_LABEL, RELAY_KEY_PLACEHOLDER, RELAY_NOT_ENROLLED, RELAY_NOT_ON_SERVER,
+            RELAY_RETYPE_KEY, RELAY_TAKE_BACK, RELAY_TITLE, REMOVE_KEY_LABEL, SAVE_LABEL,
+            TAB_LABEL, relay_line_words,
+        };
+        use crate::opengrok::{
+            SERVER_QUIET, SERVER_UNREACHED, SERVER_WITHOUT_RELAY, TOKEN_REFUSED,
+        };
+        use crate::state::{RELAY_ADDRESS_NOT_HERE, RelayLine};
+        let lines = [
+            RelayLine::Answering { in_flight: 0 },
+            RelayLine::Answering { in_flight: 1 },
+            RelayLine::Answering { in_flight: 3 },
+            RelayLine::Another {
+                label: Some("NativeChat on studio".into()),
+            },
+            RelayLine::Another { label: None },
+            RelayLine::Connecting,
+            RelayLine::NotConnected { why: None },
+        ]
+        .map(|line| relay_line_words(&line));
+        let words: Vec<&str> = [
+            TAB_LABEL,
+            INTRO,
+            INTRO_PER_BOT,
+            RELAY_TITLE,
+            RELAY_INTRO,
+            RELAY_NOT_ON_SERVER,
+            RELAY_NOT_ENROLLED,
+            RELAY_ADDR_LABEL,
+            RELAY_KEY_LABEL,
+            RELAY_KEY_PLACEHOLDER,
+            RELAY_KEY_KEPT,
+            RELAY_KEY_GOES,
+            RELAY_RETYPE_KEY,
+            RELAY_TAKE_BACK,
+            REMOVE_KEY_LABEL,
+            KEEP_KEY_LABEL,
+            SAVE_LABEL,
+            NOT_SAVED,
+            NEW_BOTS_TITLE,
+            NEW_BOTS_COMING_SOON,
+            ASKING,
+            RELAY_ADDRESS_NOT_HERE,
+            TOKEN_REFUSED,
+            SERVER_QUIET,
+            SERVER_UNREACHED,
+            SERVER_WITHOUT_RELAY,
+        ]
+        .into_iter()
+        .chain(lines.iter().map(String::as_str))
+        .collect();
+        for said in &words {
+            assert!(!said.contains("Mac"), "{said:?}");
+        }
         assert_eq!(
-            relay_model_label(true),
-            "Plan model through a Mac when a Bot hasn't chosen one"
+            lines,
+            [
+                "This computer is relaying",
+                "This computer is relaying · 1 reply in progress",
+                "This computer is relaying · 3 replies in progress",
+                "Another computer (NativeChat on studio) is relaying",
+                "Another computer is relaying",
+                "Connecting…",
+                "Not connected",
+            ]
         );
-        assert_eq!(relay_model_label(false), "Model");
+        for said in [
+            RELAY_NOT_ENROLLED,
+            RELAY_KEY_LABEL,
+            RELAY_KEY_KEPT,
+            RELAY_RETYPE_KEY,
+            RELAY_TAKE_BACK,
+            RELAY_NOT_ON_SERVER,
+            TOKEN_REFUSED,
+        ] {
+            assert!(said.contains("computer"), "{said:?}");
+        }
+        assert_eq!(
+            RELAY_KEY_LABEL,
+            "opencodex key (kept in this computer's secure storage)"
+        );
     }
 
     /// Default for new Bots says it is coming, in the owner's words, while the server keeps no
@@ -1086,92 +850,30 @@ mod tests {
         assert_eq!(dead_card_words(), ("No model", "Default"));
     }
 
-    /// The health line is the server's word on opencodex, and no address is its own answer, not
-    /// opencodex being down. The command that starts opencodex is offered only where it would
-    /// reach the server: on the server's own Mac.
-    #[test]
-    fn the_health_line_is_the_servers_word() {
-        assert_eq!(
-            health_line(ProxyHealth::Running, true),
-            ("opencodex is running", None)
-        );
-        assert_eq!(
-            health_line(ProxyHealth::NotRunning, true),
-            ("Not running — start it with", Some("ocx start"))
-        );
-        assert_eq!(
-            health_line(ProxyHealth::NotRunning, false),
-            ("Not running on the server's machine", None)
-        );
-        for here in [true, false] {
-            assert_eq!(
-                health_line(ProxyHealth::NoAddress, here),
-                ("No address saved", None)
-            );
-        }
-        assert_eq!(
-            [
-                ProxyHealth::Running,
-                ProxyHealth::NotRunning,
-                ProxyHealth::NoAddress
-            ]
-            .map(health_word),
-            ["running", "not-running", "no-address"]
-        );
-    }
-
-    /// Answer with this Mac's status line says who is answering, and its word for a driver; the
-    /// line under it says why this Mac is not connected, or, once another Mac took the relay from
+    /// The relay's status line says who is relaying, and its word for a driver; the line under
+    /// it says why this computer is not connected, or, once another computer took the relay from
     /// it, how to take it back; and the card says why it takes no change when it takes none.
     #[test]
-    fn answer_with_this_mac_says_who_is_answering() {
+    fn the_relay_says_who_is_relaying() {
         use super::{
-            RELAY_MODELS_MAY_BE_OLD, RELAY_NO_MODELS, RELAY_NOT_ENROLLED, RELAY_NOT_ON_SERVER,
-            RELAY_TAKE_BACK, relay_detail, relay_line_word, relay_line_words, relay_models_note,
-            relay_unavailable_line,
+            RELAY_NOT_ENROLLED, RELAY_NOT_ON_SERVER, RELAY_TAKE_BACK, relay_detail,
+            relay_line_word, relay_line_words, relay_unavailable_line,
         };
         use crate::opengrok::{RelayReport, RelayStatus};
         use crate::state::{RelayLine, RelayMac};
         let lines = [
-            (
-                RelayLine::Answering { in_flight: 0 },
-                "This Mac is answering",
-                "answering",
-            ),
-            (
-                RelayLine::Answering { in_flight: 1 },
-                "This Mac is answering · 1 reply in progress",
-                "answering",
-            ),
-            (
-                RelayLine::Answering { in_flight: 3 },
-                "This Mac is answering · 3 replies in progress",
-                "answering",
-            ),
+            (RelayLine::Answering { in_flight: 0 }, "answering"),
             (
                 RelayLine::Another {
                     label: Some("NativeChat on studio".into()),
                 },
-                "Another Mac (NativeChat on studio) is answering",
                 "another-mac",
             ),
-            (
-                RelayLine::Another { label: None },
-                "Another Mac is answering",
-                "another-mac",
-            ),
-            (RelayLine::Connecting, "Connecting…", "connecting"),
-            (
-                RelayLine::NotConnected { why: None },
-                "Not connected",
-                "not-connected",
-            ),
+            (RelayLine::Connecting, "connecting"),
+            (RelayLine::NotConnected { why: None }, "not-connected"),
         ];
-        for (line, words, word) in lines {
-            assert_eq!(
-                (relay_line_words(&line).as_str(), relay_line_word(&line)),
-                (words, word)
-            );
+        for (line, word) in lines {
+            assert_eq!(relay_line_word(&line), word, "{}", relay_line_words(&line));
         }
         let idle = RelayMac::default();
         let replaced = RelayMac {
@@ -1207,11 +909,5 @@ mod tests {
             Some(RELAY_NOT_ENROLLED)
         );
         assert_eq!(relay_unavailable_line(true, true), None);
-        assert_eq!(relay_models_note(false, true), Some(RELAY_NO_MODELS));
-        assert_eq!(
-            relay_models_note(true, false),
-            Some(RELAY_MODELS_MAY_BE_OLD)
-        );
-        assert_eq!(relay_models_note(true, true), None);
     }
 }

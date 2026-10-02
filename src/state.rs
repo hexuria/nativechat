@@ -15,16 +15,16 @@ use crate::opengrok::{
     BoxHandoffResolution, BoxShareScope, ChatPart, ChoiceCard, ComputerHandoffStatus,
     ConnectedComputer, Coworker, CoworkerComputer, CoworkerPatch, CoworkerSource, Enrolment,
     Failure, FormResolution, FormSpec, ImageVisibility, InferenceKind, InferenceSource,
-    InferenceSourceUpdate, LocalExecMode, LocalExecPolicy, LocalExecResolution, LocalExecStopped,
-    ModelCatalogue, ModelEntry, ModelPick, NewSchedule, NewSkill, OpenGrokClient, OpenGrokError,
-    PendingCustom, PendingOp, PendingUserMessage, PendingWrite, ProfileUpdate, ProxyKey,
-    QueuedApproval, RecipeDetail, RecipeKind, RecipeParameter, RecipeRun, RecipeRunResult,
-    RecipeShareTarget, RecipeStep, RecipeSummary, RelayHandle, RelayKey, RelayReport, RelayStatus,
-    RelayTarget, RelayTimings, RelayUpdate, ReplyQuote, ReplySource, RunCause, RunErrorCode,
-    RunRecipeResponse, RunReplay, SKILL_BODY_CHARS, SKILL_BUNDLE_FILES, SKILL_BUNDLE_LIMIT,
-    SaveLoginSpec, ScheduleEdit, ScheduleKind, ScheduleRow, ScheduleRun, ScheduleRunStatus,
-    ScreenshotSpec, SkillDetail, SkillFile, SkillPatch, SkillSource, SkillSummary, ThreadListing,
-    ThreadReplay, ThreadRun, ToolCallTracker, TurnAssembler, TurnRecipe, TurnSource, TurnTiming,
+    LocalExecMode, LocalExecPolicy, LocalExecResolution, LocalExecStopped, ModelCatalogue,
+    ModelEntry, ModelPick, NewSchedule, NewSkill, OpenGrokClient, OpenGrokError, PendingCustom,
+    PendingOp, PendingUserMessage, PendingWrite, ProfileUpdate, QueuedApproval, RecipeDetail,
+    RecipeKind, RecipeParameter, RecipeRun, RecipeRunResult, RecipeShareTarget, RecipeStep,
+    RecipeSummary, RelayHandle, RelayKey, RelayReport, RelayStatus, RelayTarget, RelayTimings,
+    ReplyQuote, ReplySource, RunCause, RunErrorCode, RunRecipeResponse, RunReplay,
+    SKILL_BODY_CHARS, SKILL_BUNDLE_FILES, SKILL_BUNDLE_LIMIT, SaveLoginSpec, ScheduleEdit,
+    ScheduleKind, ScheduleRow, ScheduleRun, ScheduleRunStatus, ScreenshotSpec, SkillDetail,
+    SkillFile, SkillPatch, SkillSource, SkillSummary, ThreadListing, ThreadReplay, ThreadRun,
+    ToolCallTracker, TurnAssembler, TurnRecipe, TurnSource, TurnTiming,
     USER_FORM_SERVER_FILL_AVAILABLE, Unreachable, UserFormDismissMode, UserFormHttpSettle,
     UserFormValues, UserFormVerb, Via, WAITING_FOR_YOU, activity_from_replay, approval_summary,
     box_handoff_resolve_entry_id, collapse_computer_roster, command_from_args,
@@ -313,88 +313,54 @@ impl AccountConnections {
     }
 }
 
-/// Settings → Reply source: the account's reply source as the server keeps it, whose kind is the
-/// door every Bot that has picked none of its own follows, and the plan's connection as the
+/// Settings → Relay: the account's reply source as the server keeps it, whose kind is the door
+/// every Bot that has picked none of its own follows, and this computer's half of the relay as the
 /// person has changed it on the page and not saved.
 ///
 /// The setting is the server's and lives nowhere else: this app never keeps it, and never calls a
-/// model either way. What the page shows as kept is only ever what the server last said, from a
-/// read or from its answer to a Save. The page no longer picks the door, the way to the plan or
-/// the plan's model: a Bot's model, and with it its door, is picked on its card in its settings,
-/// and the account's kind, way and plan model stay as the server keeps them. A change waits on
-/// the page, marked unsaved, until Save sends whatever on the page differs from what the server
-/// keeps (a field left alone is left out, and the server keeps it); a Save the server refuses
-/// leaves the kept setting as it was, with the server's words under Save and the changes still
-/// there to fix. Nothing here is written to disk.
+/// model either way. What the page shows as kept is only ever what the server last said. The page
+/// changes nothing of it: not the door, the way to the plan or the plan's model (a Bot's model,
+/// and with it its door, is picked on its card in its settings), and not the plan on the server's
+/// own machine, whose address and key the server keeps as they are. What the page does change is
+/// this computer's: opencodex's address and key for the relay, which wait on the page, marked
+/// unsaved, until Save keeps them here. Nothing here is written to disk.
 ///
 /// Not `Clone`: it can hold a key the person typed, and nothing copies that. The gpui-agent tree
 /// takes [`Self::without_key`].
 #[derive(Debug, Default, PartialEq)]
 pub struct ReplySourceSettings {
-    /// What `GET /account/inference-source` last said, or the last Save's answer. `None` until it
-    /// has been asked since sign-in.
+    /// What `GET /account/inference-source` last said. `None` until it has been asked since
+    /// sign-in.
     pub kept: Option<ReplySourceRead>,
-    /// The proxy URL as typed and not saved. `None` shows the kept one, or the default; an empty
-    /// one is the address taken away.
-    pub url_draft: Option<String>,
-    /// A key for the proxy, typed and not sent. It goes with the next Save and is dropped the
-    /// moment that Save leaves, whatever becomes of it, and when the page is left or the person
-    /// signs out before a Save: the server keeps it, and `hasApiKey` is all that ever comes back.
-    /// Never on disk, never in a driver's tree, never printed, never cloned.
-    pub key_draft: Option<ProxyKey>,
-    /// Remove key was pressed: the next Save asks the server to forget the key it holds.
-    pub remove_key: bool,
-    /// A key typed here is gone and the server may not have it: it went with a Save that was
-    /// refused or never answered, or the page was left before a Save. Dropping it is right, since
-    /// nothing here keeps a key; the page says so, and asks for it again, until one is typed or a
-    /// Save is kept.
-    pub retype_key: bool,
-    /// The app's server runs on this Mac: its address is loopback. The server calls opencodex on
-    /// its own machine, so the person's plan can be set up only from there; anywhere else the
-    /// plan's half of the page is read-only and says why. Set with every read.
-    pub server_on_this_mac: bool,
-    /// The read with the server, by its number. Save waits for it: what the page shows of the
-    /// setting is about to be replaced by what the read brings, and a Save of the old could undo
-    /// a change made on another Mac. The picks are the person's, and wait on top of either.
+    /// The read with the server, by its number. Save waits for it, as it always has: the page is
+    /// about to show what it brings.
     pub reading: Option<u64>,
-    /// The Save with the server, by its number. Every control on the page is dead while it is
-    /// out, and no read begins meanwhile: its answer is the newest word there will be.
-    pub saving: Option<u64>,
     /// What the page says about the last thing that did not go as asked, under Save.
     pub note: Option<ReplySourceNote>,
-    /// The model a turn through a Mac runs on, picked and not saved: `None` shows the kept one,
-    /// `Some(None)` is the model taken away, and `Some(Some(id))` one a Mac lists.
-    pub relay_model_pick: Option<Option<String>>,
-    /// This Mac's opencodex address as typed and not saved; `None` shows the one kept on this
-    /// Mac. An emptied field goes back to where opencodex listens by default.
+    /// This computer's opencodex address as typed and not saved; `None` shows the one kept here.
+    /// An emptied field goes back to where opencodex listens by default.
     pub relay_address_draft: Option<String>,
-    /// A key for this Mac's opencodex, typed and not kept. Save puts it in the Keychain and it
-    /// leaves the page then, or when the page is left or the person signs out before a Save.
+    /// A key for this computer's opencodex, typed and not kept. Save puts it in the Keychain and
+    /// it leaves the page then, or when the page is left or the person signs out before a Save.
     /// Never on disk but the Keychain, never sent to the server, never in a driver's tree, never
     /// printed, never cloned.
     pub relay_key_draft: Option<RelayKey>,
-    /// Remove key was pressed for this Mac's opencodex key: Save takes it out of the Keychain.
+    /// Remove key was pressed for this computer's opencodex key: Save takes it out of the
+    /// Keychain.
     pub relay_remove_key: bool,
-    /// A key for this Mac's opencodex typed here went when the page was left before a Save, and
-    /// the page asks for it again, until one is typed or kept.
+    /// A key for this computer's opencodex typed here went when the page was left before a Save,
+    /// and the page asks for it again, until one is typed or kept.
     pub relay_retype_key: bool,
 }
 
-/// What Settings → Reply source says, under Save, about the last thing that did not go as asked.
+/// What Settings → Relay says, under Save, about the last thing that did not go as asked.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReplySourceNote {
-    /// The server refused the last Save, in its own words, and kept nothing. It stays until the
-    /// next Save.
-    Refused(String),
-    /// A Save went out and no answer came back: it may have been kept or not, and the setting is
-    /// read again to find out. The read's answer clears it. Not trouble yet, so the page draws it
-    /// muted.
-    Unknown,
     /// A read failed while an earlier one's answer is still on the page, and why. The next read
     /// that lands clears it.
     ReadFailed(String),
-    /// The Keychain would not keep, or forget, the key for this Mac's opencodex, in its words.
-    /// It stays until the next Save.
+    /// The Keychain would not keep, or forget, the key for this computer's opencodex, in its
+    /// words. It stays until the next Save.
     KeyNotKept(String),
 }
 
@@ -402,8 +368,7 @@ impl ReplySourceNote {
     /// The line the page shows.
     pub fn line(&self) -> &str {
         match self {
-            Self::Refused(said) | Self::ReadFailed(said) | Self::KeyNotKept(said) => said,
-            Self::Unknown => REPLY_SOURCE_SAVE_UNKNOWN,
+            Self::ReadFailed(said) | Self::KeyNotKept(said) => said,
         }
     }
 }
@@ -421,44 +386,12 @@ pub enum ReplySourceRead {
     Unavailable(String),
 }
 
-/// Whether opencodex answers the server, as Settings → Reply source's health line says it
-/// ([`AppState::proxy_health`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ProxyHealth {
-    /// The server keeps no proxy address, so there is nothing to ask.
-    NoAddress,
-    Running,
-    NotRunning,
-}
-
-/// What Settings → Reply source says on a server without the route.
+/// What Settings → Relay says on a server without the route.
 pub(crate) const REPLY_SOURCE_NOT_ON_SERVER: &str =
     "This server can't switch where your replies come from yet.";
 
-/// What it says when a Save went out and no answer came back: the server may have kept it or not,
-/// and the page reads the setting again to find out.
-pub(crate) const REPLY_SOURCE_SAVE_UNKNOWN: &str =
-    "The server did not answer, so the change may or may not have been kept. Checking again…";
-
-/// What it says when a key typed on the page is gone and the server may not have it
-/// ([`ReplySourceSettings::retype_key`]).
-pub(crate) const REPLY_SOURCE_RETYPE_KEY: &str = "Type the key again to save it.";
-
-/// Why Save will not take the proxy's address away while the account's replies are on the
-/// person's plan on the server's own machine: the server would keep it and then turn every reply
-/// away until one was set.
-pub(crate) const REPLY_SOURCE_NEEDS_ADDRESS: &str = "Give the proxy's address first.";
-
-/// Why Save will not leave the account's way through a Mac with no model for it while a Mac lists
-/// some: the server would keep it and then turn every reply through the Mac away.
-pub(crate) const REPLY_SOURCE_PICK_RELAY_MODEL: &str = "Pick a model for your Mac first.";
-
-/// Why it will not while no Mac lists any: a Mac answering is what lists them.
-pub(crate) const REPLY_SOURCE_NO_RELAY_MODELS: &str =
-    "No Mac lists your plan's models yet. Turn on Answer with this Mac, then pick one.";
-
-/// Why Save will not keep an opencodex address that is not on this Mac, beside why not.
-pub(crate) const RELAY_ADDRESS_NOT_HERE: &str = "Give opencodex's address on this Mac first.";
+/// Why Save will not keep an opencodex address that is not on this computer, beside why not.
+pub(crate) const RELAY_ADDRESS_NOT_HERE: &str = "Give opencodex's address on this computer first.";
 
 impl ReplySourceSettings {
     /// The setting as the server last gave it, once there is one.
@@ -469,37 +402,8 @@ impl ReplySourceSettings {
         }
     }
 
-    /// The proxy URL the field shows: as typed, or as the server keeps it, or where opencodex
-    /// listens by default.
-    pub fn shown_url(&self) -> String {
-        self.url_draft
-            .clone()
-            .or_else(|| {
-                self.kept_source()
-                    .and_then(|source| source.base_url.clone())
-            })
-            .unwrap_or_else(|| crate::opengrok::DEFAULT_PROXY_URL.to_string())
-    }
-
-    /// What Save asks of the proxy URL: `None` leaves the server's alone, `Some(None)` clears it,
-    /// and `Some(Some(url))` keeps `url`. The address the field shows counts whenever it is not
-    /// the server's, the default included while the server keeps none, so a first Save sends it:
-    /// without one the server lists none of the plan's models. None is asked where the server is
-    /// not on this Mac, whose field is read-only.
-    fn url_change(&self) -> Option<Option<String>> {
-        if !self.server_on_this_mac {
-            return None;
-        }
-        let kept = self.kept_source()?;
-        let shown = self.shown_url();
-        let wanted = Some(shown.trim())
-            .filter(|url| !url.is_empty())
-            .map(str::to_string);
-        (wanted != kept.base_url).then_some(wanted)
-    }
-
-    /// The account's replies on the person's plan go through their Mac, as a server that knows
-    /// the relay keeps it.
+    /// The account's replies on the person's plan go through their computer, as a server that
+    /// knows the relay keeps it.
     pub fn on_mac(&self) -> bool {
         self.kept_source().is_some_and(|kept| {
             kept.kind == InferenceKind::LocalProxy
@@ -508,153 +412,63 @@ impl ReplySourceSettings {
         })
     }
 
-    /// The server knows the Mac relay, so the page offers it.
+    /// The server knows the relay, so the page offers it.
     pub fn knows_relay(&self) -> bool {
         self.kept_source().is_some_and(InferenceSource::knows_relay)
     }
 
-    /// The relay's model the picker shows: the person's unsaved pick, none when they took it
-    /// away, or the kept one.
-    pub fn shown_relay_model(&self) -> Option<&str> {
-        match &self.relay_model_pick {
-            Some(pick) => pick.as_deref(),
-            None => self.kept_source().and_then(InferenceSource::relay_model),
-        }
-    }
-
-    /// What Save asks of the relay's model: `None` leaves the server's alone, and a pick that
-    /// differs from the kept one replaces it, `Some(None)` clearing it. Only of a server that
-    /// knows the relay.
-    fn relay_model_change(&self) -> Option<Option<String>> {
-        let kept = self.kept_source()?;
-        if !kept.knows_relay() {
-            return None;
-        }
-        let pick = self.relay_model_pick.as_ref()?;
-        (pick.as_deref() != kept.relay_model()).then(|| pick.clone())
-    }
-
-    /// Something on the page that this Mac keeps rather than the server: opencodex's address,
-    /// or its key typed or taken away.
+    /// Something on the page that this computer keeps: opencodex's address, or its key typed or
+    /// taken away. It is all the page has to save: nothing on it is the server's to keep.
     fn changes_here(&self) -> bool {
         self.relay_address_draft.is_some()
             || self.relay_key_draft.is_some()
             || self.relay_remove_key
     }
 
-    /// Something a `PUT` would carry: a change the server keeps rather than this Mac.
-    fn changes_for_server(&self) -> bool {
-        self.kept_source().is_some()
-            && (self.url_change().is_some()
-                || self.key_draft.is_some()
-                || self.remove_key
-                || self.relay_model_change().is_some())
-    }
-
-    /// Something on the page differs from what the server, or this Mac, keeps.
+    /// Something on the page differs from what this computer keeps.
     pub fn is_unsaved(&self) -> bool {
-        self.kept_source().is_some() && (self.changes_for_server() || self.changes_here())
+        self.kept_source().is_some() && self.changes_here()
     }
 
-    /// The page's controls take a change: the setting has been read, and no Save is with the
-    /// server.
+    /// The page's controls take a change: the setting has been read.
     pub fn can_edit(&self) -> bool {
-        self.kept_source().is_some() && self.saving.is_none()
+        self.kept_source().is_some()
     }
 
-    /// The plan's half of the page takes a change: the page does, and the server is on this Mac,
-    /// the only place the person's plan can be set up from.
-    pub fn plan_editable(&self) -> bool {
-        self.can_edit() && self.server_on_this_mac
-    }
-
-    /// The key field takes typing: the plan's half of the page does, and Remove key is not
-    /// picked, which draws the field read-only until Keep key takes it back.
-    pub fn key_editable(&self) -> bool {
-        self.plan_editable() && !self.remove_key
-    }
-
-    /// Answer with this Mac's half of the page takes a change: the page does, and the server
-    /// knows the relay. Unlike the plan's own fields it is live wherever the server runs: the
-    /// relay is what lets a Mac that is not the server's answer for the person.
+    /// The relay's half of the page takes a change: the page does, and the server knows the
+    /// relay. It is live wherever the server runs: the relay is what lets a computer that is not
+    /// the server's answer for the person.
     pub fn relay_editable(&self) -> bool {
         self.can_edit() && self.knows_relay()
     }
 
-    /// The field for this Mac's opencodex key takes typing, as [`Self::key_editable`] for the
-    /// plan's.
+    /// The field for this computer's opencodex key takes typing: the relay's half of the page
+    /// does, and Remove key is not picked, which draws the field read-only until Keep key takes
+    /// it back.
     pub fn relay_key_editable(&self) -> bool {
         self.relay_editable() && !self.relay_remove_key
     }
 
-    /// Why Save will not send the page as it shows it: this Mac's opencodex address somewhere
-    /// that is not this Mac; the account's way through a Mac left without a model for it
-    /// (`relay_models`: a Mac lists some to pick from, or none does yet); or, while the account's
-    /// replies are on the plan on the server's own machine, the proxy's address taken away. The
-    /// server would keep either of the last two, and then turn every reply away until the gap was
-    /// filled. Nothing here stops on the kind, the way or the plan's model, which the page no
-    /// longer changes.
-    pub fn blocker(&self, relay_models: bool) -> Option<&'static str> {
+    /// Why Save will not keep the page as it shows it: this computer's opencodex address
+    /// somewhere that is not this computer.
+    pub fn blocker(&self) -> Option<&'static str> {
         let address = self
             .relay_address_draft
             .as_deref()
             .filter(|typed| !typed.trim().is_empty());
-        if address.is_some_and(|typed| crate::opengrok::OpencodexAddress::parse(typed).is_err()) {
-            return Some(RELAY_ADDRESS_NOT_HERE);
-        }
-        if self.on_mac() {
-            return self
-                .shown_relay_model()
-                .is_none()
-                .then_some(if relay_models {
-                    REPLY_SOURCE_PICK_RELAY_MODEL
-                } else {
-                    REPLY_SOURCE_NO_RELAY_MODELS
-                });
-        }
-        let on_plan = self
-            .kept_source()
-            .is_some_and(|kept| kept.kind == InferenceKind::LocalProxy);
-        (on_plan && self.server_on_this_mac && self.shown_url().trim().is_empty())
-            .then_some(REPLY_SOURCE_NEEDS_ADDRESS)
+        address
+            .is_some_and(|typed| crate::opengrok::OpencodexAddress::parse(typed).is_err())
+            .then_some(RELAY_ADDRESS_NOT_HERE)
     }
 
-    /// Save would do something: a change the server or this Mac would keep has been made,
-    /// nothing stands in its way, and nothing is with the server.
-    pub fn can_save(&self, relay_models: bool) -> bool {
-        self.can_edit()
-            && self.reading.is_none()
-            && self.is_unsaved()
-            && self.blocker(relay_models).is_none()
+    /// Save would do something: a change this computer would keep has been made, nothing stands
+    /// in its way, and no read is out.
+    pub fn can_save(&self) -> bool {
+        self.can_edit() && self.reading.is_none() && self.is_unsaved() && self.blocker().is_none()
     }
 
-    /// The `PUT` a Save sends: the kind the server keeps, sent back as it is, and each field the
-    /// page changed. The server takes no `PUT` without a kind (`apply` in opengrok-server's
-    /// `crates/opengrok-harness/src/local_proxy.rs`), and the page no longer switches it, so the
-    /// account's door stays where the server has it; the plan's model and the way to it are left
-    /// out, and the server keeps them. The typed key is taken, not copied: it leaves the page with
-    /// this Save, whatever becomes of it.
-    fn take_update(&mut self) -> Option<InferenceSourceUpdate> {
-        let kind = self.kept_source()?.kind;
-        let api_key = match (self.key_draft.take(), self.remove_key) {
-            (Some(key), _) => Some(Some(key)),
-            (None, true) => Some(None),
-            (None, false) => None,
-        };
-        Some(InferenceSourceUpdate {
-            kind,
-            base_url: self.url_change(),
-            local_model: None,
-            api_key,
-            via: None,
-            relay: self.relay_model_change().map(|model| RelayUpdate {
-                local_model: Some(model),
-            }),
-        })
-    }
-
-    /// What a Save keeps on this Mac rather than the server: opencodex's address, and its key
-    /// typed or taken away. Taken off the page, the key with it.
+    /// What a Save keeps on this computer: opencodex's address, and its key typed or taken away.
+    /// Taken off the page, the key with it.
     fn take_changes_here(&mut self) -> RelayChangesHere {
         let key = match (self.relay_key_draft.take(), self.relay_remove_key) {
             (Some(key), _) => Some(Some(key)),
@@ -670,12 +484,8 @@ impl ReplySourceSettings {
         RelayChangesHere { address, key }
     }
 
-    /// Put the page back to what the server keeps: every unsaved change goes.
+    /// Put the page back to what this computer keeps: every unsaved change goes.
     fn forget_picks(&mut self) {
-        self.url_draft = None;
-        self.key_draft = None;
-        self.remove_key = false;
-        self.relay_model_pick = None;
         self.relay_address_draft = None;
         self.relay_key_draft = None;
         self.relay_remove_key = false;
@@ -685,15 +495,8 @@ impl ReplySourceSettings {
     pub fn without_key(&self) -> Self {
         Self {
             kept: self.kept.clone(),
-            url_draft: self.url_draft.clone(),
-            key_draft: None,
-            remove_key: self.remove_key,
-            retype_key: self.retype_key,
-            server_on_this_mac: self.server_on_this_mac,
             reading: self.reading,
-            saving: self.saving,
             note: self.note.clone(),
-            relay_model_pick: self.relay_model_pick.clone(),
             relay_address_draft: self.relay_address_draft.clone(),
             relay_key_draft: None,
             relay_remove_key: self.relay_remove_key,
@@ -702,8 +505,8 @@ impl ReplySourceSettings {
     }
 }
 
-/// Settings → Reply source's Default for new Bots: where a newly hired Bot starts, its model, and
-/// with it its door and fast tier, and its effort, which the section shows in the picker's card.
+/// Settings → Relay's Default for new Bots: where a newly hired Bot starts, its model, and with it
+/// its door and fast tier, and its effort, which the section shows in the picker's card.
 ///
 /// TODO(opengrok-server, the account's default for new Bots): the server keeps no default for new
 /// Bots yet. Its contract (the route, the fields, and how a hire reads them) is being agreed with
@@ -720,7 +523,7 @@ pub enum DefaultForNewBots {
     NotOnServer,
 }
 
-/// What a Save keeps on this Mac ([`ReplySourceSettings::take_changes_here`]): opencodex's
+/// What a Save keeps on this computer ([`ReplySourceSettings::take_changes_here`]): opencodex's
 /// address, `Some(None)` back to its default, and its key, `Some(None)` to forget it.
 #[derive(Debug, Default)]
 struct RelayChangesHere {
@@ -728,30 +531,30 @@ struct RelayChangesHere {
     key: Option<Option<RelayKey>>,
 }
 
-/// This Mac's side of the Mac relay (opengrok-server #292): whether Answer with this Mac is
-/// switched on for the account signed in, where this Mac's opencodex listens and whether the
-/// Keychain holds a key for it, and the running relay's word on itself. The switch and the
-/// address are this Mac's prefs; the key never leaves the Keychain but for the relay.
+/// This computer's side of the relay (opengrok-server #292): whether the relay is switched on
+/// for the account signed in, where this computer's opencodex listens and whether the Keychain
+/// holds a key for it, and the running relay's word on itself. The switch and the address are
+/// this computer's prefs; the key never leaves the Keychain but for the relay.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RelayMac {
     /// Switched on for the account signed in. Off until they switch it on: enrolling never makes
-    /// a Mac the relay.
+    /// a computer the relay.
     pub on: bool,
-    /// opencodex's address as saved on this Mac, or `None` for where it listens by default.
+    /// opencodex's address as saved on this computer, or `None` for where it listens by default.
     pub address: Option<String>,
-    /// The Keychain holds a key for this Mac's opencodex.
+    /// The Keychain holds a key for this computer's opencodex.
     pub has_key: bool,
     /// The running relay's word on itself; `None` while it does not run.
     pub report: Option<RelayReport>,
 }
 
-/// Why the relay did not start: local-exec holds no credential for this Mac to answer with.
+/// Why the relay did not start: local-exec holds no credential for this computer to answer with.
 const RELAY_NO_CREDENTIAL: &str =
-    "This Mac's enrolment could not be read. Sign out and in again to enrol it.";
+    "This computer's enrolment could not be read. Sign out and in again to enrol it.";
 
-/// Why the relay did not start: the address saved for opencodex is not one on this Mac.
+/// Why the relay did not start: the address saved for opencodex is not one on this computer.
 const RELAY_ADDRESS_UNREADABLE: &str =
-    "The address saved for opencodex isn't one on this Mac. Give it again and save.";
+    "The address saved for opencodex isn't one on this computer. Give it again and save.";
 
 /// A relay that could not start, and why, as its status line says it.
 fn relay_cannot_start(why: &str) -> RelayReport {
@@ -762,16 +565,16 @@ fn relay_cannot_start(why: &str) -> RelayReport {
     }
 }
 
-/// Answer with this Mac's status line ([`AppState::relay_line`]).
+/// The relay's status line ([`AppState::relay_line`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RelayLine {
-    /// This Mac holds the relay, answering this many calls right now.
+    /// This computer holds the relay, answering this many calls right now.
     Answering { in_flight: usize },
-    /// Another Mac holds it, by its name when the server gave one.
+    /// Another computer holds it, by its name when the server gave one.
     Another { label: Option<String> },
     /// Opening the stream.
     Connecting,
-    /// Nobody's Mac holds it, or this one cannot: and why, when the relay said.
+    /// Nobody's computer holds it, or this one cannot: and why, when the relay said.
     NotConnected { why: Option<String> },
 }
 
@@ -791,37 +594,8 @@ struct ActivationReads {
     connections: bool,
     /// The account's reply source.
     reply_source: bool,
-    /// `/models`, for Settings → Reply source's health line and its relay card's picker.
+    /// `/models`, while Settings → Relay is on screen: the models a computer relaying lists.
     models: bool,
-}
-
-/// What follows a Save's answer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AfterReplySourceSave {
-    /// Nothing more to ask.
-    Done,
-    /// Read the models again: the server lists opencodex's for the setting it now keeps.
-    ReadModels,
-    /// Read the setting again: nobody knows whether the Save was kept.
-    ReadAgain,
-}
-
-/// What a Save that has gone out carried, for its answer to be read by.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct SentSave {
-    generation: u64,
-    /// It carried a key typed on the page, which is gone from the page now.
-    key_sent: bool,
-}
-
-/// A Save of the reply source that has begun: what to send, and what it carried; and what it
-/// keeps on this Mac rather than the server.
-struct ReplySourceSave {
-    client: OpenGrokClient,
-    sent: SentSave,
-    /// The `PUT`, when anything the server keeps changed.
-    update: Option<InferenceSourceUpdate>,
-    here: RelayChangesHere,
 }
 
 /// The open Bot's tool ceiling, as far as its settings know it: everything it could be offered
@@ -2124,8 +1898,8 @@ fn connectors_unavailable(error: &OpenGrokError) -> String {
     )
 }
 
-/// Why the account's reply source could not be read, in words for Settings → Reply source.
-/// Nothing from something in front of the server is shown as the server's words.
+/// Why the account's reply source could not be read, in words for Settings → Relay. Nothing
+/// from something in front of the server is shown as the server's words.
 fn reply_source_unreadable(error: &OpenGrokError) -> String {
     if error.unreachable().is_some() {
         return "Could not reach the server to ask where your replies come from.".to_string();
@@ -2134,19 +1908,6 @@ fn reply_source_unreadable(error: &OpenGrokError) -> String {
         return "Sign in again to see where your replies come from.".to_string();
     }
     rules_refusal("Where your replies come from could not be read", error)
-}
-
-/// A refused Save of the reply source, as the page says it: the server's own sentence when it
-/// wrote one (a URL that is not loopback, a model it will not route a subscription to), as it
-/// wrote it.
-fn reply_source_refusal(error: &OpenGrokError) -> String {
-    if error.is_signed_out() {
-        return "Sign in again to change where your replies come from.".to_string();
-    }
-    if error.written_by_opengrok() && !error.message.trim().is_empty() {
-        return error.message.clone();
-    }
-    rules_refusal("Not saved", error)
 }
 
 /// Why the open Bot's ceiling has no switches, in words for its Tools card.
@@ -4614,8 +4375,8 @@ pub enum AppSettingsTab {
     Logins,
     /// The services the person has signed in to for their Bots, and the ones on offer (#2).
     Connections,
-    /// Where the account's replies are paid from: the server's paid keys, or the person's own
-    /// subscription through opencodex.
+    /// Relay: the person's own plan, relayed to the server from this computer, and the default
+    /// for new Bots. Named for the reply source it was, as its stable id still is.
     ReplySource,
     Skills,
 }
@@ -5170,24 +4931,24 @@ pub struct AppState {
     /// Connect it was asked for. The service's name cannot tell that ask from another for the
     /// same service, or from one an account that has since signed out made.
     connect_asks: u64,
-    /// Settings → Reply source: where the server keeps this account's replies paid from, and
-    /// the page's unsaved changes to the plan's connection. A Bot that has picked no door of its
-    /// own follows the kind the server keeps, which the page no longer switches.
+    /// Settings → Relay: where the server keeps this account's replies paid from, and the page's
+    /// unsaved changes to this computer's half of the relay. A Bot that has picked no door of its
+    /// own follows the kind the server keeps, which the page does not switch.
     pub reply_source: ReplySourceSettings,
-    /// Settings → Reply source's Default for new Bots: what the server keeps as where a newly
-    /// hired Bot starts, which is nothing yet ([`DefaultForNewBots`]).
+    /// Settings → Relay's Default for new Bots: what the server keeps as where a newly hired Bot
+    /// starts, which is nothing yet ([`DefaultForNewBots`]).
     pub default_for_new_bots: DefaultForNewBots,
-    /// Numbers the reads and Saves of the reply source, so an answer that is not the newest, or
-    /// that lands after a sign-out, is dropped.
+    /// Numbers the reads of the reply source, so an answer that is not the newest, or that lands
+    /// after a sign-out, is dropped.
     reply_source_generation: u64,
     /// Numbers the reads of `/models`, so only the newest answer lands
     /// ([`Self::begin_models_read`]).
     models_generation: u64,
-    /// Settings → Reply source was on screen when Settings last changed what it shows, so its
-    /// arrival and its leaving are each told once ([`Self::settle_reply_source_page`]).
+    /// Settings → Relay was on screen when Settings last changed what it shows, so its arrival
+    /// and its leaving are each told once ([`Self::settle_reply_source_page`]).
     reply_source_page_shown: bool,
-    /// Answer with this Mac: the switch, this Mac's opencodex, and the running relay's word on
-    /// itself (hexuria/nativechat #156, opengrok-server #292).
+    /// The relay: the switch, this computer's opencodex, and the running relay's word on itself
+    /// (hexuria/nativechat #156, opengrok-server #292).
     pub relay_mac: RelayMac,
     /// The relay, while it runs, or once it has stopped and says why: for good after another Mac
     /// took over, and until this Mac enrols again after the server turned its token away.
@@ -7955,8 +7716,9 @@ impl AppState {
     }
 
     /// Ask the server where the account's replies are paid from: on sign-in, with the roster,
-    /// because every Bot that has picked no door follows it; and whenever Settings → Reply source
-    /// comes on screen, for its health line. What was read stays on the page while it is asked again.
+    /// because every Bot that has picked no door follows it; and whenever Settings → Relay comes
+    /// on screen, for where the relay stands. What was read stays on the page while it is asked
+    /// again.
     pub fn read_reply_source(&mut self, cx: &mut Context<Self>) {
         let Some((client, generation)) = self.begin_reply_source_read() else {
             return;
@@ -7966,7 +7728,7 @@ impl AppState {
             let _ = this.update(cx, |state, cx| {
                 if state.settle_reply_source_read(generation, read) {
                     // Whether the server knows the relay is in what it said, and so is whether
-                    // Answer with this Mac runs.
+                    // the relay runs.
                     state.ensure_relay(cx);
                     cx.notify();
                 }
@@ -7976,17 +7738,15 @@ impl AppState {
     }
 
     /// Begin a read of the reply source: every read begun before it is overtaken, and dropped
-    /// when it answers. None while a Save is out, whose answer is the newest word there will be,
-    /// and none with nobody signed in to ask for.
+    /// when it answers. None with nobody signed in to ask for.
     fn begin_reply_source_read(&mut self) -> Option<(OpenGrokClient, u64)> {
         let client = self.opengrok.clone()?;
-        if !self.is_signed_in() || self.reply_source.saving.is_some() {
+        if !self.is_signed_in() {
             return None;
         }
         if self.reply_source.kept_source().is_none() {
             self.reply_source.kept = Some(ReplySourceRead::Loading);
         }
-        self.reply_source.server_on_this_mac = client.is_on_this_machine();
         self.reply_source_generation += 1;
         self.reply_source.reading = Some(self.reply_source_generation);
         Some((client, self.reply_source_generation))
@@ -8007,9 +7767,9 @@ impl AppState {
         match read {
             Ok(source) => {
                 settings.kept = Some(ReplySourceRead::Read(source));
-                // What the server says now answers a Save nobody knew the fate of, and a read
-                // that failed. A refusal is about the Save, and stays until the next one.
-                if !matches!(settings.note, Some(ReplySourceNote::Refused(_))) {
+                // What the server says now answers a read that failed. What the Keychain said is
+                // about this computer, and stays until the next Save.
+                if matches!(settings.note, Some(ReplySourceNote::ReadFailed(_))) {
                     settings.note = None;
                 }
             }
@@ -8031,195 +7791,31 @@ impl AppState {
         true
     }
 
-    /// Settings → Reply source's Save: what changed, with the kind the server keeps sent back as
-    /// it is, in one `PUT`. Every control is dead until the server answers, and what it answers is
-    /// what the page shows after. A refusal leaves the kept setting as it was and the changes
-    /// where they were, with the server's words under Save.
-    ///
-    /// What the page keeps on this Mac rather than the server, opencodex's address and its key
-    /// for Answer with this Mac, is kept at once ([`Self::keep_changes_here`]); a Save of nothing
-    /// else sends no `PUT`.
+    /// Settings → Relay's Save: what the page keeps on this computer, opencodex's address and its
+    /// key for the relay, kept at once ([`Self::keep_changes_here`]). It sends the server nothing:
+    /// nothing on the page is the server's to keep.
     pub fn save_reply_source(&mut self, cx: &mut Context<Self>) {
-        let Some(save) = self.begin_reply_source_save() else {
+        let Some(here) = self.begin_reply_source_save() else {
             return;
         };
-        let ReplySourceSave {
-            client,
-            sent,
-            update,
-            here,
-        } = save;
         self.keep_changes_here(here, cx);
-        let Some(update) = update else {
-            cx.notify();
-            return;
-        };
-        cx.spawn(async move |this, cx| {
-            let answer = client.set_inference_source(&update).await;
-            // The key, if one went, goes no further than this request.
-            drop(update);
-            let _ = this.update(cx, |state, cx| {
-                match state.settle_reply_source_save(sent, answer) {
-                    None | Some(AfterReplySourceSave::Done) => {}
-                    Some(AfterReplySourceSave::ReadModels) => state.refresh_models(cx),
-                    Some(AfterReplySourceSave::ReadAgain) => state.read_reply_source(cx),
-                }
-                state.ensure_relay(cx);
-                cx.notify();
-            });
-        })
-        .detach();
         cx.notify();
     }
 
-    /// Begin a Save, for the caller to send: `None` while there is nothing to save, something in
-    /// its way, or anything with the server. A key typed on the page goes with it and leaves the
-    /// page for good.
-    fn begin_reply_source_save(&mut self) -> Option<ReplySourceSave> {
-        if !self.reply_source.can_save(self.relay_models_listed()) {
+    /// Begin a Save, for the caller to keep: `None` while there is nothing to save or something
+    /// in its way. A key typed on the page goes with it and leaves the page for good.
+    fn begin_reply_source_save(&mut self) -> Option<RelayChangesHere> {
+        if !self.reply_source.can_save() {
             return None;
         }
-        let client = self.opengrok.clone()?;
-        let here = self.reply_source.take_changes_here();
         self.reply_source.note = None;
-        if !self.reply_source.changes_for_server() {
-            return Some(ReplySourceSave {
-                client,
-                sent: SentSave {
-                    generation: self.reply_source_generation,
-                    key_sent: false,
-                },
-                update: None,
-                here,
-            });
-        }
-        let update = self.reply_source.take_update()?;
-        let key_sent = matches!(update.api_key, Some(Some(_)));
-        self.reply_source_generation += 1;
-        self.reply_source.saving = Some(self.reply_source_generation);
-        Some(ReplySourceSave {
-            client,
-            sent: SentSave {
-                generation: self.reply_source_generation,
-                key_sent,
-            },
-            update: Some(update),
-            here,
-        })
+        Some(self.reply_source.take_changes_here())
     }
 
-    /// Put a Save's answer on the page, and say what to ask next. `None` when the answer is not
-    /// the Save's that is out (the person signed out since) and nothing was touched.
-    fn settle_reply_source_save(
-        &mut self,
-        sent: SentSave,
-        answer: Result<InferenceSource, OpenGrokError>,
-    ) -> Option<AfterReplySourceSave> {
-        let settings = &mut self.reply_source;
-        if settings.saving != Some(sent.generation) {
-            return None;
-        }
-        settings.saving = None;
-        let after = match answer {
-            Ok(kept) => {
-                settings.forget_picks();
-                settings.retype_key = false;
-                settings.kept = Some(ReplySourceRead::Read(kept));
-                AfterReplySourceSave::ReadModels
-            }
-            Err(error) if error.is_not_found() && !error.written_by_opengrok() => {
-                settings.forget_picks();
-                settings.kept = Some(ReplySourceRead::NotOnServer);
-                AfterReplySourceSave::Done
-            }
-            // No answer at all, or one that could not be read: the server may have kept it, and
-            // only asking again can say.
-            Err(error) if error.unreachable().is_some() || error.status.is_none() => {
-                settings.note = Some(ReplySourceNote::Unknown);
-                settings.retype_key |= sent.key_sent;
-                AfterReplySourceSave::ReadAgain
-            }
-            Err(error) => {
-                settings.note = Some(ReplySourceNote::Refused(reply_source_refusal(&error)));
-                settings.retype_key |= sent.key_sent;
-                AfterReplySourceSave::Done
-            }
-        };
-        Some(after)
-    }
-
-    /// The proxy URL as the field holds it now. Emptied, it is the address taken away.
-    pub fn set_reply_source_url(&mut self, url: String, cx: &mut Context<Self>) {
-        if self.note_reply_source_url(url) {
-            cx.notify();
-        }
-    }
-
-    /// Only while the plan's half of the page takes a change, as the key and Remove key: a field
-    /// drawn read-only (a Save out, the setting not read, the server on another machine) leaves
-    /// the address as it was, whatever reaches it.
-    fn note_reply_source_url(&mut self, url: String) -> bool {
-        let settings = &mut self.reply_source;
-        if !settings.plan_editable() || settings.shown_url() == url {
-            return false;
-        }
-        settings.url_draft = Some(url);
-        true
-    }
-
-    /// A key for the proxy as the field holds it now; a blank field is no key, and leaves the
-    /// one the server has alone. A key typed takes back a Remove key, and is the key the page
-    /// asked for again.
-    pub fn set_reply_source_key(&mut self, typed: &str, cx: &mut Context<Self>) {
-        if self.note_reply_source_key(typed) {
-            cx.notify();
-        }
-    }
-
-    fn note_reply_source_key(&mut self, typed: &str) -> bool {
-        let settings = &mut self.reply_source;
-        if !settings.plan_editable() {
-            return false;
-        }
-        let key = ProxyKey::new(typed);
-        if key.is_some() {
-            settings.remove_key = false;
-            settings.retype_key = false;
-        }
-        if settings.key_draft == key {
-            return false;
-        }
-        settings.key_draft = key;
-        true
-    }
-
-    /// Remove key, and Keep key to take it back: the next Save asks the server to forget the key
-    /// it holds. Offered only while the server holds one.
-    pub fn toggle_remove_reply_source_key(&mut self, cx: &mut Context<Self>) {
-        if self.note_remove_reply_source_key() {
-            cx.notify();
-        }
-    }
-
-    fn note_remove_reply_source_key(&mut self) -> bool {
-        let settings = &mut self.reply_source;
-        let holds_key = settings
-            .kept_source()
-            .is_some_and(|source| source.has_api_key);
-        if !settings.plan_editable() || !holds_key {
-            return false;
-        }
-        settings.remove_key = !settings.remove_key;
-        if settings.remove_key {
-            settings.key_draft = None;
-        }
-        true
-    }
-
-    /// Settings has changed what it shows. Reply source coming on screen reads the setting, for
-    /// the health line and in case it changed on another Mac, and the models, for the relay
-    /// card's picker and the health line; leaving it drops a key typed there and not saved
-    /// ([`Self::settle_reply_source_page`]).
+    /// Settings has changed what it shows. Relay coming on screen reads the setting, for where the
+    /// relay stands and in case it changed on another computer, and the models, which a computer
+    /// relaying lists for every picker's Subscription group; leaving it drops a key typed there
+    /// and not saved ([`Self::settle_reply_source_page`]).
     fn reply_source_page_moved(&mut self, cx: &mut Context<Self>) {
         if self.settle_reply_source_page() {
             self.read_reply_source(cx);
@@ -8227,63 +7823,28 @@ impl AppState {
         }
     }
 
-    /// Whether Settings → Reply source has just come on screen. Off screen, a key typed there and
-    /// not saved is dropped, and the page asks for it again when it is back: nothing keeps a key
-    /// the person walked away from, in memory or anywhere else.
+    /// Whether Settings → Relay has just come on screen. Off screen, a key for this computer's
+    /// opencodex typed there and not saved is dropped, and the page asks for it again when it is
+    /// back: nothing keeps a key the person walked away from, in memory or anywhere else.
     fn settle_reply_source_page(&mut self) -> bool {
         let shown = self.reply_source_on_screen();
         let arrived = shown && !self.reply_source_page_shown;
         self.reply_source_page_shown = shown;
-        if !shown && self.reply_source.key_draft.take().is_some() {
-            self.reply_source.retype_key = true;
-        }
-        // The key for this Mac's opencodex too: nothing keeps a key the person walked away from.
         if !shown && self.reply_source.relay_key_draft.take().is_some() {
             self.reply_source.relay_retype_key = true;
         }
         arrived
     }
 
-    /// A Mac lists models of the person's plan to pick from for the relay.
-    fn relay_models_listed(&self) -> bool {
-        !self.relay_models().is_empty()
-    }
-
-    /// Save would send something ([`ReplySourceSettings::can_save`]).
+    /// Save would keep something ([`ReplySourceSettings::can_save`]).
     pub fn reply_source_can_save(&self) -> bool {
-        self.reply_source.can_save(self.relay_models_listed())
+        self.reply_source.can_save()
     }
 
-    /// The line beside Save: what it waits for before it will send the page
+    /// The line beside Save: what it waits for before it will keep the page
     /// ([`ReplySourceSettings::blocker`]).
     pub fn reply_source_hint(&self) -> Option<&'static str> {
-        self.reply_source.blocker(self.relay_models_listed())
-    }
-
-    /// Whether opencodex answers the server, for the page's health line: no address kept is its
-    /// own answer; otherwise `/models`' word on it (`localProxy.healthy`) when that gave one,
-    /// being what fills the picker's Subscription group, and the setting's `healthy` when it did
-    /// not. `None` before the setting is read.
-    pub fn proxy_health(&self) -> Option<ProxyHealth> {
-        let kept = self.reply_source.kept_source()?;
-        if kept.base_url.is_none() {
-            return Some(ProxyHealth::NoAddress);
-        }
-        let healthy = self
-            .model_catalogue
-            .local_proxy
-            .map_or(kept.healthy, |proxy| proxy.healthy);
-        Some(if healthy {
-            ProxyHealth::Running
-        } else {
-            ProxyHealth::NotRunning
-        })
-    }
-
-    /// The models "Answer with this Mac" offers: what `GET /models` lists as served through the
-    /// opencodex of the Mac holding the relay (`via: "mac"`), held to the same allowlist.
-    pub fn relay_models(&self) -> Vec<String> {
-        self.plan_models(Via::Mac)
+        self.reply_source.blocker()
     }
 
     /// The models of the person's plan for a way to it: what `GET /models` lists as served
@@ -8358,7 +7919,7 @@ impl AppState {
         }
     }
 
-    // ---- Answer with this Mac: the relay (hexuria/nativechat #156, opengrok-server #292) -----
+    // ---- The relay: this computer answers for the plan (hexuria/nativechat #156, #292) ---------
 
     /// Answer with this Mac's own half, as this Mac keeps it: the Keychain for opencodex's key,
     /// asked only whether it holds one, and the address from the prefs. The switch is the
@@ -8653,37 +8214,9 @@ impl AppState {
         true
     }
 
-    /// A model a Mac lists, for the relay: it waits for Save, which keeps it on the server.
-    pub fn pick_relay_model(&mut self, model: String, cx: &mut Context<Self>) {
-        if self.note_relay_model(Some(model)) {
-            cx.notify();
-        }
-    }
-
-    /// No model for the relay: the kept one is taken away with the next Save.
-    pub fn clear_relay_model(&mut self, cx: &mut Context<Self>) {
-        if self.note_relay_model(None) {
-            cx.notify();
-        }
-    }
-
-    fn note_relay_model(&mut self, model: Option<String>) -> bool {
-        let settings = &mut self.reply_source;
-        if !settings.relay_editable() {
-            return false;
-        }
-        let kept = settings
-            .kept_source()
-            .and_then(InferenceSource::relay_model)
-            .map(str::to_string);
-        settings.relay_model_pick = (model != kept).then_some(model);
-        true
-    }
-
-    /// What a Save keeps on this Mac rather than the server: opencodex's address in the prefs,
-    /// at once, and its key in the Keychain, off the main thread, since the Keychain may ask the
-    /// person first. A relay that runs calls opencodex at the new address, and with the new key,
-    /// from its next call on.
+    /// What a Save keeps on this computer: opencodex's address in the prefs, at once, and its key
+    /// in the Keychain, off the main thread, since the Keychain may ask the person first. A relay
+    /// that runs calls opencodex at the new address, and with the new key, from its next call on.
     fn keep_changes_here(&mut self, here: RelayChangesHere, cx: &mut Context<Self>) {
         if let Some(address) = here.address {
             self.relay_mac.address = address;
@@ -8734,7 +8267,8 @@ impl AppState {
             }
             Err(why) => {
                 self.reply_source.note = Some(ReplySourceNote::KeyNotKept(format!(
-                    "This Mac's Keychain did not keep the change to opencodex's key: {why}"
+                    "This computer's secure storage did not keep the change to opencodex's key: \
+                     {why}"
                 )));
             }
         }
@@ -9192,7 +8726,7 @@ impl AppState {
         }
     }
 
-    /// Settings is open on Reply source.
+    /// Settings is open on Relay.
     fn reply_source_on_screen(&self) -> bool {
         self.is_app_settings_open && self.app_settings_tab == AppSettingsTab::ReplySource
     }
@@ -30591,8 +30125,8 @@ mod tests {
     /// The plan's models come two ways with the Mac relay, and each list is kept by the same rule,
     /// apart: no Mac holding the relay leaves the Mac's models in its picker while the server's
     /// own opencodex answers fresh, and opencodex down on the server's machine says nothing of
-    /// the Mac's. Each way's list holds only that way's models, held to the allowlist: the
-    /// server's machine's for the picker's Subscription group, the Mac's for the relay card.
+    /// the Mac's. Each way's list holds only that way's models, held to the allowlist: each is
+    /// the pickers' Subscription group while the account's way to the plan is that way.
     #[test]
     fn the_macs_models_are_kept_apart_from_the_servers_machines() {
         let listed = |here: &[&str], mac: &[&str], healthy: bool, relay: bool| {
@@ -30624,7 +30158,7 @@ mod tests {
             ["gpt-5-codex"]
         );
         assert_eq!(
-            state.relay_models(),
+            state.plan_models(crate::opengrok::Via::Mac),
             ["grok-4"],
             "the allowlist holds for the Mac too"
         );
@@ -30638,7 +30172,7 @@ mod tests {
             state.plan_models(crate::opengrok::Via::Loopback),
             ["gpt-5-codex", "o3"]
         );
-        assert_eq!(state.relay_models(), ["grok-4"]);
+        assert_eq!(state.plan_models(crate::opengrok::Via::Mac), ["grok-4"]);
 
         // opencodex down on the server's machine: its models stay, and the Mac's are the Mac's.
         apply_catalogue(
@@ -30649,11 +30183,11 @@ mod tests {
             state.plan_models(crate::opengrok::Via::Loopback),
             ["gpt-5-codex", "o3"]
         );
-        assert_eq!(state.relay_models(), ["gpt-5.5"]);
+        assert_eq!(state.plan_models(crate::opengrok::Via::Mac), ["gpt-5.5"]);
 
         // A Mac answering that lists nothing: that is the answer.
         apply_catalogue(&mut state.model_catalogue, listed(&[], &[], false, true));
-        assert!(state.relay_models().is_empty());
+        assert!(state.plan_models(crate::opengrok::Via::Mac).is_empty());
     }
 
     /// A Bot on the person's plan names the account's way to it on every turn: through the
@@ -34938,10 +34472,7 @@ mod tests {
 
     // ---- Reply source: the server's paid keys, or the person's own plan ------------------------
 
-    use super::{
-        ActivationReads, AfterReplySourceSave, REPLY_SOURCE_NOT_ON_SERVER,
-        REPLY_SOURCE_SAVE_UNKNOWN, ReplySourceNote, ReplySourceRead,
-    };
+    use super::{ActivationReads, REPLY_SOURCE_NOT_ON_SERVER, ReplySourceNote, ReplySourceRead};
     use crate::opengrok::{InferenceKind, InferenceSource, ReplySource, TurnSource};
 
     /// Somebody signed in, with a client that is never asked: every answer here is handed in.
@@ -36094,7 +35625,7 @@ mod tests {
             Some(REPLY_SOURCE_NOT_ON_SERVER)
         );
         assert!(!state.reply_source.can_edit());
-        assert!(!state.note_reply_source_url("http://127.0.0.1:9090".into()));
+        assert!(!state.note_relay_address("http://127.0.0.1:9090".into()));
         assert_eq!(state.turn_inference_source(None), None);
         assert!(state.begin_reply_source_save().is_none());
 
@@ -36267,10 +35798,10 @@ mod tests {
         assert!(!state.note_model_list_scroll(1));
     }
 
-    // ---- Answer with this Mac: the relay's half of the page -------------------------------------
+    // ---- The relay: this computer's half of Settings → Relay ------------------------------------
 
-    /// A read from a server that knows the Mac relay: the account's door and way, and the relay's
-    /// model, with no Mac holding it.
+    /// A read from a server that knows the relay: the account's door and way, and the relay's
+    /// model, with no computer holding it.
     fn relay_kept(kind: InferenceKind, via: &str, relay_model: Option<&str>) -> InferenceSource {
         InferenceSource {
             via: Some(via.into()),
@@ -36284,118 +35815,44 @@ mod tests {
         }
     }
 
-    /// The server lists `ids` as models a Mac holding the relay lists.
-    fn with_relay_models(state: &mut AppState, ids: &[&str]) {
-        state.model_catalogue = ModelCatalogue {
-            models: ids
-                .iter()
-                .map(|id| ModelEntry {
-                    id: (*id).to_string(),
-                    source: Some("local_proxy".into()),
-                    via: Some("mac".into()),
-                })
-                .collect(),
-            note: None,
-            local_proxy: Some(crate::opengrok::LocalProxyStatus {
-                healthy: true,
-                relay_connected: true,
-            }),
-        };
-    }
-
-    /// On a server that knows the relay, a Save sends the relay's model when one was picked and
-    /// keeps the account's way as the server has it: the page has no row to move the account to
-    /// the Mac or back, so no way is ever sent. While the account's way is through the Mac, Save
-    /// says what it waits for while the relay has no model, whether a Mac lists some or none does
-    /// yet, and the relay's model taken away is not saved. A server from before the relay is sent
-    /// nothing of it.
+    /// The page sets up nothing of the plan on the server's own machine and picks no model for
+    /// the relay, whatever the server keeps of either: an account on the plan on the server's
+    /// machine, with an address, a key and a model kept there and a model kept for the relay,
+    /// leaves the page with nothing unsaved and nothing for Save, which never needed a model from
+    /// a computer relaying. A Save of what is the page's, this computer's half, sends the server
+    /// nothing at all.
     #[test]
-    fn a_save_keeps_the_accounts_way_and_sends_the_relays_model() {
-        use super::{REPLY_SOURCE_NO_RELAY_MODELS, REPLY_SOURCE_PICK_RELAY_MODEL};
+    fn the_page_has_nothing_of_the_servers_machine_and_no_relay_model_to_save() {
         let mut state = signed_in_state();
         read_as(
             &mut state,
-            relay_kept(InferenceKind::Gateway, "loopback", None),
-        );
-        with_relay_models(&mut state, &["grok-4", "claude-opus"]);
-        assert_eq!(state.relay_models(), ["grok-4"]);
-        assert!(!state.reply_source.on_mac());
-        assert!(state.note_relay_model(Some("grok-4".into())));
-        assert_eq!(
-            save_body(&mut state),
-            Some(json!({"kind": "gateway", "relay": {"localModel": "grok-4"}}))
-        );
-
-        // The account's way is the Mac, and the server keeps no model for it: Save waits for one.
-        let mut state = signed_in_state();
-        read_as(
-            &mut state,
-            relay_kept(InferenceKind::LocalProxy, "mac", None),
+            InferenceSource {
+                has_api_key: true,
+                ..relay_kept(InferenceKind::LocalProxy, "mac", Some("grok-4"))
+            },
         );
         assert!(state.reply_source.on_mac());
-        assert!(state.note_reply_source_url("http://127.0.0.1:9090".into()));
-        assert_eq!(
-            state.reply_source_hint(),
-            Some(REPLY_SOURCE_NO_RELAY_MODELS)
-        );
+        assert!(!state.reply_source.is_unsaved(), "nothing of the server's");
         assert!(!state.reply_source_can_save());
-        with_relay_models(&mut state, &["grok-4"]);
+        assert_eq!(state.reply_source_hint(), None, "Save waits for no model");
+        assert!(state.begin_reply_source_save().is_none());
+        assert!(state.note_relay_address("http://127.0.0.1:9090".into()));
+        let here = state.begin_reply_source_save().expect("a Save begins");
         assert_eq!(
-            state.reply_source_hint(),
-            Some(REPLY_SOURCE_PICK_RELAY_MODEL)
+            here.address,
+            Some(Some("http://127.0.0.1:9090".to_string())),
+            "kept on this computer, and nothing is with the server"
         );
-        assert!(state.note_relay_model(Some("grok-4".into())));
-        assert_eq!(state.reply_source_hint(), None);
-        assert_eq!(
-            save_body(&mut state),
-            Some(json!({
-                "kind": "local_proxy",
-                "baseUrl": "http://127.0.0.1:9090",
-                "relay": {"localModel": "grok-4"}
-            })),
-            "the kind as the server keeps it, and no way: the server keeps the Mac"
-        );
-
-        // The relay's model taken away while the Mac is the account's way is not saved: the
-        // server would turn every reply through the Mac away.
-        let mut state = signed_in_state();
-        read_as(
-            &mut state,
-            relay_kept(InferenceKind::LocalProxy, "mac", Some("grok-4")),
-        );
-        with_relay_models(&mut state, &["grok-4"]);
-        assert!(state.note_relay_model(None));
-        assert_eq!(
-            state.reply_source_hint(),
-            Some(REPLY_SOURCE_PICK_RELAY_MODEL)
-        );
-        assert_eq!(save_body(&mut state), None);
-
-        // A server from before the relay: nothing of the relay's taken, and no way sent.
-        let mut state = signed_in_state();
-        read_as(
-            &mut state,
-            kept(InferenceKind::LocalProxy, Some("gpt-5-codex")),
-        );
-        assert!(!state.reply_source.knows_relay());
-        assert!(!state.note_relay_model(Some("grok-4".into())));
-        assert!(!state.note_relay_address("http://127.0.0.1:9090".into()));
-        assert!(!state.note_relay_key("opencodex-test-key"));
-        assert!(state.note_reply_source_url("http://127.0.0.1:9090".into()));
-        assert_eq!(
-            save_body(&mut state),
-            Some(json!({"kind": "local_proxy", "baseUrl": "http://127.0.0.1:9090"})),
-            "the old words alone, the only ones such a server reads"
-        );
+        assert_eq!(state.reply_source.reading, None);
     }
 
-    /// opencodex's address and key for Answer with this Mac are this Mac's: Save keeps them here
-    /// and sends the server neither, and sends it nothing at all when nothing else changed. An
-    /// address that is not this Mac is refused before Save, an emptied one goes back to the
-    /// default, and a key typed and left behind with the page is dropped and asked for again.
+    /// opencodex's address and key for the relay are this computer's: Save keeps them here and
+    /// sends the server neither. An address that is not this computer is refused before Save, an
+    /// emptied one goes back to the default, and a key typed and left behind with the page is
+    /// dropped and asked for again.
     #[test]
-    fn answer_with_this_macs_address_and_key_are_kept_here_and_never_sent() {
-        use super::{RELAY_ADDRESS_NOT_HERE, ReplySourceSave};
+    fn this_computers_address_and_key_are_kept_here_and_never_sent() {
+        use super::RELAY_ADDRESS_NOT_HERE;
         let mut state = signed_in_state();
         read_as(
             &mut state,
@@ -36411,9 +35868,7 @@ mod tests {
         assert!(!printed.contains("opencodex-test-key"), "{printed}");
         assert!(state.reply_source.without_key().relay_key_draft.is_none());
         assert!(state.reply_source_can_save());
-        let ReplySourceSave { update, here, .. } =
-            state.begin_reply_source_save().expect("a Save begins");
-        assert!(update.is_none(), "nothing the server keeps changed: no PUT");
+        let here = state.begin_reply_source_save().expect("a Save begins");
         assert_eq!(
             here.address,
             Some(Some("http://127.0.0.1:9090".to_string()))
@@ -36421,10 +35876,6 @@ mod tests {
         assert_eq!(
             here.key,
             Some(crate::opengrok::RelayKey::new("opencodex-test-key"))
-        );
-        assert_eq!(
-            state.reply_source.saving, None,
-            "nothing is with the server"
         );
         assert!(!state.reply_source.is_unsaved(), "the page has let them go");
 
@@ -36444,13 +35895,13 @@ mod tests {
         state.relay_mac.has_key = true;
         assert!(state.note_remove_relay_key());
         assert!(!state.reply_source.relay_key_editable());
-        let ReplySourceSave { here, .. } = state.begin_reply_source_save().unwrap();
+        let here = state.begin_reply_source_save().unwrap();
         assert_eq!(here.key, Some(None), "Save forgets it");
 
         // An emptied address goes back to the default.
         state.relay_mac.address = Some("http://127.0.0.1:9090".into());
         assert!(state.note_relay_address(String::new()));
-        let ReplySourceSave { here, .. } = state.begin_reply_source_save().unwrap();
+        let here = state.begin_reply_source_save().unwrap();
         assert_eq!(here.address, Some(None));
 
         // A key typed and left behind with the page is dropped, and asked for again.
@@ -36466,8 +35917,8 @@ mod tests {
         assert!(!state.reply_source.relay_retype_key);
     }
 
-    /// Answer with this Mac runs only for somebody signed in, with its switch on for them, on an
-    /// enrolled Mac, against a server that knows the relay: enrolling alone never makes a Mac the
+    /// The relay runs only for somebody signed in, with its switch on for them, on an enrolled
+    /// computer, against a server that knows the relay: enrolling alone never makes a computer the
     /// relay. The switch goes on only where it could run, and off always; signing out stops the
     /// relay and forgets the switch, which is the next person's to read.
     #[test]
@@ -36671,173 +36122,16 @@ mod tests {
         });
     }
 
-    /// What a Save would send now, as JSON, without sending it.
-    fn save_body(state: &mut AppState) -> Option<serde_json::Value> {
-        let save = state.begin_reply_source_save()?;
-        let body = serde_json::to_value(&save.update).unwrap();
-        state.reply_source.saving = None;
-        Some(body)
-    }
-
-    /// A Save sends what the page changed, with the kind the server keeps sent back as it is, and
-    /// the typed key with it, once: the key leaves the app with that Save, whatever becomes of it.
-    /// While it is out nothing on the page takes a change and no read begins. The server's answer
-    /// is what shows after, the changes gone into it, and the models are read again for the
-    /// setting the server now keeps; a later Save sends only what changed since.
-    #[test]
-    fn a_save_puts_what_changed_once_and_its_answer_is_what_shows() {
-        let mut state = signed_in_state();
-        read_as(
-            &mut state,
-            kept(InferenceKind::LocalProxy, Some("gpt-5-codex")),
-        );
-        assert!(
-            !state.reply_source_can_save(),
-            "nothing changed, nothing to save"
-        );
-        // A read with the server takes changes, and Save waits for what it brings.
-        let (_, reading) = state.begin_reply_source_read().unwrap();
-        assert!(state.note_reply_source_url("http://127.0.0.1:18080".into()));
-        assert!(state.reply_source.is_unsaved() && !state.reply_source_can_save());
-        assert!(state.begin_reply_source_save().is_none());
-        assert!(state.settle_reply_source_read(
-            reading,
-            Ok(kept(InferenceKind::LocalProxy, Some("gpt-5-codex")))
-        ));
-        assert!(
-            state.reply_source_can_save(),
-            "the change waited on top of the read"
-        );
-        assert!(state.note_reply_source_key("sk-proxy-1"));
-
-        let save = state.begin_reply_source_save().expect("a Save begins");
-        assert_eq!(
-            serde_json::to_value(&save.update).unwrap(),
-            json!({
-                "kind": "local_proxy",
-                "baseUrl": "http://127.0.0.1:18080",
-                "apiKey": "sk-proxy-1"
-            }),
-            "the kind as the server keeps it, and never the plan's model"
-        );
-        assert!(save.sent.key_sent);
-        assert_eq!(
-            state.reply_source.key_draft, None,
-            "sent once, kept nowhere"
-        );
-        assert!(!state.reply_source.can_edit(), "every control is dead");
-        assert!(!state.note_reply_source_url("http://127.0.0.1:9".into()));
-        assert!(
-            state.begin_reply_source_read().is_none(),
-            "no read overtakes it"
-        );
-        assert!(
-            state.begin_reply_source_save().is_none(),
-            "one Save at a time"
-        );
-
-        let answer = InferenceSource {
-            kind: InferenceKind::LocalProxy,
-            base_url: Some("http://127.0.0.1:18080".into()),
-            local_model: Some("gpt-5-codex".into()),
-            healthy: false,
-            has_api_key: true,
-            via: None,
-            relay: None,
-        };
-        assert_eq!(
-            state.settle_reply_source_save(save.sent, Ok(answer.clone())),
-            Some(AfterReplySourceSave::ReadModels)
-        );
-        assert_eq!(state.reply_source.kept_source(), Some(&answer));
-        assert_eq!(
-            state.reply_source.url_draft, None,
-            "the change is what the server keeps now"
-        );
-        assert!(!state.reply_source.is_unsaved());
-        assert_eq!(state.reply_source.shown_url(), "http://127.0.0.1:18080");
-        assert!(state.reply_source.can_edit());
-
-        // Only the key goes next: the address the server keeps is left out, and kept.
-        assert!(state.note_remove_reply_source_key());
-        assert_eq!(
-            save_body(&mut state),
-            Some(json!({"kind": "local_proxy", "apiKey": null}))
-        );
-    }
-
-    /// A first Save sends the address a turn on the plan needs, and keeps the account's kind as
-    /// the server has it, whichever it is: a new account's page shows the default address as
-    /// unsaved, since the server keeps none and lists none of the plan's models without one, and
-    /// says no address is kept rather than that opencodex is down. An address emptied while the
-    /// account's replies are on the plan is refused; on the server's keys it is cleared.
-    #[test]
-    fn a_first_save_sends_the_address_and_keeps_the_accounts_kind() {
-        use super::REPLY_SOURCE_NEEDS_ADDRESS;
-        for kind in InferenceKind::ALL {
-            let mut state = signed_in_state();
-            read_as(
-                &mut state,
-                InferenceSource {
-                    kind,
-                    base_url: None,
-                    local_model: None,
-                    healthy: false,
-                    has_api_key: false,
-                    via: None,
-                    relay: None,
-                },
-            );
-            assert_eq!(state.proxy_health(), Some(super::ProxyHealth::NoAddress));
-            assert!(
-                state.reply_source.is_unsaved(),
-                "the default address is not the server's yet"
-            );
-            assert_eq!(
-                save_body(&mut state),
-                Some(json!({"kind": kind.word(), "baseUrl": "http://127.0.0.1:8080"})),
-                "{kind:?}: the kind as kept, and no model"
-            );
-        }
-
-        let mut state = signed_in_state();
-        read_as(
-            &mut state,
-            kept(InferenceKind::LocalProxy, Some("gpt-5-codex")),
-        );
-        state.reply_source.url_draft = Some("  ".into());
-        assert_eq!(state.reply_source_hint(), Some(REPLY_SOURCE_NEEDS_ADDRESS));
-        assert!(state.begin_reply_source_save().is_none());
-
-        let mut state = signed_in_state();
-        read_as(&mut state, kept(InferenceKind::Gateway, None));
-        state.reply_source.url_draft = Some(String::new());
-        assert_eq!(state.reply_source_hint(), None);
-        assert_eq!(
-            save_body(&mut state),
-            Some(json!({"kind": "gateway", "baseUrl": null}))
-        );
-    }
-
     /// The page no longer switches where the account's replies go, and nothing on it moves the
-    /// account's kind: every Save sends it back as the server keeps it, with no plan model and no
-    /// way. A Bot that follows the account (`source: null`) still goes the account's way: its
-    /// picker names the account's door, and its turns name none, for the server to go by what it
-    /// keeps.
+    /// account's kind or sends one: a Bot that follows the account (`source: null`) still goes the
+    /// account's way, as the server keeps it. Its picker names the account's door, and its turns
+    /// name none, for the server to go by what it keeps.
     #[test]
-    fn the_accounts_kind_stays_as_kept_and_a_bot_that_follows_it_goes_its_way() {
+    fn a_bot_that_follows_the_account_goes_its_way() {
         for kind in InferenceKind::ALL {
             let mut state = signed_in_state();
             with_bot(&mut state, serde_json::Value::Null);
             read_as(&mut state, kept(kind, Some("gpt-5-codex")));
-            assert!(state.note_reply_source_url("http://127.0.0.1:9090".into()));
-            assert!(state.note_reply_source_key("sk-proxy-1"));
-            let body = save_body(&mut state).expect("a Save");
-            assert_eq!(body["kind"], json!(kind.word()), "{kind:?}");
-            assert!(
-                body.get("localModel").is_none() && body.get("via").is_none(),
-                "{body}"
-            );
             let pick = state.model_pick().expect("a Bot is open");
             assert_eq!(pick.door, Some(kind), "the Bot follows the account's door");
             assert_eq!(
@@ -36848,93 +36142,22 @@ mod tests {
         }
     }
 
-    /// The plan is set up only where the app's server runs on this Mac: the server calls opencodex
-    /// on its own machine. Elsewhere the plan's half of the page takes no change and asks nothing
-    /// of the server, and the default address is not counted as unsaved; with the account's kind
-    /// no longer switched here, the page has nothing else to send.
-    #[test]
-    fn the_plan_is_set_up_only_where_the_server_runs_on_this_mac() {
-        let mut state = signed_in_state();
-        state.opengrok = Some(OpenGrokClient::new("https://opengrok.example.com").unwrap());
-        read_as(
-            &mut state,
-            InferenceSource {
-                base_url: None,
-                ..kept(InferenceKind::LocalProxy, Some("gpt-5-codex"))
-            },
-        );
-        assert!(!state.reply_source.server_on_this_mac);
-        assert!(!state.reply_source.plan_editable());
-        assert!(!state.reply_source.is_unsaved(), "no address to count");
-        assert!(!state.note_reply_source_url("http://127.0.0.1:9090".into()));
-        assert!(!state.note_reply_source_key("sk-proxy-1"));
-        assert!(!state.note_remove_reply_source_key());
-        assert_eq!(save_body(&mut state), None, "nothing to send from here");
-
-        let mut state = signed_in_state();
-        read_as(&mut state, kept(InferenceKind::Gateway, None));
-        assert!(
-            state.reply_source.server_on_this_mac,
-            "127.0.0.1 is this Mac"
-        );
-    }
-
-    /// A field emptied on the page is cleared on the server, as `null`: the address, and the key
-    /// (Remove key, offered while the server holds one). Typing a key takes a Remove key back,
-    /// and Keep key does too.
-    #[test]
-    fn an_emptied_field_is_cleared_and_remove_key_forgets_the_key() {
-        let mut state = signed_in_state();
-        read_as(
-            &mut state,
-            InferenceSource {
-                has_api_key: true,
-                ..kept(InferenceKind::Gateway, Some("gpt-5-codex"))
-            },
-        );
-        state.reply_source.url_draft = Some(String::new());
-        assert!(state.note_remove_reply_source_key());
-        assert_eq!(
-            save_body(&mut state),
-            Some(json!({"kind": "gateway", "baseUrl": null, "apiKey": null}))
-        );
-        assert!(state.note_reply_source_key("sk-new"));
-        assert!(
-            !state.reply_source.remove_key,
-            "a typed key replaces instead"
-        );
-        assert!(state.note_remove_reply_source_key());
-        assert_eq!(
-            state.reply_source.key_draft, None,
-            "and Remove key drops it"
-        );
-        assert!(state.note_remove_reply_source_key(), "Keep key");
-        assert!(!state.reply_source.remove_key);
-
-        let mut state = signed_in_state();
-        read_as(&mut state, kept(InferenceKind::Gateway, None));
-        assert!(
-            !state.note_remove_reply_source_key(),
-            "no key held, nothing to remove"
-        );
-    }
-
-    /// The URL and key fields take typing only while the page draws them editable, as Remove key
-    /// takes a click only then: before the setting is read, while a Save is out,
-    /// and where the server is not on this Mac, what reaches them changes no draft. The key field
-    /// is read-only while Remove key waits for Save too; the URL is not.
+    /// The relay's fields take typing only while the page draws them editable, as Remove key
+    /// takes a click only then: before the setting is read, and from a server without the relay,
+    /// what reaches them changes no draft. The key field is read-only while Remove key waits for
+    /// Save too; the address is not.
     #[test]
     fn a_field_drawn_read_only_takes_no_typing() {
         let typed = |state: &mut AppState| {
             (
-                state.note_reply_source_url("http://127.0.0.1:9090".into()),
-                state.note_reply_source_key("sk-proxy-1"),
+                state.note_relay_address("http://127.0.0.1:9090".into()),
+                state.note_relay_key("opencodex-test-key"),
             )
         };
         let drafts = |state: &AppState| {
             (
-                state.reply_source.url_draft.clone(),
-                state.reply_source.key_draft.is_some(),
+                state.reply_source.relay_address_draft.clone(),
+                state.reply_source.relay_key_draft.is_some(),
             )
         };
 
@@ -36942,47 +36165,41 @@ mod tests {
         assert_eq!(typed(&mut state), (false, false), "not read yet");
         assert_eq!(drafts(&state), (None, false));
 
+        read_as(&mut state, kept(InferenceKind::Gateway, None));
+        assert_eq!(typed(&mut state), (false, false), "no relay on the server");
+        assert_eq!(drafts(&state), (None, false));
+
         read_as(
             &mut state,
-            InferenceSource {
-                has_api_key: true,
-                ..kept(InferenceKind::Gateway, None)
-            },
+            relay_kept(InferenceKind::Gateway, "loopback", None),
         );
-        assert!(state.note_reply_source_url("http://127.0.0.1:8081".into()));
-        assert!(state.note_reply_source_key("sk-proxy-0"));
-        assert!(state.begin_reply_source_save().is_some());
-        assert_eq!(typed(&mut state), (false, false), "a Save is out");
-        assert_eq!(
-            drafts(&state),
-            (Some("http://127.0.0.1:8081".into()), false),
-            "the address waits on the Save as it was, and its key went with it"
-        );
-        state.reply_source.saving = None;
-
-        assert!(state.note_remove_reply_source_key());
-        assert!(state.reply_source.plan_editable() && !state.reply_source.key_editable());
+        state.relay_mac.has_key = true;
+        assert!(state.note_remove_relay_key());
         assert!(
-            state.note_reply_source_url("http://127.0.0.1:9090".into()),
+            state.reply_source.relay_editable() && !state.reply_source.relay_key_editable(),
+            "the key field is drawn read-only while Remove key waits for Save"
+        );
+        assert!(
+            state.note_relay_address("http://127.0.0.1:9090".into()),
             "Remove key leaves the address alone"
         );
-
-        let mut state = signed_in_state();
-        state.opengrok = Some(OpenGrokClient::new("https://opengrok.example.com").unwrap());
-        read_as(&mut state, kept(InferenceKind::Gateway, None));
-        assert_eq!(typed(&mut state), (false, false), "the server is elsewhere");
-        assert_eq!(drafts(&state), (None, false));
+        assert_eq!(
+            drafts(&state),
+            (Some("http://127.0.0.1:9090".into()), false)
+        );
     }
 
-    /// Settings → Reply source coming on screen is told once, which is when the setting and the
-    /// models are read; and a key typed there and not saved does not outlive the page: leaving
-    /// the tab, or Settings, drops it, and the page asks for it again when it is back. Signing
-    /// out drops it with everything else, and the gpui-agent tree never holds it.
+    /// Settings → Relay coming on screen is told once, which is when the setting and the models
+    /// are read; and a key typed there and not saved does not outlive the page: leaving the tab,
+    /// or Settings, drops it, and the page asks for it again when it is back. Signing out drops it
+    /// with everything else, and the gpui-agent tree never holds it.
     #[test]
     fn the_page_reads_when_it_arrives_and_a_key_left_on_it_is_dropped() {
-        use super::REPLY_SOURCE_RETYPE_KEY;
         let mut state = signed_in_state();
-        read_as(&mut state, kept(InferenceKind::Gateway, None));
+        read_as(
+            &mut state,
+            relay_kept(InferenceKind::Gateway, "loopback", None),
+        );
         assert!(!state.settle_reply_source_page(), "Settings is shut");
         state.is_app_settings_open = true;
         state.app_settings_tab = AppSettingsTab::ReplySource;
@@ -36991,146 +36208,42 @@ mod tests {
             !state.settle_reply_source_page(),
             "still there: no read again"
         );
-        assert!(state.note_reply_source_key("sk-proxy-1"));
-        assert!(state.reply_source.without_key().key_draft.is_none());
+        assert!(state.note_relay_key("opencodex-test-key"));
+        assert!(state.reply_source.without_key().relay_key_draft.is_none());
 
         state.app_settings_tab = AppSettingsTab::Logins;
         assert!(!state.settle_reply_source_page());
-        assert_eq!(state.reply_source.key_draft, None, "gone with the tab");
-        assert!(state.reply_source.retype_key);
         assert_eq!(
-            crate::components::reply_source::error_line(&state.reply_source).as_deref(),
-            Some(REPLY_SOURCE_RETYPE_KEY)
+            state.reply_source.relay_key_draft, None,
+            "gone with the tab"
         );
+        assert!(state.reply_source.relay_retype_key);
 
         state.app_settings_tab = AppSettingsTab::ReplySource;
         assert!(state.settle_reply_source_page(), "back: read again");
-        assert!(state.note_reply_source_key("sk-proxy-1"));
-        assert!(!state.reply_source.retype_key, "typed again");
+        assert!(state.note_relay_key("opencodex-test-key"));
+        assert!(!state.reply_source.relay_retype_key, "typed again");
         state.is_app_settings_open = false;
         assert!(!state.settle_reply_source_page());
-        assert_eq!(state.reply_source.key_draft, None, "gone with Settings");
+        assert_eq!(
+            state.reply_source.relay_key_draft, None,
+            "gone with Settings"
+        );
 
         state.is_app_settings_open = true;
         assert!(state.settle_reply_source_page());
-        assert!(state.note_reply_source_key("sk-proxy-1"));
+        assert!(state.note_relay_key("opencodex-test-key"));
         state.forget_account();
-        assert_eq!(state.reply_source.key_draft, None, "gone with the account");
-    }
-
-    /// A URL that is not loopback is refused with the server's sentence, which the page shows as
-    /// written; the setting stays what the server keeps, the picks stay to be fixed, and Save is
-    /// live again. A key typed for that Save is gone, and the page says to type it again rather
-    /// than drop it without a word. A Save nobody heard back from reads the setting again, and
-    /// the read's answer clears the line that said nobody knew; a refusal's line stays until the
-    /// next Save.
-    #[test]
-    fn a_refused_save_shows_the_servers_words_and_keeps_the_picks() {
-        use super::REPLY_SOURCE_RETYPE_KEY;
-        use crate::components::reply_source::error_line;
-        let said = "baseUrl must be a literal loopback address such as http://127.0.0.1:8080";
-        let mut state = signed_in_state();
-        read_as(&mut state, kept(InferenceKind::Gateway, None));
-        state.reply_source.url_draft = Some("http://my-mac.example.com:8080".into());
-        assert!(state.note_reply_source_key("sk-proxy-1"));
-        let save = state.begin_reply_source_save().unwrap();
         assert_eq!(
-            state.settle_reply_source_save(save.sent, Err(OpenGrokError::from_opengrok(400, said))),
-            Some(AfterReplySourceSave::Done)
+            state.reply_source.relay_key_draft, None,
+            "gone with the account"
         );
-        assert_eq!(
-            state.reply_source.note,
-            Some(ReplySourceNote::Refused(said.to_string()))
-        );
-        assert_eq!(state.reply_source.note.as_ref().unwrap().line(), said);
-        assert_eq!(state.reply_source.key_draft, None, "the key went with it");
-        assert_eq!(
-            error_line(&state.reply_source),
-            Some(format!("{said} {REPLY_SOURCE_RETYPE_KEY}"))
-        );
-        assert_eq!(
-            state
-                .reply_source
-                .kept_source()
-                .unwrap()
-                .base_url
-                .as_deref(),
-            Some("http://127.0.0.1:8080"),
-            "nothing was kept, and nothing claims it was"
-        );
-        assert_eq!(
-            state.reply_source.shown_url(),
-            "http://my-mac.example.com:8080",
-            "the URL stays where the person can fix it"
-        );
-        assert!(state.reply_source_can_save());
-        // A read that lands meanwhile (the window came back to the front) leaves the refusal.
-        read_as(&mut state, kept(InferenceKind::Gateway, None));
-        assert_eq!(
-            state.reply_source.note,
-            Some(ReplySourceNote::Refused(said.to_string()))
-        );
-
-        // No answer at all: nobody knows, and the setting is read again to find out. The key
-        // typed again went with it, and is asked for again too.
-        state.reply_source.url_draft = Some("http://127.0.0.1:9090".into());
-        assert!(state.note_reply_source_key("sk-proxy-1"));
-        assert!(!state.reply_source.retype_key);
-        let save = state.begin_reply_source_save().unwrap();
-        assert_eq!(state.reply_source.note, None, "a new Save, a new line");
-        assert_eq!(
-            state.settle_reply_source_save(
-                save.sent,
-                Err(OpenGrokError::message("error sending request"))
-            ),
-            Some(AfterReplySourceSave::ReadAgain)
-        );
-        assert_eq!(
-            state.reply_source.note.as_ref().map(ReplySourceNote::line),
-            Some(REPLY_SOURCE_SAVE_UNKNOWN)
-        );
-        assert!(state.reply_source.retype_key);
-        read_as(&mut state, kept(InferenceKind::Gateway, None));
-        assert_eq!(state.reply_source.note, None);
-        assert_eq!(
-            error_line(&state.reply_source).as_deref(),
-            Some(REPLY_SOURCE_RETYPE_KEY),
-            "the key is still asked for after the read"
-        );
-        // A Save the server keeps is the end of it.
-        let save = state.begin_reply_source_save().unwrap();
-        state.settle_reply_source_save(save.sent, Ok(kept(InferenceKind::Gateway, None)));
-        assert_eq!(error_line(&state.reply_source), None);
-    }
-
-    /// The health line: no address kept is said as such, not as opencodex being down; with one,
-    /// `/models`' word on the proxy is preferred when it gave one, being what filled the picker,
-    /// and the setting's own `healthy` otherwise.
-    #[test]
-    fn the_health_line_prefers_the_model_lists_word_on_the_proxy() {
-        use super::ProxyHealth;
-        let mut state = signed_in_state();
-        assert_eq!(state.proxy_health(), None, "nothing read");
-        read_as(&mut state, kept(InferenceKind::LocalProxy, Some("m")));
-        assert_eq!(state.proxy_health(), Some(ProxyHealth::Running));
-        state.model_catalogue.local_proxy = Some(crate::opengrok::LocalProxyStatus {
-            healthy: false,
-            relay_connected: false,
-        });
-        assert_eq!(state.proxy_health(), Some(ProxyHealth::NotRunning));
-        read_as(
-            &mut state,
-            InferenceSource {
-                base_url: None,
-                ..kept(InferenceKind::Gateway, None)
-            },
-        );
-        assert_eq!(state.proxy_health(), Some(ProxyHealth::NoAddress));
     }
 
     /// Only the newest read of the setting lands: an older one answered late, or one that lands
-    /// after the person signed out, is dropped, as is a Save's answer after a sign out. A read
-    /// that fails with the setting already on the page leaves it there and says so.
+    /// after the person signed out, is dropped. A read that fails with the setting already on the
+    /// page leaves it there and says so, and the next read that lands clears what it said; what
+    /// the Keychain said is about this computer, and stays.
     #[test]
     fn a_late_answer_about_the_reply_source_lands_on_nothing() {
         let mut state = signed_in_state();
@@ -37162,14 +36275,19 @@ mod tests {
             state.reply_source.note,
             Some(ReplySourceNote::ReadFailed(_))
         ));
+        read_as(&mut state, kept(InferenceKind::LocalProxy, Some("m")));
+        assert_eq!(state.reply_source.note, None, "the read answers it");
 
-        state.reply_source.url_draft = Some("http://127.0.0.1:9090".into());
-        let save = state.begin_reply_source_save().unwrap();
+        state.settle_key_kept(Err("user interaction is not allowed".into()));
+        read_as(&mut state, kept(InferenceKind::LocalProxy, Some("m")));
+        assert!(matches!(
+            state.reply_source.note,
+            Some(ReplySourceNote::KeyNotKept(_))
+        ));
+
+        let (_, late) = state.begin_reply_source_read().unwrap();
         state.forget_account();
-        assert_eq!(
-            state.settle_reply_source_save(save.sent, Ok(kept(InferenceKind::Gateway, None))),
-            None
-        );
+        assert!(!state.settle_reply_source_read(late, Ok(kept(InferenceKind::Gateway, None))));
         assert_eq!(state.reply_source.kept, None);
     }
 

@@ -63,11 +63,11 @@ const MODELS_BYTES: usize = 1024 * 1024;
 /// can be large, but not without end.
 const LINE_BYTES: usize = 64 * 1024 * 1024;
 
-/// What the Mac says when the server turns its token away, whether opening the stream or
-/// answering a call. It stops until this Mac enrols again: asking again with the same token
+/// What the relay says when the server turns its token away, whether opening the stream or
+/// answering a call. It stops until this computer enrols again: asking again with the same token
 /// would be refused again.
 pub const TOKEN_REFUSED: &str =
-    "The server turned this Mac's token away. Turn Answer with this Mac off and on to try again.";
+    "The server turned this computer's token away. Turn the relay off and on to try again.";
 
 /// What it says while the server does not answer the stream, or goes quiet on it.
 pub const SERVER_QUIET: &str = "The server went quiet. Trying again…";
@@ -76,7 +76,7 @@ pub const SERVER_QUIET: &str = "The server went quiet. Trying again…";
 pub const SERVER_UNREACHED: &str = "Can't reach the server. Trying again…";
 
 /// What it says to a server from before the relay, which answers the stream with a bare 404.
-pub const SERVER_WITHOUT_RELAY: &str = "This server can't take replies from a Mac yet.";
+pub const SERVER_WITHOUT_RELAY: &str = "This server can't take replies from a computer yet.";
 
 /// A key for this Mac's opencodex, as the person typed it. It is kept in the Keychain, and in
 /// memory while the relay runs, and never logged, shown, or written anywhere else: it is never
@@ -122,7 +122,7 @@ impl OpencodexAddress {
             return Err(NOT_AN_ADDRESS);
         }
         if !is_loopback(&url) {
-            return Err("opencodex has to be on this Mac: use 127.0.0.1, [::1] or localhost.");
+            return Err("opencodex has to be on this computer: use 127.0.0.1, [::1] or localhost.");
         }
         if !url.username().is_empty() || url.password().is_some() {
             return Err("Give the address without a name or password in it.");
@@ -692,7 +692,7 @@ impl Relay {
         {
             if !is_subscription_model(asked) {
                 return RelayAnswer::Error(bounded(&format!(
-                    "{asked} isn't a model this Mac answers with your subscription: only \
+                    "{asked} isn't a model this computer answers with your subscription: only \
                      OpenAI's (gpt-*, o1, o3, o4, codex) and xAI's (grok-*) may use it."
                 )));
             }
@@ -740,7 +740,7 @@ impl Relay {
         match listed {
             Some(models) => RelayAnswer::Models(models),
             None => RelayAnswer::Error(format!(
-                "opencodex at {} listed its models in a shape this Mac can't read.",
+                "opencodex at {} listed its models in a shape this computer can't read.",
                 target.address.host_port()
             )),
         }
@@ -1297,7 +1297,7 @@ mod tests {
             let said: Value = serde_json::from_slice(&posted.body).unwrap();
             let sentence = said["error"].as_str().expect("a sentence under error");
             assert!(
-                sentence.contains("isn't a model this Mac answers"),
+                sentence.contains("isn't a model this computer answers"),
                 "{sentence}"
             );
             assert_eq!(

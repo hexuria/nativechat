@@ -312,42 +312,33 @@
 //! the card's sentence that a lent connection reaches a plugin only once the bot is allowed it in
 //! its Tools (opengrok-server#268).
 //!
-//! Reply source, where a Bot's replies are paid from: the server's paid keys or the person's own
-//! subscription through opencodex, running on the same machine as the server. The page sets up
-//! the subscription's connection and switches no door: a Bot's door is picked with its model on
-//! `agent-model-card`, and the account's kind stays as the server keeps it for the Bots that have
-//! picked none. No radio is drawn, and none of the radio's ids, nor the plan model picker's from
-//! before (`settings-reply-source-kind*`, `settings-reply-source-via-mac`,
-//! `settings-reply-source-model*`, `settings-reply-source-no-model`), is on the tree or answers.
-//! `settings-tab-reply-source` (refused while Settings is shut); while Settings is open on it,
-//! `settings-reply-source` (value = the door the server keeps, `gateway` / `local_proxy`; states
-//! `unsaved` while a change waits for Save, `saving` and `reading` while one is with the server,
-//! and `via-mac` while the account's way to the plan is the person's Mac). Until the setting has
-//! been read, on a server without reply sources, or when it could not be read, the section holds
-//! only `settings-reply-source-unavailable`, the line the page draws in place of the form
-//! (`Asking the server…` while the section has state `asking`), and Default for new Bots. Once
-//! read it holds `settings-reply-source-elsewhere` where the app's server is not on this Mac (the
-//! page's line saying the plan is set up only from the server's own Mac);
-//! `settings-reply-source-url` (value = the proxy URL shown; `set_value` and `type` write it as
-//! typing would, and an empty one clears the address with the next Save; `key` is refused);
-//! `settings-reply-source-key` (never valued: states `set` while the server holds a key, `typed`
-//! while one waits for Save, which the window draws as masked dots whoever typed it; `set_value`
-//! writes the whole key, `type` and `key` are refused; disabled, as the window draws it, while
-//! Remove key is picked); `settings-reply-source-remove-key` (while the server holds a key: label
-//! `Remove key`, or `Keep key` with state `picked` while its removal waits for Save);
-//! `settings-reply-source-health` (label the line, value `running` / `not-running` /
-//! `no-address`); `settings-reply-source-providers` (why the Subscription group offers no Claude
-//! or Gemini model); `settings-reply-source-error` (the server's words for a refused Save, why
-//! nobody knows what became of one, or a read that failed, and after a Save or a page left with a
-//! key typed, the line asking for it again; state `trouble` while drawn in the danger colour, a
-//! refusal or a failed read); `settings-reply-source-hint` (what Save waits for: an address while
-//! the account's replies are on the plan, or a model for the Mac while its way is the Mac); and
-//! `settings-reply-source-save` (enabled only while a click would send something). A Save sends
-//! the kind the server keeps, as it is, with what changed, and never a plan model or a way. Every
-//! control is refused off the page, before the setting is read, and while a Save is out; Save is
-//! refused while a read is out too, and says what it waits for; and the plan's controls are
-//! refused where the server is not on this Mac. An id the page does not draw is refused as not on
-//! the page.
+//! Relay, Settings' page for the person's ChatGPT or Grok plan relayed to the server from this
+//! computer, which was Reply source and keeps its ids. The page switches no door: a Bot's door is
+//! picked with its model on `agent-model-card`, and the account's kind stays as the server keeps
+//! it for the Bots that have picked none. Nothing of the plan on the server's own machine is on
+//! it, nor a model of the relay's own, nor a radio: none of `settings-reply-source-url`,
+//! `settings-reply-source-key`, `settings-reply-source-remove-key`,
+//! `settings-reply-source-health`, `settings-reply-source-elsewhere`,
+//! `settings-reply-source-providers`, `settings-relay-model*`, `settings-relay-no-model`,
+//! `settings-relay-models-note`, `settings-reply-source-kind*`, `settings-reply-source-via-mac`,
+//! `settings-reply-source-model*` or `settings-reply-source-no-model` is on the tree or answers.
+//! `settings-tab-reply-source` (named `Relay`; refused while Settings is shut); while Settings is
+//! open on it, `settings-reply-source` (named `Relay`, value = the door the server keeps,
+//! `gateway` / `local_proxy`; states `unsaved` while a change to this computer's half waits for
+//! Save, `reading` while the setting is with the server, and `via-mac` while the account's way to
+//! the plan is the person's computer). Until the setting has been read, on a server without reply
+//! sources, or when it could not be read, the section holds only
+//! `settings-reply-source-unavailable`, the line the page draws in place of the page (`Asking the
+//! server…` while the section has state `asking`), and Default for new Bots. From a server without
+//! the relay it holds `settings-relay-unavailable` (that this server can't take replies from a
+//! computer yet) in the card's place, the line under Save, and Default for new Bots. Once read
+//! from a server with the relay it holds the relay's card, `settings-reply-source-error` (a read
+//! that failed, state `trouble`, or what the Keychain said when it did not keep a key),
+//! `settings-reply-source-hint` (what Save waits for: an opencodex address on this computer) and
+//! `settings-reply-source-save` (enabled only while a click would keep something). Save keeps
+//! opencodex's address and key on this computer and sends the server nothing. Every control is
+//! refused off the page and before the setting is read, and Save while a read is out, saying what
+//! it waits for. An id the page does not draw is refused as not on the page.
 //!
 //! Last on the page, whatever the setting, `settings-new-bots`: Default for new Bots, where a
 //! newly hired Bot starts (state `unavailable` while the server keeps no default for new Bots,
@@ -357,25 +348,24 @@
 //! it reads, `No model · Default`, disabled; a click is refused with why). Both are refused off
 //! the page.
 //!
-//! The Mac relay (hexuria/nativechat #156, opengrok-server #292), from a server that knows it
-//! (its setting carries `relay`); a server before it draws none of this. The page no longer moves
-//! the account to the Mac or back: the section has state `via-mac` while the server keeps the Mac
-//! as the account's way. `settings-relay`, Answer with this Mac: `settings-relay-switch`
-//! (a switch, checked while on; it acts at once and waits on no Save, off always, on once this
-//! Mac is enrolled; after another Mac took the relay, turning it off and on takes it back),
-//! `settings-relay-unavailable` (why the card takes no change: this Mac not enrolled),
-//! `settings-relay-status` (label the line, value `answering` / `another-mac` / `connecting` /
-//! `not-connected`), `settings-relay-detail` (under it: why this Mac is not connected, state
-//! `trouble`, or how to take the relay back), `settings-relay-addr` (value = opencodex's address
-//! on this Mac; `set_value` and `type` write it; an address not on this Mac is refused by Save
-//! with a hint, an emptied one goes back to the default), `settings-relay-model` (a menu, value
-//! = the relay's model shown, state `empty` while no Mac lists one) with
-//! `settings-relay-no-model` and a `settings-relay-model-{id}` per model a Mac lists,
-//! `settings-relay-models-note`, `settings-relay-key` (never valued: states `set` while this
-//! Mac's Keychain holds a key, `typed` while one waits for Save, `retype` when one typed was
-//! dropped with the page; `set_value` writes the whole key) and `settings-relay-key-remove`
-//! (while a key is kept: `Remove key`, or `Keep key` with state `picked`). The address and key are
-//! kept on this Mac by Save, the key in the Keychain, and never sent to the server.
+//! The relay (hexuria/nativechat #156, opengrok-server #292), from a server that knows it (its
+//! setting carries `relay`), in words for any computer: the wire's `via: "mac"` and the drivers'
+//! words below are as they were. `settings-relay`, Relay your plan from this computer:
+//! `settings-relay-switch` (a switch, checked while on; it acts at once and waits on no Save, off
+//! always, on once this computer is enrolled; after another computer took the relay, turning it
+//! off and on takes it back), `settings-relay-unavailable` (why the card takes no change: this
+//! computer not enrolled), `settings-relay-status` (label the line, `This computer is relaying` /
+//! `Another computer (<label>) is relaying` / `Connecting…` / `Not connected`; value `answering` /
+//! `another-mac` / `connecting` / `not-connected`), `settings-relay-detail` (under it: why this
+//! computer is not connected, state `trouble`, or how to take the relay back),
+//! `settings-relay-addr` (named `opencodex address`, value = opencodex's address on this
+//! computer; `set_value` and `type` write it; an address not on this computer is refused by Save
+//! with a hint, an emptied one goes back to the default), `settings-relay-key` (named `opencodex
+//! key (kept in this computer's secure storage)`, never valued: states `set` while the Keychain
+//! holds a key, `typed` while one waits for Save, `retype` when one typed was dropped with the
+//! page; `set_value` writes the whole key) and `settings-relay-key-remove` (while a key is kept:
+//! `Remove key`, or `Keep key` with state `picked`). The address and key are kept on this
+//! computer by Save, the key in the Keychain, and never sent to the server.
 //!
 //! `reply-source-{messageId}` is the badge of each reply in the open thread that wears one, as the
 //! feed draws it (label `paid key` / `your plan` / `your plan · Mac`, with ` ⚡` after it where the
