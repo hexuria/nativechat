@@ -17,9 +17,9 @@
 use crate::chrome::INFO_PANE_WIDTH;
 use crate::components::fields::field_input;
 use crate::opengrok::{
-    AccountPlan, EFFORT_NOT_KEPT, EFFORT_STOPS, InferenceKind, LIST_ROWS, ListLine, ModelChoice,
-    ModelPick, NO_MODEL, SUBSCRIPTION_GROUP, base_label, effort_label, effort_stop, group_title,
-    last_window_start, list_window, row_count, slider_stop, stop_word,
+    AccountPlan, DEFAULT_EFFORT_LABEL, EFFORT_NOT_KEPT, EFFORT_STOPS, InferenceKind, LIST_ROWS,
+    ListLine, ModelChoice, ModelPick, NO_MODEL, SUBSCRIPTION_GROUP, base_label, effort_label,
+    effort_stop, group_title, last_window_start, list_window, row_count, slider_stop, stop_word,
 };
 use crate::state::AppState;
 use gpui_kit::component::input::{InputEvent, InputState};
@@ -85,9 +85,11 @@ pub(crate) const NO_MODELS: &str = "The server lists no models to pick from yet.
 /// In the list while the search leaves nothing of a list that has some.
 pub(crate) const NO_MODEL_MATCHES: &str = "No model matches";
 /// Under the plan's line on a server without per-Bot doors: whose model it is, and when a Gateway
-/// model picked here answers instead.
-pub(crate) const ACCOUNT_PLAN_LINE: &str = "Every Bot's on this server, set in Settings → Reply \
-     source. A Gateway model answers once replies there are on the server's paid keys.";
+/// model picked here answers instead. Neither is changed in this app any more: the page that
+/// switched the account's door and its plan model is the subscription's connection alone.
+pub(crate) const ACCOUNT_PLAN_LINE: &str = "Your plan's model answers for every Bot on this \
+     server while your account's replies are on your plan. A Gateway model picked here answers \
+     once the server keeps them on its paid keys.";
 const RESET_TIP: &str = "Default effort, and ⚡ off";
 const FAST_ON_TIP: &str = "Fast is on. Click to turn it off.";
 const FAST_OFF_TIP: &str = "Use this model's fast version";
@@ -308,19 +310,63 @@ impl RenderOnce for CardAnchor {
     }
 }
 
-/// The Model card in the Bot's settings: the model's name, and under it the door, the effort and
-/// ⚡. A click opens the popover or shuts it.
-fn card(pick: &ModelPick, open: bool, app: Entity<AppState>, theme: &Theme) -> impl IntoElement {
-    let muted = theme.muted_foreground;
-    let secondary = theme.secondary;
+/// The frame a card is drawn in: the Bot's, and the dead one in Default for new Bots.
+fn card_frame(id: &'static str, theme: &Theme) -> Stateful<Div> {
     div()
-        .id(CARD)
+        .id(id)
         .w_full()
         .px(px(14.))
         .py(px(12.))
         .rounded(px(10.))
         .border_1()
         .border_color(theme.border)
+}
+
+/// What a card says: the model's name over a second line, and the chevron that says it opens.
+fn card_face(model: String, detail: String, muted: Hsla) -> impl IntoElement {
+    h_flex()
+        .items_center()
+        .justify_between()
+        .gap(px(10.))
+        .child(
+            v_flex()
+                .flex_1()
+                .min_w(px(0.))
+                .gap(px(2.))
+                .child(div().text_sm().truncate().child(model))
+                .child(div().text_xs().text_color(muted).child(detail)),
+        )
+        .child(
+            Icon::new(IconName::ChevronDown)
+                .size(px(14.))
+                .text_color(muted),
+        )
+}
+
+/// What the dead card says ([`dead_card`]): no model, and the effort a Bot with none of its own
+/// reads as. A default the server does not keep has neither.
+pub(crate) fn dead_card_words() -> (&'static str, &'static str) {
+    (NO_MODEL, DEFAULT_EFFORT_LABEL)
+}
+
+/// The picker's card, dimmed and opening nothing: Settings → Reply source's Default for new Bots
+/// while the server keeps no default for new Bots (`state::DefaultForNewBots`). It is the Bot's
+/// card to look at, so the section shows what it will hold, and it takes no click, since a pick
+/// in it would change nothing on the server.
+pub(crate) fn dead_card(id: &'static str, theme: &Theme) -> impl IntoElement {
+    let (model, detail) = dead_card_words();
+    card_frame(id, theme).opacity(0.5).child(card_face(
+        model.to_string(),
+        detail.to_string(),
+        theme.muted_foreground,
+    ))
+}
+
+/// The Model card in the Bot's settings: the model's name, and under it the door, the effort and
+/// ⚡. A click opens the popover or shuts it.
+fn card(pick: &ModelPick, open: bool, app: Entity<AppState>, theme: &Theme) -> impl IntoElement {
+    let secondary = theme.secondary;
+    card_frame(CARD, theme)
         .cursor_pointer()
         .when(open, |this| this.bg(secondary))
         .hover(move |style| style.bg(secondary))
@@ -331,25 +377,11 @@ fn card(pick: &ModelPick, open: bool, app: Entity<AppState>, theme: &Theme) -> i
             cx.stop_propagation();
             app.update(cx, |state, cx| state.set_model_picker_open(!open, cx));
         })
-        .child(
-            h_flex()
-                .items_center()
-                .justify_between()
-                .gap(px(10.))
-                .child(
-                    v_flex()
-                        .flex_1()
-                        .min_w(px(0.))
-                        .gap(px(2.))
-                        .child(div().text_sm().truncate().child(pick.model_label()))
-                        .child(div().text_xs().text_color(muted).child(card_detail(pick))),
-                )
-                .child(
-                    Icon::new(IconName::ChevronDown)
-                        .size(px(14.))
-                        .text_color(muted),
-                ),
-        )
+        .child(card_face(
+            pick.model_label(),
+            card_detail(pick),
+            theme.muted_foreground,
+        ))
 }
 
 /// What the popover draws.

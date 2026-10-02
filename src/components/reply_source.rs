@@ -1,8 +1,9 @@
 //! Where a Bot's replies are paid from: the server's paid keys, or the person's own subscription
 //! through opencodex, running on the same machine as the server. Two surfaces: Settings → Reply
-//! source, where the account's setting is changed, which every Bot that has picked no door of its
-//! own follows; and the badge on each reply, which says which door it came through. A Bot's own
-//! door is picked with its model, in the model picker (`components::model_picker`).
+//! source, where the subscription's connection is set up; and the badge on each reply, which says
+//! which door it came through. A Bot's door is picked with its model, on its card in its settings
+//! (`components::model_picker`), and nowhere else: the page no longer switches the account's
+//! door, which the server keeps as it is for the Bots that have picked none of their own.
 //!
 //! Nothing here calls a model or keeps a key. The server keeps the setting, and when a turn goes
 //! through the person's plan it is the server that talks to opencodex. The words and element ids
@@ -10,16 +11,21 @@
 //! the window names.
 //!
 //! The Mac relay adds a way to the plan (opengrok-server #292): through the person's Mac, whose
-//! background helper calls its own opencodex for the server (`opengrok::relay`). The radio gains
-//! its row, and the page a card, Answer with this Mac: the switch that makes this Mac the relay,
-//! opencodex's address and key on this Mac, the model a turn through a Mac runs on, and where the
-//! relay stands. The window still calls no model; the key goes to this Mac's Keychain.
+//! background helper calls its own opencodex for the server (`opengrok::relay`). The page has a
+//! card for it, Answer with this Mac: the switch that makes this Mac the relay, opencodex's
+//! address and key on this Mac, the model a turn through a Mac runs on, and where the relay
+//! stands. The window still calls no model; the key goes to this Mac's Keychain.
+//!
+//! The page ends with Default for new Bots, where a newly hired Bot will start: the picker's card,
+//! its model, effort and ⚡. The server keeps no such default yet (`state::DefaultForNewBots`), so
+//! the section says it is coming and its card takes no click.
 
 use crate::components::fields::field_input;
+use crate::components::model_picker;
 use crate::opengrok::{DEFAULT_PROXY_URL, InferenceKind, RelayStatus, ReplySource, Via};
 use crate::state::{
-    AppState, ProxyHealth, REPLY_SOURCE_NOT_ON_SERVER, REPLY_SOURCE_RETYPE_KEY, RelayLine,
-    RelayMac, ReplySourceNote, ReplySourceRead, ReplySourceSettings,
+    AppState, DefaultForNewBots, ProxyHealth, REPLY_SOURCE_NOT_ON_SERVER, REPLY_SOURCE_RETYPE_KEY,
+    RelayLine, RelayMac, ReplySourceNote, ReplySourceRead, ReplySourceSettings,
 };
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{InputEvent, InputState};
@@ -36,21 +42,13 @@ use gpui_kit::*;
 pub(crate) const SETTINGS_TAB: &str = "settings-tab-reply-source";
 /// The section: the whole form, once the setting has been read.
 pub(crate) const SECTION: &str = "settings-reply-source";
-/// The radio: Server (paid keys) or My subscription.
-pub(crate) const KIND: &str = "settings-reply-source-kind";
 pub(crate) const URL: &str = "settings-reply-source-url";
-/// The model picker, with one choice per model of the person's plan.
-pub(crate) const MODEL: &str = "settings-reply-source-model";
-/// The picker's first choice while a model is shown: none, which takes the kept one away.
-pub(crate) const NO_MODEL: &str = "settings-reply-source-no-model";
-/// Under the picker: why it offers what it offers, or nothing.
-pub(crate) const MODELS_NOTE: &str = "settings-reply-source-models-note";
 pub(crate) const KEY: &str = "settings-reply-source-key";
 /// Beside the key field while the server holds a key: Remove key, and Keep key to take it back.
 pub(crate) const REMOVE_KEY: &str = "settings-reply-source-remove-key";
 /// Whether opencodex answered the server.
 pub(crate) const HEALTH: &str = "settings-reply-source-health";
-/// Why Claude and Gemini are not offered.
+/// Why the Subscription group offers no Claude or Gemini model.
 pub(crate) const PROVIDERS: &str = "settings-reply-source-providers";
 /// Where the app's server is not on this Mac: why the plan's half of the page takes no change.
 pub(crate) const ELSEWHERE: &str = "settings-reply-source-elsewhere";
@@ -65,9 +63,6 @@ pub(crate) const ERROR: &str = "settings-reply-source-error";
 pub(crate) const UNAVAILABLE: &str = "settings-reply-source-unavailable";
 /// In a Bot's Usage card, while replies go through the person's own plan.
 pub(crate) const BOT_USAGE_PLAN: &str = "agent-usage-plan";
-/// The radio's third row, from a server that knows the relay: the person's plan through their
-/// Mac.
-pub(crate) const VIA_MAC: &str = "settings-reply-source-via-mac";
 /// Answer with this Mac: the card, and each of its controls and lines.
 pub(crate) const RELAY: &str = "settings-relay";
 pub(crate) const RELAY_SWITCH: &str = "settings-relay-switch";
@@ -87,16 +82,11 @@ pub(crate) const RELAY_NO_MODEL: &str = "settings-relay-no-model";
 pub(crate) const RELAY_MODELS_NOTE: &str = "settings-relay-models-note";
 /// Why the card takes no change: a server without the relay, or a Mac not enrolled.
 pub(crate) const RELAY_UNAVAILABLE: &str = "settings-relay-unavailable";
-
-/// One of the radio's two choices.
-pub(crate) fn kind_id(kind: InferenceKind) -> String {
-    format!("{KIND}-{}", kind.word())
-}
-
-/// One model in the picker, by the id the server lists it under.
-pub(crate) fn model_id(model: &str) -> String {
-    format!("{MODEL}-{model}")
-}
+/// Default for new Bots: the section, the line saying why it takes no change, and the picker's
+/// card in it.
+pub(crate) const NEW_BOTS: &str = "settings-new-bots";
+pub(crate) const NEW_BOTS_UNAVAILABLE: &str = "settings-new-bots-unavailable";
+pub(crate) const NEW_BOTS_CARD: &str = "settings-new-bots-card";
 
 /// One model in the relay's picker, by the id the server lists it under.
 pub(crate) fn relay_model_id(model: &str) -> String {
@@ -116,16 +106,16 @@ pub(crate) fn badge_model_id(message_id: &str) -> String {
 }
 
 pub(crate) const ASKING: &str = "Asking the server…";
-pub(crate) const INTRO: &str = "Where your Bots' replies are paid from. Either way the server \
-     runs the turn, its tools and its record; this app never calls a model or keeps a key.";
+/// The page's opening line: how the server reaches the person's own subscription.
+pub(crate) const INTRO: &str = "How the server reaches your own subscription, through opencodex. \
+     The server runs every turn, its tools and its record; this app never calls a model or keeps \
+     a key.";
 /// The same, from a server that keeps a door per Bot (opengrok-server main d6f640e (#307, after
-/// #304), pin bf99845): a Bot picks its own door and model in the model picker, and this page is
-/// what the ones that have not picked follow.
-pub(crate) const INTRO_PER_BOT: &str = "Where replies are paid from for a Bot that hasn't \
-     picked its own model in its settings. Either way the server runs the turn, its tools and its \
-     record; this app never calls a model or keeps a key.";
-/// Over the radio, from a server that keeps a door per Bot.
-pub(crate) const DEFAULT_HEADING: &str = "Default for Bots that haven't picked";
+/// #304), pin bf99845), where each Bot picks its own model, and with it its door, on its card.
+pub(crate) const INTRO_PER_BOT: &str = "How the server reaches your own subscription, through \
+     opencodex. Each Bot picks its model in its settings, from your subscription or the server's \
+     paid keys. The server runs every turn, its tools and its record; this app never calls a \
+     model or keeps a key.";
 pub(crate) const RUNNING: &str = "opencodex is running";
 /// The health line while opencodex is not answering, up to the command that starts it, which the
 /// page sets as code.
@@ -137,7 +127,7 @@ pub(crate) const NOT_RUNNING_THERE: &str = "Not running on the server's machine"
 /// The health line while the server keeps no proxy address: nothing to ask, which is not the
 /// same as opencodex being down.
 pub(crate) const NO_ADDRESS: &str = "No address saved";
-/// Why the picker offers only OpenAI's and xAI's models.
+/// Why the Subscription group offers only OpenAI's and xAI's models.
 pub(crate) const PROVIDERS_NOTE: &str = "Only Codex/OpenAI and Grok/xAI models are offered: \
      Claude's and Gemini's terms forbid routing a consumer subscription through a third-party \
      app.";
@@ -149,10 +139,6 @@ pub(crate) const ELSEWHERE_LINE: &str =
 /// up there, and this Mac can answer for the plan instead.
 pub(crate) const ELSEWHERE_RELAY_LINE: &str = "The plan on the server's own machine is set up \
      from that machine. From this Mac, your plan can answer through Answer with this Mac below.";
-/// The Mac row's words.
-pub(crate) const MAC_LABEL: &str = "My subscription, through my Mac";
-const MAC_DETAIL: &str = "Your ChatGPT or Grok plan, through opencodex on the Mac that answers \
-     for you: the server sends each model call there and the answer back.";
 pub(crate) const RELAY_TITLE: &str = "Answer with this Mac";
 pub(crate) const RELAY_INTRO: &str = "While this is on and the app is open, the server sends \
      replies meant for your Mac here, and this Mac asks its own opencodex. Its key stays in this \
@@ -175,13 +161,6 @@ pub(crate) const RELAY_MODELS_MAY_BE_OLD: &str =
 pub(crate) const RELAY_TAKE_BACK: &str = "Turn this off and on to answer from this Mac instead.";
 pub(crate) const PICK_MODEL: &str = "Pick a model";
 pub(crate) const NO_MODEL_LABEL: &str = "No model";
-pub(crate) const NO_MODELS: &str = "The server lists no models from your plan yet.";
-pub(crate) const NO_MODELS_WITHOUT_ADDRESS: &str =
-    "The server lists your plan's models once it has the proxy's address.";
-pub(crate) const NO_MODELS_NOT_RUNNING: &str =
-    "opencodex isn't answering, so the server can't list your plan's models.";
-pub(crate) const MODELS_MAY_BE_OLD: &str =
-    "opencodex isn't answering; these are the models it listed last.";
 pub(crate) const KEY_PLACEHOLDER: &str = "Proxy key, if opencodex asks for one";
 pub(crate) const KEY_SET: &str = "The server holds a key. Type one to replace it.";
 pub(crate) const KEY_GOES: &str = "The server's key goes when you save.";
@@ -190,37 +169,26 @@ pub(crate) const KEEP_KEY_LABEL: &str = "Keep key";
 /// In a Bot's Usage card while its replies go through the person's own plan: a turn there is not
 /// metered and carries no gateway key, so the server's usage report never counts it.
 pub(crate) const PLAN_USAGE_NOTE: &str = "Replies on your own subscription aren't counted here.";
+pub(crate) const NEW_BOTS_TITLE: &str = "Default for new Bots";
+/// Why Default for new Bots takes no change: the server keeps no such default yet
+/// (`state::DefaultForNewBots`).
+pub(crate) const NEW_BOTS_COMING_SOON: &str =
+    "Coming soon: the server can't keep a default for new Bots yet.";
 
-/// The page's opening line: whose door this is.
+/// The page's opening line, which says a Bot picks its own model, and with it its door, only to a
+/// server that keeps a door per Bot.
 pub(crate) fn intro(per_bot: bool) -> &'static str {
     if per_bot { INTRO_PER_BOT } else { INTRO }
 }
 
-/// The plan's model picker's label. From a server that keeps a door per Bot it is the model a
-/// Bot on the plan runs on when it has picked none of its own; from one before that it is every
-/// Bot's on the plan, as it always was.
-pub(crate) fn model_label(per_bot: bool) -> &'static str {
-    if per_bot {
-        "Plan model when a Bot hasn't chosen one"
-    } else {
-        "Model"
-    }
-}
-
-/// The relay's model picker's label, the same way.
+/// The relay's model picker's label. From a server that keeps a door per Bot it is the model a
+/// Bot on the plan through a Mac runs on when it has picked none of its own; from one before that
+/// it is every Bot's there, as it always was.
 pub(crate) fn relay_model_label(per_bot: bool) -> &'static str {
     if per_bot {
         "Plan model through a Mac when a Bot hasn't chosen one"
     } else {
         "Model"
-    }
-}
-
-/// A choice of the radio, as it reads.
-pub(crate) fn kind_label(kind: InferenceKind) -> &'static str {
-    match kind {
-        InferenceKind::Gateway => "Server (paid keys)",
-        InferenceKind::LocalProxy => "My subscription",
     }
 }
 
@@ -292,16 +260,6 @@ pub(crate) fn relay_models_note(has_models: bool, relay_connected: bool) -> Opti
     }
 }
 
-fn kind_detail(kind: InferenceKind) -> &'static str {
-    match kind {
-        InferenceKind::Gateway => "The server's own keys, through its gateway.",
-        InferenceKind::LocalProxy => {
-            "Your ChatGPT or Grok plan, through opencodex running on the same machine as the \
-             server, which talks to it."
-        }
-    }
-}
-
 /// What a reply's badge reads: whose keys paid for it, that the person's Mac answered it where it
 /// did ([`badge_label`]), and ⚡ where the model that answered is a fast twin, which is all fast
 /// ever is on the wire.
@@ -346,18 +304,6 @@ pub(crate) fn health_word(health: ProxyHealth) -> &'static str {
         ProxyHealth::NoAddress => "no-address",
         ProxyHealth::Running => "running",
         ProxyHealth::NotRunning => "not-running",
-    }
-}
-
-/// The line under the picker, from whether the server lists any of the plan's models and what it
-/// said of opencodex: why there are none, or that the ones there may be old.
-pub(crate) fn models_note(health: ProxyHealth, has_models: bool) -> Option<&'static str> {
-    match (health, has_models) {
-        (ProxyHealth::NoAddress, false) => Some(NO_MODELS_WITHOUT_ADDRESS),
-        (ProxyHealth::NotRunning, false) => Some(NO_MODELS_NOT_RUNNING),
-        (ProxyHealth::NotRunning, true) => Some(MODELS_MAY_BE_OLD),
-        (ProxyHealth::Running, false) => Some(NO_MODELS),
-        (_, true) => None,
     }
 }
 
@@ -435,10 +381,10 @@ impl ReplySourcePage {
         })
         .detach();
         // What is typed is the form: the state keeps the copy Save sends and a driver writes. A
-        // field takes typing only while the page draws it editable, as the radio and the picker
-        // take a click only then. Keys that reach one the page has just made read-only, before
-        // it is drawn so, change no draft, and the field is put back to what the page holds
-        // rather than left showing what nothing took.
+        // field takes typing only while the page draws it editable, as Remove key takes a click
+        // only then. Keys that reach one the page has just made read-only, before it is drawn
+        // so, change no draft, and the field is put back to what the page holds rather than left
+        // showing what nothing took.
         cx.subscribe_in(
             &url,
             window,
@@ -569,133 +515,11 @@ fn card() -> Div {
         .overflow_hidden()
 }
 
-fn radio_dot(on: bool) -> impl IntoElement {
-    div()
-        .size(px(16.))
-        .rounded_full()
-        .border_1()
-        .border_color(rgb(0x888888))
-        .flex()
-        .items_center()
-        .justify_center()
-        .when(on, |this| {
-            this.child(div().size(px(8.)).rounded_full().bg(rgb(0x1084FE)))
-        })
-}
-
-fn kind_row(
-    kind: InferenceKind,
-    picked: bool,
-    live: bool,
-    muted: Hsla,
-    app: Entity<AppState>,
-) -> impl IntoElement {
-    h_flex()
-        .id(SharedString::from(kind_id(kind)))
-        .w_full()
-        .px(px(16.))
-        .py(px(14.))
-        .gap(px(12.))
-        .when(live, |this| {
-            this.cursor_pointer()
-                .hover(|s| s.bg(rgb(0x777777).opacity(0.08)))
-                .on_mouse_down(MouseButton::Left, move |_, _, cx| {
-                    app.update(cx, |state, cx| state.pick_reply_source_kind(kind, cx));
-                })
-        })
-        .when(!live, |this| this.opacity(0.6))
-        .child(
-            v_flex()
-                .flex_1()
-                .min_w(px(0.))
-                .gap(px(2.))
-                .child(div().text_sm().child(kind_label(kind)))
-                .child(div().text_xs().text_color(muted).child(kind_detail(kind))),
-        )
-        .child(radio_dot(picked))
-}
-
-/// The radio's third row: the person's plan through their Mac, from a server that knows the
-/// relay.
-fn mac_row(picked: bool, live: bool, muted: Hsla, app: Entity<AppState>) -> impl IntoElement {
-    h_flex()
-        .id(VIA_MAC)
-        .w_full()
-        .px(px(16.))
-        .py(px(14.))
-        .gap(px(12.))
-        .when(live, |this| {
-            this.cursor_pointer()
-                .hover(|s| s.bg(rgb(0x777777).opacity(0.08)))
-                .on_mouse_down(MouseButton::Left, move |_, _, cx| {
-                    app.update(cx, |state, cx| state.pick_reply_source_mac(cx));
-                })
-        })
-        .when(!live, |this| this.opacity(0.6))
-        .child(
-            v_flex()
-                .flex_1()
-                .min_w(px(0.))
-                .gap(px(2.))
-                .child(div().text_sm().child(MAC_LABEL))
-                .child(div().text_xs().text_color(muted).child(MAC_DETAIL)),
-        )
-        .child(radio_dot(picked))
-}
-
 fn labelled(label: &'static str, muted: Hsla, control: impl IntoElement) -> impl IntoElement {
     v_flex()
         .gap(px(4.))
         .child(div().text_xs().text_color(muted).child(label))
         .child(control)
-}
-
-fn model_picker(
-    shown: Option<String>,
-    models: Vec<String>,
-    live: bool,
-    app: Entity<AppState>,
-) -> impl IntoElement {
-    let label = shown.clone().unwrap_or_else(|| PICK_MODEL.to_string());
-    // While a model is shown, the first choice takes it away.
-    let clearable = shown.is_some();
-    Button::new(MODEL)
-        .label(label)
-        .ghost()
-        .compact()
-        .icon(IconName::ChevronDown)
-        .disabled(!live || (models.is_empty() && !clearable))
-        .dropdown_menu(move |menu, _, _| {
-            let menu = if clearable {
-                let app = app.clone();
-                menu.item(
-                    PopupMenuItem::element(|_, _| div().id(NO_MODEL).child(NO_MODEL_LABEL))
-                        .on_click(move |_, _, cx| {
-                            cx.stop_propagation();
-                            app.update(cx, |state, cx| state.clear_reply_source_model(cx));
-                        }),
-                )
-            } else {
-                menu
-            };
-            models.iter().fold(menu, |menu, model| {
-                let app = app.clone();
-                let picked = model.clone();
-                // Its row carries the id a driver clicks, `settings-reply-source-model-{id}`.
-                let id = SharedString::from(model_id(model));
-                let label = model.clone();
-                menu.item(
-                    PopupMenuItem::element(move |_, _| div().id(id.clone()).child(label.clone()))
-                        .checked(shown.as_deref() == Some(model.as_str()))
-                        .on_click(move |_, _, cx| {
-                            cx.stop_propagation();
-                            app.update(cx, |state, cx| {
-                                state.pick_reply_source_model(picked.clone(), cx);
-                            });
-                        }),
-                )
-            })
-        })
 }
 
 /// The relay's model picker: the models a Mac lists, and No model while one is shown.
@@ -909,6 +733,27 @@ impl ReplySourcePage {
     }
 }
 
+/// Default for new Bots: where a newly hired Bot starts, in the picker's card. While the server
+/// keeps no default for new Bots the section says it is coming and the card is dimmed and takes
+/// no click, since a pick here would change nothing on the server.
+fn new_bots_section(defaults: DefaultForNewBots, theme: &Theme) -> impl IntoElement {
+    let muted = theme.muted_foreground;
+    match defaults {
+        DefaultForNewBots::NotOnServer => v_flex()
+            .id(NEW_BOTS)
+            .gap(px(8.))
+            .child(div().text_xs().text_color(muted).child(NEW_BOTS_TITLE))
+            .child(
+                div()
+                    .id(NEW_BOTS_UNAVAILABLE)
+                    .text_sm()
+                    .text_color(muted)
+                    .child(NEW_BOTS_COMING_SOON),
+            )
+            .child(model_picker::dead_card(NEW_BOTS_CARD, theme)),
+    }
+}
+
 impl Render for ReplySourcePage {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sync_inputs(window, cx);
@@ -920,27 +765,30 @@ impl Render for ReplySourcePage {
         let settings = &state.reply_source;
         let per_bot = state.server_keeps_bot_doors();
         let intro = div().text_xs().text_color(muted).child(intro(per_bot));
+        // Its own section, whatever the reply source: the default for new Bots is a setting of
+        // its own, and says so whether or not the reply source could be read.
+        let new_bots = new_bots_section(state.default_for_new_bots, &theme);
         let Some(kept) = settings.kept_source() else {
             let line = unavailable_line(settings).unwrap_or(ASKING).to_string();
             let failed = matches!(settings.kept, Some(ReplySourceRead::Unavailable(_)));
-            return v_flex().id(SECTION).gap(px(12.)).child(intro).child(
-                div()
-                    .id(UNAVAILABLE)
-                    .text_sm()
-                    .text_color(if failed { theme.danger } else { muted })
-                    .child(line),
-            );
+            return v_flex()
+                .id(SECTION)
+                .gap(px(12.))
+                .child(intro)
+                .child(
+                    div()
+                        .id(UNAVAILABLE)
+                        .text_sm()
+                        .text_color(if failed { theme.danger } else { muted })
+                        .child(line),
+                )
+                .child(new_bots);
         };
-        let models = state.subscription_models();
         let health = state.proxy_health().unwrap_or(ProxyHealth::NoAddress);
         let hint = state.reply_source_hint();
         let can_save = state.reply_source_can_save();
-        let live = settings.can_edit();
         let here = settings.server_on_this_mac;
         let plan_live = settings.plan_editable();
-        let shown = settings.shown_kind().unwrap_or(kept.kind);
-        let shown_model = settings.shown_model().map(str::to_string);
-        let models_line = models_note(health, !models.is_empty());
         let has_key = kept.has_api_key;
         let removing = settings.remove_key;
         let key_live = settings.key_editable();
@@ -949,55 +797,20 @@ impl Render for ReplySourcePage {
         let trouble = error_is_trouble(settings);
         let save_words = save_label(settings);
         let (health_words, command) = health_line(health, here);
-        // The plan's row is the plan on the server's own machine; with the relay, the Mac's row
-        // beside it is the plan through the person's Mac. A way this app cannot name shows
-        // neither picked.
         let knows_relay = settings.knows_relay();
-        let shown_via = settings.shown_via();
-        let mac_live = settings.relay_editable();
         let elsewhere = if knows_relay {
             ELSEWHERE_RELAY_LINE
         } else {
             ELSEWHERE_LINE
         };
         let relay_card = knows_relay.then(|| self.relay_card(state, &theme));
+        // The plan's connection, the Mac relay, Save for both, and the default for new Bots.
+        // There is no radio: where a Bot's replies go is picked with its model on its card, and
+        // the account's kind stays as the server keeps it, for the Bots that have picked none.
         v_flex()
             .id(SECTION)
             .gap(px(12.))
             .child(intro)
-            .when(per_bot, |this| {
-                this.child(div().text_xs().text_color(muted).child(DEFAULT_HEADING))
-            })
-            .child(
-                card()
-                    .flex()
-                    .flex_col()
-                    .id(KIND)
-                    .child(kind_row(
-                        InferenceKind::Gateway,
-                        shown == InferenceKind::Gateway,
-                        live,
-                        muted,
-                        app.clone(),
-                    ))
-                    .child(div().h(px(1.)).bg(rgb(0x777777).opacity(0.16)))
-                    .child(kind_row(
-                        InferenceKind::LocalProxy,
-                        shown == InferenceKind::LocalProxy && shown_via == Some(Via::Loopback),
-                        plan_live,
-                        muted,
-                        app.clone(),
-                    ))
-                    .when(knows_relay, |this| {
-                        this.child(div().h(px(1.)).bg(rgb(0x777777).opacity(0.16)))
-                            .child(mac_row(
-                                shown == InferenceKind::LocalProxy && shown_via == Some(Via::Mac),
-                                mac_live,
-                                muted,
-                                app.clone(),
-                            ))
-                    }),
-            )
             .child(div().text_xs().text_color(muted).child("Your subscription"))
             .child(
                 card()
@@ -1021,23 +834,6 @@ impl Render for ReplySourcePage {
                         div()
                             .id(URL)
                             .child(field_input(&self.url).disabled(!plan_live)),
-                    ))
-                    .child(labelled(
-                        model_label(per_bot),
-                        muted,
-                        v_flex()
-                            .items_start()
-                            .gap(px(4.))
-                            .child(model_picker(shown_model, models, plan_live, app.clone()))
-                            .when_some(models_line, |this, line| {
-                                this.child(
-                                    div()
-                                        .id(MODELS_NOTE)
-                                        .text_xs()
-                                        .text_color(muted)
-                                        .child(line),
-                                )
-                            }),
                     ))
                     .child(labelled(
                         "Proxy key",
@@ -1156,6 +952,9 @@ impl Render for ReplySourcePage {
                             }),
                     ),
             )
+            // After Save, which does not send it: the section's card saves nothing until the
+            // server keeps a default for new Bots.
+            .child(new_bots)
     }
 }
 
@@ -1188,18 +987,15 @@ pub(crate) fn reply_badge(
 #[cfg(test)]
 mod tests {
     // Item by item rather than a glob: `use super::*` would drag in gpui_kit's own `test`.
-    use super::{
-        MODELS_MAY_BE_OLD, NO_MODELS, NO_MODELS_NOT_RUNNING, NO_MODELS_WITHOUT_ADDRESS,
-        badge_label, badge_words, health_line, health_word, kind_id, kind_label, models_note,
-    };
+    use super::{badge_label, badge_words, health_line, health_word};
     use crate::opengrok::{InferenceKind, Via};
     use crate::state::ProxyHealth;
 
-    /// The words the badge and the radio say, as the contract's doors: the server's keys, the
-    /// plan on the server's own machine, and the plan the person's Mac answers through the relay.
-    /// A way never named, as from a server before the relay, reads as the plan.
+    /// The words a reply's badge says, as the contract's doors: the server's keys, the plan on the
+    /// server's own machine, and the plan the person's Mac answers through the relay. A way never
+    /// named, as from a server before the relay, reads as the plan.
     #[test]
-    fn each_door_reads_as_itself_on_every_surface() {
+    fn each_door_reads_as_itself_on_its_badge() {
         let doors = [
             (InferenceKind::Gateway, None),
             (InferenceKind::LocalProxy, None),
@@ -1209,17 +1005,6 @@ mod tests {
         assert_eq!(
             doors.map(|(kind, via)| badge_label(kind, via)),
             ["paid key", "your plan", "your plan", "your plan · Mac"]
-        );
-        assert_eq!(
-            InferenceKind::ALL.map(kind_label),
-            ["Server (paid keys)", "My subscription"]
-        );
-        assert_eq!(
-            InferenceKind::ALL.map(kind_id),
-            [
-                "settings-reply-source-kind-gateway",
-                "settings-reply-source-kind-local_proxy"
-            ]
         );
     }
 
@@ -1258,22 +1043,48 @@ mod tests {
         assert_eq!(badge(InferenceKind::Gateway, None, None), "paid key");
     }
 
-    /// The page says it is the default for Bots that have not picked their own only to a server
-    /// that keeps a door per Bot; before that it is every Bot's, and reads as it always did.
+    /// The page is the subscription's connection, and switches no door: it says a Bot picks its
+    /// model, and with it its door, in its settings only to a server that keeps a door per Bot,
+    /// and before that says nothing of it. Neither offers a radio's words, nor a model of the
+    /// plan's own; the relay's picker still says whose model it is.
     #[test]
-    fn the_page_is_the_default_only_where_bots_pick_their_own() {
-        use super::{INTRO, INTRO_PER_BOT, intro, model_label, relay_model_label};
+    fn the_page_is_the_subscriptions_connection_and_switches_no_door() {
+        use super::{INTRO, INTRO_PER_BOT, intro, relay_model_label};
         assert_eq!(intro(true), INTRO_PER_BOT);
         assert_eq!(intro(false), INTRO);
-        assert_eq!(model_label(true), "Plan model when a Bot hasn't chosen one");
+        assert!(INTRO_PER_BOT.contains("Each Bot picks its model in its settings"));
+        assert!(!INTRO.contains("Each Bot picks"));
+        for words in [INTRO, INTRO_PER_BOT] {
+            for radio in ["Server (paid keys)", "My subscription", "haven't picked"] {
+                assert!(!words.contains(radio), "{words:?} says {radio:?}");
+            }
+        }
         assert_eq!(
             relay_model_label(true),
             "Plan model through a Mac when a Bot hasn't chosen one"
         );
+        assert_eq!(relay_model_label(false), "Model");
+    }
+
+    /// Default for new Bots says it is coming, in the owner's words, while the server keeps no
+    /// such default, which it does not yet: the picker's card in it names no model and the
+    /// effort a Bot with none of its own reads as, and takes no click.
+    #[test]
+    fn the_default_for_new_bots_is_coming_and_its_card_is_dead() {
+        use super::{NEW_BOTS_COMING_SOON, NEW_BOTS_TITLE};
+        use crate::components::model_picker::dead_card_words;
+        use crate::state::DefaultForNewBots;
+        assert_eq!(NEW_BOTS_TITLE, "Default for new Bots");
         assert_eq!(
-            (model_label(false), relay_model_label(false)),
-            ("Model", "Model")
+            NEW_BOTS_COMING_SOON,
+            "Coming soon: the server can't keep a default for new Bots yet."
         );
+        assert_eq!(DefaultForNewBots::default(), DefaultForNewBots::NotOnServer);
+        assert_eq!(
+            crate::state::AppState::new().default_for_new_bots,
+            DefaultForNewBots::NotOnServer
+        );
+        assert_eq!(dead_card_words(), ("No model", "Default"));
     }
 
     /// The health line is the server's word on opencodex, and no address is its own answer, not
@@ -1403,24 +1214,5 @@ mod tests {
             Some(RELAY_MODELS_MAY_BE_OLD)
         );
         assert_eq!(relay_models_note(true, true), None);
-    }
-
-    /// The line under the picker says why it offers nothing, or that what it offers may be old.
-    #[test]
-    fn the_picker_says_why_it_offers_what_it_does() {
-        assert_eq!(
-            models_note(ProxyHealth::NoAddress, false),
-            Some(NO_MODELS_WITHOUT_ADDRESS)
-        );
-        assert_eq!(
-            models_note(ProxyHealth::NotRunning, false),
-            Some(NO_MODELS_NOT_RUNNING)
-        );
-        assert_eq!(
-            models_note(ProxyHealth::NotRunning, true),
-            Some(MODELS_MAY_BE_OLD)
-        );
-        assert_eq!(models_note(ProxyHealth::Running, false), Some(NO_MODELS));
-        assert_eq!(models_note(ProxyHealth::Running, true), None);
     }
 }

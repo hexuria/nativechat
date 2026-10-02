@@ -55,7 +55,7 @@ pub const FAST_DOOR_UNKNOWN: &str = "Where this Bot's replies go isn't known yet
 /// Why ⚡ is dead on a server without per-Bot doors while the account is on the person's plan:
 /// the plan's model there is the account's, and a Bot's pin would change nothing.
 pub const FAST_ACCOUNT_PLAN: &str =
-    "On this server every Bot on your plan uses the model in Settings → Reply source.";
+    "On this server every Bot on your plan uses your account's plan model.";
 /// Why the slider is dead: a server from before opengrok-server#271 keeps no effort, and a pick
 /// would look saved and change nothing.
 pub const EFFORT_NOT_KEPT: &str = "This server has nowhere to keep an effort yet.";

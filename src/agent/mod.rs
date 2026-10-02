@@ -231,49 +231,54 @@
 //! its Tools (opengrok-server#268).
 //!
 //! Reply source, where a Bot's replies are paid from: the server's paid keys or the person's own
-//! subscription through opencodex, running on the same machine as the server.
+//! subscription through opencodex, running on the same machine as the server. The page sets up
+//! the subscription's connection and switches no door: a Bot's door is picked with its model on
+//! `agent-model-card`, and the account's kind stays as the server keeps it for the Bots that have
+//! picked none. No radio is drawn, and none of the radio's ids, nor the plan model picker's from
+//! before (`settings-reply-source-kind*`, `settings-reply-source-via-mac`,
+//! `settings-reply-source-model*`, `settings-reply-source-no-model`), is on the tree or answers.
 //! `settings-tab-reply-source` (refused while Settings is shut); while Settings is open on it,
 //! `settings-reply-source` (value = the door the server keeps, `gateway` / `local_proxy`; states
-//! `unsaved` while a pick waits for Save, `saving` and `reading` while one is with the server).
-//! Until the setting has been read, on a server without reply sources, or when it could not be
-//! read, the section holds only `settings-reply-source-unavailable`, the line the page draws in
-//! place of the form (`Asking the server…` while the section has state `asking`). Once read it
-//! holds `settings-reply-source-kind` (a radio group, value = the door shown) with
-//! `settings-reply-source-kind-gateway|local_proxy` (label as the radio reads, checked on the one
-//! shown; a click picks it and it waits for Save, as on the page; `local_proxy` only where the
-//! app's server is on this Mac); `settings-reply-source-elsewhere` where it is not (the page's
-//! line saying the plan is set up only from the server's own Mac); `settings-reply-source-url`
-//! (value = the proxy URL shown; `set_value` and `type` write it as typing would, and an empty
-//! one clears the address with the next Save; `key` is refused); `settings-reply-source-model`
-//! (a menu, value = the model shown; state `empty` while the server lists no model of the
-//! person's plan) with `settings-reply-source-no-model` (while a model is shown: none, which
-//! clears it with the next Save) and a `settings-reply-source-model-{id}` per model it offers
-//! (state `selected` on the shown one; a click picks it); `settings-reply-source-models-note`
-//! (the line under the picker: why it offers nothing, or that opencodex is down and these are
-//! the models it listed last); `settings-reply-source-key` (never valued: states `set` while the
-//! server holds a key, `typed` while one waits for Save, which the window draws as masked dots
-//! whoever typed it; `set_value` writes the whole key, `type` and `key` are refused; disabled,
-//! as the window draws it, while Remove key is picked); `settings-reply-source-remove-key`
-//! (while the server holds a key: label `Remove key`, or `Keep key` with state `picked` while
-//! its removal waits for Save); `settings-reply-source-health` (label the line, value
-//! `running` / `not-running` / `no-address`); `settings-reply-source-providers` (why Claude and
-//! Gemini are not offered);
-//! `settings-reply-source-error` (the server's words for a refused Save, why nobody knows what
-//! became of one, or a read that failed, and after a Save or a page left with a key typed, the
-//! line asking for it again; state `trouble` while drawn in the danger colour, a refusal or a
-//! failed read); `settings-reply-source-hint` (what Save waits for, a model or an address, or what
-//! it keeps while no model of the plan is listed); and `settings-reply-source-save` (enabled only
-//! while a click would send something). Every control is refused off the page, before the setting
-//! is read, and while a Save is out; Save is refused while a read is out too, and says what it
-//! waits for; and the plan's controls are refused where the server is not on this Mac.
+//! `unsaved` while a change waits for Save, `saving` and `reading` while one is with the server,
+//! and `via-mac` while the account's way to the plan is the person's Mac). Until the setting has
+//! been read, on a server without reply sources, or when it could not be read, the section holds
+//! only `settings-reply-source-unavailable`, the line the page draws in place of the form
+//! (`Asking the server…` while the section has state `asking`), and Default for new Bots. Once
+//! read it holds `settings-reply-source-elsewhere` where the app's server is not on this Mac (the
+//! page's line saying the plan is set up only from the server's own Mac);
+//! `settings-reply-source-url` (value = the proxy URL shown; `set_value` and `type` write it as
+//! typing would, and an empty one clears the address with the next Save; `key` is refused);
+//! `settings-reply-source-key` (never valued: states `set` while the server holds a key, `typed`
+//! while one waits for Save, which the window draws as masked dots whoever typed it; `set_value`
+//! writes the whole key, `type` and `key` are refused; disabled, as the window draws it, while
+//! Remove key is picked); `settings-reply-source-remove-key` (while the server holds a key: label
+//! `Remove key`, or `Keep key` with state `picked` while its removal waits for Save);
+//! `settings-reply-source-health` (label the line, value `running` / `not-running` /
+//! `no-address`); `settings-reply-source-providers` (why the Subscription group offers no Claude
+//! or Gemini model); `settings-reply-source-error` (the server's words for a refused Save, why
+//! nobody knows what became of one, or a read that failed, and after a Save or a page left with a
+//! key typed, the line asking for it again; state `trouble` while drawn in the danger colour, a
+//! refusal or a failed read); `settings-reply-source-hint` (what Save waits for: an address while
+//! the account's replies are on the plan, or a model for the Mac while its way is the Mac); and
+//! `settings-reply-source-save` (enabled only while a click would send something). A Save sends
+//! the kind the server keeps, as it is, with what changed, and never a plan model or a way. Every
+//! control is refused off the page, before the setting is read, and while a Save is out; Save is
+//! refused while a read is out too, and says what it waits for; and the plan's controls are
+//! refused where the server is not on this Mac. An id the page does not draw is refused as not on
+//! the page.
+//!
+//! Last on the page, whatever the setting, `settings-new-bots`: Default for new Bots, where a
+//! newly hired Bot starts (state `unavailable` while the server keeps no default for new Bots,
+//! which it does not yet: the contract is being agreed with opengrok-server, and nothing of it is
+//! sent or read). It holds `settings-new-bots-unavailable` ("Coming soon: the server can't keep a
+//! default for new Bots yet.") and `settings-new-bots-card`, the picker's card (a button named as
+//! it reads, `No model · Default`, disabled; a click is refused with why). Both are refused off
+//! the page.
 //!
 //! The Mac relay (hexuria/nativechat #156, opengrok-server #292), from a server that knows it
-//! (its setting carries `relay`); a server before it draws none of this. The radio gains
-//! `settings-reply-source-via-mac` (label `My subscription, through my Mac`, checked while the
-//! plan through the person's Mac is shown; the radio then has state `via-mac`, and so does the
-//! section while it is the account's kept door; `settings-reply-source-kind-local_proxy` is then
-//! the plan on the server's own machine). A click picks it and it waits for Save; it is live
-//! wherever the server runs. Then `settings-relay`, Answer with this Mac: `settings-relay-switch`
+//! (its setting carries `relay`); a server before it draws none of this. The page no longer moves
+//! the account to the Mac or back: the section has state `via-mac` while the server keeps the Mac
+//! as the account's way. `settings-relay`, Answer with this Mac: `settings-relay-switch`
 //! (a switch, checked while on; it acts at once and waits on no Save, off always, on once this
 //! Mac is enrolled; after another Mac took the relay, turning it off and on takes it back),
 //! `settings-relay-unavailable` (why the card takes no change: this Mac not enrolled),
