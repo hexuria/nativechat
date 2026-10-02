@@ -51,7 +51,7 @@ impl ComputerPane {
                 .placeholder("What should this routine do each time it runs?")
                 .auto_grow(3, 8)
         });
-        let custom_cron = cx.new(|cx| InputState::new(window, cx).placeholder("@every 1h"));
+        let custom_cron = cx.new(|cx| InputState::new(window, cx).placeholder("0 9 * * MON-FRI"));
         cx.observe(&state, |_this, _, cx| cx.notify()).detach();
         Self {
             state,
@@ -2162,15 +2162,15 @@ fn mode_row(
                 PopupMenuItem::new(name).on_click({
                     let patch = patch.clone();
                     move |_, _, cx| {
-                        let mut next = spec.clone();
-                        next.mode = mode;
-                        if mode == ScheduleUiMode::Custom && next.expr.is_empty() {
-                            next.expr = match next.unit {
-                                ScheduleUnit::Minutes => format!("@every {}m", next.every),
-                                ScheduleUnit::Hours => format!("@every {}h", next.every),
-                                ScheduleUnit::Days => format!("@every {}d", next.every),
-                            };
-                        }
+                        // The line starts from the schedule as it was, never from a shorthand:
+                        // the server takes five fields and refuses `@every`.
+                        let next = if mode == ScheduleUiMode::Custom {
+                            spec.on_tab(crate::state::WakeTab::Cron)
+                        } else {
+                            let mut next = spec.clone();
+                            next.mode = mode;
+                            next
+                        };
                         patch(next, cx);
                     }
                 })

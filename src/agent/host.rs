@@ -7117,7 +7117,7 @@ mod tests {
             ("cant-run", crate::state::ROUTINE_RUN_UNAVAILABLE),
         ];
         old.runs_unavailable = true;
-        old.unsaved = vec![("Name", "Daily".into()), ("When", "Every minute".into())];
+        old.unsaved = vec![("Name", "Daily".into()), ("When", "Every 1 minute".into())];
         host.routines = vec![old, routine("sch_2", "cron")];
         host.routine_error = Some("No such schedule".into());
         let tree = host.snapshot();
@@ -7137,7 +7137,7 @@ mod tests {
         let unsaved = tree.find(&ids::routine_unsaved("sch_1")).unwrap();
         assert_eq!(
             unsaved.value.as_deref(),
-            Some("Name: Daily\nWhen: Every minute")
+            Some("Name: Daily\nWhen: Every 1 minute")
         );
         assert!(!tree.find(&ids::routine_test("sch_1")).unwrap().enabled);
         assert!(tree.find(&ids::routine_test("sch_2")).unwrap().enabled);
