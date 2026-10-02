@@ -2,7 +2,7 @@
 //! only the pill and icon buttons have a surface. Other pages retain their own header.
 
 use crate::chrome::{
-    HEADER_PX, INFO_PANE_WIDTH, TITLE_BAR_H, TITLE_BAR_LEFT_PAD, chrome_floats,
+    CONTROL_ICON_PX, HEADER_PX, INFO_PANE_WIDTH, TITLE_BAR_H, TITLE_BAR_LEFT_PAD, chrome_floats,
     header_sidebar_toggle_visible, sidebar_width,
 };
 use crate::components::agent_settings::settings_header;
@@ -239,7 +239,11 @@ impl Render for TitleBar {
                                     app.update(cx, |state, cx| state.toggle_computer_pane(cx));
                                 }
                             })
-                            .child(Icon::default().path("icons/monitor.svg").size(px(16.))),
+                            .child(
+                                Icon::default()
+                                    .path("icons/monitor.svg")
+                                    .size(px(CONTROL_ICON_PX)),
+                            ),
                     ),
                 )
             });
@@ -518,7 +522,7 @@ fn header_icon(id: &'static str, path: &'static str, selected: bool) -> Stateful
         .cursor_pointer()
         .when(selected, |this| this.bg(rgb(0x777777).opacity(0.12)))
         .hover(|s| s.bg(rgb(0x777777).opacity(0.2)))
-        .child(Icon::default().path(path).size(px(16.)))
+        .child(Icon::default().path(path).size(px(CONTROL_ICON_PX)))
 }
 
 /// Floating panes don't move the chat's centre. Docked panes do. Limit long names

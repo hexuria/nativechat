@@ -4883,6 +4883,7 @@ dependencies = [
  "gpui-kit",
  "libc",
  "log",
+ "markdown",
  "objc",
  "rand 0.10.3",
  "raw-window-handle",
