@@ -17,6 +17,10 @@ use gpui_kit::component::{ActiveTheme, Icon, Theme, h_flex};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 
+/// Where the line naming a routine's thread starts: just under the Bot chip, which is 36px tall
+/// in the middle of the bar.
+const ROUTINE_LINE_TOP: f32 = TITLE_BAR_H - 6.;
+
 /// A run of the bar with no control in it: a handle to drag the window by.
 pub fn window_drag(el: Div) -> Div {
     el.on_mouse_down(MouseButton::Left, |_, window, _| window.start_window_move())
@@ -86,8 +90,9 @@ impl Render for TitleBar {
                     c.avatar_color.clone(),
                 )
             });
-        // A routine's thread says so beside the bot's name, with the way back to the bot's own
-        // chat: it is not in the sidebar, so the header is where a person finds where they are.
+        // A routine's thread says so beside the bot's name: it is not in the sidebar, so the
+        // header is where a person finds where they are. The name is the way back to the bot's
+        // own chat, as the chip is in the floating header.
         let routine_thread = state
             .active_thread_origin()
             .filter(|_| !state.is_app_settings_open)
@@ -185,21 +190,6 @@ impl Render for TitleBar {
                                 .text_xs()
                                 .text_color(theme.muted_foreground)
                                 .child(format!("Routine · {routine}")),
-                        )
-                        .child(
-                            div()
-                                .id("header-routine-back")
-                                .text_xs()
-                                .text_color(theme.muted_foreground)
-                                .cursor_pointer()
-                                .hover(|s| s.text_color(theme.foreground))
-                                .on_mouse_down(MouseButton::Left, {
-                                    let app = app.clone();
-                                    move |_, _, cx| {
-                                        app.update(cx, |state, cx| state.back_to_bot_chat(cx));
-                                    }
-                                })
-                                .child(format!("Back to {name}")),
                         )
                     }),
                 // No bot: the page's title, in the same place and style.
@@ -406,41 +396,31 @@ impl TitleBar {
                         }),
                     ),
             )
+            // Which routine's thread this is, in a small line centred under the chip that names
+            // its Bot. The chip is the way back to the Bot's own chat from here
+            // (`AppState::press_bot_chip`), so the line is only a name.
             .when_some(state.active_thread_origin(), |this, origin| {
-                let name = bot
-                    .map(|bot| bot.name.clone())
-                    .unwrap_or_else(|| "Bot".into());
                 this.child(
-                    h_flex()
+                    div()
                         .absolute()
-                        .left(px(chat_left + HEADER_PX))
-                        .top(px(TITLE_BAR_H))
-                        .occlude()
-                        .gap_2()
-                        .px_2()
-                        .py_1()
-                        .rounded(px(8.))
-                        .bg(theme.background.opacity(0.95))
-                        .text_xs()
-                        .text_color(theme.muted_foreground)
+                        .left(px(chat_left))
+                        .right(px(chat_right))
+                        .top(px(ROUTINE_LINE_TOP))
+                        .flex()
+                        .justify_center()
                         .child(
                             div()
                                 .id("header-routine-thread")
+                                .occlude()
+                                .max_w(px(pill_width))
+                                .min_w_0()
+                                .truncate()
+                                .px_2()
+                                .rounded(px(6.))
+                                .bg(theme.background.opacity(0.95))
+                                .text_xs()
+                                .text_color(theme.muted_foreground)
                                 .child(format!("Routine · {}", origin.routine_name)),
-                        )
-                        .child(
-                            div()
-                                .id("header-routine-back")
-                                .cursor_pointer()
-                                .hover(|s| s.text_color(theme.foreground))
-                                .on_mouse_down(MouseButton::Left, {
-                                    let app = app.clone();
-                                    move |_, _, cx| {
-                                        cx.stop_propagation();
-                                        app.update(cx, |state, cx| state.back_to_bot_chat(cx));
-                                    }
-                                })
-                                .child(format!("Back to {name}")),
                         ),
                 )
             })
