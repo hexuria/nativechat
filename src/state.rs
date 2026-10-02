@@ -2702,6 +2702,16 @@ pub struct LiveTurn {
     pub persisting: bool,
 }
 
+/// A failed reply taken out of its thread so that its turn can be sent again
+/// ([`AppState::begin_retry`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Retry {
+    conversation_id: String,
+    /// The run the failed reply came out of, which the retry names to the server as the one it
+    /// retries (`retryOf`). None for a reply that names no run, which goes again naming none.
+    of: Option<String>,
+}
+
 /// What one thread's turn is doing, as the app would say it out loud.
 ///
 /// The two halves are separate because a turn between frames is still a turn: a run says
@@ -13727,6 +13737,7 @@ impl AppState {
         &mut self,
         conversation_id: String,
         content: String,
+        retry_of: Option<String>,
         cx: &mut Context<Self>,
     ) {
         let recipe = self.active_recipe.as_ref().map(ActiveRecipe::turn);
@@ -13742,6 +13753,7 @@ impl AppState {
             None,
             None,
             None,
+            retry_of,
             false,
             cx,
         );
@@ -13813,47 +13825,15 @@ impl AppState {
         history
     }
 
-    /// `recipe` and `skill` are what the message was typed with. `stop_first` is a run this turn
-    /// replaces: it is stopped on the wire before the turn is posted. `drained` is the hold this
-    /// turn is firing, when it came off `queued_sends`. `on_server` sends it on the server's paid
-    /// keys whatever the Bot's door: the turn the person's plan could not answer, sent again.
-    #[allow(clippy::too_many_arguments)]
-    fn send_opengrok_turn_with(
-        &mut self,
-        conversation_id: String,
-        _content: String,
-        recipe: Option<TurnRecipe>,
-        skill: Option<String>,
-        stop_first: Option<String>,
-        drained: Option<QueuedSend>,
-        on_server: bool,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(client) = self.opengrok.clone() else {
-            self.auth_error = Some("OpenGrok is not configured".to_string());
-            cx.notify();
-            return;
-        };
-        // The other door into this is "Try again" on a turn that did not go out, which reaches
-        // here without passing `send_message`'s guard — and it is exactly the button somebody
-        // presses while the session is gone. A turn is a turn: it does not leave while the app
-        // knows it has nothing to sign it with.
-        if !self.can_send_turn() {
-            self.note_signed_out(cx);
-            return;
-        }
-        let coworker_id = self.active_coworker_id.clone();
-        let history = self.turn_history(&conversation_id, drained.as_ref());
-        let pending_id = drained.as_ref().and_then(|held| held.pending_id.clone());
-        let queued_message_id = drained.as_ref().map(|held| held.message_id.clone());
-        // The Bot's door as the turn leaves, or for a held send the one it had when the message
-        // was sent, or the server's keys for a turn sent again on them: see `turn_door`.
-        let turn_source = self.turn_door(drained.as_ref(), on_server);
-
-        // Both ids are minted here, before anything is sent. The run id because the server files
-        // every frame under it and this is the app's only handle on the run once the stream is
-        // gone; the message id because the run has to be able to find the bubble it is filling
-        // in by name, whatever else happens to the thread meanwhile.
+    /// The bubble a turn's reply is written into, and the turn made its thread's live one, before
+    /// anything is sent: the run's id and the bubble's.
+    ///
+    /// Both ids are minted here. The run id because the server files every frame under it and
+    /// this is the app's only handle on the run once the stream is gone; the message id because
+    /// the run has to be able to find the bubble it is filling in by name, whatever else happens
+    /// to the thread meanwhile. The bubble names its run from the start: it is how the thread
+    /// accounts for the run, and the run a retry of this reply names ([`Self::begin_retry`]).
+    fn open_turn(&mut self, conversation_id: &str) -> (String, String) {
         let run_id = uuid::Uuid::now_v7().to_string();
         let reply_id = uuid::Uuid::now_v7().to_string();
         if let Some(conversation) = self
@@ -13879,13 +13859,57 @@ impl AppState {
             });
         }
         self.live_turns.insert(
-            conversation_id.clone(),
+            conversation_id.to_string(),
             LiveTurn {
                 run_id: run_id.clone(),
                 message_id: reply_id.clone(),
                 persisting: false,
             },
         );
+        (run_id, reply_id)
+    }
+
+    /// `recipe` and `skill` are what the message was typed with. `stop_first` is a run this turn
+    /// replaces: it is stopped on the wire before the turn is posted. `drained` is the hold this
+    /// turn is firing, when it came off `queued_sends`. `retry_of` is the run of the failed reply
+    /// this turn sends again, Try again's or Send on Server's ([`Self::begin_retry`]).
+    /// `on_server` sends it on the server's paid keys whatever the Bot's door: the turn the
+    /// person's plan could not answer, sent again.
+    #[allow(clippy::too_many_arguments)]
+    fn send_opengrok_turn_with(
+        &mut self,
+        conversation_id: String,
+        _content: String,
+        recipe: Option<TurnRecipe>,
+        skill: Option<String>,
+        stop_first: Option<String>,
+        drained: Option<QueuedSend>,
+        retry_of: Option<String>,
+        on_server: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(client) = self.opengrok.clone() else {
+            self.auth_error = Some("OpenGrok is not configured".to_string());
+            cx.notify();
+            return;
+        };
+        // The other door into this is "Try again" on a turn that did not go out, which reaches
+        // here without passing `send_message`'s guard — and it is exactly the button somebody
+        // presses while the session is gone. A turn is a turn: it does not leave while the app
+        // knows it has nothing to sign it with.
+        if !self.can_send_turn() {
+            self.note_signed_out(cx);
+            return;
+        }
+        let coworker_id = self.active_coworker_id.clone();
+        let history = self.turn_history(&conversation_id, drained.as_ref());
+        let pending_id = drained.as_ref().and_then(|held| held.pending_id.clone());
+        let queued_message_id = drained.as_ref().map(|held| held.message_id.clone());
+        // The Bot's door as the turn leaves, or for a held send the one it had when the message
+        // was sent, or the server's keys for a turn sent again on them: see `turn_door`.
+        let turn_source = self.turn_door(drained.as_ref(), on_server);
+
+        let (run_id, reply_id) = self.open_turn(&conversation_id);
         if let Some(id) = self.active_coworker_id.clone() {
             self.touch_coworker_activity(&id);
         }
@@ -13935,6 +13959,7 @@ impl AppState {
                             recipe.as_ref(),
                             skill.as_deref(),
                             pending_id.as_deref(),
+                            retry_of.as_deref(),
                             turn_source,
                             |event| {
                                 match tracker.tick(event) {
@@ -14118,29 +14143,9 @@ impl AppState {
                 if let Err(error) = &result
                     && (error.is_already_consumed() || error.is_not_pending())
                 {
-                    // Another machine already fired or canceled this hold. The empty
-                    // assistant row this turn minted is not an answer.
-                    if let Some(conversation) = state
-                        .conversations
-                        .iter_mut()
-                        .find(|conversation| conversation.id == conversation_id)
+                    let queued = queued_message_id.as_deref();
+                    if state.drop_refused_turn(&conversation_id, &reply_id, &run_id, queued, error)
                     {
-                        conversation
-                            .messages
-                            .retain(|message| message.id != reply_id);
-                        if error.is_not_pending()
-                            && let Some(user_id) = queued_message_id.as_deref()
-                            && let Some(message) = conversation
-                                .messages
-                                .iter_mut()
-                                .find(|message| message.id == user_id)
-                        {
-                            message.hidden = true;
-                        }
-                    }
-                    state.release_live_turn(&conversation_id, &run_id);
-                    state.finish_responding(Some(&conversation_id), false);
-                    if error.is_already_consumed() {
                         state.reconcile_thread(&conversation_id, cx);
                     }
                     state.drain_queued_send(&conversation_id, cx);
@@ -14325,22 +14330,51 @@ impl AppState {
     ///
     /// The person's message is still in the thread and is not sent again; the failed row goes,
     /// and the turn is run from the thread as it stands, which is where `send_opengrok_turn`
-    /// reads its history from anyway.
+    /// reads its history from anyway. The failed row's run goes with the turn as the one it
+    /// retries ([`Self::begin_retry`]).
     pub fn retry_turn(&mut self, cx: &mut Context<Self>) {
-        let Some(message_id) = self.retryable_turn() else {
+        let Some(retry) = self.begin_retry(false) else {
             return;
         };
-        let Some(conversation_id) = self.active_conversation_id.clone() else {
-            return;
-        };
-        if let Some(conversation) = self
+        self.send_opengrok_turn(retry.conversation_id, String::new(), retry.of, cx);
+    }
+
+    /// Take the open thread's failed last reply out, to send its turn again: Try again's, or
+    /// Send on Server's (`on_server`). None when the thread's last turn is not one to send again.
+    ///
+    /// The reply's run goes with the retry, named to the server as the run it retries
+    /// (`retryOf`: opengrok-server #300, server main 06db932 (#309, after #308), pin b6ca457).
+    /// The person's message may have been a queued send, which the server keeps as consumed by
+    /// the run that fired it, and the same bubble posted again saying nothing of that run is the
+    /// send firing a second time: it was refused `already-consumed`, and the retry never ran.
+    /// Named, and the run over, the server hands the send to the retry's run, whose own reply is
+    /// minted naming it ([`Self::open_turn`]), so a retry of that reply names the run the send is
+    /// with by then. A retry fires no queued send: it carries no drained hold, and so no
+    /// `pendingId`, beside which the server would not read `retryOf` at all.
+    fn begin_retry(&mut self, on_server: bool) -> Option<Retry> {
+        let message_id = if on_server {
+            self.plan_failed_turn()
+        } else {
+            self.retryable_turn()
+        }?;
+        let conversation_id = self.active_conversation_id.clone()?;
+        let conversation = self
             .conversations
             .iter_mut()
-            .find(|c| c.id == conversation_id)
-        {
-            conversation.messages.retain(|m| m.id != message_id);
+            .find(|c| c.id == conversation_id)?;
+        let of = conversation
+            .messages
+            .iter()
+            .find(|m| m.id == message_id)
+            .and_then(|m| m.run_id.clone());
+        conversation.messages.retain(|m| m.id != message_id);
+        if on_server {
+            self.plan_failures.remove(&message_id);
         }
-        self.send_opengrok_turn(conversation_id, String::new(), cx);
+        Some(Retry {
+            conversation_id,
+            of,
+        })
     }
 
     /// Keep, or let go, why the person's plan could not answer a reply's run.
@@ -14374,31 +14408,22 @@ impl AppState {
 
     /// Send this reply on Server instead: the turn the person's plan could not answer, again, on
     /// the server's paid keys, this once ([`Self::turn_door`]). The failed row goes and the turn
-    /// runs from the thread as it stands, as Try again's does; the person's message is not sent
-    /// twice, and the Bot's door is left where it was, for the turns after this one.
+    /// runs from the thread as it stands, as Try again's does, naming the failed row's run as the
+    /// one it retries ([`Self::begin_retry`]); the person's message is not sent twice, and the
+    /// Bot's door is left where it was, for the turns after this one.
     pub fn send_on_server(&mut self, cx: &mut Context<Self>) {
-        let Some(message_id) = self.plan_failed_turn() else {
+        let Some(retry) = self.begin_retry(true) else {
             return;
         };
-        let Some(conversation_id) = self.active_conversation_id.clone() else {
-            return;
-        };
-        if let Some(conversation) = self
-            .conversations
-            .iter_mut()
-            .find(|c| c.id == conversation_id)
-        {
-            conversation.messages.retain(|m| m.id != message_id);
-        }
-        self.plan_failures.remove(&message_id);
         let recipe = self.active_recipe.as_ref().map(ActiveRecipe::turn);
         self.send_opengrok_turn_with(
-            conversation_id,
+            retry.conversation_id,
             String::new(),
             recipe,
             None,
             None,
             None,
+            retry.of,
             true,
             cx,
         );
@@ -17740,6 +17765,7 @@ impl AppState {
             skill,
             stop_first,
             None,
+            None,
             false,
             cx,
         );
@@ -17801,6 +17827,7 @@ impl AppState {
             next.skill.clone(),
             None,
             Some(next),
+            None,
             false,
             cx,
         );
@@ -18892,6 +18919,44 @@ impl AppState {
         self.canceled_pending
             .retain(|id| !in_this_thread.contains(id.as_str()) || rows.contains_key(id.as_str()));
         fold
+    }
+
+    /// A turn the queue refused before any run began, as the queue's 409: `already-consumed`
+    /// or `not-pending`. The reply bubble the turn minted is no answer and goes, and the thread is
+    /// let go. A hold canceled elsewhere (`not-pending`) takes its message out of sight with it.
+    ///
+    /// Answers whether the thread is read again from the server, which `already-consumed` is:
+    /// another machine fired the send, or the run a retry named is still going or no longer the
+    /// one holding the send, and either way the server has a run this thread is missing.
+    fn drop_refused_turn(
+        &mut self,
+        conversation_id: &str,
+        reply_id: &str,
+        run_id: &str,
+        queued_message_id: Option<&str>,
+        error: &OpenGrokError,
+    ) -> bool {
+        if let Some(conversation) = self
+            .conversations
+            .iter_mut()
+            .find(|conversation| conversation.id == conversation_id)
+        {
+            conversation
+                .messages
+                .retain(|message| message.id != reply_id);
+            if error.is_not_pending()
+                && let Some(user_id) = queued_message_id
+                && let Some(message) = conversation
+                    .messages
+                    .iter_mut()
+                    .find(|message| message.id == user_id)
+            {
+                message.hidden = true;
+            }
+        }
+        self.release_live_turn(conversation_id, run_id);
+        self.finish_responding(Some(conversation_id), false);
+        error.is_already_consumed()
     }
 
     /// A fired hold the server answered 202: it holds the send for the person's Mac and started
@@ -33449,6 +33514,328 @@ mod tests {
             (badge.kind, badge.model.as_deref()),
             (InferenceKind::LocalProxy, Some("gpt-6-luna"))
         );
+    }
+
+    // ---- A retry of a queued message's reply (`retryOf`, opengrok-server #300) ------------------
+
+    use super::Retry;
+
+    /// The queued message every retry here sends again, as the server's recording words it.
+    const QUEUED_BUBBLE: &str = "bubble-queued";
+    const QUEUED_WORDS: &str = "summarise the report I sent this morning";
+
+    /// The open thread `cw_1`: a message that was queued, and the reply of `run_queued`, the run
+    /// that fired it, which ended in `ending`.
+    fn a_queued_messages_reply(ending: &str) -> AppState {
+        let mut state = signed_in_state();
+        state.conversations.push(thread(
+            "cw_1",
+            vec![
+                at(message(QUEUED_BUBBLE, true, QUEUED_WORDS), 10),
+                from_run("m_failed", ending, "run_queued", 20),
+            ],
+        ));
+        state.active_conversation_id = Some("cw_1".into());
+        state
+    }
+
+    /// A client signed in to `server` by its own login, with a token nothing refreshes while a
+    /// test runs (it expires in 2100): a turn does not go out without one.
+    async fn client_signed_in_to(server: &wiremock::MockServer) -> OpenGrokClient {
+        use base64::Engine as _;
+        let part = |json: &str| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json);
+        let token = format!(
+            "{}.{}.not-a-signature",
+            part(r#"{"alg":"HS256","typ":"JWT"}"#),
+            part(r#"{"exp":4102444800}"#)
+        );
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/auth/login"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .append_header("set-cookie", format!("og_access={token}; Path=/"))
+                    .set_body_json(json!({})),
+            )
+            .mount(server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).expect("a URL");
+        client
+            .login("ada@example.com", "pw")
+            .await
+            .expect("signed in");
+        client
+    }
+
+    /// The server's answer to a turn whose `forwardedProps` hold `props`: a run, its stream
+    /// `frames`.
+    async fn runs_for(
+        server: &wiremock::MockServer,
+        props: serde_json::Value,
+        frames: &[serde_json::Value],
+    ) -> wiremock::MockGuard {
+        let stream: String = frames
+            .iter()
+            .map(|frame| format!("data: {frame}\n\n"))
+            .collect();
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/ag-ui"))
+            .and(wiremock::matchers::body_partial_json(
+                json!({ "forwardedProps": props }),
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(stream),
+            )
+            .mount_as_scoped(server)
+            .await
+    }
+
+    /// The server's answer to every other turn: the queue's 409 as its recording `name` under
+    /// `POST /ag-ui` has it, `already-consumed`, naming the run that holds the send.
+    async fn refused_otherwise(server: &wiremock::MockServer, name: &str) {
+        let recorded = format!(
+            "{}/fixtures/wire/rest/POST__ag-ui/{name}",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let recorded: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&recorded).expect("the recording"))
+                .expect("JSON");
+        assert_eq!(recorded["body"]["error"], "already-consumed", "{name}");
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/ag-ui"))
+            .respond_with(wiremock::ResponseTemplate::new(409).set_body_json(&recorded["body"]))
+            .with_priority(10)
+            .mount(server)
+            .await;
+    }
+
+    /// A run that starts and finishes.
+    fn finished() -> Vec<serde_json::Value> {
+        vec![
+            json!({"type": "RUN_STARTED", "threadId": "cw_1", "runId": "r"}),
+            json!({"type": "RUN_FINISHED", "threadId": "cw_1", "runId": "r"}),
+        ]
+    }
+
+    /// `retry` up to the wire, as `send_opengrok_turn_with` takes it there: the thread as it
+    /// stands, the door `turn_door` names, the reply bubble opened under a new run, and the turn
+    /// posted under that run naming the run it retries. A retry fires no held send, so it names
+    /// no queued one. The run, the bubble, and what the turn came to.
+    async fn retry_on_the_wire(
+        state: &mut AppState,
+        client: &OpenGrokClient,
+        retry: &Retry,
+        on_server: bool,
+    ) -> (String, String, Result<String, OpenGrokError>) {
+        let history = state.turn_history(&retry.conversation_id, None);
+        let door = state.turn_door(None, on_server);
+        let (run, reply) = state.open_turn(&retry.conversation_id);
+        let result = client
+            .run_turn(
+                "cw_1",
+                &retry.conversation_id,
+                &run,
+                &history,
+                None,
+                None,
+                None,
+                retry.of.as_deref(),
+                door,
+                |_| {},
+            )
+            .await;
+        (run, reply, result)
+    }
+
+    /// The bodies of the turns `server` was sent, in order.
+    async fn turns_sent(server: &wiremock::MockServer) -> Vec<serde_json::Value> {
+        server
+            .received_requests()
+            .await
+            .expect("the recorder is on")
+            .iter()
+            .filter(|request| request.url.path() == "/ag-ui")
+            .map(|request| serde_json::from_slice(&request.body).expect("a JSON body"))
+            .collect()
+    }
+
+    /// Try again on the reply of a message that was queued names the reply's run as the one it
+    /// retries, and no queued send: the server keeps the send as that run's, and the bubble sent
+    /// again naming nothing was the send firing twice, refused `already-consumed` and never run.
+    /// Named, the turn runs (opengrok-server main 06db932 (#309, after #308), pin b6ca457).
+    #[tokio::test]
+    async fn try_again_on_a_queued_messages_reply_names_its_run_and_runs() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_signed_in_to(&server).await;
+        let _retried = runs_for(&server, json!({"retryOf": "run_queued"}), &finished()).await;
+        refused_otherwise(
+            &server,
+            "409-a_retry_that_names_no_run_is_still_already_consumed.json",
+        )
+        .await;
+        let mut state = a_queued_messages_reply(TURN_UNREACHED_NOTE);
+
+        let retry = state.begin_retry(false).expect("Try again is offered");
+        assert_eq!(retry.of.as_deref(), Some("run_queued"));
+        assert_eq!(
+            ids(&state.conversations[0].messages),
+            [QUEUED_BUBBLE],
+            "the failed reply goes"
+        );
+        let (_, _, result) = retry_on_the_wire(&mut state, &client, &retry, false).await;
+        result.expect("the retry runs, where it was refused already-consumed");
+
+        let sent = turns_sent(&server).await;
+        assert_eq!(sent.len(), 1);
+        assert_eq!(
+            sent[0]["forwardedProps"],
+            json!({ "coworkerId": "cw_1", "retryOf": "run_queued" }),
+            "the run it retries, and no pendingId"
+        );
+        let said = sent[0]["messages"].as_array().expect("the thread");
+        assert_eq!(
+            said.last().map(|message| &message["id"]),
+            Some(&json!(QUEUED_BUBBLE)),
+            "the queued message is the turn's last, as the server finds the send by it"
+        );
+    }
+
+    /// Send this reply on Server names the failed reply's run as Try again does, and the gateway
+    /// for this turn: the server runs a retry where the retry names, over where the send was
+    /// queued to ask (opengrok-server main 06db932 (#309, after #308), pin b6ca457).
+    #[tokio::test]
+    async fn send_on_server_names_the_failed_run_and_the_gateway() {
+        use crate::opengrok::RunErrorCode;
+        let said = "You chose your own subscription, but no proxy address is set; set one in \
+                    your inference source (like http://127.0.0.1:1447), or switch this turn to \
+                    the gateway.";
+        let server = wiremock::MockServer::start().await;
+        let client = client_signed_in_to(&server).await;
+        let on_server = json!({"retryOf": "run_queued", "inferenceSource": "gateway"});
+        let _retried = runs_for(&server, on_server, &finished()).await;
+        refused_otherwise(
+            &server,
+            "409-a_retry_that_names_no_run_is_still_already_consumed.json",
+        )
+        .await;
+        let mut state = a_queued_messages_reply(&format!("{RUN_ERROR_PREFIX}{said}"));
+        with_bot(&mut state, json!("local_proxy"));
+        state.note_plan_failure("m_failed", RunErrorCode::from_code("plan_unavailable"));
+        assert_eq!(
+            state.begin_retry(false),
+            None,
+            "not a turn that did not go through"
+        );
+
+        let retry = state.begin_retry(true).expect("Send on Server is offered");
+        assert_eq!(retry.of.as_deref(), Some("run_queued"));
+        assert_eq!(state.plan_failed_turn(), None, "offered once");
+        let (_, _, result) = retry_on_the_wire(&mut state, &client, &retry, true).await;
+        result.expect("the retry runs on the server's keys");
+
+        let sent = turns_sent(&server).await;
+        assert_eq!(
+            sent[0]["forwardedProps"],
+            json!({
+                "coworkerId": "cw_1",
+                "retryOf": "run_queued",
+                "inferenceSource": "gateway"
+            })
+        );
+    }
+
+    /// A retry's reply is opened under the retry's run, which the server moves the queued send
+    /// to, so Try again on that reply names that run, not the first one: naming the first again
+    /// is the 409 the second of two retries of one reply gets.
+    #[tokio::test]
+    async fn a_second_retry_names_the_run_of_the_first() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_signed_in_to(&server).await;
+        let unreachable = [
+            json!({"type": "RUN_STARTED", "threadId": "cw_1", "runId": "r"}),
+            json!({"type": "RUN_ERROR", "message": "the model gateway is unreachable"}),
+        ];
+        let first_run = runs_for(&server, json!({"retryOf": "run_queued"}), &unreachable).await;
+        refused_otherwise(
+            &server,
+            "409-two_retries_of_one_reply_run_once_and_the_retry_can_be_retried.json",
+        )
+        .await;
+        let mut state = a_queued_messages_reply(TURN_UNREACHED_NOTE);
+
+        let first = state.begin_retry(false).expect("Try again is offered");
+        let (run, reply, result) = retry_on_the_wire(&mut state, &client, &first, false).await;
+        let error = result.expect_err("the gateway was out of reach");
+        assert!(error.unreachable().is_some(), "{error:?}");
+        assert_eq!(
+            bubble(&state, &reply).run_id.as_deref(),
+            Some(run.as_str()),
+            "the retry's reply carries the retry's run"
+        );
+        // The ending the turn paints for that: a turn that did not go through, offered again.
+        if let Some(message) = state.conversations[0]
+            .messages
+            .iter_mut()
+            .find(|message| message.id == reply)
+        {
+            message.content = TURN_UNREACHED_NOTE.to_string();
+        }
+        state.release_live_turn("cw_1", &run);
+        drop(first_run);
+
+        let _second_run = runs_for(&server, json!({"retryOf": run}), &finished()).await;
+        let second = state
+            .begin_retry(false)
+            .expect("Try again on the retry's reply");
+        assert_eq!(second.of.as_deref(), Some(run.as_str()));
+        let (_, _, result) = retry_on_the_wire(&mut state, &client, &second, false).await;
+        result.expect("the second retry runs");
+        let named: Vec<serde_json::Value> = turns_sent(&server)
+            .await
+            .iter()
+            .map(|turn| turn["forwardedProps"]["retryOf"].clone())
+            .collect();
+        assert_eq!(named, [json!("run_queued"), json!(run)]);
+    }
+
+    /// A retry the server refuses `already-consumed` (the run it names still going, or no longer
+    /// the one holding the send) is the queue's refusal as any send's is: the bubble the retry
+    /// minted goes, the message stays in sight, and the thread is read again from the server,
+    /// which has a run this thread is missing.
+    #[tokio::test]
+    async fn a_retry_refused_already_consumed_reads_the_thread_again() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_signed_in_to(&server).await;
+        let refused = format!(
+            "{}/fixtures/wire/rest/POST__ag-ui/\
+             409-a_retry_of_a_reply_still_running_is_already_consumed.json",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let refused: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&refused).expect("the recording"))
+                .expect("JSON");
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/ag-ui"))
+            .and(wiremock::matchers::body_partial_json(
+                json!({"forwardedProps": {"retryOf": "run_queued"}}),
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(409).set_body_json(&refused["body"]))
+            .mount(&server)
+            .await;
+        let mut state = a_queued_messages_reply(TURN_UNREACHED_NOTE);
+
+        let retry = state.begin_retry(false).expect("Try again is offered");
+        let (run, reply, result) = retry_on_the_wire(&mut state, &client, &retry, false).await;
+        let error = result.expect_err("refused");
+        assert!(error.is_already_consumed(), "{error:?}");
+        assert!(
+            state.drop_refused_turn("cw_1", &reply, &run, None, &error),
+            "the thread is read again from the server"
+        );
+        assert_eq!(ids(&state.conversations[0].messages), [QUEUED_BUBBLE]);
+        assert!(!bubble(&state, QUEUED_BUBBLE).hidden);
+        assert!(state.live_turns.is_empty(), "the thread is let go");
     }
 
     /// A held message the server holds for the person's Mac says so, by its row's word as it

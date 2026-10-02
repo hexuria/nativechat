@@ -924,6 +924,16 @@ impl OpenGrokClient {
     /// server drains that row atomically before the harness starts so two machines cannot both
     /// post it. Absent, a last user-message id that matches `clientMessageId` still drains.
     ///
+    /// `retry_of` is the run whose reply this turn sends again: "Try again" and "Send this reply
+    /// on Server" name the run of the reply they replace, as `forwardedProps.retryOf`. A queued
+    /// send's row stays consumed by the run that fired it, and its bubble posted again without
+    /// that run named is the send firing twice, refused `already-consumed`. Named, and the run
+    /// over, the server hands the send to this run and the turn runs afresh; a run still going,
+    /// or any other, is refused as before (opengrok-server #300, server main 06db932 (#309, after
+    /// #308), pin b6ca457: `consume_for_turn` in `crates/opengrok-server/src/agui/pending.rs`).
+    /// A retry never names a queued send: beside `pendingId` the server reads no `retryOf` and
+    /// fires, or refuses, the send as a send, so `pending_id` is left off when this is given.
+    ///
     /// `inference_source` is the Bot's own door for this turn, or for a held send the door the
     /// Bot had when it was queued: it goes as `forwardedProps.inferenceSource` and wins over the
     /// Bot's and the account's for this turn only, so a held send goes where it was typed to go
@@ -951,6 +961,7 @@ impl OpenGrokClient {
         recipe: Option<&TurnRecipe>,
         skill: Option<&str>,
         pending_id: Option<&str>,
+        retry_of: Option<&str>,
         inference_source: Option<TurnSource>,
         mut on_event: F,
     ) -> Result<String, OpenGrokError>
@@ -971,7 +982,9 @@ impl OpenGrokClient {
         if let Some(skill) = skill {
             forwarded["skill"] = Value::String(skill.to_string());
         }
-        if let Some(pending_id) = pending_id.filter(|id| !id.is_empty()) {
+        if let Some(retried) = retry_of.filter(|run| !run.is_empty()) {
+            forwarded["retryOf"] = Value::String(retried.to_string());
+        } else if let Some(pending_id) = pending_id.filter(|id| !id.is_empty()) {
             forwarded["pendingId"] = Value::String(pending_id.to_string());
         }
         let body = json!({
@@ -5143,7 +5156,18 @@ mod tests {
         let server = MockServer::start().await;
         let client = OpenGrokClient::new(&server.uri()).unwrap();
         let error = client
-            .run_turn("cw", "t", "run_1", &[], None, None, None, None, |_| {})
+            .run_turn(
+                "cw",
+                "t",
+                "run_1",
+                &[],
+                None,
+                None,
+                None,
+                None,
+                None,
+                |_| {},
+            )
             .await
             .unwrap_err();
         assert!(error.is_signed_out());
@@ -5697,6 +5721,7 @@ mod tests {
                 None,
                 Some("pum_1"),
                 None,
+                None,
                 |_| {},
             )
             .await
@@ -5708,6 +5733,59 @@ mod tests {
             json!({ "coworkerId": "cw_1", "pendingId": "pum_1" })
         );
         assert_eq!(body["messages"][0]["id"], "msg_1");
+    }
+
+    /// A retry names the run whose reply it sends again, as `retryOf`, and never a queued send
+    /// beside it: beside `pendingId` the server reads no `retryOf`, and fires or refuses the send
+    /// as a send (opengrok-server #300, server main 06db932 (#309, after #308), pin b6ca457:
+    /// `consume_for_turn` in `crates/opengrok-server/src/agui/pending.rs`). An empty run is no
+    /// retry, and a queued send named with it goes as it always has.
+    #[tokio::test]
+    async fn a_retry_names_the_run_it_retries_and_never_a_queued_send() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/ag-ui"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(
+                        "data: {\"type\":\"RUN_FINISHED\",\"runId\":\"r\"}\n\n".to_string(),
+                    ),
+            )
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        put_cookie(&client, &live_session());
+        for (run, retry_of) in [("run_2", Some("run_1")), ("run_3", Some(""))] {
+            client
+                .run_turn(
+                    "cw_1",
+                    "th_1",
+                    run,
+                    &[],
+                    None,
+                    None,
+                    Some("pum_1"),
+                    retry_of,
+                    None,
+                    |_| {},
+                )
+                .await
+                .unwrap();
+        }
+        let requests = server.received_requests().await.expect("the turns");
+        let props: Vec<Value> = requests
+            .iter()
+            .map(|request| serde_json::from_slice::<Value>(&request.body).unwrap())
+            .map(|body| body["forwardedProps"].clone())
+            .collect();
+        assert_eq!(
+            props,
+            [
+                json!({ "coworkerId": "cw_1", "retryOf": "run_1" }),
+                json!({ "coworkerId": "cw_1", "pendingId": "pum_1" }),
+            ]
+        );
     }
 
     /// OpenGrok's 409 for a queued send whose row changed carries the row as it stands now. The
@@ -5782,6 +5860,7 @@ mod tests {
                 None,
                 Some("pum_1"),
                 None,
+                None,
                 |_| {},
             )
             .await
@@ -5810,7 +5889,18 @@ mod tests {
             let client = OpenGrokClient::new(&server.uri()).unwrap();
             put_cookie(&client, &live_session());
             let error = client
-                .run_turn("cw_1", "th_1", "run_1", &[], None, None, None, None, |_| {})
+                .run_turn(
+                    "cw_1",
+                    "th_1",
+                    "run_1",
+                    &[],
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    |_| {},
+                )
                 .await
                 .expect_err("refused");
             assert_eq!(error.status, Some(409));
@@ -5909,7 +5999,18 @@ mod tests {
         // is all that is left, and the app is still showing a roster.
         put_cookie(&client, "og_refresh=tok-r; Path=/; Max-Age=3600");
         client
-            .run_turn("cw", "t", "run_1", &[], None, None, None, None, |_| {})
+            .run_turn(
+                "cw",
+                "t",
+                "run_1",
+                &[],
+                None,
+                None,
+                None,
+                None,
+                None,
+                |_| {},
+            )
             .await
             .expect("the turn goes out, on a token the app fetched for itself");
 
@@ -5945,7 +6046,18 @@ mod tests {
         let client = OpenGrokClient::new(&server.uri()).unwrap();
         put_cookie(&client, &live_session());
         let error = client
-            .run_turn("cw", "t", "run_1", &[], None, None, None, None, |_| {})
+            .run_turn(
+                "cw",
+                "t",
+                "run_1",
+                &[],
+                None,
+                None,
+                None,
+                None,
+                None,
+                |_| {},
+            )
             .await
             .unwrap_err();
         assert!(error.is_signed_out());
@@ -5976,7 +6088,18 @@ mod tests {
         let client = OpenGrokClient::new(&server.uri()).unwrap();
         put_cookie(&client, &live_session());
         let error = client
-            .run_turn("cw", "t", "run_1", &[], None, None, None, None, |_| {})
+            .run_turn(
+                "cw",
+                "t",
+                "run_1",
+                &[],
+                None,
+                None,
+                None,
+                None,
+                None,
+                |_| {},
+            )
             .await
             .unwrap_err();
         assert!(!error.is_signed_out(), "nobody should be asked to sign in");
@@ -6467,6 +6590,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
                 {
                     let first_at = first_at.clone();
                     move |event| {
@@ -6537,6 +6661,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
                 |_| {},
             )
             .await
@@ -6576,6 +6701,7 @@ mod tests {
                     reply_to: None,
                     attachments: Vec::new(),
                 }],
+                None,
                 None,
                 None,
                 None,
@@ -6638,6 +6764,7 @@ mod tests {
                 Some("skl_1"),
                 None,
                 None,
+                None,
                 |_| {},
             )
             .await
@@ -6648,6 +6775,7 @@ mod tests {
                 "thread_1",
                 "run_2",
                 &[said("u1")],
+                None,
                 None,
                 None,
                 None,
@@ -6906,6 +7034,7 @@ mod tests {
                     None,
                     None,
                     None,
+                    None,
                     source,
                     |_| {},
                 )
@@ -6996,7 +7125,18 @@ mod tests {
             let client = client.clone();
             async move {
                 client
-                    .run_turn("cw_1", "thread_1", run, &[], None, None, None, None, |_| {})
+                    .run_turn(
+                        "cw_1",
+                        "thread_1",
+                        run,
+                        &[],
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        |_| {},
+                    )
                     .await
                     .unwrap_err()
             }
@@ -7065,6 +7205,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
                 Some(TurnSource::plan(Some(crate::opengrok::Via::Mac))),
                 |_| {},
             )
@@ -7120,6 +7261,7 @@ mod tests {
                 None,
                 None,
                 Some("pum_1"),
+                None,
                 None,
                 |_| frames += 1,
             )
