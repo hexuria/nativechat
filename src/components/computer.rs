@@ -12,12 +12,14 @@ use crate::components::alert_chrome::{
 use crate::components::fields::field_input;
 use crate::components::switch::Switch;
 use crate::opengrok::{
-    BoxHandoffResolution, ComputerError, CoworkerComputer, LocalExecMode, ScheduleRunStatus,
-    computer_attention_done_id, computer_attention_id, computer_attention_skip_id,
+    BoxHandoffResolution, ComputerError, CoworkerComputer, LocalExecMode, ScheduleEdit,
+    ScheduleRunStatus, computer_attention_done_id, computer_attention_id,
+    computer_attention_skip_id,
 };
 use crate::state::{
-    AgentRoutine, AppState, ComputerView, NewTrigger, RoutineTrigger, ScheduleDayKind,
-    ScheduleSpec, ScheduleUiMode, ScheduleUnit,
+    AgentRoutine, AppState, ComputerView, NewTrigger, ROUTINE_RUNS_UNAVAILABLE, RoutineTrigger,
+    ScheduleDayKind, ScheduleSpec, ScheduleUiMode, ScheduleUnit, routine_notes,
+    routine_trouble_line, unsaved_lines,
 };
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{InputState, Textarea, TextareaState};
@@ -501,9 +503,26 @@ impl ComputerPane {
             .as_ref()
             .map(|r| r.runs.clone())
             .unwrap_or_default();
+        let (missing, unsaved) = {
+            let state = app.read(cx);
+            (
+                state.routine_routes_missing,
+                id.as_ref()
+                    .and_then(|rid| state.routine_unsaved.get(rid).cloned()),
+            )
+        };
+        // A routine the server has. A draft is still this app's, and is made by a route every
+        // server has, so what an older server cannot do to a routine does not touch it.
+        let on_the_server = existing.as_ref().is_some_and(|r| r.saved.is_some());
+        let can_change = !(on_the_server && missing.edit);
+        let can_run = !missing.run_now;
+        let rid = id.clone().unwrap_or_default();
+        // What this server cannot do, said beside the controls it leaves dead, for as long as it
+        // is so: a control that does nothing must say why it does nothing.
+        let notes = routine_notes(missing, on_the_server);
         // The same line the overview puts a refused Update on. A routine's calls go out from
         // this page, so their refusals have to be readable from it.
-        let trouble = app.read(cx).computer_action_error.clone();
+        let trouble = routine_trouble_line(app.read(cx).computer_action_error.as_deref(), &notes);
         let persist = self.persist_routine(app.clone(), coworker_id.clone(), id.clone());
 
         v_flex().size_full().child(
@@ -521,8 +540,20 @@ impl ComputerPane {
                     id.clone(),
                     active,
                     id.is_some() && !triggers.is_empty(),
+                    can_run,
                     persist.clone(),
                 ))
+                .children(notes.into_iter().map(|(tail, note)| {
+                    div()
+                        .id(SharedString::from(format!("routine-{rid}-{tail}")))
+                        .w_full()
+                        .text_xs()
+                        .text_color(muted)
+                        .child(note)
+                }))
+                .when_some(unsaved, |this, edit| {
+                    this.child(unsaved_block(&rid, &edit, muted, theme))
+                })
                 .when_some(trouble, |this, trouble| {
                     this.child(
                         div()
@@ -534,9 +565,9 @@ impl ComputerPane {
                     )
                 })
                 .child(field_label("Name", muted))
-                .child(field_input(&self.name_input))
+                .child(field_input(&self.name_input).disabled(!can_change))
                 .child(field_label("Instruction", muted))
-                .child(field_textarea(&self.instruction_input, theme))
+                .child(field_textarea(&self.instruction_input, theme).disabled(!can_change))
                 .child(field_label("When to run", muted))
                 .child(self.triggers_box(
                     &triggers,
@@ -546,10 +577,21 @@ impl ComputerPane {
                     app.clone(),
                     theme,
                     persist.clone(),
+                    can_change,
                     cx,
                 ))
                 .child(field_label("Run history", muted))
-                .child(if runs.is_empty() {
+                .child(if on_the_server && missing.runs {
+                    // Not "No runs yet": nobody knows that, because this server cannot say.
+                    div()
+                        .id(SharedString::from(format!(
+                            "routine-{rid}-runs-unavailable"
+                        )))
+                        .text_sm()
+                        .text_color(muted)
+                        .child(ROUTINE_RUNS_UNAVAILABLE)
+                        .into_any_element()
+                } else if runs.is_empty() {
                     div()
                         .text_sm()
                         .text_color(muted)
@@ -633,6 +675,7 @@ impl ComputerPane {
         app: Entity<AppState>,
         theme: &gpui_kit::component::Theme,
         persist: Rc<dyn Fn(&mut App) + 'static>,
+        can_change: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let last_schedule = triggers.iter().rev().find_map(|t| match t {
@@ -704,9 +747,36 @@ impl ComputerPane {
                     self.custom_cron.clone(),
                     muted,
                     theme,
+                    can_change,
                 ))
             })
     }
+}
+
+/// What the person typed that a server unable to change a routine refused, beside the fields,
+/// which went back to the server's values. Their words are not lost to a refusal they had no
+/// part in, and nothing on screen claims they were saved.
+fn unsaved_block(
+    routine_id: &str,
+    edit: &ScheduleEdit,
+    muted: Hsla,
+    theme: &gpui_kit::component::Theme,
+) -> impl IntoElement {
+    v_flex()
+        .id(SharedString::from(format!("routine-{routine_id}-unsaved")))
+        .w_full()
+        .gap(px(6.))
+        .p(px(10.))
+        .rounded(px(8.))
+        .border_1()
+        .border_color(theme.border)
+        .child(div().text_xs().text_color(theme.danger).child("Not saved"))
+        .children(unsaved_lines(edit).into_iter().map(|(label, value)| {
+            v_flex()
+                .w_full()
+                .child(div().text_xs().text_color(muted).child(label))
+                .child(div().text_sm().child(value))
+        }))
 }
 
 /// The space between the routine editor's controls, across and down alike.
@@ -726,6 +796,7 @@ fn routine_actions(
     id: Option<String>,
     active: bool,
     has_thread: bool,
+    can_run: bool,
     persist: Rc<dyn Fn(&mut App)>,
 ) -> impl IntoElement {
     h_flex()
@@ -810,6 +881,7 @@ fn routine_actions(
                         .debug_selector(|| "routine-test".into())
                         .primary()
                         .label("Test run")
+                        .disabled(!can_run)
                         .on_click(move |_, _, cx| {
                             persist(cx);
                             if let Some(id) = id.clone() {
@@ -1491,10 +1563,7 @@ fn field_label(label: &'static str, muted: Hsla) -> impl IntoElement {
     div().text_xs().text_color(muted).child(label)
 }
 
-fn field_textarea(
-    state: &Entity<TextareaState>,
-    theme: &gpui_kit::component::Theme,
-) -> impl IntoElement {
+fn field_textarea(state: &Entity<TextareaState>, theme: &gpui_kit::component::Theme) -> Textarea {
     Textarea::new(state)
         .appearance(false)
         .w_full()
@@ -1785,6 +1854,7 @@ fn schedule_editor(
     custom_cron: Entity<InputState>,
     muted: Hsla,
     theme: &gpui_kit::component::Theme,
+    enabled: bool,
 ) -> impl IntoElement {
     let patch = {
         let app = app.clone();
@@ -1807,16 +1877,24 @@ fn schedule_editor(
         .border_color(theme.border)
         .p(px(10.))
         .gap(px(8.))
-        .child(mode_row(spec.clone(), patch.clone()))
+        .child(mode_row(spec.clone(), patch.clone(), enabled))
         .child(match spec.mode {
-            ScheduleUiMode::Interval => interval_row(spec, patch).into_any_element(),
-            ScheduleUiMode::Custom => field_input(&custom_cron).into_any_element(),
-            ScheduleUiMode::Advanced => advanced_editor(spec, patch, muted).into_any_element(),
+            ScheduleUiMode::Interval => interval_row(spec, patch, enabled).into_any_element(),
+            ScheduleUiMode::Custom => field_input(&custom_cron)
+                .disabled(!enabled)
+                .into_any_element(),
+            ScheduleUiMode::Advanced => {
+                advanced_editor(spec, patch, muted, enabled).into_any_element()
+            }
         })
 }
 
 #[allow(clippy::type_complexity)]
-fn mode_row(spec: ScheduleSpec, patch: Rc<dyn Fn(ScheduleSpec, &mut App)>) -> impl IntoElement {
+fn mode_row(
+    spec: ScheduleSpec,
+    patch: Rc<dyn Fn(ScheduleSpec, &mut App)>,
+    enabled: bool,
+) -> impl IntoElement {
     let label = match spec.mode {
         ScheduleUiMode::Interval => "Interval",
         ScheduleUiMode::Custom => "Custom",
@@ -1825,6 +1903,7 @@ fn mode_row(spec: ScheduleSpec, patch: Rc<dyn Fn(ScheduleSpec, &mut App)>) -> im
     Button::new("sched-mode")
         .ghost()
         .label(label)
+        .disabled(!enabled)
         .dropdown_menu(move |menu, _, _| {
             let item = |name: &'static str,
                         mode: ScheduleUiMode,
@@ -1868,7 +1947,11 @@ fn mode_row(spec: ScheduleSpec, patch: Rc<dyn Fn(ScheduleSpec, &mut App)>) -> im
 }
 
 #[allow(clippy::type_complexity)]
-fn interval_row(spec: ScheduleSpec, patch: Rc<dyn Fn(ScheduleSpec, &mut App)>) -> impl IntoElement {
+fn interval_row(
+    spec: ScheduleSpec,
+    patch: Rc<dyn Fn(ScheduleSpec, &mut App)>,
+    enabled: bool,
+) -> impl IntoElement {
     h_flex()
         .w_full()
         .gap(px(6.))
@@ -1880,6 +1963,7 @@ fn interval_row(spec: ScheduleSpec, patch: Rc<dyn Fn(ScheduleSpec, &mut App)>) -
             Button::new("sched-every")
                 .ghost()
                 .label(spec.every.to_string())
+                .disabled(!enabled)
                 .dropdown_menu(move |menu, _, _| {
                     let mut menu = menu;
                     for n in [1, 2, 5, 10, 15, 30, 45, 60] {
@@ -1905,6 +1989,7 @@ fn interval_row(spec: ScheduleSpec, patch: Rc<dyn Fn(ScheduleSpec, &mut App)>) -
             Button::new("sched-unit")
                 .ghost()
                 .label(unit_label)
+                .disabled(!enabled)
                 .dropdown_menu(move |menu, _, _| {
                     let item =
                         |name: &'static str,
@@ -1944,6 +2029,7 @@ fn advanced_editor(
     spec: ScheduleSpec,
     patch: Rc<dyn Fn(ScheduleSpec, &mut App)>,
     muted: Hsla,
+    enabled: bool,
 ) -> impl IntoElement {
     v_flex()
         .w_full()
@@ -1953,20 +2039,20 @@ fn advanced_editor(
                 .gap(px(8.))
                 .items_center()
                 .child(div().text_xs().text_color(muted).w(px(52.)).child("Months"))
-                .child(months_menu(spec.clone(), patch.clone())),
+                .child(months_menu(spec.clone(), patch.clone(), enabled)),
         )
         .child(
             h_flex()
                 .gap(px(8.))
                 .items_center()
                 .child(div().text_xs().text_color(muted).w(px(52.)).child("Days"))
-                .child(days_menu(spec.clone(), patch.clone()))
+                .child(days_menu(spec.clone(), patch.clone(), enabled))
                 .when(spec.day_kind == ScheduleDayKind::DaysOfMonth, |this| {
-                    this.child(month_day_menu(spec.clone(), patch.clone()))
+                    this.child(month_day_menu(spec.clone(), patch.clone(), enabled))
                 }),
         )
         .when(spec.day_kind == ScheduleDayKind::Weekdays, |this| {
-            this.child(weekday_chips(spec.clone(), patch.clone()))
+            this.child(weekday_chips(spec.clone(), patch.clone(), enabled))
         })
         .child(
             h_flex()
@@ -1983,11 +2069,9 @@ fn advanced_editor(
                 .child(
                     v_flex()
                         .gap(px(6.))
-                        .children(
-                            spec.times.iter().enumerate().map(|(i, (h, m))| {
-                                time_row(i, *h, *m, spec.clone(), patch.clone())
-                            }),
-                        )
+                        .children(spec.times.iter().enumerate().map(|(i, (h, m))| {
+                            time_row(i, *h, *m, spec.clone(), patch.clone(), enabled)
+                        }))
                         .child({
                             let spec = spec.clone();
                             let patch = patch.clone();
@@ -1996,13 +2080,16 @@ fn advanced_editor(
                                 .px(px(8.))
                                 .py(px(4.))
                                 .rounded(px(6.))
-                                .cursor_pointer()
-                                .hover(|s| s.bg(rgb(0x777777).opacity(0.12)))
-                                .on_mouse_down(MouseButton::Left, move |_, _, cx| {
-                                    let mut next = spec.clone();
-                                    next.times.push((9, 0));
-                                    patch(next, cx);
+                                .when(enabled, |this| {
+                                    this.cursor_pointer()
+                                        .hover(|s| s.bg(rgb(0x777777).opacity(0.12)))
+                                        .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                                            let mut next = spec.clone();
+                                            next.times.push((9, 0));
+                                            patch(next, cx);
+                                        })
                                 })
+                                .when(!enabled, |this| this.opacity(0.5))
                                 .child(div().text_sm().child("+ Add time"))
                         }),
                 ),
@@ -2010,7 +2097,11 @@ fn advanced_editor(
 }
 
 #[allow(clippy::type_complexity)]
-fn months_menu(spec: ScheduleSpec, patch: Rc<dyn Fn(ScheduleSpec, &mut App)>) -> impl IntoElement {
+fn months_menu(
+    spec: ScheduleSpec,
+    patch: Rc<dyn Fn(ScheduleSpec, &mut App)>,
+    enabled: bool,
+) -> impl IntoElement {
     let label = if spec.months.is_empty() {
         "Any month"
     } else {
@@ -2019,6 +2110,7 @@ fn months_menu(spec: ScheduleSpec, patch: Rc<dyn Fn(ScheduleSpec, &mut App)>) ->
     Button::new("sched-months")
         .ghost()
         .label(label)
+        .disabled(!enabled)
         .dropdown_menu(move |menu, _, _| {
             let names = [
                 "January",
@@ -2066,7 +2158,11 @@ fn months_menu(spec: ScheduleSpec, patch: Rc<dyn Fn(ScheduleSpec, &mut App)>) ->
 }
 
 #[allow(clippy::type_complexity)]
-fn days_menu(spec: ScheduleSpec, patch: Rc<dyn Fn(ScheduleSpec, &mut App)>) -> impl IntoElement {
+fn days_menu(
+    spec: ScheduleSpec,
+    patch: Rc<dyn Fn(ScheduleSpec, &mut App)>,
+    enabled: bool,
+) -> impl IntoElement {
     let label = match spec.day_kind {
         ScheduleDayKind::EveryDay => "Every day",
         ScheduleDayKind::Weekdays => "Days of the week",
@@ -2075,6 +2171,7 @@ fn days_menu(spec: ScheduleSpec, patch: Rc<dyn Fn(ScheduleSpec, &mut App)>) -> i
     Button::new("sched-days")
         .ghost()
         .label(label)
+        .disabled(!enabled)
         .dropdown_menu(move |menu, _, _| {
             let item = |name: &'static str,
                         kind: ScheduleDayKind,
@@ -2111,6 +2208,7 @@ fn days_menu(spec: ScheduleSpec, patch: Rc<dyn Fn(ScheduleSpec, &mut App)>) -> i
 fn month_day_menu(
     spec: ScheduleSpec,
     patch: Rc<dyn Fn(ScheduleSpec, &mut App)>,
+    enabled: bool,
 ) -> impl IntoElement {
     let label = spec
         .month_days
@@ -2126,6 +2224,7 @@ fn month_day_menu(
     Button::new("sched-mdays")
         .ghost()
         .label(label)
+        .disabled(!enabled)
         .dropdown_menu(move |menu, _, _| {
             let mut menu = menu;
             for d in 1u8..=31 {
@@ -2161,6 +2260,7 @@ fn month_day_menu(
 fn weekday_chips(
     spec: ScheduleSpec,
     patch: Rc<dyn Fn(ScheduleSpec, &mut App)>,
+    enabled: bool,
 ) -> impl IntoElement {
     let names = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
     h_flex().gap(px(4.)).children((0u8..7).map(|d| {
@@ -2173,17 +2273,20 @@ fn weekday_chips(
             .py(px(4.))
             .rounded(px(6.))
             .bg(rgb(0x777777).opacity(if on { 0.28 } else { 0.1 }))
-            .cursor_pointer()
-            .on_mouse_down(MouseButton::Left, move |_, _, cx| {
-                let mut next = spec.clone();
-                if let Some(pos) = next.weekdays.iter().position(|x| *x == d) {
-                    next.weekdays.remove(pos);
-                } else {
-                    next.weekdays.push(d);
-                    next.weekdays.sort();
-                }
-                patch(next, cx);
+            .when(enabled, |this| {
+                this.cursor_pointer()
+                    .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                        let mut next = spec.clone();
+                        if let Some(pos) = next.weekdays.iter().position(|x| *x == d) {
+                            next.weekdays.remove(pos);
+                        } else {
+                            next.weekdays.push(d);
+                            next.weekdays.sort();
+                        }
+                        patch(next, cx);
+                    })
             })
+            .when(!enabled, |this| this.opacity(0.5))
             .child(div().text_xs().child(names[d as usize]))
     }))
 }
@@ -2195,6 +2298,7 @@ fn time_row(
     minute: u8,
     spec: ScheduleSpec,
     patch: Rc<dyn Fn(ScheduleSpec, &mut App)>,
+    enabled: bool,
 ) -> impl IntoElement {
     let label = {
         let (h12, am) = if hour == 0 {
@@ -2215,6 +2319,7 @@ fn time_row(
             Button::new(SharedString::from(format!("time-{index}")))
                 .ghost()
                 .label(label)
+                .disabled(!enabled)
                 .dropdown_menu({
                     let spec = spec.clone();
                     let patch = patch.clone();
@@ -2257,18 +2362,20 @@ fn time_row(
                 .flex()
                 .items_center()
                 .justify_center()
-                .cursor_pointer()
-                .on_mouse_down(MouseButton::Left, {
-                    let spec = spec.clone();
-                    let patch = patch.clone();
-                    move |_, _, cx| {
-                        let mut next = spec.clone();
-                        if index < next.times.len() {
-                            next.times.remove(index);
+                .when(enabled, |this| {
+                    this.cursor_pointer().on_mouse_down(MouseButton::Left, {
+                        let spec = spec.clone();
+                        let patch = patch.clone();
+                        move |_, _, cx| {
+                            let mut next = spec.clone();
+                            if index < next.times.len() {
+                                next.times.remove(index);
+                            }
+                            patch(next, cx);
                         }
-                        patch(next, cx);
-                    }
+                    })
                 })
+                .when(!enabled, |this| this.opacity(0.5))
                 .child(div().text_sm().child("×")),
         )
 }
@@ -2331,6 +2438,7 @@ mod tests {
                     "cw_1".into(),
                     Some("sch_1".into()),
                     self.active,
+                    true,
                     true,
                     std::rc::Rc::new(|_| {}),
                 ))

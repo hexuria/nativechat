@@ -89,9 +89,19 @@
 //! asks for the other way), `routine-{id}-trigger-schedule`,
 //! `routine-{id}-trigger-webhook`, `routine-{id}-webhook-url`,
 //! `routine-{id}-webhook-key`, `routine-{id}-rotate`, `routine-{id}-test` (Test run, on a
-//! routine the server has), `routine-{id}-run-{runId}` (one Run history line: label `Test run` /
-//! `Webhook` / `Schedule`, value `running` / `waiting` / `ok` / `error`; a click opens the
+//! routine the server has; disabled, and a click refused in the editor's words, on a server that
+//! cannot run a routine on demand), `routine-{id}-run-{runId}` (one Run history line: label `Test
+//! run` / `Webhook` / `Schedule`, value `running` / `waiting` / `ok` / `error`; a click opens the
 //! routine's thread), `routine-{id}-delete`.
+//! What an older server cannot do with a routine (one from before opengrok-server 18656e3), each
+//! in the tree only while it is so, label = the editor's words: `routine-{id}-cant-change` (it
+//! cannot change a routine once it is made: the fields are dead, and `routine.edit` is refused),
+//! `routine-{id}-cant-run` (it cannot run one on demand), `routine-{id}-runs-unavailable` (in the
+//! Run history's place: it cannot list a routine's runs) and `routine-{id}-unsaved` (label `Not
+//! saved`, value = what the person typed that it did not keep, one `Label: value` line each).
+//! `routine-error` (under `computer-pane`, while a routine's editor is open and shows one: its red
+//! line, the last refusal in the server's words or what the server answered when it said
+//! nothing; never `request failed`).
 //! `routine-{id}-thread` (Open thread, on a routine the server has); on a routine's thread the
 //! chat carries `chat-routine-thread` (the line centred under the bot chip: label the routine's
 //! name, value `schedule` / `webhook`) and `chat-routine-instructions` (value = how many bubbles
