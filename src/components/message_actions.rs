@@ -1,3 +1,4 @@
+use crate::chrome::CONTROL_ICON_PX;
 use crate::icons::NativeIcon;
 use crate::state::{AppState, ReplyTo};
 use gpui_kit::base::ElementExt as _;
@@ -106,8 +107,8 @@ impl MessageToolbar {
         Button::new(ElementId::Name(id))
             .icon(icon.into().text_color(color))
             .ghost()
-            // Medium is the 16px icon; the square itself is set below, over the preset.
-            .with_size(Size::Medium)
+            // Custom presets assign 75% to the icon; keep the hitbox unchanged below.
+            .with_size(Size::Size(px(CONTROL_ICON_PX / 0.75)))
             .size(px(CONTROL_PX))
             .p_0()
             .rounded(px(6.))

@@ -8,6 +8,7 @@ pub use sources::{AppCommand, ComposerPick, TokenKind};
 
 use crate::actions::{Library, NewChat, OpenSettings, Projects, ToggleTheme};
 use crate::audio::AudioInput;
+use crate::chrome::COMPOSER_ICON_PX;
 use crate::components::composer_editor::ComposerEditor;
 use crate::components::composer_panel::{ComposerPanel, ComposerPanelEvent, ComposerPanelRow};
 use crate::components::voice_wave::VoiceWave;
@@ -20,7 +21,7 @@ use std::path::{Path, PathBuf};
 
 use gpui_kit::InteractiveElement;
 use gpui_kit::component::{
-    ActiveTheme, Icon, IconName,
+    ActiveTheme, Icon, IconName, Sizable, Size as ComponentSize,
     button::{Button, ButtonVariants},
     h_flex,
     input::InputEvent,
@@ -2224,6 +2225,8 @@ impl Render for MessageInput {
                             // The one wide panel, for everything the composer offers.
                             Button::new("add-app")
                                 .icon(IconName::Plus)
+                                .with_size(ComponentSize::Large)
+                                .size(px(32.))
                                 .ghost()
                                 .rounded_full()
                                 .when(!any_modal_open, |this| this.cursor_pointer())
@@ -2512,7 +2515,7 @@ impl Render for MessageInput {
                                             .child(
                                                 svg()
                                                     .path("icons/mic.svg")
-                                                    .size(px(18.0))
+                                                    .size(px(COMPOSER_ICON_PX))
                                                     .text_color(secondary_foreground),
                                             );
 
@@ -2586,7 +2589,7 @@ impl Render for MessageInput {
                                                 .child(
                                                     svg()
                                                         .path("icons/sparkles.svg")
-                                                        .size(px(18.0))
+                                                        .size(px(COMPOSER_ICON_PX))
                                                         .text_color(secondary_foreground),
                                                 );
 
@@ -2618,6 +2621,7 @@ impl Render for MessageInput {
                                                 })
                                                 .child(
                                                     Icon::new(IconName::ArrowUp)
+                                                        .size(px(COMPOSER_ICON_PX))
                                                         .text_color(background),
                                                 );
 

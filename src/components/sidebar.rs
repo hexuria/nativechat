@@ -1,5 +1,6 @@
 use crate::chrome::{
-    AVATAR_PX, MASCOT_BOX_PX, RAIL_HOVER, RAIL_HOVER_ALPHA, SIDEBAR_GAP, SIDEBAR_ROW, TITLE_BAR_H,
+    AVATAR_PX, CONTROL_ICON_PX, MASCOT_BOX_PX, RAIL_HOVER, RAIL_HOVER_ALPHA, SIDEBAR_GAP,
+    SIDEBAR_ROW, TITLE_BAR_H,
 };
 use crate::components::persona::PersonaMark;
 use crate::icons::NativeIcon;
@@ -10,7 +11,7 @@ use gpui_kit::base::{Align, ElementExt as _, POPUP_PRIORITY, Placement, Position
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::menu::{ContextMenuExt, PopupMenu, PopupMenuItem};
-use gpui_kit::component::{ActiveTheme, Icon, IconName, h_flex, v_flex};
+use gpui_kit::component::{ActiveTheme, Icon, IconName, Sizable, Size, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 use std::time::{Duration, SystemTime};
@@ -126,9 +127,11 @@ pub(crate) fn sidebar_toggle_button(
 ) -> Button {
     Button::new(id)
         .ghost()
+        // Custom button presets assign 75% of their size to the icon.
+        .with_size(Size::Size(px(CONTROL_ICON_PX / 0.75)))
         .size(px(size))
         .rounded(px(10.))
-        .icon(kit_icon("icons/panel-left.svg", 16., fg))
+        .icon(kit_icon("icons/panel-left.svg", CONTROL_ICON_PX, fg))
         .tooltip(if hidden {
             "Show sidebar · Right-click: Mini/Expanded"
         } else {
@@ -686,7 +689,7 @@ impl SidebarView {
                                 }
                             })
                         })
-                        .child(Icon::new(IconName::Plus).size(px(16.))),
+                        .child(Icon::new(IconName::Plus).size(px(CONTROL_ICON_PX))),
                 )
             })
     }
@@ -784,7 +787,7 @@ impl SidebarView {
                     })
                     .child(
                         Icon::new(IconName::Plus)
-                            .size(px(16.))
+                            .size(px(CONTROL_ICON_PX))
                             .text_color(icon_color),
                     ),
             )
@@ -811,7 +814,7 @@ impl SidebarView {
                     })
                     .child(
                         Icon::new(IconName::Search)
-                            .size(px(16.))
+                            .size(px(CONTROL_ICON_PX))
                             .text_color(icon_color),
                     )
                     .child(div().text_sm().text_color(icon_color).child("Search")),
@@ -991,7 +994,12 @@ impl SidebarView {
                     on_click(cx);
                 })
             })
-            .child(Icon::default().path(icon).size(px(16.)).text_color(fg))
+            .child(
+                Icon::default()
+                    .path(icon)
+                    .size(px(CONTROL_ICON_PX))
+                    .text_color(fg),
+            )
             .when(!collapsed, |this| this.child(div().text_sm().child(label)))
     }
 }
