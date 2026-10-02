@@ -445,6 +445,7 @@ impl OpenGrokClient {
         error
             .with_code(error_code_from_body(body))
             .with_pending_event(event)
+            .with_said_nothing(body.trim().is_empty())
     }
 
     /// Nothing on a 2xx, the server's error otherwise. For the doors that answer 204.
@@ -10086,6 +10087,79 @@ mod tests {
         let error = client.delete_schedule("sch_1").await.unwrap_err();
         assert_eq!(error.status, Some(404));
         assert_eq!(error.message, "No such schedule.");
+    }
+
+    /// An opengrok-server from before the one that can edit a routine, run it now and list what
+    /// it ran (opengrok-server 18656e3, `autonomy/routes.rs`) answers the three the way axum
+    /// answers what it has no route for: `GET …/runs` and `POST …/run` with an empty 404, and
+    /// `PATCH /schedules/{id}`, a path it has for `DELETE` only, with an empty 405. Each reads as
+    /// the route missing, which is a fact about the server and not about the routine.
+    #[tokio::test]
+    async fn an_older_server_without_the_routine_routes_says_so_by_its_empty_answers() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/schedules/sch_1/runs"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path("/schedules/sch_1"))
+            .respond_with(ResponseTemplate::new(405))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/schedules/sch_1/run"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+
+        let runs = client.schedule_runs("sch_1").await.unwrap_err();
+        assert!(runs.route_missing(), "{runs}");
+        assert!(runs.said_nothing(), "nothing the server wrote: {runs}");
+        let edit = client
+            .edit_schedule(
+                "sch_1",
+                &ScheduleEdit {
+                    cron: Some("* * * * *".into()),
+                    ..ScheduleEdit::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(edit.route_missing(), "{edit}");
+        let run = client.run_schedule_now("sch_1").await.unwrap_err();
+        assert!(run.route_missing(), "{run}");
+    }
+
+    /// The server's own 404 for a routine it does not have (or will not show this person) is
+    /// plain text, `no such schedule` (`owned_schedule`): its words, about the routine, on a
+    /// route it has. An empty 500 says nothing, and is still no missing route.
+    #[tokio::test]
+    async fn a_404_with_the_servers_words_is_about_the_routine_and_not_a_missing_route() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/schedules/sch_gone/run"))
+            .respond_with(ResponseTemplate::new(404).set_body_string("no such schedule"))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/schedules/sch_1/runs"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+
+        let gone = client.run_schedule_now("sch_gone").await.unwrap_err();
+        assert!(!gone.route_missing(), "{gone}");
+        assert!(!gone.said_nothing());
+        assert_eq!(gone.message, "no such schedule");
+        let broken = client.schedule_runs("sch_1").await.unwrap_err();
+        assert!(broken.said_nothing(), "{broken}");
+        assert!(
+            !broken.route_missing(),
+            "a 500 is not a route the server lacks"
+        );
     }
 
     #[tokio::test]

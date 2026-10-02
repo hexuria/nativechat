@@ -112,6 +112,9 @@ pub mod ids {
     /// The one control that opens a blank routine, whichever of its two shapes the Computer
     /// pane is drawing: the "Create routine" card when the bot has none, the `+` when it has.
     pub const ROUTINE_NEW: &str = "routine-new";
+    /// The open routine editor's red line: the last refusal, in the server's words, unless a
+    /// note of the routine's already says it. In the tree only while the editor shows one.
+    pub const ROUTINE_ERROR: &str = "routine-error";
     /// Under `computer-status`, while the Computer pane says why the server could not give the
     /// bot a computer: the server's words as the pane shows them, with its code as the value.
     pub const COMPUTER_ERROR: &str = "computer-error";
@@ -288,9 +291,27 @@ pub mod ids {
         format!("routine-{id}-active")
     }
 
-    /// Test run: the server starts the routine now. Only on a routine the server has.
+    /// Test run: the server starts the routine now. Only on a routine the server has; dead on a
+    /// server that cannot run a routine on demand.
     pub fn routine_test(id: &str) -> String {
         format!("routine-{id}-test")
+    }
+
+    /// What the editor says its server cannot do with the routine, beside the controls it leaves
+    /// dead, by the line's word: `cant-change` (it cannot change a routine once it is made) and
+    /// `cant-run` (it cannot run one on demand). In the tree only while it is so.
+    pub fn routine_note(id: &str, word: &str) -> String {
+        format!("routine-{id}-{word}")
+    }
+
+    /// In the Run history's place, on a server that cannot list a routine's runs.
+    pub fn routine_runs_unavailable(id: &str) -> String {
+        format!("routine-{id}-runs-unavailable")
+    }
+
+    /// What the person typed that a server unable to change the routine did not keep.
+    pub fn routine_unsaved(id: &str) -> String {
+        format!("routine-{id}-unsaved")
     }
 
     /// One line of the routine's Run history, by the server's run id. Its label is what set
@@ -1486,6 +1507,24 @@ struct RoutineSnap {
     webhook_key: Option<String>,
     /// Run history, newest first: run id, what set it off, where it got to.
     runs: Vec<(String, &'static str, &'static str)>,
+    /// What the editor says the server cannot do with this routine (`state::routine_notes`).
+    notes: Vec<(&'static str, &'static str)>,
+    /// The server cannot list this routine's runs, so the history says so in their place.
+    runs_unavailable: bool,
+    /// What the person typed that the server did not keep, line by line.
+    unsaved: Vec<(&'static str, String)>,
+}
+
+impl RoutineSnap {
+    /// Test run is dead: the server cannot run a routine on demand.
+    fn run_dead(&self) -> bool {
+        self.notes.iter().any(|(word, _)| *word == "cant-run")
+    }
+
+    /// The routine's fields are dead: the server cannot change it once it is made.
+    fn cant_change(&self) -> bool {
+        self.notes.iter().any(|(word, _)| *word == "cant-change")
+    }
 }
 
 /// The open recipe as the driver needs it: whether Run can be pressed and which bot it plays on,
@@ -2063,7 +2102,8 @@ fn computer_handoff_node(handoff: &ComputerHandoffSnap) -> UiNode {
 ///
 /// A routine is one schedule, so the trigger says what kind it is and carries the one fact
 /// worth asserting on: the cron line the server keeps, or the URL it minted.
-fn routine_snap(routine: &crate::state::AgentRoutine) -> RoutineSnap {
+fn routine_snap(routine: &crate::state::AgentRoutine, state: &AppState) -> RoutineSnap {
+    let on_the_server = routine.saved.is_some();
     let mut snap = RoutineSnap {
         id: routine.id.clone(),
         name: if routine.name.trim().is_empty() {
@@ -2090,6 +2130,13 @@ fn routine_snap(routine: &crate::state::AgentRoutine) -> RoutineSnap {
                 (run.run_id.clone(), run.cause_label(), status)
             })
             .collect(),
+        notes: crate::state::routine_notes(state.routine_routes_missing, on_the_server),
+        runs_unavailable: on_the_server && state.routine_routes_missing.runs,
+        unsaved: state
+            .routine_unsaved
+            .get(&routine.id)
+            .map(crate::state::unsaved_lines)
+            .unwrap_or_default(),
     };
     match routine.triggers.first() {
         Some(crate::state::RoutineTrigger::Schedule { spec, .. }) => {
@@ -2158,11 +2205,35 @@ fn routine_node(routine: &RoutineSnap) -> UiNode {
     }
     if routine.kind != "draft" {
         node = node
-            .with_child(UiNode::button(ids::routine_test(&routine.id), "Test run"))
+            .with_child(
+                UiNode::button(ids::routine_test(&routine.id), "Test run")
+                    .with_enabled(!routine.run_dead()),
+            )
             .with_child(UiNode::button(
                 ids::routine_thread(&routine.id),
                 "Open thread",
             ));
+    }
+    for (word, words) in &routine.notes {
+        node = node.with_child(UiNode::status(ids::routine_note(&routine.id, word), *words));
+    }
+    if !routine.unsaved.is_empty() {
+        node = node.with_child(
+            UiNode::status(ids::routine_unsaved(&routine.id), "Not saved").with_value(
+                routine
+                    .unsaved
+                    .iter()
+                    .map(|(label, value)| format!("{label}: {value}"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            ),
+        );
+    }
+    if routine.runs_unavailable {
+        node = node.with_child(UiNode::status(
+            ids::routine_runs_unavailable(&routine.id),
+            crate::state::ROUTINE_RUNS_UNAVAILABLE,
+        ));
     }
     for (run_id, cause, status) in &routine.runs {
         node = node.with_child(
@@ -2594,6 +2665,8 @@ pub struct NativeChatHost {
     computers: Vec<(String, String, crate::opengrok::LocalExecMode, bool)>,
     /// The open bot's routines, as the Computer pane lists them.
     routines: Vec<RoutineSnap>,
+    /// The red line of the routine editor, while one is open and shows one.
+    routine_error: Option<String>,
     /// The open thread's routine, when it is one of the bot's routines' threads: its name and
     /// the server's word for what fires it.
     routine_thread: Option<(String, String)>,
@@ -2959,6 +3032,24 @@ impl NativeChatHost {
                         .count()
                 }),
             bot_chip_goes_home: state.bot_chip_goes_home(),
+            routine_error: match (&state.computer_view, state.right_pane) {
+                (
+                    crate::state::ComputerView::Editor { id: Some(open) },
+                    crate::state::RightPane::Computer,
+                ) => {
+                    let on_the_server = state.active_coworker_id.as_deref().is_some_and(|bot| {
+                        state
+                            .coworker_routines(bot)
+                            .iter()
+                            .any(|routine| &routine.id == open && routine.saved.is_some())
+                    });
+                    crate::state::routine_trouble_line(
+                        state.computer_action_error.as_deref(),
+                        &crate::state::routine_notes(state.routine_routes_missing, on_the_server),
+                    )
+                }
+                _ => None,
+            },
             routine_thread: state
                 .active_thread_origin()
                 .map(|origin| (origin.routine_name.clone(), origin.word.clone())),
@@ -2968,7 +3059,7 @@ impl NativeChatHost {
                 .map(|id| state.coworker_routines(id))
                 .unwrap_or_default()
                 .iter()
-                .map(routine_snap)
+                .map(|routine| routine_snap(routine, state))
                 .collect(),
             composer_panel: state.composer_panel,
             composer_chips: state.composer_chips.clone(),
@@ -3538,6 +3629,9 @@ impl NativeChatHost {
             );
         }
         computer = computer.with_child(UiNode::button(ids::ROUTINE_NEW, "Create routine"));
+        if let Some(line) = &self.routine_error {
+            computer = computer.with_child(UiNode::status(ids::ROUTINE_ERROR, line.clone()));
+        }
         for routine in &self.routines {
             computer = computer.with_child(routine_node(routine));
         }
@@ -5867,6 +5961,9 @@ impl NativeChatHost {
         } else if target == ids::ROUTINE_NEW {
             Command::OpenRoutineEditor(None)
         } else if let Some(cmd) = self.routine_command(target) {
+            if let Command::RunRoutineNow { routine_id } = &cmd {
+                self.refuse_dead_test_run(target, routine_id)?;
+            }
             cmd
         } else if let Some(id) = self.site_login_delete_target(target) {
             Command::DeleteSiteLogin { id }
@@ -6642,11 +6739,25 @@ impl NativeChatHost {
                     .ok_or_else(|| "recipe.run: no bot is granted this recipe".to_string())?;
                 Command::RunOpenRecipe(bot)
             }
-            "routine.run" => Command::RunRoutineNow {
-                routine_id: self.invoke_routine_id(args, "routine.run")?,
-            },
+            "routine.run" => {
+                let routine_id = self.invoke_routine_id(args, "routine.run")?;
+                self.refuse_dead_test_run("routine.run", &routine_id)?;
+                Command::RunRoutineNow { routine_id }
+            }
             "routine.edit" => {
                 let routine_id = self.invoke_routine_id(args, "routine.edit")?;
+                // The fields are dead on a server that cannot change a routine; an edit by name
+                // is refused in the same words, as the app would refuse it.
+                if self
+                    .routines
+                    .iter()
+                    .any(|routine| routine.id == routine_id && routine.cant_change())
+                {
+                    return Err(format!(
+                        "routine.edit is refused: {}",
+                        crate::state::ROUTINE_EDIT_UNAVAILABLE
+                    ));
+                }
                 let name = invoke_arg_str(args, &["name"]);
                 let prompt = invoke_arg_str(args, &["prompt", "instruction"]);
                 if name.is_none() && prompt.is_none() {
@@ -6662,6 +6773,22 @@ impl NativeChatHost {
         };
         self.pending = Some(cmd);
         Ok(DispatchResult::empty())
+    }
+
+    /// Test run on a server that cannot run a routine on demand is dead on screen, and refused
+    /// here in the words the editor says it in.
+    fn refuse_dead_test_run(&self, target: &str, routine_id: &str) -> Result<(), String> {
+        if self
+            .routines
+            .iter()
+            .any(|routine| routine.id == routine_id && routine.run_dead())
+        {
+            return Err(format!(
+                "`{target}` is dead: {}",
+                crate::state::ROUTINE_RUN_UNAVAILABLE
+            ));
+        }
+        Ok(())
     }
 
     /// The routine an invoke names, checked against the ones on screen: an id nobody is
@@ -6759,6 +6886,9 @@ mod tests {
             webhook_url: (kind == "webhook").then(|| "https://og.example/hooks/sch_2".to_string()),
             webhook_key: (kind == "webhook").then(|| "og_live_abc".to_string()),
             runs: Vec::new(),
+            notes: Vec::new(),
+            runs_unavailable: false,
+            unsaved: Vec::new(),
         }
     }
 
@@ -6816,6 +6946,77 @@ mod tests {
         assert!(matches!(
             host.take_command().unwrap(),
             Command::SetRoutineActive { routine_id, active: false } if routine_id == "sch_1"
+        ));
+    }
+
+    /// On a server that cannot change a routine, run one on demand or list what one ran, the
+    /// routine says so where the editor does: a line for each, the history's place, what was
+    /// typed and not kept, and a Test run that is dead and refused in the editor's words, by
+    /// click and by name, as an edit by name is. The editor's red line is there while it shows.
+    #[test]
+    fn a_routine_says_what_its_server_cannot_do_with_it() {
+        let mut host = host();
+        host.computer_open = true;
+        let mut old = routine("sch_1", "cron");
+        old.notes = vec![
+            ("cant-change", crate::state::ROUTINE_EDIT_UNAVAILABLE),
+            ("cant-run", crate::state::ROUTINE_RUN_UNAVAILABLE),
+        ];
+        old.runs_unavailable = true;
+        old.unsaved = vec![("Name", "Daily".into()), ("When", "Every minute".into())];
+        host.routines = vec![old, routine("sch_2", "cron")];
+        host.routine_error = Some("No such schedule".into());
+        let tree = host.snapshot();
+        let line = |id: String| tree.find(&id).map(|node| node.name.clone());
+        assert_eq!(
+            line(ids::routine_note("sch_1", "cant-change")).as_deref(),
+            Some(crate::state::ROUTINE_EDIT_UNAVAILABLE)
+        );
+        assert_eq!(
+            line(ids::routine_note("sch_1", "cant-run")).as_deref(),
+            Some(crate::state::ROUTINE_RUN_UNAVAILABLE)
+        );
+        assert_eq!(
+            line(ids::routine_runs_unavailable("sch_1")).as_deref(),
+            Some(crate::state::ROUTINE_RUNS_UNAVAILABLE)
+        );
+        let unsaved = tree.find(&ids::routine_unsaved("sch_1")).unwrap();
+        assert_eq!(
+            unsaved.value.as_deref(),
+            Some("Name: Daily\nWhen: Every minute")
+        );
+        assert!(!tree.find(&ids::routine_test("sch_1")).unwrap().enabled);
+        assert!(tree.find(&ids::routine_test("sch_2")).unwrap().enabled);
+        assert!(tree.find(&ids::routine_runs_unavailable("sch_2")).is_none());
+        assert_eq!(
+            tree.find(ids::ROUTINE_ERROR).map(|node| node.name.as_str()),
+            Some("No such schedule")
+        );
+
+        let refused = host.click(&ids::routine_test("sch_1")).unwrap_err();
+        assert!(
+            refused.contains(crate::state::ROUTINE_RUN_UNAVAILABLE),
+            "{refused}"
+        );
+        assert!(
+            host.invoke("routine.run", &serde_json::json!({ "id": "sch_1" }))
+                .is_err()
+        );
+        let refused = host
+            .invoke(
+                "routine.edit",
+                &serde_json::json!({ "id": "sch_1", "name": "Daily" }),
+            )
+            .unwrap_err();
+        assert!(
+            refused.contains(crate::state::ROUTINE_EDIT_UNAVAILABLE),
+            "{refused}"
+        );
+        assert!(host.take_command().is_none(), "nothing was sent");
+        host.click(&ids::routine_test("sch_2")).unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::RunRoutineNow { routine_id }) if routine_id == "sch_2"
         ));
     }
 

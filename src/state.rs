@@ -3509,6 +3509,108 @@ pub struct AgentRoutine {
 pub const ROUTINE_IS_ONE_SCHEDULE: &str =
     "A routine is one schedule on the server: make another routine for a second trigger.";
 
+/// What a routine's Run history says on a server that cannot list a routine's runs.
+pub const ROUTINE_RUNS_UNAVAILABLE: &str = "This server can't show a routine's runs yet.";
+
+/// What a routine's editor says on a server that cannot change a routine once it is made.
+pub const ROUTINE_EDIT_UNAVAILABLE: &str = "This server can't change a routine after it's made.";
+
+/// What a routine's editor says on a server that cannot start a routine when asked.
+pub const ROUTINE_RUN_UNAVAILABLE: &str = "This server can't run a routine on demand yet.";
+
+/// What the open server has shown it cannot do with a routine, learnt from its answers.
+///
+/// An opengrok-server from before it could change a routine, run one on demand and list what one
+/// ran (opengrok-server 18656e3, `autonomy/routes.rs`) has none of the three routes, and answers
+/// them the way it answers any route it lacks (`OpenGrokError::route_missing`). That is a fact
+/// about the server and so about every routine on it, kept for as long as the app talks to it:
+/// the history says what it cannot show, the fields stop taking edits that would not be kept, and
+/// Test run stops offering a run that would not start. None of them is asked again.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RoutineRoutesMissing {
+    /// `GET /schedules/{id}/runs`.
+    pub runs: bool,
+    /// `PATCH /schedules/{id}`.
+    pub edit: bool,
+    /// `POST /schedules/{id}/run`.
+    pub run_now: bool,
+}
+
+/// What the routine editor says a server cannot do with a routine, beside the controls it
+/// leaves dead, as each line's id (after `routine-{id}-`) and its words. `on_the_server` is
+/// whether the server has the routine: a draft is made by a route every server has, so it can
+/// still be written whatever the server cannot change once it is made.
+pub fn routine_notes(
+    missing: RoutineRoutesMissing,
+    on_the_server: bool,
+) -> Vec<(&'static str, &'static str)> {
+    [
+        (on_the_server && missing.edit).then_some(("cant-change", ROUTINE_EDIT_UNAVAILABLE)),
+        missing
+            .run_now
+            .then_some(("cant-run", ROUTINE_RUN_UNAVAILABLE)),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
+}
+
+/// The editor's red line for a routine: the last refusal, unless one of its notes already says
+/// it, which would say it twice.
+pub fn routine_trouble_line(
+    trouble: Option<&str>,
+    notes: &[(&'static str, &'static str)],
+) -> Option<String> {
+    trouble
+        .filter(|line| !notes.iter().any(|(_, note)| note == line))
+        .map(str::to_string)
+}
+
+/// A refused routine call, as the Computer pane says it.
+///
+/// The server's own words when it wrote some, begun with a capital as the pane's other lines
+/// are. An answer with nothing in it is said as what the server answered, never as the client's
+/// stand-in, "request failed", which tells nobody what happened; and a server that could not be
+/// reached at all is said as that.
+fn routine_trouble(error: &OpenGrokError) -> String {
+    if error.unreachable() == Some(Unreachable::Server) {
+        return "Could not reach the server.".to_string();
+    }
+    match error.status {
+        Some(status) if error.said_nothing() => {
+            format!("The server answered {status} without saying why.")
+        }
+        _ => crate::components::agent_settings::sentence(error.message.trim()),
+    }
+}
+
+/// What has to follow an edit's answer, which the answer alone decides.
+#[derive(Debug, PartialEq, Eq)]
+enum AfterRoutineEdit {
+    Nothing,
+    /// A Test run pressed while the edit was out, now that the routine is the one it changed to.
+    RunNow,
+    /// The server's copy, read again over an edit it refused (`restore_routine`).
+    ReadBack,
+}
+
+/// What a person typed into a routine that a server without `PATCH /schedules/{id}` refused, as
+/// the editor lists it beside the server's values: the name, the instruction, and when it was to
+/// run, in the words the schedule picker uses.
+pub fn unsaved_lines(edit: &ScheduleEdit) -> Vec<(&'static str, String)> {
+    let mut lines = Vec::new();
+    if let Some(name) = &edit.name {
+        lines.push(("Name", name.clone()));
+    }
+    if let Some(prompt) = &edit.prompt {
+        lines.push(("Instruction", prompt.clone()));
+    }
+    if let Some(cron) = &edit.cron {
+        lines.push(("When", ScheduleSpec::from_cron(cron).label()));
+    }
+    lines
+}
+
 /// One schedule as the editor draws it.
 fn routine_from_schedule(row: ScheduleRow) -> AgentRoutine {
     let trigger = trigger_from_schedule(&row);
@@ -4502,6 +4604,13 @@ pub struct AppState {
     /// edit's answer, or a refused edit put back), so the editor's fields follow it. Per routine
     /// because an answer for one must leave another's half-typed fields alone.
     routine_resyncs: HashMap<String, u64>,
+    /// What this server has shown it cannot do with a routine. Forgotten with the client, when
+    /// the app is pointed at a server again (`set_config`).
+    pub routine_routes_missing: RoutineRoutesMissing,
+    /// Per routine, the edit a server that cannot change a routine refused: what the person
+    /// typed, kept on screen beside the server's values the fields went back to, so it is not
+    /// lost to a refusal it had no part in.
+    pub routine_unsaved: HashMap<String, ScheduleEdit>,
     pub model_picker_open: bool,
     pub avatar_editor_open: bool,
     pub hiring: bool,
@@ -5181,6 +5290,8 @@ impl AppState {
             routine_runs_asked: HashMap::new(),
             routine_latest_edit: HashMap::new(),
             routine_resyncs: HashMap::new(),
+            routine_routes_missing: RoutineRoutesMissing::default(),
+            routine_unsaved: HashMap::new(),
             model_picker_open: false,
             avatar_editor_open: false,
             hiring: false,
@@ -5317,6 +5428,10 @@ impl AppState {
     }
 
     pub fn set_config(&mut self, config: Config, cx: &mut Context<Self>) {
+        // What a server could not do with a routine is that server's: a new client may be a
+        // newer one.
+        self.routine_routes_missing = RoutineRoutesMissing::default();
+        self.routine_unsaved.clear();
         match OpenGrokClient::new(&config.opengrok_base_url) {
             Ok(client) => {
                 let client =
@@ -10404,66 +10519,144 @@ impl AppState {
         instruction: String,
         cx: &mut Context<Self>,
     ) {
-        let Some(row) = self.routine_mut(coworker_id, routine_id) else {
-            return;
-        };
-        row.name = name;
-        row.instruction = instruction;
-        let edit = routine_edit(row);
+        let begun = self.begin_routine_edit(coworker_id, routine_id, name, instruction);
         cx.notify();
-        if edit.is_empty() {
-            return;
-        }
-        let Some(client) = self.opengrok.clone() else {
+        let Some((client, this_edit, edit)) = begun else {
             return;
         };
         let coworker_id = coworker_id.to_string();
         let routine_id = routine_id.to_string();
-        self.routine_seq += 1;
-        let this_edit = self.routine_seq;
-        self.routine_latest_edit
-            .insert(routine_id.clone(), this_edit);
-        // A Test run already waiting keeps waiting, now on this edit.
-        let entry = self
-            .routine_edits
-            .entry(routine_id.clone())
-            .or_insert((this_edit, false));
-        entry.0 = this_edit;
         cx.spawn(async move |this, cx| {
             let result = client.edit_schedule(&routine_id, &edit).await;
             let _ = this.update(cx, |state, cx| {
-                // An earlier edit's answer, with a later one still out: the later one says what
-                // the routine is, and settles the wait.
-                if state
-                    .routine_edits
-                    .get(&routine_id)
-                    .map(|(latest, _)| *latest)
-                    != Some(this_edit)
+                match state.settle_routine_edit(&coworker_id, &routine_id, this_edit, edit, result)
                 {
-                    return;
-                }
-                let run_waiting = state
-                    .routine_edits
-                    .remove(&routine_id)
-                    .is_some_and(|(_, waiting)| waiting);
-                match result {
-                    Ok(row) => {
-                        state.put_server_routine(&coworker_id, row);
-                        if run_waiting {
-                            state.run_routine_now(&coworker_id, &routine_id, cx);
-                        }
+                    AfterRoutineEdit::RunNow => {
+                        state.run_routine_now(&coworker_id, &routine_id, cx)
                     }
-                    // A Test run waiting on a refused edit is not started: it would run the
-                    // routine the person just tried to change.
-                    Err(error) => {
-                        state.computer_action_error = Some(error.message);
-                        state.restore_routine(&coworker_id, &routine_id, cx);
+                    AfterRoutineEdit::ReadBack => {
+                        state.restore_routine(&coworker_id, &routine_id, cx)
                     }
+                    AfterRoutineEdit::Nothing => {}
                 }
                 cx.notify();
             });
         })
         .detach();
+    }
+
+    /// The part of [`Self::save_routine_fields`] that needs no window: the fields go onto the
+    /// routine, and what differs from the server's copy is the edit to send, numbered so a late
+    /// answer can be told from the latest. Nothing to send for a routine nobody changed, for a
+    /// draft, or with no server; and nothing to a server that has said it cannot change a
+    /// routine, where the edit is refused here, as the server refused the last.
+    fn begin_routine_edit(
+        &mut self,
+        coworker_id: &str,
+        routine_id: &str,
+        name: String,
+        instruction: String,
+    ) -> Option<(OpenGrokClient, u64, ScheduleEdit)> {
+        let row = self.routine_mut(coworker_id, routine_id)?;
+        row.name = name;
+        row.instruction = instruction;
+        let edit = routine_edit(row);
+        if edit.is_empty() {
+            return None;
+        }
+        if self.routine_routes_missing.edit {
+            self.refuse_routine_edit(coworker_id, routine_id, edit);
+            return None;
+        }
+        let client = self.opengrok.clone()?;
+        self.routine_seq += 1;
+        let this_edit = self.routine_seq;
+        self.routine_latest_edit
+            .insert(routine_id.to_string(), this_edit);
+        // A Test run already waiting keeps waiting, now on this edit.
+        let entry = self
+            .routine_edits
+            .entry(routine_id.to_string())
+            .or_insert((this_edit, false));
+        entry.0 = this_edit;
+        Some((client, this_edit, edit))
+    }
+
+    /// What an edit's answer means for the routine, and what has to follow it.
+    fn settle_routine_edit(
+        &mut self,
+        coworker_id: &str,
+        routine_id: &str,
+        this_edit: u64,
+        edit: ScheduleEdit,
+        result: Result<ScheduleRow, OpenGrokError>,
+    ) -> AfterRoutineEdit {
+        // An earlier edit's answer, with a later one still out: the later one says what the
+        // routine is, and settles the wait.
+        if self
+            .routine_edits
+            .get(routine_id)
+            .map(|(latest, _)| *latest)
+            != Some(this_edit)
+        {
+            return AfterRoutineEdit::Nothing;
+        }
+        let run_waiting = self
+            .routine_edits
+            .remove(routine_id)
+            .is_some_and(|(_, waiting)| waiting);
+        match result {
+            Ok(row) => {
+                self.put_server_routine(coworker_id, row);
+                if run_waiting {
+                    AfterRoutineEdit::RunNow
+                } else {
+                    AfterRoutineEdit::Nothing
+                }
+            }
+            // A server from before routines could be changed. Nothing was kept, and nothing will
+            // be on this server, so it is not asked again; what was typed stays on screen.
+            Err(error) if error.route_missing() => {
+                self.routine_routes_missing.edit = true;
+                self.refuse_routine_edit(coworker_id, routine_id, edit);
+                AfterRoutineEdit::Nothing
+            }
+            // A Test run waiting on a refused edit is not started: it would run the routine the
+            // person just tried to change.
+            Err(error) => {
+                self.computer_action_error = Some(routine_trouble(&error));
+                AfterRoutineEdit::ReadBack
+            }
+        }
+    }
+
+    /// An edit a server that cannot change a routine will not keep. What the person typed is
+    /// kept, to show beside the routine; the line says why; and the routine goes back to the
+    /// server's copy as it last answered it, which nothing has changed, since nothing reached it.
+    fn refuse_routine_edit(&mut self, coworker_id: &str, routine_id: &str, edit: ScheduleEdit) {
+        self.routine_unsaved.insert(routine_id.to_string(), edit);
+        self.computer_action_error = Some(ROUTINE_EDIT_UNAVAILABLE.to_string());
+        let Some(row) = self.routine_mut(coworker_id, routine_id) else {
+            return;
+        };
+        let Some(saved) = row.saved.clone() else {
+            return;
+        };
+        row.name = saved.name.unwrap_or_default();
+        row.instruction = saved.prompt.unwrap_or_default();
+        if let Some(cron) = saved.cron.as_deref() {
+            for trigger in &mut row.triggers {
+                if let RoutineTrigger::Schedule { spec, .. } = trigger {
+                    *spec = ScheduleSpec::from_server_cron(cron);
+                }
+            }
+        }
+        // The editor's fields follow the routine back, so they stop showing the refused words
+        // as if they were saved.
+        *self
+            .routine_resyncs
+            .entry(routine_id.to_string())
+            .or_default() += 1;
     }
 
     /// The server's copy of one routine, written over the one on screen and into the editor's
@@ -10515,9 +10708,9 @@ impl AppState {
                         let refused = state.computer_action_error.take().unwrap_or_default();
                         state.computer_action_error = Some(
                             format!(
-                                "{refused} The saved routine could not be read back ({}), so \
-                                 what is shown may not be what is saved.",
-                                error.message
+                                "{refused} The saved routine could not be read back, so what is \
+                                 shown may not be what is saved: {}",
+                                routine_trouble(&error)
                             )
                             .trim()
                             .to_string(),
@@ -10558,41 +10751,74 @@ impl AppState {
         routine_id: &str,
         cx: &mut Context<Self>,
     ) {
-        let on_the_server = self
-            .routine_mut(coworker_id, routine_id)
-            .is_some_and(|row| row.saved.is_some());
-        let Some(client) = self.opengrok.clone().filter(|_| on_the_server) else {
+        let Some((client, this_read)) = self.begin_routine_runs_read(coworker_id, routine_id)
+        else {
             return;
         };
         let coworker_id = coworker_id.to_string();
         let routine_id = routine_id.to_string();
-        self.routine_seq += 1;
-        let this_read = self.routine_seq;
-        self.routine_runs_asked
-            .insert(routine_id.clone(), this_read);
         cx.spawn(async move |this, cx| {
             let result = client.schedule_runs(&routine_id).await;
             let _ = this.update(cx, |state, cx| {
-                // A page asked for before the latest one is older news than it.
-                if state.routine_runs_asked.get(&routine_id) != Some(&this_read) {
-                    return;
+                if state.settle_routine_runs(&coworker_id, &routine_id, this_read, result) {
+                    cx.notify();
                 }
-                match result {
-                    Ok(runs) => {
-                        if let Some(row) = state.routine_mut(&coworker_id, &routine_id) {
-                            row.runs = with_unlisted_runs(
-                                &row.runs,
-                                runs.into_iter().map(RoutineRun::from_server).collect(),
-                                chrono::Utc::now().timestamp_millis(),
-                            );
-                        }
-                    }
-                    Err(error) => state.computer_action_error = Some(error.message),
-                }
-                cx.notify();
             });
         })
         .detach();
+    }
+
+    /// The part of [`Self::load_routine_runs`] that needs no window: the read to make, numbered
+    /// so an older page landing last can be told from the latest. Nothing for a draft, with no
+    /// server, or on a server that has said it cannot list a routine's runs.
+    fn begin_routine_runs_read(
+        &mut self,
+        coworker_id: &str,
+        routine_id: &str,
+    ) -> Option<(OpenGrokClient, u64)> {
+        let on_the_server = self
+            .routine_mut(coworker_id, routine_id)
+            .is_some_and(|row| row.saved.is_some());
+        if !on_the_server || self.routine_routes_missing.runs {
+            return None;
+        }
+        let client = self.opengrok.clone()?;
+        self.routine_seq += 1;
+        let this_read = self.routine_seq;
+        self.routine_runs_asked
+            .insert(routine_id.to_string(), this_read);
+        Some((client, this_read))
+    }
+
+    /// A read of a routine's history landing, and whether it changed what is on screen.
+    fn settle_routine_runs(
+        &mut self,
+        coworker_id: &str,
+        routine_id: &str,
+        this_read: u64,
+        result: Result<Vec<crate::opengrok::ScheduleRun>, OpenGrokError>,
+    ) -> bool {
+        // A page asked for before the latest one is older news than it.
+        if self.routine_runs_asked.get(routine_id) != Some(&this_read) {
+            return false;
+        }
+        match result {
+            Ok(runs) => {
+                if let Some(row) = self.routine_mut(coworker_id, routine_id) {
+                    row.runs = with_unlisted_runs(
+                        &row.runs,
+                        runs.into_iter().map(RoutineRun::from_server).collect(),
+                        chrono::Utc::now().timestamp_millis(),
+                    );
+                }
+            }
+            // A server from before routines kept a history. That is said once, in the history,
+            // in place of "No runs yet", which would claim what nobody knows; not as a red line
+            // over the editor about a read the person never asked for.
+            Err(error) if error.route_missing() => self.routine_routes_missing.runs = true,
+            Err(error) => self.computer_action_error = Some(routine_trouble(&error)),
+        }
+        true
     }
 
     pub fn routine_mut(
@@ -10689,7 +10915,7 @@ impl AppState {
                         ));
                         state.routines.insert(coworker_id, routines);
                     }
-                    Err(error) => state.computer_action_error = Some(error.message),
+                    Err(error) => state.computer_action_error = Some(routine_trouble(&error)),
                 }
                 cx.notify();
             });
@@ -10739,7 +10965,7 @@ impl AppState {
             let _ = this.update(cx, |state, cx| {
                 match result {
                     Ok(row) => state.settle_new_routine(&coworker_id, draft_id.as_deref(), row),
-                    Err(error) => state.computer_action_error = Some(error.message),
+                    Err(error) => state.computer_action_error = Some(routine_trouble(&error)),
                 }
                 cx.notify();
             });
@@ -10789,7 +11015,7 @@ impl AppState {
                             routine.triggers = vec![trigger_from_schedule(&row)];
                         }
                     }
-                    Err(error) => state.computer_action_error = Some(error.message),
+                    Err(error) => state.computer_action_error = Some(routine_trouble(&error)),
                 }
                 cx.notify();
             });
@@ -10835,41 +11061,79 @@ impl AppState {
     /// not this app's note that a button was pressed; while it is going, the Computer pane's
     /// poll keeps reading it until it says how it ended.
     pub fn run_routine_now(&mut self, coworker_id: &str, routine_id: &str, cx: &mut Context<Self>) {
-        let on_the_server = self
-            .routine_mut(coworker_id, routine_id)
-            .is_some_and(|row| row.saved.is_some());
-        let Some(client) = self.opengrok.clone() else {
+        let begun = self.begin_routine_run(coworker_id, routine_id);
+        cx.notify();
+        let Some(client) = begun else {
             return;
         };
-        if !on_the_server {
-            self.computer_action_error =
-                Some("Choose when this routine runs first, then test it.".to_string());
-            cx.notify();
-            return;
-        }
-        if let Some((_, run_waiting)) = self.routine_edits.get_mut(routine_id) {
-            *run_waiting = true;
-            return;
-        }
         let coworker_id = coworker_id.to_string();
         let routine_id = routine_id.to_string();
         cx.spawn(async move |this, cx| {
             let result = client.run_schedule_now(&routine_id).await;
             let _ = this.update(cx, |state, cx| {
-                match result {
-                    Ok(run_id) => {
-                        state.computer_action_error = None;
-                        if let Some(row) = state.routine_mut(&coworker_id, &routine_id) {
-                            row.runs.insert(0, RoutineRun::just_started(run_id));
-                        }
-                        state.load_routine_runs(&coworker_id, &routine_id, cx);
-                    }
-                    Err(error) => state.computer_action_error = Some(error.message),
+                if state.settle_routine_run(&coworker_id, &routine_id, result) {
+                    state.load_routine_runs(&coworker_id, &routine_id, cx);
                 }
                 cx.notify();
             });
         })
         .detach();
+    }
+
+    /// The part of [`Self::run_routine_now`] that needs no window: the client to start the run
+    /// with, or nothing when there is no run to start now. A routine the server does not have
+    /// yet says to choose when it runs first; one with an edit still out waits for that edit's
+    /// answer (`settle_routine_edit`); and on a server that has said it cannot run a routine on
+    /// demand, where Test run is dead, a run asked for anyway is refused here in the same words.
+    fn begin_routine_run(&mut self, coworker_id: &str, routine_id: &str) -> Option<OpenGrokClient> {
+        let on_the_server = self
+            .routine_mut(coworker_id, routine_id)
+            .is_some_and(|row| row.saved.is_some());
+        let client = self.opengrok.clone()?;
+        if !on_the_server {
+            self.computer_action_error =
+                Some("Choose when this routine runs first, then test it.".to_string());
+            return None;
+        }
+        if self.routine_routes_missing.run_now {
+            self.computer_action_error = Some(ROUTINE_RUN_UNAVAILABLE.to_string());
+            return None;
+        }
+        if let Some((_, run_waiting)) = self.routine_edits.get_mut(routine_id) {
+            *run_waiting = true;
+            return None;
+        }
+        Some(client)
+    }
+
+    /// A Test run's answer landing, and whether the history is to be read again for the run it
+    /// started.
+    fn settle_routine_run(
+        &mut self,
+        coworker_id: &str,
+        routine_id: &str,
+        result: Result<String, OpenGrokError>,
+    ) -> bool {
+        match result {
+            Ok(run_id) => {
+                self.computer_action_error = None;
+                if let Some(row) = self.routine_mut(coworker_id, routine_id) {
+                    row.runs.insert(0, RoutineRun::just_started(run_id));
+                }
+                true
+            }
+            // A server from before routines could be run on demand. It says so, and Test run
+            // goes dead, rather than a press that does nothing being offered again.
+            Err(error) if error.route_missing() => {
+                self.routine_routes_missing.run_now = true;
+                self.computer_action_error = Some(ROUTINE_RUN_UNAVAILABLE.to_string());
+                false
+            }
+            Err(error) => {
+                self.computer_action_error = Some(routine_trouble(&error));
+                false
+            }
+        }
     }
 
     /// Drop the routine here and on the server.
@@ -10884,6 +11148,7 @@ impl AppState {
         if let Some(rows) = self.routines.get_mut(coworker_id) {
             rows.retain(|row| row.id != routine_id);
         }
+        self.routine_unsaved.remove(routine_id);
         self.computer_view = ComputerView::Overview;
         cx.notify();
         // A draft nobody finished is nobody's but this app's.
@@ -10898,7 +11163,7 @@ impl AppState {
             let result = client.delete_schedule(&routine_id).await;
             let _ = this.update(cx, |state, cx| {
                 if let Err(error) = result {
-                    state.computer_action_error = Some(error.message);
+                    state.computer_action_error = Some(routine_trouble(&error));
                     state.load_routines(cx);
                 }
                 cx.notify();
@@ -10947,7 +11212,7 @@ impl AppState {
                     if let Some(row) = state.routine_mut(&coworker_id, &routine_id) {
                         row.active = !active;
                     }
-                    state.computer_action_error = Some(error.message);
+                    state.computer_action_error = Some(routine_trouble(&error));
                 }
                 cx.notify();
             });
@@ -24745,6 +25010,296 @@ mod tests {
         assert_eq!(entry, "e_form");
         assert_eq!(thread_id, "sch_1", "the card is on the routine's thread");
         assert_eq!(agent_id, "cw_1", "and it is the bot's card to answer");
+    }
+
+    // ---- A routine on a server that cannot do everything with one -------------------------
+
+    /// The open bot and its routines, talking to `server`.
+    fn routines_on(server: &wiremock::MockServer) -> AppState {
+        let mut state = with_routines();
+        state.opengrok = Some(OpenGrokClient::new(&server.uri()).expect("a URL that parses"));
+        state
+    }
+
+    /// `server` answers `method path` with `answer`, and nothing else.
+    async fn answers(
+        method: &str,
+        route: &str,
+        answer: wiremock::ResponseTemplate,
+    ) -> wiremock::MockServer {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method(method))
+            .and(wiremock::matchers::path(route))
+            .respond_with(answer)
+            .mount(&server)
+            .await;
+        server
+    }
+
+    /// A server from before routines kept a history answers `GET /schedules/{id}/runs` with an
+    /// empty 404. The history says it cannot show the runs, in place of "No runs yet", and there
+    /// is no red line over the editor about a read nobody asked for; nor is it asked again.
+    #[tokio::test]
+    async fn a_server_without_a_routines_history_says_so_in_the_history() {
+        let server = answers(
+            "GET",
+            "/schedules/sch_1/runs",
+            wiremock::ResponseTemplate::new(404),
+        )
+        .await;
+        let mut state = routines_on(&server);
+        let (client, read) = state
+            .begin_routine_runs_read("cw_1", "sch_1")
+            .expect("a routine the server has");
+        let result = client.schedule_runs("sch_1").await;
+        assert!(state.settle_routine_runs("cw_1", "sch_1", read, result));
+        assert!(state.routine_routes_missing.runs);
+        assert_eq!(state.computer_action_error, None, "not \"request failed\"");
+        assert!(
+            state.begin_routine_runs_read("cw_1", "sch_1").is_none(),
+            "a server that has said it cannot is not asked again"
+        );
+    }
+
+    /// A server from before routines could be changed answers `PATCH /schedules/{id}` with a
+    /// 405. What the person typed stays on screen to read, the line says why, the routine goes
+    /// back to the server's own values (which the fields follow), and from then on an edit is
+    /// refused here the same way rather than sent again.
+    #[tokio::test]
+    async fn a_server_that_cannot_change_a_routine_keeps_what_was_typed_and_puts_its_own_back() {
+        let server = answers(
+            "PATCH",
+            "/schedules/sch_1",
+            wiremock::ResponseTemplate::new(405),
+        )
+        .await;
+        let mut state = routines_on(&server);
+        // Every minute, where the server has Mondays at nine, and a new name.
+        if let Some(super::RoutineTrigger::Schedule { spec, .. }) = state
+            .routine_mut("cw_1", "sch_1")
+            .and_then(|row| row.triggers.first_mut())
+        {
+            *spec = super::ScheduleSpec::interval(1, super::ScheduleUnit::Minutes);
+        }
+        let (client, number, edit) = state
+            .begin_routine_edit(
+                "cw_1",
+                "sch_1",
+                "Daily".into(),
+                "write the weekly report".into(),
+            )
+            .expect("an edit to send");
+        assert_eq!(edit.cron.as_deref(), Some("* * * * *"));
+        let result = client.edit_schedule("sch_1", &edit).await;
+        assert_eq!(
+            state.settle_routine_edit("cw_1", "sch_1", number, edit.clone(), result),
+            super::AfterRoutineEdit::Nothing,
+            "nothing to read back: the server has what it had"
+        );
+
+        assert!(state.routine_routes_missing.edit);
+        assert_eq!(
+            state.computer_action_error.as_deref(),
+            Some(super::ROUTINE_EDIT_UNAVAILABLE)
+        );
+        assert_eq!(state.routine_unsaved.get("sch_1"), Some(&edit));
+        assert_eq!(
+            super::unsaved_lines(&edit),
+            [
+                ("Name", "Daily".to_string()),
+                ("When", "Every minute".to_string())
+            ]
+        );
+        let row = state.routine_mut("cw_1", "sch_1").expect("the routine");
+        assert_eq!(row.name, "Weekly", "the server's name is back");
+        assert!(
+            super::routine_edit(row).is_empty(),
+            "and so is its schedule: nothing differs from what it has"
+        );
+        assert_eq!(
+            state.routine_resync("sch_1"),
+            1,
+            "the fields follow it back"
+        );
+        assert_eq!(
+            super::routine_notes(state.routine_routes_missing, true),
+            [("cant-change", super::ROUTINE_EDIT_UNAVAILABLE)]
+        );
+        assert!(
+            super::routine_notes(state.routine_routes_missing, false).is_empty(),
+            "a draft is made by a route every server has"
+        );
+
+        state.computer_action_error = None;
+        assert!(
+            state
+                .begin_routine_edit(
+                    "cw_1",
+                    "sch_1",
+                    "Again".into(),
+                    "write the weekly report".into()
+                )
+                .is_none(),
+            "not sent again"
+        );
+        assert_eq!(
+            state.computer_action_error.as_deref(),
+            Some(super::ROUTINE_EDIT_UNAVAILABLE)
+        );
+        assert_eq!(
+            state
+                .routine_unsaved
+                .get("sch_1")
+                .and_then(|edit| edit.name.as_deref()),
+            Some("Again")
+        );
+        assert_eq!(state.routine_mut("cw_1", "sch_1").unwrap().name, "Weekly");
+        let mut sent = server
+            .received_requests()
+            .await
+            .expect("the recorder is on");
+        sent.retain(|request| request.method.as_str() == "PATCH");
+        assert_eq!(sent.len(), 1, "one PATCH, the first");
+    }
+
+    /// A server from before routines could be run on demand answers `POST /schedules/{id}/run`
+    /// with an empty 404. Test run says so and goes dead, and a run asked for after that is
+    /// refused here in the same words rather than sent.
+    #[tokio::test]
+    async fn a_server_that_cannot_run_a_routine_on_demand_says_so_and_test_run_goes_dead() {
+        let server = answers(
+            "POST",
+            "/schedules/sch_1/run",
+            wiremock::ResponseTemplate::new(404),
+        )
+        .await;
+        let mut state = routines_on(&server);
+        let client = state
+            .begin_routine_run("cw_1", "sch_1")
+            .expect("a run to start");
+        let result = client.run_schedule_now("sch_1").await;
+        assert!(
+            !state.settle_routine_run("cw_1", "sch_1", result),
+            "no run started, so no history to read"
+        );
+        assert!(state.routine_routes_missing.run_now);
+        assert_eq!(
+            state.computer_action_error.as_deref(),
+            Some(super::ROUTINE_RUN_UNAVAILABLE)
+        );
+        assert!(
+            super::routine_notes(state.routine_routes_missing, false)
+                .contains(&("cant-run", super::ROUTINE_RUN_UNAVAILABLE))
+        );
+
+        state.computer_action_error = None;
+        assert!(state.begin_routine_run("cw_1", "sch_1").is_none());
+        assert_eq!(
+            state.computer_action_error.as_deref(),
+            Some(super::ROUTINE_RUN_UNAVAILABLE)
+        );
+    }
+
+    /// Any other refusal is said in the server's words, and one with no words in it as what the
+    /// server answered: never the client's stand-in, "request failed". Neither marks a route as
+    /// missing, so nothing goes dead over a routine that is gone or a server having a bad moment.
+    #[tokio::test]
+    async fn a_routine_refusal_is_the_servers_words_and_never_a_bare_request_failed() {
+        let gone = answers(
+            "POST",
+            "/schedules/sch_1/run",
+            wiremock::ResponseTemplate::new(404).set_body_string("no such schedule"),
+        )
+        .await;
+        let mut state = routines_on(&gone);
+        let client = state.begin_routine_run("cw_1", "sch_1").expect("a run");
+        let result = client.run_schedule_now("sch_1").await;
+        assert!(!state.settle_routine_run("cw_1", "sch_1", result));
+        assert_eq!(
+            state.computer_action_error.as_deref(),
+            Some("No such schedule")
+        );
+        assert!(!state.routine_routes_missing.run_now);
+
+        let silent = answers(
+            "GET",
+            "/schedules/sch_1/runs",
+            wiremock::ResponseTemplate::new(500),
+        )
+        .await;
+        let mut state = routines_on(&silent);
+        let (client, read) = state
+            .begin_routine_runs_read("cw_1", "sch_1")
+            .expect("a read");
+        let result = client.schedule_runs("sch_1").await;
+        assert!(state.settle_routine_runs("cw_1", "sch_1", read, result));
+        assert_eq!(
+            state.computer_action_error.as_deref(),
+            Some("The server answered 500 without saying why.")
+        );
+        assert!(!state.routine_routes_missing.runs);
+
+        // Nobody answered at all.
+        let mut state = with_routines();
+        state.opengrok = Some(OpenGrokClient::new("http://127.0.0.1:9").expect("a URL"));
+        let (client, read) = state
+            .begin_routine_runs_read("cw_1", "sch_1")
+            .expect("a read");
+        let result = client.schedule_runs("sch_1").await;
+        assert!(state.settle_routine_runs("cw_1", "sch_1", read, result));
+        assert_eq!(
+            state.computer_action_error.as_deref(),
+            Some("Could not reach the server.")
+        );
+    }
+
+    /// An edit the server takes is what the routine reads as from then on: its answer, in the
+    /// server's six-field form, is the picker's every minute again, nothing is left to send, and a
+    /// listing read later (the editor opened again from another Bot) says the same.
+    #[tokio::test]
+    async fn an_edit_the_server_takes_is_what_the_routine_reads_as_when_opened_again() {
+        let saved = serde_json::json!({
+            "id": "sch_1", "coworkerId": "cw_1", "kind": "cron", "cron": "0 * * * * *",
+            "prompt": "write the weekly report", "name": "Weekly", "active": true
+        });
+        let server = answers(
+            "PATCH",
+            "/schedules/sch_1",
+            wiremock::ResponseTemplate::new(200).set_body_json(saved.clone()),
+        )
+        .await;
+        let mut state = routines_on(&server);
+        if let Some(super::RoutineTrigger::Schedule { spec, .. }) = state
+            .routine_mut("cw_1", "sch_1")
+            .and_then(|row| row.triggers.first_mut())
+        {
+            *spec = super::ScheduleSpec::interval(1, super::ScheduleUnit::Minutes);
+        }
+        let (client, number, edit) = state
+            .begin_routine_edit(
+                "cw_1",
+                "sch_1",
+                "Weekly".into(),
+                "write the weekly report".into(),
+            )
+            .expect("an edit to send");
+        let result = client.edit_schedule("sch_1", &edit).await;
+        assert_eq!(
+            state.settle_routine_edit("cw_1", "sch_1", number, edit, result),
+            super::AfterRoutineEdit::Nothing
+        );
+        let label = |routine: &super::AgentRoutine| routine.triggers[0].label();
+        let row = state.routine_mut("cw_1", "sch_1").expect("the routine");
+        assert_eq!(label(row), "Every minute");
+        assert!(super::routine_edit(row).is_empty(), "nothing left to send");
+        assert_eq!(state.computer_action_error, None);
+        assert!(state.routine_unsaved.is_empty());
+
+        let listed = super::relisted(
+            state.routines.get("cw_1").map(Vec::as_slice),
+            vec![serde_json::from_value(saved).unwrap()],
+        );
+        assert_eq!(label(&listed[0]), "Every minute");
     }
 
     // ---- Stopping a turn --------------------------------------------------------------------
