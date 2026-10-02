@@ -1,11 +1,18 @@
-//! Settings → General's first section, Default models: where a newly hired Bot starts. It is the
-//! account's, kept on the server beside the reply source (`/account/inference-source`), and picked
-//! in the same card and popover a Bot's model is picked in (`components::model_picker`), its
-//! model, effort and ⚡, with None over the list.
+//! Settings → General's first section, Default models: where a newly hired Bot starts, and what a
+//! Bot on the person's plan answers with while the relay is off. Each is the account's, kept on
+//! the server beside the reply source (`/account/inference-source`), and picked in the same card
+//! and popover a Bot's model is picked in (`components::model_picker`), its model, effort and ⚡,
+//! with None over the list.
 //!
 //! A server that keeps a default for new Bots says so by the key on its read (opengrok-server
 //! #322, on main c0bb6ae), and every pick is kept on the account at once; on one that keeps none
 //! the section says it is coming and its card takes no click (`state::DefaultForNewBots`).
+//!
+//! The Relay-off fallback, "When Relay is off, Subscription Bots use", is a Gateway model alone:
+//! the server's paid keys answer instead of the person's plan. It is `planFallback` on the same
+//! setting (opengrok-server relay-off fallback contract, agreed 2026-10-03, not yet built), live
+//! only where the read carries that key, and otherwise coming, as the default for new Bots was
+//! (`state::RelayOffFallback`).
 //!
 //! Default for new Bots was on Settings → Relay, and came here with its ids,
 //! `settings-new-bots-*`: where a new Bot starts is not the relay's to say, and it is the first
@@ -15,7 +22,7 @@
 //! window says and names what the window names.
 
 use crate::components::model_picker::{self, ModelPicker};
-use crate::state::{AccountChange, AppState, DefaultForNewBots, PickerFor};
+use crate::state::{AccountChange, AppState, DefaultForNewBots, PickerFor, RelayOffFallback};
 use gpui_kit::component::{ActiveTheme, Theme, v_flex};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
@@ -36,6 +43,16 @@ pub(crate) const NEW_BOTS_LINE: &str = "A newly hired Bot starts on this model, 
 /// (`state::DefaultForNewBots`).
 pub(crate) const NEW_BOTS_COMING_SOON: &str =
     "Coming soon: the server can't keep a default for new Bots yet.";
+/// The Relay-off fallback: the section, the line saying why it takes no change, and the picker's
+/// card in it, whose popover's parts are `model_picker::PLAN_FALLBACK_IDS`.
+pub(crate) const PLAN_FALLBACK: &str = "settings-plan-fallback";
+pub(crate) const PLAN_FALLBACK_UNAVAILABLE: &str = "settings-plan-fallback-unavailable";
+pub(crate) const PLAN_FALLBACK_CARD: &str = "settings-plan-fallback-card";
+pub(crate) const PLAN_FALLBACK_TITLE: &str = "When Relay is off, Subscription Bots use";
+/// Why the Relay-off fallback takes no change: the server keeps no such fallback yet
+/// (`state::RelayOffFallback`).
+pub(crate) const PLAN_FALLBACK_COMING_SOON: &str =
+    "Coming soon: the server can't keep a Relay-off fallback yet.";
 
 /// Default models, on Settings → General. Its pickers need a window, so it is made on the first
 /// render of the tab, as Settings → Relay is.
@@ -43,12 +60,20 @@ pub struct DefaultModels {
     state: Entity<AppState>,
     /// Default for new Bots' picker: the Bot's card and popover, for the account's default.
     new_bots: Entity<ModelPicker>,
+    /// The Relay-off fallback's picker: the same, over the Gateway group alone.
+    plan_fallback: Entity<ModelPicker>,
 }
 
 impl DefaultModels {
     pub fn new(window: &mut Window, state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
         let new_bots = cx.new(|cx| ModelPicker::new(window, state.clone(), PickerFor::NewBots, cx));
-        Self { state, new_bots }
+        let plan_fallback =
+            cx.new(|cx| ModelPicker::new(window, state.clone(), PickerFor::PlanFallback, cx));
+        Self {
+            state,
+            new_bots,
+            plan_fallback,
+        }
     }
 
     /// Default for new Bots: where a newly hired Bot starts, in the picker's card. While the
@@ -98,6 +123,53 @@ impl DefaultModels {
     }
 }
 
+impl DefaultModels {
+    /// When Relay is off, Subscription Bots use: the Relay-off fallback, in the picker's card,
+    /// drawn as Default for new Bots is. While the server keeps one the card is the Bot's, over
+    /// the Gateway group alone, and what a refusal said is under it while the popover is shut;
+    /// while it keeps none the section says it is coming and the card is dimmed and takes no
+    /// click.
+    fn plan_fallback_section(&self, state: &AppState, theme: &Theme) -> AnyElement {
+        let muted = theme.muted_foreground;
+        let section = v_flex()
+            .id(PLAN_FALLBACK)
+            .debug_selector(|| PLAN_FALLBACK.into())
+            .gap(px(8.))
+            .child(div().text_sm().child(PLAN_FALLBACK_TITLE));
+        match state.relay_off_fallback() {
+            RelayOffFallback::NotOnServer => section
+                .child(
+                    div()
+                        .id(PLAN_FALLBACK_UNAVAILABLE)
+                        .text_xs()
+                        .text_color(muted)
+                        .child(PLAN_FALLBACK_COMING_SOON),
+                )
+                .child(model_picker::dead_card(PLAN_FALLBACK_CARD, theme))
+                .into_any_element(),
+            RelayOffFallback::Kept(_) => {
+                let note = state
+                    .reply_source
+                    .change_note(AccountChange::PlanFallback)
+                    .filter(|_| !state.plan_fallback_picker.open)
+                    .map(str::to_string);
+                section
+                    .child(self.plan_fallback.clone())
+                    .when_some(note, |this, note| {
+                        this.child(
+                            div()
+                                .id(model_picker::PLAN_FALLBACK_IDS.error)
+                                .text_xs()
+                                .text_color(theme.danger)
+                                .child(note),
+                        )
+                    })
+                    .into_any_element()
+            }
+        }
+    }
+}
+
 impl Render for DefaultModels {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
@@ -113,13 +185,17 @@ impl Render for DefaultModels {
                     .child(TITLE),
             )
             .child(self.new_bots_section(state, &theme))
+            .child(self.plan_fallback_section(state, &theme))
     }
 }
 
 #[cfg(test)]
 mod tests {
     // Item by item rather than a glob: `use super::*` would drag in gpui_kit's own `test`.
-    use super::{NEW_BOTS_COMING_SOON, NEW_BOTS_LINE, NEW_BOTS_TITLE, TITLE};
+    use super::{
+        NEW_BOTS_COMING_SOON, NEW_BOTS_LINE, NEW_BOTS_TITLE, PLAN_FALLBACK_COMING_SOON,
+        PLAN_FALLBACK_TITLE, TITLE,
+    };
 
     /// Default for new Bots says it is coming, in the owner's words, while the server keeps no
     /// such default, which is also before the setting is read: the picker's card in it names no
@@ -143,5 +219,30 @@ mod tests {
         );
         assert_eq!(dead_card_words(), ("No model", "Default"));
         assert!(NEW_BOTS_LINE.contains("None leaves it to the server's default"));
+    }
+
+    /// The Relay-off fallback says, in the owner's words, what it is for and that it is coming
+    /// while the server keeps none, which is also before the setting is read; its card is the
+    /// dead one Default for new Bots has.
+    #[test]
+    fn the_relay_off_fallback_is_coming_until_the_server_keeps_one() {
+        use crate::state::RelayOffFallback;
+        assert_eq!(
+            PLAN_FALLBACK_TITLE,
+            "When Relay is off, Subscription Bots use"
+        );
+        assert_eq!(
+            PLAN_FALLBACK_COMING_SOON,
+            "Coming soon: the server can't keep a Relay-off fallback yet."
+        );
+        assert_eq!(RelayOffFallback::default(), RelayOffFallback::NotOnServer);
+        assert_eq!(
+            crate::state::AppState::new().relay_off_fallback(),
+            RelayOffFallback::NotOnServer
+        );
+        assert_eq!(
+            super::PLAN_FALLBACK_CARD,
+            crate::components::model_picker::PLAN_FALLBACK_IDS.card
+        );
     }
 }

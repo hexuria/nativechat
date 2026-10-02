@@ -1328,9 +1328,9 @@ fn shortcuts_page(
 mod tests {
     use super::not_in_effect_line;
 
-    /// Settings → General opens with Default models, over Chat: the default for new Bots in the
-    /// same card a Bot's model is picked in, drawn dead while the server keeps none. Settings →
-    /// Relay no longer holds it.
+    /// Settings → General opens with Default models, over Chat: the default for new Bots and the
+    /// Relay-off fallback, each in the same card a Bot's model is picked in, drawn dead while the
+    /// server keeps neither. Settings → Relay holds neither.
     #[gpui_kit::test]
     fn general_opens_with_the_default_models_and_relay_holds_none(
         cx: &mut gpui_kit::TestAppContext,
@@ -1354,10 +1354,17 @@ mod tests {
         let models = drawn(cx, "settings-default-models").expect("Default models is on General");
         let chat = drawn(cx, "settings-send-enter").expect("so is Chat");
         assert!(models.bottom() <= chat.top(), "{models:?} over {chat:?}");
-        let card = drawn(cx, "settings-new-bots-card").expect("the default for new Bots");
+        let new_bots = drawn(cx, "settings-new-bots-card").expect("the default for new Bots");
+        let fallback = drawn(cx, "settings-plan-fallback-card").expect("the Relay-off fallback");
+        for card in [new_bots, fallback] {
+            assert!(
+                models.top() <= card.top() && card.bottom() <= models.bottom(),
+                "{card:?} in {models:?}"
+            );
+        }
         assert!(
-            models.top() <= card.top() && card.bottom() <= models.bottom(),
-            "{card:?} in {models:?}"
+            new_bots.bottom() <= fallback.top(),
+            "the default for new Bots first"
         );
 
         settings.update(cx, |settings, cx| {
@@ -1367,10 +1374,9 @@ mod tests {
             });
         });
         assert!(drawn(cx, "settings-default-models").is_none());
-        assert!(
-            drawn(cx, "settings-new-bots-card").is_none(),
-            "not on Relay any more"
-        );
+        for card in ["settings-new-bots-card", "settings-plan-fallback-card"] {
+            assert!(drawn(cx, card).is_none(), "{card} is not on Relay");
+        }
     }
 
     /// An allow the gate never reads says so, in the server's sentence given whole and closed

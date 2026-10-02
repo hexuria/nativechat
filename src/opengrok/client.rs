@@ -7039,6 +7039,7 @@ mod tests {
                 via: Some(Via::Mac),
                 new_bot_default: None,
                 relay_enabled: None,
+                plan_fallback: None,
             })
             .await
             .unwrap();
@@ -7070,6 +7071,7 @@ mod tests {
                 via: Some(Via::Mac),
                 new_bot_default: None,
                 relay_enabled: None,
+                plan_fallback: None,
             })
             .await
             .unwrap_err();
@@ -7106,6 +7108,7 @@ mod tests {
                     via: None,
                     new_bot_default: None,
                     relay_enabled: None,
+                    plan_fallback: None,
                 })
                 .await
                 .map(drop),

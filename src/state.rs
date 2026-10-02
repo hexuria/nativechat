@@ -17,22 +17,22 @@ use crate::opengrok::{
     Failure, FormResolution, FormSpec, ImageVisibility, InferenceKind, InferenceSource,
     InferenceSourceUpdate, LocalExecMode, LocalExecPolicy, LocalExecResolution, LocalExecStopped,
     ModelCatalogue, ModelEntry, ModelPick, NewBotDefault, NewSchedule, NewSkill, OpenGrokClient,
-    OpenGrokError, PendingCustom, PendingOp, PendingUserMessage, PendingWrite, ProfileUpdate,
-    QueuedApproval, RecipeDetail, RecipeKind, RecipeParameter, RecipeRun, RecipeRunResult,
-    RecipeShareTarget, RecipeStep, RecipeSummary, RelayHandle, RelayKey, RelayReport, RelayStatus,
-    RelayTarget, RelayTimings, ReplyQuote, ReplySource, RunCause, RunErrorCode, RunRecipeResponse,
-    RunReplay, SKILL_BODY_CHARS, SKILL_BUNDLE_FILES, SKILL_BUNDLE_LIMIT, SaveLoginSpec,
-    ScheduleEdit, ScheduleKind, ScheduleRow, ScheduleRun, ScheduleRunStatus, ScreenshotSpec,
-    SkillDetail, SkillFile, SkillPatch, SkillSource, SkillSummary, ThreadListing, ThreadReplay,
-    ThreadRun, ToolCallTracker, TurnAssembler, TurnRecipe, TurnSource, TurnTiming,
-    USER_FORM_SERVER_FILL_AVAILABLE, Unreachable, UserFormDismissMode, UserFormHttpSettle,
-    UserFormValues, UserFormVerb, Via, WAITING_FOR_YOU, activity_from_replay, approval_summary,
-    box_handoff_resolve_entry_id, collapse_computer_roster, command_from_args,
-    command_from_replay_events, deeds_from_replay, enrol_this_machine, env_egress_tunnel_enabled,
-    host_egress_tunnel_available, host_egress_tunnel_flag, keep_local_save_offer, persons_messages,
-    place_hitl_cards_in_document_order, policy_answer, reads_as_gateway_unreachable, retry_enqueue,
-    save_login_from_local, serve_local_exec, stamp_duration, start_relay, stored_machine_id,
-    tool_standin,
+    OpenGrokError, PendingCustom, PendingOp, PendingUserMessage, PendingWrite, PlanFallback,
+    ProfileUpdate, QueuedApproval, RecipeDetail, RecipeKind, RecipeParameter, RecipeRun,
+    RecipeRunResult, RecipeShareTarget, RecipeStep, RecipeSummary, RelayHandle, RelayKey,
+    RelayReport, RelayStatus, RelayTarget, RelayTimings, ReplyQuote, ReplySource, RunCause,
+    RunErrorCode, RunRecipeResponse, RunReplay, SKILL_BODY_CHARS, SKILL_BUNDLE_FILES,
+    SKILL_BUNDLE_LIMIT, SaveLoginSpec, ScheduleEdit, ScheduleKind, ScheduleRow, ScheduleRun,
+    ScheduleRunStatus, ScreenshotSpec, SkillDetail, SkillFile, SkillPatch, SkillSource,
+    SkillSummary, ThreadListing, ThreadReplay, ThreadRun, ToolCallTracker, TurnAssembler,
+    TurnRecipe, TurnSource, TurnTiming, USER_FORM_SERVER_FILL_AVAILABLE, Unreachable,
+    UserFormDismissMode, UserFormHttpSettle, UserFormValues, UserFormVerb, Via, WAITING_FOR_YOU,
+    activity_from_replay, approval_summary, box_handoff_resolve_entry_id, collapse_computer_roster,
+    command_from_args, command_from_replay_events, deeds_from_replay, enrol_this_machine,
+    env_egress_tunnel_enabled, host_egress_tunnel_available, host_egress_tunnel_flag,
+    keep_local_save_offer, persons_messages, place_hitl_cards_in_document_order, policy_answer,
+    reads_as_gateway_unreachable, retry_enqueue, save_login_from_local, serve_local_exec,
+    stamp_duration, start_relay, stored_machine_id, tool_standin,
 };
 use crate::opengrok::{FrameArrivals, keep_call_times};
 use crate::reachability::Reachability;
@@ -387,6 +387,9 @@ impl ReplySourceNote {
 }
 
 /// The account's reply source, as far as the app knows it.
+// The setting is carried in its own variant, unboxed: the app holds one of these, the account's,
+// and reads it in place everywhere, so its size costs nothing and a Box would only add noise.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq)]
 pub enum ReplySourceRead {
     Loading,
@@ -536,6 +539,8 @@ impl ReplySourceSettings {
 pub enum AccountChange {
     /// A pick in Default for new Bots' picker, or None.
     NewBots,
+    /// A pick in the Relay-off fallback's picker, or None.
+    PlanFallback,
     /// The relay switch: the account's way to the plan pointed at this computer as it goes on,
     /// and a server that keeps whether the relay is on told so either way.
     Relay,
@@ -587,13 +592,30 @@ pub enum DefaultForNewBots {
     Kept(Option<NewBotDefault>),
 }
 
+/// Settings → General's Relay-off fallback: what a Bot on the person's plan answers with while the
+/// relay is off, a Gateway model and its effort ([`AppState::relay_off_fallback`]).
+///
+/// It is the account's (opengrok-server relay-off fallback contract, agreed 2026-10-03, not yet
+/// built), read with the reply source, which carries it as `planFallback` on every read from a
+/// server that keeps one, `null` until the person sets one. A server without it sends no such
+/// key, and the section then says the fallback is coming and its card takes no click.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum RelayOffFallback {
+    /// The server keeps no Relay-off fallback, or the setting has not been read.
+    #[default]
+    NotOnServer,
+    /// The server keeps one: the person's, or `None` while they have set none.
+    Kept(Option<PlanFallback>),
+}
+
 /// Which model picker: the open Bot's, on the Model card in its settings, or Default for new
-/// Bots', on Settings → General. The two are the same card and popover
+/// Bots' or the Relay-off fallback's, on Settings → General. They are the same card and popover
 /// (`components::model_picker`); what differs is what they show and where a change goes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PickerFor {
     Bot,
     NewBots,
+    PlanFallback,
 }
 
 /// Where a picker's popover is.
@@ -4922,6 +4944,8 @@ pub struct AppState {
     pub model_picker: PickerView,
     /// Default for new Bots' picker's popover, under its card on Settings → General.
     pub new_bots_picker: PickerView,
+    /// The Relay-off fallback's picker's popover, under its card on Settings → General.
+    pub plan_fallback_picker: PickerView,
     /// The server's words for the last change the picker made that did not go through, with the
     /// Bot it was for. The popover says it under its controls until the next change is sent.
     pub model_pick_note: Option<(String, String)>,
@@ -5633,6 +5657,7 @@ impl AppState {
             reveal_run: None,
             model_picker: PickerView::default(),
             new_bots_picker: PickerView::default(),
+            plan_fallback_picker: PickerView::default(),
             time_zone_sent: None,
             time_zone_epoch: 0,
             model_pick_note: None,
@@ -6901,6 +6926,7 @@ impl AppState {
         // the Bot's last said was about theirs.
         self.model_picker = PickerView::default();
         self.new_bots_picker = PickerView::default();
+        self.plan_fallback_picker = PickerView::default();
         self.model_pick_note = None;
         // The relay answered for them, and stops with every call it was answering; the switch was
         // theirs, and is read again for whoever signs in next.
@@ -8162,7 +8188,7 @@ impl AppState {
                     settings.change_note = None;
                 }
                 match about {
-                    AccountChange::NewBots => AfterChange::Done,
+                    AccountChange::NewBots | AccountChange::PlanFallback => AfterChange::Done,
                     // The pickers' Subscription group is the account's way's models.
                     AccountChange::Relay => AfterChange::ReadModels,
                 }
@@ -8233,6 +8259,7 @@ impl AppState {
             via: on.then_some(Via::Mac),
             relay_enabled: keeps_enabled.then_some(on),
             new_bot_default: None,
+            plan_fallback: None,
         })
     }
 
@@ -8268,6 +8295,7 @@ impl AppState {
         self.default_models_page_shown = shown;
         if !shown {
             self.new_bots_picker = PickerView::default();
+            self.plan_fallback_picker = PickerView::default();
         }
         arrived
     }
@@ -12681,6 +12709,7 @@ impl AppState {
         match which {
             PickerFor::Bot => self.model_pick(),
             PickerFor::NewBots => self.new_bots_pick(),
+            PickerFor::PlanFallback => self.plan_fallback_pick(),
         }
     }
 
@@ -12690,6 +12719,7 @@ impl AppState {
         match which {
             PickerFor::Bot => &self.model_picker,
             PickerFor::NewBots => &self.new_bots_picker,
+            PickerFor::PlanFallback => &self.plan_fallback_picker,
         }
     }
 
@@ -12697,6 +12727,7 @@ impl AppState {
         match which {
             PickerFor::Bot => &mut self.model_picker,
             PickerFor::NewBots => &mut self.new_bots_picker,
+            PickerFor::PlanFallback => &mut self.plan_fallback_picker,
         }
     }
 
@@ -12712,6 +12743,34 @@ impl AppState {
             Some(default) => DefaultForNewBots::Kept(default.clone()),
             None => DefaultForNewBots::NotOnServer,
         }
+    }
+
+    /// The Relay-off fallback, as the account's setting last read says it: kept by a server whose
+    /// read carries `planFallback`, `null` or not (opengrok-server relay-off fallback contract,
+    /// agreed 2026-10-03, not yet built), and not kept by one whose read carries no such key, or
+    /// before the setting is read.
+    pub fn relay_off_fallback(&self) -> RelayOffFallback {
+        match self
+            .reply_source
+            .kept_source()
+            .and_then(|kept| kept.plan_fallback.as_ref())
+        {
+            Some(fallback) => RelayOffFallback::Kept(fallback.clone()),
+            None => RelayOffFallback::NotOnServer,
+        }
+    }
+
+    /// The Relay-off fallback's picker, as its card on Settings → General draws it: the Gateway
+    /// group alone ([`crate::opengrok::plan_fallback_pick`]). `None` while the server keeps no
+    /// such fallback, when the card is dead and opens nothing.
+    pub fn plan_fallback_pick(&self) -> Option<ModelPick> {
+        let RelayOffFallback::Kept(fallback) = self.relay_off_fallback() else {
+            return None;
+        };
+        Some(crate::opengrok::plan_fallback_pick(
+            fallback.as_ref(),
+            &self.model_catalogue,
+        ))
     }
 
     /// The server keeps a door per Bot: some row of the roster carries `source` (opengrok-server
@@ -12886,13 +12945,13 @@ impl AppState {
         patch: CoworkerPatch,
         cx: &mut Context<Self>,
     ) {
-        match which {
-            PickerFor::Bot => self.save_model_pick(patch, cx),
-            PickerFor::NewBots => {
-                if let Some(send) = self.begin_new_bots_pick(&patch) {
-                    self.send_account_change(send, cx);
-                }
-            }
+        let send = match which {
+            PickerFor::Bot => return self.save_model_pick(patch, cx),
+            PickerFor::NewBots => self.begin_new_bots_pick(&patch),
+            PickerFor::PlanFallback => self.begin_plan_fallback_pick(&patch),
+        };
+        if let Some(send) = send {
+            self.send_account_change(send, cx);
         }
     }
 
@@ -12965,6 +13024,51 @@ impl AppState {
             via: None,
             new_bot_default: Some(default),
             relay_enabled: None,
+            plan_fallback: None,
+        })
+    }
+
+    /// Begin what a change the Relay-off fallback's picker made sends: the whole fallback `patch`
+    /// makes of the kept one ([`ModelPick::plan_fallback`]). `None` where it makes none, or no
+    /// change can begin.
+    fn begin_plan_fallback_pick(&mut self, patch: &CoworkerPatch) -> Option<AccountChangeSend> {
+        let fallback = self.plan_fallback_pick()?.plan_fallback(patch)?;
+        self.begin_plan_fallback_change(Some(fallback))
+    }
+
+    /// None, the Relay-off fallback's first row: the fallback the server keeps goes.
+    pub fn clear_plan_fallback(&mut self, cx: &mut Context<Self>) {
+        self.shut_picker_list(PickerFor::PlanFallback);
+        match self.begin_plan_fallback_none() {
+            Some(send) => self.send_account_change(send, cx),
+            None => cx.notify(),
+        }
+    }
+
+    /// Begin None: `None` while none is kept, which is nothing to send, as well as where no
+    /// change can begin.
+    fn begin_plan_fallback_none(&mut self) -> Option<AccountChangeSend> {
+        if !matches!(self.relay_off_fallback(), RelayOffFallback::Kept(Some(_))) {
+            return None;
+        }
+        self.begin_plan_fallback_change(None)
+    }
+
+    /// Begin keeping the Relay-off fallback on the account at once, whole, with the kind the
+    /// server keeps sent back as it is: `PUT /account/inference-source` `{kind, planFallback}`
+    /// (opengrok-server relay-off fallback contract, agreed 2026-10-03, not yet built), whole, or
+    /// `null` to take it away. The card shows what the server answers; a refusal is said in its
+    /// words.
+    fn begin_plan_fallback_change(
+        &mut self,
+        fallback: Option<PlanFallback>,
+    ) -> Option<AccountChangeSend> {
+        self.begin_account_change(AccountChange::PlanFallback, |kind| InferenceSourceUpdate {
+            kind,
+            via: None,
+            relay_enabled: None,
+            new_bot_default: None,
+            plan_fallback: Some(fallback),
         })
     }
 
@@ -12978,14 +13082,15 @@ impl AppState {
                 (self.active_coworker_id.as_deref() == Some(bot.as_str())).then_some(said.as_str())
             }
             PickerFor::NewBots => self.reply_source.change_note(AccountChange::NewBots),
+            PickerFor::PlanFallback => self.reply_source.change_note(AccountChange::PlanFallback),
         }
     }
 
-    /// A picker takes no change now: Default for new Bots' while a change of the account's is
-    /// with the server, one at a time, since each sends the default whole and two crossing on the
-    /// wire could land in either order. A Bot's never waits.
+    /// A picker takes no change now: Default for new Bots' and the Relay-off fallback's while a
+    /// change of the account's is with the server, one at a time, since each sends its setting
+    /// whole and two crossing on the wire could land in either order. A Bot's never waits.
     pub fn picker_busy(&self, which: PickerFor) -> bool {
-        which == PickerFor::NewBots && self.reply_source.changing.is_some()
+        which != PickerFor::Bot && self.reply_source.changing.is_some()
     }
 
     /// A patch that never left the app. The settings pane paints the reason, and whoever is
@@ -35098,6 +35203,7 @@ mod tests {
             relay: None,
             new_bot_default: None,
             relay_enabled: None,
+            plan_fallback: None,
         }
     }
 
@@ -36815,6 +36921,242 @@ mod tests {
             None
         );
         assert_eq!(state.reply_source.kept, None);
+    }
+
+    // ---- The Relay-off fallback: the account's, kept at once (relay-off fallback contract) -----
+
+    /// A read from a server that keeps a Relay-off fallback, as given, `None` being `null`.
+    fn with_plan_fallback(fallback: Option<crate::opengrok::PlanFallback>) -> InferenceSource {
+        InferenceSource {
+            plan_fallback: Some(fallback),
+            ..relay_kept(InferenceKind::LocalProxy, "mac", None)
+        }
+    }
+
+    fn cheap(effort: &str) -> crate::opengrok::PlanFallback {
+        crate::opengrok::PlanFallback {
+            model: "oag/cheap".into(),
+            effort: effort.into(),
+        }
+    }
+
+    /// The setting as the server answers it, as JSON, with `planFallback` as given.
+    fn answered_with_fallback(fallback: serde_json::Value) -> serde_json::Value {
+        json!({
+            "kind": "local_proxy", "via": "mac", "baseUrl": null, "localModel": null,
+            "healthy": false, "hasApiKey": false,
+            "relay": {"connected": false, "machineId": null, "machineLabel": null,
+                      "localModel": null},
+            "planFallback": fallback
+        })
+    }
+
+    /// One gateway route and one model of the person's plan, as `GET /models` lists them.
+    fn a_route_and_a_plan_model() -> ModelCatalogue {
+        ModelCatalogue {
+            models: vec![
+                ModelEntry {
+                    id: "oag/cheap".into(),
+                    source: Some("gateway".into()),
+                    via: None,
+                },
+                ModelEntry {
+                    id: "gpt-6-luna".into(),
+                    source: Some("local_proxy".into()),
+                    via: None,
+                },
+            ],
+            note: None,
+            local_proxy: None,
+        }
+    }
+
+    /// The Relay-off fallback is live only where the server's read carries its key, `null` or not
+    /// (opengrok-server relay-off fallback contract, agreed 2026-10-03, not yet built): before the
+    /// setting is read, and from a server whose read has no such key, it is not on the server, it
+    /// has no picker, and nothing of it can be sent. Signing out forgets it with the setting.
+    #[test]
+    fn the_relay_off_fallback_is_live_only_where_the_read_carries_its_key() {
+        use super::{PickerFor, RelayOffFallback};
+        let mut state = signed_in_state();
+        assert_eq!(
+            state.relay_off_fallback(),
+            RelayOffFallback::NotOnServer,
+            "not read"
+        );
+        read_as(
+            &mut state,
+            relay_kept(InferenceKind::LocalProxy, "mac", None),
+        );
+        assert_eq!(
+            state.relay_off_fallback(),
+            RelayOffFallback::NotOnServer,
+            "no key on the read"
+        );
+        assert!(state.picker_pick(PickerFor::PlanFallback).is_none());
+        assert!(state.begin_plan_fallback_none().is_none());
+
+        read_as(&mut state, with_plan_fallback(None));
+        assert_eq!(state.relay_off_fallback(), RelayOffFallback::Kept(None));
+        let pick = state.picker_pick(PickerFor::PlanFallback).expect("live");
+        assert_eq!(pick.summary(), "None · Default");
+        assert!(
+            state.begin_plan_fallback_none().is_none(),
+            "none kept: nothing to send"
+        );
+
+        read_as(&mut state, with_plan_fallback(Some(cheap("low"))));
+        assert_eq!(
+            state.relay_off_fallback(),
+            RelayOffFallback::Kept(Some(cheap("low")))
+        );
+        state.forget_account();
+        assert_eq!(state.relay_off_fallback(), RelayOffFallback::NotOnServer);
+    }
+
+    /// The Relay-off fallback's list is the Gateway group alone: over the same models, where
+    /// Default for new Bots offers the person's plan too, the fallback offers the server's keys
+    /// and nothing else.
+    #[test]
+    fn the_relay_off_fallbacks_list_holds_gateway_rows_only() {
+        let mut state = signed_in_state();
+        read_as(
+            &mut state,
+            InferenceSource {
+                new_bot_default: Some(None),
+                plan_fallback: Some(None),
+                ..relay_kept(InferenceKind::LocalProxy, "loopback", None)
+            },
+        );
+        state.model_catalogue = a_route_and_a_plan_model();
+        let doors = |pick: crate::opengrok::ModelPick| {
+            pick.rows()
+                .map(|row| (row.source, row.base_id.clone()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            doors(state.new_bots_pick().expect("live")),
+            [
+                (InferenceKind::LocalProxy, "gpt-6-luna".to_string()),
+                (InferenceKind::Gateway, "oag/cheap".to_string())
+            ]
+        );
+        assert_eq!(
+            doors(state.plan_fallback_pick().expect("live")),
+            [(InferenceKind::Gateway, "oag/cheap".to_string())]
+        );
+    }
+
+    /// A pick in the Relay-off fallback's list is kept on the account at once, whole: one `PUT`
+    /// of the kind the server keeps and `planFallback`, the row's model with the Default effort,
+    /// and nothing else. While it is out no other change of the account's is taken, the
+    /// fallback's or the default for new Bots'; what the server answers is what the card shows
+    /// after. A refusal is said under the fallback's picker in the server's words, and nowhere
+    /// else.
+    #[tokio::test]
+    async fn a_pick_for_the_relay_off_fallback_puts_it_whole_at_once() {
+        use super::{AccountChange, AfterChange, PickerFor, RelayOffFallback};
+        let server = wiremock::MockServer::start().await;
+        let picked = json!({"model": "oag/cheap", "effort": "inherit"});
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .and(wiremock::matchers::path("/account/inference-source"))
+            .and(wiremock::matchers::body_json(
+                json!({"kind": "local_proxy", "planFallback": picked}),
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(answered_with_fallback(picked.clone())),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut state = signed_in_state();
+        state.opengrok = Some(client_signed_in_to(&server).await);
+        read_as(&mut state, with_plan_fallback(None));
+        state.model_catalogue = a_route_and_a_plan_model();
+        let patch = state
+            .plan_fallback_pick()
+            .and_then(|pick| {
+                pick.pick_patch(InferenceKind::Gateway, "oag/cheap")
+                    .ok()
+                    .flatten()
+            })
+            .expect("a row of the list");
+        let send = state
+            .begin_plan_fallback_pick(&patch)
+            .expect("a change begins");
+        assert!(state.picker_busy(PickerFor::PlanFallback));
+        assert!(state.picker_busy(PickerFor::NewBots), "one at a time");
+        assert!(state.begin_plan_fallback_pick(&patch).is_none());
+        let answer = send.client.set_inference_source(&send.update).await;
+        assert_eq!(
+            state.settle_account_change(send.generation, send.about, answer),
+            Some(AfterChange::Done)
+        );
+        assert_eq!(
+            state.relay_off_fallback(),
+            RelayOffFallback::Kept(Some(cheap("inherit")))
+        );
+        assert!(!state.picker_busy(PickerFor::PlanFallback));
+        assert_eq!(
+            puts_sent(&server).await,
+            [json!({"kind": "local_proxy", "planFallback": picked})]
+        );
+
+        let said = "planFallback.model: \"oag/none\" is not a model this server routes";
+        let send = state
+            .begin_plan_fallback_change(Some(cheap("high")))
+            .expect("a change begins");
+        assert_eq!(
+            state.settle_account_change(
+                send.generation,
+                send.about,
+                Err(OpenGrokError::from_opengrok(400, said))
+            ),
+            Some(AfterChange::Done)
+        );
+        assert_eq!(state.picker_note(PickerFor::PlanFallback), Some(said));
+        assert_eq!(state.picker_note(PickerFor::NewBots), None);
+        assert_eq!(
+            state.reply_source.change_note(AccountChange::PlanFallback),
+            Some(said)
+        );
+    }
+
+    /// None takes the kept fallback away: one `PUT` of the kind the server keeps and
+    /// `planFallback: null`.
+    #[tokio::test]
+    async fn none_sends_null_and_takes_the_relay_off_fallback_away() {
+        use super::{AfterChange, RelayOffFallback};
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .and(wiremock::matchers::path("/account/inference-source"))
+            .and(wiremock::matchers::body_json(
+                json!({"kind": "local_proxy", "planFallback": null}),
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(answered_with_fallback(serde_json::Value::Null)),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut state = signed_in_state();
+        state.opengrok = Some(client_signed_in_to(&server).await);
+        read_as(&mut state, with_plan_fallback(Some(cheap("low"))));
+        let send = state
+            .begin_plan_fallback_none()
+            .expect("a fallback to take away");
+        let answer = send.client.set_inference_source(&send.update).await;
+        assert_eq!(
+            state.settle_account_change(send.generation, send.about, answer),
+            Some(AfterChange::Done)
+        );
+        assert_eq!(state.relay_off_fallback(), RelayOffFallback::Kept(None));
+        assert_eq!(
+            puts_sent(&server).await,
+            [json!({"kind": "local_proxy", "planFallback": null})]
+        );
     }
 
     // ---- The relay switch: this computer relays, and the account asks through it --------------

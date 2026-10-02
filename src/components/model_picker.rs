@@ -12,13 +12,15 @@
 //! The same card and popover are Default for new Bots on Settings → General ([`PickerFor`]), where
 //! a newly hired Bot starts: the same controls and the same list, with None over it, which leaves a
 //! new Bot to the server's own default. Its ids are the Bot's with `settings-new-bots-` for
-//! `agent-model-` ([`NEW_BOTS_IDS`]).
+//! `agent-model-` ([`NEW_BOTS_IDS`]). And the Relay-off fallback beside it, what a Bot on the
+//! person's plan answers with while the relay is off: the Gateway group alone, with None over it,
+//! under `settings-plan-fallback-` ([`PLAN_FALLBACK_IDS`]).
 //!
 //! Every change is saved at once (`AppState::pick_model` and its neighbours): on the Bot, or on
-//! the account for Default for new Bots. Nothing waits for a Save, and nothing is kept anywhere
-//! but the server. What the picker offers and what each change sends is `opengrok::model_choice`'s;
-//! the words and element ids live here so the gpui-agent tree (`agent/host.rs`) says what the
-//! window says.
+//! the account for Default for new Bots and the Relay-off fallback. Nothing waits for a Save, and
+//! nothing is kept anywhere but the server. What the picker offers and what each change sends is
+//! `opengrok::model_choice`'s; the words and element ids live here so the gpui-agent tree
+//! (`agent/host.rs`) says what the window says.
 
 use crate::chrome::INFO_PANE_WIDTH;
 use crate::components::fields::field_input;
@@ -88,9 +90,11 @@ pub(crate) struct PickerIds {
     pub note: &'static str,
     pub routines: &'static str,
     pub error: &'static str,
-    /// The list's first row, None, which only Default for new Bots has: no default, which leaves
-    /// a new Bot to the server's own.
+    /// The list's first row, None, which Default for new Bots and the Relay-off fallback have:
+    /// none set, which leaves a new Bot to the server's own default, and a Bot on the plan with
+    /// no fallback. And what None says beside it ([`NONE_HINT`], [`PLAN_FALLBACK_NONE_HINT`]).
     pub none: Option<&'static str>,
+    pub none_hint: &'static str,
     /// Where the popover hangs from, under the card, and the popover's own element.
     pub anchor: &'static str,
     pub popover: &'static str,
@@ -114,6 +118,7 @@ pub(crate) const BOT_IDS: PickerIds = PickerIds {
     routines: ROUTINES,
     error: ERROR,
     none: None,
+    none_hint: "",
     anchor: "agent-model-anchor",
     popover: "agent-model-picker",
 };
@@ -137,8 +142,34 @@ pub(crate) const NEW_BOTS_IDS: PickerIds = PickerIds {
     routines: "settings-new-bots-routines",
     error: "settings-new-bots-error",
     none: Some("settings-new-bots-none"),
+    none_hint: NONE_HINT,
     anchor: "settings-new-bots-anchor",
     popover: "settings-new-bots-picker",
+};
+
+/// The Relay-off fallback's picker's ids, on Settings → General: the Bot's, under
+/// `settings-plan-fallback-`. Its list has only the Gateway group, so a row is
+/// `settings-plan-fallback-row-gateway-{id}`.
+pub(crate) const PLAN_FALLBACK_IDS: PickerIds = PickerIds {
+    card: "settings-plan-fallback-card",
+    pop: "settings-plan-fallback-pop",
+    fast: "settings-plan-fallback-fast",
+    reset: "settings-plan-fallback-reset",
+    effort: "settings-plan-fallback-effort",
+    open_list: "settings-plan-fallback-open-list",
+    search: "settings-plan-fallback-search",
+    list: "settings-plan-fallback-list",
+    group: "settings-plan-fallback-group-",
+    row: "settings-plan-fallback-row-",
+    no_match: "settings-plan-fallback-no-match",
+    plan: "settings-plan-fallback-plan",
+    note: "settings-plan-fallback-note",
+    routines: "settings-plan-fallback-routines",
+    error: "settings-plan-fallback-error",
+    none: Some("settings-plan-fallback-none"),
+    none_hint: PLAN_FALLBACK_NONE_HINT,
+    anchor: "settings-plan-fallback-anchor",
+    popover: "settings-plan-fallback-picker",
 };
 
 /// A picker's ids.
@@ -146,6 +177,7 @@ pub(crate) fn ids(which: PickerFor) -> &'static PickerIds {
     match which {
         PickerFor::Bot => &BOT_IDS,
         PickerFor::NewBots => &NEW_BOTS_IDS,
+        PickerFor::PlanFallback => &PLAN_FALLBACK_IDS,
     }
 }
 
@@ -207,6 +239,8 @@ pub(crate) const NO_MODELS: &str = "The server lists no models to pick from yet.
 pub(crate) const NO_MODEL_MATCHES: &str = "No model matches";
 /// Beside None in Default for new Bots' list: what a new Bot starts on then.
 pub(crate) const NONE_HINT: &str = "the server's default";
+/// Beside None in the Relay-off fallback's list: no model is kept to fall back on.
+pub(crate) const PLAN_FALLBACK_NONE_HINT: &str = "no fallback";
 /// Under the plan's line on a server without per-Bot doors: whose model it is, and when a Gateway
 /// model picked here answers instead. Neither is changed in this app any more: the page that
 /// switched the account's door and its plan model is the subscription's connection alone.
@@ -236,13 +270,13 @@ pub(crate) fn card_detail(pick: &ModelPick) -> String {
         .join(" · ")
 }
 
-/// Whether None shows in Default for new Bots' list: while what is typed in the search box is
-/// held by its words, as a model's row shows while the search holds its name, and so whenever
-/// nothing is typed.
-pub(crate) fn none_shows(query: &str) -> bool {
+/// Whether None shows in a list that has it: while what is typed in the search box is held by its
+/// words, None or what is said beside it, as a model's row shows while the search holds its name,
+/// and so whenever nothing is typed.
+pub(crate) fn none_shows(query: &str, hint: &str) -> bool {
     let query = query.trim().to_lowercase();
     query.is_empty()
-        || [NEW_BOTS_NONE, NONE_HINT]
+        || [NEW_BOTS_NONE, hint]
             .iter()
             .any(|words| words.to_lowercase().contains(&query))
 }
@@ -759,7 +793,7 @@ impl Panel {
         let muted = theme.muted_foreground;
         let groups = pick.search(&self.query);
         let plan = pick.plan_line(&self.query).cloned();
-        let none = ids.none.filter(|_| none_shows(&self.query));
+        let none = ids.none.filter(|_| none_shows(&self.query, ids.none_hint));
         let total = row_count(&groups);
         // A list with nothing in it is the server's to explain, whatever is typed; a search that
         // leaves nothing of a list that has some is the search's.
@@ -810,7 +844,13 @@ impl Panel {
                     .gap(px(10.))
                     .on_scroll_wheel(wheel)
                     .when_some(none, |this, id| {
-                        this.child(none_row(id, pick.model.is_none(), app.clone(), theme))
+                        this.child(none_row(
+                            which,
+                            id,
+                            pick.model.is_none(),
+                            app.clone(),
+                            theme,
+                        ))
                     })
                     .when_some(plan, |this, plan| {
                         this.child(account_plan(ids.plan, &plan, theme))
@@ -965,9 +1005,11 @@ fn group_heading(
         .child(group_title(source))
 }
 
-/// None, the first row of Default for new Bots' list: no default, which leaves a new Bot to the
-/// server's own. Ticked while none is kept; a click takes the kept one away.
+/// None, the first row of Default for new Bots' list and of the Relay-off fallback's: none kept,
+/// which leaves a new Bot to the server's own default, and a Bot on the plan with no fallback.
+/// Ticked while none is kept; a click takes the kept one away.
 fn none_row(
+    which: PickerFor,
     id: &'static str,
     current: bool,
     app: Entity<AppState>,
@@ -985,7 +1027,12 @@ fn none_row(
         .hover(|style| style.bg(rgb(0x777777).opacity(0.12)))
         .on_mouse_down(MouseButton::Left, move |_, _, cx| {
             cx.stop_propagation();
-            app.update(cx, |state, cx| state.clear_new_bots_default(cx));
+            app.update(cx, |state, cx| match which {
+                PickerFor::NewBots => state.clear_new_bots_default(cx),
+                PickerFor::PlanFallback => state.clear_plan_fallback(cx),
+                // A Bot always has a model, and its list no None.
+                PickerFor::Bot => {}
+            });
         })
         .child(div().text_sm().child(NEW_BOTS_NONE))
         .child(
@@ -995,7 +1042,7 @@ fn none_row(
                 .text_xs()
                 .text_color(theme.muted_foreground)
                 .truncate()
-                .child(NONE_HINT),
+                .child(ids(which).none_hint),
         )
         .when(current, |this| {
             this.child(
@@ -1071,7 +1118,10 @@ fn account_plan(id: &'static str, plan: &AccountPlan, theme: &Theme) -> impl Int
 #[cfg(test)]
 mod tests {
     // Item by item rather than a glob: `use super::*` would drag in gpui_kit's own `test`.
-    use super::{BOT_IDS, NEW_BOTS_IDS, card_detail, none_shows, row_id, wheel_rows};
+    use super::{
+        BOT_IDS, NEW_BOTS_IDS, NONE_HINT, PLAN_FALLBACK_IDS, card_detail, none_shows, row_id,
+        wheel_rows,
+    };
     use crate::opengrok::{InferenceKind, ModelCatalogue, bot_pick};
 
     fn pick(source: serde_json::Value, model: &str, effort: &str) -> crate::opengrok::ModelPick {
@@ -1147,8 +1197,43 @@ mod tests {
             NEW_BOTS_IDS.group_id(InferenceKind::Gateway),
             "settings-new-bots-group-gateway"
         );
-        assert!(none_shows("") && none_shows(" NONE ") && none_shows("server"));
-        assert!(!none_shows("luna"));
+        assert!(
+            none_shows("", NONE_HINT)
+                && none_shows(" NONE ", NONE_HINT)
+                && none_shows("server", NONE_HINT)
+        );
+        assert!(!none_shows("luna", NONE_HINT));
+    }
+
+    /// The Relay-off fallback's picker is the Bot's too, every part of it under
+    /// `settings-plan-fallback-` for `agent-model-`, with None as a part of its own, which says
+    /// there is no fallback. Its rows are the Gateway's.
+    #[test]
+    fn the_relay_off_fallback_ids_mirror_the_bots() {
+        assert_eq!(
+            [
+                PLAN_FALLBACK_IDS.card,
+                PLAN_FALLBACK_IDS.pop,
+                PLAN_FALLBACK_IDS.search,
+                PLAN_FALLBACK_IDS.list,
+                PLAN_FALLBACK_IDS.error,
+            ],
+            [
+                "settings-plan-fallback-card",
+                "settings-plan-fallback-pop",
+                "settings-plan-fallback-search",
+                "settings-plan-fallback-list",
+                "settings-plan-fallback-error",
+            ]
+        );
+        assert_eq!(PLAN_FALLBACK_IDS.none, Some("settings-plan-fallback-none"));
+        assert_eq!(
+            PLAN_FALLBACK_IDS.row_id(InferenceKind::Gateway, "oag/cheap"),
+            "settings-plan-fallback-row-gateway-oag/cheap"
+        );
+        assert_eq!(PLAN_FALLBACK_IDS.none_hint, "no fallback");
+        assert!(none_shows("fallback", PLAN_FALLBACK_IDS.none_hint));
+        assert!(!none_shows("server", PLAN_FALLBACK_IDS.none_hint));
     }
 
     /// The wheel moves the window a model for every row's height scrolled: a trackpad's small

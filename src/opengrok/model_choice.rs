@@ -25,7 +25,7 @@
 
 use super::{
     Coworker, CoworkerPatch, CoworkerSource, EFFORT_INHERIT, InferenceKind, InferenceSource,
-    ModelCatalogue, NewBotDefault, Via, is_subscription_model,
+    ModelCatalogue, NewBotDefault, PlanFallback, Via, is_subscription_model,
 };
 
 /// What opencodex puts after a model's id for its fast tier.
@@ -70,6 +70,9 @@ pub const NEW_BOTS_NONE: &str = "None";
 /// Why ⚡ and the slider are dead in Default for new Bots while it holds none: the server keeps a
 /// default whole, its model with its door and effort, and there is no model yet to go with them.
 pub const NEW_BOTS_PICK_FIRST: &str = "Pick a model first: a default for new Bots starts with one.";
+/// The same for the Relay-off fallback: the server keeps it whole, its model with its effort.
+pub const PLAN_FALLBACK_PICK_FIRST: &str =
+    "Pick a model first: a Relay-off fallback starts with one.";
 /// What the list says under its rows for a Bot whose own door is the person's plan
 /// ([`ModelPick::routines`]).
 pub const ROUTINES_ON_PLAN: &str = "This Bot's routines won't run while it answers on your own \
@@ -492,6 +495,8 @@ pub struct ModelPick {
 
 /// [`ModelPick::bot_id`] for Default for new Bots, which is no Bot's.
 pub const NEW_BOTS_PICK_ID: &str = "new-bots";
+/// [`ModelPick::bot_id`] for the Relay-off fallback, which is no Bot's either.
+pub const PLAN_FALLBACK_PICK_ID: &str = "plan-fallback";
 
 /// The way to the account's plan a turn that names none goes: the account's own where the server
 /// knows the relay, which is `None` for one this app cannot name, and the server's own machine
@@ -667,6 +672,54 @@ pub fn new_bots_pick(
             |default| default.effort.clone(),
         ),
         effort_dead: default.is_none().then_some(NEW_BOTS_PICK_FIRST),
+        groups,
+        account_plan: None,
+        routines: None,
+        unset: NEW_BOTS_NONE,
+    }
+}
+
+/// The Relay-off fallback as the same card and popover show it (opengrok-server relay-off
+/// fallback contract, agreed 2026-10-03, not yet built): what a Bot on the person's plan answers
+/// with while the relay is off, `None` while the person has set none. It is on the server's paid
+/// keys, so the list is the Gateway group alone, whatever the plan offers; and like a default for
+/// new Bots, with none set there is no model to tick, nor one to move to its fast twin or give an
+/// effort: the server keeps it whole, and a pick in the list is what starts one.
+pub fn plan_fallback_pick(
+    fallback: Option<&PlanFallback>,
+    catalogue: &ModelCatalogue,
+) -> ModelPick {
+    let groups: Vec<ChoiceGroup> = [ChoiceGroup {
+        source: InferenceKind::Gateway,
+        rows: server_choices(catalogue),
+    }]
+    .into_iter()
+    .filter(|group| !group.rows.is_empty())
+    .collect();
+    let door = fallback.map(|_| InferenceKind::Gateway);
+    let model = fallback
+        .map(|fallback| fallback.model.clone())
+        .filter(|model| !model.trim().is_empty());
+    let current = current_row(&groups, door, model.as_deref());
+    let fast_blocked = match (fallback, &current) {
+        (None, _) => Some(PLAN_FALLBACK_PICK_FIRST),
+        (Some(_), Some(row)) if row.has_fast => None,
+        (Some(_), _) => Some(FAST_NO_TWIN),
+    };
+    ModelPick {
+        bot_id: PLAN_FALLBACK_PICK_ID.to_string(),
+        per_bot: true,
+        bot_door: door,
+        door,
+        model,
+        pin: fallback.map_or_else(String::new, |fallback| fallback.model.clone()),
+        current,
+        fast_blocked,
+        effort: fallback.map_or_else(
+            || EFFORT_INHERIT.to_string(),
+            |fallback| fallback.effort.clone(),
+        ),
+        effort_dead: fallback.is_none().then_some(PLAN_FALLBACK_PICK_FIRST),
         groups,
         account_plan: None,
         routines: None,
@@ -853,6 +906,25 @@ impl ModelPick {
             effort,
         })
     }
+
+    /// What a change the Relay-off fallback's picker makes, as a Bot's patch would carry it,
+    /// makes of the fallback: the whole of it, the patch's model and effort over the ones kept,
+    /// since the server takes it whole. `None` while that names no model, or a door other than the
+    /// Gateway, which a fallback on the server's paid keys cannot be.
+    pub fn plan_fallback(&self, patch: &CoworkerPatch) -> Option<PlanFallback> {
+        if patch
+            .source
+            .is_some_and(|source| source != InferenceKind::Gateway)
+        {
+            return None;
+        }
+        let model = patch.model.clone().unwrap_or_else(|| self.pin.clone());
+        if model.trim().is_empty() {
+            return None;
+        }
+        let effort = patch.effort.clone().unwrap_or_else(|| self.effort.clone());
+        Some(PlanFallback { model, effort })
+    }
 }
 
 #[cfg(test)]
@@ -903,6 +975,7 @@ mod tests {
             relay: None,
             new_bot_default: None,
             relay_enabled: None,
+            plan_fallback: None,
         }
     }
 
@@ -1663,11 +1736,11 @@ mod tests {
     }
 
     /// Default for new Bots is the Bot's picker over the same list, read as a Bot on its own door
-    /// would be (opengrok-server #322, on main c0bb6ae): set, the card names
-    /// its model, door, effort and ⚡, the list ticks its row, and every change makes the whole
-    /// default anew, the kept door, model and effort under the change, since the server keeps it
-    /// whole. With none set the card says None, nothing is ticked, ⚡ and the slider are dead and
-    /// say why, and a pick of a row starts a whole default, on its door and the Default effort.
+    /// would be (opengrok-server #322, on main c0bb6ae): set, the card names its model, door,
+    /// effort and ⚡, the list ticks its row, and every change makes the whole default anew, the
+    /// kept door, model and effort under the change, since the server keeps it whole. With none
+    /// set the card says None, nothing is ticked, ⚡ and the slider are dead and say why, and a
+    /// pick of a row starts a whole default, on its door and the Default effort.
     #[test]
     fn the_default_for_new_bots_is_picked_whole_in_the_bots_picker() {
         let kept = NewBotDefault {
@@ -1745,6 +1818,83 @@ mod tests {
             None,
             "an effort alone makes no default"
         );
+    }
+
+    /// The Relay-off fallback is the Bot's picker over the Gateway group alone (opengrok-server
+    /// relay-off fallback contract, agreed 2026-10-03, not yet built), whatever else the list of
+    /// models holds: it is what a Bot on the plan answers with on the server's paid keys. Set, the
+    /// card names its model and effort, the list ticks its row, and every change makes the whole
+    /// fallback anew. With none set the card says None, ⚡ and the slider are dead and say why,
+    /// and a pick starts a whole fallback on the Default effort. The plan's door makes none.
+    #[test]
+    fn the_relay_off_fallback_is_picked_whole_from_the_gateway_alone() {
+        let fallback = |model: &str, effort: &str| {
+            Some(PlanFallback {
+                model: model.into(),
+                effort: effort.into(),
+            })
+        };
+        let mut listed = catalogue(SERVER);
+        listed
+            .models
+            .push(entry("gpt-6-luna", "local_proxy", Some("mac")));
+        let kept = fallback("xai/grok-4.7", "high");
+        let pick = plan_fallback_pick(kept.as_ref(), &listed);
+        assert_eq!(
+            pick.groups
+                .iter()
+                .map(ChoiceGroup::title)
+                .collect::<Vec<_>>(),
+            [GATEWAY_GROUP]
+        );
+        assert!(pick.rows().all(|row| row.source == InferenceKind::Gateway));
+        assert_eq!(pick.summary(), "Grok 4.7 · High");
+        assert_eq!(pick.door, Some(InferenceKind::Gateway));
+        assert_eq!(
+            pick.current.as_ref().map(|row| row.base_id.as_str()),
+            Some("xai/grok-4.7")
+        );
+        assert!(
+            pick.pick_patch(InferenceKind::LocalProxy, "gpt-6-luna")
+                .is_err(),
+            "the plan's models are not offered"
+        );
+        let whole = |patch: Option<CoworkerPatch>| pick.plan_fallback(&patch.expect("a change"));
+        assert_eq!(
+            whole(
+                pick.pick_patch(InferenceKind::Gateway, "oag/cheap")
+                    .unwrap()
+            ),
+            fallback("oag/cheap", "high")
+        );
+        assert_eq!(
+            whole(pick.effort_patch("low").unwrap()),
+            fallback("xai/grok-4.7", "low")
+        );
+        assert_eq!(
+            pick.plan_fallback(&CoworkerPatch {
+                source: Some(InferenceKind::LocalProxy),
+                model: Some("gpt-6-luna".into()),
+                ..Default::default()
+            }),
+            None,
+            "never the plan"
+        );
+
+        let none = plan_fallback_pick(None, &listed);
+        assert_eq!(none.summary(), "None · Default");
+        assert_eq!(
+            (none.fast_blocked, none.effort_dead),
+            (
+                Some(PLAN_FALLBACK_PICK_FIRST),
+                Some(PLAN_FALLBACK_PICK_FIRST)
+            )
+        );
+        let first = none
+            .pick_patch(InferenceKind::Gateway, "oag/cheap")
+            .unwrap()
+            .expect("a change");
+        assert_eq!(none.plan_fallback(&first), fallback("oag/cheap", "inherit"));
     }
 
     /// From a server that keeps no effort (before opengrok-server#271) the Bot reads Default and

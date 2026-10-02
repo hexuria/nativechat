@@ -253,6 +253,12 @@ pub struct InferenceSource {
     /// it, which is never sent one: the relay switch tells only a server that keeps it.
     #[serde(default)]
     pub relay_enabled: Option<bool>,
+    /// The Relay-off fallback, from a server that keeps one, which sends the key on every read,
+    /// `null` until the person sets one (opengrok-server relay-off fallback contract, agreed
+    /// 2026-10-03, not yet built). `None` is the key left out, a server before it, which keeps no
+    /// such fallback; `Some(None)` is `null`, none set.
+    #[serde(default, deserialize_with = "keyed")]
+    pub plan_fallback: Option<Option<PlanFallback>>,
 }
 
 /// A key that is there, `null` or not: `Some(None)` for `null` and `Some(Some(_))` for a value,
@@ -286,6 +292,22 @@ pub struct NewBotDefault {
     /// The door a new Bot is born on: `gateway` or `local_proxy`.
     pub source: InferenceKind,
     /// The id it is pinned to.
+    pub model: String,
+    /// One of a Bot's effort words (`types::EFFORT_WORDS`); left out or `null`, `inherit`.
+    #[serde(default = "effort_inherit", deserialize_with = "effort_word")]
+    pub effort: String,
+}
+
+/// What a Bot on the person's plan answers with while the relay is off, the account's Relay-off
+/// fallback: `planFallback: {model, effort} | null` on `GET` and `PUT
+/// /account/inference-source` (opengrok-server relay-off fallback contract, agreed 2026-10-03,
+/// not yet built). Its model is on the server's paid keys, held to what a Bot's gateway pin is
+/// held to, and its effort is one of a Bot's words. Fast is the model's `--fast` id, as
+/// everywhere, not a field.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanFallback {
+    /// The gateway id a Bot on the plan answers on while the relay is off.
     pub model: String,
     /// One of a Bot's effort words (`types::EFFORT_WORDS`); left out or `null`, `inherit`.
     #[serde(default = "effort_inherit", deserialize_with = "effort_word")]
@@ -360,7 +382,7 @@ pub struct RelayRead {
 }
 
 /// A `PUT /account/inference-source` body, as this app sends one: `{"kind", "via"?,
-/// "relayEnabled"?, "newBotDefault"?}`.
+/// "relayEnabled"?, "newBotDefault"?, "planFallback"?}`.
 ///
 /// The server takes no `PUT` without a kind (`apply` in
 /// `crates/opengrok-harness/src/local_proxy.rs`), and this app switches no kind, so `kind` is the
@@ -394,6 +416,12 @@ pub struct InferenceSourceUpdate {
     /// it, and a value replaces it whole.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub new_bot_default: Option<Option<NewBotDefault>>,
+    /// The Relay-off fallback, sent whole when the app changes it, only to a server whose read
+    /// carries the key, and `null` to take it away (opengrok-server relay-off fallback contract,
+    /// agreed 2026-10-03, not yet built): absent keeps it, `null` clears it, and a value replaces
+    /// it whole.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plan_fallback: Option<Option<PlanFallback>>,
 }
 
 /// Which door one reply came through, as the run's `opengrok.inferenceSource` CUSTOM says:
@@ -600,6 +628,7 @@ mod tests {
                 relay: None,
                 new_bot_default: None,
                 relay_enabled: None,
+                plan_fallback: None,
             }
         );
         let unset: InferenceSource = serde_json::from_value(json!({
@@ -632,6 +661,7 @@ mod tests {
                 via: None,
                 new_bot_default: None,
                 relay_enabled: None,
+                plan_fallback: None,
             };
             assert_eq!(
                 serde_json::to_value(&bare).unwrap(),
@@ -644,6 +674,7 @@ mod tests {
             via: Some(Via::Mac),
             new_bot_default: None,
             relay_enabled: None,
+            plan_fallback: None,
         };
         let body = serde_json::to_value(&moved).unwrap();
         assert_eq!(body, json!({"kind": "gateway", "via": "mac"}));
@@ -826,6 +857,7 @@ mod tests {
                 kind: InferenceKind::Gateway,
                 via: None,
                 relay_enabled: None,
+                plan_fallback: None,
                 new_bot_default,
             })
             .unwrap()
@@ -875,6 +907,7 @@ mod tests {
                 via,
                 relay_enabled,
                 new_bot_default: None,
+                plan_fallback: None,
             })
             .unwrap()
         };
@@ -890,6 +923,73 @@ mod tests {
             put(Some(Via::Mac), None),
             json!({"kind": "local_proxy", "via": "mac"}),
             "left alone, kept"
+        );
+    }
+
+    /// The Relay-off fallback reads as the agreed contract writes it (opengrok-server relay-off
+    /// fallback contract, agreed 2026-10-03, not yet built): left out by a server that keeps
+    /// none, `null` while none is set, and whole once set, an effort left out or `null` read as
+    /// `inherit`. A `PUT` names it only when the app changes it: whole, or `null` to take it away.
+    #[test]
+    fn the_relay_off_fallback_reads_and_puts_as_the_contract_writes_it() {
+        let read = |fallback: Option<Value>| {
+            let mut body = json!({
+                "kind": "local_proxy", "baseUrl": null, "localModel": null,
+                "healthy": false, "hasApiKey": false
+            });
+            if let Some(fallback) = fallback {
+                body["planFallback"] = fallback;
+            }
+            serde_json::from_value::<InferenceSource>(body).unwrap()
+        };
+        let cheap = PlanFallback {
+            model: "oag/cheap".into(),
+            effort: "low".into(),
+        };
+        assert_eq!(read(None).plan_fallback, None, "a server before it");
+        assert_eq!(read(Some(Value::Null)).plan_fallback, Some(None));
+        assert_eq!(
+            read(Some(json!({"model": "oag/cheap", "effort": "low"}))).plan_fallback,
+            Some(Some(cheap.clone()))
+        );
+        for left in [
+            json!({"model": "oag/cheap"}),
+            json!({"model": "oag/cheap", "effort": null}),
+        ] {
+            assert_eq!(
+                read(Some(left.clone()))
+                    .plan_fallback
+                    .flatten()
+                    .map(|fallback| fallback.effort),
+                Some("inherit".to_string()),
+                "{left}"
+            );
+        }
+
+        let put = |plan_fallback| {
+            serde_json::to_value(InferenceSourceUpdate {
+                kind: InferenceKind::LocalProxy,
+                via: None,
+                relay_enabled: None,
+                new_bot_default: None,
+                plan_fallback,
+            })
+            .unwrap()
+        };
+        assert_eq!(
+            put(None),
+            json!({"kind": "local_proxy"}),
+            "left alone, kept"
+        );
+        assert_eq!(
+            put(Some(None)),
+            json!({"kind": "local_proxy", "planFallback": null}),
+            "taken away"
+        );
+        assert_eq!(
+            put(Some(Some(cheap))),
+            json!({"kind": "local_proxy", "planFallback": {"model": "oag/cheap", "effort": "low"}}),
+            "whole"
         );
     }
 

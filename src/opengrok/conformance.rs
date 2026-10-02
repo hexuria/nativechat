@@ -693,6 +693,23 @@ const REST_FIELDS_NOT_RECORDED_YET: &[(&str, &str, &str)] = &[
          no via as it goes off, only where the read carries the key, and the answer carries it as \
          a read does. Its recording comes with the corpus re-vendored from a main that builds it.",
     ),
+    (
+        "GET__account_inference-source",
+        "planFallback",
+        "opengrok-server relay-off fallback contract, agreed 2026-10-03, not yet built: the \
+         account's setting carries planFallback, {model, effort} or null, on every read, and \
+         Settings → General's Relay-off fallback picker is live only where the read carries the \
+         key. Its recording comes with the corpus re-vendored from a main that builds it.",
+    ),
+    (
+        "PUT__account_inference-source",
+        "planFallback",
+        "opengrok-server relay-off fallback contract, agreed 2026-10-03, not yet built: a PUT \
+         takes planFallback whole, its model held as a gateway pin is and its effort to a Bot's \
+         words, null clears it, and the answer carries it as a read does. The Relay-off fallback \
+         picker sends it at once. Its recording comes with the corpus re-vendored from a main \
+         that builds it.",
+    ),
 ];
 
 // ---- the corpus ----
@@ -3806,6 +3823,23 @@ fn inference_source(_: u16, body: &Value) -> Check {
         read.relay_enabled == body.get("relayEnabled").and_then(Value::as_bool),
         "whether the relay is on should come through as sent: {read:?} from {body}"
     );
+    // The Relay-off fallback, from a server that keeps one (the same contract): read exactly when
+    // the key is sent, null as none set, and an object field for field, an effort left out as
+    // `inherit`.
+    match (&read.plan_fallback, body.get("planFallback")) {
+        (None, None) | (Some(None), Some(Value::Null)) => {}
+        (Some(Some(fallback)), Some(raw)) => must!(
+            fallback.model == str_at(raw, "model")
+                && fallback.effort == opt_str(raw, "effort").unwrap_or(EFFORT_INHERIT),
+            "the Relay-off fallback should come through as sent: {fallback:?} from {raw}"
+        ),
+        (read, sent) => {
+            return Err(format!(
+                "the Relay-off fallback should be read exactly as it is sent: {read:?} from \
+                 {sent:?}"
+            ));
+        }
+    }
     Ok(())
 }
 

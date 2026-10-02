@@ -338,6 +338,24 @@
 //! popover, as `agent-model-dismiss` shuts the Bot's. All of it is refused off General, saying to
 //! open it with `settings-tab-general`.
 //!
+//! Under it in Default models, `settings-plan-fallback`: the Relay-off fallback, "When Relay is
+//! off, Subscription Bots use", what a Bot on the person's plan answers with while the relay is
+//! off (opengrok-server relay-off fallback contract, agreed 2026-10-03, not yet built: the
+//! account's `planFallback`, `{model, effort}` or `null`, on `/account/inference-source`). It is
+//! live only where the server's read carries that key, `null` or not. Otherwise (state
+//! `unavailable`) it holds `settings-plan-fallback-unavailable` ("Coming soon: the server can't
+//! keep a Relay-off fallback yet.") and `settings-plan-fallback-card`, disabled and refused with
+//! why. Live, it is the Bot's card and popover under `settings-plan-fallback-*` as Default for new
+//! Bots' are under `settings-new-bots-*` (`-card`, `-pop`, `-fast`, `-effort`, `-reset`,
+//! `-open-list`, `-search`, `-list`, `-no-match`, `-note`, `-error`), over the Gateway group
+//! alone: `settings-plan-fallback-group-gateway` and its rows,
+//! `settings-plan-fallback-row-gateway-{id}`, and none of the plan's models. Over them,
+//! `settings-plan-fallback-none` (`None`, valued `no fallback`, state `selected` while none is
+//! set; a click takes the kept fallback away). Every pick is kept on the account at once, whole,
+//! as `PUT /account/inference-source` `{kind, planFallback}` with the kind the server keeps (None
+//! sends `null`), one change of the account's at a time. `settings-plan-fallback-dismiss` shuts
+//! the popover. All of it is refused off General.
+//!
 //! Relay, Settings' page for the person's ChatGPT or Grok plan relayed to the server from this
 //! computer, which was Reply source and keeps its ids. The page switches no door: a Bot's door is
 //! picked with its model on `agent-model-card`, and the account's kind stays as the server keeps

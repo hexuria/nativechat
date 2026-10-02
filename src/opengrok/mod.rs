@@ -38,8 +38,8 @@ pub use gen_ui::{
 };
 pub use inference::{
     DEFAULT_PROXY_URL, HELD_FOR_RELAY_OFFLINE, INFERENCE_SOURCE_CUSTOM, InferenceKind,
-    InferenceSource, InferenceSourceUpdate, NewBotDefault, RelayRead, ReplySource, RunErrorCode,
-    TurnSource, Via, is_loopback, is_subscription_model,
+    InferenceSource, InferenceSourceUpdate, NewBotDefault, PlanFallback, RelayRead, ReplySource,
+    RunErrorCode, TurnSource, Via, is_loopback, is_subscription_model,
 };
 pub use local_exec::{
     Enrolment, LocalExecStopped, MachineCredential, enrol_this_machine, serve_local_exec,
@@ -49,10 +49,10 @@ pub use model_choice::{
     AccountPlan, ChoiceGroup, DEFAULT_EFFORT_LABEL, EFFORT_NOT_KEPT, EFFORT_STOPS,
     FAST_ACCOUNT_PLAN, FAST_DOOR_UNKNOWN, FAST_NO_TWIN, FAST_SUFFIX, GATEWAY_GROUP, LIST_ROWS,
     ListLine, ModelChoice, ModelPick, NEW_BOTS_NONE, NEW_BOTS_PICK_FIRST, NEW_BOTS_PICK_ID,
-    NO_MODEL, ROUTINES_ON_PLAN, SUBSCRIPTION_GROUP, base_label, bot_pick, effort_label,
-    effort_stop, group_title, is_fast, last_window_start, list_window, model_label, new_bots_pick,
-    plan_choices, row_count, server_choices, slider_stop, stop_word, window_opening_on,
-    without_fast,
+    NO_MODEL, PLAN_FALLBACK_PICK_FIRST, ROUTINES_ON_PLAN, SUBSCRIPTION_GROUP, base_label, bot_pick,
+    effort_label, effort_stop, group_title, is_fast, last_window_start, list_window, model_label,
+    new_bots_pick, plan_choices, plan_fallback_pick, row_count, server_choices, slider_stop,
+    stop_word, window_opening_on, without_fast,
 };
 pub use relay::{
     OpencodexAddress, RelayHandle, RelayKey, RelayReport, RelayStatus, RelayTarget, RelayTimings,
