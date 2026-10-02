@@ -9,8 +9,8 @@ use crate::opengrok::{
     BotSkillRow, BotSkillScope, CeilingRow, CoworkerPatch, CoworkerTool, USER_MACHINE_SHELL,
 };
 use crate::state::{
-    AppState, BotSkills, CeilingBlock, CeilingCard, CeilingSwitch, PickerPlace, SkillSwitch,
-    SkillsBlock, SkillsCard, ToolCeiling, ToolList, UsageReport,
+    AppState, BotSkills, CeilingBlock, CeilingCard, CeilingSwitch, SkillSwitch, SkillsBlock,
+    SkillsCard, ToolCeiling, ToolList, UsageReport,
 };
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputState, Textarea, TextareaState};
@@ -54,8 +54,8 @@ pub struct AgentSettings {
     name_input: Entity<InputState>,
     label_input: Entity<InputState>,
     role_input: Entity<TextareaState>,
-    /// The Bot's model, door, fast tier and effort, as the model picker's card: every change is
-    /// saved on the Bot at once, and none waits for Save.
+    /// The Bot's model, door, fast tier and effort, as the model picker's card, the one place a
+    /// Bot's model is picked: every change is saved on the Bot at once, and none waits for Save.
     model_card: Entity<ModelPicker>,
     synced_id: Option<String>,
     /// The profile is with the server. The Save button is out of the person's hands until the
@@ -82,7 +82,7 @@ impl AgentSettings {
             state.set_auto_grow(3, 7, cx);
             state
         });
-        let model_card = cx.new(|cx| ModelPicker::new(state.clone(), PickerPlace::Card, cx));
+        let model_card = cx.new(|cx| ModelPicker::new(state.clone(), cx));
         cx.observe(&state, |this, state, cx| {
             // A driver's Save, which comes by way of the app because the button and the fields
             // it sends are this pane's. Only for the bot the fields were filled for: a switch the
@@ -148,7 +148,7 @@ impl AgentSettings {
         }
         // The words in the fields. The model, its door and the effort are the picker's, saved
         // the moment they are picked; sent back with every Save, what the pane last read would
-        // undo a pick made since from the composer or another Mac.
+        // undo a pick made since on the card or from another Mac.
         let patch = CoworkerPatch {
             name: Some(self.name_input.read(cx).value().to_string()),
             title: Some(self.label_input.read(cx).value().to_string()),
@@ -523,7 +523,7 @@ impl Render for AgentSettings {
                                     )
                                     .child(heading("Model", muted))
                                     // The model, its door, the fast tier and the effort, all in the
-                                    // one control the composer's chip opens too.
+                                    // one control, and the only place they are picked.
                                     .child(self.model_card.clone())
                                     .child(
                                         div()

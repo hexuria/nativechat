@@ -73,7 +73,7 @@ impl ShellRev {
                 state.computer_view,
                 crate::state::ComputerView::Editor { .. }
             ),
-            model_picker: state.model_picker.is_some(),
+            model_picker: state.model_picker_open,
             avatar_editor: state.avatar_editor_open,
             app_settings: state.is_app_settings_open,
             bot_finder: state.bot_finder_open,

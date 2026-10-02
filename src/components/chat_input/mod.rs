@@ -241,10 +241,6 @@ pub struct MessageInput {
     /// button. Cached off [`AppState`] like the rest, so the composer draws without reading the
     /// state on every frame.
     turn_in_flight: bool,
-    /// The open Bot's model picker as the composer's chip: its model, fast tier and effort, and
-    /// the door they are served through, each saved on the Bot the moment it is picked. A view
-    /// of its own, which follows the state itself.
-    model_picker: Entity<crate::components::model_picker::ModelPicker>,
 }
 
 impl MessageInput {
@@ -266,13 +262,6 @@ impl MessageInput {
         let reply_to = app_state.reply_to.clone();
         let coworker_name = composer_bot_name(app_state);
         let turn_in_flight = app_state.is_turn_in_flight();
-        let model_picker = cx.new(|cx| {
-            crate::components::model_picker::ModelPicker::new(
-                state.clone(),
-                crate::state::PickerPlace::Composer,
-                cx,
-            )
-        });
 
         let this = Self {
             state: state.clone(),
@@ -298,7 +287,6 @@ impl MessageInput {
             notice: None,
             dismissed_at: None,
             turn_in_flight,
-            model_picker,
         };
 
         // Subscribe to state changes to update cached values and notify only when relevant
@@ -653,23 +641,13 @@ impl MessageInput {
                 }
             }
         }
-        self.tell_state_dictating(cx);
         cx.notify();
-    }
-
-    /// The model picker's chip gives its place to the dictation's buttons, and the state is told:
-    /// a chip that is not drawn is not in a driver's tree either.
-    fn tell_state_dictating(&self, cx: &mut Context<Self>) {
-        let dictating = self.voice_mode;
-        self.state
-            .update(cx, |state, cx| state.set_composer_dictating(dictating, cx));
     }
 
     fn confirm_voice_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.voice_mode = false;
         self.audio_input = None;
         self.voice_wave = None;
-        self.tell_state_dictating(cx);
         cx.notify();
 
         // Mock transcription
@@ -2478,11 +2456,6 @@ impl Render for MessageInput {
 
                                         confirm_btn
                                     })
-                                })
-                                // The open Bot's model, fast tier and effort, beside the button
-                                // that sends to it. It draws nothing with no Bot open.
-                                .when(!self.voice_mode, |this| {
-                                    this.child(self.model_picker.clone())
                                 })
                                 .when(!self.voice_mode, |this| {
                                     // Text Mode: Mic and Send/Headphone

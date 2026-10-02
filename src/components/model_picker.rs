@@ -1,7 +1,11 @@
-//! A Bot's model, fast tier and effort, picked the way Codex picks them: one chip in the composer
-//! ("GPT-6 Luna · Medium ⚡"), and the same control as the Model card in the Bot's settings. Each
-//! opens a popover whose top row is ⚡, the effort, the model's name, which opens the list of
-//! models grouped by door, and ↺, over a slider of five stops of effort.
+//! A Bot's model, fast tier and effort, picked the way Codex picks them, on the Model card in the
+//! Bot's settings: the model's name, over its door, the effort and ⚡. The card opens a popover
+//! whose top row is ⚡, the effort, the model's name, which opens the list of models grouped by
+//! door, and ↺, over a slider of five stops of effort.
+//!
+//! The card is the only place a Bot's model is picked. The composer has no chip for it: the model
+//! is the Bot's setting, changed where the Bot's other settings are, and every turn goes through
+//! the door the card shows.
 //!
 //! Every change is saved on the Bot at once (`AppState::pick_model` and its neighbours): nothing
 //! waits for a Save, and nothing is kept anywhere but the server. What the picker offers and what
@@ -13,7 +17,7 @@ use crate::opengrok::{
     AccountPlan, ChoiceGroup, EFFORT_NOT_KEPT, EFFORT_STOPS, InferenceKind, ModelChoice, ModelPick,
     NO_MODEL, PLAN_GROUP, base_label, effort_label, effort_stop, slider_stop, stop_word,
 };
-use crate::state::{AppState, PickerPlace};
+use crate::state::AppState;
 use gpui_kit::component::popover::Popover;
 use gpui_kit::component::slider::{Slider, SliderEvent, SliderState};
 use gpui_kit::component::tooltip::Tooltip;
@@ -21,43 +25,32 @@ use gpui_kit::component::{ActiveTheme, Icon, IconName, Selectable, Theme, h_flex
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 
-/// The composer's chip, and the card in the Bot's settings.
-pub(crate) const CHIP: &str = "model-chip";
+/// The card in the Bot's settings, which opens the popover.
 pub(crate) const CARD: &str = "agent-model-card";
-/// The popover, and each of its parts. The card's are these with `agent-` before them
-/// ([`part_id`]), so one driver's words work on either.
-pub(crate) const POP: &str = "model-pop";
-pub(crate) const FAST: &str = "model-fast";
-pub(crate) const RESET: &str = "model-reset";
-pub(crate) const EFFORT: &str = "model-effort";
+/// The popover, and each of its parts.
+pub(crate) const POP: &str = "agent-model-pop";
+pub(crate) const FAST: &str = "agent-model-fast";
+pub(crate) const RESET: &str = "agent-model-reset";
+pub(crate) const EFFORT: &str = "agent-model-effort";
 /// The model's name, which opens the list, and in the list the heading that goes back.
-pub(crate) const OPEN_LIST: &str = "model-open-list";
-pub(crate) const LIST: &str = "model-list";
+pub(crate) const OPEN_LIST: &str = "agent-model-open-list";
+pub(crate) const LIST: &str = "agent-model-list";
 /// Before each row's door and id ([`row_id`]).
-pub(crate) const ROW: &str = "model-row-";
+pub(crate) const ROW: &str = "agent-model-row-";
 /// In the list, on a server without per-Bot doors while the account is on the person's plan:
 /// the plan's model, which answers for every Bot there.
-pub(crate) const PLAN: &str = "model-plan";
+pub(crate) const PLAN: &str = "agent-model-plan";
 /// In the list: the server's word about why it lists no more, as `GET /models` gives it.
-pub(crate) const NOTE: &str = "model-note";
+pub(crate) const NOTE: &str = "agent-model-note";
 /// In the list, on a Bot whose own door is the person's plan, whatever it is pinned to: its
 /// routines, which run on the server's paid keys, won't run (`ModelPick::routines`).
-pub(crate) const ROUTINES: &str = "model-routines";
+pub(crate) const ROUTINES: &str = "agent-model-routines";
 /// Under the controls: the server's words for the last change that did not go through.
-pub(crate) const ERROR: &str = "model-error";
-
-/// One of a presentation's parts by its id: the composer's as they are, the card's with `agent-`
-/// before them.
-pub(crate) fn part_id(place: PickerPlace, part: &str) -> String {
-    match place {
-        PickerPlace::Composer => part.to_string(),
-        PickerPlace::Card => format!("agent-{part}"),
-    }
-}
+pub(crate) const ERROR: &str = "agent-model-error";
 
 /// One row of the list, by its door's wire word and the id a pick of it pins with ⚡ off.
-pub(crate) fn row_id(place: PickerPlace, source: InferenceKind, base_id: &str) -> String {
-    part_id(place, &format!("{ROW}{}-{base_id}", source.word()))
+pub(crate) fn row_id(source: InferenceKind, base_id: &str) -> String {
+    format!("{ROW}{}-{base_id}", source.word())
 }
 
 /// What a driver's tree names ⚡ and ↺ by, which the window draws as their marks alone.
@@ -77,21 +70,8 @@ const RESET_TIP: &str = "Default effort, and ⚡ off";
 const FAST_ON_TIP: &str = "Fast is on. Click to turn it off.";
 const FAST_OFF_TIP: &str = "Use this model's fast version";
 
-/// The composer's popover is as wide as a Codex popover; the card's is the settings pane's width.
-const COMPOSER_WIDTH: f32 = 300.;
+/// The popover is the settings pane's width, as the card is.
 const CARD_WIDTH: f32 = INFO_PANE_WIDTH - 32.;
-
-/// What the chip says on hover: the model the next turn runs on, by its id, and whose it is.
-pub(crate) fn chip_tooltip(pick: &ModelPick) -> String {
-    let model = pick.model.as_deref().unwrap_or(NO_MODEL);
-    match pick.door {
-        Some(InferenceKind::LocalProxy) => format!("{model} on your plan. Click to change."),
-        Some(InferenceKind::Gateway) => {
-            format!("{model} on the server's paid keys. Click to change.")
-        }
-        None => format!("{model}. Click to change."),
-    }
-}
 
 /// The card's second line: the door, the effort, and ⚡ while it is on.
 pub(crate) fn card_detail(pick: &ModelPick) -> String {
@@ -120,8 +100,8 @@ struct Snap {
 }
 
 impl Snap {
-    fn read(state: &AppState, place: PickerPlace) -> Self {
-        let open = state.model_picker == Some(place);
+    fn read(state: &AppState) -> Self {
+        let open = state.model_picker_open;
         Self {
             pick: state.model_pick(),
             open,
@@ -132,11 +112,10 @@ impl Snap {
     }
 }
 
-/// The picker in one of its two places. Its own view, because the slider's state is an entity of
-/// its own that has to outlive every frame, and a drag of it is heard here.
+/// The picker on the Bot's card. Its own view, because the slider's state is an entity of its own
+/// that has to outlive every frame, and a drag of it is heard here.
 pub struct ModelPicker {
     state: Entity<AppState>,
-    place: PickerPlace,
     slider: Entity<SliderState>,
     /// The Bot and the effort the slider was last put at: it is moved when the Bot's effort
     /// changes (a pick saved, a refusal put back, another Bot opened), and never under a drag.
@@ -145,7 +124,7 @@ pub struct ModelPicker {
 }
 
 impl ModelPicker {
-    pub fn new(state: Entity<AppState>, place: PickerPlace, cx: &mut Context<Self>) -> Self {
+    pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
         let last = (EFFORT_STOPS.len() - 1) as f32;
         let slider = cx.new(|_| {
             SliderState::new()
@@ -168,17 +147,16 @@ impl ModelPicker {
         })
         .detach();
         cx.observe(&state, |this, state, cx| {
-            let snap = Snap::read(state.read(cx), this.place);
+            let snap = Snap::read(state.read(cx));
             if snap != this.snap {
                 this.snap = snap;
                 cx.notify();
             }
         })
         .detach();
-        let snap = Snap::read(state.read(cx), place);
+        let snap = Snap::read(state.read(cx));
         Self {
             state,
-            place,
             slider,
             slider_at: None,
             snap,
@@ -204,102 +182,36 @@ impl Render for ModelPicker {
             return div().into_any_element();
         };
         self.sync_slider(&pick, window, cx);
-        let place = self.place;
         let open = self.snap.open;
         let app = self.state.clone();
         let panel = Panel {
-            place,
             pick: pick.clone(),
             list_open: self.snap.list_open,
             note: self.snap.note.clone(),
             catalogue_note: self.snap.catalogue_note.clone(),
             slider: self.slider.clone(),
         };
-        let popover = Popover::new(SharedString::from(part_id(place, "model-picker")))
+        let popover = Popover::new("agent-model-picker")
             .appearance(false)
             .overlay_closable(true)
             .open(open)
             .on_open_change({
                 let app = app.clone();
                 move |open, _, cx| {
-                    app.update(cx, |state, cx| {
-                        if *open {
-                            state.set_model_picker(Some(place), cx);
-                        } else {
-                            state.close_model_picker(place, cx);
-                        }
-                    });
+                    app.update(cx, |state, cx| state.set_model_picker_open(*open, cx));
                 }
             })
             .content({
                 let app = app.clone();
                 move |_, _, cx| panel.render(app.clone(), cx.theme())
             });
-        match place {
-            // Above the chip, as the composer's other popovers open: the composer is at the
-            // bottom of the window.
-            PickerPlace::Composer => popover
-                .anchor(Anchor::BottomRight)
-                .trigger(ChipTrigger {
-                    label: pick.chip_label(),
-                    tooltip: chip_tooltip(&pick),
-                    selected: open,
-                })
-                .into_any_element(),
-            // Under the card, from an anchor of its own the width of the card, as the settings
-            // pane's model list always hung: a trigger's popover opens over the trigger itself.
-            PickerPlace::Card => v_flex()
-                .w(px(CARD_WIDTH))
-                .child(card(&pick, open, app, cx.theme()))
-                .child(popover.trigger(CardAnchor { selected: open }))
-                .into_any_element(),
-        }
-    }
-}
-
-/// The composer's chip: the popover's own trigger.
-#[derive(IntoElement)]
-struct ChipTrigger {
-    label: String,
-    tooltip: String,
-    selected: bool,
-}
-
-impl Selectable for ChipTrigger {
-    fn selected(mut self, selected: bool) -> Self {
-        self.selected = selected;
-        self
-    }
-
-    fn is_selected(&self) -> bool {
-        self.selected
-    }
-}
-
-impl RenderOnce for ChipTrigger {
-    fn render(self, _: &mut Window, cx: &mut App) -> impl IntoElement {
-        let theme = cx.theme();
-        let secondary = theme.secondary;
-        let tooltip = self.tooltip;
-        div()
-            .id(CHIP)
-            .flex_none()
-            .h(px(26.))
-            .px(px(10.))
-            .rounded_full()
-            .flex()
-            .items_center()
-            .border_1()
-            .border_color(theme.border)
-            .when(self.selected, |this| this.bg(secondary))
-            .text_xs()
-            .text_color(theme.secondary_foreground)
-            .cursor_pointer()
-            .hover(move |style| style.bg(secondary))
-            .when(!self.selected, |this| {
-                this.tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
-            })
-            .child(self.label)
+        // Under the card, from an anchor of its own the width of the card, as the settings pane's
+        // model list always hung: a trigger's popover opens over the trigger itself.
+        v_flex()
+            .w(px(CARD_WIDTH))
+            .child(card(&pick, open, app, cx.theme()))
+            .child(popover.trigger(CardAnchor { selected: open }))
+            .into_any_element()
     }
 }
 
@@ -347,9 +259,7 @@ fn card(pick: &ModelPick, open: bool, app: Entity<AppState>, theme: &Theme) -> i
             // own click-outside may have shut it already by the time this runs, so this sets
             // what the card showed when it was clicked, rather than turning whatever is now.
             cx.stop_propagation();
-            app.update(cx, |state, cx| {
-                state.set_model_picker((!open).then_some(PickerPlace::Card), cx);
-            });
+            app.update(cx, |state, cx| state.set_model_picker_open(!open, cx));
         })
         .child(
             h_flex()
@@ -375,7 +285,6 @@ fn card(pick: &ModelPick, open: bool, app: Entity<AppState>, theme: &Theme) -> i
 /// What the popover draws.
 #[derive(Clone)]
 struct Panel {
-    place: PickerPlace,
     pick: ModelPick,
     list_open: bool,
     note: Option<String>,
@@ -385,18 +294,14 @@ struct Panel {
 
 impl Panel {
     fn render(&self, app: Entity<AppState>, theme: &Theme) -> AnyElement {
-        let width = match self.place {
-            PickerPlace::Composer => COMPOSER_WIDTH,
-            PickerPlace::Card => CARD_WIDTH,
-        };
         let fill = if theme.is_dark() {
             rgb(0x1c1c1c)
         } else {
             rgb(0xffffff)
         };
         v_flex()
-            .id(SharedString::from(part_id(self.place, POP)))
-            .w(px(width))
+            .id(POP)
+            .w(px(CARD_WIDTH))
             .p(px(12.))
             .gap(px(10.))
             .rounded(px(12.))
@@ -419,7 +324,7 @@ impl Panel {
             .when_some(self.note.clone(), |this, note| {
                 this.child(
                     div()
-                        .id(SharedString::from(part_id(self.place, ERROR)))
+                        .id(ERROR)
                         .text_xs()
                         .text_color(theme.danger)
                         .child(note),
@@ -430,7 +335,6 @@ impl Panel {
 
     /// ⚡, the effort, the model's name and ↺, over the slider.
     fn controls(&self, app: &Entity<AppState>, theme: &Theme) -> impl IntoElement {
-        let place = self.place;
         let pick = &self.pick;
         let muted = theme.muted_foreground;
         let hover = rgb(0x777777).opacity(0.16);
@@ -439,7 +343,7 @@ impl Panel {
             let app = app.clone();
             let blocked = pick.fast_blocked;
             div()
-                .id(SharedString::from(part_id(place, FAST)))
+                .id(FAST)
                 .size(px(28.))
                 .flex_none()
                 .rounded(px(8.))
@@ -472,7 +376,7 @@ impl Panel {
         let open_list = {
             let app = app.clone();
             h_flex()
-                .id(SharedString::from(part_id(place, OPEN_LIST)))
+                .id(OPEN_LIST)
                 .min_w(px(0.))
                 .gap(px(4.))
                 .px(px(8.))
@@ -502,7 +406,7 @@ impl Panel {
             let app = app.clone();
             let live = pick.can_reset();
             div()
-                .id(SharedString::from(part_id(place, RESET)))
+                .id(RESET)
                 .size(px(28.))
                 .flex_none()
                 .rounded(px(8.))
@@ -548,7 +452,7 @@ impl Panel {
             )
             .child(
                 v_flex()
-                    .id(SharedString::from(part_id(place, EFFORT)))
+                    .id(EFFORT)
                     .gap(px(4.))
                     .child(
                         Slider::new(&self.slider)
@@ -572,14 +476,13 @@ impl Panel {
 
     /// The models, grouped by door, under a heading that goes back to the controls.
     fn list(&self, app: &Entity<AppState>, theme: &Theme) -> impl IntoElement {
-        let place = self.place;
         let pick = &self.pick;
         let muted = theme.muted_foreground;
         let empty = pick.groups.is_empty() && pick.account_plan.is_none();
         let back = {
             let app = app.clone();
             h_flex()
-                .id(SharedString::from(part_id(place, OPEN_LIST)))
+                .id(OPEN_LIST)
                 .gap(px(6.))
                 .items_center()
                 .cursor_pointer()
@@ -596,12 +499,12 @@ impl Panel {
         };
         v_flex().gap(px(8.)).child(back).child(
             v_flex()
-                .id(SharedString::from(part_id(place, LIST)))
+                .id(LIST)
                 .max_h(px(320.))
                 .overflow_y_scroll()
                 .gap(px(10.))
                 .when_some(pick.account_plan.clone(), |this, plan| {
-                    this.child(account_plan(place, &plan, theme))
+                    this.child(account_plan(&plan, theme))
                 })
                 .children(
                     pick.groups
@@ -621,7 +524,7 @@ impl Panel {
                 .when_some(pick.routines.clone(), |this, line| {
                     this.child(
                         div()
-                            .id(SharedString::from(part_id(place, ROUTINES)))
+                            .id(ROUTINES)
                             .px(px(8.))
                             .text_xs()
                             .text_color(muted)
@@ -631,7 +534,7 @@ impl Panel {
                 .when_some(self.catalogue_note.clone(), |this, note| {
                     this.child(
                         div()
-                            .id(SharedString::from(part_id(place, NOTE)))
+                            .id(NOTE)
                             .px(px(8.))
                             .text_xs()
                             .text_color(muted)
@@ -670,11 +573,7 @@ impl Panel {
         let source = row.source;
         let base_id = row.base_id.clone();
         h_flex()
-            .id(SharedString::from(row_id(
-                self.place,
-                row.source,
-                &row.base_id,
-            )))
+            .id(SharedString::from(row_id(row.source, &row.base_id)))
             .gap(px(6.))
             .px(px(8.))
             .py(px(5.))
@@ -716,7 +615,7 @@ impl Panel {
 /// The plan's model on a server without per-Bot doors, while the account is on the person's
 /// plan: ticked, because it is what answers, and not a row to pick, because a Bot's pick of it
 /// would change nothing there.
-fn account_plan(place: PickerPlace, plan: &AccountPlan, theme: &Theme) -> impl IntoElement {
+fn account_plan(plan: &AccountPlan, theme: &Theme) -> impl IntoElement {
     let muted = theme.muted_foreground;
     let model = plan
         .model
@@ -733,7 +632,7 @@ fn account_plan(place: PickerPlace, plan: &AccountPlan, theme: &Theme) -> impl I
         )
         .child(
             h_flex()
-                .id(SharedString::from(part_id(place, PLAN)))
+                .id(PLAN)
                 .gap(px(6.))
                 .px(px(8.))
                 .py(px(5.))
@@ -765,9 +664,8 @@ fn account_plan(place: PickerPlace, plan: &AccountPlan, theme: &Theme) -> impl I
 #[cfg(test)]
 mod tests {
     // Item by item rather than a glob: `use super::*` would drag in gpui_kit's own `test`.
-    use super::{card_detail, chip_tooltip, part_id, row_id};
+    use super::{card_detail, row_id};
     use crate::opengrok::{InferenceKind, ModelCatalogue, bot_pick};
-    use crate::state::PickerPlace;
 
     fn pick(source: serde_json::Value, model: &str, effort: &str) -> crate::opengrok::ModelPick {
         let bot = serde_json::from_value(serde_json::json!({
@@ -777,44 +675,29 @@ mod tests {
         bot_pick(&bot, None, &ModelCatalogue::default(), |_| Vec::new())
     }
 
-    /// The card's ids are the chip's with `agent-` before them, rows included, so a driver says
-    /// one set of words to either.
+    /// Every part of the picker is under `agent-`, in the Bot's settings, and a row is named by
+    /// its door's wire word and the id a pick of it pins.
     #[test]
-    fn the_cards_parts_are_the_chips_with_agent_before_them() {
-        assert_eq!(part_id(PickerPlace::Composer, super::FAST), "model-fast");
-        assert_eq!(part_id(PickerPlace::Card, super::FAST), "agent-model-fast");
+    fn a_rows_id_is_its_door_and_the_id_it_pins() {
+        assert_eq!(super::FAST, "agent-model-fast");
         assert_eq!(
-            row_id(
-                PickerPlace::Composer,
-                InferenceKind::LocalProxy,
-                "gpt-6-luna"
-            ),
-            "model-row-local_proxy-gpt-6-luna"
+            row_id(InferenceKind::LocalProxy, "gpt-6-luna"),
+            "agent-model-row-local_proxy-gpt-6-luna"
         );
         assert_eq!(
-            row_id(PickerPlace::Card, InferenceKind::Gateway, "oag/cheap"),
+            row_id(InferenceKind::Gateway, "oag/cheap"),
             "agent-model-row-gateway-oag/cheap"
         );
     }
 
-    /// The chip says on hover which model answers, by its id, and whose it is; the card's second
-    /// line says the door, the effort and ⚡.
+    /// The card's second line says the door, the effort and ⚡.
     #[test]
-    fn the_chip_and_the_card_say_which_model_and_whose() {
+    fn the_card_says_the_door_the_effort_and_fast() {
         let plan = pick(serde_json::json!("local_proxy"), "gpt-6-luna--fast", "max");
-        assert_eq!(
-            chip_tooltip(&plan),
-            "gpt-6-luna--fast on your plan. Click to change."
-        );
         assert_eq!(card_detail(&plan), "Your plan · Ultra · ⚡ Fast");
         let keys = pick(serde_json::json!("gateway"), "oag/cheap", "inherit");
-        assert_eq!(
-            chip_tooltip(&keys),
-            "oag/cheap on the server's paid keys. Click to change."
-        );
         assert_eq!(card_detail(&keys), "Server · Default");
         let follows = pick(serde_json::Value::Null, "oag/cheap", "low");
-        assert_eq!(chip_tooltip(&follows), "oag/cheap. Click to change.");
         assert_eq!(card_detail(&follows), "Light");
     }
 }
