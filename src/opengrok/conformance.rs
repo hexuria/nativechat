@@ -4,8 +4,8 @@
 //! agree. `fixtures/wire/` is the server's side of that, recorded by the server itself: every
 //! AG-UI frame and REST body its own tests drove, teed off its router by the recorder of
 //! opengrok-server#258 and written out by its `examples/wire_corpus.rs`. It is vendored whole from
-//! the server's `tests/fixtures/wire/` at server main d6f640e (#307, after #304, a Bot's own door
-//! and the model line), pin bf99845, the commit its `MANIFEST.json` names as the one it was
+//! the server's `tests/fixtures/wire/` at server main 06db932 (#309, after #308, a retry of a
+//! queued send's reply), pin b6ca457, the commit its `MANIFEST.json` names as the one it was
 //! recorded at. The layout is opengrok-server#255's: `agui/<type>/<slug>.json`, a CUSTOM under
 //! `agui/custom/<name>/`, and `rest/<METHOD>_<route>/<status>-<slug>.json` holding
 //! `{method, path, status, body}`, one file per distinct shape, named after the first test that
@@ -5453,9 +5453,12 @@ fn every_word_read_ahead_of_its_recording_is_matched_and_not_sent_yet() {
 /// shared Bot on its own plan, is refused in the server's words with the code beside them, live and
 /// journaled in the thread's replay. Live, the frame is the turn's error with the code that offers
 /// it again on the server's keys; read back, the replay's run failed in those words, and its
-/// `RUN_ERROR` carries the same code. The refusals for no model on the person's plan are the same
-/// shape, of which the recorder keeps this one file. A code spelt otherwise is one nothing here
-/// reads, and is caught.
+/// `RUN_ERROR` carries the same code. The refusals for no model on the person's plan, and the
+/// queued send on the person's own door with no proxy set whose reply a retry sends again (#308),
+/// are the same shape, of which the recorder keeps one file, under the first test to produce it:
+/// since server main 06db932 (#309, after #308), pin b6ca457, that is
+/// `agui/RUN_ERROR/a_retry_naming_another_run_is_already_consumed.json`. A code spelt otherwise
+/// is one nothing here reads, and is caught.
 #[test]
 fn a_turn_the_plan_was_unavailable_for_is_recorded_with_its_code() {
     let corpus = Corpus::load();
