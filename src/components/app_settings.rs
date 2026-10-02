@@ -741,6 +741,11 @@ fn computer_page(
         .show_egress_policy_in_user_settings()
         .then(|| app.read(cx).egress_policy())
         .flatten();
+    let stopped = app
+        .read(cx)
+        .local_exec_stopped
+        .as_ref()
+        .map(crate::opengrok::LocalExecStopped::sentence);
     let page = v_flex()
         .gap(px(12.))
         .when(show_route, |this| {
@@ -758,7 +763,17 @@ fn computer_page(
                 .child(
                     "Local-exec enrolment and policy. Each bot's screen and image updates are on that bot's Computer pane.",
                 ),
-        );
+        )
+        // Why this Mac stopped running commands for the server by itself, until the next
+        // sign-in. Its row only says Offline, which reads as NativeChat not being open here.
+        .when_some(stopped, |this, stopped| {
+            this.child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().danger)
+                    .child(stopped),
+            )
+        });
     if computers.is_empty() {
         return page.child(
             div()

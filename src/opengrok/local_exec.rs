@@ -104,51 +104,119 @@ impl std::fmt::Debug for MachineCredential {
 /// Mac again, and a relay stopped for the old token starts again with the new credential.
 pub type Enrolment = watch::Receiver<Option<MachineCredential>>;
 
-/// Hold this Mac's local-exec stream until `cancel`, enrolling it again when the server turns its
-/// token away. Each credential it holds goes to `enrolled`, for the relay ([`Enrolment`]).
+/// Why local-exec stopped holding this Mac's stream by itself. Settings → Computer says it under
+/// This Mac: a Mac that runs nothing for the server any more would otherwise read as if it did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LocalExecStopped {
+    /// Enrolling this Mac did not go through, at the start or after the server turned its token
+    /// away, and why ([`enrol_failure`]).
+    NotEnrolled(String),
+    /// The server turned this Mac's token away again after this Mac had enrolled again.
+    TurnedAwayAgain,
+}
+
+impl LocalExecStopped {
+    /// What the person reads.
+    pub fn sentence(&self) -> String {
+        match self {
+            Self::NotEnrolled(why) => format!(
+                "This Mac couldn't enrol with the server, so it isn't running commands for your \
+                 Bots: {why}. Sign out and in again to try again."
+            ),
+            Self::TurnedAwayAgain => TURNED_AWAY_AGAIN.to_string(),
+        }
+    }
+}
+
+/// [`LocalExecStopped::TurnedAwayAgain`] in words.
+const TURNED_AWAY_AGAIN: &str = "The server turned this Mac away again after it enrolled again, \
+     so it has stopped running commands for your Bots. Something else may be enrolling this Mac \
+     too. Sign out and in again to take it back.";
+
+/// Why an enrolment did not go through, in words: that the server couldn't be reached, what it
+/// answered when it said nothing, or else what it said.
+fn enrol_failure(error: &OpenGrokError) -> String {
+    if error.unreachable().is_some() {
+        "the server couldn't be reached".to_string()
+    } else if error.said_nothing() {
+        error.status.map_or_else(
+            || error.to_string(),
+            |status| format!("the server answered {status}"),
+        )
+    } else {
+        error.message.trim().to_string()
+    }
+}
+
+/// Hold this Mac's local-exec stream until `cancel`. Each credential it holds goes to `enrolled`,
+/// for the relay ([`Enrolment`]).
+///
+/// When the server turns this Mac's token away, which it does once something else has enrolled
+/// this Mac's machine again or revoked it (a `401` before any frame, after it ended the stream the
+/// token held), this enrols this Mac again as its own machine, once. A token turned away again
+/// after that is something else enrolling the machine too, and enrolling once more would only
+/// retire that one's token in turn, the two taking turns for good. So then it stops, as it does
+/// when enrolling does not go through, and answers why. `None` when `cancel` stopped it.
 pub async fn serve_local_exec(
     client: OpenGrokClient,
     data_dir: PathBuf,
     cancel: Arc<AtomicBool>,
     enrolled: watch::Sender<Option<MachineCredential>>,
-) {
+) -> Option<LocalExecStopped> {
     let mut cred = match ensure_daemon(&client, &data_dir).await {
         Ok(cred) => cred,
         Err(error) => {
             eprintln!("NativeChat local-exec: could not enrol this machine: {error}");
-            return;
+            return (!cancel.load(Ordering::Relaxed))
+                .then(|| LocalExecStopped::NotEnrolled(enrol_failure(&error)));
         }
     };
     publish(&enrolled, &cred);
 
     let running = Running::default();
-    while !cancel.load(Ordering::Relaxed) {
-        if let Err(error) = run_request_stream(&client, &cred, &cancel, &running).await {
-            if error.is_unauthorized() {
-                match ensure_daemon(&client, &data_dir).await {
+    let mut enrolled_again = false;
+    let stopped = loop {
+        if cancel.load(Ordering::Relaxed) {
+            break None;
+        }
+        match run_request_stream(&client, &cred, &cancel, &running).await {
+            Err(error) if error.is_unauthorized() => {
+                if cancel.load(Ordering::Relaxed) {
+                    break None;
+                }
+                if enrolled_again {
+                    eprintln!("NativeChat local-exec: turned away again after enrolling again");
+                    break Some(LocalExecStopped::TurnedAwayAgain);
+                }
+                enrolled_again = true;
+                let path = data_dir.join(CREDENTIAL_FILE);
+                match enrol(&client, &path, Some(&cred.machine_id)).await {
                     Ok(fresh) => {
                         cred = fresh;
                         publish(&enrolled, &cred);
-                        if let Err(again) =
-                            run_request_stream(&client, &cred, &cancel, &running).await
-                        {
-                            eprintln!("NativeChat local-exec: {again}");
-                        }
+                        // The new token is tried at once: it is the old one that was refused.
+                        continue;
                     }
-                    Err(enrol) => eprintln!("NativeChat local-exec: re-enrol failed: {enrol}"),
+                    Err(error) => {
+                        eprintln!("NativeChat local-exec: could not enrol again: {error}");
+                        break (!cancel.load(Ordering::Relaxed))
+                            .then(|| LocalExecStopped::NotEnrolled(enrol_failure(&error)));
+                    }
                 }
-            } else if !cancel.load(Ordering::Relaxed) {
+            }
+            Err(error) if !cancel.load(Ordering::Relaxed) => {
                 eprintln!("NativeChat local-exec: {error}");
             }
+            _ => {}
         }
         if cancel.load(Ordering::Relaxed) {
-            break;
+            break None;
         }
         tokio::time::sleep(RECONNECT_WAIT).await;
-    }
-    // Signed out: nothing this Mac started for the server goes on without it, or posts a result
-    // after the person has gone. Aborting a command's task kills what it was running; see
-    // `ProcessGroup`.
+    };
+    // Signed out, or stopped: nothing this Mac started for the server goes on without it, or
+    // posts a result after the person has gone or with a token the server no longer takes.
+    // Aborting a command's task kills what it was running; see `ProcessGroup`.
     for (_, task) in running
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
@@ -156,6 +224,7 @@ pub async fn serve_local_exec(
     {
         task.abort();
     }
+    stopped
 }
 
 /// Tell the relay the credential local-exec holds now, when it is not the one it held: an
@@ -844,54 +913,93 @@ mod tests {
         stops(&pid, "the command outlived the sign-out").await;
     }
 
-    /// The server turns this Mac's token away (its machine revoked, here) and local-exec enrols it
-    /// again: the new credential goes to the relay, which follows it, and not only to the file.
-    /// That is what starts a relay stopped for the old token again; with the file alone, it kept
-    /// the token it was started with and stayed stopped until the switch went off and on.
+    /// `GET /local-exec/requests` as the server answers a token it takes: the reconnect hint, the
+    /// `welcome` naming the machine, and then the end of the stream, which is how it ends one whose
+    /// token a re-enrolment or a revoke retired, with nothing more sent (`poll_requests` and the
+    /// broker's `disconnect` in opengrok-server `crates/opengrok-server/src/local_exec.rs`).
+    fn welcome_then_end(machine_id: &str) -> ResponseTemplate {
+        let welcome = json!({ "kind": "welcome", "providerId": machine_id });
+        ResponseTemplate::new(200).set_body_raw(
+            format!("retry: 1000\n\ndata: {welcome}\n\n"),
+            "text/event-stream",
+        )
+    }
+
+    /// How the server answers a stream opened with a token it no longer takes, retired before
+    /// the stream opened or while it did: `401` before any frame, in plain words
+    /// (`poll_requests`).
+    fn turned_away() -> ResponseTemplate {
+        ResponseTemplate::new(401).set_body_string("enrol this machine first")
+    }
+
+    /// This Mac's machine as the server lists it while the machine is live.
+    async fn lists_this_mac(server: &MockServer) {
+        Mock::given(method("GET"))
+            .and(path("/local-exec/daemon"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "machines": [listed("mac_1", "NativeChat on this Mac", false)]
+            })))
+            .mount(server)
+            .await;
+    }
+
+    /// The bearer each `GET /local-exec/requests` opened the stream with, in order.
+    async fn opened_with(server: &MockServer) -> Vec<String> {
+        server
+            .received_requests()
+            .await
+            .expect("the recorder is on")
+            .iter()
+            .filter(|request| request.url.path() == "/local-exec/requests")
+            .map(|request| {
+                request
+                    .headers
+                    .get("authorization")
+                    .and_then(|bearer| bearer.to_str().ok())
+                    .unwrap_or_default()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    /// Something else enrolled this Mac's machine again, so the server retired the token this Mac
+    /// holds: it ended the stream that token held, and when this Mac opens it again, turns the
+    /// token away before any frame. Local-exec enrols this Mac again, as its own machine, and the
+    /// new credential goes to the relay, which follows it, and not only to the file: that is what
+    /// starts a relay stopped for the old token again. It used to enrol again only when the server
+    /// no longer listed the machine as live, which it still did here, so it knocked with the
+    /// retired token every two seconds for good.
     #[tokio::test]
     async fn enrolling_again_hands_the_relay_the_new_credential() {
         let server = MockServer::start().await;
         let dir = tempfile::tempdir().unwrap();
         save_credential(&dir.path().join(CREDENTIAL_FILE), &daemon());
+        lists_this_mac(&server).await;
         Mock::given(method("GET"))
-            .and(path("/local-exec/daemon"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(json!({ "machines": [{ "machineId": "mac_1" }] })),
-            )
+            .and(path("/local-exec/requests"))
+            .and(header("authorization", "Bearer tok_1"))
+            .respond_with(welcome_then_end("mac_1"))
             .up_to_n_times(1)
-            .mount(&server)
-            .await;
-        Mock::given(method("GET"))
-            .and(path("/local-exec/daemon"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(
-                    json!({ "machines": [{ "machineId": "mac_1", "revoked": true }] }),
-                ),
-            )
             .mount(&server)
             .await;
         Mock::given(method("GET"))
             .and(path("/local-exec/requests"))
             .and(header("authorization", "Bearer tok_1"))
-            .respond_with(
-                ResponseTemplate::new(401).set_body_json(json!({ "error": "unknown machine" })),
-            )
+            .respond_with(turned_away())
             .mount(&server)
             .await;
         Mock::given(method("POST"))
             .and(path("/local-exec/daemon"))
             .respond_with(
                 ResponseTemplate::new(200)
-                    .set_body_json(json!({ "machineId": "mac_2", "token": "tok_2" })),
+                    .set_body_json(json!({ "machineId": "mac_1", "token": "tok_2" })),
             )
-            .expect(1)
             .mount(&server)
             .await;
         Mock::given(method("GET"))
             .and(path("/local-exec/requests"))
             .and(header("authorization", "Bearer tok_2"))
-            .respond_with(ResponseTemplate::new(200).set_body_raw("", "text/event-stream"))
+            .respond_with(welcome_then_end("mac_1"))
             .mount(&server)
             .await;
         let (enrolled, mut enrolment) = watch::channel(None);
@@ -902,7 +1010,7 @@ mod tests {
             enrolled,
         ));
 
-        let fresh = MachineCredential::new("mac_2", "tok_2");
+        let fresh = MachineCredential::new("mac_1", "tok_2");
         let handed = tokio::time::timeout(
             Duration::from_secs(10),
             enrolment.wait_for(|held| held.as_ref() == Some(&fresh)),
@@ -911,7 +1019,107 @@ mod tests {
         .is_ok_and(|held| held.is_ok());
         serving.abort();
         assert!(handed, "the relay is handed the new credential");
-        assert_eq!(stored_machine_id(dir.path()).as_deref(), Some("mac_2"));
+        assert_eq!(
+            enrolled_as(&server).await,
+            [Some("mac_1".to_string())],
+            "once, as this Mac's own machine"
+        );
+        let kept = load_credential(&dir.path().join(CREDENTIAL_FILE)).expect("a credential");
+        assert_eq!(
+            (kept.machine_id.as_str(), kept.token.as_str()),
+            ("mac_1", "tok_2")
+        );
+    }
+
+    /// The server turns this Mac's token away again after it has enrolled again: something else
+    /// is enrolling this Mac's machine too, and enrolling once more would only retire that one's
+    /// token in turn, the two taking turns for good. Local-exec stops knocking, and says why. It
+    /// used to knock with a token that was turned away every two seconds, for good.
+    #[tokio::test]
+    async fn turned_away_again_after_enrolling_again_it_stops_and_says_why() {
+        let server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        save_credential(&dir.path().join(CREDENTIAL_FILE), &daemon());
+        lists_this_mac(&server).await;
+        Mock::given(method("GET"))
+            .and(path("/local-exec/requests"))
+            .respond_with(turned_away())
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/local-exec/daemon"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({ "machineId": "mac_1", "token": "tok_2" })),
+            )
+            .mount(&server)
+            .await;
+        let (enrolled, enrolment) = watch::channel(None);
+        let serving = tokio::spawn(serve_local_exec(
+            OpenGrokClient::new(&server.uri()).unwrap(),
+            dir.path().to_path_buf(),
+            Arc::new(AtomicBool::new(false)),
+            enrolled,
+        ));
+
+        let stopped = tokio::time::timeout(Duration::from_secs(10), serving)
+            .await
+            .expect("it stops knocking")
+            .unwrap();
+
+        assert_eq!(stopped, Some(LocalExecStopped::TurnedAwayAgain));
+        assert_eq!(
+            opened_with(&server).await,
+            ["Bearer tok_1", "Bearer tok_2"],
+            "once with each token, and no more"
+        );
+        assert_eq!(enrolled_as(&server).await, [Some("mac_1".to_string())]);
+        assert_eq!(
+            *enrolment.borrow(),
+            Some(MachineCredential::new("mac_1", "tok_2")),
+            "the relay was handed the new credential all the same"
+        );
+    }
+
+    /// Enrolling again after the server turned this Mac's token away does not go through, and
+    /// local-exec stops knocking, saying why in the server's words.
+    #[tokio::test]
+    async fn an_enrolment_that_fails_after_a_401_stops_it_and_says_why() {
+        let server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        save_credential(&dir.path().join(CREDENTIAL_FILE), &daemon());
+        lists_this_mac(&server).await;
+        Mock::given(method("GET"))
+            .and(path("/local-exec/requests"))
+            .respond_with(turned_away())
+            .mount(&server)
+            .await;
+        // What the server says when it cannot keep the enrolment (`enrol_daemon`'s `failed`).
+        Mock::given(method("POST"))
+            .and(path("/local-exec/daemon"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("could not enrol the machine"))
+            .mount(&server)
+            .await;
+        let serving = tokio::spawn(serve_local_exec(
+            OpenGrokClient::new(&server.uri()).unwrap(),
+            dir.path().to_path_buf(),
+            Arc::new(AtomicBool::new(false)),
+            watch::channel(None).0,
+        ));
+
+        let stopped = tokio::time::timeout(Duration::from_secs(10), serving)
+            .await
+            .expect("it stops knocking")
+            .unwrap();
+
+        assert_eq!(
+            stopped,
+            Some(LocalExecStopped::NotEnrolled(
+                "could not enrol the machine".into()
+            ))
+        );
+        assert_eq!(opened_with(&server).await, ["Bearer tok_1"]);
+        assert_eq!(enrolled_as(&server).await, [Some("mac_1".to_string())]);
     }
 
     #[test]

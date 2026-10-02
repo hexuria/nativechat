@@ -15,16 +15,16 @@ use crate::opengrok::{
     BoxHandoffResolution, BoxShareScope, ChatPart, ChoiceCard, ComputerHandoffStatus,
     ConnectedComputer, Coworker, CoworkerComputer, CoworkerPatch, CoworkerSource, Enrolment,
     Failure, FormResolution, FormSpec, ImageVisibility, InferenceKind, InferenceSource,
-    InferenceSourceUpdate, LocalExecMode, LocalExecPolicy, LocalExecResolution, ModelCatalogue,
-    ModelEntry, ModelPick, NewSchedule, NewSkill, OpenGrokClient, OpenGrokError, PendingCustom,
-    PendingOp, PendingUserMessage, PendingWrite, ProfileUpdate, ProxyKey, QueuedApproval,
-    RecipeDetail, RecipeKind, RecipeParameter, RecipeRun, RecipeRunResult, RecipeShareTarget,
-    RecipeStep, RecipeSummary, RelayHandle, RelayKey, RelayReport, RelayStatus, RelayTarget,
-    RelayTimings, RelayUpdate, ReplyQuote, ReplySource, RunCause, RunErrorCode, RunRecipeResponse,
-    RunReplay, SKILL_BODY_CHARS, SKILL_BUNDLE_FILES, SKILL_BUNDLE_LIMIT, SaveLoginSpec,
-    ScheduleEdit, ScheduleKind, ScheduleRow, ScheduleRun, ScheduleRunStatus, ScreenshotSpec,
-    SkillDetail, SkillFile, SkillPatch, SkillSource, SkillSummary, ThreadListing, ThreadReplay,
-    ThreadRun, ToolCallTracker, TurnAssembler, TurnRecipe, TurnSource, TurnTiming,
+    InferenceSourceUpdate, LocalExecMode, LocalExecPolicy, LocalExecResolution, LocalExecStopped,
+    ModelCatalogue, ModelEntry, ModelPick, NewSchedule, NewSkill, OpenGrokClient, OpenGrokError,
+    PendingCustom, PendingOp, PendingUserMessage, PendingWrite, ProfileUpdate, ProxyKey,
+    QueuedApproval, RecipeDetail, RecipeKind, RecipeParameter, RecipeRun, RecipeRunResult,
+    RecipeShareTarget, RecipeStep, RecipeSummary, RelayHandle, RelayKey, RelayReport, RelayStatus,
+    RelayTarget, RelayTimings, RelayUpdate, ReplyQuote, ReplySource, RunCause, RunErrorCode,
+    RunRecipeResponse, RunReplay, SKILL_BODY_CHARS, SKILL_BUNDLE_FILES, SKILL_BUNDLE_LIMIT,
+    SaveLoginSpec, ScheduleEdit, ScheduleKind, ScheduleRow, ScheduleRun, ScheduleRunStatus,
+    ScreenshotSpec, SkillDetail, SkillFile, SkillPatch, SkillSource, SkillSummary, ThreadListing,
+    ThreadReplay, ThreadRun, ToolCallTracker, TurnAssembler, TurnRecipe, TurnSource, TurnTiming,
     USER_FORM_SERVER_FILL_AVAILABLE, Unreachable, UserFormDismissMode, UserFormHttpSettle,
     UserFormValues, UserFormVerb, Via, WAITING_FOR_YOU, activity_from_replay, approval_summary,
     box_handoff_resolve_entry_id, collapse_computer_roster, command_from_args,
@@ -5121,6 +5121,10 @@ pub struct AppState {
     /// This Mac's credential as local-exec holds it, while local-exec runs: the relay opens its
     /// stream and answers with it, and follows it when local-exec enrols this Mac again.
     local_exec_enrolment: Option<Enrolment>,
+    /// Why local-exec stopped by itself, since it last started: this Mac runs no command for the
+    /// server until it starts again, at the next sign-in. Settings → Computer says so under This
+    /// Mac.
+    pub local_exec_stopped: Option<LocalExecStopped>,
     pub expanded_shell_output: HashSet<String>,
     /// The step rows, groups of steps, Thought rows and Timing rows the person has opened, by the
     /// keys `components::steps` gives them. Not saved: every one of them is shut when a thread is
@@ -5774,6 +5778,7 @@ impl AppState {
             local_exec_machine_id: None,
             local_exec_cancel: None,
             local_exec_enrolment: None,
+            local_exec_stopped: None,
             expanded_shell_output: HashSet::new(),
             expanded_steps: HashSet::new(),
             computers: Vec::new(),
@@ -16167,8 +16172,8 @@ impl AppState {
         // it too, for the id it knows this Mac by ([`Self::follow_enrolment`]).
         let (enrolled, enrolment) = tokio::sync::watch::channel(None);
         self.local_exec_enrolment = Some(enrolment.clone());
-        self.follow_enrolment(enrolment, cx);
-        cx.spawn(async move |_, _| {
+        self.follow_enrolment(enrolment.clone(), cx);
+        cx.spawn(async move |this, cx| {
             match enrol_this_machine(&client, &config.data_dir).await {
                 // What follows the enrolment takes it from here: this Mac's id, its computers,
                 // and the relay, which opens its stream with the credential held here.
@@ -16179,18 +16184,40 @@ impl AppState {
                     eprintln!("NativeChat local-exec: {error}");
                 }
             }
-            serve_local_exec(client, config.data_dir, cancel, enrolled).await;
+            let stopped = serve_local_exec(client, config.data_dir, cancel, enrolled).await;
+            let _ = this.update(cx, |state, cx| {
+                state.note_local_exec_stopped(&enrolment, stopped, cx);
+            });
         })
         .detach();
     }
 
+    /// Why the local-exec that `enrolment` is the credential of stopped by itself, kept for
+    /// Settings → Computer to say. Nothing for one stopped by signing out, or no longer the one
+    /// running: signed out and in again since, it is not this Mac's local-exec any more.
+    fn note_local_exec_stopped(
+        &mut self,
+        enrolment: &Enrolment,
+        stopped: Option<LocalExecStopped>,
+        cx: &mut Context<Self>,
+    ) {
+        let current = self
+            .local_exec_enrolment
+            .as_ref()
+            .is_some_and(|held| held.same_channel(enrolment));
+        if current && stopped.is_some() {
+            self.local_exec_stopped = stopped;
+            cx.notify();
+        }
+    }
+
     /// Follow local-exec's enrolment for as long as it is the one local-exec runs with: this
     /// Mac's id, the computers read with it, and the relay, which a Mac enrolled for the first
-    /// time may start. Local-exec enrols this Mac again when the server turns its token away, and
-    /// may come back as another machine. The relay follows the new credential by itself, and the
-    /// id here has to as well: one left at the first enrolment would read the relay the server
-    /// says the new machine holds as another Mac's, under this Mac's own name, and keep a card's
-    /// rule for a machine this Mac no longer is.
+    /// time may start. Local-exec enrols this Mac again when the server turns its token away,
+    /// always as this Mac's own machine, and the relay follows the new credential by itself. The
+    /// id here follows whatever machine the credential names: one left behind would read the
+    /// relay the server says this Mac's machine holds as another Mac's, under this Mac's own name,
+    /// and keep a card's rule for a machine this Mac is not.
     fn follow_enrolment(&mut self, mut enrolment: Enrolment, cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| {
             while enrolment.changed().await.is_ok() {
@@ -16216,7 +16243,7 @@ impl AppState {
 
     /// This Mac's id, from the credential local-exec holds now: `None` once `enrolment` is not the
     /// one local-exec runs with (stopped, or started again since), and otherwise whether the id
-    /// moved, at the first enrolment or at one that came back as another machine.
+    /// moved, as it does at the first enrolment.
     fn note_enrolment(&mut self, enrolment: &Enrolment) -> Option<bool> {
         let held = self
             .local_exec_enrolment
@@ -16240,6 +16267,7 @@ impl AppState {
         self.local_exec_cancel = None;
         self.local_exec_machine_id = None;
         self.local_exec_enrolment = None;
+        self.local_exec_stopped = None;
     }
 
     pub fn toggle_shell_output(&mut self, call_id: String, cx: &mut Context<Self>) {
@@ -36551,11 +36579,10 @@ mod tests {
         assert_eq!(state.relay_line(), RelayLine::NotConnected { why: None });
     }
 
-    /// Local-exec enrols this Mac again when the server turns its token away, and may come back
-    /// as another machine. The id this app knows this Mac by follows the newest enrolment, as the
-    /// relay does, so the relay the server says the new machine holds is this Mac's own, and not
-    /// another Mac's under this Mac's own name. The same credential again moves nothing, and nor
-    /// does the enrolment of a local-exec that is no longer the one running.
+    /// The id this app knows this Mac by follows the newest enrolment, whatever machine it names,
+    /// as the relay does, so the relay the server says that machine holds is this Mac's own, and
+    /// not another Mac's under this Mac's own name. The same credential again moves nothing, and
+    /// nor does the enrolment of a local-exec that is no longer the one running.
     #[test]
     fn this_macs_id_follows_its_newest_enrolment() {
         use super::RelayLine;
@@ -36575,8 +36602,8 @@ mod tests {
             "the same machine again"
         );
 
-        // The server turned the token away and local-exec enrolled this Mac again, as a new
-        // machine: the relay opens its stream again with it, and the server says it holds it.
+        // A credential naming another machine: the relay opens its stream again with it, and
+        // the server says that machine holds it.
         enrolled.send_replace(Some(MachineCredential::new("mac_2", "tok_2")));
         read_as(
             &mut state,
@@ -36612,6 +36639,36 @@ mod tests {
         state.stop_local_exec();
         assert_eq!(state.note_enrolment(&enrolment), None, "stopped");
         assert_eq!(state.local_exec_machine_id, None);
+    }
+
+    /// Why this Mac's local-exec stopped by itself is kept for Settings → Computer to say. A stop
+    /// it was told to make says nothing, nor does one from a local-exec that is no longer the one
+    /// running (signed out and in again since), and signing out forgets it.
+    #[gpui_kit::test]
+    fn why_local_exec_stopped_is_kept_until_it_starts_again(cx: &mut gpui_kit::TestAppContext) {
+        use crate::opengrok::LocalExecStopped;
+        use gpui_kit::AppContext as _;
+        let app = cx.new(|_| signed_in_state());
+        app.update(cx, |state, cx| {
+            let (_enrolled, enrolment) = tokio::sync::watch::channel(None);
+            state.local_exec_enrolment = Some(enrolment.clone());
+            let (_stale, old) = tokio::sync::watch::channel(None);
+            state.note_local_exec_stopped(&old, Some(LocalExecStopped::TurnedAwayAgain), cx);
+            assert_eq!(
+                state.local_exec_stopped, None,
+                "not this Mac's local-exec any more"
+            );
+            state.note_local_exec_stopped(&enrolment, None, cx);
+            assert_eq!(state.local_exec_stopped, None, "told to stop");
+
+            state.note_local_exec_stopped(&enrolment, Some(LocalExecStopped::TurnedAwayAgain), cx);
+            assert_eq!(
+                state.local_exec_stopped,
+                Some(LocalExecStopped::TurnedAwayAgain)
+            );
+            state.stop_local_exec();
+            assert_eq!(state.local_exec_stopped, None, "signed out");
+        });
     }
 
     /// What a Save would send now, as JSON, without sending it.

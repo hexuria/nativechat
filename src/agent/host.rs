@@ -429,6 +429,10 @@ pub mod ids {
     pub const LOCAL_RULES_EMPTY: &str = "settings-local-rules-empty";
     pub const LOCAL_RULES_ERROR: &str = "settings-local-rules-error";
 
+    /// Why this Mac stopped running commands for the server by itself, on Settings → Computer
+    /// under This Mac. In the tree only while it has, until the next sign-in.
+    pub const LOCAL_EXEC_STOPPED: &str = "settings-local-exec-stopped";
+
     /// One of the two lists, `allow` or `deny`, with its count as the value. In the tree only
     /// while it has a rule on it, as on screen.
     pub fn local_rules(kind: RuleKind) -> String {
@@ -3229,6 +3233,9 @@ pub struct NativeChatHost {
     /// This Mac's standing rules, where Settings → Computer draws them: see
     /// [`AppState::this_mac_rules`]. `None` where it draws none.
     local_rules: Option<LocalRules>,
+    /// Why local-exec stopped by itself, in the words Settings → Computer shows:
+    /// [`AppState::local_exec_stopped`].
+    local_exec_stopped: Option<String>,
     /// The person's connections and the services on offer, as Settings → Connections and the
     /// open bot's Connections card draw them (#2). Bot names come from `sessions`, which is the
     /// roster while signed in.
@@ -3804,6 +3811,10 @@ impl NativeChatHost {
             .flatten(),
             network_policy_open: state.network_policy_open,
             local_rules: state.this_mac_rules().cloned(),
+            local_exec_stopped: state
+                .local_exec_stopped
+                .as_ref()
+                .map(crate::opengrok::LocalExecStopped::sentence),
             connections: state.connections.clone(),
             reply_source: ReplySourceSnap::from_state(state),
             reply_source_tab: state.app_settings_tab == AppSettingsTab::ReplySource,
@@ -4335,9 +4346,17 @@ impl NativeChatHost {
                                 self.computer_update_label.clone(),
                             ));
                         }
-                        // Each connected computer's local-exec mode, while Settings is open on
-                        // Computer: the choice a check of this Mac's Ask / Always / Never sets.
+                        // Why this Mac stopped running commands, over its computers as on the
+                        // page, then each connected computer's local-exec mode, while Settings is
+                        // open on Computer: the choice a check of this Mac's Ask / Always / Never
+                        // sets.
                         if self.account_open && self.computer_tab {
+                            if let Some(why) = &self.local_exec_stopped {
+                                settings = settings.with_child(UiNode::status(
+                                    ids::LOCAL_EXEC_STOPPED,
+                                    why.clone(),
+                                ));
+                            }
                             for (machine, label, mode, this_mac) in &self.computers {
                                 let mut menu =
                                     UiNode::new(ids::computer_exec(machine), "menu", label.clone())
@@ -12079,6 +12098,51 @@ mod tests {
         let bo = tree.find(&ids::coworker("cw_2")).unwrap();
         assert_eq!(bo.value, None);
         assert!(!bo.states.contains(&"listed".to_string()));
+    }
+
+    /// Why this Mac stopped running commands for the server by itself is a line on Settings →
+    /// Computer, in the page's words, and in the tree only while the page shows it.
+    #[test]
+    fn why_this_mac_stopped_running_commands_is_a_line_on_settings_computer() {
+        let mut state = AppState::new();
+        state.auth_status = crate::state::AuthStatus::SignedIn;
+        state.account = Some(
+            serde_json::from_value(serde_json::json!({ "id": "acct_1", "email": "a@b.c" }))
+                .unwrap(),
+        );
+        state.coworkers = vec![
+            serde_json::from_value(serde_json::json!({ "id": "cw_1", "name": "Ada" })).unwrap(),
+        ];
+        state.active_coworker_id = Some("cw_1".into());
+        state.is_app_settings_open = true;
+        state.app_settings_tab = AppSettingsTab::Computer;
+        assert!(
+            NativeChatHost::from_app(&state)
+                .snapshot()
+                .find(ids::LOCAL_EXEC_STOPPED)
+                .is_none()
+        );
+
+        let why =
+            crate::opengrok::LocalExecStopped::NotEnrolled("could not enrol the machine".into());
+        state.local_exec_stopped = Some(why.clone());
+        let tree = NativeChatHost::from_app(&state).snapshot();
+        let line = tree
+            .find(ids::LOCAL_EXEC_STOPPED)
+            .expect("the line is drawn");
+        assert_eq!(line.name, why.sentence());
+        assert!(
+            line.name.contains("could not enrol the machine"),
+            "{}",
+            line.name
+        );
+
+        state.app_settings_tab = AppSettingsTab::Logins;
+        let tree = NativeChatHost::from_app(&state).snapshot();
+        assert!(
+            tree.find(ids::LOCAL_EXEC_STOPPED).is_none(),
+            "only on Computer"
+        );
     }
 
     /// A host on Settings → Computer with this Mac's rules as the server listed them: two

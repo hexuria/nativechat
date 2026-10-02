@@ -42,7 +42,8 @@ pub use inference::{
     RunErrorCode, TurnSource, Via, is_loopback, is_subscription_model,
 };
 pub use local_exec::{
-    Enrolment, MachineCredential, enrol_this_machine, serve_local_exec, stored_machine_id,
+    Enrolment, LocalExecStopped, MachineCredential, enrol_this_machine, serve_local_exec,
+    stored_machine_id,
 };
 pub use model_choice::{
     AccountPlan, ChoiceGroup, DEFAULT_EFFORT_LABEL, EFFORT_NOT_KEPT, EFFORT_STOPS,

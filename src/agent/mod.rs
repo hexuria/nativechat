@@ -84,6 +84,10 @@
 //! `settings-local-rule-error-allow|deny-{n}` (why its last Remove did not go through);
 //! `settings-local-rules-empty` while there are none, `settings-local-rules-error` while they
 //! could not be read. Nothing for a machine that is not this Mac.
+//! `settings-local-exec-stopped` (on `settings-tab-computer`, label = the page's words for why
+//! this Mac stopped running commands for the server by itself: enrolling it did not go through,
+//! or the server turned it away again after it enrolled again; in the tree only until the next
+//! sign-in starts it again).
 //! `routine-new`, `routine-{id}`, `routine-{id}-active` (the editor's Active switch: label
 //! `Active`, or `Paused` while it is off; checked while the routine runs on its own; a click
 //! asks for the other way), `routine-{id}-trigger-schedule`,
