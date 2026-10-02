@@ -17,9 +17,9 @@ use crate::opengrok::{
     computer_attention_skip_id,
 };
 use crate::state::{
-    AgentRoutine, AppState, ComputerView, NewTrigger, ROUTINE_RUNS_UNAVAILABLE, RoutineTrigger,
-    ScheduleDayKind, ScheduleSpec, ScheduleUiMode, ScheduleUnit, routine_notes,
-    routine_trouble_line, unsaved_lines,
+    AgentRoutine, AppState, ComputerView, NewTrigger, ROUTINE_RUN_UNAVAILABLE,
+    ROUTINE_RUNS_UNAVAILABLE, RoutineTrigger, ScheduleDayKind, ScheduleSpec, ScheduleUiMode,
+    ScheduleUnit, routine_notes, routine_trouble_line, unsaved_lines,
 };
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{InputState, Textarea, TextareaState};
@@ -264,23 +264,45 @@ impl ComputerPane {
     /// The pane's header row. In the title bar over the pane while the pane is docked (then
     /// its title and empty run drag the window), in the pane itself while it floats.
     /// Overview: close chevron (Update / Reset sit next to the screen). Routine: back, title,
-    /// close.
+    /// the routine's four icons, close.
     pub fn header(&self, cx: &App, drag: bool) -> AnyElement {
         let app = self.state.clone();
         let state = self.state.read(cx);
         match state.computer_view.clone() {
-            ComputerView::Overview => pane_header(None, "", None, app, drag).into_any_element(),
+            ComputerView::Overview => {
+                pane_header(None, "", None, None, app, drag).into_any_element()
+            }
             ComputerView::Editor { id } => {
                 let coworker_id = state.active_coworker_id.clone().unwrap_or_default();
-                let persist = self.persist_routine(app.clone(), coworker_id, id);
+                let persist = self.persist_routine(app.clone(), coworker_id.clone(), id.clone());
                 let back = {
                     let app = app.clone();
+                    let persist = persist.clone();
                     Rc::new(move |cx: &mut App| {
                         persist(cx);
                         app.update(cx, |state, cx| state.back_to_computer(cx));
                     }) as Rc<dyn Fn(&mut App)>
                 };
-                pane_header(Some(back), "Routine", None, app, drag).into_any_element()
+                let on_the_server = id.as_ref().is_some_and(|rid| {
+                    state
+                        .coworker_routines(&coworker_id)
+                        .iter()
+                        .any(|row| &row.id == rid && row.saved.is_some())
+                });
+                let icons = id.map(|id| {
+                    routine_icons(RoutineIcons {
+                        app: app.clone(),
+                        coworker_id,
+                        id,
+                        on_the_server,
+                        can_run: !state.routine_routes_missing.run_now,
+                        history_open: state.routine_history_open,
+                        persist,
+                        theme: cx.theme().clone(),
+                    })
+                    .into_any_element()
+                });
+                pane_header(Some(back), "Routine", None, icons, app, drag).into_any_element()
             }
         }
     }
@@ -515,15 +537,33 @@ impl ComputerPane {
         // server has, so what an older server cannot do to a routine does not touch it.
         let on_the_server = existing.as_ref().is_some_and(|r| r.saved.is_some());
         let can_change = !(on_the_server && missing.edit);
-        let can_run = !missing.run_now;
         let rid = id.clone().unwrap_or_default();
         // What this server cannot do, said beside the controls it leaves dead, for as long as it
-        // is so: a control that does nothing must say why it does nothing.
+        // is so: a control that does nothing must say why it does nothing. Test run's is in the
+        // header, as its icon's tooltip and here.
         let notes = routine_notes(missing, on_the_server);
         // The same line the overview puts a refused Update on. A routine's calls go out from
         // this page, so their refusals have to be readable from it.
         let trouble = routine_trouble_line(app.read(cx).computer_action_error.as_deref(), &notes);
         let persist = self.persist_routine(app.clone(), coworker_id.clone(), id.clone());
+
+        let history_open = app.read(cx).routine_history_open;
+        let notes = notes.into_iter().map(|(tail, note)| {
+            div()
+                .id(SharedString::from(format!("routine-{rid}-{tail}")))
+                .w_full()
+                .text_xs()
+                .text_color(muted)
+                .child(note)
+        });
+        let trouble = trouble.map(|trouble| {
+            div()
+                .id("routine-error")
+                .w_full()
+                .text_xs()
+                .text_color(theme.danger)
+                .child(trouble)
+        });
 
         v_flex().size_full().child(
             v_flex()
@@ -534,133 +574,75 @@ impl ComputerPane {
                 .px(px(16.))
                 .py(px(12.))
                 .gap(px(16.))
-                .child(routine_actions(
-                    app.clone(),
-                    coworker_id.clone(),
-                    id.clone(),
-                    active,
-                    id.is_some() && !triggers.is_empty(),
-                    can_run,
-                    persist.clone(),
-                ))
-                .children(notes.into_iter().map(|(tail, note)| {
-                    div()
-                        .id(SharedString::from(format!("routine-{rid}-{tail}")))
-                        .w_full()
-                        .text_xs()
-                        .text_color(muted)
-                        .child(note)
-                }))
-                .when_some(unsaved, |this, edit| {
-                    this.child(unsaved_block(&rid, &edit, muted, theme))
-                })
-                .when_some(trouble, |this, trouble| {
-                    this.child(
-                        div()
-                            .id("routine-error")
-                            .w_full()
-                            .text_xs()
-                            .text_color(theme.danger)
-                            .child(trouble),
-                    )
-                })
-                .child(field_label("Name", muted))
-                .child(field_input(&self.name_input).disabled(!can_change))
-                .child(field_label("Instruction", muted))
-                .child(field_textarea(&self.instruction_input, theme).disabled(!can_change))
-                .child(field_label("When to run", muted))
-                .child(self.triggers_box(
-                    &triggers,
-                    &coworker_id,
-                    id.clone(),
-                    muted,
-                    app.clone(),
-                    theme,
-                    persist.clone(),
-                    can_change,
-                    cx,
-                ))
-                .child(field_label("Run history", muted))
-                .child(if on_the_server && missing.runs {
-                    // Not "No runs yet": nobody knows that, because this server cannot say.
-                    div()
-                        .id(SharedString::from(format!(
-                            "routine-{rid}-runs-unavailable"
-                        )))
-                        .text_sm()
-                        .text_color(muted)
-                        .child(ROUTINE_RUNS_UNAVAILABLE)
-                        .into_any_element()
-                } else if runs.is_empty() {
-                    div()
-                        .text_sm()
-                        .text_color(muted)
-                        .child("No runs yet")
-                        .into_any_element()
-                } else {
-                    v_flex()
-                        .w_full()
-                        .gap(px(6.))
-                        .children(runs.into_iter().enumerate().map(|(i, run)| {
-                            h_flex()
-                                .id(SharedString::from(format!("run-{i}")))
-                                // A line of the history opens the thread it ran in, which is
-                                // where what it said is. On click, not on press, so a scroll
-                                // that starts on a line stays in the editor.
-                                .cursor_pointer()
-                                .on_click({
-                                    let persist = persist.clone();
-                                    let app = app.clone();
-                                    let id = id.clone();
-                                    move |_, _, cx| {
-                                        persist(cx);
-                                        if let Some(id) = id.clone() {
-                                            app.update(cx, |state, cx| {
-                                                state.open_routine_thread(&id, cx);
-                                            });
+                // What happened to the last thing asked of the routine, and what the server
+                // cannot do with it, are said over either view: the header's icons, which they
+                // are about, are over both.
+                .children(notes)
+                .children(trouble)
+                .map(|this| {
+                    if history_open {
+                        // The Run history, and nothing else: the routine's fields are behind the
+                        // header's first icon, which now says so.
+                        this.child(routine_history(
+                            &rid,
+                            runs,
+                            on_the_server && missing.runs,
+                            muted,
+                            app.clone(),
+                            theme,
+                            persist.clone(),
+                        ))
+                    } else {
+                        this.child(
+                            div().debug_selector(|| "routine-active".into()).child(
+                                Switch::new("routine-active")
+                                    .checked(active)
+                                    // Says what the position means, so off reads as a state the
+                                    // routine is in and not as a label the switch has lost.
+                                    .label(if active { "Active" } else { "Paused" })
+                                    .on_click({
+                                        let app = app.clone();
+                                        let coworker_id = coworker_id.clone();
+                                        let id = id.clone();
+                                        move |checked, _, cx| {
+                                            if let Some(id) = id.clone() {
+                                                app.update(cx, |state, cx| {
+                                                    state.set_routine_active(
+                                                        &coworker_id,
+                                                        &id,
+                                                        *checked,
+                                                        cx,
+                                                    );
+                                                });
+                                            }
                                         }
-                                    }
-                                })
-                                .w_full()
-                                .justify_between()
-                                .items_center()
-                                .py(px(4.))
-                                .child(
-                                    h_flex()
-                                        .gap(px(6.))
-                                        .child(div().text_sm().child(run.at.clone()))
-                                        .child(
-                                            div()
-                                                .text_xs()
-                                                .text_color(muted)
-                                                .child(run.cause_label()),
-                                        ),
-                                )
-                                .child(match run.status {
-                                    ScheduleRunStatus::Ok => Icon::default()
-                                        .path("icons/check.svg")
-                                        .size(px(14.))
-                                        .text_color(rgb(0x34c759))
-                                        .into_any_element(),
-                                    ScheduleRunStatus::Error => div()
-                                        .text_xs()
-                                        .text_color(theme.danger)
-                                        .child("Failed")
-                                        .into_any_element(),
-                                    ScheduleRunStatus::Running => div()
-                                        .text_xs()
-                                        .text_color(muted)
-                                        .child("Running")
-                                        .into_any_element(),
-                                    ScheduleRunStatus::Waiting => div()
-                                        .text_xs()
-                                        .text_color(muted)
-                                        .child("Waiting on you")
-                                        .into_any_element(),
-                                    ScheduleRunStatus::Other => div().into_any_element(),
-                                })
-                        }))
-                        .into_any_element()
+                                    }),
+                            ),
+                        )
+                        .when_some(unsaved, |this, edit| {
+                            this.child(unsaved_block(&rid, &edit, muted, theme))
+                        })
+                        .child(field_label("Name", muted))
+                        .child(
+                            div()
+                                .debug_selector(|| "routine-name".into())
+                                .child(field_input(&self.name_input).disabled(!can_change)),
+                        )
+                        .child(field_label("Instruction", muted))
+                        .child(field_textarea(&self.instruction_input, theme).disabled(!can_change))
+                        .child(field_label("When to run", muted))
+                        .child(self.triggers_box(
+                            &triggers,
+                            &coworker_id,
+                            id.clone(),
+                            muted,
+                            app.clone(),
+                            theme,
+                            persist.clone(),
+                            can_change,
+                            cx,
+                        ))
+                    }
                 }),
         )
     }
@@ -779,118 +761,254 @@ fn unsaved_block(
         }))
 }
 
-/// The space between the routine editor's controls, across and down alike.
-const ACTION_GAP: f32 = 8.;
+/// A routine's Run history: one line per run, newest first, each opening the routine's thread
+/// at that run. In its place, on a server that cannot list a routine's runs, the sentence saying
+/// so; on a routine with none, "No runs yet".
+#[allow(clippy::too_many_arguments)]
+fn routine_history(
+    routine_id: &str,
+    runs: Vec<crate::state::RoutineRun>,
+    unavailable: bool,
+    muted: Hsla,
+    app: Entity<AppState>,
+    theme: &gpui_kit::component::Theme,
+    persist: Rc<dyn Fn(&mut App)>,
+) -> AnyElement {
+    if unavailable {
+        // Not "No runs yet": nobody knows that, because this server cannot say.
+        return div()
+            .id(SharedString::from(format!(
+                "routine-{routine_id}-runs-unavailable"
+            )))
+            .text_sm()
+            .text_color(muted)
+            .child(ROUTINE_RUNS_UNAVAILABLE)
+            .into_any_element();
+    }
+    if runs.is_empty() {
+        return div()
+            .debug_selector(|| "routine-history".into())
+            .text_sm()
+            .text_color(muted)
+            .child("No runs yet")
+            .into_any_element();
+    }
+    v_flex()
+        .debug_selector(|| "routine-history".into())
+        .w_full()
+        .gap(px(6.))
+        .children(runs.into_iter().enumerate().map(|(i, run)| {
+            let routine_id = routine_id.to_string();
+            h_flex()
+                .id(SharedString::from(format!("run-{i}")))
+                // A line of the history opens the thread it ran in at that run, which is where
+                // what it said is. On click, not on press, so a scroll that starts on a line
+                // stays in the panel.
+                .cursor_pointer()
+                .on_click({
+                    let persist = persist.clone();
+                    let app = app.clone();
+                    let run_id = run.run_id.clone();
+                    move |_, _, cx| {
+                        persist(cx);
+                        app.update(cx, |state, cx| {
+                            state.open_routine_run(&routine_id, &run_id, cx);
+                        });
+                    }
+                })
+                .w_full()
+                .justify_between()
+                .items_center()
+                .py(px(4.))
+                .child(
+                    h_flex()
+                        .gap(px(6.))
+                        .child(div().text_sm().child(run.at.clone()))
+                        .child(div().text_xs().text_color(muted).child(run.cause_label())),
+                )
+                .child(match run.status {
+                    ScheduleRunStatus::Ok => Icon::default()
+                        .path("icons/check.svg")
+                        .size(px(14.))
+                        .text_color(rgb(0x34c759))
+                        .into_any_element(),
+                    ScheduleRunStatus::Error => div()
+                        .text_xs()
+                        .text_color(theme.danger)
+                        .child("Failed")
+                        .into_any_element(),
+                    ScheduleRunStatus::Running => div()
+                        .text_xs()
+                        .text_color(muted)
+                        .child("Running")
+                        .into_any_element(),
+                    ScheduleRunStatus::Waiting => div()
+                        .text_xs()
+                        .text_color(muted)
+                        .child("Waiting on you")
+                        .into_any_element(),
+                    ScheduleRunStatus::Other => div().into_any_element(),
+                })
+        }))
+        .into_any_element()
+}
 
-/// The routine editor's row of controls: the Active switch, then Delete, Open thread and Test
-/// run.
-///
-/// It wraps rather than running on past the pane's edge. On one line the four are wider than the
-/// pane, and Test run, the last of them, was the one cut off. The buttons keep together after the
-/// switch, beside it while they fit and under it once they do not, and wrap among themselves in
-/// turn, every gap the same across and down, so each control is whole at whatever width the pane
-/// is.
-fn routine_actions(
+/// What a routine's header icons act on, and whether each can.
+struct RoutineIcons {
     app: Entity<AppState>,
     coworker_id: String,
-    id: Option<String>,
-    active: bool,
-    has_thread: bool,
+    id: String,
+    /// The server has the routine: it has a thread, and can be run.
+    on_the_server: bool,
+    /// The server can run a routine when asked.
     can_run: bool,
+    /// The panel shows the Run history in place of the routine's fields.
+    history_open: bool,
     persist: Rc<dyn Fn(&mut App)>,
-) -> impl IntoElement {
+    theme: gpui_kit::component::Theme,
+}
+
+/// A routine's four icons, on the right of its header: Run history, Open in thread, Run it now
+/// and Delete. Icons, not words, so the four fit the panel's header at any width, each saying
+/// what it does in its tooltip, and why when it cannot.
+fn routine_icons(icons: RoutineIcons) -> impl IntoElement {
+    let RoutineIcons {
+        app,
+        coworker_id,
+        id,
+        on_the_server,
+        can_run,
+        history_open,
+        persist,
+        theme,
+    } = icons;
+    let run_why = if !can_run {
+        ROUTINE_RUN_UNAVAILABLE
+    } else if !on_the_server {
+        "Choose when it runs first, then run it"
+    } else {
+        "Run it now"
+    };
     h_flex()
-        .debug_selector(|| "routine-actions".into())
-        .w_full()
-        .flex_wrap()
-        .justify_between()
-        .gap(px(ACTION_GAP))
+        .gap(px(2.))
+        .items_center()
         .child(
-            div().debug_selector(|| "routine-active".into()).child(
-                Switch::new("routine-active")
-                    .checked(active)
-                    // Says what the position means, so off reads as a state the routine is in
-                    // and not as a label the switch has lost.
-                    .label(if active { "Active" } else { "Paused" })
-                    .on_click({
-                        let app = app.clone();
-                        let coworker_id = coworker_id.clone();
-                        let id = id.clone();
-                        move |checked, _, cx| {
-                            if let Some(id) = id.clone() {
-                                app.update(cx, |state, cx| {
-                                    state.set_routine_active(&coworker_id, &id, *checked, cx);
-                                });
-                            }
-                        }
-                    }),
+            // Its fields again, while the history is shown: the icon says where it goes.
+            routine_icon(
+                "routine-history-toggle",
+                if history_open {
+                    "icons/list.svg"
+                } else {
+                    "icons/rotate-ccw-clock.svg"
+                },
+                if history_open {
+                    "Back to the routine"
+                } else {
+                    "Run history"
+                },
+                true,
+                history_open,
+                &theme,
+                {
+                    let app = app.clone();
+                    move |cx| app.update(cx, |state, cx| state.toggle_routine_history(cx))
+                },
             ),
         )
+        .child(routine_icon(
+            "routine-open-thread",
+            "icons/message-circle.svg",
+            if on_the_server {
+                "Open in thread"
+            } else {
+                "Choose when it runs first: its thread is on the server"
+            },
+            on_the_server,
+            false,
+            &theme,
+            {
+                let app = app.clone();
+                let persist = persist.clone();
+                let id = id.clone();
+                move |cx| {
+                    persist(cx);
+                    app.update(cx, |state, cx| state.open_routine_thread(&id, cx));
+                }
+            },
+        ))
+        .child(routine_icon(
+            "routine-run-now",
+            "icons/play.svg",
+            run_why,
+            on_the_server && can_run,
+            false,
+            &theme,
+            {
+                let app = app.clone();
+                let coworker_id = coworker_id.clone();
+                let id = id.clone();
+                move |cx| {
+                    persist(cx);
+                    app.update(cx, |state, cx| state.run_routine_now(&coworker_id, &id, cx));
+                }
+            },
+        ))
+        .child(routine_icon(
+            "routine-delete",
+            "icons/trash.svg",
+            "Delete",
+            true,
+            false,
+            &theme,
+            move |cx| {
+                app.update(cx, |state, cx| state.delete_routine(&coworker_id, &id, cx));
+            },
+        ))
+}
+
+/// One icon of a routine's header, with its tooltip. Dead and dimmed while what it does cannot
+/// be done, the tooltip then saying why; filled while `selected`, for the one that is a state.
+#[allow(clippy::too_many_arguments)]
+fn routine_icon(
+    id: &'static str,
+    icon: &'static str,
+    tooltip: &'static str,
+    enabled: bool,
+    selected: bool,
+    theme: &gpui_kit::component::Theme,
+    on_press: impl Fn(&mut App) + 'static,
+) -> Stateful<Div> {
+    div()
+        .id(id)
+        .debug_selector(move || id.to_string())
+        .size(px(28.))
+        .rounded(px(8.))
+        .flex()
+        .items_center()
+        .justify_center()
+        .when(selected, |this| this.bg(theme.primary))
+        .when(enabled, |this| {
+            this.cursor_pointer()
+                .when(!selected, |this| {
+                    this.hover(|s| s.bg(rgb(0x777777).opacity(0.2)))
+                })
+                .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                    // Not a press on the bar under it, which drags the window.
+                    cx.stop_propagation();
+                    on_press(cx);
+                })
+        })
+        .when(!enabled, |this| this.opacity(0.35))
+        .tooltip(move |window, cx| Tooltip::new(tooltip).build(window, cx))
         .child(
-            h_flex()
-                .flex_wrap()
-                .gap(px(ACTION_GAP))
-                .when(id.is_some(), |this| {
-                    this.child(
-                        Button::new(SharedString::from(format!(
-                            "routine-{}-delete",
-                            id.as_deref().unwrap_or_default()
-                        )))
-                        .debug_selector(|| "routine-delete".into())
-                        .ghost()
-                        .label("Delete")
-                        .on_click({
-                            let app = app.clone();
-                            let coworker_id = coworker_id.clone();
-                            let id = id.clone();
-                            move |_, _, cx| {
-                                if let Some(id) = id.clone() {
-                                    app.update(cx, |state, cx| {
-                                        state.delete_routine(&coworker_id, &id, cx);
-                                    });
-                                }
-                            }
-                        }),
-                    )
-                })
-                // What the routine said each time it ran, and any card it is waiting on, are in
-                // its own thread; only a routine the server has has one.
-                .when(has_thread, |this| {
-                    this.child(
-                        Button::new("routine-open-thread")
-                            .debug_selector(|| "routine-open-thread".into())
-                            .ghost()
-                            .label("Open thread")
-                            .on_click({
-                                let persist = persist.clone();
-                                let app = app.clone();
-                                let id = id.clone();
-                                move |_, _, cx| {
-                                    persist(cx);
-                                    if let Some(id) = id.clone() {
-                                        app.update(cx, |state, cx| {
-                                            state.open_routine_thread(&id, cx);
-                                        });
-                                    }
-                                }
-                            }),
-                    )
-                })
-                .child(
-                    Button::new("routine-test")
-                        .debug_selector(|| "routine-test".into())
-                        .primary()
-                        .label("Test run")
-                        .disabled(!can_run)
-                        .on_click(move |_, _, cx| {
-                            persist(cx);
-                            if let Some(id) = id.clone() {
-                                app.update(cx, |state, cx| {
-                                    state.run_routine_now(&coworker_id, &id, cx);
-                                });
-                            }
-                        }),
-                ),
+            Icon::default()
+                .path(icon)
+                .size(px(16.))
+                .text_color(if selected {
+                    theme.primary_foreground
+                } else {
+                    theme.foreground
+                }),
         )
 }
 
@@ -1425,6 +1543,7 @@ fn pane_header(
     back: Option<Rc<dyn Fn(&mut App)>>,
     title: &'static str,
     actions: Option<&ComputerControls>,
+    trailing: Option<AnyElement>,
     app: Entity<AppState>,
     drag: bool,
 ) -> impl IntoElement {
@@ -1507,6 +1626,7 @@ fn pane_header(
         .child(div().flex_1().h_full().when(drag, |this| {
             this.on_mouse_down(MouseButton::Left, |_, window, _| window.start_window_move())
         }))
+        .children(trailing)
         .when(drag, |this| {
             this.child(icon_btn(
                 "computer-close",
@@ -2417,90 +2537,85 @@ mod tests {
         assert!(controls.present);
     }
 
-    /// The routine editor's row of controls as the pane lays it out: as wide as the pane's
-    /// content, which is the pane less 16px either side.
-    struct ActionRow {
-        app: gpui_kit::Entity<AppState>,
-        active: bool,
+    /// The open bot, with one routine the server has, open in the Computer pane.
+    pub(super) fn routine_open() -> AppState {
+        use crate::state::{AgentRoutine, ComputerView, RightPane, RoutineTrigger, ScheduleSpec};
+        let mut state = AppState::new();
+        state.coworkers = vec![
+            serde_json::from_value(serde_json::json!({ "id": "cw_1", "name": "New Bot" }))
+                .expect("a coworker"),
+        ];
+        state.active_coworker_id = Some("cw_1".into());
+        state.routines.insert(
+            "cw_1".into(),
+            vec![AgentRoutine {
+                id: "sch_1".into(),
+                name: "Say hello".into(),
+                instruction: "Say hello to the team".into(),
+                active: true,
+                triggers: vec![RoutineTrigger::Schedule {
+                    id: "sch_1".into(),
+                    spec: ScheduleSpec::from_cron("*/30 * * * *"),
+                }],
+                runs: Vec::new(),
+                saved: Some(crate::opengrok::ScheduleEdit {
+                    name: Some("Say hello".into()),
+                    prompt: Some("Say hello to the team".into()),
+                    cron: Some("0 */30 * * * *".into()),
+                }),
+            }],
+        );
+        state.right_pane = RightPane::Computer;
+        state.computer_view = ComputerView::Editor {
+            id: Some("sch_1".into()),
+        };
+        state
     }
 
-    impl gpui_kit::Render for ActionRow {
-        fn render(
-            &mut self,
-            _: &mut gpui_kit::Window,
-            _: &mut gpui_kit::Context<Self>,
-        ) -> impl gpui_kit::IntoElement {
-            use gpui_kit::{ParentElement as _, Styled as _};
-            gpui_kit::div()
-                .w(gpui_kit::px(crate::chrome::INFO_PANE_WIDTH - 32.))
-                .child(super::routine_actions(
-                    self.app.clone(),
-                    "cw_1".into(),
-                    Some("sch_1".into()),
-                    self.active,
-                    true,
-                    true,
-                    std::rc::Rc::new(|_| {}),
-                ))
-        }
-    }
-
-    /// Every one of the routine editor's controls is whole inside the pane, whichever way the
-    /// switch reads. On one line the four ran past the pane's edge and Test run, the last, was cut
-    /// off; now the buttons go under the switch together and wrap among themselves, every gap the
-    /// same across and down.
+    /// The routine's header carries its four icons, and the first switches the panel between
+    /// the routine's fields and its Run history alone: by default Active, Name and the rest, and
+    /// no history; pressed, the history and none of the fields; pressed again, the fields.
     #[gpui_kit::test]
-    fn every_routine_control_is_whole_inside_the_pane(cx: &mut gpui_kit::TestAppContext) {
-        use gpui_kit::{AppContext as _, Bounds, Pixels, px};
+    fn the_history_icon_swaps_the_routines_fields_for_its_runs(cx: &mut gpui_kit::TestAppContext) {
+        use gpui_kit::{AppContext as _, Modifiers};
         cx.update(gpui_kit::init);
-        let gap = px(super::ACTION_GAP);
-        let close = |a: Pixels, b: Pixels| (a - b).abs() < px(0.5);
-        for active in [true, false] {
-            let (_, window) = cx.add_window_view(|_, cx| ActionRow {
-                app: cx.new(|_| AppState::new()),
-                active,
-            });
-            window.update(|window, cx| window.draw(cx).clear(cx));
-            let mut drawn = |id: &'static str| -> Bounds<Pixels> {
-                window
-                    .debug_bounds(id)
-                    .unwrap_or_else(|| panic!("{id} is not drawn"))
-            };
-            let row = drawn("routine-actions");
-            let controls = [
-                "routine-active",
-                "routine-delete",
-                "routine-open-thread",
-                "routine-test",
-            ]
-            .map(|id| (id, drawn(id)));
-            for (id, control) in &controls {
-                assert!(
-                    control.left() >= row.left() && control.right() <= row.right(),
-                    "{id} runs past the pane (switch {active}): {control:?} in {row:?}"
-                );
-            }
-            let switch = controls[0].1;
-            let delete = controls[1].1;
-            assert!(
-                close(delete.top() - switch.bottom(), gap),
-                "the buttons go under the switch, {gap:?} below it: {switch:?}, {delete:?}"
-            );
-            for pair in controls[1..].windows(2) {
-                let ((before_id, before), (after_id, after)) = (pair[0], pair[1]);
-                if close(after.top(), before.top()) {
-                    assert!(
-                        close(after.left() - before.right(), gap),
-                        "{before_id} and {after_id} are not {gap:?} apart: {before:?}, {after:?}"
-                    );
-                } else {
-                    assert!(
-                        close(after.top() - before.bottom(), gap)
-                            && close(after.left(), row.left()),
-                        "{after_id} does not wrap {gap:?} under {before_id}: {before:?}, {after:?}"
-                    );
-                }
-            }
+        let (pane, cx) = cx.add_window_view(|window, cx| {
+            let state = cx.new(|_| routine_open());
+            super::ComputerPane::new(window, state, cx)
+        });
+        let drawn = |cx: &mut gpui_kit::VisualTestContext, id: &'static str| {
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            cx.debug_bounds(id)
+        };
+        for icon in [
+            "routine-history-toggle",
+            "routine-open-thread",
+            "routine-run-now",
+            "routine-delete",
+        ] {
+            assert!(drawn(cx, icon).is_some(), "{icon} is in the header");
         }
+        assert!(drawn(cx, "routine-active").is_some());
+        assert!(drawn(cx, "routine-name").is_some());
+        assert!(
+            drawn(cx, "routine-history").is_none(),
+            "no history by default"
+        );
+
+        let toggle = drawn(cx, "routine-history-toggle").unwrap().center();
+        cx.simulate_mouse_move(toggle, None, Modifiers::none());
+        cx.simulate_click(toggle, Modifiers::none());
+        assert!(pane.update(cx, |pane, cx| pane.state.read(cx).routine_history_open));
+        assert!(
+            drawn(cx, "routine-history").is_some(),
+            "the runs, and only them"
+        );
+        assert!(drawn(cx, "routine-active").is_none());
+        assert!(drawn(cx, "routine-name").is_none());
+
+        cx.simulate_mouse_move(toggle, None, Modifiers::none());
+        cx.simulate_click(toggle, Modifiers::none());
+        assert!(drawn(cx, "routine-name").is_some(), "the fields again");
+        assert!(drawn(cx, "routine-history").is_none());
     }
 }

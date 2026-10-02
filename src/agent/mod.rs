@@ -92,7 +92,12 @@
 //! routine the server has; disabled, and a click refused in the editor's words, on a server that
 //! cannot run a routine on demand), `routine-{id}-run-{runId}` (one Run history line: label `Test
 //! run` / `Webhook` / `Schedule`, value `running` / `waiting` / `ok` / `error`; a click opens the
-//! routine's thread), `routine-{id}-delete`.
+//! routine's thread and brings that run into view once the thread has it), `routine-{id}-delete`.
+//! While a routine is open in the Computer pane, its header's four icons are under
+//! `computer-pane`, each acting on that routine: `routine-history-toggle` (label `Run history`, or
+//! `Back to the routine` with state `selected` while the panel shows the Run history alone in
+//! place of the routine's fields), `routine-open-thread`, `routine-run-now` and `routine-delete`;
+//! one that cannot act is disabled, with the reason as its value, and a click on it is refused.
 //! What an older server cannot do with a routine (one from before opengrok-server 18656e3), each
 //! in the tree only while it is so, label = the editor's words: `routine-{id}-cant-change` (it
 //! cannot change a routine once it is made: the fields are dead, and `routine.edit` is refused),

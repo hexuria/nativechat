@@ -115,6 +115,14 @@ pub mod ids {
     /// The open routine editor's red line: the last refusal, in the server's words, unless a
     /// note of the routine's already says it. In the tree only while the editor shows one.
     pub const ROUTINE_ERROR: &str = "routine-error";
+    /// The open routine's four header icons, in the tree while a routine is open in the
+    /// Computer pane: its Run history in place of its fields (state `selected` while shown, when
+    /// it reads "Back to the routine"), Open in thread, Run it now, and Delete. Each acts on the
+    /// open routine, and one that cannot is disabled with the reason as its value.
+    pub const ROUTINE_HISTORY_TOGGLE: &str = "routine-history-toggle";
+    pub const ROUTINE_OPEN_THREAD: &str = "routine-open-thread";
+    pub const ROUTINE_RUN_NOW: &str = "routine-run-now";
+    pub const ROUTINE_DELETE: &str = "routine-delete";
     /// Under `computer-status`, while the Computer pane says why the server could not give the
     /// bot a computer: the server's words as the pane shows them, with its code as the value.
     pub const COMPUTER_ERROR: &str = "computer-error";
@@ -846,6 +854,13 @@ pub enum Command {
     OpenRoutineThread {
         routine_id: String,
     },
+    /// A line of a routine's Run history: its thread, at that run.
+    OpenRoutineRun {
+        routine_id: String,
+        run_id: String,
+    },
+    /// The open routine's history icon: its Run history in place of its fields, or back.
+    ToggleRoutineHistory,
     /// The Bot chip, pressed: the Bot's settings, or its own chat from a routine's thread.
     PressBotChip,
     /// Run the open recipe on this bot.
@@ -1091,6 +1106,10 @@ impl Command {
                 }
             }
             Self::OpenRoutineThread { routine_id } => state.open_routine_thread(&routine_id, cx),
+            Self::OpenRoutineRun { routine_id, run_id } => {
+                state.open_routine_run(&routine_id, &run_id, cx)
+            }
+            Self::ToggleRoutineHistory => state.toggle_routine_history(cx),
             Self::PressBotChip => state.press_bot_chip(cx),
             Self::RunOpenRecipe(coworker_id) => state.run_open_recipe(coworker_id, cx),
             Self::SetComputerExecMode { machine_id, mode } => {
@@ -2153,6 +2172,41 @@ fn routine_snap(routine: &crate::state::AgentRoutine, state: &AppState) -> Routi
     snap
 }
 
+/// The open routine's four header icons, as the panel draws them: each enabled while it can
+/// act, with the reason as the value of one that cannot.
+fn routine_header_nodes(routine: &RoutineSnap, history_open: bool) -> Vec<UiNode> {
+    let on_the_server = routine.kind != "draft";
+    let mut history = UiNode::button(
+        ids::ROUTINE_HISTORY_TOGGLE,
+        if history_open {
+            "Back to the routine"
+        } else {
+            "Run history"
+        },
+    );
+    if history_open {
+        history.states.push("selected".into());
+    }
+    let mut thread =
+        UiNode::button(ids::ROUTINE_OPEN_THREAD, "Open in thread").with_enabled(on_the_server);
+    if !on_the_server {
+        thread = thread.with_value("Choose when it runs first: its thread is on the server");
+    }
+    let mut run = UiNode::button(ids::ROUTINE_RUN_NOW, "Run it now")
+        .with_enabled(on_the_server && !routine.run_dead());
+    if routine.run_dead() {
+        run = run.with_value(crate::state::ROUTINE_RUN_UNAVAILABLE);
+    } else if !on_the_server {
+        run = run.with_value("Choose when it runs first, then run it");
+    }
+    vec![
+        history,
+        thread,
+        run,
+        UiNode::button(ids::ROUTINE_DELETE, "Delete"),
+    ]
+}
+
 /// The routine's row and everything reachable from it.
 ///
 /// The two triggers are here only while the routine has none, and the webhook's three only
@@ -2667,6 +2721,10 @@ pub struct NativeChatHost {
     routines: Vec<RoutineSnap>,
     /// The red line of the routine editor, while one is open and shows one.
     routine_error: Option<String>,
+    /// The routine open in the Computer pane, by id.
+    routine_editor: Option<String>,
+    /// The open routine's panel shows its Run history in place of its fields.
+    routine_history_open: bool,
     /// The open thread's routine, when it is one of the bot's routines' threads: its name and
     /// the server's word for what fires it.
     routine_thread: Option<(String, String)>,
@@ -3032,6 +3090,14 @@ impl NativeChatHost {
                         .count()
                 }),
             bot_chip_goes_home: state.bot_chip_goes_home(),
+            routine_editor: match (&state.computer_view, state.right_pane) {
+                (
+                    crate::state::ComputerView::Editor { id: Some(open) },
+                    crate::state::RightPane::Computer,
+                ) => Some(open.clone()),
+                _ => None,
+            },
+            routine_history_open: state.routine_history_open,
             routine_error: match (&state.computer_view, state.right_pane) {
                 (
                     crate::state::ComputerView::Editor { id: Some(open) },
@@ -3631,6 +3697,11 @@ impl NativeChatHost {
         computer = computer.with_child(UiNode::button(ids::ROUTINE_NEW, "Create routine"));
         if let Some(line) = &self.routine_error {
             computer = computer.with_child(UiNode::status(ids::ROUTINE_ERROR, line.clone()));
+        }
+        if let Some(open) = self.open_routine() {
+            for node in routine_header_nodes(open, self.routine_history_open) {
+                computer = computer.with_child(node);
+            }
         }
         for routine in &self.routines {
             computer = computer.with_child(routine_node(routine));
@@ -5960,6 +6031,15 @@ impl NativeChatHost {
             Command::CloseNetworkPolicy
         } else if target == ids::ROUTINE_NEW {
             Command::OpenRoutineEditor(None)
+        } else if [
+            ids::ROUTINE_HISTORY_TOGGLE,
+            ids::ROUTINE_OPEN_THREAD,
+            ids::ROUTINE_RUN_NOW,
+            ids::ROUTINE_DELETE,
+        ]
+        .contains(&target)
+        {
+            self.routine_header_command(target)?
         } else if let Some(cmd) = self.routine_command(target) {
             if let Command::RunRoutineNow { routine_id } = &cmd {
                 self.refuse_dead_test_run(target, routine_id)?;
@@ -6302,8 +6382,9 @@ impl NativeChatHost {
                 .and_then(|tail| tail.strip_prefix("-run-"))
                 && routine.runs.iter().any(|(id, _, _)| id == run)
             {
-                return Some(Command::OpenRoutineThread {
+                return Some(Command::OpenRoutineRun {
                     routine_id: routine.id.clone(),
+                    run_id: run.to_string(),
                 });
             }
         }
@@ -6775,6 +6856,41 @@ impl NativeChatHost {
         Ok(DispatchResult::empty())
     }
 
+    /// One of the open routine's header icons, refused when no routine is open or when the icon
+    /// is dead, in the words its tooltip says it in.
+    fn routine_header_command(&self, target: &str) -> Result<Command, String> {
+        let open = self
+            .open_routine()
+            .ok_or_else(|| format!("`{target}` is in a routine's header, and none is open"))?;
+        let routine_id = open.id.clone();
+        let on_the_server = open.kind != "draft";
+        Ok(match target {
+            ids::ROUTINE_HISTORY_TOGGLE => Command::ToggleRoutineHistory,
+            ids::ROUTINE_OPEN_THREAD if !on_the_server => {
+                return Err(format!(
+                    "`{target}` is dead: choose when it runs first; its thread is on the server"
+                ));
+            }
+            ids::ROUTINE_OPEN_THREAD => Command::OpenRoutineThread { routine_id },
+            ids::ROUTINE_RUN_NOW if !on_the_server => {
+                return Err(format!(
+                    "`{target}` is dead: choose when it runs first, then run it"
+                ));
+            }
+            ids::ROUTINE_RUN_NOW => {
+                self.refuse_dead_test_run(target, &routine_id)?;
+                Command::RunRoutineNow { routine_id }
+            }
+            _ => Command::DeleteRoutine { routine_id },
+        })
+    }
+
+    /// The routine open in the Computer pane, as the tree lists it.
+    fn open_routine(&self) -> Option<&RoutineSnap> {
+        let open = self.routine_editor.as_deref()?;
+        self.routines.iter().find(|routine| routine.id == open)
+    }
+
     /// Test run on a server that cannot run a routine on demand is dead on screen, and refused
     /// here in the words the editor says it in.
     fn refuse_dead_test_run(&self, target: &str, routine_id: &str) -> Result<(), String> {
@@ -7020,6 +7136,83 @@ mod tests {
         ));
     }
 
+    /// The open routine's header carries its four icons, each acting on that routine: the
+    /// history toggle says which view it leads to and is `selected` while the history shows, and
+    /// Open in thread and Run it now are dead on a draft, Run it now also where the server cannot
+    /// run a routine on demand, each refused with its reason. With no routine open there are none.
+    #[test]
+    fn the_open_routines_header_icons_act_on_it() {
+        let mut host = host();
+        host.computer_open = true;
+        host.routines = vec![routine("sch_1", "cron"), routine("draft-1", "draft")];
+        assert!(host.snapshot().find(ids::ROUTINE_HISTORY_TOGGLE).is_none());
+        assert!(
+            host.click(ids::ROUTINE_RUN_NOW).is_err(),
+            "no routine is open"
+        );
+
+        host.routine_editor = Some("sch_1".into());
+        let tree = host.snapshot();
+        for id in [
+            ids::ROUTINE_HISTORY_TOGGLE,
+            ids::ROUTINE_OPEN_THREAD,
+            ids::ROUTINE_RUN_NOW,
+            ids::ROUTINE_DELETE,
+        ] {
+            assert!(tree.find(id).is_some_and(|node| node.enabled), "{id}");
+        }
+        assert_eq!(
+            tree.find(ids::ROUTINE_HISTORY_TOGGLE).unwrap().name,
+            "Run history"
+        );
+        let clicked = |host: &mut NativeChatHost, id: &str| {
+            host.click(id).unwrap();
+            host.take_command().unwrap()
+        };
+        assert!(matches!(
+            clicked(&mut host, ids::ROUTINE_HISTORY_TOGGLE),
+            Command::ToggleRoutineHistory
+        ));
+        assert!(matches!(
+            clicked(&mut host, ids::ROUTINE_OPEN_THREAD),
+            Command::OpenRoutineThread { routine_id } if routine_id == "sch_1"
+        ));
+        assert!(matches!(
+            clicked(&mut host, ids::ROUTINE_RUN_NOW),
+            Command::RunRoutineNow { routine_id } if routine_id == "sch_1"
+        ));
+        assert!(matches!(
+            clicked(&mut host, ids::ROUTINE_DELETE),
+            Command::DeleteRoutine { routine_id } if routine_id == "sch_1"
+        ));
+
+        host.routine_history_open = true;
+        let toggle = host
+            .snapshot()
+            .find(ids::ROUTINE_HISTORY_TOGGLE)
+            .cloned()
+            .unwrap();
+        assert_eq!(toggle.name, "Back to the routine");
+        assert!(toggle.states.iter().any(|state| state == "selected"));
+
+        host.routine_editor = Some("draft-1".into());
+        let tree = host.snapshot();
+        assert!(!tree.find(ids::ROUTINE_OPEN_THREAD).unwrap().enabled);
+        assert!(!tree.find(ids::ROUTINE_RUN_NOW).unwrap().enabled);
+        assert!(host.click(ids::ROUTINE_RUN_NOW).is_err());
+        assert!(host.click(ids::ROUTINE_OPEN_THREAD).is_err());
+
+        host.routine_editor = Some("sch_1".into());
+        host.routines[0].notes = vec![("cant-run", crate::state::ROUTINE_RUN_UNAVAILABLE)];
+        let run = host.snapshot().find(ids::ROUTINE_RUN_NOW).cloned().unwrap();
+        assert!(!run.enabled);
+        assert_eq!(
+            run.value.as_deref(),
+            Some(crate::state::ROUTINE_RUN_UNAVAILABLE)
+        );
+        assert!(host.click(ids::ROUTINE_RUN_NOW).is_err());
+    }
+
     /// The driver's two routine verbs: Test run by name, and an edit saved the way the editor
     /// saves one. An edit that names nothing to change is refused before it reaches the app.
     #[test]
@@ -7073,12 +7266,13 @@ mod tests {
             host.take_command().unwrap(),
             Command::OpenRoutineThread { routine_id } if routine_id == "sch-1-2"
         ));
-        // A line of its history opens the same thread, dashes in both ids and all.
+        // A line of its history opens the same thread at that run, dashes in both ids and all.
         host.routines[0].runs = vec![("run-a-1".into(), "Test run", "ok")];
         host.click(&ids::routine_run("sch-1-2", "run-a-1")).unwrap();
         assert!(matches!(
             host.take_command().unwrap(),
-            Command::OpenRoutineThread { routine_id } if routine_id == "sch-1-2"
+            Command::OpenRoutineRun { routine_id, run_id }
+                if routine_id == "sch-1-2" && run_id == "run-a-1"
         ));
         host.invoke("routine.thread", &serde_json::json!({ "id": "sch-1-2" }))
             .unwrap();

@@ -541,6 +541,19 @@ fn transcript_row_gap(row: &ChatRow, next: Option<&ChatRow>) -> Pixels {
     }
 }
 
+/// The first row of a routine's run in a thread: the instruction it opened with, which a replay
+/// names `{runId}-prompt` (opengrok-server `agui/history.rs`, `routine_prompt`), or else the first
+/// row of any message of that run.
+fn run_row(rows: &[ChatRow], run_id: &str) -> Option<usize> {
+    let prompt = format!("{run_id}-prompt");
+    rows.iter()
+        .position(|row| row.source_id == prompt)
+        .or_else(|| {
+            rows.iter()
+                .position(|row| row.source_id.starts_with(run_id))
+        })
+}
+
 /// Whether a picture belongs to the strip the row before it already holds. Pictures are one
 /// set when they came from the same turn with nothing but pictures between them — that is
 /// what makes a strip, rather than a column of full-width screens nobody scrolls past.
@@ -958,6 +971,9 @@ impl ChatTranscript {
                 let app = state.read(cx);
                 let feed = ChatFeedRev::from_state(app);
                 if this.feed_rev == feed {
+                    // The rows are the same, but a run of this very thread may have been asked
+                    // for from the routine's Run history.
+                    this.reveal_asked_run(&state, cx);
                     return;
                 }
                 (feed, snapshot_rows(app))
@@ -983,6 +999,7 @@ impl ChatTranscript {
                 this.start_highlight_pump(cx);
             }
             this.recompute_find(false, cx);
+            this.reveal_asked_run(&state, cx);
             cx.notify();
         })
         .detach();
@@ -1105,6 +1122,29 @@ impl ChatTranscript {
         if land && let Some(index) = self.find_current {
             self.scroll_to_hit(index, cx);
         }
+        cx.notify();
+    }
+
+    /// Bring the routine's run that the person asked for from its Run history into view, once the
+    /// open thread has a row of it. A thread rebuilt from the server may not have it the first
+    /// time its rows are taken, so this is asked again each time they change; it is let go once
+    /// shown, or once the person is in another thread.
+    fn reveal_asked_run(&mut self, state: &Entity<AppState>, cx: &mut Context<Self>) {
+        let Some((thread_id, run_id)) = state.read(cx).reveal_run.clone() else {
+            return;
+        };
+        if self.last_conversation_id.as_deref() != Some(thread_id.as_str()) {
+            state.update(cx, |state, _| state.reveal_run = None);
+            return;
+        }
+        let Some(row) = run_row(&self.rows, &run_id) else {
+            return;
+        };
+        // Going to a run is the person going somewhere in the thread, as going to a find hit is.
+        self.scroll.scroll_to_item(row);
+        self.scroll.remeasure_items(row..row + 1);
+        self.publish_tail(cx);
+        state.update(cx, |state, _| state.reveal_run = None);
         cx.notify();
     }
 
@@ -2261,13 +2301,34 @@ fn text_row_id(msg_id: &str, n: usize) -> String {
 mod tests {
     use super::{
         ChatFeedRev, ChatRow, RowsChange, RunRow, ScreenshotSpec, TRANSCRIPT_EDGE_GAP, apply_rows,
-        changed_rows, joins_previous_set, just_sent, snapshot_rows, tail_room, text_row_id,
+        changed_rows, joins_previous_set, just_sent, run_row, snapshot_rows, tail_room,
+        text_row_id,
     };
     use crate::components::steps::{step_key, timing_key};
     use crate::components::transcript_scroll::TranscriptScroll;
     use crate::opengrok::{ChatPart, StepSpec, TurnTiming};
     use crate::state::AppState;
     use gpui_kit::{ListOffset, px};
+
+    /// A line of a routine's Run history lands on the run's first row in the thread: the
+    /// instruction it opened with, or failing that the first row of anything the run said. A run
+    /// the thread does not hold yet has no row, and is waited for rather than guessed at.
+    #[test]
+    fn a_runs_line_lands_on_the_runs_first_row() {
+        let rows = [
+            ChatRow::slot("r0".into(), "client-q1".into()),
+            ChatRow::slot("r1".into(), "run_01a-prompt".into()),
+            ChatRow::slot("r2".into(), "run_01a-reply".into()),
+            ChatRow::slot("r3".into(), "run_02b-reply".into()),
+        ];
+        assert_eq!(run_row(&rows, "run_01a"), Some(1));
+        assert_eq!(
+            run_row(&rows, "run_02b"),
+            Some(3),
+            "no instruction row: its first"
+        );
+        assert_eq!(run_row(&rows, "run_03c"), None);
+    }
 
     /// The room is the last bubble's alone: give it to every row and the transcript would be
     /// mostly air, and the rows above the composer would each hold a composer's worth of it.

@@ -4611,6 +4611,13 @@ pub struct AppState {
     /// typed, kept on screen beside the server's values the fields went back to, so it is not
     /// lost to a refusal it had no part in.
     pub routine_unsaved: HashMap<String, ScheduleEdit>,
+    /// The open routine's panel shows its Run history and nothing else, in place of its fields.
+    /// Per routine opened: the next one to open shows its fields again.
+    pub routine_history_open: bool,
+    /// A run of a routine to bring into view in the routine's thread once the thread has it:
+    /// the thread's id and the run's. Set by a line of the Run history; let go once shown, or
+    /// once the person is in another thread.
+    pub reveal_run: Option<(String, String)>,
     pub model_picker_open: bool,
     pub avatar_editor_open: bool,
     pub hiring: bool,
@@ -5292,6 +5299,8 @@ impl AppState {
             routine_resyncs: HashMap::new(),
             routine_routes_missing: RoutineRoutesMissing::default(),
             routine_unsaved: HashMap::new(),
+            routine_history_open: false,
+            reveal_run: None,
             model_picker_open: false,
             avatar_editor_open: false,
             hiring: false,
@@ -10471,8 +10480,23 @@ impl AppState {
         self.set_right_pane(RightPane::Computer, cx);
         self.load_routine_runs(&coworker_id, &id, cx);
         self.computer_view = ComputerView::Editor { id: Some(id) };
+        self.routine_history_open = false;
         self.record_nav();
         cx.notify();
+    }
+
+    /// The history icon in a routine's header: its Run history in place of its fields, or its
+    /// fields again.
+    pub fn toggle_routine_history(&mut self, cx: &mut Context<Self>) {
+        self.routine_history_open = !self.routine_history_open;
+        cx.notify();
+    }
+
+    /// A line of a routine's Run history: the routine's thread, with that run brought into view
+    /// once the thread has it (`ChatView`), which a thread rebuilt from the server may not yet.
+    pub fn open_routine_run(&mut self, routine_id: &str, run_id: &str, cx: &mut Context<Self>) {
+        self.reveal_run = Some((routine_id.to_string(), run_id.to_string()));
+        self.open_routine_thread(routine_id, cx);
     }
 
     pub fn back_to_computer(&mut self, cx: &mut Context<Self>) {
@@ -25010,6 +25034,47 @@ mod tests {
         assert_eq!(entry, "e_form");
         assert_eq!(thread_id, "sch_1", "the card is on the routine's thread");
         assert_eq!(agent_id, "cw_1", "and it is the bot's card to answer");
+    }
+
+    /// The history icon swaps a routine's fields for its runs and back, and the next routine to
+    /// open, or the same one opened again, opens on its fields.
+    #[gpui_kit::test]
+    fn a_routines_history_is_shown_until_another_routine_opens(cx: &mut gpui_kit::TestAppContext) {
+        use gpui_kit::AppContext as _;
+        let app = cx.new(|_| with_routines());
+        app.update(cx, |state, cx| {
+            state.open_routine_editor(Some("sch_1".into()), cx);
+            assert!(!state.routine_history_open, "fields first");
+            state.toggle_routine_history(cx);
+            assert!(state.routine_history_open);
+            state.open_routine_editor(Some("draft-1".into()), cx);
+            assert!(
+                !state.routine_history_open,
+                "another routine opens on its fields"
+            );
+            state.toggle_routine_history(cx);
+            state.open_routine_editor(Some("draft-1".into()), cx);
+            assert!(
+                !state.routine_history_open,
+                "and so does this one, opened again"
+            );
+        });
+    }
+
+    /// A line of the Run history opens the routine's thread and asks for that run to be brought
+    /// into view there.
+    #[gpui_kit::test]
+    fn a_run_line_opens_the_thread_at_that_run(cx: &mut gpui_kit::TestAppContext) {
+        use gpui_kit::AppContext as _;
+        let app = cx.new(|_| with_routines());
+        app.update(cx, |state, cx| {
+            state.open_routine_run("sch_1", "run_01a", cx);
+            assert_eq!(state.active_conversation_id.as_deref(), Some("sch_1"));
+            assert_eq!(
+                state.reveal_run,
+                Some(("sch_1".to_string(), "run_01a".to_string()))
+            );
+        });
     }
 
     // ---- A routine on a server that cannot do everything with one -------------------------
