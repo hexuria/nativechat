@@ -4390,6 +4390,13 @@ fn schedules(_: u16, body: &Value) -> Check {
                 && row.webhook.is_some() == webhook.is_some(),
             "a routine came through changed: {row:?}"
         );
+        // The zone its line is read in (#316: `tz` on every row), which the editor names beside
+        // its times where it is not this computer's.
+        must!(
+            row.tz.as_deref() == opt_str(raw, "tz"),
+            "a routine's zone should come through as sent: {:?} from {raw}",
+            row.tz
+        );
         if let (Some(info), Some(raw)) = (&row.webhook, webhook) {
             must!(
                 info.url == str_at(raw, "url")

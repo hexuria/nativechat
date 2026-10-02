@@ -16,9 +16,11 @@
 //! most people know, and what this module writes and reads follows the server, because the
 //! server is what runs it:
 //!
-//! * Times are UTC. The server asks for the next run after now in UTC, so `0 9 * * *` runs at
-//!   9:00 UTC wherever the person is; the words here say so, and the editor says when the next
-//!   run lands in the person's own time.
+//! * Times are the routine's own zone's. The server reads a routine's line in the IANA zone it
+//!   keeps for it (opengrok-server #316: `tz`, the account's `timeZone` for one this app makes,
+//!   UTC for one stored before zones), so `0 9 * * *` in Asia/Manila runs at 9:00 there. The
+//!   words here name no zone: the editor names the routine's beside them where it is not this
+//!   computer's, and says when the next run lands in the person's own time.
 //! * Days of the week count from Sunday as 1 to Saturday as 7, and 0 is refused. In the cron most
 //!   people know Sunday is 0 and Monday 1, so `1-5` there is Monday to Friday and here is Sunday
 //!   to Thursday. The lines written here name their days (`MON-FRI`), which both read alike; a
@@ -407,11 +409,11 @@ fn interval_label(every: u32, unit: ScheduleUnit) -> String {
             if every == 0 || every > 23 || 24 % every == 0 {
                 base
             } else {
-                format!("{base}, starting again at 12 AM UTC each day")
+                format!("{base}, starting again at 12 AM each day")
             }
         }
         ScheduleUnit::Days => {
-            let base = format!("Every {every} {} at 12:00 AM UTC", noun("day", "days"));
+            let base = format!("Every {every} {} at 12:00 AM", noun("day", "days"));
             if every <= 1 {
                 base
             } else {
@@ -430,7 +432,7 @@ fn advanced_label(spec: &ScheduleSpec) -> String {
     let time = if times.is_empty() {
         "no time of day".to_string()
     } else {
-        format!("{} UTC", join_and(&times))
+        join_and(&times)
     };
     let days = match spec.day_kind {
         ScheduleDayKind::EveryDay => format!("Every day at {time}"),
@@ -948,7 +950,7 @@ fn time_phrase(minute: &CronField, hour: &CronField) -> String {
         CronField::Any => how_often
             .unwrap_or_else(|| format!("at {} past every hour", minute_marks(&minutes_of(minute)))),
         CronField::Every(step) => {
-            let hours = format!("every {step} hours from 12 AM UTC");
+            let hours = format!("every {step} hours from 12 AM");
             match how_often {
                 Some(often) => format!("{often}, in {hours}"),
                 None => format!("at {} past {hours}", minute_marks(&minutes_of(minute))),
@@ -961,7 +963,7 @@ fn time_phrase(minute: &CronField, hour: &CronField) -> String {
                     return String::new();
                 };
                 return format!(
-                    "{often} from {} to {} UTC",
+                    "{often} from {} to {}",
                     format_clock(*first, start),
                     format_clock(*last, end)
                 );
@@ -971,9 +973,9 @@ fn time_phrase(minute: &CronField, hour: &CronField) -> String {
                     .iter()
                     .map(|hour| format_clock(*hour, minutes[0]))
                     .collect();
-                return format!("at {} UTC", join_and(&times));
+                return format!("at {}", join_and(&times));
             }
-            let hours = format!("{} UTC", named_runs(hours, format_hour));
+            let hours = named_runs(hours, format_hour);
             match how_often {
                 Some(often) => format!("{often} in the hours of {hours}"),
                 None => format!("at {} past {hours}", minute_marks(&minutes)),
@@ -1098,21 +1100,18 @@ mod tests {
     #[test]
     fn weekdays_are_named_and_a_numbered_one_is_read_the_servers_way() {
         let label = |line: &str| ScheduleSpec::from_cron(line).label();
-        assert_eq!(label("0 9 * * MON-FRI"), "Weekdays at 9:00 AM UTC");
-        assert_eq!(
-            label("0 9 * * mon,tue,wed,thu,fri"),
-            "Weekdays at 9:00 AM UTC"
-        );
+        assert_eq!(label("0 9 * * MON-FRI"), "Weekdays at 9:00 AM");
+        assert_eq!(label("0 9 * * mon,tue,wed,thu,fri"), "Weekdays at 9:00 AM");
         assert_eq!(
             label("0 9 * * 2-6"),
-            "Weekdays at 9:00 AM UTC",
+            "Weekdays at 9:00 AM",
             "2 is Monday there"
         );
-        assert_eq!(label("0 9 * * 1-5"), "Sun to Thu at 9:00 AM UTC");
-        assert_eq!(label("0 9 * * 1,2,3,4,5"), "Sun to Thu at 9:00 AM UTC");
-        assert_eq!(label("0 9 * * 1"), "Every Sunday at 9:00 AM UTC");
-        assert_eq!(label("0 9 * * SAT,SUN"), "Weekends at 9:00 AM UTC");
-        assert_eq!(label("0 9 * * 1-7"), "Every day at 9:00 AM UTC");
+        assert_eq!(label("0 9 * * 1-5"), "Sun to Thu at 9:00 AM");
+        assert_eq!(label("0 9 * * 1,2,3,4,5"), "Sun to Thu at 9:00 AM");
+        assert_eq!(label("0 9 * * 1"), "Every Sunday at 9:00 AM");
+        assert_eq!(label("0 9 * * SAT,SUN"), "Weekends at 9:00 AM");
+        assert_eq!(label("0 9 * * 1-7"), "Every day at 9:00 AM");
         assert_eq!(
             ScheduleSpec::from_cron("0 9 * * 0").tab(),
             WakeTab::Cron,
@@ -1125,50 +1124,45 @@ mod tests {
 
     /// What each tab says under the editor, and in the list of when a routine runs: what was
     /// picked, in words, the months by name and never "Selected months", and the time on the
-    /// clock the server runs it by, which is UTC.
+    /// routine's own clock, whose zone the words do not name: the editor names it beside them
+    /// where it is not this computer's.
     #[test]
     fn a_summary_says_exactly_what_was_picked() {
         let mut spec = ScheduleSpec::advanced_daily(9, 0).on_tab(WakeTab::Weekly);
         spec.months = vec![1, 3];
-        assert_eq!(spec.label(), "Weekdays at 9:00 AM UTC, in Jan and Mar");
+        assert_eq!(spec.label(), "Weekdays at 9:00 AM, in Jan and Mar");
         spec.months = vec![3, 4, 5, 6, 12];
-        assert_eq!(
-            spec.label(),
-            "Weekdays at 9:00 AM UTC, in Mar to Jun and Dec"
-        );
+        assert_eq!(spec.label(), "Weekdays at 9:00 AM, in Mar to Jun and Dec");
         spec.months = (1..=12).collect();
         assert_eq!(
             spec.label(),
-            "Weekdays at 9:00 AM UTC",
+            "Weekdays at 9:00 AM",
             "every month is no month named"
         );
         spec.weekdays = vec![1, 3, 5];
         spec.times = vec![(14, 15)];
-        assert_eq!(spec.label(), "Mon, Wed and Fri at 2:15 PM UTC");
+        assert_eq!(spec.label(), "Mon, Wed and Fri at 2:15 PM");
         spec.weekdays = vec![2];
-        assert_eq!(spec.label(), "Every Tuesday at 2:15 PM UTC");
+        assert_eq!(spec.label(), "Every Tuesday at 2:15 PM");
 
         let mut monthly = ScheduleSpec::advanced_daily(8, 0).on_tab(WakeTab::Monthly);
         monthly.month_days = vec![1, 15];
-        assert_eq!(
-            monthly.label(),
-            "Monthly on the 1st and 15th at 8:00 AM UTC"
-        );
+        assert_eq!(monthly.label(), "Monthly on the 1st and 15th at 8:00 AM");
         monthly.month_days = vec![1, 2, 3, 22];
         assert_eq!(
             monthly.label(),
-            "Monthly on the 1st to 3rd and 22nd at 8:00 AM UTC"
+            "Monthly on the 1st to 3rd and 22nd at 8:00 AM"
         );
 
         assert_eq!(
             ScheduleSpec::advanced_daily(0, 5).label(),
-            "Every day at 12:05 AM UTC"
+            "Every day at 12:05 AM"
         );
         let every = |n, unit| ScheduleSpec::interval(n, unit).label();
         assert_eq!(every(1, ScheduleUnit::Hours), "Every 1 hour");
         assert_eq!(every(30, ScheduleUnit::Minutes), "Every 30 minutes");
         assert_eq!(every(1, ScheduleUnit::Minutes), "Every 1 minute");
-        assert_eq!(every(1, ScheduleUnit::Days), "Every 1 day at 12:00 AM UTC");
+        assert_eq!(every(1, ScheduleUnit::Days), "Every 1 day at 12:00 AM");
     }
 
     /// A step that does not divide its field starts again at the field's start, on the server
@@ -1182,12 +1176,12 @@ mod tests {
         );
         assert_eq!(
             every(5, ScheduleUnit::Hours),
-            "Every 5 hours, starting again at 12 AM UTC each day"
+            "Every 5 hours, starting again at 12 AM each day"
         );
         assert_eq!(every(8, ScheduleUnit::Hours), "Every 8 hours");
         assert_eq!(
             every(2, ScheduleUnit::Days),
-            "Every 2 days at 12:00 AM UTC, starting again on the 1st of each month"
+            "Every 2 days at 12:00 AM, starting again on the 1st of each month"
         );
     }
 
@@ -1247,9 +1241,9 @@ mod tests {
         daily.months = vec![12];
         let weekly = daily.on_tab(WakeTab::Weekly);
         assert_eq!(weekly.tab(), WakeTab::Weekly);
-        assert_eq!(weekly.label(), "Weekdays at 6:30 PM UTC, in Dec");
+        assert_eq!(weekly.label(), "Weekdays at 6:30 PM, in Dec");
         let monthly = weekly.on_tab(WakeTab::Monthly);
-        assert_eq!(monthly.label(), "Monthly on the 1st at 6:30 PM UTC, in Dec");
+        assert_eq!(monthly.label(), "Monthly on the 1st at 6:30 PM, in Dec");
         let cron = monthly.on_tab(WakeTab::Cron);
         assert_eq!(cron.tab(), WakeTab::Cron);
         assert_eq!(cron.expr, "30 18 1 12 *");
@@ -1257,7 +1251,7 @@ mod tests {
         assert_eq!(every.label(), "Every 1 hour");
         assert_eq!(
             every.on_tab(WakeTab::Daily).label(),
-            "Every day at 6:30 PM UTC, in Dec"
+            "Every day at 6:30 PM, in Dec"
         );
     }
 
@@ -1265,26 +1259,23 @@ mod tests {
     #[test]
     fn a_line_no_tab_draws_is_said_in_words_the_servers_way() {
         let words = |line: &str| describe_cron(line).unwrap();
-        assert_eq!(
-            words("0 9,17 * * *"),
-            "At 9:00 AM and 5:00 PM UTC, every day"
-        );
+        assert_eq!(words("0 9,17 * * *"), "At 9:00 AM and 5:00 PM, every day");
         assert_eq!(
             words("*/15 9-17 * * MON-FRI"),
-            "Every 15 minutes from 9:00 AM to 5:45 PM UTC, on weekdays"
+            "Every 15 minutes from 9:00 AM to 5:45 PM, on weekdays"
         );
         assert_eq!(
             words("0 9 1 * MON"),
-            "At 9:00 AM UTC, on the 1st, when it is a Monday"
+            "At 9:00 AM, on the 1st, when it is a Monday"
         );
         assert_eq!(
             words("0 9 1,15 * MON-FRI"),
-            "At 9:00 AM UTC, on the 1st and 15th, when it is a weekday"
+            "At 9:00 AM, on the 1st and 15th, when it is a weekday"
         );
         assert_eq!(words("30 * * * *"), "At :30 past every hour, every day");
         assert_eq!(
             words("0 12 * JAN-MAR SAT"),
-            "Every Saturday at 12:00 PM UTC, in Jan to Mar"
+            "Every Saturday at 12:00 PM, in Jan to Mar"
         );
         assert_eq!(describe_cron("0 9 * * 0"), None, "the server refuses day 0");
         assert_eq!(describe_cron("@daily"), None, "not five fields");
@@ -1444,12 +1435,9 @@ mod tests {
         let label = |line: &str| ScheduleSpec::from_cron(line).label();
         assert_eq!(label("0 * * * *"), "Every 1 hour");
         assert_eq!(label("*/30 * * * *"), "Every 30 minutes");
-        assert_eq!(label("0 9 * * *"), "Every day at 9:00 AM UTC");
-        assert_eq!(label("0 8 1 * *"), "Monthly on the 1st at 8:00 AM UTC");
-        assert_eq!(
-            label("0 9,17 * * *"),
-            "At 9:00 AM and 5:00 PM UTC, every day"
-        );
+        assert_eq!(label("0 9 * * *"), "Every day at 9:00 AM");
+        assert_eq!(label("0 8 1 * *"), "Monthly on the 1st at 8:00 AM");
+        assert_eq!(label("0 9,17 * * *"), "At 9:00 AM and 5:00 PM, every day");
         assert_eq!(
             label("@daily"),
             "@daily",

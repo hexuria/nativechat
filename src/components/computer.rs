@@ -18,8 +18,8 @@ use crate::opengrok::{
 };
 use crate::state::{
     AgentRoutine, AppState, ComputerView, LAST_WAKE_STAYS, NUMBERED_WEEKDAYS, ONE_WAKE_PER_ROUTINE,
-    ROUTINE_RUN_UNAVAILABLE, ROUTINE_RUNS_UNAVAILABLE, RoutineTrigger, RunOutcome, ScheduleUnit,
-    WakeBox, WakeEditor, WakeTab, routine_notes, routine_trouble_line, unsaved_lines,
+    ROUTINE_RUN_UNAVAILABLE, ROUTINE_RUNS_UNAVAILABLE, RoutineTrigger, RoutineZone, RunOutcome,
+    ScheduleUnit, WakeBox, WakeEditor, WakeTab, routine_notes, routine_trouble_line, unsaved_lines,
 };
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{InputEvent, InputState, Textarea, TextareaState};
@@ -692,6 +692,7 @@ impl ComputerPane {
             .filter(|editor| routine.is_some_and(|row| row.id == editor.routine_id));
         let can_add = routine.is_some_and(AppState::can_add_wake);
         let routine_id = routine.map(|row| row.id.clone()).unwrap_or_default();
+        let zone = routine.map(|row| app.read(cx).routine_zone(row));
         let heading = h_flex()
             .w_full()
             .justify_between()
@@ -728,7 +729,14 @@ impl ComputerPane {
                 Some(editor) => self
                     .wake_editor(&editor, routine, muted, app, theme)
                     .into_any_element(),
-                None => wake_rows(routine, can_change, muted, app, theme),
+                None => wake_rows(
+                    routine,
+                    zone.as_ref().and_then(RoutineZone::note),
+                    can_change,
+                    muted,
+                    app,
+                    theme,
+                ),
             })
             .into_any_element()
     }
@@ -813,6 +821,23 @@ impl ComputerPane {
                     .text_sm()
                     .font_weight(FontWeight::MEDIUM)
                     .child(status.summary.clone()),
+            )
+            // The zone the times picked are in, small, where it is not this computer's: the
+            // server reads the routine's line in it (opengrok-server #316).
+            .when_some(
+                editor
+                    .zone
+                    .note()
+                    .filter(|_| editor.tab != WakeTab::Webhook),
+                |this, zone| {
+                    this.child(
+                        div()
+                            .id("routine-wake-zone")
+                            .text_xs()
+                            .text_color(muted)
+                            .child(zone_words(zone)),
+                    )
+                },
             )
             .when_some(status.next.clone(), |this, next| {
                 this.child(
@@ -914,8 +939,8 @@ impl ComputerPane {
             ))
     }
 
-    /// A time of day: the hour and the minute, typed or stepped, and AM or PM. On the server's
-    /// clock, which is UTC, and the label says so.
+    /// A time of day: the hour and the minute, typed or stepped, and AM or PM, on the routine's
+    /// own clock: its zone is named under what was picked where it is not this computer's.
     fn time_picker(
         &self,
         editor: &WakeEditor,
@@ -925,7 +950,7 @@ impl ComputerPane {
     ) -> impl IntoElement {
         v_flex()
             .gap(px(4.))
-            .child(field_label("Time (UTC)", muted))
+            .child(field_label("Time", muted))
             .child(
                 h_flex()
                     .flex_wrap()
@@ -2155,6 +2180,7 @@ fn copy_row(
 /// A routine's wakes, one row each: what sets it off in words, ✎ and 🗑.
 fn wake_rows(
     routine: Option<&AgentRoutine>,
+    zone: Option<&str>,
     can_change: bool,
     muted: Hsla,
     app: Entity<AppState>,
@@ -2201,6 +2227,17 @@ fn wake_rows(
                         .text_color(muted),
                 )
                 .child(div().flex_1().min_w_0().text_sm().child(trigger.label()))
+                // A schedule's zone, small, where it is not this computer's (#316).
+                .when_some(zone.filter(|_| !webhook), |this, zone| {
+                    this.child(
+                        div()
+                            .id(SharedString::from(format!("routine-wake-{at}-zone")))
+                            .flex_shrink_0()
+                            .text_xs()
+                            .text_color(muted)
+                            .child(zone.to_string()),
+                    )
+                })
                 .child(routine_icon(
                     format!("routine-wake-edit-{at}"),
                     "icons/pencil.svg",
@@ -2241,6 +2278,12 @@ fn wake_rows(
                 ))
         }))
         .into_any_element()
+}
+
+/// The zone a routine's times are in, as the wake editor says it under what was picked, beside
+/// the next run in "your time": "Europe/London time".
+pub(crate) fn zone_words(zone: &str) -> String {
+    format!("{zone} time")
 }
 
 /// The wake editor's tabs, in two rows of three so that all six fit the panel: the selected one
@@ -2670,6 +2713,7 @@ mod tests {
                     prompt: Some("Say hello to the team".into()),
                     cron: Some("0 */30 * * * *".into()),
                 }),
+                tz: None,
             }],
         );
         state.right_pane = RightPane::Computer;
@@ -2807,7 +2851,7 @@ mod tests {
                 .routine_wake_editor
                 .as_ref()
                 .map(|editor| editor.summary())),
-            Some("Monthly on the 1st at 10:00 AM UTC".to_string())
+            Some("Monthly on the 1st at 10:00 AM".to_string())
         );
 
         let save = drawn(cx, "routine-wake-save").unwrap();
@@ -2818,7 +2862,7 @@ mod tests {
                 [0]
             .triggers[0]
                 .label()),
-            "Monthly on the 1st at 10:00 AM UTC"
+            "Monthly on the 1st at 10:00 AM"
         );
     }
 

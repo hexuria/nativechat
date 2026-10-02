@@ -133,6 +133,9 @@ pub mod ids {
     pub const ROUTINE_WAKE_NEXT: &str = "routine-wake-next";
     pub const ROUTINE_WAKE_ERROR: &str = "routine-wake-error";
     pub const ROUTINE_WAKE_CRON_NOTE: &str = "routine-wake-cron-note";
+    /// Under what the wake editor picked, the zone its times are in (label `<zone> time`, value
+    /// the IANA name), only where that is not this computer's zone.
+    pub const ROUTINE_WAKE_ZONE: &str = "routine-wake-zone";
     pub const ROUTINE_WAKE_SAVE: &str = "routine-wake-save";
     pub const ROUTINE_WAKE_CANCEL: &str = "routine-wake-cancel";
     pub const ROUTINE_WAKE_AM: &str = "routine-wake-am";
@@ -141,6 +144,12 @@ pub mod ids {
     /// One of the open routine's wakes (label = what sets it off, in words), and its ✎ and 🗑.
     pub fn routine_wake(at: usize) -> String {
         format!("routine-wake-{at}")
+    }
+
+    /// Under a schedule's wake, the zone its times are in (label = the IANA name), only where
+    /// that is not this computer's zone.
+    pub fn routine_wake_zone(at: usize) -> String {
+        format!("routine-wake-{at}-zone")
     }
 
     pub fn routine_wake_edit(at: usize) -> String {
@@ -1830,6 +1839,9 @@ struct RoutineSnap {
     unsaved: Vec<(&'static str, String)>,
     /// Its wakes, in order: what sets each off in words, and whether it is a webhook.
     wakes: Vec<(String, bool)>,
+    /// The zone its times are in, where that is not this computer's
+    /// ([`crate::state::RoutineZone::note`]).
+    zone: Option<String>,
 }
 
 /// One line of a routine's Run history as the driver sees it.
@@ -2467,6 +2479,7 @@ fn routine_snap(routine: &crate::state::AgentRoutine, state: &AppState) -> Routi
                 )
             })
             .collect(),
+        zone: state.routine_zone(routine).note().map(str::to_string),
     };
     match routine.triggers.first() {
         Some(crate::state::RoutineTrigger::Schedule { spec, .. }) => {
@@ -2539,15 +2552,17 @@ fn routine_wake_nodes(
         if !can_edit {
             edit = edit.with_value(ROUTINE_EDIT_UNAVAILABLE);
         }
-        nodes.push(
-            UiNode::status(ids::routine_wake(at), summary.clone())
-                .with_child(edit)
-                .with_child(
-                    UiNode::button(ids::routine_wake_delete(at), "Delete")
-                        .with_enabled(false)
-                        .with_value(LAST_WAKE_STAYS),
-                ),
-        );
+        let mut wake = UiNode::status(ids::routine_wake(at), summary.clone())
+            .with_child(edit)
+            .with_child(
+                UiNode::button(ids::routine_wake_delete(at), "Delete")
+                    .with_enabled(false)
+                    .with_value(LAST_WAKE_STAYS),
+            );
+        if let Some(zone) = open.zone.as_ref().filter(|_| !*webhook) {
+            wake = wake.with_child(UiNode::status(ids::routine_wake_zone(at), zone.clone()));
+        }
+        nodes.push(wake);
     }
     if let Some((editor, status)) = editor {
         nodes.push(wake_editor_node(editor, status));
@@ -2671,6 +2686,19 @@ fn wake_editor_node(
         ids::ROUTINE_WAKE_SUMMARY,
         status.summary.clone(),
     ));
+    if let Some(zone) = editor
+        .zone
+        .note()
+        .filter(|_| editor.tab != WakeTab::Webhook)
+    {
+        node = node.with_child(
+            UiNode::status(
+                ids::ROUTINE_WAKE_ZONE,
+                crate::components::computer::zone_words(zone),
+            )
+            .with_value(zone),
+        );
+    }
     if let Some(next) = &status.next {
         node = node.with_child(UiNode::status(ids::ROUTINE_WAKE_NEXT, next.clone()));
     }
@@ -8398,10 +8426,11 @@ mod tests {
             runs_unavailable: false,
             unsaved: Vec::new(),
             wakes: match kind {
-                "cron" => vec![("Every day at 9:00 AM UTC".into(), false)],
+                "cron" => vec![("Every day at 9:00 AM".into(), false)],
                 "webhook" => vec![("When a webhook fires".into(), true)],
                 _ => Vec::new(),
             },
+            zone: None,
         }
     }
 
@@ -8691,6 +8720,87 @@ mod tests {
         ));
     }
 
+    /// A routine whose times are in another zone than this computer's names it under its wake
+    /// and under what the wake editor picked (opengrok-server #316: the server reads the line in
+    /// the routine's zone); in this computer's own zone nothing is named, nor on a webhook, which
+    /// has no times. The editor leaves the next run unsaid in a zone it cannot read the line in,
+    /// and says it in UTC, which it can.
+    #[test]
+    fn a_routines_zone_is_named_where_it_is_not_this_computers() {
+        use crate::state::{RoutineZone, ScheduleSpec, WakeEditor, WakeTab};
+        let mut host = host();
+        host.computer_open = true;
+        let mut away = routine("sch_1", "cron");
+        away.zone = Some("Europe/London".into());
+        let mut hook = routine("sch_2", "webhook");
+        hook.zone = Some("Europe/London".into());
+        host.routines = vec![away, hook, routine("sch_3", "cron")];
+        host.routine_editor = Some("sch_1".into());
+        let tree = host.snapshot();
+        assert_eq!(
+            tree.find(&ids::routine_wake_zone(0))
+                .expect("the zone under the wake")
+                .name,
+            "Europe/London"
+        );
+        host.routine_editor = Some("sch_2".into());
+        assert!(
+            host.snapshot().find(&ids::routine_wake_zone(0)).is_none(),
+            "a webhook has no times"
+        );
+        host.routine_editor = Some("sch_3".into());
+        assert!(
+            host.snapshot().find(&ids::routine_wake_zone(0)).is_none(),
+            "this computer's own zone"
+        );
+
+        host.routine_editor = Some("sch_1".into());
+        let editor = |name: &str, here: bool| WakeEditor {
+            routine_id: "sch_1".into(),
+            index: Some(0),
+            kind: Some(crate::opengrok::ScheduleKind::Cron),
+            tab: WakeTab::Daily,
+            spec: ScheduleSpec::advanced_daily(9, 0),
+            every: "1".into(),
+            hour: "9".into(),
+            minute: "00".into(),
+            pm: false,
+            opened: 1,
+            resync: 0,
+            zone: RoutineZone {
+                name: name.into(),
+                here,
+            },
+        };
+        let open = |host: &mut NativeChatHost, editor: WakeEditor| {
+            let status = editor.status(chrono::Utc::now());
+            host.routine_wake_editor = Some((editor, status));
+            host.snapshot()
+        };
+        let tree = open(&mut host, editor("Europe/London", false));
+        let zone = tree.find(ids::ROUTINE_WAKE_ZONE).expect("the zone");
+        assert_eq!(zone.name, "Europe/London time");
+        assert_eq!(zone.value.as_deref(), Some("Europe/London"));
+        assert_eq!(
+            tree.find(ids::ROUTINE_WAKE_SUMMARY).unwrap().name,
+            "Every day at 9:00 AM"
+        );
+        assert!(
+            tree.find(ids::ROUTINE_WAKE_NEXT).is_none(),
+            "no clock here for Europe/London"
+        );
+        assert!(tree.find(ids::ROUTINE_WAKE_SAVE).unwrap().enabled);
+        let tree = open(&mut host, editor("UTC", false));
+        assert_eq!(tree.find(ids::ROUTINE_WAKE_ZONE).unwrap().name, "UTC time");
+        assert!(tree.find(ids::ROUTINE_WAKE_NEXT).is_some(), "UTC is read");
+        let tree = open(&mut host, editor("Asia/Manila", true));
+        assert!(tree.find(ids::ROUTINE_WAKE_ZONE).is_none());
+        assert!(
+            tree.find(ids::ROUTINE_WAKE_NEXT).is_some(),
+            "this computer's own"
+        );
+    }
+
     /// "When to run" on the open routine: + is dead while it has its one wake, saying why; the
     /// wake is listed in words with ✎ live and 🗑 dead; ✎ is dead too where the server cannot
     /// change a routine. The wake editor, while open, carries its tabs and the open tab's
@@ -8712,7 +8822,7 @@ mod tests {
         assert_eq!(add.value.as_deref(), Some(ONE_WAKE_PER_ROUTINE));
         assert_eq!(
             tree.find(&ids::routine_wake(0)).unwrap().name,
-            "Every day at 9:00 AM UTC"
+            "Every day at 9:00 AM"
         );
         assert!(tree.find(&ids::routine_wake_edit(0)).unwrap().enabled);
         let delete = tree.find(&ids::routine_wake_delete(0)).unwrap();
@@ -8764,6 +8874,10 @@ mod tests {
             pm: false,
             opened: 1,
             resync: 0,
+            zone: crate::state::RoutineZone {
+                name: "UTC".into(),
+                here: false,
+            },
         };
         let status = editor.status(chrono::Utc::now());
         host.routine_wake_editor = Some((editor, status));
@@ -8793,7 +8907,7 @@ mod tests {
         );
         assert_eq!(
             tree.find(ids::ROUTINE_WAKE_SUMMARY).unwrap().name,
-            "Weekdays at 9:00 AM UTC"
+            "Weekdays at 9:00 AM"
         );
         assert!(tree.find(ids::ROUTINE_WAKE_NEXT).is_some());
         assert!(tree.find(ids::ROUTINE_WAKE_SAVE).unwrap().enabled);

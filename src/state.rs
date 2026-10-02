@@ -3584,6 +3584,57 @@ pub struct AgentRoutine {
     /// The name, prompt and cron line as the server last answered them, for a routine it has.
     /// An edit sends only what differs from this. A draft has none.
     pub saved: Option<ScheduleEdit>,
+    /// The zone the server reads its line in, as its row says it (`ScheduleRow::tz`); `None` on
+    /// a draft and on a routine from a server before zones. Read through [`RoutineZone::of`].
+    pub tz: Option<String>,
+}
+
+/// The zone a routine's times are in, and whether it is this computer's own, which is when its
+/// times need no zone named beside them (opengrok-server #316, PR #334 at 628dcff: the server
+/// reads a routine's line in the IANA zone on its row, `tz`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RoutineZone {
+    /// The zone's IANA name, as the server keeps it.
+    pub name: String,
+    /// It is the zone this computer's system names now.
+    pub here: bool,
+}
+
+/// The zone the server read every routine's line in before routines had one of their own, and
+/// the one a routine stored before them replays as (`UTC` in opengrok-core `schedule.rs`).
+const UTC_ZONE: &str = "UTC";
+
+impl RoutineZone {
+    /// The zone `routine`'s line is read in: its own; on a routine whose server names none, UTC;
+    /// and on a draft, the one the server will give it, since this app names none on a create:
+    /// the account's `timeZone`, else UTC (`zone_of` in opengrok-server's
+    /// `crates/opengrok-server/src/autonomy/desk.rs`). `account` is the account's zone as last
+    /// read, and `mac` this computer's, when the system can say.
+    pub fn of(routine: &AgentRoutine, account: Option<&str>, mac: Option<&str>) -> Self {
+        let named = |zone: Option<&str>| {
+            zone.map(str::trim)
+                .filter(|zone| !zone.is_empty())
+                .map(str::to_string)
+        };
+        let name = match routine.saved {
+            Some(_) => named(routine.tz.as_deref()),
+            None => named(account),
+        }
+        .unwrap_or_else(|| UTC_ZONE.to_string());
+        let here = named(mac).as_deref() == Some(name.as_str());
+        Self { name, here }
+    }
+
+    /// The zone's name where it is not this computer's: the small word beside a routine's times.
+    /// Nothing where it is, since those times are the person's own.
+    pub fn note(&self) -> Option<&str> {
+        (!self.here).then_some(self.name.as_str())
+    }
+
+    /// UTC by name, which needs no zone database to read a line in.
+    fn is_utc(&self) -> bool {
+        matches!(self.name.as_str(), "UTC" | "Etc/UTC")
+    }
 }
 
 /// What the app says when somebody asks a routine for a second way of firing.
@@ -3650,6 +3701,8 @@ pub struct WakeEditor {
     /// when to write the boxes again. A person's typing is the box's own.
     pub opened: u64,
     pub resync: u64,
+    /// The zone the routine's line is read in, which the times picked are in.
+    pub zone: RoutineZone,
 }
 
 /// What the wake editor says under what was picked, worked out once for the pane and the
@@ -3683,6 +3736,7 @@ impl WakeEditor {
         index: Option<usize>,
         kind: Option<ScheduleKind>,
         spec: ScheduleSpec,
+        zone: RoutineZone,
     ) -> Self {
         let tab = if kind == Some(ScheduleKind::Webhook) {
             WakeTab::Webhook
@@ -3703,11 +3757,18 @@ impl WakeEditor {
             spec,
             opened: 0,
             resync: 0,
+            zone,
         }
     }
 
     /// The editor's lines for what is picked now: its summary, its next run after `now` in the
-    /// person's time (by the server's own parser, `cron_next`), or why it cannot be saved.
+    /// person's time (by the server's own parser, `cron_next`, the line read in the routine's
+    /// zone), or why it cannot be saved.
+    ///
+    /// The next run is said where this app can read the line in the routine's zone: this
+    /// computer's own, or UTC. A routine in a third zone (one a Bot made for somewhere else, or
+    /// one from before this computer moved) is still held to the server's parser, which no zone
+    /// changes, and its next run is left unsaid rather than worked out on another clock.
     pub fn status(&self, now: chrono::DateTime<chrono::Utc>) -> WakeStatus {
         let mut status = WakeStatus {
             summary: self.summary(),
@@ -3727,10 +3788,16 @@ impl WakeEditor {
         };
         status.numbered_weekdays =
             self.tab == WakeTab::Cron && crate::cron_spec::numbered_weekdays(&line);
-        match crate::cron_next::next_run(&line, now) {
-            Ok(Some(when)) => {
+        let next = if self.zone.here {
+            crate::cron_next::next_run(&line, now, &chrono::Local)
+        } else {
+            crate::cron_next::next_run(&line, now, &chrono::Utc)
+        };
+        match next {
+            Ok(Some(when)) if self.zone.here || self.zone.is_utc() => {
                 status.next = Some(crate::cron_next::next_run_words(when, &chrono::Local));
             }
+            Ok(Some(_)) => {}
             Ok(None) => {
                 status.error = Some("No date matches this line, so it would never run.".into());
             }
@@ -3943,6 +4010,7 @@ fn routine_from_schedule(row: ScheduleRow) -> AgentRoutine {
         runs: Vec::new(),
         saved: Some(saved),
         id: row.id,
+        tz: row.tz,
     }
 }
 
@@ -11327,6 +11395,7 @@ impl AppState {
                             triggers: Vec::new(),
                             runs: Vec::new(),
                             saved: None,
+                            tz: None,
                         },
                     );
                 id
@@ -11364,6 +11433,7 @@ impl AppState {
         let Some(coworker_id) = self.active_coworker_id.clone() else {
             return;
         };
+        let account = self.account_time_zone();
         let Some(row) = self.routine_mut(&coworker_id, routine_id) else {
             return;
         };
@@ -11375,7 +11445,8 @@ impl AppState {
             Some(RoutineTrigger::Schedule { spec, .. }) => spec.clone(),
             _ => ScheduleSpec::advanced_daily(9, 0),
         };
-        let mut editor = WakeEditor::new(routine_id.to_string(), index, kind, spec);
+        let zone = RoutineZone::of(row, account.as_deref(), system_time_zone().as_deref());
+        let mut editor = WakeEditor::new(routine_id.to_string(), index, kind, spec, zone);
         self.wake_opens += 1;
         editor.opened = self.wake_opens;
         self.routine_wake_editor = Some(editor);
@@ -11609,6 +11680,24 @@ impl AppState {
         self.computer_view = ComputerView::Overview;
         self.record_nav();
         cx.notify();
+    }
+
+    /// The zone `routine`'s times are in, and whether it is this computer's ([`RoutineZone::of`]).
+    pub fn routine_zone(&self, routine: &AgentRoutine) -> RoutineZone {
+        RoutineZone::of(
+            routine,
+            self.account_time_zone().as_deref(),
+            system_time_zone().as_deref(),
+        )
+    }
+
+    /// The zone the account keeps for its routines, as last read: none from a server that keeps
+    /// none, or while none is set.
+    fn account_time_zone(&self) -> Option<String> {
+        self.account
+            .as_ref()
+            .and_then(|account| account.time_zone.clone())
+            .flatten()
     }
 
     pub fn coworker_routines(&self, coworker_id: &str) -> &[AgentRoutine] {
@@ -22832,7 +22921,7 @@ mod tests {
         // 1: the editor's old "Weekdays", `1,2,3,4,5`, runs Sunday to Thursday, and says so.
         assert_eq!(
             row("0 0 9 * * 1,2,3,4,5").triggers[0].label(),
-            "Sun to Thu at 9:00 AM UTC"
+            "Sun to Thu at 9:00 AM"
         );
         let routine = row("0 0 9 * * MON-FRI");
         assert_eq!(routine.id, "sch_1");
@@ -22843,7 +22932,7 @@ mod tests {
             panic!("a cron row is a schedule trigger: {:?}", routine.triggers);
         };
         assert_eq!(id, "sch_1", "the trigger is the schedule, so it is its id");
-        assert_eq!(spec.label(), "Weekdays at 9:00 AM UTC");
+        assert_eq!(spec.label(), "Weekdays at 9:00 AM");
     }
 
     /// The URL and key on a webhook routine are the server's and no others: the app used to
@@ -23081,6 +23170,116 @@ mod tests {
         assert!(!line(RunCause::Manual, ScheduleRunStatus::Ok).at.is_empty());
     }
 
+    /// The zone a routine's times are in (opengrok-server #316): its own, as its row says it;
+    /// UTC on one from a server before zones, which read every line in UTC; and on a draft, the
+    /// one the server will give it, since this app names none: the account's, else UTC. It is
+    /// named beside the times only where it is not this computer's.
+    #[test]
+    fn a_routines_zone_is_its_own_or_the_one_the_server_will_give_it() {
+        let row = |tz: Option<&str>| {
+            let mut row = serde_json::json!({
+                "id": "sch_1", "coworkerId": "cw_1", "kind": "cron", "cron": "0 0 9 * * MON-FRI",
+                "prompt": "post the standup", "active": true
+            });
+            if let Some(tz) = tz {
+                row["tz"] = tz.into();
+            }
+            super::routine_from_schedule(serde_json::from_value(row).expect("a row"))
+        };
+        let zone = super::RoutineZone::of;
+        let manila = row(Some("Asia/Manila"));
+        assert_eq!(
+            zone(&manila, Some("Europe/London"), Some("Asia/Manila")),
+            super::RoutineZone {
+                name: "Asia/Manila".into(),
+                here: true
+            },
+            "its own, which is this computer's"
+        );
+        assert_eq!(
+            zone(&manila, None, Some("Europe/London")).note(),
+            Some("Asia/Manila")
+        );
+        assert_eq!(
+            zone(&manila, None, None).note(),
+            Some("Asia/Manila"),
+            "a computer that cannot say its zone"
+        );
+        assert_eq!(
+            zone(&row(None), Some("Asia/Manila"), Some("Asia/Manila")).note(),
+            Some("UTC"),
+            "a server before zones read it in UTC"
+        );
+        let mut draft = manila.clone();
+        draft.saved = None;
+        draft.tz = None;
+        assert_eq!(
+            zone(&draft, Some("Asia/Manila"), Some("Asia/Manila")).note(),
+            None,
+            "the account's, which is this computer's"
+        );
+        assert_eq!(
+            zone(&draft, None, Some("Asia/Manila")).note(),
+            Some("UTC"),
+            "an account that keeps none: UTC"
+        );
+        assert_eq!(
+            zone(&draft, Some(" "), Some("UTC")).note(),
+            None,
+            "a blank zone is none, and UTC here is here"
+        );
+    }
+
+    /// The wake editor says when its pick next runs where it can read the line in the routine's
+    /// zone: this computer's own, or UTC. In any other it leaves the next run unsaid, and still
+    /// holds the line to the server's parser, which no zone changes. A draft's editor reads the
+    /// line in the zone the server will give it, the account's.
+    #[gpui_kit::test]
+    fn the_wake_editor_reads_the_line_in_the_routines_zone(cx: &mut gpui_kit::TestAppContext) {
+        use super::{RoutineZone, WakeTab};
+        use gpui_kit::AppContext as _;
+        let status = |zone: &str, here: bool, line: &str| {
+            let mut editor = super::WakeEditor::new(
+                "sch_1".into(),
+                Some(0),
+                Some(super::ScheduleKind::Cron),
+                super::ScheduleSpec::custom(line),
+                RoutineZone {
+                    name: zone.into(),
+                    here,
+                },
+            );
+            editor.tab = WakeTab::Cron;
+            editor.status(chrono::Utc::now())
+        };
+        assert!(status("Asia/Manila", true, "0 9 * * *").next.is_some());
+        assert!(status("UTC", false, "0 9 * * *").next.is_some());
+        let away = status("Europe/London", false, "0 9 * * *");
+        assert!(away.next.is_none() && away.can_save(), "{away:?}");
+        let never = status("Europe/London", false, "0 9 31 2 *");
+        assert!(!never.can_save(), "the 31st of February, anywhere");
+
+        let app = cx.new(|_| {
+            let mut state = with_routines();
+            state.account = Some(account_in(Some("Asia/Manila")));
+            state
+        });
+        app.update(cx, |state, cx| {
+            state.open_wake_editor("draft-1", None, cx);
+            assert_eq!(
+                state.routine_wake_editor.as_ref().unwrap().zone.name,
+                "Asia/Manila",
+                "a draft is made in the account's zone"
+            );
+            state.open_wake_editor("sch_1", Some(0), cx);
+            assert_eq!(
+                state.routine_wake_editor.as_ref().unwrap().zone.name,
+                "UTC",
+                "a routine from a server before zones"
+            );
+        });
+    }
+
     /// A line the tabs cannot draw is still a routine: it lists, it pauses, it deletes, and it
     /// is said in words where it can be and shown as the server wrote it where it cannot.
     #[test]
@@ -23096,7 +23295,7 @@ mod tests {
         };
         assert_eq!(
             routine("0 0 9,17 * * MON-FRI").triggers[0].label(),
-            "At 9:00 AM and 5:00 PM UTC, on weekdays"
+            "At 9:00 AM and 5:00 PM, on weekdays"
         );
         assert_eq!(routine("@daily").triggers[0].label(), "@daily");
     }
@@ -27059,7 +27258,7 @@ mod tests {
             state.set_wake_box(WakeBox::Minute, "30".into(), true, cx);
             state.set_wake_pm(true, cx);
             assert_eq!(line(state), "30 19 * * *");
-            assert_eq!(summary(state), "Every day at 7:30 PM UTC");
+            assert_eq!(summary(state), "Every day at 7:30 PM");
             state.step_wake_box(WakeBox::Hour, true, cx);
             state.step_wake_box(WakeBox::Minute, true, cx);
             let editor = state.routine_wake_editor.as_ref().unwrap();
@@ -27071,15 +27270,12 @@ mod tests {
             assert_eq!(line(state), "35 20 * * SUN", "the day carries over");
             state.toggle_wake_weekday(6, cx);
             assert_eq!(line(state), "35 20 * * SUN,SAT");
-            assert_eq!(summary(state), "Weekends at 8:35 PM UTC");
+            assert_eq!(summary(state), "Weekends at 8:35 PM");
             state.toggle_wake_weekday(0, cx);
             state.toggle_wake_month(1, cx);
             state.toggle_wake_month(3, cx);
             assert_eq!(line(state), "35 20 * 1,3 SAT");
-            assert_eq!(
-                summary(state),
-                "Every Saturday at 8:35 PM UTC, in Jan and Mar"
-            );
+            assert_eq!(summary(state), "Every Saturday at 8:35 PM, in Jan and Mar");
 
             // Monthly
             state.pick_wake_tab(WakeTab::Monthly, cx);
@@ -27087,7 +27283,7 @@ mod tests {
             assert_eq!(line(state), "35 20 1,15 1,3 *");
             assert_eq!(
                 summary(state),
-                "Monthly on the 1st and 15th at 8:35 PM UTC, in Jan and Mar"
+                "Monthly on the 1st and 15th at 8:35 PM, in Jan and Mar"
             );
 
             // Cron: five fields, said in words, with the server's next run or its refusal.
@@ -27098,14 +27294,14 @@ mod tests {
                 "it starts from the line it was"
             );
             state.set_wake_box(WakeBox::Cron, "0 9 * * MON-FRI".into(), true, cx);
-            assert_eq!(summary(state), "Weekdays at 9:00 AM UTC");
+            assert_eq!(summary(state), "Weekdays at 9:00 AM");
             let now = chrono::Utc::now();
             let status = state.routine_wake_editor.as_ref().unwrap().status(now);
             assert!(status.can_save() && status.next.is_some(), "{status:?}");
             state.set_wake_box(WakeBox::Cron, "0 9 * * 1-5".into(), true, cx);
             let status = state.routine_wake_editor.as_ref().unwrap().status(now);
             assert!(status.numbered_weekdays, "the server counts Sunday as 1");
-            assert_eq!(status.summary, "Sun to Thu at 9:00 AM UTC");
+            assert_eq!(status.summary, "Sun to Thu at 9:00 AM");
             for refused in ["0 9 * * 0", "@every 1h", "0 9 * *"] {
                 state.set_wake_box(WakeBox::Cron, refused.into(), true, cx);
                 let status = state.routine_wake_editor.as_ref().unwrap().status(now);
@@ -27127,7 +27323,7 @@ mod tests {
             );
             assert!(state.routine_wake_editor.is_none());
             let row = state.routine_mut("cw_1", "sch_1").unwrap();
-            assert_eq!(row.triggers[0].label(), "Weekdays at 9:00 AM UTC");
+            assert_eq!(row.triggers[0].label(), "Weekdays at 9:00 AM");
         });
     }
 
@@ -27168,7 +27364,7 @@ mod tests {
             state.close_wake_editor(cx);
             assert_eq!(
                 state.routine_mut("cw_1", "sch_1").unwrap().triggers[0].label(),
-                "Every Sunday at 9:00 AM UTC",
+                "Every Sunday at 9:00 AM",
                 "nothing picked reached the routine"
             );
         });

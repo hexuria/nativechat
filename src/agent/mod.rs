@@ -110,9 +110,11 @@
 //! "When to run" on the open routine, under `computer-pane`: `routine-wake-add` (+, disabled
 //! while the routine has its one wake, the server's limit until opengrok-server#315, with the
 //! reason as its value), `routine-wake-{i}` (a wake: label = what sets it off, in words, times on
-//! the server's clock, UTC) holding `routine-wake-edit-{i}` (opens the wake editor on it; disabled
-//! on a schedule where the server cannot change a routine) and `routine-wake-delete-{i}`
-//! (disabled: a routine keeps its only wake). While the wake editor is open, `routine-wake-editor`
+//! the routine's own clock, in the zone the server reads its line in, opengrok-server #316)
+//! holding `routine-wake-edit-{i}` (opens the wake editor on it; disabled on a schedule where the
+//! server cannot change a routine), `routine-wake-delete-{i}` (disabled: a routine keeps its only
+//! wake) and, on a schedule whose zone is not this computer's, `routine-wake-{i}-zone` (label =
+//! the IANA zone). While the wake editor is open, `routine-wake-editor`
 //! (value = the open tab's word) holds `routine-wake-tab-every|daily|weekly|monthly|webhook|cron`
 //! (state `selected` on the open one; disabled where the routine's kind rules it out, since a
 //! schedule never becomes a webhook nor a webhook a schedule) and the open tab's controls: on
@@ -124,8 +126,11 @@
 //! Weekly, `routine-wake-day-{0..6}` (Sunday is 0); on Monthly, `routine-wake-date-{1..31}`; on
 //! Cron, `routine-wake-cron` (a textbox: five fields) and `routine-wake-cron-note` (while its days
 //! of the week are numbers, which the server counts from Sunday as 1). Under them
-//! `routine-wake-summary` (label = what was picked, in words), `routine-wake-next` (when it would
-//! next run, in the person's own time), `routine-wake-error` (why it cannot be saved),
+//! `routine-wake-summary` (label = what was picked, in words), `routine-wake-zone` (label `<zone>
+//! time`, value = the IANA zone, only where the routine's zone is not this computer's),
+//! `routine-wake-next` (when it would next run, in the person's own time; only where the line can
+//! be read here in the routine's zone, this computer's own or UTC), `routine-wake-error` (why it
+//! cannot be saved),
 //! `routine-wake-save` (label `Save`, or `Done` on a webhook; disabled while there is an error)
 //! and `routine-wake-cancel`.
 //! A click on `routine-delete` or `routine-{id}-delete` asks first, as a person's does:

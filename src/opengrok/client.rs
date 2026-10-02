@@ -3862,6 +3862,13 @@ pub struct ScheduleRow {
     pub next_due_ms: Option<i64>,
     #[serde(default)]
     pub webhook: Option<WebhookInfo>,
+    /// The IANA zone the server reads the routine's cron line in (opengrok-server #316, PR #334
+    /// at 628dcff: `tz` on every row, `row` in `crates/opengrok-server/src/autonomy/routes.rs`),
+    /// `UTC` for one stored before zones. This app names none on a create or an edit, so a new
+    /// routine takes the account's `timeZone`, else UTC (`zone_of` in `autonomy/desk.rs`), and an
+    /// edit keeps the zone it had. `None` from a server before zones, which read every line in UTC.
+    #[serde(default)]
+    pub tz: Option<String>,
 }
 
 /// What `PATCH /schedules/{id}` is asked to change. Every field is optional on the server, and
@@ -10531,6 +10538,77 @@ mod tests {
         let hook = row.webhook.unwrap();
         assert_eq!(hook.url, "https://og.example/hooks/sch_2");
         assert_eq!(hook.header, "Authorization: Bearer og_live_abc");
+    }
+
+    /// A routine's zone is read off its row as the server keeps it (opengrok-server #316, PR #334
+    /// at 628dcff), and a server from before zones sends none. A create and an edit from this app
+    /// name no zone, so a new routine takes the account's and an edited one keeps its own.
+    #[tokio::test]
+    async fn a_routines_zone_is_read_off_its_row_and_never_sent() {
+        let row = json!({
+            "id": "sch_1", "coworkerId": "cw_1", "kind": "cron", "cron": "0 0 9 * * MON-FRI",
+            "prompt": "post the standup", "name": "Standup", "active": true,
+            "tz": "Asia/Manila"
+        });
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/schedules"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+                row.clone(),
+                {
+                    "id": "sch_2", "coworkerId": "cw_1", "kind": "cron", "cron": "0 0 8 * * *",
+                    "prompt": "write it", "active": true
+                }
+            ])))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/schedules"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(row.clone()))
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path("/schedules/sch_1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(row))
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        let rows = client.list_schedules("cw_1").await.unwrap();
+        assert_eq!(rows[0].tz.as_deref(), Some("Asia/Manila"));
+        assert_eq!(rows[1].tz, None, "a server before zones");
+        let made = client
+            .create_schedule(&NewSchedule {
+                coworker_id: "cw_1".into(),
+                kind: ScheduleKind::Cron,
+                prompt: "post the standup".into(),
+                name: "Standup".into(),
+                cron: Some("0 9 * * MON-FRI".into()),
+            })
+            .await
+            .unwrap();
+        assert_eq!(made.tz.as_deref(), Some("Asia/Manila"), "the account's");
+        client
+            .edit_schedule(
+                "sch_1",
+                &ScheduleEdit {
+                    cron: Some("0 10 * * MON-FRI".into()),
+                    ..ScheduleEdit::default()
+                },
+            )
+            .await
+            .unwrap();
+        let sent: Vec<Value> = server
+            .received_requests()
+            .await
+            .expect("the recorder is on")
+            .iter()
+            .filter(|request| request.method.as_str() != "GET")
+            .map(|request| serde_json::from_slice(&request.body).expect("a JSON body"))
+            .collect();
+        assert_eq!(sent.len(), 2, "a create and an edit");
+        for body in &sent {
+            assert!(body.get("tz").is_none(), "no zone named: {body}");
+        }
     }
 
     /// An edit sends only what the person changed: an absent field keeps what the routine has
