@@ -81,6 +81,54 @@ pub struct Coworker {
     /// app reads it through [`Self::is_shared`].
     #[serde(default)]
     pub visibility: Option<String>,
+    /// Which door the Bot's replies go through ([`CoworkerSource`]), read from `source`, which
+    /// may be missing, `null` or a word, and each of the three says something different.
+    #[serde(default, deserialize_with = "coworker_source")]
+    pub source: CoworkerSource,
+}
+
+/// Which door a Bot's replies go through, as its row says it: `"source": "gateway" |
+/// "local_proxy" | null`, and `PATCH /coworkers/{id}` takes the same word (opengrok-server
+/// main d6f640e (#307, after #304), pin bf99845: `coworker_row` in
+/// `crates/opengrok-server/src/agui/routes.rs`). A server with per-Bot doors writes the key, a
+/// word or `null` and never left out, on every row it answers with: the roster's
+/// (`GET /coworkers`), a hire's (`POST /coworkers`) and a PATCH's. It mounts no
+/// `GET /coworkers/{id}`, so those three are where a Bot's door is read. `null` is a Bot that
+/// follows the account's setting, Settings → Reply source, and on the person's plan it answers
+/// with the account's plan model whatever it is pinned to: only a Bot whose own door is
+/// `local_proxy` is answered there with its pin. A server from before it writes no key at all,
+/// and every Bot there goes where the account's setting says, answering on the person's plan with
+/// the account's plan model whatever the Bot is pinned to. The two are told apart here because
+/// the picker offers a Bot its own plan model only where the server would keep one.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum CoworkerSource {
+    /// The row carries no `source`: a server from before per-Bot doors.
+    #[default]
+    NotKept,
+    /// `null`: the account's own door.
+    AccountDefault,
+    /// The Bot's own door.
+    Kind(super::InferenceKind),
+    /// A word this app has not heard of, kept as the server sent it: a door this app cannot name
+    /// is not claimed to be either of the two it can, and the server goes by its own word.
+    Unknown(String),
+}
+
+/// `source` as a row brings it. The key is there (the field's default covers a row without it),
+/// so `null` is the account's door; anything but a known word is kept as sent rather than failing
+/// the roster, as one row's `effort` never does.
+fn coworker_source<'de, D>(deserializer: D) -> Result<CoworkerSource, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(
+        match Option::<serde_json::Value>::deserialize(deserializer)? {
+            None => CoworkerSource::AccountDefault,
+            Some(serde_json::Value::String(word)) => super::InferenceKind::from_word(&word)
+                .map_or(CoworkerSource::Unknown(word), CoworkerSource::Kind),
+            Some(other) => CoworkerSource::Unknown(other.to_string()),
+        },
+    )
 }
 
 /// How hard a coworker thinks before it answers, in the server's words and in its order.
@@ -109,7 +157,7 @@ impl Coworker {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CoworkerPatch {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -136,6 +184,18 @@ pub struct CoworkerPatch {
     /// but the sidebar flag.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
+    /// The Bot's own door, sent with the model the model picker put it on, and only to a server
+    /// whose rows carry `source` (opengrok-server main d6f640e (#307, after #304), pin bf99845:
+    /// `repin_coworker` in `crates/opengrok-server/src/agui/routes.rs`):
+    /// absent leaves the door alone. The server refuses with a 400 in its own words, `model: ` and
+    /// the sentence its subscription allowlist refuses the account's plan model with, a patch
+    /// whose whole body leaves the Bot on `local_proxy` with a model the allowlist does not take;
+    /// and a `source` that is neither of its two words (`source must be "gateway" or
+    /// "local_proxy"`), which this app never sends, sending only an
+    /// [`InferenceKind`](super::InferenceKind). Either way it writes nothing. A teammate's patch of
+    /// a shared Bot is refused with a 403, as every change there but the sidebar flag is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<super::InferenceKind>,
 }
 
 impl CoworkerPatch {
@@ -148,6 +208,7 @@ impl CoworkerPatch {
             && self.avatar_color.is_none()
             && self.hidden_from_sidebar.is_none()
             && self.effort.is_none()
+            && self.source.is_none()
     }
 }
 
@@ -189,6 +250,13 @@ pub struct ModelEntry {
     /// the word the server sent and read through [`Self::source`].
     #[serde(default)]
     pub source: Option<String>,
+    /// For one of the plan's models, which way the server reaches it: `loopback`, listed by
+    /// opencodex on the server's machine, or `mac`, listed by the opencodex of the Mac holding
+    /// the relay (opengrok-server #292: `listed` in `crates/opengrok-harness/src/local_proxy.rs`,
+    /// server main cad36fd (#303, after #298), pin 47a5d6b). Kept as the word
+    /// sent and read through [`Self::plan_via`].
+    #[serde(default)]
+    pub via: Option<String>,
 }
 
 impl ModelEntry {
@@ -202,10 +270,23 @@ impl ModelEntry {
         }
     }
 
-    /// One of the person's own plan's models, which Settings → Reply source offers and a Bot's
-    /// Model field does not.
+    /// One of the person's own plan's models, which Settings → Reply source offers, and a Bot's
+    /// model picker in its plan group where the server keeps a door per Bot.
     pub fn is_local_proxy(&self) -> bool {
         self.source() == Some(super::InferenceKind::LocalProxy)
+    }
+
+    /// The way the server reaches one of the plan's models: `loopback` when the entry names none,
+    /// as a server before the relay lists only those, and `None` for the gateway's models and for
+    /// a way this app has not heard of, which neither of the plan's pickers offers.
+    pub fn plan_via(&self) -> Option<super::Via> {
+        if !self.is_local_proxy() {
+            return None;
+        }
+        match self.via.as_deref() {
+            None => Some(super::Via::Loopback),
+            Some(word) => super::Via::from_word(word),
+        }
     }
 }
 
@@ -222,7 +303,7 @@ pub struct ModelCatalogue {
     /// `crates/opengrok-server/src/agui/routes.rs`, `listed` in
     /// `crates/opengrok-harness/src/local_proxy.rs`). A proxy that is down lists nothing, and
     /// this is how that reads apart from a plan with nothing to offer. One this app cannot read
-    /// is none: the list the Bot's Model field is drawn from never fails for it.
+    /// is none: the list a Bot's model picker is drawn from never fails for it.
     #[serde(
         default,
         rename = "localProxy",
@@ -236,6 +317,11 @@ pub struct ModelCatalogue {
 pub struct LocalProxyStatus {
     /// opencodex answered its `/healthz` when the server asked.
     pub healthy: bool,
+    /// A Mac holds the relay, so the models listed through it are its opencodex's word now
+    /// (opengrok-server #292: server main cad36fd (#303, after #298), pin 47a5d6b). False from a
+    /// server before the relay, which lists none that way.
+    #[serde(default, rename = "relayConnected")]
+    pub relay_connected: bool,
 }
 
 fn proxy_status_or_none<'de, D>(deserializer: D) -> Result<Option<LocalProxyStatus>, D::Error>
@@ -511,7 +597,8 @@ mod tests {
 
     /// Every key a coworker patch can carry is one the server's patch route reads
     /// (opengrok-server `agui/routes.rs`: name, model, role, visibility, hiddenFromSidebar, and
-    /// title/avatarShape/avatarColor; `effort` from opengrok-server#271). A key it reads nowhere
+    /// title/avatarShape/avatarColor; `effort` from opengrok-server#271; `source` from
+    /// opengrok-server main d6f640e (#307, after #304), pin bf99845). A key it reads nowhere
     /// is a setting that looks saved and is not, and a patch of only that is refused.
     #[test]
     fn a_coworker_patch_names_only_what_the_server_keeps() {
@@ -524,6 +611,7 @@ mod tests {
             avatar_color: Some("c".into()),
             hidden_from_sidebar: Some(true),
             effort: Some("high".into()),
+            source: Some(super::super::InferenceKind::LocalProxy),
         };
         let wire = serde_json::to_value(&full).unwrap();
         let mut keys: Vec<&str> = wire
@@ -541,13 +629,45 @@ mod tests {
             "model",
             "name",
             "role",
+            "source",
             "title",
             "visibility",
         ];
         for key in &keys {
             assert!(read.contains(key), "the server reads no {key:?}");
         }
-        assert_eq!(keys.len(), 8, "every field is on the wire: {keys:?}");
+        assert_eq!(keys.len(), 9, "every field is on the wire: {keys:?}");
+        assert_eq!(wire["source"], "local_proxy", "the door goes as its word");
+    }
+
+    /// A row's `source` says three different things by being missing, `null` or a word: a server
+    /// from before per-Bot doors, a Bot that follows the account's door, and the Bot's own door
+    /// (opengrok-server main d6f640e (#307, after #304), pin bf99845).
+    /// A word this app has not heard of is kept as sent, and no row's door ever fails the roster.
+    #[test]
+    fn a_rows_door_is_missing_null_or_its_word() {
+        use super::super::InferenceKind;
+        let roster: Vec<Coworker> = serde_json::from_value(serde_json::json!([
+            {"id": "cw_old", "name": "Old", "model": "oag/cheap"},
+            {"id": "cw_default", "name": "Default", "model": "oag/cheap", "source": null},
+            {"id": "cw_plan", "name": "Plan", "model": "gpt-6-luna", "source": "local_proxy"},
+            {"id": "cw_keys", "name": "Keys", "model": "oag/cheap", "source": "gateway"},
+            {"id": "cw_odd", "name": "Odd", "model": "oag/cheap", "source": "byok"},
+            {"id": "cw_worse", "name": "Worse", "model": "oag/cheap", "source": 7}
+        ]))
+        .expect("one row's door never fails the roster");
+        let doors: Vec<CoworkerSource> = roster.into_iter().map(|bot| bot.source).collect();
+        assert_eq!(
+            doors,
+            vec![
+                CoworkerSource::NotKept,
+                CoworkerSource::AccountDefault,
+                CoworkerSource::Kind(InferenceKind::LocalProxy),
+                CoworkerSource::Kind(InferenceKind::Gateway),
+                CoworkerSource::Unknown("byok".into()),
+                CoworkerSource::Unknown("7".into()),
+            ]
+        );
     }
 
     /// A roster from a server before opengrok-server#271 has no `effort` on its rows, and every
@@ -648,14 +768,26 @@ mod tests {
             "note": null,
             "localProxy": {"healthy": true}
         }));
-        assert_eq!(up.local_proxy, Some(LocalProxyStatus { healthy: true }));
+        assert_eq!(
+            up.local_proxy,
+            Some(LocalProxyStatus {
+                healthy: true,
+                relay_connected: false,
+            })
+        );
         assert!(up.models[0].is_local_proxy());
         let down = read(serde_json::json!({
             "models": [{"id": "oag/cheap", "source": "gateway", "points": null}],
             "note": null,
             "localProxy": {"healthy": false}
         }));
-        assert_eq!(down.local_proxy, Some(LocalProxyStatus { healthy: false }));
+        assert_eq!(
+            down.local_proxy,
+            Some(LocalProxyStatus {
+                healthy: false,
+                relay_connected: false,
+            })
+        );
         assert!(!down.models[0].is_local_proxy());
         let none = read(serde_json::json!({"models": [], "note": null}));
         assert_eq!(none.local_proxy, None);
@@ -679,6 +811,52 @@ mod tests {
             assert_eq!(odd.local_proxy, None);
             assert_eq!(odd.models.len(), 1);
         }
+    }
+
+    /// With the Mac relay each of the plan's models says which way the server reaches it, and
+    /// `localProxy` whether a Mac holds the relay (opengrok-server PR #298, whose recording the
+    /// ledger reads). A plan's model that names no way is the server's own machine's, as
+    /// every one a server before the relay lists; a way this app has not heard of is neither
+    /// picker's, and the gateway's models have none.
+    #[test]
+    fn a_plans_model_says_which_way_it_is_reached() {
+        use super::super::Via;
+        let catalogue: ModelCatalogue = serde_json::from_value(serde_json::json!({
+            "models": [
+                {"id": "oag/cheap", "source": "gateway", "points": null},
+                {"id": "gpt-5-codex", "source": "local_proxy", "via": "loopback"},
+                {"id": "grok-4", "source": "local_proxy", "via": "mac"},
+                {"id": "gpt-5", "source": "local_proxy"},
+                {"id": "odd", "source": "local_proxy", "via": "helper"},
+                {"id": "stray", "source": "gateway", "via": "mac"}
+            ],
+            "note": null,
+            "localProxy": {"healthy": false, "relayConnected": true}
+        }))
+        .expect("one entry's way never fails the list");
+        let ways: Vec<(&str, Option<Via>)> = catalogue
+            .models
+            .iter()
+            .map(|entry| (entry.id.as_str(), entry.plan_via()))
+            .collect();
+        assert_eq!(
+            ways,
+            vec![
+                ("oag/cheap", None),
+                ("gpt-5-codex", Some(Via::Loopback)),
+                ("grok-4", Some(Via::Mac)),
+                ("gpt-5", Some(Via::Loopback)),
+                ("odd", None),
+                ("stray", None),
+            ]
+        );
+        assert_eq!(
+            catalogue.local_proxy,
+            Some(LocalProxyStatus {
+                healthy: false,
+                relay_connected: true,
+            })
+        );
     }
 
     /// The field is new: a server that has never heard of it must still see the array it saw

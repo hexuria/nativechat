@@ -15,7 +15,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::process::Command;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
 use super::client::OpenGrokClient;
@@ -34,6 +34,15 @@ struct StoredDaemon {
     label: String,
 }
 
+impl StoredDaemon {
+    fn credential(&self) -> MachineCredential {
+        MachineCredential {
+            machine_id: self.machine_id.clone(),
+            token: self.token.clone(),
+        }
+    }
+}
+
 /// The commands this Mac is running for the server, by the `requestId` their `exec` frame
 /// carried, so that a `cancel` naming one can stop it. A command takes itself out when it
 /// finishes. Kept across reconnects: the server sends a cancel down whichever stream holds the
@@ -43,16 +52,66 @@ type Running = Arc<Mutex<HashMap<String, JoinHandle<()>>>>;
 pub async fn enrol_this_machine(
     client: &OpenGrokClient,
     data_dir: &Path,
-) -> Result<String, OpenGrokError> {
+) -> Result<MachineCredential, OpenGrokError> {
     let cred = ensure_daemon(client, data_dir).await?;
-    Ok(cred.machine_id)
+    Ok(cred.credential())
 }
 
 pub fn stored_machine_id(data_dir: &Path) -> Option<String> {
     load_credential(&data_dir.join(CREDENTIAL_FILE)).map(|cred| cred.machine_id)
 }
 
-pub async fn serve_local_exec(client: OpenGrokClient, data_dir: PathBuf, cancel: Arc<AtomicBool>) {
+/// This Mac's credential with the server as enrolment left it: its machine id, and the token the
+/// local-exec stream opens with. The Mac relay opens its stream and posts its answers with the
+/// same token (`super::relay`, opengrok-server #292), so enrolling is what lets this Mac answer,
+/// though it never makes it the relay by itself. Its `Debug` never prints the token.
+#[derive(Clone, PartialEq, Eq)]
+pub struct MachineCredential {
+    machine_id: String,
+    token: String,
+}
+
+impl MachineCredential {
+    #[cfg(test)]
+    pub(crate) fn new(machine_id: &str, token: &str) -> Self {
+        Self {
+            machine_id: machine_id.to_string(),
+            token: token.to_string(),
+        }
+    }
+
+    pub fn machine_id(&self) -> &str {
+        &self.machine_id
+    }
+
+    pub(crate) fn token(&self) -> &str {
+        &self.token
+    }
+}
+
+impl std::fmt::Debug for MachineCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MachineCredential")
+            .field("machine_id", &self.machine_id)
+            .field("token", &"«redacted»")
+            .finish()
+    }
+}
+
+/// This Mac's credential as local-exec holds it, as it changes: `None` until it has enrolled, then
+/// the credential of each enrolment. The Mac relay opens its stream and answers with it
+/// (`super::relay`) and follows it: when the server turns the token away, local-exec enrols this
+/// Mac again, and a relay stopped for the old token starts again with the new credential.
+pub type Enrolment = watch::Receiver<Option<MachineCredential>>;
+
+/// Hold this Mac's local-exec stream until `cancel`, enrolling it again when the server turns its
+/// token away. Each credential it holds goes to `enrolled`, for the relay ([`Enrolment`]).
+pub async fn serve_local_exec(
+    client: OpenGrokClient,
+    data_dir: PathBuf,
+    cancel: Arc<AtomicBool>,
+    enrolled: watch::Sender<Option<MachineCredential>>,
+) {
     let mut cred = match ensure_daemon(&client, &data_dir).await {
         Ok(cred) => cred,
         Err(error) => {
@@ -60,6 +119,7 @@ pub async fn serve_local_exec(client: OpenGrokClient, data_dir: PathBuf, cancel:
             return;
         }
     };
+    publish(&enrolled, &cred);
 
     let running = Running::default();
     while !cancel.load(Ordering::Relaxed) {
@@ -68,6 +128,7 @@ pub async fn serve_local_exec(client: OpenGrokClient, data_dir: PathBuf, cancel:
                 match ensure_daemon(&client, &data_dir).await {
                     Ok(fresh) => {
                         cred = fresh;
+                        publish(&enrolled, &cred);
                         if let Err(again) =
                             run_request_stream(&client, &cred, &cancel, &running).await
                         {
@@ -95,6 +156,19 @@ pub async fn serve_local_exec(client: OpenGrokClient, data_dir: PathBuf, cancel:
     {
         task.abort();
     }
+}
+
+/// Tell the relay the credential local-exec holds now, when it is not the one it held: an
+/// enrolment that gave nothing new wakes nothing.
+fn publish(enrolled: &watch::Sender<Option<MachineCredential>>, cred: &StoredDaemon) {
+    let fresh = cred.credential();
+    enrolled.send_if_modified(|held| {
+        let changed = held.as_ref() != Some(&fresh);
+        if changed {
+            *held = Some(fresh);
+        }
+        changed
+    });
 }
 
 async fn ensure_daemon(
@@ -375,7 +449,7 @@ fn save_credential(path: &Path, cred: &StoredDaemon) {
 mod tests {
     use super::*;
     use std::time::Instant;
-    use wiremock::matchers::{method, path};
+    use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn daemon() -> StoredDaemon {
@@ -437,9 +511,9 @@ mod tests {
         let client = OpenGrokClient::new(&server.uri()).unwrap();
         let dir = tempfile::tempdir().unwrap();
 
-        let machine_id = enrol_this_machine(&client, dir.path()).await.unwrap();
+        let machine = enrol_this_machine(&client, dir.path()).await.unwrap();
 
-        assert_eq!(machine_id, "mac_new");
+        assert_eq!(machine, MachineCredential::new("mac_new", "tok_new"));
         assert_eq!(stored_machine_id(dir.path()).as_deref(), Some("mac_new"));
         let calls: Vec<String> = server
             .received_requests()
@@ -641,6 +715,7 @@ mod tests {
             client,
             dir.path().to_path_buf(),
             Arc::clone(&cancel),
+            watch::channel(None).0,
         ));
         let pid = written(&pid_file).await;
         assert!(is_running(&pid));
@@ -652,6 +727,76 @@ mod tests {
             .expect("serving stops once signed out")
             .unwrap();
         stops(&pid, "the command outlived the sign-out").await;
+    }
+
+    /// The server turns this Mac's token away (its machine revoked, here) and local-exec enrols it
+    /// again: the new credential goes to the relay, which follows it, and not only to the file.
+    /// That is what starts a relay stopped for the old token again; with the file alone, it kept
+    /// the token it was started with and stayed stopped until the switch went off and on.
+    #[tokio::test]
+    async fn enrolling_again_hands_the_relay_the_new_credential() {
+        let server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        save_credential(&dir.path().join(CREDENTIAL_FILE), &daemon());
+        Mock::given(method("GET"))
+            .and(path("/local-exec/daemon"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({ "machines": [{ "machineId": "mac_1" }] })),
+            )
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/local-exec/daemon"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(
+                    json!({ "machines": [{ "machineId": "mac_1", "revoked": true }] }),
+                ),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/local-exec/requests"))
+            .and(header("authorization", "Bearer tok_1"))
+            .respond_with(
+                ResponseTemplate::new(401).set_body_json(json!({ "error": "unknown machine" })),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/local-exec/daemon"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({ "machineId": "mac_2", "token": "tok_2" })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/local-exec/requests"))
+            .and(header("authorization", "Bearer tok_2"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw("", "text/event-stream"))
+            .mount(&server)
+            .await;
+        let (enrolled, mut enrolment) = watch::channel(None);
+        let serving = tokio::spawn(serve_local_exec(
+            OpenGrokClient::new(&server.uri()).unwrap(),
+            dir.path().to_path_buf(),
+            Arc::new(AtomicBool::new(false)),
+            enrolled,
+        ));
+
+        let fresh = MachineCredential::new("mac_2", "tok_2");
+        let handed = tokio::time::timeout(
+            Duration::from_secs(10),
+            enrolment.wait_for(|held| held.as_ref() == Some(&fresh)),
+        )
+        .await
+        .is_ok_and(|held| held.is_ok());
+        serving.abort();
+        assert!(handed, "the relay is handed the new credential");
+        assert_eq!(stored_machine_id(dir.path()).as_deref(), Some("mac_2"));
     }
 
     #[test]

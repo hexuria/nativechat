@@ -1,0 +1,6 @@
+{
+  "type": "TEXT_MESSAGE_START",
+  "messageId": "m1",
+  "role": "user",
+  "timestamp": 100
+}

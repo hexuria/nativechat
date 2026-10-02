@@ -24,6 +24,7 @@ pub mod login;
 pub mod logins;
 pub mod message;
 pub mod message_actions;
+pub mod model_picker;
 pub mod multi_select;
 pub mod persona;
 pub mod recipes;

@@ -10,7 +10,9 @@ mod error;
 mod gen_ui;
 mod inference;
 mod local_exec;
+mod model_choice;
 mod pending;
+mod relay;
 mod timing;
 mod types;
 mod user_form;
@@ -35,10 +37,25 @@ pub use gen_ui::{
     persons_messages, place_hitl_cards_in_document_order, policy_answer,
 };
 pub use inference::{
-    DEFAULT_PROXY_URL, INFERENCE_SOURCE_CUSTOM, InferenceKind, InferenceSource,
-    InferenceSourceUpdate, ProxyKey, ReplySource, is_loopback, is_subscription_model,
+    DEFAULT_PROXY_URL, HELD_FOR_RELAY_OFFLINE, INFERENCE_SOURCE_CUSTOM, InferenceKind,
+    InferenceSource, InferenceSourceUpdate, ProxyKey, RelayRead, RelayUpdate, ReplySource,
+    RunErrorCode, TurnSource, Via, is_loopback, is_subscription_model,
 };
-pub use local_exec::{enrol_this_machine, serve_local_exec, stored_machine_id};
+pub use local_exec::{
+    Enrolment, MachineCredential, enrol_this_machine, serve_local_exec, stored_machine_id,
+};
+pub use model_choice::{
+    AccountPlan, ChoiceGroup, DEFAULT_EFFORT_LABEL, EFFORT_NOT_KEPT, EFFORT_STOPS,
+    FAST_ACCOUNT_PLAN, FAST_DOOR_UNKNOWN, FAST_NO_TWIN, FAST_SUFFIX, GATEWAY_GROUP, LIST_ROWS,
+    ListLine, ModelChoice, ModelPick, NO_MODEL, ROUTINES_ON_PLAN, SUBSCRIPTION_GROUP, base_label,
+    bot_pick, effort_label, effort_stop, group_title, is_fast, last_window_start, list_window,
+    model_label, plan_choices, row_count, server_choices, slider_stop, stop_word,
+    window_opening_on, without_fast,
+};
+pub use relay::{
+    OpencodexAddress, RelayHandle, RelayKey, RelayReport, RelayStatus, RelayTarget, RelayTimings,
+    SERVER_QUIET, SERVER_UNREACHED, SERVER_WITHOUT_RELAY, TOKEN_REFUSED, start_relay,
+};
 pub(crate) use user_form::USER_FORM_REASON;
 pub use user_form::{
     BOX_HANDOFF_RESOLVE_PATH, BoxHandoffReply, BoxHandoffResolution, ComputerHandoffSpec,
@@ -83,7 +100,7 @@ pub use pending::{
 };
 pub use timing::{TurnTiming, stamp_duration};
 pub use types::{
-    Account, AguiMessage, Attachment, Coworker, CoworkerPatch, EFFORT_INHERIT, EFFORT_WORDS,
-    LocalProxyStatus, ModelCatalogue, ModelEntry, ProfileUpdate, ReplyQuote, SentAttachment,
-    ThreadListing, assistant_text_from_sse,
+    Account, AguiMessage, Attachment, Coworker, CoworkerPatch, CoworkerSource, EFFORT_INHERIT,
+    EFFORT_WORDS, LocalProxyStatus, ModelCatalogue, ModelEntry, ProfileUpdate, ReplyQuote,
+    SentAttachment, ThreadListing, assistant_text_from_sse,
 };

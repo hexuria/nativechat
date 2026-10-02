@@ -27,6 +27,11 @@ use crate::state::{
     is_unsent_turn_note,
 };
 use crate::tts_text::{looks_like_markdown, map_utf16_range_to_utf8};
+
+/// Beside the line of a turn the person's plan could not answer: the turn again, on the server's
+/// paid keys.
+pub(crate) const SEND_ON_SERVER: &str = "run-error-send-on-server";
+pub(crate) const SEND_ON_SERVER_LABEL: &str = "Send this reply on Server instead";
 use gpui_kit::base::{Align, Placement, Positioner};
 use gpui_kit::component::input::{InputEvent, InputState, TextareaState};
 use gpui_kit::component::tooltip::Tooltip;
@@ -94,6 +99,12 @@ struct ChatFeedRev {
     )>,
     /// Every reply's badge: the frame that brings one changes nothing else a row is drawn from.
     sources: Vec<Option<crate::opengrok::ReplySource>>,
+    /// The reply the person's plan could not answer, which offers itself on the server's keys: a
+    /// run's code arrives with the same words a row already shows.
+    plan_failed: Option<String>,
+    /// The held sends the server holds for the person's Mac: a row's `heldFor` changes nothing
+    /// else a bubble is drawn from.
+    waiting_for_mac: Vec<String>,
 }
 
 impl ChatFeedRev {
@@ -329,6 +340,8 @@ impl ChatFeedRev {
             sources: conv
                 .map(|c| c.messages.iter().map(|m| m.reply_source.clone()).collect())
                 .unwrap_or_default(),
+            plan_failed: state.plan_failed_turn(),
+            waiting_for_mac: state.sends_waiting_for_mac(),
         }
     }
 }
@@ -351,6 +364,9 @@ struct ChatRow {
     is_cached: bool,
     /// The person's message is on screen but its turn is held until the thread is idle.
     queued: bool,
+    /// Held by the server until a Mac holds the relay again: the queued line says it waits for
+    /// the person's Mac.
+    waiting_for_mac: bool,
     highlight_range: Option<std::ops::Range<usize>>,
     highlight_native: bool,
     use_markdown: bool,
@@ -369,6 +385,9 @@ struct ChatRow {
     status_failed: bool,
     /// A status line for a turn that never left, which carries the offer to send it again.
     status_retry: bool,
+    /// A status line for a turn the person's plan could not answer, which carries the offer to
+    /// send it again on the server's keys.
+    status_send_on_server: bool,
     /// The pictures of one stretch of a turn, which the row paints as one strip and the
     /// lightbox pages through as one set.
     screenshots: Vec<ScreenshotSpec>,
@@ -402,6 +421,7 @@ impl ChatRow {
             is_ai_loading: false,
             is_cached: false,
             queued: false,
+            waiting_for_mac: false,
             highlight_range: None,
             highlight_native: false,
             use_markdown: false,
@@ -416,6 +436,7 @@ impl ChatRow {
             status_line: None,
             status_failed: false,
             status_retry: false,
+            status_send_on_server: false,
             files: Vec::new(),
             screenshots: Vec::new(),
             user_form: None,
@@ -571,6 +592,8 @@ fn snapshot_rows(state: &AppState) -> Arc<Vec<ChatRow>> {
     // The one turn the thread would send again, if it has one. Asked once rather than per row,
     // and by id, because only the thread's last turn is the one a retry would be about.
     let retryable = state.retryable_turn();
+    // And the one the person's plan could not answer, which goes again on the server's keys.
+    let plan_failed = state.plan_failed_turn();
     let mut rows = Vec::new();
     for msg in &conv.messages {
         // Saved quotes may have been truncated in the middle of Markdown. Project the
@@ -664,6 +687,7 @@ fn snapshot_rows(state: &AppState) -> Arc<Vec<ChatRow>> {
                         && text.trim() != STOPPED_TURN_NOTE
                         && !is_unsent_turn_note(&text),
                     status_retry: retryable.as_ref() == Some(&msg.id),
+                    status_send_on_server: plan_failed.as_ref() == Some(&msg.id),
                     content: SharedString::from(text.clone()),
                     status_line: Some(text),
                     ..ChatRow::slot(id, msg.id.clone())
@@ -676,6 +700,7 @@ fn snapshot_rows(state: &AppState) -> Arc<Vec<ChatRow>> {
                 timestamp: SharedString::from(msg.formatted_time()),
                 duration: SharedString::from(msg.formatted_duration().unwrap_or_default()),
                 queued: msg.is_me && state.is_send_queued(&msg.id),
+                waiting_for_mac: msg.is_me && state.is_send_waiting_for_mac(&msg.id),
                 is_native_speaking,
                 is_native_paused: state.native_tts.is_paused && is_native_speaking,
                 is_native_loading: state.native_tts.is_loading && is_native_speaking,
@@ -810,6 +835,7 @@ fn snapshot_rows(state: &AppState) -> Arc<Vec<ChatRow>> {
                         is_native_loading: state.native_tts.is_loading && is_native_speaking,
                         timestamp: SharedString::from(msg.formatted_time()),
                         queued: state.is_send_queued(&msg.id),
+                        waiting_for_mac: state.is_send_waiting_for_mac(&msg.id),
                         show_footer: true,
                         // What Copy puts on the clipboard and what is read aloud: the files'
                         // names, the only words a files-alone message has.
@@ -1499,6 +1525,28 @@ impl Render for ChatTranscript {
                                                 .child("Try again"),
                                         )
                                     })
+                                    // A turn the person's plan could not answer: the sentence says
+                                    // why, and the turn can go again on the server's paid keys,
+                                    // this once, without the person's message sent twice.
+                                    .when(row.status_send_on_server, |this| {
+                                        let state = app_state.clone();
+                                        this.child(
+                                            div()
+                                                .id(SEND_ON_SERVER)
+                                                .text_sm()
+                                                .text_color(palette.primary)
+                                                .cursor_pointer()
+                                                .on_mouse_down(
+                                                    MouseButton::Left,
+                                                    move |_, _, cx| {
+                                                        state.update(cx, |state, cx| {
+                                                            state.send_on_server(cx);
+                                                        });
+                                                    },
+                                                )
+                                                .child(SEND_ON_SERVER_LABEL),
+                                        )
+                                    })
                                     .into_any_element();
                             }
                             if let Some(spec) = &row.approval {
@@ -1617,6 +1665,7 @@ impl Render for ChatTranscript {
                                 .is_ai_loading(row.is_ai_loading)
                                 .is_cached(row.is_cached)
                                 .queued(row.queued)
+                                .waiting_for_mac(row.waiting_for_mac)
                                 .files(row.files.clone())
                                 .source_badge(row.source_badge.clone())
                                 .highlight_range(row.highlight_range.clone())
