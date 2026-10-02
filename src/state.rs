@@ -3959,7 +3959,7 @@ fn with_unlisted_runs(
         .filter(|run| {
             run.unsettled()
                 && now_ms - run.started_at_ms < UNLISTED_RUN_MS
-                && !listed.iter().any(|listed| listed.run_id == run.run_id)
+                && !listed.iter().any(|listed| listed.run_id() == run.run_id())
         })
         .cloned()
         .collect();
@@ -4080,12 +4080,38 @@ impl RoutineTrigger {
 /// One line of a routine's Run history, from the server's.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RoutineRun {
-    pub run_id: String,
-    /// When it started, as the row reads.
+    /// When it started, or for a skipped firing when it was due, as the row reads.
     pub at: String,
     pub started_at_ms: i64,
     pub cause: RunCause,
-    pub status: ScheduleRunStatus,
+    pub outcome: RunOutcome,
+}
+
+/// What came of one firing of a routine.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RunOutcome {
+    /// A run, which its line opens in the routine's thread, and where it got to.
+    Ran {
+        run_id: String,
+        status: ScheduleRunStatus,
+    },
+    /// No run: the Bot answers on its person's own plan, and the plan could not answer when the
+    /// routine was due (opengrok-server #316, PR #334 at 628dcff). The line says the server's
+    /// sentence for why, and has nothing to open.
+    Skipped { reason: String },
+}
+
+/// A moment of a routine's history as its line reads it, in the person's own time: "Oct 3 at
+/// 9:05 AM".
+fn history_time(at_ms: i64) -> String {
+    chrono::DateTime::from_timestamp_millis(at_ms)
+        .map(|at| {
+            at.with_timezone(&chrono::Local)
+                .format("%b %d at %I:%M %p")
+                .to_string()
+                .replace(" 0", " ")
+        })
+        .unwrap_or_default()
 }
 
 /// How long a Test run the server has named stays on screen before its history lists it. The
@@ -4095,39 +4121,61 @@ const UNLISTED_RUN_MS: i64 = 60_000;
 
 impl RoutineRun {
     fn from_server(run: ScheduleRun) -> Self {
-        let at = chrono::DateTime::from_timestamp_millis(run.started_at_ms)
-            .map(|at| {
-                at.with_timezone(&chrono::Local)
-                    .format("%b %d at %I:%M %p")
-                    .to_string()
-                    .replace(" 0", " ")
-            })
-            .unwrap_or_default();
+        let skipped = run.is_skipped();
+        let started_at_ms = run.started_at_ms.or(run.at).unwrap_or_default();
+        let outcome = match run.run_id {
+            Some(run_id) if !skipped => RunOutcome::Ran {
+                run_id,
+                status: run.status.unwrap_or(ScheduleRunStatus::Other),
+            },
+            // "Skipped" alone is the server's own word for a skip it has no sentence for
+            // (`skip_reason` in opengrok-server's `crates/opengrok-server/src/autonomy/mod.rs`).
+            _ => RunOutcome::Skipped {
+                reason: run
+                    .reason
+                    .map(|reason| reason.trim().to_string())
+                    .filter(|reason| !reason.is_empty())
+                    .unwrap_or_else(|| "Skipped".to_string()),
+            },
+        };
         Self {
-            run_id: run.run_id,
-            at,
-            started_at_ms: run.started_at_ms,
+            at: history_time(started_at_ms),
+            started_at_ms,
             cause: run.cause,
-            status: run.status,
+            outcome,
         }
     }
 
     /// The run a Test run just started, before the history has it.
     fn just_started(run_id: String) -> Self {
-        Self::from_server(ScheduleRun {
-            run_id,
+        let started_at_ms = chrono::Utc::now().timestamp_millis();
+        Self {
+            at: history_time(started_at_ms),
+            started_at_ms,
             cause: RunCause::Manual,
-            status: ScheduleRunStatus::Running,
-            started_at_ms: chrono::Utc::now().timestamp_millis(),
-            ended_at_ms: None,
-        })
+            outcome: RunOutcome::Ran {
+                run_id,
+                status: ScheduleRunStatus::Running,
+            },
+        }
     }
 
-    /// Still going, or parked on a card: a later look can say how it ended.
+    /// The run its line opens, or `None` on a skipped firing, which started none.
+    pub fn run_id(&self) -> Option<&str> {
+        match &self.outcome {
+            RunOutcome::Ran { run_id, .. } => Some(run_id),
+            RunOutcome::Skipped { .. } => None,
+        }
+    }
+
+    /// Still going, or parked on a card: a later look can say how it ended. A skip is settled.
     pub fn unsettled(&self) -> bool {
         matches!(
-            self.status,
-            ScheduleRunStatus::Running | ScheduleRunStatus::Waiting
+            self.outcome,
+            RunOutcome::Ran {
+                status: ScheduleRunStatus::Running | ScheduleRunStatus::Waiting,
+                ..
+            }
         )
     }
 
@@ -12145,7 +12193,7 @@ impl AppState {
     }
 
     /// A Test run's answer landing, and whether the history is to be read again for the run it
-    /// started.
+    /// started, or for the skip the server kept in its place.
     fn settle_routine_run(
         &mut self,
         coworker_id: &str,
@@ -12166,6 +12214,14 @@ impl AppState {
                 self.routine_routes_missing.run_now = true;
                 self.computer_action_error = Some(ROUTINE_RUN_UNAVAILABLE.to_string());
                 false
+            }
+            // The Bot answers on its person's own plan, and the plan could not answer now: no run
+            // started, and the server kept the firing in the history as skipped (opengrok-server
+            // #316). Its sentence is what the person is told, and the history is read again for
+            // the line it kept, with nothing shown as running in the meantime.
+            Err(error) if error.is_skipped_firing() => {
+                self.computer_action_error = Some(routine_trouble(&error));
+                true
             }
             Err(error) => {
                 self.computer_action_error = Some(routine_trouble(&error));
@@ -22906,11 +22962,32 @@ mod tests {
         );
     }
 
+    /// A line of a routine's history that is a run, as `GET /schedules/{id}/runs` lists one.
+    fn history_run(
+        run_id: &str,
+        cause: crate::opengrok::RunCause,
+        status: crate::opengrok::ScheduleRunStatus,
+        started_at_ms: i64,
+        ended_at_ms: Option<i64>,
+    ) -> crate::opengrok::ScheduleRun {
+        crate::opengrok::ScheduleRun {
+            run_id: Some(run_id.into()),
+            cause,
+            status: Some(status),
+            started_at_ms: Some(started_at_ms),
+            ended_at_ms,
+            state: None,
+            at: None,
+            skipped: None,
+            reason: None,
+        }
+    }
+
     /// A roster refresh re-lists the routines while one is open, and the history already read
     /// for it stays: the listing has none in it.
     #[test]
     fn a_relist_keeps_the_history_already_read() {
-        use crate::opengrok::{RunCause, ScheduleRun, ScheduleRunStatus};
+        use crate::opengrok::{RunCause, ScheduleRunStatus};
         let row = || -> crate::opengrok::ScheduleRow {
             serde_json::from_value(serde_json::json!({
                 "id": "sch_1", "coworkerId": "cw_1", "kind": "cron", "cron": "0 0 9 * * 1",
@@ -22919,13 +22996,13 @@ mod tests {
             .unwrap()
         };
         let mut shown = super::routine_from_schedule(row());
-        shown.runs = vec![super::RoutineRun::from_server(ScheduleRun {
-            run_id: "run_1".into(),
-            cause: RunCause::Manual,
-            status: ScheduleRunStatus::Ok,
-            started_at_ms: 1_000,
-            ended_at_ms: Some(2_000),
-        })];
+        shown.runs = vec![super::RoutineRun::from_server(history_run(
+            "run_1",
+            RunCause::Manual,
+            ScheduleRunStatus::Ok,
+            1_000,
+            Some(2_000),
+        ))];
         let relisted = super::relisted(Some(std::slice::from_ref(&shown)), vec![row()]);
         assert_eq!(relisted[0].runs, shown.runs);
         assert!(super::relisted(None, vec![row()])[0].runs.is_empty());
@@ -22936,19 +23013,21 @@ mod tests {
     /// lists is dropped after a minute rather than running for good.
     #[test]
     fn a_test_run_is_shown_before_the_history_lists_it() {
-        use crate::opengrok::{RunCause, ScheduleRun, ScheduleRunStatus};
+        use crate::opengrok::{RunCause, ScheduleRunStatus};
         let started = super::RoutineRun::just_started("run_new".into());
         let now = started.started_at_ms;
-        let old = super::RoutineRun::from_server(ScheduleRun {
-            run_id: "run_old".into(),
-            cause: RunCause::Clock,
-            status: ScheduleRunStatus::Ok,
-            started_at_ms: now - 86_400_000,
-            ended_at_ms: Some(now - 86_000_000),
-        });
+        let old = super::RoutineRun::from_server(history_run(
+            "run_old",
+            RunCause::Clock,
+            ScheduleRunStatus::Ok,
+            now - 86_400_000,
+            Some(now - 86_000_000),
+        ));
         let shown = vec![started.clone(), old.clone()];
         let ids = |runs: &[super::RoutineRun]| -> Vec<String> {
-            runs.iter().map(|run| run.run_id.clone()).collect()
+            runs.iter()
+                .filter_map(|run| run.run_id().map(str::to_string))
+                .collect()
         };
 
         let behind = super::with_unlisted_runs(&shown, vec![old.clone()], now + 50);
@@ -22960,14 +23039,13 @@ mod tests {
         assert!(behind[0].unsettled(), "and still read again");
 
         let mut listed = started.clone();
-        listed.status = ScheduleRunStatus::Ok;
+        listed.outcome = super::RunOutcome::Ran {
+            run_id: "run_new".into(),
+            status: ScheduleRunStatus::Ok,
+        };
         let caught_up = super::with_unlisted_runs(&shown, vec![listed, old.clone()], now + 50);
         assert_eq!(ids(&caught_up), ["run_new", "run_old"]);
-        assert_eq!(
-            caught_up[0].status,
-            ScheduleRunStatus::Ok,
-            "the history's own line wins"
-        );
+        assert!(!caught_up[0].unsettled(), "the history's own line wins");
 
         let never = super::with_unlisted_runs(&shown, vec![old], now + super::UNLISTED_RUN_MS);
         assert_eq!(
@@ -22982,13 +23060,7 @@ mod tests {
     #[test]
     fn a_history_line_names_its_cause_and_knows_when_it_is_settled() {
         let line = |cause, status| {
-            super::RoutineRun::from_server(crate::opengrok::ScheduleRun {
-                run_id: "run_1".into(),
-                cause,
-                status,
-                started_at_ms: 1_000,
-                ended_at_ms: None,
-            })
+            super::RoutineRun::from_server(history_run("run_1", cause, status, 1_000, None))
         };
         use crate::opengrok::{RunCause, ScheduleRunStatus};
         assert_eq!(
@@ -27408,6 +27480,99 @@ mod tests {
             state.computer_action_error.as_deref(),
             Some("Could not reach the server.")
         );
+    }
+
+    /// A firing the server skipped (opengrok-server #316: the Bot answers on its person's own
+    /// plan, and no computer held the relay) is a line of the history with no run: it says the
+    /// server's sentence, opens nothing, and is settled, so nothing reads it again.
+    #[test]
+    fn a_skipped_line_says_why_and_has_no_run_to_open() {
+        let said = "Skipped: your computer was off, so your plan couldn't answer";
+        let line: crate::opengrok::ScheduleRun = serde_json::from_value(serde_json::json!({
+            "runId": null, "cause": "clock", "status": null, "startedAtMs": null,
+            "endedAtMs": null, "at": 1_790_000_000_000i64, "state": "skipped",
+            "skipped": "relay_offline", "reason": said
+        }))
+        .expect("a skipped line");
+        let run = super::RoutineRun::from_server(line);
+        assert_eq!(
+            run.outcome,
+            super::RunOutcome::Skipped {
+                reason: said.into()
+            }
+        );
+        assert_eq!(run.run_id(), None, "nothing to open");
+        assert!(!run.unsettled(), "a skip is settled");
+        assert_eq!(run.cause_label(), "Schedule");
+        assert_eq!(
+            run.started_at_ms, 1_790_000_000_000,
+            "its time is when it was due"
+        );
+        assert!(!run.at.is_empty());
+    }
+
+    /// Run it now on a Bot whose own plan cannot answer (opengrok-server #316, PR #334 at
+    /// 628dcff: no computer holds the person's relay) is the server's 409 with the skip's code.
+    /// Its sentence goes on the routine's red line, nothing is shown as running, and the history
+    /// is read again for the line the server kept, which says the same and opens nothing.
+    #[tokio::test]
+    async fn run_now_while_the_plan_cannot_answer_says_why_and_reads_the_skip_back() {
+        let said = "Skipped: your computer was off, so your plan couldn't answer";
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/schedules/sch_1/run"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(409)
+                    .set_body_json(serde_json::json!({ "error": said, "code": "relay_offline" })),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/schedules/sch_1/runs"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!([{
+                    "runId": null, "cause": "manual", "status": null, "startedAtMs": null,
+                    "endedAtMs": null, "at": 1_790_000_000_000i64, "state": "skipped",
+                    "skipped": "relay_offline", "reason": said
+                }])),
+            )
+            .mount(&server)
+            .await;
+        let mut state = routines_on(&server);
+        let client = state
+            .begin_routine_run("cw_1", "sch_1")
+            .expect("a run to ask for");
+        let result = client.run_schedule_now("sch_1").await;
+        assert!(
+            state.settle_routine_run("cw_1", "sch_1", result),
+            "the history is read again for the skip"
+        );
+        assert_eq!(state.computer_action_error.as_deref(), Some(said));
+        assert!(
+            state.routine_mut("cw_1", "sch_1").unwrap().runs.is_empty(),
+            "no run started, so none is shown running"
+        );
+
+        let (client, read) = state
+            .begin_routine_runs_read("cw_1", "sch_1")
+            .expect("a read");
+        let result = client.schedule_runs("sch_1").await;
+        assert!(state.settle_routine_runs("cw_1", "sch_1", read, result));
+        assert_eq!(
+            state.computer_action_error.as_deref(),
+            Some(said),
+            "the read raises nothing of its own"
+        );
+        let runs = &state.routine_mut("cw_1", "sch_1").unwrap().runs;
+        assert_eq!(runs.len(), 1);
+        assert_eq!(
+            runs[0].outcome,
+            super::RunOutcome::Skipped {
+                reason: said.into()
+            }
+        );
+        assert_eq!(runs[0].cause_label(), "Test run");
+        assert_eq!(runs[0].run_id(), None);
     }
 
     /// An edit the server takes is what the routine reads as from then on: its answer, in the

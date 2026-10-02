@@ -57,9 +57,9 @@ use super::client::{
     ConnectionView, Connector, CoworkerCeiling, CoworkerComputer, CoworkerSkills, CoworkerUsage,
     DaemonEnrol, DaemonList, LocalExecMode, LocalExecPolicy, OpenGrokClient, QueuedApproval,
     RecipeDetail, RecipeList, RecipeParameterKind, RecipeRunResult, RunCause, RunReplay,
-    ScheduleKind, ScheduleRow, ScheduleRun, ScheduleRunStarted, ScheduleRunStatus, SkillDetail,
-    SkillSummary, SkillVersion, StopReply, ThreadReplay, ToolListing, host_egress_tunnel_available,
-    host_egress_tunnel_flag,
+    SKIPPED_FIRING, ScheduleKind, ScheduleRow, ScheduleRun, ScheduleRunStarted, ScheduleRunStatus,
+    SkillDetail, SkillSummary, SkillVersion, StopReply, ThreadReplay, ToolListing,
+    host_egress_tunnel_available, host_egress_tunnel_flag,
 };
 use super::credential::{CREDENTIAL_OFFER_SAVE, SaveLoginSpec};
 use super::error::{Failure, Unreachable, reads_as_gateway_unreachable};
@@ -508,22 +508,6 @@ const WORDS_NOT_RECORDED_YET: &[(Slot, &str, &str)] = &[];
 /// check has to fail with those words: one that passes means the drift is fixed and the entry
 /// goes, and one that fails some other way is a new problem, not this one.
 const KNOWN_DRIFT: &[(&str, &str, &str)] = &[
-    (
-        "rest/GET__schedules__id__runs/200-a_due_routine_with_no_mac_is_skipped_and_its_clock_moves_on.json",
-        "invalid type: null, expected a string",
-        "A firing the server skipped because the Bot's own plan could not answer (opengrok-server \
-         #316, `history` in autonomy/routes.rs) is a line of the history with runId, status and \
-         startedAtMs null, beside its own at, state skipped, the code and the server's reason. \
-         ScheduleRun takes a run id, a status and a start on every line, so the whole history \
-         fails to parse: the read's error goes on the routine's red line, and none of its runs is \
-         listed.",
-    ),
-    (
-        "rest/GET__schedules__id__runs/200-run_now_with_no_mac_answers_409_and_records_the_skip.json",
-        "invalid type: null, expected a string",
-        "The same skipped line, recorded by a Run it now refused with 409 while the Mac was away \
-         (cause manual): the history it is in does not parse.",
-    ),
     (
         "agui/custom/run-awaiting-approval/a_delete_asks_first_naming_the_routine_as_stored.json",
         "the card says \"delete_routine — a plugin tool",
@@ -2399,6 +2383,7 @@ const REFUSALS: &[(&str, RestCheck)] = &[
     ("POST__ag-ui_user-form_dismiss", form_refused),
     ("POST__ag-ui_box-handoff_resolve", handoff_refused),
     ("POST__recipes__id__run", run_refused),
+    ("POST__schedules__id__run", schedule_run_refused),
     ("POST__skills_from-tape", tape_refused),
     ("GET__inference-relay_requests", relay_stream_refused),
     (
@@ -2776,6 +2761,21 @@ fn run_refused(status: u16, body: &Value) -> Check {
             refusal(status, body)
         }
     }
+}
+
+/// Run it now refused (`run_schedule_now`): the server's sentence, as anywhere else, and a skip
+/// is told from every other refusal. Its 409 with a code is the routine's Bot on its person's own
+/// plan while the plan cannot answer (#316: `run_schedule_now` in autonomy/routes.rs), which kept
+/// the firing as skipped and has the history read again for it; the 409 for a retired coworker
+/// names no code, and is no skip.
+fn schedule_run_refused(status: u16, body: &Value) -> Check {
+    let error = OpenGrokClient::refusal(status, &body_text(body));
+    let (_, code) = said_by(body);
+    must!(
+        error.is_skipped_firing() == (status == 409 && code.is_some()),
+        "a skipped firing should be told from any other refusal: {error:?}"
+    );
+    refusal(status, body)
 }
 
 /// `tape_error`: the server's sentence, as anywhere else, read as a verdict about the recording
@@ -4322,20 +4322,44 @@ fn recipe_run(status: u16, body: &Value) -> Check {
 
 /// Every line of a routine's history comes through, and every word in it is one this app has
 /// a name for: a cause or a status read as `Other` is the server saying something the editor
-/// cannot say back.
+/// cannot say back. A firing the server skipped (#316: `history` in autonomy/routes.rs) reads as
+/// a skip, with no run to open, when it was due, and the server's sentence for why, which is what
+/// its line says; and a run is never read as one.
 fn schedule_runs(_: u16, body: &Value) -> Check {
     let listed: Vec<ScheduleRun> = parse(body)?;
     let raw = rows(body)?;
     same_len(&listed, raw)?;
     for (run, raw) in listed.iter().zip(raw) {
         must!(
-            run.run_id == str_at(raw, "runId")
-                && Some(run.started_at_ms) == raw.get("startedAtMs").and_then(Value::as_i64)
+            run.cause != RunCause::Other,
+            "a word this app has no name for: {raw}"
+        );
+        if str_at(raw, "state") == SKIPPED_FIRING {
+            must!(
+                run.is_skipped()
+                    && run.run_id.is_none()
+                    && run.at.is_some()
+                    && run.at == raw.get("at").and_then(Value::as_i64)
+                    && run.reason.as_deref() == opt_str(raw, "reason")
+                    && run
+                        .reason
+                        .as_deref()
+                        .is_some_and(|why| !why.trim().is_empty()),
+                "a skipped firing should read as one, with its time and its reason: {run:?}"
+            );
+            continue;
+        }
+        must!(
+            !run.is_skipped()
+                && run.run_id.as_deref() == opt_str(raw, "runId")
+                && run.started_at_ms == raw.get("startedAtMs").and_then(Value::as_i64)
+                && run.started_at_ms.is_some()
                 && run.ended_at_ms == raw.get("endedAtMs").and_then(Value::as_i64),
             "a run came through changed: {run:?}"
         );
         must!(
-            run.cause != RunCause::Other && run.status != ScheduleRunStatus::Other,
+            run.status
+                .is_some_and(|status| status != ScheduleRunStatus::Other),
             "a word this app has no name for: {raw}"
         );
     }

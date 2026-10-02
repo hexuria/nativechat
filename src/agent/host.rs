@@ -400,6 +400,13 @@ pub mod ids {
         format!("routine-{id}-run-{run_id}")
     }
 
+    /// A line of the routine's Run history that is a firing the server skipped (opengrok-server
+    /// #316), by when it was due, in the server's milliseconds: it has no run id. Its label is
+    /// what set it off and its value the server's sentence for why. It opens nothing.
+    pub fn routine_skipped(id: &str, at_ms: i64) -> String {
+        format!("routine-{id}-skipped-{at_ms}")
+    }
+
     /// Open the thread the routine runs in. Only on a routine the server has.
     pub fn routine_thread(id: &str) -> String {
         format!("routine-{id}-thread")
@@ -1813,8 +1820,8 @@ struct RoutineSnap {
     active: bool,
     webhook_url: Option<String>,
     webhook_key: Option<String>,
-    /// Run history, newest first: run id, what set it off, where it got to.
-    runs: Vec<(String, &'static str, &'static str)>,
+    /// Run history, newest first.
+    runs: Vec<RunLineSnap>,
     /// What the editor says the server cannot do with this routine (`state::routine_notes`).
     notes: Vec<(&'static str, &'static str)>,
     /// The server cannot list this routine's runs, so the history says so in their place.
@@ -1823,6 +1830,24 @@ struct RoutineSnap {
     unsaved: Vec<(&'static str, String)>,
     /// Its wakes, in order: what sets each off in words, and whether it is a webhook.
     wakes: Vec<(String, bool)>,
+}
+
+/// One line of a routine's Run history as the driver sees it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum RunLineSnap {
+    /// A run, by its id: what set it off, and where it got to.
+    Ran {
+        run_id: String,
+        cause: &'static str,
+        status: &'static str,
+    },
+    /// A firing the server skipped, by when it was due: what set it off, and the server's
+    /// sentence for why.
+    Skipped {
+        at_ms: i64,
+        cause: &'static str,
+        reason: String,
+    },
 }
 
 impl RoutineSnap {
@@ -2406,15 +2431,23 @@ fn routine_snap(routine: &crate::state::AgentRoutine, state: &AppState) -> Routi
         runs: routine
             .runs
             .iter()
-            .map(|run| {
-                let status = match run.status {
-                    crate::opengrok::ScheduleRunStatus::Running => "running",
-                    crate::opengrok::ScheduleRunStatus::Waiting => "waiting",
-                    crate::opengrok::ScheduleRunStatus::Ok => "ok",
-                    crate::opengrok::ScheduleRunStatus::Error => "error",
-                    crate::opengrok::ScheduleRunStatus::Other => "other",
-                };
-                (run.run_id.clone(), run.cause_label(), status)
+            .map(|run| match &run.outcome {
+                crate::state::RunOutcome::Ran { run_id, status } => RunLineSnap::Ran {
+                    run_id: run_id.clone(),
+                    cause: run.cause_label(),
+                    status: match status {
+                        crate::opengrok::ScheduleRunStatus::Running => "running",
+                        crate::opengrok::ScheduleRunStatus::Waiting => "waiting",
+                        crate::opengrok::ScheduleRunStatus::Ok => "ok",
+                        crate::opengrok::ScheduleRunStatus::Error => "error",
+                        crate::opengrok::ScheduleRunStatus::Other => "other",
+                    },
+                },
+                crate::state::RunOutcome::Skipped { reason } => RunLineSnap::Skipped {
+                    at_ms: run.started_at_ms,
+                    cause: run.cause_label(),
+                    reason: reason.clone(),
+                },
             })
             .collect(),
         notes: crate::state::routine_notes(state.routine_routes_missing, on_the_server),
@@ -2735,11 +2768,25 @@ fn routine_node(routine: &RoutineSnap) -> UiNode {
             crate::state::ROUTINE_RUNS_UNAVAILABLE,
         ));
     }
-    for (run_id, cause, status) in &routine.runs {
-        node = node.with_child(
-            UiNode::status(ids::routine_run(&routine.id, run_id), *cause)
+    for line in &routine.runs {
+        node = node.with_child(match line {
+            RunLineSnap::Ran {
+                run_id,
+                cause,
+                status,
+            } => UiNode::status(ids::routine_run(&routine.id, run_id), *cause)
                 .with_value(status.to_string()),
-        );
+            RunLineSnap::Skipped {
+                at_ms,
+                cause,
+                reason,
+            } => {
+                let mut skipped = UiNode::status(ids::routine_skipped(&routine.id, *at_ms), *cause)
+                    .with_value(reason.clone());
+                skipped.states.push("skipped".into());
+                skipped
+            }
+        });
     }
     node.with_child(UiNode::button(ids::routine_delete(&routine.id), "Delete"))
 }
@@ -7258,6 +7305,8 @@ impl NativeChatHost {
         .contains(&target)
         {
             self.routine_header_command(target)?
+        } else if let Some(why) = self.skipped_line_refusal(target) {
+            return Err(why);
         } else if let Some(cmd) = self.routine_command(target) {
             if let Command::RunRoutineNow { routine_id } = &cmd {
                 self.refuse_dead_test_run(target, routine_id)?;
@@ -7585,6 +7634,29 @@ impl NativeChatHost {
         })
     }
 
+    /// Why a click on a skipped line of a routine's Run history does nothing, or `None` for a
+    /// target that is not one: the firing started no run, so there is no thread to open at it.
+    fn skipped_line_refusal(&self, target: &str) -> Option<String> {
+        let rest = target.strip_prefix("routine-")?;
+        self.routines.iter().find_map(|routine| {
+            let at = rest
+                .strip_prefix(routine.id.as_str())?
+                .strip_prefix("-skipped-")?;
+            routine
+                .runs
+                .iter()
+                .any(|line| {
+                    matches!(line, RunLineSnap::Skipped { at_ms, .. } if at_ms.to_string() == at)
+                })
+                .then(|| {
+                    format!(
+                        "`{target}` is a firing the server skipped: it started no run, so there \
+                         is nothing to open"
+                    )
+                })
+        })
+    }
+
     /// One of a routine's controls, or `None` for a target that is not a routine's at all.
     ///
     /// The id is the server's and can hold anything, dashes included, so this reads the tail
@@ -7600,7 +7672,10 @@ impl NativeChatHost {
             if let Some(run) = rest
                 .strip_prefix(routine.id.as_str())
                 .and_then(|tail| tail.strip_prefix("-run-"))
-                && routine.runs.iter().any(|(id, _, _)| id == run)
+                && routine
+                    .runs
+                    .iter()
+                    .any(|line| matches!(line, RunLineSnap::Ran { run_id, .. } if run_id == run))
             {
                 return Some(Command::OpenRoutineRun {
                     routine_id: routine.id.clone(),
@@ -8330,6 +8405,54 @@ mod tests {
         }
     }
 
+    /// A run's line of a routine's Run history, as the tree is given it.
+    fn ran(run_id: &str, cause: &'static str, status: &'static str) -> RunLineSnap {
+        RunLineSnap::Ran {
+            run_id: run_id.into(),
+            cause,
+            status,
+        }
+    }
+
+    /// A firing the server skipped is on the tree among the runs, by when it was due, with what
+    /// set it off and the server's sentence for why, and state `skipped`. It started no run, so
+    /// a click on it is refused in words rather than sent as an open of a run that is not there,
+    /// and the run beside it still opens.
+    #[test]
+    fn a_skipped_line_of_the_history_says_why_and_opens_nothing() {
+        let said = "Skipped: your computer was off, so your plan couldn't answer";
+        let mut host = host();
+        host.computer_open = true;
+        let mut fired = routine("sch-1-2", "cron");
+        fired.runs = vec![
+            RunLineSnap::Skipped {
+                at_ms: 1_790_000_000_000,
+                cause: "Schedule",
+                reason: said.into(),
+            },
+            ran("run_a", "Test run", "ok"),
+        ];
+        host.routines = vec![fired];
+        let tree = host.snapshot();
+        let skipped = tree
+            .find(&ids::routine_skipped("sch-1-2", 1_790_000_000_000))
+            .expect("the skipped line");
+        assert_eq!(skipped.name, "Schedule");
+        assert_eq!(skipped.value.as_deref(), Some(said));
+        assert!(skipped.states.iter().any(|state| state == "skipped"));
+
+        let refused = host
+            .click(&ids::routine_skipped("sch-1-2", 1_790_000_000_000))
+            .unwrap_err();
+        assert!(refused.contains("started no run"), "{refused}");
+        assert!(host.take_command().is_none(), "nothing was opened");
+        host.click(&ids::routine_run("sch-1-2", "run_a")).unwrap();
+        assert!(matches!(
+            host.take_command().unwrap(),
+            Command::OpenRoutineRun { run_id, .. } if run_id == "run_a"
+        ));
+    }
+
     /// A routine the server has can be test-run, and its history is on the tree line by line:
     /// what set each run off, and where it got to. A draft has neither.
     #[test]
@@ -8338,8 +8461,8 @@ mod tests {
         host.computer_open = true;
         let mut fired = routine("sch-1-2", "webhook");
         fired.runs = vec![
-            ("run_b".into(), "Test run", "running"),
-            ("run_a".into(), "Webhook", "ok"),
+            ran("run_b", "Test run", "running"),
+            ran("run_a", "Webhook", "ok"),
         ];
         host.routines = vec![fired, routine("draft-1", "draft")];
         let tree = host.snapshot();
@@ -8799,7 +8922,7 @@ mod tests {
             Command::OpenRoutineThread { routine_id } if routine_id == "sch-1-2"
         ));
         // A line of its history opens the same thread at that run, dashes in both ids and all.
-        host.routines[0].runs = vec![("run-a-1".into(), "Test run", "ok")];
+        host.routines[0].runs = vec![ran("run-a-1", "Test run", "ok")];
         host.click(&ids::routine_run("sch-1-2", "run-a-1")).unwrap();
         assert!(matches!(
             host.take_command().unwrap(),

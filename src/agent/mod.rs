@@ -96,7 +96,12 @@
 //! routine the server has; disabled, and a click refused in the editor's words, on a server that
 //! cannot run a routine on demand), `routine-{id}-run-{runId}` (one Run history line: label `Test
 //! run` / `Webhook` / `Schedule`, value `running` / `waiting` / `ok` / `error`; a click opens the
-//! routine's thread and brings that run into view once the thread has it), `routine-{id}-delete`.
+//! routine's thread and brings that run into view once the thread has it),
+//! `routine-{id}-skipped-{atMs}` (a Run history line for a firing the server skipped because the
+//! Bot's own plan could not answer, opengrok-server #316, by when it was due: label as a run's,
+//! value = the server's sentence for why, e.g. "Skipped: your computer was off, so your plan
+//! couldn't answer", state `skipped`; it started no run, so a click is refused and opens nothing),
+//! `routine-{id}-delete`.
 //! While a routine is open in the Computer pane, its header's four icons are under
 //! `computer-pane`, each acting on that routine: `routine-history-toggle` (label `Run history`, or
 //! `Back to the routine` with state `selected` while the panel shows the Run history alone in

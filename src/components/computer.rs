@@ -18,8 +18,8 @@ use crate::opengrok::{
 };
 use crate::state::{
     AgentRoutine, AppState, ComputerView, LAST_WAKE_STAYS, NUMBERED_WEEKDAYS, ONE_WAKE_PER_ROUTINE,
-    ROUTINE_RUN_UNAVAILABLE, ROUTINE_RUNS_UNAVAILABLE, RoutineTrigger, ScheduleUnit, WakeBox,
-    WakeEditor, WakeTab, routine_notes, routine_trouble_line, unsaved_lines,
+    ROUTINE_RUN_UNAVAILABLE, ROUTINE_RUNS_UNAVAILABLE, RoutineTrigger, RunOutcome, ScheduleUnit,
+    WakeBox, WakeEditor, WakeTab, routine_notes, routine_trouble_line, unsaved_lines,
 };
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{InputEvent, InputState, Textarea, TextareaState};
@@ -995,8 +995,9 @@ fn unsaved_block(
 }
 
 /// A routine's Run history: one line per run, newest first, each opening the routine's thread
-/// at that run. In its place, on a server that cannot list a routine's runs, the sentence saying
-/// so; on a routine with none, "No runs yet".
+/// at that run, and among them each firing the server skipped, which says why and opens nothing.
+/// In its place, on a server that cannot list a routine's runs, the sentence saying so; on a
+/// routine with none, "No runs yet".
 #[allow(clippy::too_many_arguments)]
 fn routine_history(
     routine_id: &str,
@@ -1031,6 +1032,12 @@ fn routine_history(
         .w_full()
         .gap(px(6.))
         .children(runs.into_iter().enumerate().map(|(i, run)| {
+            let (run_id, status) = match run.outcome.clone() {
+                RunOutcome::Ran { run_id, status } => (run_id, status),
+                RunOutcome::Skipped { reason } => {
+                    return skipped_line(i, &run, reason, muted).into_any_element();
+                }
+            };
             let routine_id = routine_id.to_string();
             h_flex()
                 .id(SharedString::from(format!("run-{i}")))
@@ -1041,7 +1048,6 @@ fn routine_history(
                 .on_click({
                     let persist = persist.clone();
                     let app = app.clone();
-                    let run_id = run.run_id.clone();
                     move |_, _, cx| {
                         persist(cx);
                         app.update(cx, |state, cx| {
@@ -1059,7 +1065,7 @@ fn routine_history(
                         .child(div().text_sm().child(run.at.clone()))
                         .child(div().text_xs().text_color(muted).child(run.cause_label())),
                 )
-                .child(match run.status {
+                .child(match status {
                     ScheduleRunStatus::Ok => Icon::default()
                         .path("icons/check.svg")
                         .size(px(14.))
@@ -1082,8 +1088,40 @@ fn routine_history(
                         .into_any_element(),
                     ScheduleRunStatus::Other => div().into_any_element(),
                 })
+                .into_any_element()
         }))
         .into_any_element()
+}
+
+/// A firing the server skipped, as its line of the Run history: when it was due and what set it
+/// off, the skip's own icon where a run's status goes, and under them the server's sentence for
+/// why ("Skipped: your computer was off, so your plan couldn't answer"). It started no run, so it
+/// opens nothing, and nothing about it says it can be pressed.
+fn skipped_line(i: usize, run: &crate::state::RoutineRun, reason: String, muted: Hsla) -> Div {
+    v_flex()
+        .w_full()
+        .py(px(4.))
+        .gap(px(2.))
+        .child(
+            h_flex()
+                .id(SharedString::from(format!("skipped-{i}")))
+                .w_full()
+                .justify_between()
+                .items_center()
+                .child(
+                    h_flex()
+                        .gap(px(6.))
+                        .child(div().text_sm().child(run.at.clone()))
+                        .child(div().text_xs().text_color(muted).child(run.cause_label())),
+                )
+                .child(
+                    Icon::default()
+                        .path("icons/circle-slash.svg")
+                        .size(px(14.))
+                        .text_color(muted),
+                ),
+        )
+        .child(div().text_xs().text_color(muted).child(reason))
 }
 
 /// What a routine's header icons act on, and whether each can.

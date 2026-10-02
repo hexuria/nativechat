@@ -324,6 +324,16 @@ impl OpenGrokError {
         self.status == Some(409) && self.code() == Some(super::client::SKILLS_CHANGED)
     }
 
+    /// `POST /schedules/{id}/run` refused because the routine's Bot answers on its person's own
+    /// plan and the plan could not answer now (opengrok-server #316, PR #334 at 628dcff:
+    /// `run_schedule_now` in `crates/opengrok-server/src/autonomy/routes.rs`): `409 {error,
+    /// code}`, the code why (`relay_offline`, `proxy_down`) and the sentence what the person is
+    /// shown. The server keeps the firing in the routine's history as skipped. Its other 409, for
+    /// a retired coworker, names no code.
+    pub fn is_skipped_firing(&self) -> bool {
+        self.status == Some(409) && self.code().is_some()
+    }
+
     /// `POST /pending` lost the race the server describes as "another writer got there
     /// first; retry". The insert collided and the winning row was gone before it could be
     /// read, so the same POST is worth one more try. Any other 409 is a decision.
