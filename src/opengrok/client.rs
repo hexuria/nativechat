@@ -952,7 +952,7 @@ impl OpenGrokClient {
         mut on_event: F,
     ) -> Result<String, OpenGrokError>
     where
-        F: FnMut(&serde_json::Value),
+        F: FnMut(&serde_json::Value, std::time::Instant),
     {
         let mut forwarded = json!({ "coworkerId": coworker_id });
         if let Some(kind) = inference_source {
@@ -1012,6 +1012,9 @@ impl OpenGrokClient {
         let mut persons = super::gen_ui::PersonsText::default();
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(|e| OpenGrokError::transport(&e))?;
+            // Every frame decoded from one delivery shares its arrival boundary. Parsing time
+            // is not tool time, and buffered END/RESULT pairs cannot be measured individually.
+            let arrived_at = std::time::Instant::now();
             buf.push_str(&String::from_utf8_lossy(&chunk));
             while let Some(idx) = buf.find("\n\n") {
                 let frame = buf[..idx].to_string();
@@ -1046,7 +1049,7 @@ impl OpenGrokClient {
                     {
                         assistant.push_str(delta);
                     }
-                    on_event(&value);
+                    on_event(&value, arrived_at);
                 }
             }
         }
@@ -5064,7 +5067,7 @@ mod tests {
         let server = MockServer::start().await;
         let client = OpenGrokClient::new(&server.uri()).unwrap();
         let error = client
-            .run_turn("cw", "t", "run_1", &[], None, None, None, None, |_| {})
+            .run_turn("cw", "t", "run_1", &[], None, None, None, None, |_, _| {})
             .await
             .unwrap_err();
         assert!(error.is_signed_out());
@@ -5618,7 +5621,7 @@ mod tests {
                 None,
                 Some("pum_1"),
                 None,
-                |_| {},
+                |_, _| {},
             )
             .await
             .unwrap();
@@ -5703,7 +5706,7 @@ mod tests {
                 None,
                 Some("pum_1"),
                 None,
-                |_| {},
+                |_, _| {},
             )
             .await
             .expect_err("refused")
@@ -5731,7 +5734,17 @@ mod tests {
             let client = OpenGrokClient::new(&server.uri()).unwrap();
             put_cookie(&client, &live_session());
             let error = client
-                .run_turn("cw_1", "th_1", "run_1", &[], None, None, None, None, |_| {})
+                .run_turn(
+                    "cw_1",
+                    "th_1",
+                    "run_1",
+                    &[],
+                    None,
+                    None,
+                    None,
+                    None,
+                    |_, _| {},
+                )
                 .await
                 .expect_err("refused");
             assert_eq!(error.status, Some(409));
@@ -5830,7 +5843,7 @@ mod tests {
         // is all that is left, and the app is still showing a roster.
         put_cookie(&client, "og_refresh=tok-r; Path=/; Max-Age=3600");
         client
-            .run_turn("cw", "t", "run_1", &[], None, None, None, None, |_| {})
+            .run_turn("cw", "t", "run_1", &[], None, None, None, None, |_, _| {})
             .await
             .expect("the turn goes out, on a token the app fetched for itself");
 
@@ -5866,7 +5879,7 @@ mod tests {
         let client = OpenGrokClient::new(&server.uri()).unwrap();
         put_cookie(&client, &live_session());
         let error = client
-            .run_turn("cw", "t", "run_1", &[], None, None, None, None, |_| {})
+            .run_turn("cw", "t", "run_1", &[], None, None, None, None, |_, _| {})
             .await
             .unwrap_err();
         assert!(error.is_signed_out());
@@ -5897,7 +5910,7 @@ mod tests {
         let client = OpenGrokClient::new(&server.uri()).unwrap();
         put_cookie(&client, &live_session());
         let error = client
-            .run_turn("cw", "t", "run_1", &[], None, None, None, None, |_| {})
+            .run_turn("cw", "t", "run_1", &[], None, None, None, None, |_, _| {})
             .await
             .unwrap_err();
         assert!(!error.is_signed_out(), "nobody should be asked to sign in");
@@ -6390,7 +6403,7 @@ mod tests {
                 None,
                 {
                     let first_at = first_at.clone();
-                    move |event| {
+                    move |event, _| {
                         let kind = event.get("type").and_then(|v| v.as_str()).unwrap_or("");
                         if kind == "TEXT_MESSAGE_CONTENT" {
                             let mut slot = first_at.lock().unwrap();
@@ -6411,6 +6424,49 @@ mod tests {
             until_first + Duration::from_millis(50) < total,
             "first text at {until_first:?}, stream ended at {total:?} — frames were buffered"
         );
+    }
+
+    #[tokio::test]
+    async fn buffered_sse_actions_share_arrival_instead_of_timing_callback_work() {
+        let server = MockServer::start().await;
+        let events = [
+            json!({"type":"TOOL_CALL_START","toolCallId":"c1","toolCallName":"shell"}),
+            json!({"type":"TOOL_CALL_END","toolCallId":"c1"}),
+            json!({"type":"TOOL_CALL_RESULT","toolCallId":"c1","content":"ok","ok":true}),
+            json!({"type":"RUN_FINISHED","runId":"r1"}),
+        ];
+        let body: String = events
+            .iter()
+            .map(|event| format!("data: {event}\n\n"))
+            .collect();
+        Mock::given(method("POST"))
+            .and(path("/ag-ui"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(body),
+            )
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        put_cookie(&client, &live_session());
+        let mut arrivals = Vec::new();
+        let mut turn = super::super::gen_ui::TurnAssembler::default();
+        client
+            .run_turn("cw", "t", "r1", &[], None, None, None, None, |event, at| {
+                arrivals.push(at);
+                turn.push_event_at(event, Some(at));
+                // A slow render must not turn parsing of the same delivery into tool execution.
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            })
+            .await
+            .unwrap();
+        assert_eq!(arrivals.len(), events.len());
+        assert!(arrivals.windows(2).all(|pair| pair[0] == pair[1]));
+        let (_, parts) = turn.snapshot();
+        assert!(parts.iter().any(
+            |part| matches!(part, super::super::ChatPart::Step(step) if step.took_ms.is_none())
+        ));
     }
 
     /// The turn's body is a contract with the server, which reads `forwardedProps` for the
@@ -6458,7 +6514,7 @@ mod tests {
                 None,
                 None,
                 None,
-                |_| {},
+                |_, _| {},
             )
             .await
             .unwrap();
@@ -6501,7 +6557,7 @@ mod tests {
                 None,
                 None,
                 None,
-                |_| {},
+                |_, _| {},
             )
             .await
             .unwrap();
@@ -6559,7 +6615,7 @@ mod tests {
                 Some("skl_1"),
                 None,
                 None,
-                |_| {},
+                |_, _| {},
             )
             .await
             .unwrap();
@@ -6573,7 +6629,7 @@ mod tests {
                 None,
                 None,
                 None,
-                |_| {},
+                |_, _| {},
             )
             .await
             .unwrap();
@@ -6818,7 +6874,7 @@ mod tests {
                     None,
                     None,
                     source,
-                    |_| {},
+                    |_, _| {},
                 )
                 .await
                 .unwrap();

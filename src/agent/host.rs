@@ -114,6 +114,9 @@ pub mod ids {
     /// any, and its Thought rows (value = how many), only while it has any.
     pub const REPLY_STEPS: &str = "reply-steps";
     pub const REPLY_REASONING: &str = "reply-reasoning";
+    /// The newest coworker reply's Timing row (value = what it says shut, `10s total`), in the
+    /// tree only while the feed draws one.
+    pub const REPLY_TIMING: &str = "reply-timing";
 
     /// One step of the newest reply, by the call it was.
     pub fn step(call_id: &str) -> String {
@@ -1484,7 +1487,10 @@ struct RecipeDetailSnap {
 struct ReplyRunSnap {
     steps: Vec<StepSnap>,
     /// Each Thought row's key, and whether it is open.
-    thoughts: Vec<(String, bool)>,
+    thoughts: Vec<(String, bool, Option<String>)>,
+    /// Its Timing row, from the function that builds the feed's (`steps::timing_row`), while
+    /// the feed draws one.
+    timing: Option<crate::components::steps::RunRow>,
 }
 
 /// One step of that reply.
@@ -1497,16 +1503,29 @@ struct StepSnap {
     /// Its key in `AppState::expanded_steps`, and whether its row is open.
     key: String,
     open: bool,
+    /// How long the call took, as the end of its row says it (`StepSpec::took`), while the row
+    /// says it.
+    took: Option<String>,
 }
 
 impl ReplyRunSnap {
-    fn from_parts(
-        message_id: &str,
-        parts: &[ChatPart],
+    /// `show_timing` is Settings → Show turn timing, which puts each call's time on its row and
+    /// the Timing row under the reply.
+    fn from_message(
+        message: &crate::state::Message,
         open: &std::collections::HashSet<String>,
+        show_timing: bool,
     ) -> Self {
-        let mut run = Self::default();
-        for part in parts {
+        let message_id = message.id.as_str();
+        let mut run = Self {
+            timing: message
+                .run_timing
+                .as_ref()
+                .filter(|_| show_timing)
+                .and_then(|frame| crate::components::steps::timing_row(message_id, frame, open)),
+            ..Self::default()
+        };
+        for part in &message.parts {
             match part {
                 ChatPart::Step(step) => {
                     let key = crate::components::steps::step_key(message_id, &step.call_id);
@@ -1516,11 +1535,16 @@ impl ReplyRunSnap {
                         status: step.status(),
                         open: open.contains(&key),
                         key,
+                        took: show_timing.then(|| step.took()).flatten(),
                     });
                 }
-                ChatPart::Reasoning(_) => {
+                ChatPart::Reasoning(thought) => {
                     let key = crate::components::steps::thought_key(message_id, run.thoughts.len());
-                    run.thoughts.push((key.clone(), open.contains(&key)));
+                    run.thoughts.push((
+                        key.clone(),
+                        open.contains(&key),
+                        show_timing.then(|| thought.took()).flatten(),
+                    ));
                 }
                 _ => {}
             }
@@ -2694,7 +2718,9 @@ impl NativeChatHost {
                 .iter()
                 .find(|c| Some(&c.id) == state.active_conversation_id.as_ref())
                 .and_then(|c| c.messages.iter().rev().find(|m| !m.is_me && !m.hidden))
-                .map(|m| ReplyRunSnap::from_parts(&m.id, &m.parts, &state.expanded_steps))
+                .map(|m| {
+                    ReplyRunSnap::from_message(m, &state.expanded_steps, state.show_turn_timing)
+                })
                 .unwrap_or_default(),
             bot_status: state.visible_bot_status(),
             turn_in_flight: state.is_turn_in_flight(),
@@ -3730,6 +3756,9 @@ impl NativeChatHost {
     /// its Thought rows. Each is in the tree only while the reply has some, so `assert --exists
     /// false` is "this reply did nothing but talk". An open row has state `expanded`; for the
     /// Thought rows that is all of them open, which is what a click on `reply-reasoning` asks for.
+    /// A step whose row ends with how long the call took has that as a state, `took-1s`; its
+    /// value stays how it came out. The Timing row under the reply is `reply-timing`, with its
+    /// lines under it while it is open.
     fn reply_run_nodes(&self) -> Vec<UiNode> {
         let run = &self.reply_run;
         let mut nodes = Vec::new();
@@ -3747,6 +3776,9 @@ impl NativeChatHost {
                                 if step.open {
                                     node.states.push("expanded".into());
                                 }
+                                if let Some(took) = &step.took {
+                                    node.states.push(format!("took-{took}"));
+                                }
                                 node
                             })
                             .collect(),
@@ -3756,10 +3788,29 @@ impl NativeChatHost {
         if !run.thoughts.is_empty() {
             let mut node = UiNode::status(ids::REPLY_REASONING, "Thought")
                 .with_value(run.thoughts.len().to_string());
-            if run.thoughts.iter().all(|(_, open)| *open) {
+            if run.thoughts.iter().all(|(_, open, _)| *open) {
                 node.states.push("expanded".into());
             }
+            node = node.with_children(
+                run.thoughts
+                    .iter()
+                    .enumerate()
+                    .map(|(n, (_, open, took))| {
+                        let mut thought = UiNode::status(format!("reply-thought-{n}"), "Thinking");
+                        if *open {
+                            thought.states.push("expanded".into());
+                        }
+                        if let Some(took) = took {
+                            thought.states.push(format!("took-{took}"));
+                        }
+                        thought
+                    })
+                    .collect(),
+            );
             nodes.push(node);
+        }
+        if let Some(crate::components::steps::RunRow::Timing { total, .. }) = &run.timing {
+            nodes.push(UiNode::status(ids::REPLY_TIMING, "Timing").with_value(total.clone()));
         }
         nodes
     }
@@ -3767,16 +3818,24 @@ impl NativeChatHost {
     /// A click on one of the newest reply's steps opens it, or shuts it if it is open. What
     /// holds it opens with it: an open step keeps its "N steps" line open (see
     /// `components::steps`). A click on `reply-reasoning` opens every Thought row, or shuts
-    /// them all once they all are.
+    /// them all once they all are. The `reply-timing` footer is plain text and refuses clicks.
     fn reply_run_command(&self, target: &str) -> Option<Result<Command, String>> {
+        if target == ids::REPLY_TIMING {
+            return Some(match &self.reply_run.timing {
+                Some(_) => {
+                    Err("the newest reply's Timing row is its total and does not open".to_string())
+                }
+                None => Err("the newest reply has no Timing row".to_string()),
+            });
+        }
         if target == ids::REPLY_REASONING {
             let thoughts = &self.reply_run.thoughts;
             if thoughts.is_empty() {
                 return Some(Err("the newest reply has no Thought row".to_string()));
             }
             return Some(Ok(Command::SetStepsOpen {
-                keys: thoughts.iter().map(|(key, _)| key.clone()).collect(),
-                open: !thoughts.iter().all(|(_, open)| *open),
+                keys: thoughts.iter().map(|(key, _, _)| key.clone()).collect(),
+                open: !thoughts.iter().all(|(_, open, _)| *open),
             }));
         }
         let call_id = target.strip_prefix("step-")?;
@@ -9558,6 +9617,7 @@ mod tests {
                 arguments: arguments.into(),
                 result: result.map(|(content, _)| content.to_string()),
                 ok: result.map(|(_, ok)| ok),
+                took_ms: None,
             })
         };
         let reply = |id: &str, is_me: bool, parts: Vec<ChatPart>| crate::state::Message {
@@ -9682,6 +9742,147 @@ mod tests {
         let tree = host(&state).snapshot();
         assert!(tree.find(ids::REPLY_STEPS).is_none());
         assert!(tree.find(ids::REPLY_REASONING).is_none());
+    }
+
+    /// The newest reply, one call this app timed and one it did not, in a thread of its own.
+    fn one_timed_reply() -> AppState {
+        use crate::opengrok::StepSpec;
+        let step = |call_id: &str, took_ms: Option<u64>| {
+            ChatPart::Step(StepSpec {
+                call_id: call_id.into(),
+                tool: "shell".into(),
+                arguments: "{\"command\":\"uname -a\"}".into(),
+                result: Some("Darwin".into()),
+                ok: Some(true),
+                took_ms,
+            })
+        };
+        let mut state = AppState::new();
+        state.coworkers = vec![
+            serde_json::from_value(serde_json::json!({ "id": "cw_1", "name": "Hex" })).unwrap(),
+        ];
+        state.active_coworker_id = Some("cw_1".into());
+        state.active_conversation_id = Some("cw_1".into());
+        state.conversations.push(crate::state::Conversation {
+            id: "cw_1".into(),
+            title: "Hex".into(),
+            created_at: String::new(),
+            updated_at: String::new(),
+            messages: vec![crate::state::Message {
+                id: "m_new".into(),
+                sender: "AI".into(),
+                content: "It is a Mac.".into(),
+                sent_at: std::time::SystemTime::UNIX_EPOCH,
+                finished_at: None,
+                run_timing: None,
+                reply_source: None,
+                is_me: false,
+                reply_preview: None,
+                reply_to_id: None,
+                reply_is_me: false,
+                parts: vec![
+                    step("c1", Some(1000)),
+                    step("c2", None),
+                    ChatPart::Text("It is a Mac.".into()),
+                ],
+                run_id: None,
+                hidden: false,
+            }],
+            unread_count: 0,
+            origin: None,
+        });
+        state
+    }
+
+    fn signed_in_host(state: &AppState) -> NativeChatHost {
+        let mut host = NativeChatHost::from_app(state);
+        host.signed_in = true;
+        host
+    }
+
+    /// With Settings → Show turn timing on, a step whose row ends with how long the call took
+    /// has that as a state, and its value still says how it came out; a call this app did not
+    /// time has none. With the setting off, no row says it, and no step has it.
+    #[test]
+    fn a_step_s_time_is_a_state_while_its_row_says_it() {
+        let mut state = one_timed_reply();
+        let took = |state: &AppState, call_id: &str| {
+            let tree = signed_in_host(state).snapshot();
+            let node = tree.find(&ids::step(call_id)).unwrap();
+            (
+                node.value.clone().unwrap_or_default(),
+                node.states
+                    .iter()
+                    .filter(|state| state.starts_with("took-"))
+                    .cloned()
+                    .collect::<Vec<_>>(),
+            )
+        };
+        assert_eq!(took(&state, "c1"), ("ok".to_string(), Vec::new()));
+        state.show_turn_timing = true;
+        assert_eq!(
+            took(&state, "c1"),
+            ("ok".to_string(), vec!["took-1s".to_string()])
+        );
+        assert_eq!(took(&state, "c2"), ("ok".to_string(), Vec::new()));
+    }
+
+    /// With Settings → Show turn timing on, the Timing row under the newest reply is on the tree
+    /// with what it says shut, and a click opens it on its lines, as a person's does. A row that
+    /// is the total alone does not open, and the click says so. With the setting off, or with no
+    /// `run-timing` frame, it is not there, as it is not drawn.
+    #[test]
+    fn the_timing_footer_is_on_the_tree_but_never_opens() {
+        use crate::opengrok::TurnTiming;
+        let mut state = one_timed_reply();
+        state.show_turn_timing = true;
+        let timing_node = |state: &AppState| {
+            signed_in_host(state)
+                .snapshot()
+                .find(ids::REPLY_TIMING)
+                .cloned()
+        };
+        assert!(timing_node(&state).is_none(), "no frame came");
+
+        state.conversations[0].messages[0].run_timing =
+            TurnTiming::from_value(&serde_json::json!({
+                "model_ms": [2000, 2000],
+                "tools": [{ "name": "shell", "ms": 1000 }],
+                "tool_wait_ms": 1000,
+                "total_ms": 10000,
+                "tool_rounds": 1
+            }));
+        state.show_turn_timing = false;
+        assert!(timing_node(&state).is_none(), "the setting is off");
+
+        state.show_turn_timing = true;
+        let shut = timing_node(&state).expect("the Timing row");
+        assert_eq!(shut.value.as_deref(), Some("10s total"));
+        assert!(!shut.states.contains(&"expanded".to_string()));
+        assert!(shut.children.is_empty(), "shut, it is the total alone");
+        assert!(signed_in_host(&state).snapshot().ids_are_unique());
+
+        let mut driver = signed_in_host(&state);
+        assert!(driver.click(ids::REPLY_TIMING).is_err());
+        assert!(driver.take_command().is_none());
+        state.mark_steps_open(&[crate::components::steps::timing_key("m1")], true);
+        let open = timing_node(&state).expect("the Timing row");
+        assert!(!open.states.contains(&"expanded".to_string()));
+        let lines: Vec<(String, String)> = open
+            .children
+            .iter()
+            .map(|line| (line.id.clone(), line.name.clone()))
+            .collect();
+        assert_eq!(lines, Vec::<(String, String)>::new());
+
+        // A frame with a total and nothing else is a row that does not open.
+        state.conversations[0].messages[0].run_timing =
+            TurnTiming::from_value(&serde_json::json!({ "total_ms": 10000 }));
+        assert_eq!(
+            timing_node(&state).and_then(|node| node.value),
+            Some("10s total".to_string())
+        );
+        assert!(signed_in_host(&state).click(ids::REPLY_TIMING).is_err());
     }
 
     /// Settings → Computer lists each connected computer's local-exec mode, marks this Mac, and

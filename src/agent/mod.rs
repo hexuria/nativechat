@@ -44,10 +44,18 @@
 //! `approval-{call}` (title = the card's own, states = reason, thread, tool),
 //! `reply-steps` (the newest coworker reply's steps, a list with value = how many; in the tree
 //! only while it has any) with `step-{call_id}` under it (label = the step row's own words,
-//! value `running` / `ok` / `failed`, state `expanded` while its row is open; a click opens or
-//! shuts it, and an open step holds its "N steps" line open), `reply-reasoning` (value = how
-//! many Thought rows that reply has, in the tree only while it has any; state `expanded` while
-//! all are open; a click opens them all, or shuts them once they all are),
+//! value `running` / `ok` / `failed`, state `expanded` while its row is open, and state
+//! `took-{time}`, e.g. `took-1s`, while the end of its row says how long the call took: Settings
+//! → Show turn timing on, and a call this Mac timed from its arguments' end to its answer, which
+//! a replay, a call answered together with another and a call that waited on a person never
+//! are; a click opens or shuts it, and an open step holds its "N steps" line open),
+//! `reply-reasoning` (value = how many Thought rows that reply has, in the tree only while it has
+//! any; state `expanded` while all are open; a click opens them all, or shuts them once they all
+//! are), with `reply-thought-{n}` underneath (name = Thinking, state `took-{time}` when that
+//! segment was timed). `reply-timing` is the plain total under that reply, value = `10s total`;
+//! in the tree only while Show turn timing is on and the run sent a total in `run-timing`.
+//! It has no children or expanded state, and refuses clicks: durations belong to action rows,
+//! not a second breakdown under the total.
 //! `recipe-run` (on the open recipe: value = the bot it plays on, disabled while it cannot run
 //! or a run is going; invoke `recipe.run {bot?}`), `recipe-run-result` (value `running` / `ok`
 //! / `failed` / `interrupted`), `recipe-error` (what the page says went wrong, e.g. a

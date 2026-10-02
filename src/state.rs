@@ -32,6 +32,7 @@ use crate::opengrok::{
     place_hitl_cards_in_document_order, policy_answer, reads_as_gateway_unreachable, retry_enqueue,
     save_login_from_local, serve_local_exec, stamp_duration, stored_machine_id, tool_standin,
 };
+use crate::opengrok::{FrameArrivals, keep_call_times};
 use crate::reachability::Reachability;
 use crate::send_policy::{Busy, OnSend, SendPlan, plan_send};
 use crate::services::database::{
@@ -1523,7 +1524,7 @@ fn saved_parts(parts: &[ChatPart]) -> Vec<MessagePart> {
             }
             ChatPart::Reasoning(thought) => {
                 close_text_run(&mut words, &mut saved);
-                saved.push(MessagePart::Reasoning(thought.clone()));
+                saved.push(MessagePart::Reasoning(thought.stored()));
             }
         }
     }
@@ -1600,9 +1601,9 @@ fn restored_parts(content: &str, saved: Vec<MessagePart>) -> Vec<ChatPart> {
                 .and_then(|value| crate::opengrok::StepSpec::from_value(call_id, &value))
                 .map(ChatPart::Step),
             // Held to the size a thought is kept at, whichever build wrote it.
-            MessagePart::Reasoning(thought) => {
-                Some(ChatPart::Reasoning(crate::opengrok::capped(&thought)))
-            }
+            MessagePart::Reasoning(thought) => Some(ChatPart::Reasoning(
+                crate::opengrok::ThoughtSpec::from_stored(&thought),
+            )),
         })
         .collect()
 }
@@ -2894,9 +2895,18 @@ fn replayed_run(
     events: &[serde_json::Value],
     status: &str,
 ) -> (String, Vec<ChatPart>, Option<ReplySource>) {
+    reply_from_followed(events, status, &FrameArrivals::default())
+}
+
+/// Replay with locally observed frame arrivals, retaining the reply's source badge.
+fn reply_from_followed(
+    events: &[serde_json::Value],
+    status: &str,
+    arrivals: &FrameArrivals,
+) -> (String, Vec<ChatPart>, Option<ReplySource>) {
     let mut assembler = TurnAssembler::default();
     for event in events {
-        assembler.push_event(event);
+        assembler.push_event_at(event, arrivals.at(event));
     }
     if status != "running" {
         assembler.finish();
@@ -4575,8 +4585,8 @@ pub struct AppState {
     pub local_exec_machine_id: Option<String>,
     local_exec_cancel: Option<Arc<AtomicBool>>,
     pub expanded_shell_output: HashSet<String>,
-    /// The step rows, groups of steps and Thought rows the person has opened, by the keys
-    /// `components::steps` gives them. Not saved: every one of them is shut when a thread is
+    /// The step rows, groups of steps, Thought rows and Timing rows the person has opened, by the
+    /// keys `components::steps` gives them. Not saved: every one of them is shut when a thread is
     /// opened again, which is how a reply is meant to be read.
     pub expanded_steps: HashSet<String>,
     pub computers: Vec<ConnectedComputer>,
@@ -12773,7 +12783,7 @@ impl AppState {
         cx: &mut Context<Self>,
     ) {
         let (plain, parts, source) = replayed_run(&replay.events, &replay.status);
-        let parts = self.graft_user_forms(parts);
+        let mut parts = self.graft_user_forms(parts);
         let plain = replayed_ending(
             &replay.events,
             &replay.status,
@@ -12786,6 +12796,8 @@ impl AppState {
             streaming_message_mut(&mut self.conversations, conversation_id, &turn.message_id)
         {
             message.content = plain.clone();
+            // What the stream timed before the thread was left keeps its times.
+            keep_call_times(&message.parts, &mut parts);
             message.parts = parts.clone();
             if wear_replayed_source(message, source.clone()) {
                 badge = source.map(|source| ReplayedBadge {
@@ -13270,7 +13282,7 @@ impl AppState {
                             skill.as_deref(),
                             pending_id.as_deref(),
                             turn_source,
-                            |event| {
+                            |event, arrived_at| {
                                 match tracker.tick(event) {
                                     ActivityTick::Keep => {}
                                     tick => {
@@ -13294,7 +13306,9 @@ impl AppState {
                                         });
                                     }
                                 }
-                                assembler.push_event(event);
+                                // When each frame came is how a call's row knows how long its
+                                // answer took: nothing on the wire says.
+                                assembler.push_event_at(event, Some(arrived_at));
                                 let timing = TurnTiming::from_event(event);
                                 let source = source_news(&assembler, &mut told_source);
                                 let (plain, parts) = assembler.snapshot();
@@ -14074,6 +14088,9 @@ impl AppState {
         cx.spawn(async move |this, cx| {
             let mut last_len = 0usize;
             let mut last_status = String::new();
+            // When each call's end and answer first came back, so the calls this poll saw
+            // happen can say how long they took.
+            let mut arrivals = FrameArrivals::default();
             for _ in 0..400 {
                 if registered {
                     let settled = this
@@ -14091,6 +14108,7 @@ impl AppState {
                 }
                 match client.replay_run(&run_id).await {
                     Ok(replay) => {
+                        arrivals.note(&replay.events, Instant::now());
                         // The status counts as news of its own: the frame that ends a run is
                         // often one the last poll already saw, and a run that stopped holding
                         // its text back has words to show for it even when nothing new arrived.
@@ -14098,7 +14116,7 @@ impl AppState {
                             last_len = replay.events.len();
                             last_status = replay.status.clone();
                             let (plain, parts, source) =
-                                replayed_run(&replay.events, &replay.status);
+                                reply_from_followed(&replay.events, &replay.status, &arrivals);
                             let status = replay.status.clone();
                             // A resumed turn that only ran tools says what it did, so the
                             // thread keeps a memory of the run the person allowed.
@@ -14121,7 +14139,7 @@ impl AppState {
                                     + Duration::from_millis(replay.started_at_ms as u64)
                             });
                             let _ = this.update(cx, |state, cx| {
-                                let parts = state.graft_user_forms(parts.clone());
+                                let mut parts = state.graft_user_forms(parts.clone());
                                 // The bubble this run has been filling in all along, by the name
                                 // it was given when the turn started — the resumed half of a turn
                                 // belongs to the same row as the half before the card. Only when
@@ -14151,6 +14169,9 @@ impl AppState {
                                     let last = &mut conversation.messages[at];
                                     painted = Some(last.id.clone());
                                     last.content = plain.clone();
+                                    // The half before a card was timed live, and the server's
+                                    // frames cannot give those times back.
+                                    keep_call_times(&last.parts, &mut parts);
                                     last.parts = parts.clone();
                                     if let Some(timing) = TurnTiming::from_events(&replay.events) {
                                         apply_timing(last, timing);
@@ -14548,7 +14569,7 @@ impl AppState {
         cx.notify();
     }
 
-    /// Open or shut step rows, groups of steps and Thought rows, by their keys.
+    /// Open or shut step rows, groups of steps, Thought rows and Timing rows, by their keys.
     pub fn set_steps_open(&mut self, keys: &[String], open: bool, cx: &mut Context<Self>) {
         self.mark_steps_open(keys, open);
         cx.notify();
@@ -21631,7 +21652,7 @@ mod tests {
                     "step {} {} {} {:?} {:?}",
                     step.call_id, step.tool, step.arguments, step.result, step.ok
                 ),
-                ChatPart::Reasoning(thought) => format!("thought {thought}"),
+                ChatPart::Reasoning(thought) => format!("thought {}", thought.text),
             })
             .collect()
     }
@@ -23413,6 +23434,8 @@ mod tests {
                 arguments: "{\"command\":\"du -sh /srv/archive\"}".into(),
                 result: Some("4.0G\t/srv/archive".into()),
                 ok: Some(true),
+                // Timed as it happened: nothing can time it again once the turn is over.
+                took_ms: Some(1234),
             }),
             ChatPart::Step(crate::opengrok::StepSpec {
                 call_id: "c2".into(),
@@ -23420,6 +23443,7 @@ mod tests {
                 arguments: "{\"path\":\"/srv/archive/INDEX\"}".into(),
                 result: None,
                 ok: None,
+                took_ms: None,
             }),
             ChatPart::Text("The archive is four gigabytes.".into()),
         ];
@@ -23460,6 +23484,7 @@ mod tests {
                 arguments: "{\"command\":\"ls\"}".into(),
                 result: Some("a.txt".into()),
                 ok: Some(true),
+                took_ms: None,
             }),
             ChatPart::Text("After.".into()),
         ];
@@ -23656,13 +23681,13 @@ mod tests {
         match raw.as_slice() {
             [ChatPart::Step(step), ChatPart::Reasoning(thought)] => {
                 assert_eq!(step.arguments, "{\"recipe\":\"Gmail login\"}");
-                assert!(thought.len() < "思".repeat(3_500).len());
+                assert!(thought.text.len() < "思".repeat(3_500).len());
                 assert_eq!(
-                    &crate::opengrok::capped(thought),
-                    thought,
+                    &crate::opengrok::capped(&thought.text),
+                    &thought.text,
                     "read back already kept to the cap"
                 );
-                assert!(thought.ends_with('…'));
+                assert!(thought.text.ends_with('…'));
             }
             other => panic!("expected a step and a thought, got {other:?}"),
         }
@@ -23736,6 +23761,7 @@ mod tests {
             arguments: "{\"command\":\"du -sh /srv/archive\"}".into(),
             result: Some("4.0G\t/srv/archive".into()),
             ok: Some(true),
+            took_ms: None,
         })];
         let (content, saved) = reply_to_keep("", &parts).expect("the step is worth keeping");
         let db = test_db().await;
@@ -24599,7 +24625,7 @@ mod tests {
             .push(message(id, true, words));
         state.enqueue_hold(
             "cw_1".to_string(),
-            super::held_message(id.to_string(), words.to_string(), None, None, None),
+            super::held_message(id.to_string(), words.to_string(), None, None, None, None),
         );
     }
 
