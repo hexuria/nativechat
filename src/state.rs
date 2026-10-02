@@ -4718,6 +4718,10 @@ pub struct AppState {
     /// The coworker whose absent computer we already asked the server to (re)provision, so a
     /// status of `absent` heals once per visit rather than on every poll.
     computer_heal_requested: Option<String>,
+    /// The bots whose computer the server has been asked for (`POST /coworkers/{id}/computer`)
+    /// and has not answered about yet. Get a computer waits on its bot's, as two asks at once
+    /// could each make a box.
+    computer_asks: HashSet<String>,
     /// What the main slot shows: the chat, or the Recipes page.
     pub page: MainPage,
     /// The pictures of one turn, opened full window from a tile in the transcript.
@@ -5238,6 +5242,7 @@ impl AppState {
             computer_confirm: None,
             computer_action_error: None,
             computer_heal_requested: None,
+            computer_asks: HashSet::new(),
             computer_endpoint_missing: false,
             computer_poll: None,
             page: MainPage::Chat,
@@ -8408,8 +8413,9 @@ impl AppState {
                     Ok(mut status) => {
                         state.hold_pending_egress_policy(&coworker_id, &mut status);
                         // A bot with no computer gets one: ask once per visit, and let the
-                        // next poll pick up the answer. A recorded error is the server saying
-                        // it cannot, so that is left alone.
+                        // next poll pick up the answer. Asked even when the server has recorded
+                        // why it could not give one, as that reason can be an earlier attempt's;
+                        // the answer carries this attempt's, and Get a computer asks again.
                         let absent = status.state == "absent" && !status.updating();
                         if state.coworker_computer.as_ref() != Some(&status) {
                             state.coworker_computer = Some(status);
@@ -8497,7 +8503,7 @@ impl AppState {
     }
 
     /// Ask the server to (re)provision the active coworker's computer, and take the answer as
-    /// the current status.
+    /// the current status. Once at a time per bot: see [`Self::asking_for_computer`].
     pub fn ensure_coworker_computer(&mut self, cx: &mut Context<Self>) {
         let Some(client) = self.opengrok.clone() else {
             return;
@@ -8505,9 +8511,15 @@ impl AppState {
         let Some(coworker_id) = self.active_coworker_id.clone() else {
             return;
         };
+        if !self.computer_asks.insert(coworker_id.clone()) {
+            return;
+        }
+        cx.notify();
         cx.spawn(async move |this, cx| {
             let result = client.ensure_coworker_computer(&coworker_id).await;
             let _ = this.update(cx, |state, cx| {
+                state.computer_asks.remove(&coworker_id);
+                cx.notify();
                 if state.active_coworker_id.as_deref() != Some(coworker_id.as_str()) {
                     return;
                 }
@@ -8525,6 +8537,14 @@ impl AppState {
             });
         })
         .detach();
+    }
+
+    /// The open bot's computer has been asked for and the server has not answered yet, so Get a
+    /// computer waits: a second ask while the first is making a box could make another.
+    pub fn asking_for_computer(&self) -> bool {
+        self.active_coworker_id
+            .as_ref()
+            .is_some_and(|id| self.computer_asks.contains(id))
     }
 
     /// Ask before acting on the active bot's computer: the dialog over the app.
