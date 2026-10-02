@@ -102,9 +102,9 @@ pub mod ids {
     pub const RECIPE_HISTORY_RUNS: &str = "recipe-history-runs";
     pub const RECIPE_ERROR: &str = "recipe-error";
     /// On a routine's thread: which routine (label) and what fires it (value, `schedule` or
-    /// `webhook`), and the way back to the bot's own chat.
+    /// `webhook`), the line centred under the Bot chip. The way back to the bot's own chat is
+    /// the chip itself, `header-coworker`, which says `goes-home` there.
     pub const CHAT_ROUTINE_THREAD: &str = "chat-routine-thread";
-    pub const CHAT_ROUTINE_BACK: &str = "chat-routine-back";
     /// On a routine's thread: how many bubbles are labelled as its instruction (value).
     pub const CHAT_ROUTINE_INSTRUCTIONS: &str = "chat-routine-instructions";
     pub const AGENT_SETTINGS: &str = "agent-settings";
@@ -825,7 +825,6 @@ pub enum Command {
     OpenRoutineThread {
         routine_id: String,
     },
-    BackToBotChat,
     /// The Bot chip, pressed: the Bot's settings, or its own chat from a routine's thread.
     PressBotChip,
     /// Run the open recipe on this bot.
@@ -1071,7 +1070,6 @@ impl Command {
                 }
             }
             Self::OpenRoutineThread { routine_id } => state.open_routine_thread(&routine_id, cx),
-            Self::BackToBotChat => state.back_to_bot_chat(cx),
             Self::PressBotChip => state.press_bot_chip(cx),
             Self::RunOpenRecipe(coworker_id) => state.run_open_recipe(coworker_id, cx),
             Self::SetComputerExecMode { machine_id, mode } => {
@@ -3426,17 +3424,7 @@ impl NativeChatHost {
                 )
                 .with_child(
                     UiNode::status(ids::CHAT_ROUTINE_THREAD, name.clone()).with_value(word.clone()),
-                )
-                .with_child(UiNode::button(
-                    ids::CHAT_ROUTINE_BACK,
-                    format!(
-                        "Back to {}",
-                        self.sessions
-                            .iter()
-                            .find(|session| session.active)
-                            .map_or("the bot", |session| session.title.as_str())
-                    ),
-                ));
+                );
         }
         if self.queued_sends > 0 {
             page = page.with_child(UiNode::new(
@@ -5651,11 +5639,6 @@ impl NativeChatHost {
             Command::ToggleAccount
         } else if target == ids::HEADER_SETTINGS || target == ids::AGENT_SETTINGS {
             Command::ToggleAgentSettings
-        } else if target == ids::CHAT_ROUTINE_BACK {
-            if self.routine_thread.is_none() {
-                return Err("the open thread is the bot's own chat already".to_string());
-            }
-            Command::BackToBotChat
         } else if target == "agent-tools-toggle" {
             if !self.agent_settings_open {
                 return Err(
@@ -6870,7 +6853,8 @@ mod tests {
     }
 
     /// A routine the server has opens its thread, by its button or by name. The chat then says
-    /// which routine it is and what fires it, and the way back is there only while it is open.
+    /// which routine it is and what fires it, and the way back is the Bot chip, which says it
+    /// goes home only while the thread is open. There is no Back link of its own any more.
     #[test]
     fn a_routines_thread_is_opened_and_left_by_id() {
         let mut host = host();
@@ -6881,8 +6865,7 @@ mod tests {
                 .find(&ids::routine_thread("draft-1"))
                 .is_none()
         );
-        assert!(host.snapshot().find(ids::CHAT_ROUTINE_BACK).is_none());
-        assert!(host.click(ids::CHAT_ROUTINE_BACK).is_err());
+        assert!(host.snapshot().find(ids::CHAT_ROUTINE_THREAD).is_none());
 
         host.click(&ids::routine_thread("sch-1-2")).unwrap();
         assert!(matches!(
@@ -6904,15 +6887,18 @@ mod tests {
         ));
 
         host.routine_thread = Some(("Morning post".into(), "schedule".into()));
+        host.bot_chip_goes_home = true;
         let tree = host.snapshot();
         let badge = tree.find(ids::CHAT_ROUTINE_THREAD).unwrap();
         assert_eq!(badge.name, "Morning post");
         assert_eq!(badge.value.as_deref(), Some("schedule"));
-        host.click(ids::CHAT_ROUTINE_BACK).unwrap();
-        assert!(matches!(
-            host.take_command().unwrap(),
-            Command::BackToBotChat
-        ));
+        assert!(
+            tree.find("chat-routine-back").is_none(),
+            "the Back link is gone"
+        );
+        assert!(host.click("chat-routine-back").is_err());
+        let chip = tree.find(ids::HEADER_COWORKER).unwrap();
+        assert!(chip.states.iter().any(|state| state == "goes-home"));
     }
 
     /// The chip at the top of the chat names the open Bot and says when a press of it goes home:
