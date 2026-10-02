@@ -372,6 +372,13 @@
 //! `Another computer (<label>) is relaying` / `Connecting…` / `Not connected`; value `answering` /
 //! `another-mac` / `connecting` / `not-connected`), `settings-relay-detail` (under it: why this
 //! computer is not connected, state `trouble`, or how to take the relay back),
+//! `settings-relay-via` and `settings-relay-via-use` (only while the relay is switched on here
+//! and the account's way to the plan, as the server keeps it, is still the server's own machine:
+//! the line "Your account still asks the server's own machine first", valued `loopback`, and the
+//! button "Use this computer instead", which moves the account's way at once as
+//! `PUT /account/inference-source` `{kind, via: "mac"}` with the kind the server keeps; dead
+//! while a change is with the server), `settings-relay-via-error` (the server's words for a
+//! refusal of it, or that nobody knows whether it was kept),
 //! `settings-relay-addr` (named `opencodex address`, value = opencodex's address on this
 //! computer; `set_value` and `type` write it; an address not on this computer is refused by Save
 //! with a hint, an emptied one goes back to the default), `settings-relay-key` (named `opencodex
