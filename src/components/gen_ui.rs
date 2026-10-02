@@ -404,7 +404,7 @@ pub(crate) fn approval_title(spec: &ApprovalSpec, bot: &str, review: bool) -> St
 }
 
 /// The server's question on a routine's delete card, which names the routine as it is stored
-/// (opengrok-server #316, PR #334 at 628dcff: `admit` in `crates/opengrok-tools/src/routine.rs`
+/// (opengrok-server #316, #334, on main 8e7387f: `admit` in `crates/opengrok-tools/src/routine.rs`
 /// writes it as the card's `why`, live and in the approvals queue alike). `None` for any other
 /// card, and for a delete card that came without one.
 fn routine_question(spec: &ApprovalSpec) -> Option<&str> {
@@ -886,10 +886,11 @@ mod tests {
 
     /// A routine's card asks about the person's routines, never about the Bot's computer, which
     /// none of the four touches; and a delete, which always asks first, asks in the server's own
-    /// question, naming the routine as it is stored (opengrok-server #316, recorded at PR #334 as
-    /// `agui/custom/run-awaiting-approval/a_delete_asks_first_naming_the_routine_as_stored`).
-    /// That is its title, and nothing under it names the routine by its id; a delete card from
-    /// a frame without the question asks as the others do, and says what it would delete.
+    /// question, naming the routine as it is stored (opengrok-server #316, recorded at #334, on
+    /// main 8e7387f, as
+    /// `agui/custom/run-awaiting-approval/a_delete_asks_first_naming_the_routine_as_stored`). That
+    /// is its title, and nothing under it names the routine by its id; a delete card from a frame
+    /// without the question asks as the others do, and says what it would delete.
     #[test]
     fn a_routines_card_asks_about_routines_and_a_delete_in_the_servers_words() {
         use crate::opengrok::{CREATE_ROUTINE, DELETE_ROUTINE, LIST_ROUTINES, UPDATE_ROUTINE};

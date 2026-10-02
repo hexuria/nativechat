@@ -1937,9 +1937,9 @@ mod tools_tests {
     }
 
     /// The routine tools are one row of the ceiling, a builtin the server labels for people
-    /// (opengrok-server #316, recorded at PR #334: `{name: "routines", kind: "builtin", label:
-    /// "Routines"}`), and it is headed by that label; its switch is still known by its name. A
-    /// builtin with no label is headed by its wire name, as before.
+    /// (opengrok-server #316, recorded at #334, on main 8e7387f: `{name: "routines", kind:
+    /// "builtin", label: "Routines"}`), and it is headed by that label; its switch is still known
+    /// by its name. A builtin with no label is headed by its wire name, as before.
     #[test]
     fn a_builtin_the_server_labels_is_headed_by_its_label() {
         let card = CeilingCard {

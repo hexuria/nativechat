@@ -4,10 +4,10 @@
 //! agree. `fixtures/wire/` is the server's side of that, recorded by the server itself: every
 //! AG-UI frame and REST body its own tests drove, teed off its router by the recorder of
 //! opengrok-server#258 and written out by its `examples/wire_corpus.rs`. It is vendored whole from
-//! the server's `tests/fixtures/wire/` at PR #334 (branch `routine-tools`, the server half of
-//! #316: a Bot's routine tools, a routine's own zone, the one-minute floor and skipped runs) at
-//! 628dcff, recorded at 80cb795, the commit its `MANIFEST.json` names, on top of server main
-//! 73064e2 (#333, after #322). The layout is opengrok-server#255's: `agui/<type>/<slug>.json`, a
+//! the server's `tests/fixtures/wire/` at #334, on main 8e7387f (the server half of #316: a Bot's
+//! routine tools, a routine's own zone, the one-minute floor and skipped runs, after #331). Its
+//! `MANIFEST.json` names 426fa0d, the branch commit it was recorded at, until a restamp names the
+//! main commit. The layout is opengrok-server#255's: `agui/<type>/<slug>.json`, a
 //! CUSTOM under `agui/custom/<name>/`, and `rest/<METHOD>_<route>/<status>-<slug>.json` holding
 //! `{method, path, status, body}`, one file per distinct shape, named after the first test that
 //! produced it; and since the relay, the frames of its stream under `relay/<type>/<slug>.json`,
@@ -2332,6 +2332,8 @@ const REST_ROUTES: &[(&str, RestCheck)] = &[
     ("GET__schedules", schedules),
     ("POST__schedules", one_routine),
     ("PATCH__schedules__id_", one_routine),
+    // Delete (`delete_schedule`) answers 204 and nothing to read.
+    ("DELETE__schedules__id_", read_as_done),
     ("POST__schedules__id__pause", read_as_done),
     ("POST__schedules__id__resume", read_as_done),
     ("POST__schedules__id__rotate-key", rotated_key),
@@ -5834,16 +5836,16 @@ fn every_recorded_setting_is_from_a_server_that_knows_the_relay() {
 /// The server that made the recording keeps a door per Bot, and writes it on every coworker row it
 /// answers with, `null` and all (`coworker_row` in opengrok-server's
 /// `crates/opengrok-server/src/agui/routes.rs`, server main d6f640e (#307, after #304), pin
-/// bf99845): the roster's, a hire's and a PATCH's. So every recorded row reads
-/// as one from a server that keeps a door per Bot, which is what lets a Bot's model picker offer
-/// the person's plan and send the Bot's door with a pick; a server from before per-Bot doors
-/// writes no `source`, and is taken to keep none. A hire whose body names its model answers
-/// `null`, a Bot that follows the account's door until it is given one of its own; since #322 (on
-/// main since c0bb6ae: `hire` in the same file, and `Coworker::born_on`), one hired with no model
-/// is born on its hirer's default for new Bots, door and all. The recording holds a hire of each,
-/// and a row on the Bot's own plan. A row on its other door, `gateway`, is the same shape to the
-/// recorder, which keeps one file per shape, and the recording at PR #334 (628dcff) keeps none, so
-/// that word is read beyond the recording ([`a_bots_door_is_read_beyond_the_recording`]).
+/// bf99845): the roster's, a hire's and a PATCH's. So every recorded row reads as one from a server
+/// that keeps a door per Bot, which is what lets a Bot's model picker offer the person's plan and
+/// send the Bot's door with a pick; a server from before per-Bot doors writes no `source`, and is
+/// taken to keep none. A hire whose body names its model answers `null`, a Bot that follows the
+/// account's door until it is given one of its own; since #322 (on main since c0bb6ae: `hire` in
+/// the same file, and `Coworker::born_on`), one hired with no model is born on its hirer's default
+/// for new Bots, door and all. The recording holds a hire of each, and a row on the Bot's own plan.
+/// A row on its other door, `gateway`, is the same shape to the recorder, which keeps one file per
+/// shape, and the recording at #334, on main 8e7387f, keeps none, so that word is read beyond the
+/// recording ([`a_bots_door_is_read_beyond_the_recording`]).
 #[test]
 fn every_recorded_coworker_row_is_from_a_server_that_keeps_a_door_per_bot() {
     let corpus = Corpus::load();
@@ -5900,8 +5902,8 @@ fn every_recorded_coworker_row_is_from_a_server_that_keeps_a_door_per_bot() {
 /// A Bot's door, read beyond the recording, which holds rows with `null` and `local_proxy`, a
 /// hire's and a PATCH's among them, and the PATCH's 400s for a Bot left on the person's plan with
 /// a model the allowlist does not take (opengrok-server main d6f640e (#307, after #304), pin
-/// bf99845): a row on the server's other word, `gateway`, which the recording at PR #334
-/// (628dcff) keeps no file of, a row whose door is a word
+/// bf99845): a row on the server's other word, `gateway`, which the recording at #334,
+/// on main 8e7387f, keeps no file of, a row whose door is a word
 /// this app has not heard of, and one from a server before per-Bot doors, with no `source` at
 /// all, each read as sent, and a row whose parse lost its door caught; and the 400 for a `source`
 /// that is neither word, which the recorder keeps no file of, having one 400 of that shape

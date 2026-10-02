@@ -3590,7 +3590,7 @@ pub struct AgentRoutine {
 }
 
 /// The zone a routine's times are in, and whether it is this computer's own, which is when its
-/// times need no zone named beside them (opengrok-server #316, PR #334 at 628dcff: the server
+/// times need no zone named beside them (opengrok-server #316, #334, on main 8e7387f: the server
 /// reads a routine's line in the IANA zone on its row, `tz`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RoutineZone {
@@ -4164,7 +4164,7 @@ pub enum RunOutcome {
         status: ScheduleRunStatus,
     },
     /// No run: the Bot answers on its person's own plan, and the plan could not answer when the
-    /// routine was due (opengrok-server #316, PR #334 at 628dcff). The line says the server's
+    /// routine was due (opengrok-server #316, #334, on main 8e7387f). The line says the server's
     /// sentence for why, and has nothing to open.
     Skipped { reason: String },
 }
@@ -27707,10 +27707,10 @@ mod tests {
         assert!(!run.at.is_empty());
     }
 
-    /// Run it now on a Bot whose own plan cannot answer (opengrok-server #316, PR #334 at
-    /// 628dcff: no computer holds the person's relay) is the server's 409 with the skip's code.
-    /// Its sentence goes on the routine's red line, nothing is shown as running, and the history
-    /// is read again for the line the server kept, which says the same and opens nothing.
+    /// Run it now on a Bot whose own plan cannot answer (opengrok-server #316, #334, on main
+    /// 8e7387f: no computer holds the person's relay) is the server's 409 with the skip's code. Its
+    /// sentence goes on the routine's red line, nothing is shown as running, and the history is
+    /// read again for the line the server kept, which says the same and opens nothing.
     #[tokio::test]
     async fn run_now_while_the_plan_cannot_answer_says_why_and_reads_the_skip_back() {
         let said = "Skipped: your computer was off, so your plan couldn't answer";

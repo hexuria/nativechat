@@ -3,6 +3,6 @@
   "path": "/schedules",
   "status": 422,
   "body": {
-    "error": "a cron routine needs a cron expression"
+    "error": "not a cron expression: 0 9 * * 8 (8 is not a day of the week: a day is 0 to 7, where 0 and 7 are both Sunday, or SUN to SAT, and a range runs forward and steps by 1 to 7)"
   }
 }

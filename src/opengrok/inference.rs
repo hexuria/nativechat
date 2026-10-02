@@ -19,8 +19,8 @@
 //! `crates/opengrok-harness/src/local_proxy.rs`, and the door's words and the models a
 //! subscription may answer in `crates/opengrok-core/src/inference.rs`. The conformance ledger
 //! reads the two routes and the CUSTOM frame against the server's recording, vendored in
-//! `fixtures/wire/` from opengrok-server PR #334 at 628dcff (recorded at 80cb795, on top of main
-//! 73064e2). These shapes are as they were at main cad36fd (#303, after #298): #306 changed no
+//! `fixtures/wire/` from opengrok-server #334, on main 8e7387f (recorded at its branch commit
+//! 426fa0d). These shapes are as they were at main cad36fd (#303, after #298): #306 changed no
 //! crate, #304 puts a Bot's own door between a turn's and the account's (`route` in
 //! `crates/opengrok-harness/src/local_proxy.rs`), #308 lets a retry of a queued send's reply
 //! name its own door over the one the send was queued with (`consume_for_turn` in
@@ -589,7 +589,7 @@ pub const HELD_FOR_RELAY_OFFLINE: &str = "relay_offline";
 /// never offers what a Save would be refused for, even should a list ever carry one (a list held
 /// from before, or a server that tags a row `local_proxy` without asking): `subscription_model`
 /// in opengrok-server's `crates/opengrok-core/src/inference.rs`, anchored since #296 and unchanged
-/// in the vendored recording (PR #334 at 628dcff, on top of main 73064e2), where a Bot's own plan
+/// in the vendored recording (#334, on main 8e7387f), where a Bot's own plan
 /// model is held to it too, as it has been since #304, and so is a default for new Bots on the
 /// plan, since #322.
 ///

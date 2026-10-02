@@ -325,7 +325,7 @@ impl OpenGrokError {
     }
 
     /// `POST /schedules/{id}/run` refused because the routine's Bot answers on its person's own
-    /// plan and the plan could not answer now (opengrok-server #316, PR #334 at 628dcff:
+    /// plan and the plan could not answer now (opengrok-server #316, #334, on main 8e7387f:
     /// `run_schedule_now` in `crates/opengrok-server/src/autonomy/routes.rs`): `409 {error,
     /// code}`, the code why (`relay_offline`, `proxy_down`) and the sentence what the person is
     /// shown. The server keeps the firing in the routine's history as skipped. Its other 409, for

@@ -3862,8 +3862,8 @@ pub struct ScheduleRow {
     pub next_due_ms: Option<i64>,
     #[serde(default)]
     pub webhook: Option<WebhookInfo>,
-    /// The IANA zone the server reads the routine's cron line in (opengrok-server #316, PR #334
-    /// at 628dcff: `tz` on every row, `row` in `crates/opengrok-server/src/autonomy/routes.rs`),
+    /// The IANA zone the server reads the routine's cron line in (opengrok-server #316, #334, on
+    /// main 8e7387f: `tz` on every row, `row` in `crates/opengrok-server/src/autonomy/routes.rs`),
     /// `UTC` for one stored before zones. This app names none on a create or an edit, so a new
     /// routine takes the account's `timeZone`, else UTC (`zone_of` in `autonomy/desk.rs`), and an
     /// edit keeps the zone it had. `None` from a server before zones, which read every line in UTC.
@@ -3894,7 +3894,7 @@ impl ScheduleEdit {
 
 /// One line of a routine's history, as `GET /schedules/{id}/runs` answers it
 /// (opengrok-server `autonomy/routes.rs`, `history`): `{runId, cause, status, startedAtMs,
-/// endedAtMs}` for a run; and since #316 (PR #334 at 628dcff, the same `history`) a firing the
+/// endedAtMs}` for a run; and since #316 (#334, on main 8e7387f, the same `history`) a firing the
 /// server skipped, because the Bot answers on its person's own plan and the plan could not answer
 /// then, as `{runId: null, cause, status: null, startedAtMs: null, endedAtMs: null, at, state:
 /// "skipped", skipped, reason}`. A skip started no run, so it has nothing to open.
@@ -10540,8 +10540,8 @@ mod tests {
         assert_eq!(hook.header, "Authorization: Bearer og_live_abc");
     }
 
-    /// A routine's zone is read off its row as the server keeps it (opengrok-server #316, PR #334
-    /// at 628dcff), and a server from before zones sends none. A create and an edit from this app
+    /// A routine's zone is read off its row as the server keeps it (opengrok-server #316, #334, on
+    /// main 8e7387f), and a server from before zones sends none. A create and an edit from this app
     /// name no zone, so a new routine takes the account's and an edited one keeps its own.
     #[tokio::test]
     async fn a_routines_zone_is_read_off_its_row_and_never_sent() {
@@ -10749,11 +10749,11 @@ mod tests {
         );
     }
 
-    /// A firing the server skipped, because the Bot answers on its person's own plan and the
-    /// plan could not answer (opengrok-server #316, PR #334 at 628dcff), is a line of the history
+    /// A firing the server skipped, because the Bot answers on its person's own plan and the plan
+    /// could not answer (opengrok-server #316, #334, on main 8e7387f), is a line of the history
     /// with no run, no status and no start, beside its own time, the code and the server's
-    /// sentence. It reads as a skip, in its order among the runs, and leaves the runs beside it
-    /// as they were.
+    /// sentence. It reads as a skip, in its order among the runs, and leaves the runs beside it as
+    /// they were.
     #[tokio::test]
     async fn a_skipped_firing_is_a_line_of_the_history_with_no_run() {
         let said = "Skipped: your computer was off, so your plan couldn't answer";
@@ -10797,8 +10797,8 @@ mod tests {
     }
 
     /// Run it now while the Bot's plan cannot answer is the server's 409 with the skip's code and
-    /// its sentence (opengrok-server #316, PR #334 at 628dcff: `run_schedule_now`), which is what
-    /// the person is told; the code says the firing was kept as skipped. The 409 for a retired
+    /// its sentence (opengrok-server #316, #334, on main 8e7387f: `run_schedule_now`), which is
+    /// what the person is told; the code says the firing was kept as skipped. The 409 for a retired
     /// coworker names no code, and is no skip.
     #[tokio::test]
     async fn run_now_on_a_plan_that_cannot_answer_is_refused_as_a_skip() {
@@ -10812,11 +10812,10 @@ mod tests {
             )
             .mount(&server)
             .await;
+        let retired = "this routine's coworker is no longer hired; hand it to another coworker";
         Mock::given(method("POST"))
             .and(path("/schedules/sch_2/run"))
-            .respond_with(ResponseTemplate::new(409).set_body_json(
-                json!({ "error": "this routine's coworker is no longer hired; hand it to another coworker" }),
-            ))
+            .respond_with(ResponseTemplate::new(409).set_body_json(json!({ "error": retired })))
             .mount(&server)
             .await;
         let client = OpenGrokClient::new(&server.uri()).unwrap();
