@@ -83,6 +83,9 @@ pub mod ids {
     pub const DIALOG_ACCOUNT: &str = "dialog-account";
     pub const DIALOG_VOICE: &str = "dialog-voice";
     pub const HEADER_SETTINGS: &str = "header-settings";
+    pub const HEADER_LEFT_SIDEBAR: &str = "header-left-sidebar";
+    pub const HEADER_RIGHT_SIDEBAR: &str = "header-right-sidebar";
+    pub const HEADER_MONITOR: &str = "header-monitor";
     /// The open recipe's Run, the outcome of the run it started (value `running`, `ok`,
     /// `failed` or `interrupted`), and its run history.
     pub const RECIPE_RUN: &str = "recipe-run";
@@ -3180,6 +3183,11 @@ impl NativeChatHost {
                 ready: self.ready,
                 nodes: vec![
                     UiNode::window(ids::WINDOW, "NativeChat")
+                        .with_child(UiNode::button(ids::HEADER_LEFT_SIDEBAR, "Toggle sidebar"))
+                        .with_child(UiNode::button(
+                            ids::HEADER_RIGHT_SIDEBAR,
+                            "Toggle Bot details",
+                        ))
                         .with_child(UiNode::button(ids::NAV_NEW_CHAT, "New Bot"))
                         .with_child(empty),
                 ],
@@ -3242,6 +3250,17 @@ impl NativeChatHost {
                     self.last_assistant.chars().take(400).collect()
                 },
             ));
+        if self.signed_in {
+            page = page
+                .with_child(UiNode::button(ids::HEADER_LEFT_SIDEBAR, "Toggle sidebar"))
+                .with_child(UiNode::button(
+                    ids::HEADER_RIGHT_SIDEBAR,
+                    "Toggle right sidebar",
+                ));
+            if self.sessions.iter().any(|session| session.active) {
+                page = page.with_child(UiNode::button(ids::HEADER_MONITOR, "Toggle computer pane"));
+            }
+        }
         if let Some(status) = &self.bot_status {
             page = page.with_child(UiNode::new("bot-status", "status", status.clone()));
         }
@@ -5435,8 +5454,16 @@ impl NativeChatHost {
     fn click(&mut self, target: &str) -> Result<DispatchResult, String> {
         let cmd = if target == ids::NAV_NEW_CHAT || target == "create-first-bot" {
             Command::NewChat
-        } else if target == ids::NAV_TOGGLE {
+        } else if target == ids::NAV_TOGGLE || target == ids::HEADER_LEFT_SIDEBAR {
             Command::ToggleSidebar
+        } else if target == ids::HEADER_MONITOR {
+            Command::ToggleComputerPane
+        } else if target == ids::HEADER_RIGHT_SIDEBAR {
+            if self.computer_open {
+                Command::ToggleComputerPane
+            } else {
+                Command::ToggleAgentSettings
+            }
         } else if target == ids::FOOTER_THEME {
             Command::ToggleTheme
         } else if target == ids::FOOTER_ACCOUNT {
@@ -7834,6 +7861,43 @@ mod tests {
                 listed: false,
             }],
             ..Default::default()
+        }
+    }
+
+    #[test]
+    fn floating_header_controls_match_their_visible_actions() {
+        let mut host = host();
+        let tree = host.snapshot();
+        for id in [
+            ids::HEADER_LEFT_SIDEBAR,
+            ids::HEADER_RIGHT_SIDEBAR,
+            ids::HEADER_MONITOR,
+        ] {
+            assert!(tree.find(id).is_some(), "missing {id}");
+        }
+        host.dispatch(&Op::click(ids::HEADER_LEFT_SIDEBAR)).unwrap();
+        assert!(matches!(host.take_command(), Some(Command::ToggleSidebar)));
+        host.dispatch(&Op::click(ids::HEADER_MONITOR)).unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::ToggleComputerPane)
+        ));
+        for computer_open in [false, true] {
+            host.computer_open = computer_open;
+            host.dispatch(&Op::click(ids::HEADER_RIGHT_SIDEBAR))
+                .unwrap();
+            let command = host.take_command();
+            assert!(if computer_open {
+                matches!(command, Some(Command::ToggleComputerPane))
+            } else {
+                matches!(command, Some(Command::ToggleAgentSettings))
+            });
+        }
+        host.sessions.clear();
+        let empty_tree = host.snapshot();
+        assert!(empty_tree.find(ids::HEADER_MONITOR).is_none());
+        for id in [ids::HEADER_LEFT_SIDEBAR, ids::HEADER_RIGHT_SIDEBAR] {
+            assert!(empty_tree.find(id).is_some(), "missing {id} without a Bot");
         }
     }
 

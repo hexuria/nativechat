@@ -1480,7 +1480,9 @@ impl Render for ChatTranscript {
                             .px_4()
                             // The transcript's own edges, carried by the rows that sit against
                             // them rather than by the list's padding (see `tail_room`).
-                            .when(ix == 0, |this| this.pt(px(TRANSCRIPT_EDGE_GAP)))
+                            .when(ix == 0, |this| {
+                                this.pt(px(crate::chrome::TITLE_BAR_H + TRANSCRIPT_EDGE_GAP))
+                            })
                             .when_some(tail_room(ix, rows.len(), composer_height), |this, room| {
                                 this.pb(room)
                             })
@@ -1492,8 +1494,8 @@ impl Render for ChatTranscript {
                             )
                     },
                 )
-                // Straight under the title bar, which holds the chat's header.
-                .pt(px(20.0))
+                // Reserve room only at the start of the transcript. Once scrolled,
+                // messages use the full viewport behind the floating header fade.
                 // No padding on the list. The room at both ends travels with the rows, so
                 // that the height of the items is the whole of the transcript and the two
                 // ways GPUI measures the scroll cannot disagree — see `TRANSCRIPT_EDGE_GAP`.
@@ -1502,6 +1504,7 @@ impl Render for ChatTranscript {
                 // the scroller's floor by exactly what the composer covers; the rem the
                 // scroller already holds it by then reads from the composer's top edge.
                 .with_jump_button_style(StyleRefinement::default().mb(composer_height))
+                .with_jump_button_renderer(super::transcript_chrome::jump_button)
                 .with_jump_button_transition(Duration::ZERO),
             )
     }

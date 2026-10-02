@@ -6,6 +6,8 @@
 //!
 //! Stable ids: `app-window`, `sidebar`, `sidebar-chat-list`, `nav-new-chat`,
 //! `nav-toggle-sidebar`, `session-{id}`, `footer-theme`, `footer-account`,
+//! `header-left-sidebar`, `header-right-sidebar` (chat's window-level pane toggles),
+//! `header-monitor` (computer pane toggle while a bot is open),
 //! `composer`, `composer-panel`, `composer-panel-search`, `composer-recipe-bar`,
 //! `composer-skill` (the skill the next message is sent with, value = the id the turn names;
 //! in the tree only while one is on the draft),

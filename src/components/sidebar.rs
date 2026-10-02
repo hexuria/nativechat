@@ -1,5 +1,5 @@
 use crate::chrome::{
-    AVATAR_PX, MASCOT_BOX_PX, RAIL_HOVER, RAIL_HOVER_ALPHA, SIDEBAR_GAP, SIDEBAR_ROW,
+    AVATAR_PX, MASCOT_BOX_PX, RAIL_HOVER, RAIL_HOVER_ALPHA, SIDEBAR_GAP, SIDEBAR_ROW, TITLE_BAR_H,
 };
 use crate::components::persona::PersonaMark;
 use crate::icons::NativeIcon;
@@ -275,6 +275,9 @@ impl Render for SidebarView {
             .bg(theme.sidebar)
             .border_r_1()
             .border_color(theme.border)
+            .when(state.page == crate::state::MainPage::Chat, |this| {
+                this.child(div().h(px(TITLE_BAR_H)).flex_shrink_0())
+            })
             .child(
                 v_flex()
                     .id("sidebar-main")
