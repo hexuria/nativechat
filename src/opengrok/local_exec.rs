@@ -171,15 +171,21 @@ fn publish(enrolled: &watch::Sender<Option<MachineCredential>>, cred: &StoredDae
     });
 }
 
+/// This Mac's credential: the one kept here while the server still lists its machine as live,
+/// and otherwise a new one, from enrolling this Mac as its own machine again, or as a new machine
+/// when it has none.
+///
+/// Never as another machine. The account's other machines are other Macs, and this used to enrol
+/// as the first live one listed whenever its own was not: the server gave that Mac's machine a new
+/// token and retired the old, and the Mac whose machine it was was turned away from then on.
 async fn ensure_daemon(
     client: &OpenGrokClient,
     data_dir: &Path,
 ) -> Result<StoredDaemon, OpenGrokError> {
     let path = data_dir.join(CREDENTIAL_FILE);
     let stored = load_credential(&path);
-    let machines = client.list_daemons().await.unwrap_or_default();
-
     if let Some(stored) = stored.as_ref() {
+        let machines = client.list_daemons().await.unwrap_or_default();
         let still_listed = machines
             .iter()
             .any(|m| m.machine_id == stored.machine_id && !m.revoked);
@@ -187,12 +193,20 @@ async fn ensure_daemon(
             return Ok(stored.clone());
         }
     }
+    let own = stored.as_ref().map(|stored| stored.machine_id.as_str());
+    enrol(client, &path, own).await
+}
 
-    let existing = machines.iter().find(|machine| !machine.revoked);
+/// Enrol this Mac with the server as `machine_id`, its own machine, which gives it a new token
+/// and retires the one it held (with the streams that token opened); or, with none, as a new
+/// machine the server names. The credential is kept at `path` for the next start.
+async fn enrol(
+    client: &OpenGrokClient,
+    path: &Path,
+    machine_id: Option<&str>,
+) -> Result<StoredDaemon, OpenGrokError> {
     let label = machine_label();
-    let enrol = client
-        .enrol_daemon(&label, existing.map(|machine| machine.machine_id.as_str()))
-        .await?;
+    let enrol = client.enrol_daemon(&label, machine_id).await?;
     // The mode is left where the server keeps it, which for a Mac nobody has set is `never`,
     // until the person turns it on in Settings. Enrolling used to write `ask` on its own, and
     // that offered this Mac's shell to every coworker without anyone having said so (#87).
@@ -201,7 +215,7 @@ async fn ensure_daemon(
         token: enrol.token,
         label,
     };
-    save_credential(&path, &cred);
+    save_credential(path, &cred);
     Ok(cred)
 }
 
@@ -528,6 +542,107 @@ mod tests {
                 .all(|call| !call.ends_with(" /local-exec/policy")),
             "the mode is not read or written on the way in: {calls:?}"
         );
+    }
+
+    /// One of the account's machines as `GET /local-exec/daemon` lists it (`list_daemons` in
+    /// opengrok-server `crates/opengrok-server/src/local_exec.rs`).
+    fn listed(machine_id: &str, label: &str, revoked: bool) -> Value {
+        json!({
+            "machineId": machine_id,
+            "label": label,
+            "enrolledAtMs": 1_790_000_000_000_u64,
+            "revoked": revoked,
+            "connected": !revoked,
+        })
+    }
+
+    /// The machine id each `POST /local-exec/daemon` asked to enrol, in order: `None` for a body
+    /// that named none, which the server answers with a new machine of its own.
+    async fn enrolled_as(server: &MockServer) -> Vec<Option<String>> {
+        server
+            .received_requests()
+            .await
+            .expect("the recorder is on")
+            .iter()
+            .filter(|request| {
+                request.method.as_str() == "POST" && request.url.path() == "/local-exec/daemon"
+            })
+            .map(|request| {
+                let body: Value = request.body_json().expect("an enrolment's body is JSON");
+                body.get("machineId")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .collect()
+    }
+
+    /// A second Mac on the account, with no machine of its own yet, enrols as a new machine. It
+    /// used to enrol as the first machine the account listed, the first Mac's: the server gave
+    /// that machine a new token, and the first Mac was turned away from then on.
+    #[tokio::test]
+    async fn a_mac_with_no_machine_of_its_own_enrols_as_a_new_one() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/local-exec/daemon"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "machines": [listed("mac_first", "NativeChat on the first Mac", false)]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/local-exec/daemon"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({ "machineId": "mac_second", "token": "tok_second" })),
+            )
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+
+        let machine = enrol_this_machine(&client, dir.path()).await.unwrap();
+
+        assert_eq!(
+            enrolled_as(&server).await,
+            [None],
+            "a new machine, named by none"
+        );
+        assert_eq!(machine, MachineCredential::new("mac_second", "tok_second"));
+        assert_eq!(stored_machine_id(dir.path()).as_deref(), Some("mac_second"));
+    }
+
+    /// A Mac whose machine the server no longer lists as live (revoked here, while another Mac's
+    /// is listed first) enrols again as its own machine, and as no other.
+    #[tokio::test]
+    async fn a_mac_enrols_again_as_its_own_machine_and_never_as_another() {
+        let server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        save_credential(&dir.path().join(CREDENTIAL_FILE), &daemon());
+        Mock::given(method("GET"))
+            .and(path("/local-exec/daemon"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "machines": [
+                    listed("mac_other", "NativeChat on another Mac", false),
+                    listed("mac_1", "NativeChat on this Mac", true),
+                ]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/local-exec/daemon"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({ "machineId": "mac_1", "token": "tok_2" })),
+            )
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+
+        let machine = enrol_this_machine(&client, dir.path()).await.unwrap();
+
+        assert_eq!(enrolled_as(&server).await, [Some("mac_1".to_string())]);
+        assert_eq!(machine, MachineCredential::new("mac_1", "tok_2"));
+        assert_eq!(stored_machine_id(dir.path()).as_deref(), Some("mac_1"));
     }
 
     /// A command that leaves the pid of something it started in `pid_file`, and waits on it.
