@@ -4,6 +4,7 @@ use crate::chrome::{
 };
 use crate::components::fields::field_input;
 use crate::components::persona::PersonaMark;
+use crate::components::title_bar::window_drag;
 use crate::opengrok::{
     BotSkillRow, BotSkillScope, CeilingRow, CoworkerPatch, CoworkerTool, EFFORT_INHERIT,
     EFFORT_WORDS, ModelEntry, USER_MACHINE_SHELL,
@@ -418,11 +419,14 @@ fn notify_switch(on: bool) -> Div {
         )
 }
 
-/// Chat has a single window-level pane toggle. Other pages retain a close control
-/// in their own header, where the settings title is also a window-drag handle.
-pub fn settings_header(app: Entity<AppState>, drag: bool) -> impl IntoElement {
+/// The pane's header row. "Settings" is a handle to drag the window by, whether the row is in
+/// the title bar over a docked pane or at the top of the pane itself. With `close`, the row ends
+/// in the control that closes the pane; the chat page leaves it off, because the chat's title
+/// bar floats its one window-level pane toggle over that end of the row.
+pub fn settings_header(app: Entity<AppState>, close: bool) -> impl IntoElement {
     div()
         .id("agent-settings-header")
+        .debug_selector(|| "agent-settings-header".into())
         .w_full()
         .h(px(TITLE_BAR_H))
         .px(px(HEADER_PX))
@@ -430,7 +434,7 @@ pub fn settings_header(app: Entity<AppState>, drag: bool) -> impl IntoElement {
         .items_center()
         .justify_between()
         .flex_shrink_0()
-        .child(
+        .child(window_drag(
             div()
                 .flex_1()
                 .h_full()
@@ -438,12 +442,9 @@ pub fn settings_header(app: Entity<AppState>, drag: bool) -> impl IntoElement {
                 .items_center()
                 .text_sm()
                 .font_weight(FontWeight::SEMIBOLD)
-                .child("Settings")
-                .when(drag, |this| {
-                    this.on_mouse_down(MouseButton::Left, |_, window, _| window.start_window_move())
-                }),
-        )
-        .when(drag, |this| {
+                .child("Settings"),
+        ))
+        .when(close, |this| {
             this.child(
                 div()
                     .id("header-settings")
@@ -586,10 +587,11 @@ impl Render for AgentSettings {
                     });
                 }
             })
-            .when(chat_page, |this| {
-                this.child(div().h(px(TITLE_BAR_H)).flex_shrink_0())
-                    .child(settings_header(app.clone(), false))
-            })
+            // On the chat page the pane reaches the window's top edge, under the floating title
+            // bar, so its header is the bar's row over the pane: one row, which drags the window
+            // as a title bar does. A blank row above a second header put the avatar 104px down
+            // and left the header that showed unable to move the window.
+            .when(chat_page, |this| this.child(settings_header(app.clone(), false)))
             .when(!chat_page && chrome_floats(f32::from(window.viewport_size().width)), |this| {
                 this.child(settings_header(app.clone(), true))
             })
