@@ -1,5 +1,6 @@
 use crate::chrome::{
-    AVATAR_PX, MASCOT_BOX_PX, RAIL_HOVER, RAIL_HOVER_ALPHA, SIDEBAR_GAP, SIDEBAR_ROW,
+    AVATAR_PX, MASCOT_BOX_PX, RAIL_HOVER, RAIL_HOVER_ALPHA, SIDEBAR_GAP, SIDEBAR_ROW, SidebarMode,
+    TITLE_BAR_H,
 };
 use crate::components::persona::PersonaMark;
 use crate::icons::NativeIcon;
@@ -7,8 +8,10 @@ use crate::state::{AppSettingsTab, AppState, Conversation, THREAD_LIST_UNAVAILAB
 use chrono::NaiveDateTime;
 use gpui_kit::assets::IconNamed;
 use gpui_kit::base::{Align, ElementExt as _, POPUP_PRIORITY, Placement, Positioner};
+use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::menu::{ContextMenuExt, PopupMenu, PopupMenuItem};
+use gpui_kit::component::popover::Popover;
 use gpui_kit::component::{ActiveTheme, Icon, IconName, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
@@ -28,6 +31,7 @@ struct RailCoworker {
 struct SidebarRev {
     collapsed: bool,
     hidden: bool,
+    menu_open: bool,
     expanded_width: i32,
     theme_mode: String,
     active_id: Option<String>,
@@ -46,6 +50,7 @@ impl SidebarRev {
         Self {
             collapsed: state.sidebar_collapsed,
             hidden: state.sidebar_hidden,
+            menu_open: state.sidebar_menu_open,
             expanded_width: state.sidebar_expanded_width.round() as i32,
             theme_mode: state.theme_mode.clone(),
             active_id: state.active_coworker_id.clone(),
@@ -116,6 +121,69 @@ pub struct SidebarView {
 }
 
 impl SidebarView {
+    fn sidebar_mode_button(&self, collapsed: bool, fg: Hsla) -> impl IntoElement {
+        let app = self.state.clone();
+        let open = self.rev.menu_open;
+        Popover::new("sidebar-mode-popover")
+            .open(open)
+            .appearance(false)
+            .overlay_closable(true)
+            .trigger(
+                Button::new("nav-toggle-sidebar")
+                    .ghost()
+                    .size(px(if collapsed { SIDEBAR_ROW } else { 28. }))
+                    .rounded(px(10.))
+                    .icon(kit_icon("icons/panel-left.svg", 16., fg))
+                    .tooltip("Sidebar: Expanded, Mini, or Hide"),
+            )
+            .on_open_change({
+                let app = app.clone();
+                move |open, _, cx| {
+                    app.update(cx, |state, cx| state.set_sidebar_menu_open(*open, cx));
+                }
+            })
+            .content(move |_, _, cx| {
+                let theme = cx.theme();
+                [
+                    ("sidebar-mode-expanded", "Expanded", SidebarMode::Expanded),
+                    ("sidebar-mode-mini", "Mini", SidebarMode::Mini),
+                    ("sidebar-mode-hide", "Hide", SidebarMode::Hidden),
+                ]
+                .into_iter()
+                .fold(
+                    v_flex()
+                        .id("sidebar-mode-menu")
+                        .w(px(168.))
+                        .p(px(4.))
+                        .gap(px(2.))
+                        .rounded(px(10.))
+                        .bg(theme.popover)
+                        .text_color(theme.popover_foreground)
+                        .border_1()
+                        .border_color(theme.border)
+                        .shadow_lg()
+                        .occlude(),
+                    |menu, (id, label, mode)| {
+                        let app = app.clone();
+                        let checked = (mode == SidebarMode::Mini && collapsed)
+                            || (mode == SidebarMode::Expanded && !collapsed);
+                        menu.child(
+                            Button::new(id)
+                                .ghost()
+                                .w_full()
+                                .justify_start()
+                                .label(label)
+                                .when(checked, |this| this.icon(IconName::Check))
+                                .on_click(move |_, _, cx| {
+                                    cx.stop_propagation();
+                                    app.update(cx, |state, cx| state.set_sidebar_mode(mode, cx));
+                                }),
+                        )
+                    },
+                )
+            })
+    }
+
     pub fn new(window: &mut Window, state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
         let rename_input = cx.new(|cx| InputState::new(window, cx).placeholder("Name"));
         let search_input = cx.new(|cx| InputState::new(window, cx).placeholder("Search"));
@@ -275,6 +343,9 @@ impl Render for SidebarView {
             .bg(theme.sidebar)
             .border_r_1()
             .border_color(theme.border)
+            .when(state.page == crate::state::MainPage::Chat, |this| {
+                this.child(div().h(px(TITLE_BAR_H)).flex_shrink_0())
+            })
             .child(
                 v_flex()
                     .id("sidebar-main")
@@ -580,29 +651,7 @@ impl SidebarView {
             .when(collapsed, |this| this.justify_center())
             .when(!collapsed, |this| this.px(px(12.)).pl(px(16.)).gap(px(8.)))
             .when(collapsed, |this| {
-                this.child(
-                    div()
-                        .id("nav-toggle-sidebar")
-                        .w(px(SIDEBAR_ROW))
-                        .h(px(SIDEBAR_ROW))
-                        .rounded(px(10.))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .cursor_pointer()
-                        .hover(|s| s.bg(hover))
-                        .on_mouse_down(MouseButton::Left, {
-                            let view = view.clone();
-                            move |_, _, cx| {
-                                view.update(cx, |this, cx| {
-                                    this.state.update(cx, |state, cx| {
-                                        state.set_sidebar_collapsed(false, false, cx);
-                                    });
-                                });
-                            }
-                        })
-                        .child(kit_icon("icons/panel-left.svg", 16.0, fg)),
-                )
+                this.child(self.sidebar_mode_button(collapsed, fg))
             })
             .when(!collapsed, |this| {
                 this.child(
@@ -621,15 +670,23 @@ impl SidebarView {
                 )
                 .child(
                     div()
+                        .min_w_0()
+                        .truncate()
                         .text_sm()
                         .font_weight(FontWeight::SEMIBOLD)
                         .child("NativeChat"),
                 )
                 .child(
                     div()
-                        .id("nav-new-chat")
                         .ml_auto()
+                        .flex_shrink_0()
+                        .child(self.sidebar_mode_button(collapsed, fg)),
+                )
+                .child(
+                    div()
+                        .id("nav-new-chat")
                         .size(px(28.))
+                        .flex_shrink_0()
                         .rounded(px(8.))
                         .flex()
                         .items_center()
