@@ -6,7 +6,10 @@
 //!
 //! Stable ids: `app-window`, `sidebar`, `sidebar-chat-list`, `nav-new-chat`,
 //! `nav-toggle-sidebar`, `session-{id}`, `footer-theme`, `footer-account`,
-//! `header-left-sidebar`, `header-right-sidebar` (chat's window-level pane toggles),
+//! `header-left-sidebar` (restore the hidden sidebar; absent while it is visible),
+//! `nav-toggle-sidebar` (open the visible sidebar's size menu), `sidebar-mode-menu` with
+//! `sidebar-mode-expanded`, `sidebar-mode-mini`, `sidebar-mode-hide` while the menu is open,
+//! `header-right-sidebar` (chat's window-level pane toggle),
 //! `header-monitor` (computer pane toggle while a bot is open),
 //! `composer`, `composer-panel`, `composer-panel-search`, `composer-recipe-bar`,
 //! `composer-skill` (the skill the next message is sent with, value = the id the turn names;

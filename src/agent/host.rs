@@ -54,6 +54,10 @@ pub mod ids {
     pub const NAV_RECIPES: &str = "nav-recipes";
     pub const PAGE_RECIPES: &str = "page-recipes";
     pub const NAV_TOGGLE: &str = "nav-toggle-sidebar";
+    pub const SIDEBAR_MODE_MENU: &str = "sidebar-mode-menu";
+    pub const SIDEBAR_EXPANDED: &str = "sidebar-mode-expanded";
+    pub const SIDEBAR_MINI: &str = "sidebar-mode-mini";
+    pub const SIDEBAR_HIDE: &str = "sidebar-mode-hide";
     pub const FOOTER_THEME: &str = "footer-theme";
     pub const FOOTER_ACCOUNT: &str = "footer-account";
     pub const FOOTER_SIGN_OUT: &str = "footer-sign-out";
@@ -565,6 +569,8 @@ pub enum Command {
     NewChat,
     ToggleSidebar,
     ToggleMiniSidebar,
+    SetSidebarMenu(bool),
+    SetSidebarMode(crate::chrome::SidebarMode),
     ToggleTheme,
     ToggleAccount,
     ToggleAgentSettings,
@@ -861,6 +867,8 @@ impl Command {
             Self::NewChat => state.create_agent(cx),
             Self::ToggleSidebar => state.toggle_sidebar(cx),
             Self::ToggleMiniSidebar => state.toggle_mini_sidebar(cx),
+            Self::SetSidebarMenu(open) => state.set_sidebar_menu_open(open, cx),
+            Self::SetSidebarMode(mode) => state.set_sidebar_mode(mode, cx),
             Self::ToggleTheme => state.toggle_theme(cx),
             Self::ToggleAccount => state.toggle_account_settings(cx),
             Self::ToggleAgentSettings => state.toggle_agent_settings(cx),
@@ -2439,6 +2447,9 @@ impl ReplySourceSnap {
 #[derive(Default)]
 pub struct NativeChatHost {
     ready: bool,
+    sidebar_hidden: bool,
+    sidebar_collapsed: bool,
+    sidebar_menu_open: bool,
     theme_mode: String,
     sessions: Vec<SessionSnap>,
     account_open: bool,
@@ -2651,6 +2662,9 @@ impl NativeChatHost {
         Self {
             ready: true,
             theme_mode: state.theme_mode.clone(),
+            sidebar_hidden: state.sidebar_hidden,
+            sidebar_collapsed: state.sidebar_collapsed,
+            sidebar_menu_open: state.sidebar_menu_open,
             sessions,
             account_open: state.is_app_settings_open,
             voice_open: state.is_voice_mode_open,
@@ -3183,7 +3197,11 @@ impl NativeChatHost {
                 ready: self.ready,
                 nodes: vec![
                     UiNode::window(ids::WINDOW, "NativeChat")
-                        .with_child(UiNode::button(ids::HEADER_LEFT_SIDEBAR, "Toggle sidebar"))
+                        .with_child(if self.sidebar_hidden {
+                            UiNode::button(ids::HEADER_LEFT_SIDEBAR, "Show sidebar")
+                        } else {
+                            self.sidebar_mode_node()
+                        })
                         .with_child(UiNode::button(
                             ids::HEADER_RIGHT_SIDEBAR,
                             "Toggle Bot details",
@@ -3219,7 +3237,7 @@ impl NativeChatHost {
 
         let sidebar =
             UiNode::navigation(ids::SIDEBAR, "Sidebar")
-                .with_child(UiNode::button(ids::NAV_TOGGLE, "Toggle sidebar"))
+                .with_child(self.sidebar_mode_node())
                 .with_child(UiNode::button(ids::NAV_NEW_CHAT, "New Bot"))
                 .with_child(UiNode::button(ids::NAV_SEARCH, "Search"))
                 .with_child(UiNode::button(ids::NAV_LIBRARY, "Library"))
@@ -3251,12 +3269,13 @@ impl NativeChatHost {
                 },
             ));
         if self.signed_in {
-            page = page
-                .with_child(UiNode::button(ids::HEADER_LEFT_SIDEBAR, "Toggle sidebar"))
-                .with_child(UiNode::button(
-                    ids::HEADER_RIGHT_SIDEBAR,
-                    "Toggle right sidebar",
-                ));
+            if self.sidebar_hidden {
+                page = page.with_child(UiNode::button(ids::HEADER_LEFT_SIDEBAR, "Show sidebar"));
+            }
+            page = page.with_child(UiNode::button(
+                ids::HEADER_RIGHT_SIDEBAR,
+                "Toggle right sidebar",
+            ));
             if self.sessions.iter().any(|session| session.active) {
                 page = page.with_child(UiNode::button(ids::HEADER_MONITOR, "Toggle computer pane"));
             }
@@ -3587,7 +3606,12 @@ impl NativeChatHost {
             ready: self.ready,
             nodes: vec![
                 UiNode::window(ids::WINDOW, "NativeChat")
-                    .with_child(sidebar)
+                    .with_children(
+                        (!self.sidebar_hidden)
+                            .then_some(sidebar)
+                            .into_iter()
+                            .collect(),
+                    )
                     .with_child(page)
                     .with_child(self.recipes_node())
                     .with_child({
@@ -5451,11 +5475,48 @@ impl NativeChatHost {
         })
     }
 
+    fn sidebar_mode_node(&self) -> UiNode {
+        let mut trigger = UiNode::button(ids::NAV_TOGGLE, "Sidebar: Expanded, Mini, or Hide");
+        if self.sidebar_menu_open {
+            let mut menu = UiNode::new(ids::SIDEBAR_MODE_MENU, "menu", "Sidebar");
+            for (id, label, checked) in [
+                (ids::SIDEBAR_EXPANDED, "Expanded", !self.sidebar_collapsed),
+                (ids::SIDEBAR_MINI, "Mini", self.sidebar_collapsed),
+                (ids::SIDEBAR_HIDE, "Hide", false),
+            ] {
+                let mut row = UiNode::button(id, label);
+                if checked {
+                    row.states.push("selected".into());
+                }
+                menu = menu.with_child(row);
+            }
+            trigger = trigger.with_child(menu);
+        }
+        trigger
+    }
+
     fn click(&mut self, target: &str) -> Result<DispatchResult, String> {
         let cmd = if target == ids::NAV_NEW_CHAT || target == "create-first-bot" {
             Command::NewChat
-        } else if target == ids::NAV_TOGGLE || target == ids::HEADER_LEFT_SIDEBAR {
+        } else if target == ids::HEADER_LEFT_SIDEBAR {
+            if !self.sidebar_hidden {
+                return Err("the sidebar is already visible".into());
+            }
             Command::ToggleSidebar
+        } else if target == ids::NAV_TOGGLE {
+            if self.sidebar_hidden {
+                return Err("the sidebar control is hidden".into());
+            }
+            Command::SetSidebarMenu(!self.sidebar_menu_open)
+        } else if [ids::SIDEBAR_EXPANDED, ids::SIDEBAR_MINI, ids::SIDEBAR_HIDE].contains(&target) {
+            if self.sidebar_hidden || !self.sidebar_menu_open {
+                return Err("the sidebar menu is closed".into());
+            }
+            Command::SetSidebarMode(match target {
+                ids::SIDEBAR_EXPANDED => crate::chrome::SidebarMode::Expanded,
+                ids::SIDEBAR_MINI => crate::chrome::SidebarMode::Mini,
+                _ => crate::chrome::SidebarMode::Hidden,
+            })
         } else if target == ids::HEADER_MONITOR {
             Command::ToggleComputerPane
         } else if target == ids::HEADER_RIGHT_SIDEBAR {
@@ -7867,6 +7928,7 @@ mod tests {
     #[test]
     fn floating_header_controls_match_their_visible_actions() {
         let mut host = host();
+        host.sidebar_hidden = true;
         let tree = host.snapshot();
         for id in [
             ids::HEADER_LEFT_SIDEBAR,
@@ -7898,6 +7960,49 @@ mod tests {
         assert!(empty_tree.find(ids::HEADER_MONITOR).is_none());
         for id in [ids::HEADER_LEFT_SIDEBAR, ids::HEADER_RIGHT_SIDEBAR] {
             assert!(empty_tree.find(id).is_some(), "missing {id} without a Bot");
+        }
+    }
+
+    #[test]
+    fn sidebar_has_one_visible_control_and_menu_commands_match_rows() {
+        use crate::chrome::SidebarMode;
+        for empty in [false, true] {
+            for hidden in [false, true] {
+                for collapsed in [false, true] {
+                    let mut host = host();
+                    if empty {
+                        host.sessions.clear();
+                    }
+                    host.sidebar_hidden = hidden;
+                    host.sidebar_collapsed = collapsed;
+                    let tree = host.snapshot();
+                    assert_eq!(tree.find(ids::HEADER_LEFT_SIDEBAR).is_some(), hidden);
+                    assert_eq!(tree.find(ids::NAV_TOGGLE).is_some(), !hidden);
+                    assert!(tree.find(ids::SIDEBAR_MODE_MENU).is_none());
+                    if hidden {
+                        assert!(host.dispatch(&Op::click(ids::NAV_TOGGLE)).is_err());
+                        continue;
+                    }
+                    host.dispatch(&Op::click(ids::NAV_TOGGLE)).unwrap();
+                    assert!(matches!(
+                        host.take_command(),
+                        Some(Command::SetSidebarMenu(true))
+                    ));
+                    host.sidebar_menu_open = true;
+                    let tree = host.snapshot();
+                    for (id, mode) in [
+                        (ids::SIDEBAR_EXPANDED, SidebarMode::Expanded),
+                        (ids::SIDEBAR_MINI, SidebarMode::Mini),
+                        (ids::SIDEBAR_HIDE, SidebarMode::Hidden),
+                    ] {
+                        assert!(tree.find(id).is_some());
+                        host.dispatch(&Op::click(id)).unwrap();
+                        assert!(
+                            matches!(host.take_command(), Some(Command::SetSidebarMode(value)) if value == mode)
+                        );
+                    }
+                }
+            }
         }
     }
 

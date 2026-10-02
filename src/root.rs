@@ -521,8 +521,15 @@ impl Render for RootView {
                 let root_focus = self.focus_handle.clone();
                 move |_: &CloseCommandPalette, window: &mut Window, cx: &mut App| {
                     state.update(cx, |state, cx| {
-                        state.close_command_palette(cx);
-                        state.close_hidden_bots(cx);
+                        if state.command_palette_open {
+                            state.close_command_palette(cx);
+                        } else if state.hidden_bots_open {
+                            state.close_hidden_bots(cx);
+                        } else if crate::chrome::chrome_floats(f32::from(
+                            window.viewport_size().width,
+                        )) {
+                            state.dismiss_floating_chrome(cx);
+                        }
                     });
                     click_away(window, &root_focus, cx);
                 }
