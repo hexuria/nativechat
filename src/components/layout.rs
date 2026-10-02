@@ -410,17 +410,10 @@ impl Render for Layout {
                         .bg(gpui::black().opacity(0.28))
                         .on_mouse_down(MouseButton::Left, {
                             let state = self.state.clone();
-                            let menu_open = state.read(cx).sidebar_menu_open;
                             move |_, _, cx| {
                                 cx.stop_propagation();
                                 state.update(cx, |state, cx| {
-                                    // The popover's outside handler can run first. The state
-                                    // at paint time decides what this one click dismisses.
-                                    if menu_open {
-                                        state.set_sidebar_menu_open(false, cx);
-                                    } else {
-                                        state.dismiss_floating_chrome(cx);
-                                    }
+                                    state.dismiss_floating_chrome(cx);
                                 });
                             }
                         }),
