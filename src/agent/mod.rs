@@ -7,8 +7,8 @@
 //! Stable ids: `app-window`, `sidebar`, `sidebar-chat-list`, `nav-new-chat`,
 //! `nav-toggle-sidebar`, `session-{id}`, `footer-theme`, `footer-account`,
 //! `header-left-sidebar` (restore the hidden sidebar; absent while it is visible),
-//! `nav-toggle-sidebar` (open the visible sidebar's size menu), `sidebar-mode-menu` with
-//! `sidebar-mode-expanded`, `sidebar-mode-mini`, `sidebar-mode-hide` while the menu is open,
+//! `nav-toggle-sidebar` (hide the visible sidebar). Native right-click changes Mini/Expanded
+//! without opening a menu; the `sidebar.mini` action remains available to keyboard automation.
 //! `header-right-sidebar` (chat's window-level pane toggle),
 //! `header-monitor` (computer pane toggle while a bot is open),
 //! `composer`, `composer-panel`, `composer-panel-search`, `composer-recipe-bar`,

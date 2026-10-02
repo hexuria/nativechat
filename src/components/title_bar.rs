@@ -10,6 +10,7 @@ use crate::components::chat::ChatView;
 use crate::components::computer::ComputerPane;
 use crate::components::persona::PersonaMark;
 use crate::components::recipes::{RecipesView, recipes_header};
+use crate::components::sidebar::sidebar_toggle_button;
 use crate::state::{AppState, MainPage, RightPane};
 use gpui_kit::component::{ActiveTheme, Icon, h_flex};
 use gpui_kit::prelude::FluentBuilder;
@@ -395,21 +396,16 @@ impl TitleBar {
                 header_sidebar_toggle_visible(state.sidebar_hidden),
                 |this| {
                     this.child(
-                        header_icon(
+                        sidebar_toggle_button(
+                            app.clone(),
                             "header-left-sidebar",
-                            "icons/panel-left.svg",
-                            !state.sidebar_hidden,
+                            28.,
+                            cx.theme().foreground,
+                            true,
                         )
                         .absolute()
                         .left(px(TITLE_BAR_LEFT_PAD))
-                        .top(px(12.))
-                        .on_mouse_down(MouseButton::Left, {
-                            let app = app.clone();
-                            move |_, _, cx| {
-                                cx.stop_propagation();
-                                app.update(cx, |state, cx| state.toggle_sidebar(cx));
-                            }
-                        }),
+                        .top(px(12.)),
                     )
                 },
             )

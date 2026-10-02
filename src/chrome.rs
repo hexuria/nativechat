@@ -242,14 +242,6 @@ pub fn header_sidebar_toggle_visible(sidebar_hidden: bool) -> bool {
     sidebar_hidden
 }
 
-/// Hide remembers the last visible size, so reopening does not choose one for the person.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SidebarMode {
-    Expanded,
-    Mini,
-    Hidden,
-}
-
 pub fn chat_column_width(
     window_width: f32,
     hidden: bool,
