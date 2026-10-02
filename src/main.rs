@@ -1,13 +1,13 @@
 use gpui_kit::component::Root;
 use gpui_kit::*;
 use nativechat::actions::{
-    About, BranchInNewChat, CloseBotFinder, CloseCommandPalette, CloseFind, CloseLightbox,
-    CloseSettings, CloseWindow, CopyMessage, FindNext, FindPrev, FocusChatInput, Hide, HideOthers,
-    LightboxNext, LightboxPrev, Minimize, NavBack, NavForward, NewChat, OpenCommandPalette,
-    OpenSettings, PaletteNextTab, PalettePrevTab, PaletteSelectNext, PaletteSelectPrev,
-    PickFinderItem, Quit, ReadAloud, ReportMessage, Search, ShowAll, ToggleAgentSettings,
-    ToggleComputerPane, ToggleDebugMarkdown, ToggleFps, ToggleMiniSidebar, ToggleSidebar,
-    ToggleTheme, Zoom,
+    About, BranchInNewChat, CancelRoutineDelete, CloseBotFinder, CloseCommandPalette, CloseFind,
+    CloseLightbox, CloseSettings, CloseWindow, CopyMessage, FindNext, FindPrev, FocusChatInput,
+    Hide, HideOthers, LightboxNext, LightboxPrev, Minimize, NavBack, NavForward, NewChat,
+    OpenCommandPalette, OpenSettings, PaletteNextTab, PalettePrevTab, PaletteSelectNext,
+    PaletteSelectPrev, PickFinderItem, Quit, ReadAloud, ReportMessage, Search, ShowAll,
+    ToggleAgentSettings, ToggleComputerPane, ToggleDebugMarkdown, ToggleFps, ToggleMiniSidebar,
+    ToggleSidebar, ToggleTheme, Zoom,
 };
 use nativechat::assets::CombinedAssets;
 use nativechat::chrome::TITLE_BAR_H;
@@ -144,6 +144,8 @@ fn main() {
                 KeyBinding::new("escape", CloseLightbox, Some("Lightbox")),
                 KeyBinding::new("left", LightboxPrev, Some("Lightbox")),
                 KeyBinding::new("right", LightboxNext, Some("Lightbox")),
+                // The routine Delete question holds focus while it asks, the same way.
+                KeyBinding::new("escape", CancelRoutineDelete, Some("RoutineDelete")),
                 KeyBinding::new("tab", PaletteNextTab, Some("CommandPalette")),
                 KeyBinding::new("shift-tab", PalettePrevTab, Some("CommandPalette")),
                 KeyBinding::new("down", PaletteSelectNext, Some("CommandPalette")),

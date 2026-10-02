@@ -11,6 +11,9 @@
 //! without opening a menu; the `sidebar.mini` action remains available to keyboard automation.
 //! `header-right-sidebar` (chat's window-level pane toggle),
 //! `header-monitor` (computer pane toggle while a bot is open),
+//! `header-coworker` (the chip at the top of the chat, while a bot is open: label = its name; a
+//! click opens the bot's settings, or, with state `goes-home` in one of its routines' threads,
+//! goes back to the bot's own chat),
 //! `composer`, `composer-panel`, `composer-panel-search`, `composer-recipe-bar`,
 //! `composer-skill` (the skill the next message is sent with, value = the id the turn names;
 //! in the tree only while one is on the draft),
@@ -81,16 +84,61 @@
 //! `settings-local-rule-error-allow|deny-{n}` (why its last Remove did not go through);
 //! `settings-local-rules-empty` while there are none, `settings-local-rules-error` while they
 //! could not be read. Nothing for a machine that is not this Mac.
-//! `routine-new`, `routine-{id}`, `routine-{id}-trigger-schedule`,
+//! `routine-new`, `routine-{id}`, `routine-{id}-active` (the editor's Active switch: label
+//! `Active`, or `Paused` while it is off; checked while the routine runs on its own; a click
+//! asks for the other way), `routine-{id}-trigger-schedule`,
 //! `routine-{id}-trigger-webhook`, `routine-{id}-webhook-url`,
 //! `routine-{id}-webhook-key`, `routine-{id}-rotate`, `routine-{id}-test` (Test run, on a
-//! routine the server has), `routine-{id}-run-{runId}` (one Run history line: label `Test run` /
-//! `Webhook` / `Schedule`, value `running` / `waiting` / `ok` / `error`; a click opens the
-//! routine's thread), `routine-{id}-delete`.
+//! routine the server has; disabled, and a click refused in the editor's words, on a server that
+//! cannot run a routine on demand), `routine-{id}-run-{runId}` (one Run history line: label `Test
+//! run` / `Webhook` / `Schedule`, value `running` / `waiting` / `ok` / `error`; a click opens the
+//! routine's thread and brings that run into view once the thread has it), `routine-{id}-delete`.
+//! While a routine is open in the Computer pane, its header's four icons are under
+//! `computer-pane`, each acting on that routine: `routine-history-toggle` (label `Run history`, or
+//! `Back to the routine` with state `selected` while the panel shows the Run history alone in
+//! place of the routine's fields), `routine-open-thread`, `routine-run-now` and `routine-delete`;
+//! one that cannot act is disabled, with the reason as its value, and a click on it is refused.
+//! "When to run" on the open routine, under `computer-pane`: `routine-wake-add` (+, disabled
+//! while the routine has its one wake, the server's limit until opengrok-server#315, with the
+//! reason as its value), `routine-wake-{i}` (a wake: label = what sets it off, in words, times on
+//! the server's clock, UTC) holding `routine-wake-edit-{i}` (opens the wake editor on it; disabled
+//! on a schedule where the server cannot change a routine) and `routine-wake-delete-{i}`
+//! (disabled: a routine keeps its only wake). While the wake editor is open, `routine-wake-editor`
+//! (value = the open tab's word) holds `routine-wake-tab-every|daily|weekly|monthly|webhook|cron`
+//! (state `selected` on the open one; disabled where the routine's kind rules it out, since a
+//! schedule never becomes a webhook nor a webhook a schedule) and the open tab's controls: on
+//! Every, `routine-wake-every` (a textbox; `set_value` writes it) with `routine-wake-every-up|down`
+//! and `routine-wake-unit-minutes|hours|days` (state `selected`); on Daily, Weekly and Monthly,
+//! `routine-wake-hour` and `routine-wake-minute` (textboxes, on a 12-hour clock) with their
+//! `-up|down` (the hour by one round the clock, the minute by five), `routine-wake-am|pm` (state
+//! `selected`) and `routine-wake-month-{1..12}` (checkboxes; none checked is every month); on
+//! Weekly, `routine-wake-day-{0..6}` (Sunday is 0); on Monthly, `routine-wake-date-{1..31}`; on
+//! Cron, `routine-wake-cron` (a textbox: five fields) and `routine-wake-cron-note` (while its days
+//! of the week are numbers, which the server counts from Sunday as 1). Under them
+//! `routine-wake-summary` (label = what was picked, in words), `routine-wake-next` (when it would
+//! next run, in the person's own time), `routine-wake-error` (why it cannot be saved),
+//! `routine-wake-save` (label `Save`, or `Done` on a webhook; disabled while there is an error)
+//! and `routine-wake-cancel`.
+//! A click on `routine-delete` or `routine-{id}-delete` asks first, as a person's does:
+//! `routine-delete-prompt` (a dialog over the whole window, label `Delete "<name>"?`, value =
+//! what deleting it does, e.g. "It stops running. Its past runs and conversation stay.") with
+//! `routine-delete-cancel` and `routine-delete-confirm`, in the tree only while it asks. Escape
+//! answers Cancel in the window. Invoke `routine.delete` deletes outright, without asking.
+//! What an older server cannot do with a routine (one from before opengrok-server 18656e3), each
+//! in the tree only while it is so, label = the editor's words: `routine-{id}-cant-change` (it
+//! cannot change a routine once it is made: the fields are dead, and `routine.edit` is refused),
+//! `routine-{id}-cant-run` (it cannot run one on demand), `routine-{id}-runs-unavailable` (in the
+//! Run history's place: it cannot list a routine's runs) and `routine-{id}-unsaved` (label `Not
+//! saved`, value = what the person typed that it did not keep, one `Label: value` line each).
+//! `routine-error` (under `computer-pane`, while a routine's editor is open and shows one: its red
+//! line, the last refusal in the server's words or what the server answered when it said
+//! nothing; never `request failed`).
 //! `routine-{id}-thread` (Open thread, on a routine the server has); on a routine's thread the
-//! chat carries `chat-routine-thread` (label the routine's name, value `schedule` / `webhook`)
-//! and `chat-routine-back` (back to the bot's own chat), `chat-routine-instructions` (value = how many
-//! bubbles are labelled as the routine's instruction). Invoke `routine.thread {id}` opens it.
+//! chat carries `chat-routine-thread` (the line centred under the bot chip: label the routine's
+//! name, value `schedule` / `webhook`) and `chat-routine-instructions` (value = how many bubbles
+//! are labelled as the routine's instruction). There is no Back link: the way back to the bot's
+//! own chat is `header-coworker`, in state `goes-home` there. Invoke `routine.thread {id}` opens
+//! it.
 //! Invoke `routine.run {id}` is Test run; `routine.edit {id, name?, prompt?}` saves an edit the
 //! way the editor does (a `PATCH` of what changed).
 //!

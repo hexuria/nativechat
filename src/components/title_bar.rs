@@ -11,10 +11,26 @@ use crate::components::computer::ComputerPane;
 use crate::components::persona::PersonaMark;
 use crate::components::recipes::{RecipesView, recipes_header};
 use crate::components::sidebar::sidebar_toggle_button;
+use crate::opengrok::Coworker;
 use crate::state::{AppState, MainPage, RightPane};
-use gpui_kit::component::{ActiveTheme, Icon, h_flex};
+use gpui_kit::component::{ActiveTheme, Icon, Theme, h_flex};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
+
+/// Where the line naming a routine's thread starts: just under the Bot chip, which is 36px tall
+/// in the middle of the bar.
+const ROUTINE_LINE_TOP: f32 = TITLE_BAR_H - 6.;
+
+/// The chat's floating bar ends in a row of icon buttons, the computer's and the pane toggle:
+/// each this wide, this far apart, and `HEADER_PX` in from the window's right edge.
+const BUTTON_PX: f32 = 28.;
+const BUTTON_GAP: f32 = 8.;
+
+/// How much of the right end of a pane's header row the chat's floating bar keeps for its two
+/// buttons, with a gap before them as wide as the one between them. Beside the chat the pane
+/// reaches the window's top right corner, docked or floating, and the bar is painted over it, so
+/// a control the row put in this run would sit under a button and lose its presses to it.
+pub const PANE_ROW_UNDER_BUTTONS: f32 = HEADER_PX + 2. * (BUTTON_PX + BUTTON_GAP);
 
 /// A run of the bar with no control in it: a handle to drag the window by.
 pub fn window_drag(el: Div) -> Div {
@@ -106,8 +122,9 @@ impl Render for TitleBar {
                     c.avatar_color.clone(),
                 )
             });
-        // A routine's thread says so beside the bot's name, with the way back to the bot's own
-        // chat: it is not in the sidebar, so the header is where a person finds where they are.
+        // A routine's thread says so beside the bot's name: it is not in the sidebar, so the
+        // header is where a person finds where they are. The name is the way back to the bot's
+        // own chat, as the chip is in the floating header.
         let routine_thread = state
             .active_thread_origin()
             .filter(|_| !state.is_app_settings_open)
@@ -177,7 +194,7 @@ impl Render for TitleBar {
                             .on_mouse_down(MouseButton::Left, {
                                 let app = app.clone();
                                 move |_, _, cx| {
-                                    app.update(cx, |state, cx| state.toggle_agent_settings(cx));
+                                    app.update(cx, |state, cx| state.press_bot_chip(cx));
                                 }
                             })
                             .child(
@@ -205,21 +222,6 @@ impl Render for TitleBar {
                                 .text_xs()
                                 .text_color(theme.muted_foreground)
                                 .child(format!("Routine · {routine}")),
-                        )
-                        .child(
-                            div()
-                                .id("header-routine-back")
-                                .text_xs()
-                                .text_color(theme.muted_foreground)
-                                .cursor_pointer()
-                                .hover(|s| s.text_color(theme.foreground))
-                                .on_mouse_down(MouseButton::Left, {
-                                    let app = app.clone();
-                                    move |_, _, cx| {
-                                        app.update(cx, |state, cx| state.back_to_bot_chat(cx));
-                                    }
-                                })
-                                .child(format!("Back to {name}")),
                         )
                     }),
                 // No bot: the page's title, in the same place and style.
@@ -370,58 +372,7 @@ impl TitleBar {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .child(
-                        div()
-                            .id("header-coworker")
-                            .occlude()
-                            .max_w(px(pill_width))
-                            .min_w_0()
-                            .h(px(36.))
-                            .px(px(12.))
-                            .rounded_full()
-                            .bg(theme.secondary.opacity(0.94))
-                            .border_1()
-                            .border_color(theme.border.opacity(0.5))
-                            .flex()
-                            .items_center()
-                            .gap(px(8.))
-                            .when_some(bot, |this, bot| {
-                                let name = if bot.name.trim().is_empty() {
-                                    "Bot"
-                                } else {
-                                    bot.name.trim()
-                                };
-                                this.cursor_pointer()
-                                    .hover(|s| s.bg(theme.secondary))
-                                    .on_mouse_down(MouseButton::Left, {
-                                        let app = app.clone();
-                                        move |_, _, cx| {
-                                            cx.stop_propagation();
-                                            app.update(cx, |state, cx| {
-                                                state.toggle_agent_settings(cx)
-                                            });
-                                        }
-                                    })
-                                    .child(
-                                        div().flex_shrink_0().child(
-                                            PersonaMark::new(bot.id.clone())
-                                                .shape(bot.avatar_shape.clone())
-                                                .color(bot.avatar_color.clone())
-                                                .size(px(24.))
-                                                .dark(theme.is_dark()),
-                                        ),
-                                    )
-                                    .child(
-                                        div()
-                                            .min_w_0()
-                                            .truncate()
-                                            .text_sm()
-                                            .font_weight(FontWeight::SEMIBOLD)
-                                            .child(name.to_owned()),
-                                    )
-                            })
-                            .when(bot.is_none(), |this| this.child("Bots")),
-                    ),
+                    .child(bot_chip(app.clone(), bot, pill_width, theme)),
             )
             .when(
                 header_sidebar_toggle_visible(state.sidebar_hidden),
@@ -440,12 +391,13 @@ impl TitleBar {
                     )
                 },
             )
+            // The pane's header row keeps the run under these clear (`PANE_ROW_UNDER_BUTTONS`).
             .child(
                 h_flex()
                     .absolute()
                     .right(px(HEADER_PX))
                     .top(px(12.))
-                    .gap(px(8.))
+                    .gap(px(BUTTON_GAP))
                     .when(bot.is_some(), |this| {
                         this.child(
                             header_icon(
@@ -483,41 +435,31 @@ impl TitleBar {
                         }),
                     ),
             )
+            // Which routine's thread this is, in a small line centred under the chip that names
+            // its Bot. The chip is the way back to the Bot's own chat from here
+            // (`AppState::press_bot_chip`), so the line is only a name.
             .when_some(state.active_thread_origin(), |this, origin| {
-                let name = bot
-                    .map(|bot| bot.name.clone())
-                    .unwrap_or_else(|| "Bot".into());
                 this.child(
-                    h_flex()
+                    div()
                         .absolute()
-                        .left(px(chat_left + HEADER_PX))
-                        .top(px(TITLE_BAR_H))
-                        .occlude()
-                        .gap_2()
-                        .px_2()
-                        .py_1()
-                        .rounded(px(8.))
-                        .bg(theme.background.opacity(0.95))
-                        .text_xs()
-                        .text_color(theme.muted_foreground)
+                        .left(px(chat_left))
+                        .right(px(chat_right))
+                        .top(px(ROUTINE_LINE_TOP))
+                        .flex()
+                        .justify_center()
                         .child(
                             div()
                                 .id("header-routine-thread")
+                                .occlude()
+                                .max_w(px(pill_width))
+                                .min_w_0()
+                                .truncate()
+                                .px_2()
+                                .rounded(px(6.))
+                                .bg(theme.background.opacity(0.95))
+                                .text_xs()
+                                .text_color(theme.muted_foreground)
                                 .child(format!("Routine · {}", origin.routine_name)),
-                        )
-                        .child(
-                            div()
-                                .id("header-routine-back")
-                                .cursor_pointer()
-                                .hover(|s| s.text_color(theme.foreground))
-                                .on_mouse_down(MouseButton::Left, {
-                                    let app = app.clone();
-                                    move |_, _, cx| {
-                                        cx.stop_propagation();
-                                        app.update(cx, |state, cx| state.back_to_bot_chat(cx));
-                                    }
-                                })
-                                .child(format!("Back to {name}")),
                         ),
                 )
             })
@@ -537,11 +479,70 @@ impl TitleBar {
     }
 }
 
+/// The pill at the top centre of the chat that names the open Bot, or says Bots while none is.
+///
+/// A press opens and shuts the Bot's settings, or, in one of its routines' threads, goes back to
+/// the Bot's own chat (`AppState::press_bot_chip`).
+fn bot_chip(
+    app: Entity<AppState>,
+    bot: Option<&Coworker>,
+    pill_width: f32,
+    theme: &Theme,
+) -> Stateful<Div> {
+    div()
+        .id("header-coworker")
+        .debug_selector(|| "header-coworker".into())
+        .occlude()
+        .max_w(px(pill_width))
+        .min_w_0()
+        .h(px(36.))
+        .px(px(12.))
+        .rounded_full()
+        .bg(theme.secondary.opacity(0.94))
+        .border_1()
+        .border_color(theme.border.opacity(0.5))
+        .flex()
+        .items_center()
+        .gap(px(8.))
+        .when_some(bot, |this, bot| {
+            let name = if bot.name.trim().is_empty() {
+                "Bot"
+            } else {
+                bot.name.trim()
+            };
+            this.cursor_pointer()
+                .hover(|s| s.bg(theme.secondary))
+                .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                    cx.stop_propagation();
+                    app.update(cx, |state, cx| state.press_bot_chip(cx));
+                })
+                .child(
+                    div().flex_shrink_0().child(
+                        PersonaMark::new(bot.id.clone())
+                            .shape(bot.avatar_shape.clone())
+                            .color(bot.avatar_color.clone())
+                            .size(px(24.))
+                            .dark(theme.is_dark()),
+                    ),
+                )
+                .child(
+                    div()
+                        .min_w_0()
+                        .truncate()
+                        .text_sm()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child(name.to_owned()),
+                )
+        })
+        .when(bot.is_none(), |this| this.child("Bots"))
+}
+
 fn header_icon(id: &'static str, path: &'static str, selected: bool) -> Stateful<Div> {
     div()
         .id(id)
+        .debug_selector(move || id.to_string())
         .occlude()
-        .size(px(28.))
+        .size(px(BUTTON_PX))
         .rounded(px(8.))
         .flex()
         .items_center()
@@ -586,6 +587,104 @@ fn fade_span(width: f32, left: f32, right_open: bool) -> (f32, f32) {
 #[cfg(test)]
 mod tests {
     use super::floating_header_span;
+    use crate::state::{AppState, Conversation, RightPane, ThreadOrigin};
+    use gpui_kit::component::ActiveTheme as _;
+    use gpui_kit::{
+        AppContext as _, Context, Entity, IntoElement, Modifiers, ParentElement as _, Render,
+        TestAppContext, Window, div,
+    };
+
+    /// The chat's top chip on its own, over the app state.
+    struct Chip {
+        app: Entity<AppState>,
+    }
+
+    impl Render for Chip {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let state = self.app.read(cx);
+            let bot = state
+                .active_coworker_id
+                .as_ref()
+                .and_then(|id| state.coworkers.iter().find(|bot| &bot.id == id));
+            div().child(super::bot_chip(self.app.clone(), bot, 240., cx.theme()))
+        }
+    }
+
+    fn thread(id: &str, origin: Option<ThreadOrigin>) -> Conversation {
+        Conversation {
+            id: id.into(),
+            title: id.into(),
+            created_at: String::new(),
+            updated_at: String::new(),
+            messages: Vec::new(),
+            unread_count: 0,
+            origin,
+        }
+    }
+
+    /// New Bot, open on the thread its routine "Say hello" runs in.
+    fn in_a_routines_thread() -> AppState {
+        let mut state = AppState::new();
+        state.coworkers = vec![
+            serde_json::from_value(serde_json::json!({ "id": "cw_1", "name": "New Bot" }))
+                .expect("a coworker"),
+        ];
+        state.active_coworker_id = Some("cw_1".into());
+        state.conversations = vec![
+            thread("cw_1", None),
+            thread(
+                "sch_1",
+                Some(ThreadOrigin {
+                    word: "schedule".into(),
+                    routine_name: "Say hello".into(),
+                    coworker_id: "cw_1".into(),
+                }),
+            ),
+        ];
+        state.active_conversation_id = Some("sch_1".into());
+        state
+    }
+
+    /// The chip, pressed the way a person presses it. In a routine's thread it goes back to the
+    /// Bot's own chat and leaves the settings shut; in the Bot's own chat the same chip opens the
+    /// settings, as it always has.
+    #[gpui_kit::test]
+    fn the_bot_chip_goes_home_from_a_routines_thread(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (view, cx) = cx.add_window_view(|_, cx| Chip {
+            app: cx.new(|_| in_a_routines_thread()),
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let chip = cx
+            .debug_bounds("header-coworker")
+            .expect("the chip is drawn")
+            .center();
+        cx.simulate_mouse_move(chip, None, Modifiers::none());
+        cx.simulate_click(chip, Modifiers::none());
+        view.update(cx, |view, cx| {
+            let state = view.app.read(cx);
+            assert_eq!(
+                state.active_conversation_id.as_deref(),
+                Some("cw_1"),
+                "the chip goes back to the Bot's own chat"
+            );
+            assert_eq!(
+                state.right_pane,
+                RightPane::Closed,
+                "and opens nothing on the way"
+            );
+        });
+
+        view.update(cx, |_, cx| cx.notify());
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.simulate_mouse_move(chip, None, Modifiers::none());
+        cx.simulate_click(chip, Modifiers::none());
+        view.update(cx, |view, cx| {
+            let state = view.app.read(cx);
+            assert_eq!(state.right_pane, RightPane::Settings);
+            assert_eq!(state.active_conversation_id.as_deref(), Some("cw_1"));
+        });
+    }
 
     #[test]
     fn pill_tracks_chat_centre_for_all_sidebar_states() {
@@ -848,6 +947,59 @@ mod tests {
                     "a press on {header} in {pane:?} {computer:?} did not move the window"
                 );
             }
+        }
+
+        /// Beside the chat the title bar's two buttons float over the right end of the pane's
+        /// header row. A routine's four icons in that row stop short of them, so each is pressed
+        /// as itself: Delete asks about the routine, where the pane toggle over it shut the pane.
+        #[gpui_kit::test]
+        fn a_routines_icons_beside_the_chat_are_clear_of_the_title_bars_buttons(
+            cx: &mut TestAppContext,
+        ) {
+            let (view, cx) = chat_page(cx, 1200.);
+            view.update(cx, |page, cx| {
+                page.app.update(cx, |state, cx| {
+                    state.right_pane = RightPane::Computer;
+                    state.computer_view = ComputerView::Editor {
+                        id: Some("sch_1".into()),
+                    };
+                    cx.notify();
+                });
+            });
+            let buttons = ["header-monitor", "header-right-sidebar"].map(|button| {
+                let bounds = cx
+                    .debug_bounds(button)
+                    .unwrap_or_else(|| panic!("no {button} in the title bar"));
+                (button, bounds)
+            });
+            for icon in [
+                "routine-history-toggle",
+                "routine-open-thread",
+                "routine-run-now",
+                "routine-delete",
+            ] {
+                let bounds = cx
+                    .debug_bounds(icon)
+                    .unwrap_or_else(|| panic!("no {icon} in the routine's header"));
+                for (button, over) in &buttons {
+                    assert!(!bounds.intersects(over), "{icon} is under {button}");
+                }
+            }
+
+            let delete = cx
+                .debug_bounds("routine-delete")
+                .expect("the routine's Delete is drawn")
+                .center();
+            press(cx, delete);
+            view.update(cx, |page, cx| {
+                let state = page.app.read(cx);
+                assert_eq!(
+                    state.routine_delete_prompt.as_deref(),
+                    Some("sch_1"),
+                    "Delete asks about the routine"
+                );
+                assert_eq!(state.right_pane, RightPane::Computer, "the pane stays open");
+            });
         }
     }
 }

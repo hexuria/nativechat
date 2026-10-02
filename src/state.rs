@@ -8,7 +8,7 @@ use crate::config::Config;
 /// The routine editor's schedule and the cron line it becomes. Re-exported because every
 /// caller reads it as part of a routine, and a routine is a thing on `AppState`.
 pub use crate::cron_spec::{
-    ScheduleDayKind, ScheduleNotCron, ScheduleSpec, ScheduleUiMode, ScheduleUnit,
+    ScheduleDayKind, ScheduleNotCron, ScheduleSpec, ScheduleUiMode, ScheduleUnit, WakeTab,
 };
 use crate::opengrok::{
     Account, ActivityTick, AguiMessage, ApprovalSpec, BotActivity, BoxHandoffReply,
@@ -3673,6 +3673,337 @@ pub struct AgentRoutine {
 pub const ROUTINE_IS_ONE_SCHEDULE: &str =
     "A routine is one schedule on the server: make another routine for a second trigger.";
 
+/// What deleting a routine the server has does, as Delete's question says it. The server only
+/// marks the routine deleted (opengrok-server `autonomy/routes.rs`, `delete_schedule`, which
+/// appends `ScheduleEvent::Deleted`): it stops firing and refuses edits, and its runs and its
+/// thread are kept.
+pub const ROUTINE_DELETE_KEEPS: &str = "It stops running. Its past runs and conversation stay.";
+
+/// The same question about a draft, which never reached the server.
+pub const DRAFT_DELETE_KEEPS: &str = "It was never saved, so nothing else changes.";
+
+/// What + says, dead, on a routine that has its one wake. opengrok-server keeps one wake per
+/// routine (`opengrok-core` `schedule.rs`: a schedule is one `Wake`); opengrok-server#315 lets a
+/// routine have several, and is what will let + add another.
+pub const ONE_WAKE_PER_ROUTINE: &str = "This server allows one schedule per routine";
+
+/// What 🗑 says, dead, on a routine's only wake: a routine with none would never run, and
+/// stopping it is what deleting the routine does.
+pub const LAST_WAKE_STAYS: &str = "A routine needs a schedule: delete the routine to stop it";
+
+/// One of the wake editor's typed boxes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WakeBox {
+    /// The Every tab's number.
+    Every,
+    /// The hour, on a 12-hour clock.
+    Hour,
+    Minute,
+    /// The Cron tab's line.
+    Cron,
+}
+
+/// A wake of a routine being picked in the wake editor, before Save: what has been picked, and
+/// what the routine already is.
+#[derive(Clone, Debug, PartialEq)]
+pub struct WakeEditor {
+    pub routine_id: String,
+    /// The wake being changed, by its place in the routine's list; `None` while one is added.
+    pub index: Option<usize>,
+    /// The kind the routine already is, which an edit cannot change: the server refuses ("a
+    /// routine's kind cannot change; create a new routine instead", opengrok-server
+    /// `autonomy/routes.rs`, `edit_schedule`). `None` for a routine's first wake.
+    pub kind: Option<ScheduleKind>,
+    pub tab: WakeTab,
+    /// What the time tabs and the Cron tab have picked.
+    pub spec: ScheduleSpec,
+    /// The Every number, the hour and the minute as they are in their boxes: what the person
+    /// sees, kept even while one of them is not a number, so the schedule says it is not one
+    /// rather than keep an older value the box no longer shows.
+    pub every: String,
+    pub hour: String,
+    pub minute: String,
+    pub pm: bool,
+    /// Which opening of the editor this is, unique to it, and bumped with every change to a
+    /// box's text from outside the box (a stepper, a tab, a driver): together they tell the pane
+    /// when to write the boxes again. A person's typing is the box's own.
+    pub opened: u64,
+    pub resync: u64,
+}
+
+/// What the wake editor says under what was picked, worked out once for the pane and the
+/// driver's tree alike.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WakeStatus {
+    /// The one sentence that says exactly what was picked.
+    pub summary: String,
+    /// When it would next run, in the person's own time.
+    pub next: Option<String>,
+    /// Why Save cannot go: what was picked is not a schedule the server would take.
+    pub error: Option<String>,
+    /// On the Cron tab, the line's days of the week are numbers, which the server counts from
+    /// Sunday as 1.
+    pub numbered_weekdays: bool,
+}
+
+/// What the Cron tab says beside a line that numbers its days of the week.
+pub const NUMBERED_WEEKDAYS: &str =
+    "On this server, day 1 of the week is Sunday and 7 is Saturday: MON-FRI says weekdays.";
+
+impl WakeStatus {
+    pub fn can_save(&self) -> bool {
+        self.error.is_none()
+    }
+}
+
+impl WakeEditor {
+    fn new(
+        routine_id: String,
+        index: Option<usize>,
+        kind: Option<ScheduleKind>,
+        spec: ScheduleSpec,
+    ) -> Self {
+        let tab = if kind == Some(ScheduleKind::Webhook) {
+            WakeTab::Webhook
+        } else {
+            spec.tab()
+        };
+        let (hour, minute) = spec.times.first().copied().unwrap_or((9, 0));
+        let (h12, am) = crate::cron_spec::twelve_hour(hour);
+        Self {
+            routine_id,
+            index,
+            kind,
+            tab,
+            every: spec.every.to_string(),
+            hour: h12.to_string(),
+            minute: format!("{minute:02}"),
+            pm: !am,
+            spec,
+            opened: 0,
+            resync: 0,
+        }
+    }
+
+    /// The editor's lines for what is picked now: its summary, its next run after `now` in the
+    /// person's time (by the server's own parser, `cron_next`), or why it cannot be saved.
+    pub fn status(&self, now: chrono::DateTime<chrono::Utc>) -> WakeStatus {
+        let mut status = WakeStatus {
+            summary: self.summary(),
+            next: None,
+            error: None,
+            numbered_weekdays: false,
+        };
+        if self.tab == WakeTab::Webhook {
+            return status;
+        }
+        let line = match self.spec.to_cron() {
+            Ok(line) => line,
+            Err(not_cron) => {
+                status.error = Some(not_cron.sentence().to_string());
+                return status;
+            }
+        };
+        status.numbered_weekdays =
+            self.tab == WakeTab::Cron && crate::cron_spec::numbered_weekdays(&line);
+        match crate::cron_next::next_run(&line, now) {
+            Ok(Some(when)) => {
+                status.next = Some(crate::cron_next::next_run_words(when, &chrono::Local));
+            }
+            Ok(None) => {
+                status.error = Some("No date matches this line, so it would never run.".into());
+            }
+            Err(why) => status.error = Some(format!("The server would refuse this line: {why}")),
+        }
+        status
+    }
+
+    /// Whether `tab` can be picked: no webhook for a routine that is a schedule, and no schedule
+    /// for one that is a webhook.
+    pub fn tab_open(&self, tab: WakeTab) -> bool {
+        match self.kind {
+            Some(ScheduleKind::Webhook) => tab == WakeTab::Webhook,
+            Some(ScheduleKind::Cron) => tab != WakeTab::Webhook,
+            None => true,
+        }
+    }
+
+    /// What was picked, as the trigger the server will be asked for, or why it is not one.
+    pub fn picked(&self) -> Result<NewTrigger, ScheduleNotCron> {
+        if self.tab == WakeTab::Webhook {
+            return Ok(NewTrigger::Webhook);
+        }
+        self.spec
+            .to_cron()
+            .map(|_| NewTrigger::Schedule(self.spec.clone()))
+    }
+
+    /// The one sentence under the editor that says exactly what was picked.
+    pub fn summary(&self) -> String {
+        match self.tab {
+            WakeTab::Webhook => "When a webhook fires".into(),
+            _ => self.spec.label(),
+        }
+    }
+
+    /// The time boxes, read into the schedule: no time at all while either is not one, which
+    /// the schedule then says.
+    fn read_time(&mut self) {
+        let hour = self
+            .hour
+            .trim()
+            .parse::<u8>()
+            .ok()
+            .filter(|h| (1..=12).contains(h));
+        let minute = self.minute.trim().parse::<u8>().ok().filter(|m| *m <= 59);
+        self.spec.times = match (hour, minute) {
+            (Some(hour), Some(minute)) => vec![(hour % 12 + if self.pm { 12 } else { 0 }, minute)],
+            _ => Vec::new(),
+        };
+    }
+
+    /// The boxes written from the schedule, after a change from outside them.
+    fn write_boxes(&mut self) {
+        self.every = self.spec.every.to_string();
+        if let Some(&(hour, minute)) = self.spec.times.first() {
+            let (h12, am) = crate::cron_spec::twelve_hour(hour);
+            self.hour = h12.to_string();
+            self.minute = format!("{minute:02}");
+            self.pm = !am;
+        }
+        self.resync += 1;
+    }
+}
+
+/// What Save did with the wake picked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WakeSaved {
+    /// Nothing: there was no editor, or the pick is not a schedule the server takes and the
+    /// editor stays open saying why.
+    Nothing,
+    /// The routine's first wake: the routine is made on the server with it.
+    Created,
+    /// A new wake on a routine the server has, sent with the rest of what changed.
+    Changed,
+    /// A webhook's: there is nothing to change on one, so the editor closes.
+    Closed,
+}
+
+/// What a routine's Run history says on a server that cannot list a routine's runs.
+pub const ROUTINE_RUNS_UNAVAILABLE: &str = "This server can't show a routine's runs yet.";
+
+/// What a routine's editor says on a server that cannot change a routine once it is made.
+pub const ROUTINE_EDIT_UNAVAILABLE: &str = "This server can't change a routine after it's made.";
+
+/// What a routine's editor says on a server that cannot start a routine when asked.
+pub const ROUTINE_RUN_UNAVAILABLE: &str = "This server can't run a routine on demand yet.";
+
+/// What the open server has shown it cannot do with a routine, learnt from its answers.
+///
+/// An opengrok-server from before it could change a routine, run one on demand and list what one
+/// ran (opengrok-server 18656e3, `autonomy/routes.rs`) has none of the three routes, and answers
+/// them the way it answers any route it lacks (`OpenGrokError::route_missing`). That is a fact
+/// about the server and so about every routine on it, kept for as long as the app talks to it:
+/// the history says what it cannot show, the fields stop taking edits that would not be kept, and
+/// Test run stops offering a run that would not start. None of them is asked again.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RoutineRoutesMissing {
+    /// `GET /schedules/{id}/runs`.
+    pub runs: bool,
+    /// `PATCH /schedules/{id}`.
+    pub edit: bool,
+    /// `POST /schedules/{id}/run`.
+    pub run_now: bool,
+}
+
+/// What the routine editor says a server cannot do with a routine, beside the controls it
+/// leaves dead, as each line's id (after `routine-{id}-`) and its words. `on_the_server` is
+/// whether the server has the routine: a draft is made by a route every server has, so it can
+/// still be written whatever the server cannot change once it is made.
+pub fn routine_notes(
+    missing: RoutineRoutesMissing,
+    on_the_server: bool,
+) -> Vec<(&'static str, &'static str)> {
+    [
+        (on_the_server && missing.edit).then_some(("cant-change", ROUTINE_EDIT_UNAVAILABLE)),
+        missing
+            .run_now
+            .then_some(("cant-run", ROUTINE_RUN_UNAVAILABLE)),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
+}
+
+/// The editor's red line for a routine: the last refusal, unless one of its notes already says
+/// it, which would say it twice.
+pub fn routine_trouble_line(
+    trouble: Option<&str>,
+    notes: &[(&'static str, &'static str)],
+) -> Option<String> {
+    trouble
+        .filter(|line| !notes.iter().any(|(_, note)| note == line))
+        .map(str::to_string)
+}
+
+/// A refused routine call, as the Computer pane says it.
+///
+/// The server's own words when it wrote some, begun with a capital as the pane's other lines
+/// are. An answer with nothing in it is said as what the server answered, never as the client's
+/// stand-in, "request failed", which tells nobody what happened; and a server that could not be
+/// reached at all is said as that.
+fn routine_trouble(error: &OpenGrokError) -> String {
+    if error.unreachable() == Some(Unreachable::Server) {
+        return "Could not reach the server.".to_string();
+    }
+    match error.status {
+        Some(status) if error.said_nothing() => {
+            format!("The server answered {status} without saying why.")
+        }
+        _ => crate::components::agent_settings::sentence(error.message.trim()),
+    }
+}
+
+/// In if out, out if in: a chip.
+fn toggle(picked: &mut Vec<u8>, value: u8) {
+    match picked.iter().position(|v| *v == value) {
+        Some(at) => {
+            picked.remove(at);
+        }
+        None => {
+            picked.push(value);
+            picked.sort_unstable();
+        }
+    }
+}
+
+/// What has to follow an edit's answer, which the answer alone decides.
+#[derive(Debug, PartialEq, Eq)]
+enum AfterRoutineEdit {
+    Nothing,
+    /// A Test run pressed while the edit was out, now that the routine is the one it changed to.
+    RunNow,
+    /// The server's copy, read again over an edit it refused (`restore_routine`).
+    ReadBack,
+}
+
+/// What a person typed into a routine that a server without `PATCH /schedules/{id}` refused, as
+/// the editor lists it beside the server's values: the name, the instruction, and when it was to
+/// run, in the words the schedule picker uses.
+pub fn unsaved_lines(edit: &ScheduleEdit) -> Vec<(&'static str, String)> {
+    let mut lines = Vec::new();
+    if let Some(name) = &edit.name {
+        lines.push(("Name", name.clone()));
+    }
+    if let Some(prompt) = &edit.prompt {
+        lines.push(("Instruction", prompt.clone()));
+    }
+    if let Some(cron) = &edit.cron {
+        lines.push(("When", ScheduleSpec::from_cron(cron).label()));
+    }
+    lines
+}
+
 /// One schedule as the editor draws it.
 fn routine_from_schedule(row: ScheduleRow) -> AgentRoutine {
     let trigger = trigger_from_schedule(&row);
@@ -4666,6 +4997,26 @@ pub struct AppState {
     /// edit's answer, or a refused edit put back), so the editor's fields follow it. Per routine
     /// because an answer for one must leave another's half-typed fields alone.
     routine_resyncs: HashMap<String, u64>,
+    /// What this server has shown it cannot do with a routine. Forgotten with the client, when
+    /// the app is pointed at a server again (`set_config`).
+    pub routine_routes_missing: RoutineRoutesMissing,
+    /// Per routine, the edit a server that cannot change a routine refused: what the person
+    /// typed, kept on screen beside the server's values the fields went back to, so it is not
+    /// lost to a refusal it had no part in.
+    pub routine_unsaved: HashMap<String, ScheduleEdit>,
+    /// The routine Delete is asking about, while its question is over the window.
+    pub routine_delete_prompt: Option<String>,
+    /// The open routine's panel shows its Run history and nothing else, in place of its fields.
+    /// Per routine opened: the next one to open shows its fields again.
+    pub routine_history_open: bool,
+    /// The wake being picked for the open routine, while the wake editor is open.
+    pub routine_wake_editor: Option<WakeEditor>,
+    /// How many times the wake editor has opened: each opening's own number.
+    wake_opens: u64,
+    /// A run of a routine to bring into view in the routine's thread once the thread has it:
+    /// the thread's id and the run's. Set by a line of the Run history; let go once shown, or
+    /// once the person is in another thread.
+    pub reveal_run: Option<(String, String)>,
     /// The Bot's model picker has its popover open under the Model card in the Bot's settings,
     /// the one place a Bot's model is picked (`components::model_picker`).
     pub model_picker_open: bool,
@@ -5370,6 +5721,13 @@ impl AppState {
             routine_runs_asked: HashMap::new(),
             routine_latest_edit: HashMap::new(),
             routine_resyncs: HashMap::new(),
+            routine_routes_missing: RoutineRoutesMissing::default(),
+            routine_unsaved: HashMap::new(),
+            routine_history_open: false,
+            routine_wake_editor: None,
+            wake_opens: 0,
+            routine_delete_prompt: None,
+            reveal_run: None,
             model_picker_open: false,
             model_list_open: false,
             model_search: String::new(),
@@ -5515,6 +5873,10 @@ impl AppState {
     }
 
     pub fn set_config(&mut self, config: Config, cx: &mut Context<Self>) {
+        // What a server could not do with a routine is that server's: a new client may be a
+        // newer one.
+        self.routine_routes_missing = RoutineRoutesMissing::default();
+        self.routine_unsaved.clear();
         match OpenGrokClient::new(&config.opengrok_base_url) {
             Ok(client) => {
                 let client =
@@ -10859,8 +11221,256 @@ impl AppState {
         self.set_right_pane(RightPane::Computer, cx);
         self.load_routine_runs(&coworker_id, &id, cx);
         self.computer_view = ComputerView::Editor { id: Some(id) };
+        self.routine_history_open = false;
+        self.routine_wake_editor = None;
         self.record_nav();
         cx.notify();
+    }
+
+    /// Whether + can add a wake to a routine: only while it has none, since the server keeps one
+    /// per routine (see [`ONE_WAKE_PER_ROUTINE`]; opengrok-server#315 will lift this).
+    pub fn can_add_wake(routine: &AgentRoutine) -> bool {
+        routine.triggers.is_empty()
+    }
+
+    /// Whether 🗑 can take a wake off a routine: never its only one ([`LAST_WAKE_STAYS`]), and
+    /// with one per routine on the server, that is every one there is.
+    pub fn can_remove_wake(routine: &AgentRoutine) -> bool {
+        routine.triggers.len() > 1
+    }
+
+    /// ✎ on one of a routine's wakes, or + on a routine with none: the wake editor, on the wake's
+    /// own tab and values, or on 9:00 AM every day for a new one.
+    pub fn open_wake_editor(
+        &mut self,
+        routine_id: &str,
+        index: Option<usize>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(coworker_id) = self.active_coworker_id.clone() else {
+            return;
+        };
+        let Some(row) = self.routine_mut(&coworker_id, routine_id) else {
+            return;
+        };
+        let kind = row.triggers.first().map(|trigger| match trigger {
+            RoutineTrigger::Webhook { .. } => ScheduleKind::Webhook,
+            _ => ScheduleKind::Cron,
+        });
+        let spec = match index.and_then(|at| row.triggers.get(at)) {
+            Some(RoutineTrigger::Schedule { spec, .. }) => spec.clone(),
+            _ => ScheduleSpec::advanced_daily(9, 0),
+        };
+        let mut editor = WakeEditor::new(routine_id.to_string(), index, kind, spec);
+        self.wake_opens += 1;
+        editor.opened = self.wake_opens;
+        self.routine_wake_editor = Some(editor);
+        self.routine_history_open = false;
+        cx.notify();
+    }
+
+    /// Cancel, in the wake editor: nothing picked reaches the routine.
+    pub fn close_wake_editor(&mut self, cx: &mut Context<Self>) {
+        if self.routine_wake_editor.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// A tab of the wake editor: the same schedule as far as it goes, drawn by that tab. A tab
+    /// the routine's kind rules out is dead, and asked for anyway changes nothing.
+    pub fn pick_wake_tab(&mut self, tab: WakeTab, cx: &mut Context<Self>) {
+        let Some(editor) = self.routine_wake_editor.as_mut() else {
+            return;
+        };
+        if !editor.tab_open(tab) || editor.tab == tab {
+            return;
+        }
+        editor.tab = tab;
+        if tab != WakeTab::Webhook {
+            editor.spec = editor.spec.on_tab(tab);
+            editor.write_boxes();
+        }
+        cx.notify();
+    }
+
+    /// One of the editor's typed boxes, as typed (`from_box`), or set from outside it, which is
+    /// then written back into the box.
+    pub fn set_wake_box(
+        &mut self,
+        which: WakeBox,
+        text: String,
+        from_box: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(editor) = self.routine_wake_editor.as_mut() else {
+            return;
+        };
+        match which {
+            WakeBox::Every => {
+                // Not a number is no interval, which the editor then says, rather than an older
+                // number the box no longer shows.
+                editor.spec.every = text.trim().parse().unwrap_or(0);
+                editor.every = text;
+            }
+            WakeBox::Hour => {
+                editor.hour = text;
+                editor.read_time();
+            }
+            WakeBox::Minute => {
+                editor.minute = text;
+                editor.read_time();
+            }
+            WakeBox::Cron => editor.spec.expr = text,
+        }
+        if !from_box {
+            editor.resync += 1;
+        }
+        cx.notify();
+    }
+
+    /// ▲ or ▼ beside the Every number, the hour or the minute: one more or one less, the hour
+    /// round the clock through noon and midnight, and the minute by five.
+    pub fn step_wake_box(&mut self, which: WakeBox, up: bool, cx: &mut Context<Self>) {
+        let Some(editor) = self.routine_wake_editor.as_mut() else {
+            return;
+        };
+        match which {
+            WakeBox::Every => {
+                let every = editor.spec.every;
+                editor.spec.every = if up {
+                    every + 1
+                } else {
+                    every.saturating_sub(1).max(1)
+                };
+            }
+            WakeBox::Hour | WakeBox::Minute => {
+                let (hour, minute) = editor.spec.times.first().copied().unwrap_or((9, 0));
+                editor.spec.times = vec![match (which, up) {
+                    (WakeBox::Hour, true) => ((hour + 1) % 24, minute),
+                    (WakeBox::Hour, false) => ((hour + 23) % 24, minute),
+                    (_, true) => (hour, (minute / 5 * 5 + 5) % 60),
+                    (_, false) => (
+                        hour,
+                        if minute % 5 == 0 {
+                            (minute + 55) % 60
+                        } else {
+                            minute / 5 * 5
+                        },
+                    ),
+                }];
+            }
+            WakeBox::Cron => return,
+        }
+        editor.write_boxes();
+        cx.notify();
+    }
+
+    /// AM or PM, for the time typed.
+    pub fn set_wake_pm(&mut self, pm: bool, cx: &mut Context<Self>) {
+        let Some(editor) = self.routine_wake_editor.as_mut() else {
+            return;
+        };
+        editor.pm = pm;
+        editor.read_time();
+        cx.notify();
+    }
+
+    /// The Every tab's unit.
+    pub fn set_wake_unit(&mut self, unit: ScheduleUnit, cx: &mut Context<Self>) {
+        if let Some(editor) = self.routine_wake_editor.as_mut() {
+            editor.spec.unit = unit;
+            cx.notify();
+        }
+    }
+
+    /// A day of the week's chip, on the Weekly tab: in or out (0 is Sunday).
+    pub fn toggle_wake_weekday(&mut self, day: u8, cx: &mut Context<Self>) {
+        if let Some(editor) = self.routine_wake_editor.as_mut() {
+            toggle(&mut editor.spec.weekdays, day);
+            cx.notify();
+        }
+    }
+
+    /// A date in the Monthly tab's grid: in or out.
+    pub fn toggle_wake_date(&mut self, date: u8, cx: &mut Context<Self>) {
+        if let Some(editor) = self.routine_wake_editor.as_mut() {
+            toggle(&mut editor.spec.month_days, date);
+            cx.notify();
+        }
+    }
+
+    /// A month's chip: in or out. None in is every month.
+    pub fn toggle_wake_month(&mut self, month: u8, cx: &mut Context<Self>) {
+        if let Some(editor) = self.routine_wake_editor.as_mut() {
+            toggle(&mut editor.spec.months, month);
+            cx.notify();
+        }
+    }
+
+    /// Save, in the wake editor. The fields typed for the routine go on it first, since a
+    /// routine's first wake is what makes it on the server, with its name and instruction
+    /// (`add_routine_trigger`); a change to the wake it has goes as one edit with whatever else
+    /// changed (`save_routine_fields`). A pick that is not one line the server takes leaves the
+    /// editor open, saying why.
+    pub fn save_wake(
+        &mut self,
+        name: String,
+        instruction: String,
+        cx: &mut Context<Self>,
+    ) -> WakeSaved {
+        let (Some(editor), Some(coworker_id)) = (
+            self.routine_wake_editor.clone(),
+            self.active_coworker_id.clone(),
+        ) else {
+            return WakeSaved::Nothing;
+        };
+        let picked = match editor.picked() {
+            Ok(picked) => picked,
+            Err(not_cron) => {
+                self.say_routine_trouble(not_cron.sentence().to_string(), cx);
+                return WakeSaved::Nothing;
+            }
+        };
+        let Some(first) = self
+            .routine_mut(&coworker_id, &editor.routine_id)
+            .map(|row| row.triggers.is_empty())
+        else {
+            return WakeSaved::Nothing;
+        };
+        self.routine_wake_editor = None;
+        if first {
+            if let Some(row) = self.routine_mut(&coworker_id, &editor.routine_id) {
+                row.name = name;
+                row.instruction = instruction;
+            }
+            self.add_routine_trigger(&coworker_id, &editor.routine_id, picked, cx);
+            return WakeSaved::Created;
+        }
+        if let (NewTrigger::Schedule(spec), Some(at)) = (picked, editor.index)
+            && let Some(RoutineTrigger::Schedule { spec: wake, .. }) = self
+                .routine_mut(&coworker_id, &editor.routine_id)
+                .and_then(|row| row.triggers.get_mut(at))
+        {
+            *wake = spec;
+            self.save_routine_fields(&coworker_id, &editor.routine_id, name, instruction, cx);
+            return WakeSaved::Changed;
+        }
+        cx.notify();
+        WakeSaved::Closed
+    }
+
+    /// The history icon in a routine's header: its Run history in place of its fields, or its
+    /// fields again.
+    pub fn toggle_routine_history(&mut self, cx: &mut Context<Self>) {
+        self.routine_history_open = !self.routine_history_open;
+        cx.notify();
+    }
+
+    /// A line of a routine's Run history: the routine's thread, with that run brought into view
+    /// once the thread has it (`ChatView`), which a thread rebuilt from the server may not yet.
+    pub fn open_routine_run(&mut self, routine_id: &str, run_id: &str, cx: &mut Context<Self>) {
+        self.reveal_run = Some((routine_id.to_string(), run_id.to_string()));
+        self.open_routine_thread(routine_id, cx);
     }
 
     pub fn back_to_computer(&mut self, cx: &mut Context<Self>) {
@@ -10907,66 +11517,144 @@ impl AppState {
         instruction: String,
         cx: &mut Context<Self>,
     ) {
-        let Some(row) = self.routine_mut(coworker_id, routine_id) else {
-            return;
-        };
-        row.name = name;
-        row.instruction = instruction;
-        let edit = routine_edit(row);
+        let begun = self.begin_routine_edit(coworker_id, routine_id, name, instruction);
         cx.notify();
-        if edit.is_empty() {
-            return;
-        }
-        let Some(client) = self.opengrok.clone() else {
+        let Some((client, this_edit, edit)) = begun else {
             return;
         };
         let coworker_id = coworker_id.to_string();
         let routine_id = routine_id.to_string();
-        self.routine_seq += 1;
-        let this_edit = self.routine_seq;
-        self.routine_latest_edit
-            .insert(routine_id.clone(), this_edit);
-        // A Test run already waiting keeps waiting, now on this edit.
-        let entry = self
-            .routine_edits
-            .entry(routine_id.clone())
-            .or_insert((this_edit, false));
-        entry.0 = this_edit;
         cx.spawn(async move |this, cx| {
             let result = client.edit_schedule(&routine_id, &edit).await;
             let _ = this.update(cx, |state, cx| {
-                // An earlier edit's answer, with a later one still out: the later one says what
-                // the routine is, and settles the wait.
-                if state
-                    .routine_edits
-                    .get(&routine_id)
-                    .map(|(latest, _)| *latest)
-                    != Some(this_edit)
+                match state.settle_routine_edit(&coworker_id, &routine_id, this_edit, edit, result)
                 {
-                    return;
-                }
-                let run_waiting = state
-                    .routine_edits
-                    .remove(&routine_id)
-                    .is_some_and(|(_, waiting)| waiting);
-                match result {
-                    Ok(row) => {
-                        state.put_server_routine(&coworker_id, row);
-                        if run_waiting {
-                            state.run_routine_now(&coworker_id, &routine_id, cx);
-                        }
+                    AfterRoutineEdit::RunNow => {
+                        state.run_routine_now(&coworker_id, &routine_id, cx)
                     }
-                    // A Test run waiting on a refused edit is not started: it would run the
-                    // routine the person just tried to change.
-                    Err(error) => {
-                        state.computer_action_error = Some(error.message);
-                        state.restore_routine(&coworker_id, &routine_id, cx);
+                    AfterRoutineEdit::ReadBack => {
+                        state.restore_routine(&coworker_id, &routine_id, cx)
                     }
+                    AfterRoutineEdit::Nothing => {}
                 }
                 cx.notify();
             });
         })
         .detach();
+    }
+
+    /// The part of [`Self::save_routine_fields`] that needs no window: the fields go onto the
+    /// routine, and what differs from the server's copy is the edit to send, numbered so a late
+    /// answer can be told from the latest. Nothing to send for a routine nobody changed, for a
+    /// draft, or with no server; and nothing to a server that has said it cannot change a
+    /// routine, where the edit is refused here, as the server refused the last.
+    fn begin_routine_edit(
+        &mut self,
+        coworker_id: &str,
+        routine_id: &str,
+        name: String,
+        instruction: String,
+    ) -> Option<(OpenGrokClient, u64, ScheduleEdit)> {
+        let row = self.routine_mut(coworker_id, routine_id)?;
+        row.name = name;
+        row.instruction = instruction;
+        let edit = routine_edit(row);
+        if edit.is_empty() {
+            return None;
+        }
+        if self.routine_routes_missing.edit {
+            self.refuse_routine_edit(coworker_id, routine_id, edit);
+            return None;
+        }
+        let client = self.opengrok.clone()?;
+        self.routine_seq += 1;
+        let this_edit = self.routine_seq;
+        self.routine_latest_edit
+            .insert(routine_id.to_string(), this_edit);
+        // A Test run already waiting keeps waiting, now on this edit.
+        let entry = self
+            .routine_edits
+            .entry(routine_id.to_string())
+            .or_insert((this_edit, false));
+        entry.0 = this_edit;
+        Some((client, this_edit, edit))
+    }
+
+    /// What an edit's answer means for the routine, and what has to follow it.
+    fn settle_routine_edit(
+        &mut self,
+        coworker_id: &str,
+        routine_id: &str,
+        this_edit: u64,
+        edit: ScheduleEdit,
+        result: Result<ScheduleRow, OpenGrokError>,
+    ) -> AfterRoutineEdit {
+        // An earlier edit's answer, with a later one still out: the later one says what the
+        // routine is, and settles the wait.
+        if self
+            .routine_edits
+            .get(routine_id)
+            .map(|(latest, _)| *latest)
+            != Some(this_edit)
+        {
+            return AfterRoutineEdit::Nothing;
+        }
+        let run_waiting = self
+            .routine_edits
+            .remove(routine_id)
+            .is_some_and(|(_, waiting)| waiting);
+        match result {
+            Ok(row) => {
+                self.put_server_routine(coworker_id, row);
+                if run_waiting {
+                    AfterRoutineEdit::RunNow
+                } else {
+                    AfterRoutineEdit::Nothing
+                }
+            }
+            // A server from before routines could be changed. Nothing was kept, and nothing will
+            // be on this server, so it is not asked again; what was typed stays on screen.
+            Err(error) if error.route_missing() => {
+                self.routine_routes_missing.edit = true;
+                self.refuse_routine_edit(coworker_id, routine_id, edit);
+                AfterRoutineEdit::Nothing
+            }
+            // A Test run waiting on a refused edit is not started: it would run the routine the
+            // person just tried to change.
+            Err(error) => {
+                self.computer_action_error = Some(routine_trouble(&error));
+                AfterRoutineEdit::ReadBack
+            }
+        }
+    }
+
+    /// An edit a server that cannot change a routine will not keep. What the person typed is
+    /// kept, to show beside the routine; the line says why; and the routine goes back to the
+    /// server's copy as it last answered it, which nothing has changed, since nothing reached it.
+    fn refuse_routine_edit(&mut self, coworker_id: &str, routine_id: &str, edit: ScheduleEdit) {
+        self.routine_unsaved.insert(routine_id.to_string(), edit);
+        self.computer_action_error = Some(ROUTINE_EDIT_UNAVAILABLE.to_string());
+        let Some(row) = self.routine_mut(coworker_id, routine_id) else {
+            return;
+        };
+        let Some(saved) = row.saved.clone() else {
+            return;
+        };
+        row.name = saved.name.unwrap_or_default();
+        row.instruction = saved.prompt.unwrap_or_default();
+        if let Some(cron) = saved.cron.as_deref() {
+            for trigger in &mut row.triggers {
+                if let RoutineTrigger::Schedule { spec, .. } = trigger {
+                    *spec = ScheduleSpec::from_server_cron(cron);
+                }
+            }
+        }
+        // The editor's fields follow the routine back, so they stop showing the refused words
+        // as if they were saved.
+        *self
+            .routine_resyncs
+            .entry(routine_id.to_string())
+            .or_default() += 1;
     }
 
     /// The server's copy of one routine, written over the one on screen and into the editor's
@@ -11018,9 +11706,9 @@ impl AppState {
                         let refused = state.computer_action_error.take().unwrap_or_default();
                         state.computer_action_error = Some(
                             format!(
-                                "{refused} The saved routine could not be read back ({}), so \
-                                 what is shown may not be what is saved.",
-                                error.message
+                                "{refused} The saved routine could not be read back, so what is \
+                                 shown may not be what is saved: {}",
+                                routine_trouble(&error)
                             )
                             .trim()
                             .to_string(),
@@ -11061,41 +11749,74 @@ impl AppState {
         routine_id: &str,
         cx: &mut Context<Self>,
     ) {
-        let on_the_server = self
-            .routine_mut(coworker_id, routine_id)
-            .is_some_and(|row| row.saved.is_some());
-        let Some(client) = self.opengrok.clone().filter(|_| on_the_server) else {
+        let Some((client, this_read)) = self.begin_routine_runs_read(coworker_id, routine_id)
+        else {
             return;
         };
         let coworker_id = coworker_id.to_string();
         let routine_id = routine_id.to_string();
-        self.routine_seq += 1;
-        let this_read = self.routine_seq;
-        self.routine_runs_asked
-            .insert(routine_id.clone(), this_read);
         cx.spawn(async move |this, cx| {
             let result = client.schedule_runs(&routine_id).await;
             let _ = this.update(cx, |state, cx| {
-                // A page asked for before the latest one is older news than it.
-                if state.routine_runs_asked.get(&routine_id) != Some(&this_read) {
-                    return;
+                if state.settle_routine_runs(&coworker_id, &routine_id, this_read, result) {
+                    cx.notify();
                 }
-                match result {
-                    Ok(runs) => {
-                        if let Some(row) = state.routine_mut(&coworker_id, &routine_id) {
-                            row.runs = with_unlisted_runs(
-                                &row.runs,
-                                runs.into_iter().map(RoutineRun::from_server).collect(),
-                                chrono::Utc::now().timestamp_millis(),
-                            );
-                        }
-                    }
-                    Err(error) => state.computer_action_error = Some(error.message),
-                }
-                cx.notify();
             });
         })
         .detach();
+    }
+
+    /// The part of [`Self::load_routine_runs`] that needs no window: the read to make, numbered
+    /// so an older page landing last can be told from the latest. Nothing for a draft, with no
+    /// server, or on a server that has said it cannot list a routine's runs.
+    fn begin_routine_runs_read(
+        &mut self,
+        coworker_id: &str,
+        routine_id: &str,
+    ) -> Option<(OpenGrokClient, u64)> {
+        let on_the_server = self
+            .routine_mut(coworker_id, routine_id)
+            .is_some_and(|row| row.saved.is_some());
+        if !on_the_server || self.routine_routes_missing.runs {
+            return None;
+        }
+        let client = self.opengrok.clone()?;
+        self.routine_seq += 1;
+        let this_read = self.routine_seq;
+        self.routine_runs_asked
+            .insert(routine_id.to_string(), this_read);
+        Some((client, this_read))
+    }
+
+    /// A read of a routine's history landing, and whether it changed what is on screen.
+    fn settle_routine_runs(
+        &mut self,
+        coworker_id: &str,
+        routine_id: &str,
+        this_read: u64,
+        result: Result<Vec<crate::opengrok::ScheduleRun>, OpenGrokError>,
+    ) -> bool {
+        // A page asked for before the latest one is older news than it.
+        if self.routine_runs_asked.get(routine_id) != Some(&this_read) {
+            return false;
+        }
+        match result {
+            Ok(runs) => {
+                if let Some(row) = self.routine_mut(coworker_id, routine_id) {
+                    row.runs = with_unlisted_runs(
+                        &row.runs,
+                        runs.into_iter().map(RoutineRun::from_server).collect(),
+                        chrono::Utc::now().timestamp_millis(),
+                    );
+                }
+            }
+            // A server from before routines kept a history. That is said once, in the history,
+            // in place of "No runs yet", which would claim what nobody knows; not as a red line
+            // over the editor about a read the person never asked for.
+            Err(error) if error.route_missing() => self.routine_routes_missing.runs = true,
+            Err(error) => self.computer_action_error = Some(routine_trouble(&error)),
+        }
+        true
     }
 
     pub fn routine_mut(
@@ -11192,7 +11913,7 @@ impl AppState {
                         ));
                         state.routines.insert(coworker_id, routines);
                     }
-                    Err(error) => state.computer_action_error = Some(error.message),
+                    Err(error) => state.computer_action_error = Some(routine_trouble(&error)),
                 }
                 cx.notify();
             });
@@ -11242,7 +11963,7 @@ impl AppState {
             let _ = this.update(cx, |state, cx| {
                 match result {
                     Ok(row) => state.settle_new_routine(&coworker_id, draft_id.as_deref(), row),
-                    Err(error) => state.computer_action_error = Some(error.message),
+                    Err(error) => state.computer_action_error = Some(routine_trouble(&error)),
                 }
                 cx.notify();
             });
@@ -11292,7 +12013,7 @@ impl AppState {
                             routine.triggers = vec![trigger_from_schedule(&row)];
                         }
                     }
-                    Err(error) => state.computer_action_error = Some(error.message),
+                    Err(error) => state.computer_action_error = Some(routine_trouble(&error)),
                 }
                 cx.notify();
             });
@@ -11307,72 +12028,131 @@ impl AppState {
         cx.notify();
     }
 
-    /// Change when a routine runs, on screen.
-    ///
-    /// On screen only, for the same reason the name and the prompt are: `/schedules` has no
-    /// route to change a schedule once it is made. What this does do is say so the moment a
-    /// combination stops being one cron line — two times of day with different minutes past
-    /// the hour, a week with no day picked — because that is a thing the person is building
-    /// right now and can still put right.
-    pub fn update_schedule_spec(
-        &mut self,
-        coworker_id: &str,
-        routine_id: &str,
-        trigger_id: &str,
-        spec: ScheduleSpec,
-        cx: &mut Context<Self>,
-    ) {
-        let trouble = spec.to_cron().err();
-        if let Some(row) = self.routine_mut(coworker_id, routine_id)
-            && let Some(RoutineTrigger::Schedule { spec: current, .. }) =
-                row.triggers.iter_mut().find(|t| t.id() == trigger_id)
-        {
-            *current = spec;
-        }
-        self.computer_action_error = trouble.map(|not_cron| not_cron.sentence().to_string());
-        cx.notify();
-    }
-
     /// Test run: the server starts the routine's prompt now, in the routine's thread, and the
     /// history is read again so the run it started is the top line. The line is the server's,
     /// not this app's note that a button was pressed; while it is going, the Computer pane's
     /// poll keeps reading it until it says how it ended.
     pub fn run_routine_now(&mut self, coworker_id: &str, routine_id: &str, cx: &mut Context<Self>) {
-        let on_the_server = self
-            .routine_mut(coworker_id, routine_id)
-            .is_some_and(|row| row.saved.is_some());
-        let Some(client) = self.opengrok.clone() else {
+        let begun = self.begin_routine_run(coworker_id, routine_id);
+        cx.notify();
+        let Some(client) = begun else {
             return;
         };
-        if !on_the_server {
-            self.computer_action_error =
-                Some("Choose when this routine runs first, then test it.".to_string());
-            cx.notify();
-            return;
-        }
-        if let Some((_, run_waiting)) = self.routine_edits.get_mut(routine_id) {
-            *run_waiting = true;
-            return;
-        }
         let coworker_id = coworker_id.to_string();
         let routine_id = routine_id.to_string();
         cx.spawn(async move |this, cx| {
             let result = client.run_schedule_now(&routine_id).await;
             let _ = this.update(cx, |state, cx| {
-                match result {
-                    Ok(run_id) => {
-                        state.computer_action_error = None;
-                        if let Some(row) = state.routine_mut(&coworker_id, &routine_id) {
-                            row.runs.insert(0, RoutineRun::just_started(run_id));
-                        }
-                        state.load_routine_runs(&coworker_id, &routine_id, cx);
-                    }
-                    Err(error) => state.computer_action_error = Some(error.message),
+                if state.settle_routine_run(&coworker_id, &routine_id, result) {
+                    state.load_routine_runs(&coworker_id, &routine_id, cx);
                 }
                 cx.notify();
             });
         })
         .detach();
+    }
+
+    /// The part of [`Self::run_routine_now`] that needs no window: the client to start the run
+    /// with, or nothing when there is no run to start now. A routine the server does not have
+    /// yet says to choose when it runs first; one with an edit still out waits for that edit's
+    /// answer (`settle_routine_edit`); and on a server that has said it cannot run a routine on
+    /// demand, where Test run is dead, a run asked for anyway is refused here in the same words.
+    fn begin_routine_run(&mut self, coworker_id: &str, routine_id: &str) -> Option<OpenGrokClient> {
+        let on_the_server = self
+            .routine_mut(coworker_id, routine_id)
+            .is_some_and(|row| row.saved.is_some());
+        let client = self.opengrok.clone()?;
+        if !on_the_server {
+            self.computer_action_error =
+                Some("Choose when this routine runs first, then test it.".to_string());
+            return None;
+        }
+        if self.routine_routes_missing.run_now {
+            self.computer_action_error = Some(ROUTINE_RUN_UNAVAILABLE.to_string());
+            return None;
+        }
+        if let Some((_, run_waiting)) = self.routine_edits.get_mut(routine_id) {
+            *run_waiting = true;
+            return None;
+        }
+        Some(client)
+    }
+
+    /// A Test run's answer landing, and whether the history is to be read again for the run it
+    /// started.
+    fn settle_routine_run(
+        &mut self,
+        coworker_id: &str,
+        routine_id: &str,
+        result: Result<String, OpenGrokError>,
+    ) -> bool {
+        match result {
+            Ok(run_id) => {
+                self.computer_action_error = None;
+                if let Some(row) = self.routine_mut(coworker_id, routine_id) {
+                    row.runs.insert(0, RoutineRun::just_started(run_id));
+                }
+                true
+            }
+            // A server from before routines could be run on demand. It says so, and Test run
+            // goes dead, rather than a press that does nothing being offered again.
+            Err(error) if error.route_missing() => {
+                self.routine_routes_missing.run_now = true;
+                self.computer_action_error = Some(ROUTINE_RUN_UNAVAILABLE.to_string());
+                false
+            }
+            Err(error) => {
+                self.computer_action_error = Some(routine_trouble(&error));
+                false
+            }
+        }
+    }
+
+    /// Delete, pressed on a routine: a question over the whole window first, because a routine
+    /// deleted stops running for good.
+    pub fn ask_delete_routine(&mut self, routine_id: &str, cx: &mut Context<Self>) {
+        self.routine_delete_prompt = Some(routine_id.to_string());
+        cx.notify();
+    }
+
+    /// Cancel, Escape, or a press beside the question: nothing is deleted.
+    pub fn cancel_routine_delete(&mut self, cx: &mut Context<Self>) {
+        if self.routine_delete_prompt.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// The question's Delete.
+    pub fn confirm_routine_delete(&mut self, cx: &mut Context<Self>) {
+        let (Some(routine_id), Some(coworker_id)) = (
+            self.routine_delete_prompt.take(),
+            self.active_coworker_id.clone(),
+        ) else {
+            return;
+        };
+        self.delete_routine(&coworker_id, &routine_id, cx);
+    }
+
+    /// What Delete asks: the routine by its name, and what deleting it does. Nothing while it is
+    /// not asking, or about a routine gone from the open bot's meanwhile.
+    pub fn routine_delete_question(&self) -> Option<(String, &'static str)> {
+        let routine_id = self.routine_delete_prompt.as_deref()?;
+        let routine = self
+            .coworker_routines(self.active_coworker_id.as_deref()?)
+            .iter()
+            .find(|row| row.id == routine_id)?;
+        let name = match routine.name.trim() {
+            "" => "Untitled routine",
+            name => name,
+        };
+        Some((
+            format!("Delete \"{name}\"?"),
+            if routine.saved.is_some() {
+                ROUTINE_DELETE_KEEPS
+            } else {
+                DRAFT_DELETE_KEEPS
+            },
+        ))
     }
 
     /// Drop the routine here and on the server.
@@ -11387,6 +12167,7 @@ impl AppState {
         if let Some(rows) = self.routines.get_mut(coworker_id) {
             rows.retain(|row| row.id != routine_id);
         }
+        self.routine_unsaved.remove(routine_id);
         self.computer_view = ComputerView::Overview;
         cx.notify();
         // A draft nobody finished is nobody's but this app's.
@@ -11401,7 +12182,7 @@ impl AppState {
             let result = client.delete_schedule(&routine_id).await;
             let _ = this.update(cx, |state, cx| {
                 if let Err(error) = result {
-                    state.computer_action_error = Some(error.message);
+                    state.computer_action_error = Some(routine_trouble(&error));
                     state.load_routines(cx);
                 }
                 cx.notify();
@@ -11450,7 +12231,7 @@ impl AppState {
                     if let Some(row) = state.routine_mut(&coworker_id, &routine_id) {
                         row.active = !active;
                     }
-                    state.computer_action_error = Some(error.message);
+                    state.computer_action_error = Some(routine_trouble(&error));
                 }
                 cx.notify();
             });
@@ -12589,6 +13370,26 @@ impl AppState {
             self.select_conversation(bot, cx);
             self.record_nav();
         }
+    }
+
+    /// A press of the Bot chip, the pill at the top of the chat that names the open Bot.
+    ///
+    /// In one of the Bot's routines' threads it goes back to the Bot's own chat. That thread is
+    /// not a row of the sidebar, and the chip is the one thing on screen that names the Bot it
+    /// belongs to, so it is the way home. Anywhere else it opens and shuts the Bot's settings, as
+    /// it always has.
+    pub fn press_bot_chip(&mut self, cx: &mut Context<Self>) {
+        if self.bot_chip_goes_home() {
+            self.back_to_bot_chat(cx);
+        } else {
+            self.toggle_agent_settings(cx);
+        }
+    }
+
+    /// Whether the Bot chip goes back to the Bot's own chat rather than opening its settings:
+    /// while the open thread is one of its routines'.
+    pub fn bot_chip_goes_home(&self) -> bool {
+        self.active_thread_origin().is_some()
     }
 
     /// The routine the open thread belongs to, when it is one of the bot's routines' threads.
@@ -21653,13 +22454,22 @@ mod tests {
     /// showing the words it was chosen by rather than a line to decipher.
     #[test]
     fn a_cron_row_is_a_routine_with_the_picker_back_on_it() {
-        let routine = super::routine_from_schedule(
-            serde_json::from_value(serde_json::json!({
-                "id": "sch_1", "coworkerId": "cw_1", "kind": "cron", "cron": "0 9 * * 1,2,3,4,5",
-                "prompt": "Read the inbox", "name": "Morning post", "active": true
-            }))
-            .unwrap(),
+        let row = |cron: &str| {
+            super::routine_from_schedule(
+                serde_json::from_value(serde_json::json!({
+                    "id": "sch_1", "coworkerId": "cw_1", "kind": "cron", "cron": cron,
+                    "prompt": "Read the inbox", "name": "Morning post", "active": true
+                }))
+                .unwrap(),
+            )
+        };
+        // A line written with numbers reads the way the server runs it, which counts Sunday as
+        // 1: the editor's old "Weekdays", `1,2,3,4,5`, runs Sunday to Thursday, and says so.
+        assert_eq!(
+            row("0 0 9 * * 1,2,3,4,5").triggers[0].label(),
+            "Sun to Thu at 9:00 AM UTC"
         );
+        let routine = row("0 0 9 * * MON-FRI");
         assert_eq!(routine.id, "sch_1");
         assert_eq!(routine.name, "Morning post");
         assert_eq!(routine.instruction, "Read the inbox");
@@ -21668,7 +22478,7 @@ mod tests {
             panic!("a cron row is a schedule trigger: {:?}", routine.triggers);
         };
         assert_eq!(id, "sch_1", "the trigger is the schedule, so it is its id");
-        assert_eq!(spec.label(), "Weekdays at 9:00 AM");
+        assert_eq!(spec.label(), "Weekdays at 9:00 AM UTC");
     }
 
     /// The URL and key on a webhook routine are the server's and no others: the app used to
@@ -21757,10 +22567,10 @@ mod tests {
         );
     }
 
-    /// The server keeps a line in six fields (`0 0 9 * * 1`). Read the way the server shows it,
-    /// it is the picker's own Every week on Monday at 9:00: the editor opens on the picker and
-    /// not a line to decipher, switching the mode control keeps Monday at nine, and the picker
-    /// choosing that same schedule is no edit at all.
+    /// The server keeps a line in six fields (`0 0 9 * * 1`). Read the way the server shows it
+    /// and runs it, it is the Weekly tab's Sunday at 9:00, since the server counts Sunday as 1:
+    /// the editor opens on the tab and not a line to decipher, and the tab writing that same day
+    /// by name is no edit at all.
     #[test]
     fn the_servers_six_field_line_is_the_pickers_own_schedule() {
         let mut routine = super::routine_from_schedule(
@@ -21773,18 +22583,16 @@ mod tests {
         let super::RoutineTrigger::Schedule { spec, .. } = &mut routine.triggers[0] else {
             panic!("a cron row is a schedule trigger");
         };
-        assert_ne!(spec.mode, super::ScheduleUiMode::Custom, "{spec:?}");
-        assert_eq!(spec.to_cron().ok().as_deref(), Some("0 9 * * 1"));
-        *spec = super::ScheduleSpec::from_cron("0 9 * * 1");
+        assert_eq!(spec.tab(), super::WakeTab::Weekly, "{spec:?}");
+        assert_eq!(spec.to_cron().ok().as_deref(), Some("0 9 * * SUN"));
+        *spec = super::ScheduleSpec::from_cron("0 9 * * SUN");
         assert!(
             super::routine_edit(&routine).is_empty(),
-            "the picker's Monday at nine is the server's Monday at nine"
+            "the tab's Sunday at nine is the server's Sunday at nine"
         );
         assert_eq!(
-            super::ScheduleSpec::from_server_cron("@every 90m")
-                .to_cron()
-                .ok(),
-            super::ScheduleSpec::from_cron("@every 90m").to_cron().ok(),
+            super::ScheduleSpec::from_server_cron("@daily"),
+            super::ScheduleSpec::from_cron("@daily"),
             "a line with no seconds field is read as it is"
         );
     }
@@ -21892,18 +22700,24 @@ mod tests {
         assert!(!line(RunCause::Manual, ScheduleRunStatus::Ok).at.is_empty());
     }
 
-    /// A line the pickers cannot draw is still a routine: it lists, it pauses, it deletes, and
-    /// the line is shown as the server wrote it.
+    /// A line the tabs cannot draw is still a routine: it lists, it pauses, it deletes, and it
+    /// is said in words where it can be and shown as the server wrote it where it cannot.
     #[test]
     fn a_line_with_no_picker_for_it_is_still_a_routine() {
-        let routine = super::routine_from_schedule(
-            serde_json::from_value(serde_json::json!({
-                "id": "sch_3", "coworkerId": "cw_1", "kind": "cron", "cron": "@every 90m",
-                "prompt": "Sweep", "active": true
-            }))
-            .unwrap(),
+        let routine = |cron: &str| {
+            super::routine_from_schedule(
+                serde_json::from_value(serde_json::json!({
+                    "id": "sch_3", "coworkerId": "cw_1", "kind": "cron", "cron": cron,
+                    "prompt": "Sweep", "active": true
+                }))
+                .unwrap(),
+            )
+        };
+        assert_eq!(
+            routine("0 0 9,17 * * MON-FRI").triggers[0].label(),
+            "At 9:00 AM and 5:00 PM UTC, on weekdays"
         );
-        assert_eq!(routine.triggers[0].label(), "@every 90m");
+        assert_eq!(routine("@daily").triggers[0].label(), "@daily");
     }
 
     #[test]
@@ -25680,6 +26494,631 @@ mod tests {
         assert_eq!(entry, "e_form");
         assert_eq!(thread_id, "sch_1", "the card is on the routine's thread");
         assert_eq!(agent_id, "cw_1", "and it is the bot's card to answer");
+    }
+
+    /// The history icon swaps a routine's fields for its runs and back, and the next routine to
+    /// open, or the same one opened again, opens on its fields.
+    #[gpui_kit::test]
+    fn a_routines_history_is_shown_until_another_routine_opens(cx: &mut gpui_kit::TestAppContext) {
+        use gpui_kit::AppContext as _;
+        let app = cx.new(|_| with_routines());
+        app.update(cx, |state, cx| {
+            state.open_routine_editor(Some("sch_1".into()), cx);
+            assert!(!state.routine_history_open, "fields first");
+            state.toggle_routine_history(cx);
+            assert!(state.routine_history_open);
+            state.open_routine_editor(Some("draft-1".into()), cx);
+            assert!(
+                !state.routine_history_open,
+                "another routine opens on its fields"
+            );
+            state.toggle_routine_history(cx);
+            state.open_routine_editor(Some("draft-1".into()), cx);
+            assert!(
+                !state.routine_history_open,
+                "and so does this one, opened again"
+            );
+        });
+    }
+
+    /// Delete asks before it deletes: the question names the routine and says what deleting it
+    /// does, which is not the same for a draft that never reached the server. Cancel leaves the
+    /// routine; Delete takes it off the list.
+    #[gpui_kit::test]
+    fn delete_asks_before_it_deletes(cx: &mut gpui_kit::TestAppContext) {
+        use gpui_kit::AppContext as _;
+        let app = cx.new(|_| with_routines());
+        app.update(cx, |state, cx| {
+            assert_eq!(state.routine_delete_question(), None);
+            state.ask_delete_routine("sch_1", cx);
+            assert_eq!(
+                state.routine_delete_question(),
+                Some((
+                    "Delete \"Weekly\"?".to_string(),
+                    super::ROUTINE_DELETE_KEEPS
+                ))
+            );
+            state.cancel_routine_delete(cx);
+            assert_eq!(state.routine_delete_question(), None);
+            assert_eq!(state.coworker_routines("cw_1").len(), 2, "nothing deleted");
+
+            state.ask_delete_routine("draft-1", cx);
+            assert_eq!(
+                state.routine_delete_question().map(|(_, what)| what),
+                Some(super::DRAFT_DELETE_KEEPS)
+            );
+            state.confirm_routine_delete(cx);
+            assert_eq!(state.routine_delete_prompt, None);
+            assert!(
+                state
+                    .coworker_routines("cw_1")
+                    .iter()
+                    .all(|row| row.id != "draft-1")
+            );
+        });
+    }
+
+    /// A line of the Run history opens the routine's thread and asks for that run to be brought
+    /// into view there.
+    #[gpui_kit::test]
+    fn a_run_line_opens_the_thread_at_that_run(cx: &mut gpui_kit::TestAppContext) {
+        use gpui_kit::AppContext as _;
+        let app = cx.new(|_| with_routines());
+        app.update(cx, |state, cx| {
+            state.open_routine_run("sch_1", "run_01a", cx);
+            assert_eq!(state.active_conversation_id.as_deref(), Some("sch_1"));
+            assert_eq!(
+                state.reveal_run,
+                Some(("sch_1".to_string(), "run_01a".to_string()))
+            );
+        });
+    }
+
+    // ---- When to run: the wakes, and the wake editor ----------------------------------------
+
+    /// The open bot with one saved routine (Sundays at nine, by the server's numbering), one
+    /// draft with no wake yet, and one webhook routine.
+    fn with_wakes() -> AppState {
+        let mut state = with_routines();
+        let rows = state.routines.get_mut("cw_1").expect("the bot's routines");
+        if let Some(draft) = rows.iter_mut().find(|row| row.id == "draft-1") {
+            draft.triggers.clear();
+            draft.name.clear();
+            draft.instruction.clear();
+        }
+        rows.push(super::routine_from_schedule(
+            serde_json::from_value(serde_json::json!({
+                "id": "sch_hook", "coworkerId": "cw_1", "kind": "webhook", "cron": null,
+                "prompt": "Deal with it", "name": "Hook", "active": true,
+                "webhook": { "url": "u", "key": "k", "header": "h" }
+            }))
+            .unwrap(),
+        ));
+        state.computer_view = super::ComputerView::Editor {
+            id: Some("sch_1".into()),
+        };
+        state
+    }
+
+    /// The server keeps one wake per routine: + adds the first and is dead once there is one,
+    /// and 🗑 never takes a routine's only wake, which is what deleting the routine is for.
+    #[test]
+    fn a_routine_has_one_wake_and_keeps_it() {
+        let state = with_wakes();
+        let routine = |id: &str| {
+            state
+                .coworker_routines("cw_1")
+                .iter()
+                .find(|row| row.id == id)
+                .cloned()
+                .unwrap()
+        };
+        assert!(
+            AppState::can_add_wake(&routine("draft-1")),
+            "a draft gets its first"
+        );
+        assert!(
+            !AppState::can_add_wake(&routine("sch_1")),
+            "one per routine"
+        );
+        assert!(!AppState::can_add_wake(&routine("sch_hook")));
+        assert!(
+            !AppState::can_remove_wake(&routine("sch_1")),
+            "its only wake stays"
+        );
+        assert!(!AppState::can_remove_wake(&routine("sch_hook")));
+    }
+
+    /// Each tab of the wake editor writes the line the server takes for what it shows, and says
+    /// it in words under it: the editor opens on the routine's own wake, every pick changes only
+    /// the editor, and Save puts it on the routine.
+    #[gpui_kit::test]
+    fn each_tab_writes_its_line_and_says_what_was_picked(cx: &mut gpui_kit::TestAppContext) {
+        use super::{WakeBox, WakeSaved, WakeTab};
+        use gpui_kit::AppContext as _;
+        let app = cx.new(|_| with_wakes());
+        app.update(cx, |state, cx| {
+            let line = |state: &AppState| match state.routine_wake_editor.as_ref().unwrap().picked()
+            {
+                Ok(super::NewTrigger::Schedule(spec)) => spec.to_cron().unwrap(),
+                other => panic!("not a schedule: {other:?}"),
+            };
+            let summary = |state: &AppState| state.routine_wake_editor.as_ref().unwrap().summary();
+
+            state.open_wake_editor("sch_1", Some(0), cx);
+            let editor = state.routine_wake_editor.as_ref().unwrap();
+            assert_eq!(
+                editor.tab,
+                WakeTab::Weekly,
+                "the server's `0 0 9 * * 1` is Sundays"
+            );
+            assert_eq!(
+                (editor.hour.as_str(), editor.minute.as_str(), editor.pm),
+                ("9", "00", false)
+            );
+            assert_eq!(line(state), "0 9 * * SUN");
+
+            // Every
+            state.pick_wake_tab(WakeTab::Every, cx);
+            state.set_wake_box(WakeBox::Every, "15".into(), true, cx);
+            state.set_wake_unit(super::ScheduleUnit::Minutes, cx);
+            assert_eq!(line(state), "*/15 * * * *");
+            assert_eq!(summary(state), "Every 15 minutes");
+            state.step_wake_box(WakeBox::Every, false, cx);
+            assert_eq!(state.routine_wake_editor.as_ref().unwrap().every, "14");
+            state.set_wake_unit(super::ScheduleUnit::Hours, cx);
+            state.set_wake_box(WakeBox::Every, "6".into(), true, cx);
+            assert_eq!(line(state), "0 */6 * * *");
+            assert_eq!(summary(state), "Every 6 hours");
+
+            // Daily, typed and stepped
+            state.pick_wake_tab(WakeTab::Daily, cx);
+            state.set_wake_box(WakeBox::Hour, "7".into(), true, cx);
+            state.set_wake_box(WakeBox::Minute, "30".into(), true, cx);
+            state.set_wake_pm(true, cx);
+            assert_eq!(line(state), "30 19 * * *");
+            assert_eq!(summary(state), "Every day at 7:30 PM UTC");
+            state.step_wake_box(WakeBox::Hour, true, cx);
+            state.step_wake_box(WakeBox::Minute, true, cx);
+            let editor = state.routine_wake_editor.as_ref().unwrap();
+            assert_eq!((editor.hour.as_str(), editor.minute.as_str()), ("8", "35"));
+            assert_eq!(line(state), "35 20 * * *");
+
+            // Weekly keeps the day it had, and takes months.
+            state.pick_wake_tab(WakeTab::Weekly, cx);
+            assert_eq!(line(state), "35 20 * * SUN", "the day carries over");
+            state.toggle_wake_weekday(6, cx);
+            assert_eq!(line(state), "35 20 * * SUN,SAT");
+            assert_eq!(summary(state), "Weekends at 8:35 PM UTC");
+            state.toggle_wake_weekday(0, cx);
+            state.toggle_wake_month(1, cx);
+            state.toggle_wake_month(3, cx);
+            assert_eq!(line(state), "35 20 * 1,3 SAT");
+            assert_eq!(
+                summary(state),
+                "Every Saturday at 8:35 PM UTC, in Jan and Mar"
+            );
+
+            // Monthly
+            state.pick_wake_tab(WakeTab::Monthly, cx);
+            state.toggle_wake_date(15, cx);
+            assert_eq!(line(state), "35 20 1,15 1,3 *");
+            assert_eq!(
+                summary(state),
+                "Monthly on the 1st and 15th at 8:35 PM UTC, in Jan and Mar"
+            );
+
+            // Cron: five fields, said in words, with the server's next run or its refusal.
+            state.pick_wake_tab(WakeTab::Cron, cx);
+            assert_eq!(
+                line(state),
+                "35 20 1,15 1,3 *",
+                "it starts from the line it was"
+            );
+            state.set_wake_box(WakeBox::Cron, "0 9 * * MON-FRI".into(), true, cx);
+            assert_eq!(summary(state), "Weekdays at 9:00 AM UTC");
+            let now = chrono::Utc::now();
+            let status = state.routine_wake_editor.as_ref().unwrap().status(now);
+            assert!(status.can_save() && status.next.is_some(), "{status:?}");
+            state.set_wake_box(WakeBox::Cron, "0 9 * * 1-5".into(), true, cx);
+            let status = state.routine_wake_editor.as_ref().unwrap().status(now);
+            assert!(status.numbered_weekdays, "the server counts Sunday as 1");
+            assert_eq!(status.summary, "Sun to Thu at 9:00 AM UTC");
+            for refused in ["0 9 * * 0", "@every 1h", "0 9 * *"] {
+                state.set_wake_box(WakeBox::Cron, refused.into(), true, cx);
+                let status = state.routine_wake_editor.as_ref().unwrap().status(now);
+                assert!(!status.can_save(), "{refused}: {status:?}");
+            }
+
+            // A routine that is a schedule cannot become a webhook.
+            state.pick_wake_tab(WakeTab::Webhook, cx);
+            assert_eq!(
+                state.routine_wake_editor.as_ref().unwrap().tab,
+                WakeTab::Cron
+            );
+
+            // Save puts it on the routine.
+            state.set_wake_box(WakeBox::Cron, "0 9 * * MON-FRI".into(), true, cx);
+            assert_eq!(
+                state.save_wake("Weekly".into(), "write the weekly report".into(), cx),
+                WakeSaved::Changed
+            );
+            assert!(state.routine_wake_editor.is_none());
+            let row = state.routine_mut("cw_1", "sch_1").unwrap();
+            assert_eq!(row.triggers[0].label(), "Weekdays at 9:00 AM UTC");
+        });
+    }
+
+    /// A box that is not a time is no time, which the editor says, rather than an older time the
+    /// box no longer shows; Save waits for one. Cancel leaves the routine as it was.
+    #[gpui_kit::test]
+    fn a_box_that_is_not_a_time_is_said_and_cancel_changes_nothing(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        use super::{WakeBox, WakeSaved, WakeTab};
+        use gpui_kit::AppContext as _;
+        let app = cx.new(|_| with_wakes());
+        app.update(cx, |state, cx| {
+            state.open_wake_editor("sch_1", Some(0), cx);
+            state.pick_wake_tab(WakeTab::Daily, cx);
+            state.set_wake_box(WakeBox::Hour, "13".into(), true, cx);
+            let status = state
+                .routine_wake_editor
+                .as_ref()
+                .unwrap()
+                .status(chrono::Utc::now());
+            assert!(
+                status
+                    .error
+                    .as_deref()
+                    .is_some_and(|why| why.contains("time of day")),
+                "{status:?}"
+            );
+            assert_eq!(
+                state.save_wake("Weekly".into(), "write the weekly report".into(), cx),
+                WakeSaved::Nothing
+            );
+            assert!(
+                state.routine_wake_editor.is_some(),
+                "still open, saying why"
+            );
+
+            state.close_wake_editor(cx);
+            assert_eq!(
+                state.routine_mut("cw_1", "sch_1").unwrap().triggers[0].label(),
+                "Every Sunday at 9:00 AM UTC",
+                "nothing picked reached the routine"
+            );
+        });
+    }
+
+    /// A webhook routine's ✎ shows the webhook, and stays one; a draft's + may be either, and
+    /// Save on a draft makes the routine, with the name and instruction typed for it.
+    #[gpui_kit::test]
+    fn a_webhook_stays_one_and_a_drafts_first_wake_makes_it(cx: &mut gpui_kit::TestAppContext) {
+        use super::{WakeSaved, WakeTab};
+        use gpui_kit::AppContext as _;
+        let app = cx.new(|_| with_wakes());
+        app.update(cx, |state, cx| {
+            state.open_wake_editor("sch_hook", Some(0), cx);
+            let editor = state.routine_wake_editor.as_ref().unwrap();
+            assert_eq!(editor.tab, WakeTab::Webhook);
+            assert!(!editor.tab_open(WakeTab::Daily));
+            assert_eq!(editor.summary(), "When a webhook fires");
+            assert_eq!(
+                state.save_wake("Hook".into(), "Deal with it".into(), cx),
+                WakeSaved::Closed
+            );
+
+            state.open_wake_editor("draft-1", None, cx);
+            let editor = state.routine_wake_editor.as_ref().unwrap();
+            assert!(WakeTab::ALL.into_iter().all(|tab| editor.tab_open(tab)));
+            assert_eq!(
+                editor.tab,
+                WakeTab::Daily,
+                "a new wake starts at 9:00 AM daily"
+            );
+            assert_eq!(
+                state.save_wake("Morning".into(), "say hello".into(), cx),
+                WakeSaved::Created
+            );
+            let draft = state.routine_mut("cw_1", "draft-1").unwrap();
+            assert_eq!(
+                (draft.name.as_str(), draft.instruction.as_str()),
+                ("Morning", "say hello"),
+                "what was typed goes to the server with it"
+            );
+        });
+    }
+
+    // ---- A routine on a server that cannot do everything with one -------------------------
+
+    /// The open bot and its routines, talking to `server`.
+    fn routines_on(server: &wiremock::MockServer) -> AppState {
+        let mut state = with_routines();
+        state.opengrok = Some(OpenGrokClient::new(&server.uri()).expect("a URL that parses"));
+        state
+    }
+
+    /// `server` answers `method path` with `answer`, and nothing else.
+    async fn answers(
+        method: &str,
+        route: &str,
+        answer: wiremock::ResponseTemplate,
+    ) -> wiremock::MockServer {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method(method))
+            .and(wiremock::matchers::path(route))
+            .respond_with(answer)
+            .mount(&server)
+            .await;
+        server
+    }
+
+    /// A server from before routines kept a history answers `GET /schedules/{id}/runs` with an
+    /// empty 404. The history says it cannot show the runs, in place of "No runs yet", and there
+    /// is no red line over the editor about a read nobody asked for; nor is it asked again.
+    #[tokio::test]
+    async fn a_server_without_a_routines_history_says_so_in_the_history() {
+        let server = answers(
+            "GET",
+            "/schedules/sch_1/runs",
+            wiremock::ResponseTemplate::new(404),
+        )
+        .await;
+        let mut state = routines_on(&server);
+        let (client, read) = state
+            .begin_routine_runs_read("cw_1", "sch_1")
+            .expect("a routine the server has");
+        let result = client.schedule_runs("sch_1").await;
+        assert!(state.settle_routine_runs("cw_1", "sch_1", read, result));
+        assert!(state.routine_routes_missing.runs);
+        assert_eq!(state.computer_action_error, None, "not \"request failed\"");
+        assert!(
+            state.begin_routine_runs_read("cw_1", "sch_1").is_none(),
+            "a server that has said it cannot is not asked again"
+        );
+    }
+
+    /// A server from before routines could be changed answers `PATCH /schedules/{id}` with a
+    /// 405. What the person typed stays on screen to read, the line says why, the routine goes
+    /// back to the server's own values (which the fields follow), and from then on an edit is
+    /// refused here the same way rather than sent again.
+    #[tokio::test]
+    async fn a_server_that_cannot_change_a_routine_keeps_what_was_typed_and_puts_its_own_back() {
+        let server = answers(
+            "PATCH",
+            "/schedules/sch_1",
+            wiremock::ResponseTemplate::new(405),
+        )
+        .await;
+        let mut state = routines_on(&server);
+        // Every minute, where the server has Sundays at nine, and a new name.
+        if let Some(super::RoutineTrigger::Schedule { spec, .. }) = state
+            .routine_mut("cw_1", "sch_1")
+            .and_then(|row| row.triggers.first_mut())
+        {
+            *spec = super::ScheduleSpec::interval(1, super::ScheduleUnit::Minutes);
+        }
+        let (client, number, edit) = state
+            .begin_routine_edit(
+                "cw_1",
+                "sch_1",
+                "Daily".into(),
+                "write the weekly report".into(),
+            )
+            .expect("an edit to send");
+        assert_eq!(edit.cron.as_deref(), Some("* * * * *"));
+        let result = client.edit_schedule("sch_1", &edit).await;
+        assert_eq!(
+            state.settle_routine_edit("cw_1", "sch_1", number, edit.clone(), result),
+            super::AfterRoutineEdit::Nothing,
+            "nothing to read back: the server has what it had"
+        );
+
+        assert!(state.routine_routes_missing.edit);
+        assert_eq!(
+            state.computer_action_error.as_deref(),
+            Some(super::ROUTINE_EDIT_UNAVAILABLE)
+        );
+        assert_eq!(state.routine_unsaved.get("sch_1"), Some(&edit));
+        assert_eq!(
+            super::unsaved_lines(&edit),
+            [
+                ("Name", "Daily".to_string()),
+                ("When", "Every 1 minute".to_string())
+            ]
+        );
+        let row = state.routine_mut("cw_1", "sch_1").expect("the routine");
+        assert_eq!(row.name, "Weekly", "the server's name is back");
+        assert!(
+            super::routine_edit(row).is_empty(),
+            "and so is its schedule: nothing differs from what it has"
+        );
+        assert_eq!(
+            state.routine_resync("sch_1"),
+            1,
+            "the fields follow it back"
+        );
+        assert_eq!(
+            super::routine_notes(state.routine_routes_missing, true),
+            [("cant-change", super::ROUTINE_EDIT_UNAVAILABLE)]
+        );
+        assert!(
+            super::routine_notes(state.routine_routes_missing, false).is_empty(),
+            "a draft is made by a route every server has"
+        );
+
+        state.computer_action_error = None;
+        assert!(
+            state
+                .begin_routine_edit(
+                    "cw_1",
+                    "sch_1",
+                    "Again".into(),
+                    "write the weekly report".into()
+                )
+                .is_none(),
+            "not sent again"
+        );
+        assert_eq!(
+            state.computer_action_error.as_deref(),
+            Some(super::ROUTINE_EDIT_UNAVAILABLE)
+        );
+        assert_eq!(
+            state
+                .routine_unsaved
+                .get("sch_1")
+                .and_then(|edit| edit.name.as_deref()),
+            Some("Again")
+        );
+        assert_eq!(state.routine_mut("cw_1", "sch_1").unwrap().name, "Weekly");
+        let mut sent = server
+            .received_requests()
+            .await
+            .expect("the recorder is on");
+        sent.retain(|request| request.method.as_str() == "PATCH");
+        assert_eq!(sent.len(), 1, "one PATCH, the first");
+    }
+
+    /// A server from before routines could be run on demand answers `POST /schedules/{id}/run`
+    /// with an empty 404. Test run says so and goes dead, and a run asked for after that is
+    /// refused here in the same words rather than sent.
+    #[tokio::test]
+    async fn a_server_that_cannot_run_a_routine_on_demand_says_so_and_test_run_goes_dead() {
+        let server = answers(
+            "POST",
+            "/schedules/sch_1/run",
+            wiremock::ResponseTemplate::new(404),
+        )
+        .await;
+        let mut state = routines_on(&server);
+        let client = state
+            .begin_routine_run("cw_1", "sch_1")
+            .expect("a run to start");
+        let result = client.run_schedule_now("sch_1").await;
+        assert!(
+            !state.settle_routine_run("cw_1", "sch_1", result),
+            "no run started, so no history to read"
+        );
+        assert!(state.routine_routes_missing.run_now);
+        assert_eq!(
+            state.computer_action_error.as_deref(),
+            Some(super::ROUTINE_RUN_UNAVAILABLE)
+        );
+        assert!(
+            super::routine_notes(state.routine_routes_missing, false)
+                .contains(&("cant-run", super::ROUTINE_RUN_UNAVAILABLE))
+        );
+
+        state.computer_action_error = None;
+        assert!(state.begin_routine_run("cw_1", "sch_1").is_none());
+        assert_eq!(
+            state.computer_action_error.as_deref(),
+            Some(super::ROUTINE_RUN_UNAVAILABLE)
+        );
+    }
+
+    /// Any other refusal is said in the server's words, and one with no words in it as what the
+    /// server answered: never the client's stand-in, "request failed". Neither marks a route as
+    /// missing, so nothing goes dead over a routine that is gone or a server having a bad moment.
+    #[tokio::test]
+    async fn a_routine_refusal_is_the_servers_words_and_never_a_bare_request_failed() {
+        let gone = answers(
+            "POST",
+            "/schedules/sch_1/run",
+            wiremock::ResponseTemplate::new(404).set_body_string("no such schedule"),
+        )
+        .await;
+        let mut state = routines_on(&gone);
+        let client = state.begin_routine_run("cw_1", "sch_1").expect("a run");
+        let result = client.run_schedule_now("sch_1").await;
+        assert!(!state.settle_routine_run("cw_1", "sch_1", result));
+        assert_eq!(
+            state.computer_action_error.as_deref(),
+            Some("No such schedule")
+        );
+        assert!(!state.routine_routes_missing.run_now);
+
+        let silent = answers(
+            "GET",
+            "/schedules/sch_1/runs",
+            wiremock::ResponseTemplate::new(500),
+        )
+        .await;
+        let mut state = routines_on(&silent);
+        let (client, read) = state
+            .begin_routine_runs_read("cw_1", "sch_1")
+            .expect("a read");
+        let result = client.schedule_runs("sch_1").await;
+        assert!(state.settle_routine_runs("cw_1", "sch_1", read, result));
+        assert_eq!(
+            state.computer_action_error.as_deref(),
+            Some("The server answered 500 without saying why.")
+        );
+        assert!(!state.routine_routes_missing.runs);
+
+        // Nobody answered at all.
+        let mut state = with_routines();
+        state.opengrok = Some(OpenGrokClient::new("http://127.0.0.1:9").expect("a URL"));
+        let (client, read) = state
+            .begin_routine_runs_read("cw_1", "sch_1")
+            .expect("a read");
+        let result = client.schedule_runs("sch_1").await;
+        assert!(state.settle_routine_runs("cw_1", "sch_1", read, result));
+        assert_eq!(
+            state.computer_action_error.as_deref(),
+            Some("Could not reach the server.")
+        );
+    }
+
+    /// An edit the server takes is what the routine reads as from then on: its answer, in the
+    /// server's six-field form, is the picker's every minute again, nothing is left to send, and a
+    /// listing read later (the editor opened again from another Bot) says the same.
+    #[tokio::test]
+    async fn an_edit_the_server_takes_is_what_the_routine_reads_as_when_opened_again() {
+        let saved = serde_json::json!({
+            "id": "sch_1", "coworkerId": "cw_1", "kind": "cron", "cron": "0 * * * * *",
+            "prompt": "write the weekly report", "name": "Weekly", "active": true
+        });
+        let server = answers(
+            "PATCH",
+            "/schedules/sch_1",
+            wiremock::ResponseTemplate::new(200).set_body_json(saved.clone()),
+        )
+        .await;
+        let mut state = routines_on(&server);
+        if let Some(super::RoutineTrigger::Schedule { spec, .. }) = state
+            .routine_mut("cw_1", "sch_1")
+            .and_then(|row| row.triggers.first_mut())
+        {
+            *spec = super::ScheduleSpec::interval(1, super::ScheduleUnit::Minutes);
+        }
+        let (client, number, edit) = state
+            .begin_routine_edit(
+                "cw_1",
+                "sch_1",
+                "Weekly".into(),
+                "write the weekly report".into(),
+            )
+            .expect("an edit to send");
+        let result = client.edit_schedule("sch_1", &edit).await;
+        assert_eq!(
+            state.settle_routine_edit("cw_1", "sch_1", number, edit, result),
+            super::AfterRoutineEdit::Nothing
+        );
+        let label = |routine: &super::AgentRoutine| routine.triggers[0].label();
+        let row = state.routine_mut("cw_1", "sch_1").expect("the routine");
+        assert_eq!(label(row), "Every 1 minute");
+        assert!(super::routine_edit(row).is_empty(), "nothing left to send");
+        assert_eq!(state.computer_action_error, None);
+        assert!(state.routine_unsaved.is_empty());
+
+        let listed = super::relisted(
+            state.routines.get("cw_1").map(Vec::as_slice),
+            vec![serde_json::from_value(saved).unwrap()],
+        );
+        assert_eq!(label(&listed[0]), "Every 1 minute");
     }
 
     // ---- Stopping a turn --------------------------------------------------------------------

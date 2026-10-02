@@ -92,6 +92,10 @@ pub mod ids {
     pub const HEADER_LEFT_SIDEBAR: &str = "header-left-sidebar";
     pub const HEADER_RIGHT_SIDEBAR: &str = "header-right-sidebar";
     pub const HEADER_MONITOR: &str = "header-monitor";
+    /// The chip at the top of the chat that names the open Bot. A press opens its settings, or,
+    /// in one of its routines' threads, goes back to the Bot's own chat: state `goes-home` says
+    /// which it will do.
+    pub const HEADER_COWORKER: &str = "header-coworker";
     /// The open recipe's Run, the outcome of the run it started (value `running`, `ok`,
     /// `failed` or `interrupted`), and its run history.
     pub const RECIPE_RUN: &str = "recipe-run";
@@ -99,9 +103,9 @@ pub mod ids {
     pub const RECIPE_HISTORY_RUNS: &str = "recipe-history-runs";
     pub const RECIPE_ERROR: &str = "recipe-error";
     /// On a routine's thread: which routine (label) and what fires it (value, `schedule` or
-    /// `webhook`), and the way back to the bot's own chat.
+    /// `webhook`), the line centred under the Bot chip. The way back to the bot's own chat is
+    /// the chip itself, `header-coworker`, which says `goes-home` there.
     pub const CHAT_ROUTINE_THREAD: &str = "chat-routine-thread";
-    pub const CHAT_ROUTINE_BACK: &str = "chat-routine-back";
     /// On a routine's thread: how many bubbles are labelled as its instruction (value).
     pub const CHAT_ROUTINE_INSTRUCTIONS: &str = "chat-routine-instructions";
     pub const AGENT_SETTINGS: &str = "agent-settings";
@@ -109,6 +113,87 @@ pub mod ids {
     /// The one control that opens a blank routine, whichever of its two shapes the Computer
     /// pane is drawing: the "Create routine" card when the bot has none, the `+` when it has.
     pub const ROUTINE_NEW: &str = "routine-new";
+    /// The open routine editor's red line: the last refusal, in the server's words, unless a
+    /// note of the routine's already says it. In the tree only while the editor shows one.
+    pub const ROUTINE_ERROR: &str = "routine-error";
+    /// The open routine's four header icons, in the tree while a routine is open in the
+    /// Computer pane: its Run history in place of its fields (state `selected` while shown, when
+    /// it reads "Back to the routine"), Open in thread, Run it now, and Delete. Each acts on the
+    /// open routine, and one that cannot is disabled with the reason as its value.
+    pub const ROUTINE_HISTORY_TOGGLE: &str = "routine-history-toggle";
+    pub const ROUTINE_OPEN_THREAD: &str = "routine-open-thread";
+    pub const ROUTINE_RUN_NOW: &str = "routine-run-now";
+    pub const ROUTINE_DELETE: &str = "routine-delete";
+    /// "When to run" on the open routine: + (dead, with the reason as its value, while the
+    /// routine has its one wake), and the wake editor's Save and Cancel.
+    pub const ROUTINE_WAKE_ADD: &str = "routine-wake-add";
+    pub const ROUTINE_WAKE_EDITOR: &str = "routine-wake-editor";
+    pub const ROUTINE_WAKE_SUMMARY: &str = "routine-wake-summary";
+    pub const ROUTINE_WAKE_NEXT: &str = "routine-wake-next";
+    pub const ROUTINE_WAKE_ERROR: &str = "routine-wake-error";
+    pub const ROUTINE_WAKE_CRON_NOTE: &str = "routine-wake-cron-note";
+    pub const ROUTINE_WAKE_SAVE: &str = "routine-wake-save";
+    pub const ROUTINE_WAKE_CANCEL: &str = "routine-wake-cancel";
+    pub const ROUTINE_WAKE_AM: &str = "routine-wake-am";
+    pub const ROUTINE_WAKE_PM: &str = "routine-wake-pm";
+
+    /// One of the open routine's wakes (label = what sets it off, in words), and its ✎ and 🗑.
+    pub fn routine_wake(at: usize) -> String {
+        format!("routine-wake-{at}")
+    }
+
+    pub fn routine_wake_edit(at: usize) -> String {
+        format!("routine-wake-edit-{at}")
+    }
+
+    pub fn routine_wake_delete(at: usize) -> String {
+        format!("routine-wake-delete-{at}")
+    }
+
+    /// A tab of the wake editor, by its word: `every`, `daily`, `weekly`, `monthly`, `webhook`,
+    /// `cron`.
+    pub fn routine_wake_tab(tab: crate::state::WakeTab) -> String {
+        format!("routine-wake-tab-{}", tab.word())
+    }
+
+    /// One of the wake editor's typed boxes, and its ▲ and ▼.
+    pub fn routine_wake_box(which: crate::state::WakeBox) -> &'static str {
+        match which {
+            crate::state::WakeBox::Every => "routine-wake-every",
+            crate::state::WakeBox::Hour => "routine-wake-hour",
+            crate::state::WakeBox::Minute => "routine-wake-minute",
+            crate::state::WakeBox::Cron => "routine-wake-cron",
+        }
+    }
+
+    /// The Every tab's unit, by its word: `minutes`, `hours`, `days`.
+    pub fn routine_wake_unit(unit: crate::state::ScheduleUnit) -> &'static str {
+        match unit {
+            crate::state::ScheduleUnit::Minutes => "routine-wake-unit-minutes",
+            crate::state::ScheduleUnit::Hours => "routine-wake-unit-hours",
+            crate::state::ScheduleUnit::Days => "routine-wake-unit-days",
+        }
+    }
+
+    /// The Weekly tab's day chips (0 is Sunday), the Monthly tab's dates (1 to 31) and the month
+    /// chips (1 is January).
+    pub fn routine_wake_day(day: u8) -> String {
+        format!("routine-wake-day-{day}")
+    }
+
+    pub fn routine_wake_date(date: u8) -> String {
+        format!("routine-wake-date-{date}")
+    }
+
+    pub fn routine_wake_month(month: u8) -> String {
+        format!("routine-wake-month-{month}")
+    }
+
+    /// The question Delete asks over the whole window (label = `Delete "<name>"?`, value = what
+    /// deleting it does), and its two answers. In the tree only while it asks.
+    pub const ROUTINE_DELETE_PROMPT: &str = "routine-delete-prompt";
+    pub const ROUTINE_DELETE_CANCEL: &str = "routine-delete-cancel";
+    pub const ROUTINE_DELETE_CONFIRM: &str = "routine-delete-confirm";
     /// Under `computer-status`, while the Computer pane says why the server could not give the
     /// bot a computer: the server's words as the pane shows them, with its code as the value.
     pub const COMPUTER_ERROR: &str = "computer-error";
@@ -279,9 +364,33 @@ pub mod ids {
         format!("routine-{id}-rotate")
     }
 
-    /// Test run: the server starts the routine now. Only on a routine the server has.
+    /// The Active switch on the routine's editor: checked while the routine runs on its own,
+    /// labelled `Active`, or `Paused` while it does not. A click asks for the other way.
+    pub fn routine_active(id: &str) -> String {
+        format!("routine-{id}-active")
+    }
+
+    /// Test run: the server starts the routine now. Only on a routine the server has; dead on a
+    /// server that cannot run a routine on demand.
     pub fn routine_test(id: &str) -> String {
         format!("routine-{id}-test")
+    }
+
+    /// What the editor says its server cannot do with the routine, beside the controls it leaves
+    /// dead, by the line's word: `cant-change` (it cannot change a routine once it is made) and
+    /// `cant-run` (it cannot run one on demand). In the tree only while it is so.
+    pub fn routine_note(id: &str, word: &str) -> String {
+        format!("routine-{id}-{word}")
+    }
+
+    /// In the Run history's place, on a server that cannot list a routine's runs.
+    pub fn routine_runs_unavailable(id: &str) -> String {
+        format!("routine-{id}-runs-unavailable")
+    }
+
+    /// What the person typed that a server unable to change the routine did not keep.
+    pub fn routine_unsaved(id: &str) -> String {
+        format!("routine-{id}-unsaved")
     }
 
     /// One line of the routine's Run history, by the server's run id. Its label is what set
@@ -847,10 +956,45 @@ pub enum Command {
     RunRoutineNow {
         routine_id: String,
     },
+    /// The Active switch: pause the routine, or let it run on its own again.
+    SetRoutineActive {
+        routine_id: String,
+        active: bool,
+    },
     OpenRoutineThread {
         routine_id: String,
     },
-    BackToBotChat,
+    /// A line of a routine's Run history: its thread, at that run.
+    OpenRoutineRun {
+        routine_id: String,
+        run_id: String,
+    },
+    /// The open routine's history icon: its Run history in place of its fields, or back.
+    ToggleRoutineHistory,
+    /// ✎ on one of the open routine's wakes, or + on one with none.
+    OpenWakeEditor {
+        index: Option<usize>,
+    },
+    CloseWakeEditor,
+    PickWakeTab(crate::state::WakeTab),
+    /// A typed box of the wake editor, set the way a driver sets a field.
+    SetWakeBox {
+        which: crate::state::WakeBox,
+        text: String,
+    },
+    StepWakeBox {
+        which: crate::state::WakeBox,
+        up: bool,
+    },
+    SetWakePm(bool),
+    SetWakeUnit(crate::state::ScheduleUnit),
+    ToggleWakeDay(u8),
+    ToggleWakeDate(u8),
+    ToggleWakeMonth(u8),
+    /// The wake editor's Save, with the routine's name and instruction as they stand.
+    SaveWake,
+    /// The Bot chip, pressed: the Bot's settings, or its own chat from a routine's thread.
+    PressBotChip,
     /// Run the open recipe on this bot.
     RunOpenRecipe(String),
     SetComputerExecMode {
@@ -867,6 +1011,12 @@ pub enum Command {
     DeleteRoutine {
         routine_id: String,
     },
+    /// Delete, clicked: the question first, as a person's click asks it.
+    AskDeleteRoutine {
+        routine_id: String,
+    },
+    ConfirmRoutineDelete,
+    CancelRoutineDelete,
     /// Settings → Computer: take one of this Mac's standing rules off, named by its command.
     RemoveLocalRule {
         kind: RuleKind,
@@ -1102,7 +1252,40 @@ impl Command {
                 }
             }
             Self::OpenRoutineThread { routine_id } => state.open_routine_thread(&routine_id, cx),
-            Self::BackToBotChat => state.back_to_bot_chat(cx),
+            Self::OpenRoutineRun { routine_id, run_id } => {
+                state.open_routine_run(&routine_id, &run_id, cx)
+            }
+            Self::ToggleRoutineHistory => state.toggle_routine_history(cx),
+            Self::OpenWakeEditor { index } => {
+                if let crate::state::ComputerView::Editor { id: Some(open) } =
+                    state.computer_view.clone()
+                {
+                    state.open_wake_editor(&open, index, cx);
+                }
+            }
+            Self::CloseWakeEditor => state.close_wake_editor(cx),
+            Self::PickWakeTab(tab) => state.pick_wake_tab(tab, cx),
+            Self::SetWakeBox { which, text } => state.set_wake_box(which, text, false, cx),
+            Self::StepWakeBox { which, up } => state.step_wake_box(which, up, cx),
+            Self::SetWakePm(pm) => state.set_wake_pm(pm, cx),
+            Self::SetWakeUnit(unit) => state.set_wake_unit(unit, cx),
+            Self::ToggleWakeDay(day) => state.toggle_wake_weekday(day, cx),
+            Self::ToggleWakeDate(date) => state.toggle_wake_date(date, cx),
+            Self::ToggleWakeMonth(month) => state.toggle_wake_month(month, cx),
+            Self::SaveWake => {
+                let fields = state.routine_wake_editor.as_ref().and_then(|editor| {
+                    let bot = state.active_coworker_id.as_deref()?;
+                    state
+                        .coworker_routines(bot)
+                        .iter()
+                        .find(|row| row.id == editor.routine_id)
+                        .map(|row| (row.name.clone(), row.instruction.clone()))
+                });
+                if let Some((name, instruction)) = fields {
+                    state.save_wake(name, instruction, cx);
+                }
+            }
+            Self::PressBotChip => state.press_bot_chip(cx),
             Self::RunOpenRecipe(coworker_id) => state.run_open_recipe(coworker_id, cx),
             Self::SetComputerExecMode { machine_id, mode } => {
                 state.set_computer_exec_mode(machine_id, mode, cx)
@@ -1110,6 +1293,11 @@ impl Command {
             Self::RunRoutineNow { routine_id } => {
                 if let Some(coworker_id) = state.active_coworker_id.clone() {
                     state.run_routine_now(&coworker_id, &routine_id, cx);
+                }
+            }
+            Self::SetRoutineActive { routine_id, active } => {
+                if let Some(coworker_id) = state.active_coworker_id.clone() {
+                    state.set_routine_active(&coworker_id, &routine_id, active, cx);
                 }
             }
             Self::EditRoutine {
@@ -1130,6 +1318,9 @@ impl Command {
                     state.delete_routine(&coworker_id, &routine_id, cx);
                 }
             }
+            Self::AskDeleteRoutine { routine_id } => state.ask_delete_routine(&routine_id, cx),
+            Self::ConfirmRoutineDelete => state.confirm_routine_delete(cx),
+            Self::CancelRoutineDelete => state.cancel_routine_delete(cx),
             Self::RemoveLocalRule { kind, pattern } => state.remove_local_rule(kind, pattern, cx),
             Self::RefreshConnections => state.refresh_connections(cx),
             Self::ConnectService(connector) => state.connect_service(connector, cx),
@@ -1542,6 +1733,26 @@ struct RoutineSnap {
     webhook_key: Option<String>,
     /// Run history, newest first: run id, what set it off, where it got to.
     runs: Vec<(String, &'static str, &'static str)>,
+    /// What the editor says the server cannot do with this routine (`state::routine_notes`).
+    notes: Vec<(&'static str, &'static str)>,
+    /// The server cannot list this routine's runs, so the history says so in their place.
+    runs_unavailable: bool,
+    /// What the person typed that the server did not keep, line by line.
+    unsaved: Vec<(&'static str, String)>,
+    /// Its wakes, in order: what sets each off in words, and whether it is a webhook.
+    wakes: Vec<(String, bool)>,
+}
+
+impl RoutineSnap {
+    /// Test run is dead: the server cannot run a routine on demand.
+    fn run_dead(&self) -> bool {
+        self.notes.iter().any(|(word, _)| *word == "cant-run")
+    }
+
+    /// The routine's fields are dead: the server cannot change it once it is made.
+    fn cant_change(&self) -> bool {
+        self.notes.iter().any(|(word, _)| *word == "cant-change")
+    }
 }
 
 /// The open recipe as the driver needs it: whether Run can be pressed and which bot it plays on,
@@ -2096,7 +2307,8 @@ fn computer_handoff_node(handoff: &ComputerHandoffSnap) -> UiNode {
 ///
 /// A routine is one schedule, so the trigger says what kind it is and carries the one fact
 /// worth asserting on: the cron line the server keeps, or the URL it minted.
-fn routine_snap(routine: &crate::state::AgentRoutine) -> RoutineSnap {
+fn routine_snap(routine: &crate::state::AgentRoutine, state: &AppState) -> RoutineSnap {
+    let on_the_server = routine.saved.is_some();
     let mut snap = RoutineSnap {
         id: routine.id.clone(),
         name: if routine.name.trim().is_empty() {
@@ -2123,6 +2335,23 @@ fn routine_snap(routine: &crate::state::AgentRoutine) -> RoutineSnap {
                 (run.run_id.clone(), run.cause_label(), status)
             })
             .collect(),
+        notes: crate::state::routine_notes(state.routine_routes_missing, on_the_server),
+        runs_unavailable: on_the_server && state.routine_routes_missing.runs,
+        unsaved: state
+            .routine_unsaved
+            .get(&routine.id)
+            .map(crate::state::unsaved_lines)
+            .unwrap_or_default(),
+        wakes: routine
+            .triggers
+            .iter()
+            .map(|trigger| {
+                (
+                    trigger.label(),
+                    matches!(trigger, crate::state::RoutineTrigger::Webhook { .. }),
+                )
+            })
+            .collect(),
     };
     match routine.triggers.first() {
         Some(crate::state::RoutineTrigger::Schedule { spec, .. }) => {
@@ -2139,6 +2368,209 @@ fn routine_snap(routine: &crate::state::AgentRoutine) -> RoutineSnap {
     snap
 }
 
+/// The open routine's four header icons, as the panel draws them: each enabled while it can
+/// act, with the reason as the value of one that cannot.
+fn routine_header_nodes(routine: &RoutineSnap, history_open: bool) -> Vec<UiNode> {
+    let on_the_server = routine.kind != "draft";
+    let mut history = UiNode::button(
+        ids::ROUTINE_HISTORY_TOGGLE,
+        if history_open {
+            "Back to the routine"
+        } else {
+            "Run history"
+        },
+    );
+    if history_open {
+        history.states.push("selected".into());
+    }
+    let mut thread =
+        UiNode::button(ids::ROUTINE_OPEN_THREAD, "Open in thread").with_enabled(on_the_server);
+    if !on_the_server {
+        thread = thread.with_value("Choose when it runs first: its thread is on the server");
+    }
+    let mut run = UiNode::button(ids::ROUTINE_RUN_NOW, "Run it now")
+        .with_enabled(on_the_server && !routine.run_dead());
+    if routine.run_dead() {
+        run = run.with_value(crate::state::ROUTINE_RUN_UNAVAILABLE);
+    } else if !on_the_server {
+        run = run.with_value("Choose when it runs first, then run it");
+    }
+    vec![
+        history,
+        thread,
+        run,
+        UiNode::button(ids::ROUTINE_DELETE, "Delete"),
+    ]
+}
+
+/// "When to run" on the open routine: +, a node per wake with its ✎ and 🗑, and the wake editor
+/// while it is open, each enabled while a click would act and with the reason as the value of
+/// one that would not.
+fn routine_wake_nodes(
+    open: &RoutineSnap,
+    editor: Option<&(crate::state::WakeEditor, crate::state::WakeStatus)>,
+) -> Vec<UiNode> {
+    use crate::state::{LAST_WAKE_STAYS, ONE_WAKE_PER_ROUTINE, ROUTINE_EDIT_UNAVAILABLE};
+    let can_add = open.wakes.is_empty();
+    let mut add = UiNode::button(ids::ROUTINE_WAKE_ADD, "Add a schedule")
+        .with_enabled(can_add && editor.is_none());
+    if !can_add {
+        add = add.with_value(ONE_WAKE_PER_ROUTINE);
+    }
+    let mut nodes = vec![add];
+    for (at, (summary, webhook)) in open.wakes.iter().enumerate() {
+        let can_edit = *webhook || !open.cant_change();
+        let mut edit = UiNode::button(ids::routine_wake_edit(at), "Edit").with_enabled(can_edit);
+        if !can_edit {
+            edit = edit.with_value(ROUTINE_EDIT_UNAVAILABLE);
+        }
+        nodes.push(
+            UiNode::status(ids::routine_wake(at), summary.clone())
+                .with_child(edit)
+                .with_child(
+                    UiNode::button(ids::routine_wake_delete(at), "Delete")
+                        .with_enabled(false)
+                        .with_value(LAST_WAKE_STAYS),
+                ),
+        );
+    }
+    if let Some((editor, status)) = editor {
+        nodes.push(wake_editor_node(editor, status));
+    }
+    nodes
+}
+
+/// The wake editor as the panel draws it: the tabs, what the open tab picks with, and under
+/// them what was picked, when it would next run or why it cannot be saved, and the two buttons.
+fn wake_editor_node(
+    editor: &crate::state::WakeEditor,
+    status: &crate::state::WakeStatus,
+) -> UiNode {
+    use crate::state::{WakeBox, WakeTab};
+    let mut node =
+        UiNode::dialog(ids::ROUTINE_WAKE_EDITOR, "When to run").with_value(editor.tab.word());
+    for tab in WakeTab::ALL {
+        let mut button = UiNode::button(ids::routine_wake_tab(tab), tab.label())
+            .with_enabled(editor.tab_open(tab));
+        if editor.tab == tab {
+            button.states.push("selected".into());
+        }
+        node = node.with_child(button);
+    }
+    let typed = |which: WakeBox, label: &str, value: &str| {
+        UiNode::textbox(ids::routine_wake_box(which), label).with_value(value)
+    };
+    let steppers = |which: WakeBox| {
+        [true, false].map(|up| {
+            UiNode::button(
+                format!(
+                    "{}-{}",
+                    ids::routine_wake_box(which),
+                    if up { "up" } else { "down" }
+                ),
+                if up { "Up" } else { "Down" },
+            )
+        })
+    };
+    let chip =
+        |id: String, label: String, on: bool| UiNode::new(id, "checkbox", label).with_checked(on);
+    let time_tab = matches!(
+        editor.tab,
+        WakeTab::Daily | WakeTab::Weekly | WakeTab::Monthly
+    );
+    match editor.tab {
+        WakeTab::Every => {
+            node = node.with_child(typed(WakeBox::Every, "Every", &editor.every));
+            for stepper in steppers(WakeBox::Every) {
+                node = node.with_child(stepper);
+            }
+            for unit in [
+                crate::state::ScheduleUnit::Minutes,
+                crate::state::ScheduleUnit::Hours,
+                crate::state::ScheduleUnit::Days,
+            ] {
+                let mut button = UiNode::button(ids::routine_wake_unit(unit), format!("{unit:?}"));
+                if editor.spec.unit == unit {
+                    button.states.push("selected".into());
+                }
+                node = node.with_child(button);
+            }
+        }
+        WakeTab::Weekly => {
+            for day in 0u8..7 {
+                node = node.with_child(chip(
+                    ids::routine_wake_day(day),
+                    crate::cron_spec::WEEKDAYS[usize::from(day)].to_string(),
+                    editor.spec.weekdays.contains(&day),
+                ));
+            }
+        }
+        WakeTab::Monthly => {
+            for date in 1u8..=31 {
+                node = node.with_child(chip(
+                    ids::routine_wake_date(date),
+                    date.to_string(),
+                    editor.spec.month_days.contains(&date),
+                ));
+            }
+        }
+        WakeTab::Cron => {
+            node = node.with_child(typed(WakeBox::Cron, "Cron line", &editor.spec.expr));
+            if status.numbered_weekdays {
+                node = node.with_child(UiNode::status(
+                    ids::ROUTINE_WAKE_CRON_NOTE,
+                    crate::state::NUMBERED_WEEKDAYS,
+                ));
+            }
+        }
+        WakeTab::Daily | WakeTab::Webhook => {}
+    }
+    if time_tab {
+        node = node.with_child(typed(WakeBox::Hour, "Hour", &editor.hour));
+        for stepper in steppers(WakeBox::Hour) {
+            node = node.with_child(stepper);
+        }
+        node = node.with_child(typed(WakeBox::Minute, "Minute", &editor.minute));
+        for stepper in steppers(WakeBox::Minute) {
+            node = node.with_child(stepper);
+        }
+        for (id, label, pm) in [
+            (ids::ROUTINE_WAKE_AM, "AM", false),
+            (ids::ROUTINE_WAKE_PM, "PM", true),
+        ] {
+            let mut button = UiNode::button(id, label);
+            if editor.pm == pm {
+                button.states.push("selected".into());
+            }
+            node = node.with_child(button);
+        }
+        for month in 1u8..=12 {
+            node = node.with_child(chip(
+                ids::routine_wake_month(month),
+                crate::cron_spec::MONTHS[usize::from(month) - 1].to_string(),
+                editor.spec.months.contains(&month),
+            ));
+        }
+    }
+    node = node.with_child(UiNode::status(
+        ids::ROUTINE_WAKE_SUMMARY,
+        status.summary.clone(),
+    ));
+    if let Some(next) = &status.next {
+        node = node.with_child(UiNode::status(ids::ROUTINE_WAKE_NEXT, next.clone()));
+    }
+    if let Some(error) = &status.error {
+        node = node.with_child(UiNode::status(ids::ROUTINE_WAKE_ERROR, error.clone()));
+    }
+    let done = if editor.kind == Some(crate::opengrok::ScheduleKind::Webhook) {
+        "Done"
+    } else {
+        "Save"
+    };
+    node.with_child(UiNode::button(ids::ROUTINE_WAKE_SAVE, done).with_enabled(status.can_save()))
+        .with_child(UiNode::button(ids::ROUTINE_WAKE_CANCEL, "Cancel"))
+}
+
 /// The routine's row and everything reachable from it.
 ///
 /// The two triggers are here only while the routine has none, and the webhook's three only
@@ -2152,6 +2584,14 @@ fn routine_node(routine: &RoutineSnap) -> UiNode {
     if let Some(cron) = &routine.cron {
         node = node.with_value(cron.clone());
     }
+    node = node.with_child(
+        UiNode::new(
+            ids::routine_active(&routine.id),
+            "switch",
+            if routine.active { "Active" } else { "Paused" },
+        )
+        .with_checked(routine.active),
+    );
     if routine.kind == "draft" {
         node = node
             .with_child(UiNode::button(
@@ -2183,11 +2623,35 @@ fn routine_node(routine: &RoutineSnap) -> UiNode {
     }
     if routine.kind != "draft" {
         node = node
-            .with_child(UiNode::button(ids::routine_test(&routine.id), "Test run"))
+            .with_child(
+                UiNode::button(ids::routine_test(&routine.id), "Test run")
+                    .with_enabled(!routine.run_dead()),
+            )
             .with_child(UiNode::button(
                 ids::routine_thread(&routine.id),
                 "Open thread",
             ));
+    }
+    for (word, words) in &routine.notes {
+        node = node.with_child(UiNode::status(ids::routine_note(&routine.id, word), *words));
+    }
+    if !routine.unsaved.is_empty() {
+        node = node.with_child(
+            UiNode::status(ids::routine_unsaved(&routine.id), "Not saved").with_value(
+                routine
+                    .unsaved
+                    .iter()
+                    .map(|(label, value)| format!("{label}: {value}"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            ),
+        );
+    }
+    if routine.runs_unavailable {
+        node = node.with_child(UiNode::status(
+            ids::routine_runs_unavailable(&routine.id),
+            crate::state::ROUTINE_RUNS_UNAVAILABLE,
+        ));
     }
     for (run_id, cause, status) in &routine.runs {
         node = node.with_child(
@@ -2674,9 +3138,21 @@ pub struct NativeChatHost {
     computers: Vec<(String, String, crate::opengrok::LocalExecMode, bool)>,
     /// The open bot's routines, as the Computer pane lists them.
     routines: Vec<RoutineSnap>,
+    /// The red line of the routine editor, while one is open and shows one.
+    routine_error: Option<String>,
+    /// The routine open in the Computer pane, by id.
+    routine_editor: Option<String>,
+    /// The open routine's panel shows its Run history in place of its fields.
+    routine_history_open: bool,
+    /// The question Delete is asking about a routine: its title and what deleting it does.
+    routine_delete_question: Option<(String, String)>,
+    /// The wake editor while it is open, and what it says under what is picked.
+    routine_wake_editor: Option<(crate::state::WakeEditor, crate::state::WakeStatus)>,
     /// The open thread's routine, when it is one of the bot's routines' threads: its name and
     /// the server's word for what fires it.
     routine_thread: Option<(String, String)>,
+    /// A press of the Bot chip goes back to the Bot's own chat (`AppState::bot_chip_goes_home`).
+    bot_chip_goes_home: bool,
     /// How many of the open routine thread's bubbles carry a routine's instruction caption.
     routine_instructions: usize,
     /// The composer's panel, when one is open: which list it is, and the rows in it.
@@ -3033,6 +3509,40 @@ impl NativeChatHost {
                         })
                         .count()
                 }),
+            bot_chip_goes_home: state.bot_chip_goes_home(),
+            routine_editor: match (&state.computer_view, state.right_pane) {
+                (
+                    crate::state::ComputerView::Editor { id: Some(open) },
+                    crate::state::RightPane::Computer,
+                ) => Some(open.clone()),
+                _ => None,
+            },
+            routine_history_open: state.routine_history_open,
+            routine_delete_question: state
+                .routine_delete_question()
+                .map(|(title, what)| (title, what.to_string())),
+            routine_wake_editor: state.routine_wake_editor.clone().map(|editor| {
+                let status = editor.status(chrono::Utc::now());
+                (editor, status)
+            }),
+            routine_error: match (&state.computer_view, state.right_pane) {
+                (
+                    crate::state::ComputerView::Editor { id: Some(open) },
+                    crate::state::RightPane::Computer,
+                ) => {
+                    let on_the_server = state.active_coworker_id.as_deref().is_some_and(|bot| {
+                        state
+                            .coworker_routines(bot)
+                            .iter()
+                            .any(|routine| &routine.id == open && routine.saved.is_some())
+                    });
+                    crate::state::routine_trouble_line(
+                        state.computer_action_error.as_deref(),
+                        &crate::state::routine_notes(state.routine_routes_missing, on_the_server),
+                    )
+                }
+                _ => None,
+            },
             routine_thread: state
                 .active_thread_origin()
                 .map(|origin| (origin.routine_name.clone(), origin.word.clone())),
@@ -3042,7 +3552,7 @@ impl NativeChatHost {
                 .map(|id| state.coworker_routines(id))
                 .unwrap_or_default()
                 .iter()
-                .map(routine_snap)
+                .map(|routine| routine_snap(routine, state))
                 .collect(),
             composer_panel: state.composer_panel,
             composer_chips: state.composer_chips.clone(),
@@ -3440,6 +3950,13 @@ impl NativeChatHost {
             if self.sessions.iter().any(|session| session.active) {
                 page = page.with_child(UiNode::button(ids::HEADER_MONITOR, "Toggle computer pane"));
             }
+            if let Some(bot) = self.sessions.iter().find(|session| session.active) {
+                let mut chip = UiNode::button(ids::HEADER_COWORKER, bot.title.clone());
+                if self.bot_chip_goes_home {
+                    chip.states.push("goes-home".into());
+                }
+                page = page.with_child(chip);
+            }
         }
         if let Some(status) = &self.bot_status {
             page = page.with_child(UiNode::new("bot-status", "status", status.clone()));
@@ -3482,17 +3999,7 @@ impl NativeChatHost {
                 )
                 .with_child(
                     UiNode::status(ids::CHAT_ROUTINE_THREAD, name.clone()).with_value(word.clone()),
-                )
-                .with_child(UiNode::button(
-                    ids::CHAT_ROUTINE_BACK,
-                    format!(
-                        "Back to {}",
-                        self.sessions
-                            .iter()
-                            .find(|session| session.active)
-                            .map_or("the bot", |session| session.title.as_str())
-                    ),
-                ));
+                );
         }
         if self.queued_sends > 0 {
             // Each held message the server holds for the person's Mac says so under it, as its
@@ -3529,6 +4036,14 @@ impl NativeChatHost {
         }
         if let Some(lightbox) = self.lightbox_node() {
             page = page.with_child(lightbox);
+        }
+        if let Some((title, what)) = &self.routine_delete_question {
+            page = page.with_child(
+                UiNode::dialog(ids::ROUTINE_DELETE_PROMPT, title.clone())
+                    .with_value(what.clone())
+                    .with_child(UiNode::button(ids::ROUTINE_DELETE_CANCEL, "Cancel"))
+                    .with_child(UiNode::button(ids::ROUTINE_DELETE_CONFIRM, "Delete")),
+            );
         }
         for approval in &self.approvals {
             let id = format!("approval-{}", approval.call_id);
@@ -3617,6 +4132,17 @@ impl NativeChatHost {
             );
         }
         computer = computer.with_child(UiNode::button(ids::ROUTINE_NEW, "Create routine"));
+        if let Some(line) = &self.routine_error {
+            computer = computer.with_child(UiNode::status(ids::ROUTINE_ERROR, line.clone()));
+        }
+        if let Some(open) = self.open_routine() {
+            for node in routine_header_nodes(open, self.routine_history_open) {
+                computer = computer.with_child(node);
+            }
+            for node in routine_wake_nodes(open, self.routine_wake_editor.as_ref()) {
+                computer = computer.with_child(node);
+            }
+        }
         for routine in &self.routines {
             computer = computer.with_child(routine_node(routine));
         }
@@ -6224,6 +6750,11 @@ impl NativeChatHost {
             Command::ToggleSidebar
         } else if target == ids::HEADER_MONITOR {
             Command::ToggleComputerPane
+        } else if target == ids::HEADER_COWORKER {
+            if !self.sessions.iter().any(|session| session.active) {
+                return Err("the Bot chip is there only while a Bot is open".into());
+            }
+            Command::PressBotChip
         } else if target == ids::HEADER_RIGHT_SIDEBAR {
             if self.computer_open {
                 Command::ToggleComputerPane
@@ -6236,11 +6767,6 @@ impl NativeChatHost {
             Command::ToggleAccount
         } else if target == ids::HEADER_SETTINGS || target == ids::AGENT_SETTINGS {
             Command::ToggleAgentSettings
-        } else if target == ids::CHAT_ROUTINE_BACK {
-            if self.routine_thread.is_none() {
-                return Err("the open thread is the bot's own chat already".to_string());
-            }
-            Command::BackToBotChat
         } else if target == "agent-tools-toggle" {
             if !self.agent_settings_open {
                 return Err(
@@ -6469,7 +6995,32 @@ impl NativeChatHost {
             Command::CloseNetworkPolicy
         } else if target == ids::ROUTINE_NEW {
             Command::OpenRoutineEditor(None)
+        } else if target == ids::ROUTINE_DELETE_CONFIRM || target == ids::ROUTINE_DELETE_CANCEL {
+            if self.routine_delete_question.is_none() {
+                return Err(format!(
+                    "`{target}` answers Delete's question, which is not asked"
+                ));
+            }
+            if target == ids::ROUTINE_DELETE_CONFIRM {
+                Command::ConfirmRoutineDelete
+            } else {
+                Command::CancelRoutineDelete
+            }
+        } else if let Some(cmd) = self.wake_command(target) {
+            cmd?
+        } else if [
+            ids::ROUTINE_HISTORY_TOGGLE,
+            ids::ROUTINE_OPEN_THREAD,
+            ids::ROUTINE_RUN_NOW,
+            ids::ROUTINE_DELETE,
+        ]
+        .contains(&target)
+        {
+            self.routine_header_command(target)?
         } else if let Some(cmd) = self.routine_command(target) {
+            if let Command::RunRoutineNow { routine_id } = &cmd {
+                self.refuse_dead_test_run(target, routine_id)?;
+            }
             cmd
         } else if let Some(id) = self.site_login_delete_target(target) {
             Command::DeleteSiteLogin { id }
@@ -6519,6 +7070,24 @@ impl NativeChatHost {
         }
         if target == model_picker::SEARCH {
             return self.set_model_search(target, value);
+        }
+        if let Some(which) = [
+            crate::state::WakeBox::Every,
+            crate::state::WakeBox::Hour,
+            crate::state::WakeBox::Minute,
+            crate::state::WakeBox::Cron,
+        ]
+        .into_iter()
+        .find(|which| target == ids::routine_wake_box(*which))
+        {
+            if self.routine_wake_editor.is_none() {
+                return Err(format!("`{target}` is in the wake editor, which is shut"));
+            }
+            self.pending = Some(Command::SetWakeBox {
+                which,
+                text: value.to_string(),
+            });
+            return Ok(DispatchResult::empty());
         }
         if let Some(refusal) = self.skill_sheet_field(target) {
             return refusal;
@@ -6821,10 +7390,22 @@ impl NativeChatHost {
                 .and_then(|tail| tail.strip_prefix("-run-"))
                 && routine.runs.iter().any(|(id, _, _)| id == run)
             {
-                return Some(Command::OpenRoutineThread {
+                return Some(Command::OpenRoutineRun {
                     routine_id: routine.id.clone(),
+                    run_id: run.to_string(),
                 });
             }
+        }
+        // The switch asks for the other way from where it stands, so it is read off the row
+        // and not off the id alone.
+        if let Some(routine) = rest
+            .strip_suffix("-active")
+            .and_then(|id| self.routines.iter().find(|routine| routine.id == id))
+        {
+            return Some(Command::SetRoutineActive {
+                routine_id: routine.id.clone(),
+                active: !routine.active,
+            });
         }
         let mut cmd: Option<(&str, fn(String) -> Command)> = None;
         for (tail, make) in [
@@ -6860,7 +7441,7 @@ impl NativeChatHost {
             ),
             (
                 "-delete",
-                (|id| Command::DeleteRoutine { routine_id: id }) as fn(String) -> Command,
+                (|id| Command::AskDeleteRoutine { routine_id: id }) as fn(String) -> Command,
             ),
         ] {
             if let Some(id) = rest.strip_suffix(tail) {
@@ -7248,11 +7829,25 @@ impl NativeChatHost {
                     .ok_or_else(|| "recipe.run: no bot is granted this recipe".to_string())?;
                 Command::RunOpenRecipe(bot)
             }
-            "routine.run" => Command::RunRoutineNow {
-                routine_id: self.invoke_routine_id(args, "routine.run")?,
-            },
+            "routine.run" => {
+                let routine_id = self.invoke_routine_id(args, "routine.run")?;
+                self.refuse_dead_test_run("routine.run", &routine_id)?;
+                Command::RunRoutineNow { routine_id }
+            }
             "routine.edit" => {
                 let routine_id = self.invoke_routine_id(args, "routine.edit")?;
+                // The fields are dead on a server that cannot change a routine; an edit by name
+                // is refused in the same words, as the app would refuse it.
+                if self
+                    .routines
+                    .iter()
+                    .any(|routine| routine.id == routine_id && routine.cant_change())
+                {
+                    return Err(format!(
+                        "routine.edit is refused: {}",
+                        crate::state::ROUTINE_EDIT_UNAVAILABLE
+                    ));
+                }
                 let name = invoke_arg_str(args, &["name"]);
                 let prompt = invoke_arg_str(args, &["prompt", "instruction"]);
                 if name.is_none() && prompt.is_none() {
@@ -7268,6 +7863,153 @@ impl NativeChatHost {
         };
         self.pending = Some(cmd);
         Ok(DispatchResult::empty())
+    }
+
+    /// One of the open routine's header icons, refused when no routine is open or when the icon
+    /// is dead, in the words its tooltip says it in.
+    fn routine_header_command(&self, target: &str) -> Result<Command, String> {
+        let open = self
+            .open_routine()
+            .ok_or_else(|| format!("`{target}` is in a routine's header, and none is open"))?;
+        let routine_id = open.id.clone();
+        let on_the_server = open.kind != "draft";
+        Ok(match target {
+            ids::ROUTINE_HISTORY_TOGGLE => Command::ToggleRoutineHistory,
+            ids::ROUTINE_OPEN_THREAD if !on_the_server => {
+                return Err(format!(
+                    "`{target}` is dead: choose when it runs first; its thread is on the server"
+                ));
+            }
+            ids::ROUTINE_OPEN_THREAD => Command::OpenRoutineThread { routine_id },
+            ids::ROUTINE_RUN_NOW if !on_the_server => {
+                return Err(format!(
+                    "`{target}` is dead: choose when it runs first, then run it"
+                ));
+            }
+            ids::ROUTINE_RUN_NOW => {
+                self.refuse_dead_test_run(target, &routine_id)?;
+                Command::RunRoutineNow { routine_id }
+            }
+            _ => Command::AskDeleteRoutine { routine_id },
+        })
+    }
+
+    /// A click on "When to run" or in the wake editor, refused where the panel's control is dead,
+    /// in the words it says it in. `None` for a target that is not one of theirs.
+    fn wake_command(&self, target: &str) -> Option<Result<Command, String>> {
+        use crate::state::{WakeBox, WakeTab};
+        let rest = target.strip_prefix("routine-wake-")?;
+        let Some(open) = self.open_routine() else {
+            return Some(Err(format!(
+                "`{target}` is in a routine's panel, and none is open"
+            )));
+        };
+        let editor = self.routine_wake_editor.as_ref();
+        let dead = |why: &str| Some(Err(format!("`{target}` is dead: {why}")));
+        if target == ids::ROUTINE_WAKE_ADD {
+            if !open.wakes.is_empty() {
+                return dead(crate::state::ONE_WAKE_PER_ROUTINE);
+            }
+            if editor.is_some() {
+                return dead("the wake editor is open");
+            }
+            return Some(Ok(Command::OpenWakeEditor { index: None }));
+        }
+        if let Some(at) = rest
+            .strip_prefix("edit-")
+            .and_then(|at| at.parse::<usize>().ok())
+        {
+            let Some((_, webhook)) = open.wakes.get(at) else {
+                return Some(Err(format!("the open routine has no wake {at}")));
+            };
+            if !webhook && open.cant_change() {
+                return dead(crate::state::ROUTINE_EDIT_UNAVAILABLE);
+            }
+            return Some(Ok(Command::OpenWakeEditor { index: Some(at) }));
+        }
+        if rest.starts_with("delete-") {
+            return dead(crate::state::LAST_WAKE_STAYS);
+        }
+        let Some((editor, status)) = editor else {
+            return Some(Err(format!(
+                "`{target}` is in the wake editor, which is shut"
+            )));
+        };
+        let cmd = if let Some(word) = rest.strip_prefix("tab-") {
+            let tab = WakeTab::ALL.into_iter().find(|tab| tab.word() == word)?;
+            if !editor.tab_open(tab) {
+                return dead("a routine stays the kind it was made");
+            }
+            Command::PickWakeTab(tab)
+        } else if let Some((which, up)) = [WakeBox::Every, WakeBox::Hour, WakeBox::Minute]
+            .into_iter()
+            .flat_map(|which| [(which, true), (which, false)])
+            .find(|(which, up)| {
+                target
+                    == format!(
+                        "{}-{}",
+                        ids::routine_wake_box(*which),
+                        if *up { "up" } else { "down" }
+                    )
+            })
+        {
+            Command::StepWakeBox { which, up }
+        } else if let Some(unit) = [
+            crate::state::ScheduleUnit::Minutes,
+            crate::state::ScheduleUnit::Hours,
+            crate::state::ScheduleUnit::Days,
+        ]
+        .into_iter()
+        .find(|unit| target == ids::routine_wake_unit(*unit))
+        {
+            Command::SetWakeUnit(unit)
+        } else if target == ids::ROUTINE_WAKE_AM || target == ids::ROUTINE_WAKE_PM {
+            Command::SetWakePm(target == ids::ROUTINE_WAKE_PM)
+        } else if let Some(day) = rest.strip_prefix("day-").and_then(|d| d.parse::<u8>().ok()) {
+            Command::ToggleWakeDay(day)
+        } else if let Some(date) = rest
+            .strip_prefix("date-")
+            .and_then(|d| d.parse::<u8>().ok())
+        {
+            Command::ToggleWakeDate(date)
+        } else if let Some(month) = rest
+            .strip_prefix("month-")
+            .and_then(|m| m.parse::<u8>().ok())
+        {
+            Command::ToggleWakeMonth(month)
+        } else if target == ids::ROUTINE_WAKE_SAVE {
+            if let Some(why) = &status.error {
+                return dead(why);
+            }
+            Command::SaveWake
+        } else if target == ids::ROUTINE_WAKE_CANCEL {
+            Command::CloseWakeEditor
+        } else {
+            return None;
+        };
+        Some(Ok(cmd))
+    }
+
+    /// The routine open in the Computer pane, as the tree lists it.
+    fn open_routine(&self) -> Option<&RoutineSnap> {
+        let open = self.routine_editor.as_deref()?;
+        self.routines.iter().find(|routine| routine.id == open)
+    }
+
+    /// Test run on a server that cannot run a routine on demand is dead on screen, and refused
+    /// here in the words the editor says it in.
+    fn refuse_dead_test_run(&self, target: &str, routine_id: &str) -> Result<(), String> {
+        if self
+            .routines
+            .iter()
+            .any(|routine| routine.id == routine_id && routine.run_dead())
+        {
+            return Err(format!(
+                "`{target}` is dead: {}",
+                crate::state::ROUTINE_RUN_UNAVAILABLE
+            ));
+        }
+        Ok(())
     }
 
     /// The routine an invoke names, checked against the ones on screen: an id nobody is
@@ -7365,6 +8107,14 @@ mod tests {
             webhook_url: (kind == "webhook").then(|| "https://og.example/hooks/sch_2".to_string()),
             webhook_key: (kind == "webhook").then(|| "og_live_abc".to_string()),
             runs: Vec::new(),
+            notes: Vec::new(),
+            runs_unavailable: false,
+            unsaved: Vec::new(),
+            wakes: match kind {
+                "cron" => vec![("Every day at 9:00 AM UTC".into(), false)],
+                "webhook" => vec![("When a webhook fires".into(), true)],
+                _ => Vec::new(),
+            },
         }
     }
 
@@ -7394,6 +8144,393 @@ mod tests {
             host.take_command().unwrap(),
             Command::RunRoutineNow { routine_id } if routine_id == "sch-1-2"
         ));
+    }
+
+    /// The Active switch is on the tree where it stands, labelled as the editor labels it, and a
+    /// click asks for the other way: a paused routine is switched back on, an active one paused.
+    #[test]
+    fn a_routines_active_switch_reads_where_it_stands_and_flips() {
+        let mut host = host();
+        host.computer_open = true;
+        let mut paused = routine("sch-1-2", "cron");
+        paused.active = false;
+        host.routines = vec![routine("sch_1", "cron"), paused];
+        let tree = host.snapshot();
+        let on = tree.find(&ids::routine_active("sch_1")).unwrap();
+        assert_eq!(on.name, "Active");
+        assert!(on.checked == Some(true), "{on:?}");
+        let off = tree.find(&ids::routine_active("sch-1-2")).unwrap();
+        assert_eq!(off.name, "Paused");
+        assert!(off.checked == Some(false), "{off:?}");
+
+        host.click(&ids::routine_active("sch-1-2")).unwrap();
+        assert!(matches!(
+            host.take_command().unwrap(),
+            Command::SetRoutineActive { routine_id, active: true } if routine_id == "sch-1-2"
+        ));
+        host.click(&ids::routine_active("sch_1")).unwrap();
+        assert!(matches!(
+            host.take_command().unwrap(),
+            Command::SetRoutineActive { routine_id, active: false } if routine_id == "sch_1"
+        ));
+    }
+
+    /// On a server that cannot change a routine, run one on demand or list what one ran, the
+    /// routine says so where the editor does: a line for each, the history's place, what was
+    /// typed and not kept, and a Test run that is dead and refused in the editor's words, by
+    /// click and by name, as an edit by name is. The editor's red line is there while it shows.
+    #[test]
+    fn a_routine_says_what_its_server_cannot_do_with_it() {
+        let mut host = host();
+        host.computer_open = true;
+        let mut old = routine("sch_1", "cron");
+        old.notes = vec![
+            ("cant-change", crate::state::ROUTINE_EDIT_UNAVAILABLE),
+            ("cant-run", crate::state::ROUTINE_RUN_UNAVAILABLE),
+        ];
+        old.runs_unavailable = true;
+        old.unsaved = vec![("Name", "Daily".into()), ("When", "Every 1 minute".into())];
+        host.routines = vec![old, routine("sch_2", "cron")];
+        host.routine_error = Some("No such schedule".into());
+        let tree = host.snapshot();
+        let line = |id: String| tree.find(&id).map(|node| node.name.clone());
+        assert_eq!(
+            line(ids::routine_note("sch_1", "cant-change")).as_deref(),
+            Some(crate::state::ROUTINE_EDIT_UNAVAILABLE)
+        );
+        assert_eq!(
+            line(ids::routine_note("sch_1", "cant-run")).as_deref(),
+            Some(crate::state::ROUTINE_RUN_UNAVAILABLE)
+        );
+        assert_eq!(
+            line(ids::routine_runs_unavailable("sch_1")).as_deref(),
+            Some(crate::state::ROUTINE_RUNS_UNAVAILABLE)
+        );
+        let unsaved = tree.find(&ids::routine_unsaved("sch_1")).unwrap();
+        assert_eq!(
+            unsaved.value.as_deref(),
+            Some("Name: Daily\nWhen: Every 1 minute")
+        );
+        assert!(!tree.find(&ids::routine_test("sch_1")).unwrap().enabled);
+        assert!(tree.find(&ids::routine_test("sch_2")).unwrap().enabled);
+        assert!(tree.find(&ids::routine_runs_unavailable("sch_2")).is_none());
+        assert_eq!(
+            tree.find(ids::ROUTINE_ERROR).map(|node| node.name.as_str()),
+            Some("No such schedule")
+        );
+
+        let refused = host.click(&ids::routine_test("sch_1")).unwrap_err();
+        assert!(
+            refused.contains(crate::state::ROUTINE_RUN_UNAVAILABLE),
+            "{refused}"
+        );
+        assert!(
+            host.invoke("routine.run", &serde_json::json!({ "id": "sch_1" }))
+                .is_err()
+        );
+        let refused = host
+            .invoke(
+                "routine.edit",
+                &serde_json::json!({ "id": "sch_1", "name": "Daily" }),
+            )
+            .unwrap_err();
+        assert!(
+            refused.contains(crate::state::ROUTINE_EDIT_UNAVAILABLE),
+            "{refused}"
+        );
+        assert!(host.take_command().is_none(), "nothing was sent");
+        host.click(&ids::routine_test("sch_2")).unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::RunRoutineNow { routine_id }) if routine_id == "sch_2"
+        ));
+    }
+
+    /// The open routine's header carries its four icons, each acting on that routine: the
+    /// history toggle says which view it leads to and is `selected` while the history shows, and
+    /// Open in thread and Run it now are dead on a draft, Run it now also where the server cannot
+    /// run a routine on demand, each refused with its reason. With no routine open there are none.
+    #[test]
+    fn the_open_routines_header_icons_act_on_it() {
+        let mut host = host();
+        host.computer_open = true;
+        host.routines = vec![routine("sch_1", "cron"), routine("draft-1", "draft")];
+        assert!(host.snapshot().find(ids::ROUTINE_HISTORY_TOGGLE).is_none());
+        assert!(
+            host.click(ids::ROUTINE_RUN_NOW).is_err(),
+            "no routine is open"
+        );
+
+        host.routine_editor = Some("sch_1".into());
+        let tree = host.snapshot();
+        for id in [
+            ids::ROUTINE_HISTORY_TOGGLE,
+            ids::ROUTINE_OPEN_THREAD,
+            ids::ROUTINE_RUN_NOW,
+            ids::ROUTINE_DELETE,
+        ] {
+            assert!(tree.find(id).is_some_and(|node| node.enabled), "{id}");
+        }
+        assert_eq!(
+            tree.find(ids::ROUTINE_HISTORY_TOGGLE).unwrap().name,
+            "Run history"
+        );
+        let clicked = |host: &mut NativeChatHost, id: &str| {
+            host.click(id).unwrap();
+            host.take_command().unwrap()
+        };
+        assert!(matches!(
+            clicked(&mut host, ids::ROUTINE_HISTORY_TOGGLE),
+            Command::ToggleRoutineHistory
+        ));
+        assert!(matches!(
+            clicked(&mut host, ids::ROUTINE_OPEN_THREAD),
+            Command::OpenRoutineThread { routine_id } if routine_id == "sch_1"
+        ));
+        assert!(matches!(
+            clicked(&mut host, ids::ROUTINE_RUN_NOW),
+            Command::RunRoutineNow { routine_id } if routine_id == "sch_1"
+        ));
+        assert!(matches!(
+            clicked(&mut host, ids::ROUTINE_DELETE),
+            Command::AskDeleteRoutine { routine_id } if routine_id == "sch_1"
+        ));
+
+        host.routine_history_open = true;
+        let toggle = host
+            .snapshot()
+            .find(ids::ROUTINE_HISTORY_TOGGLE)
+            .cloned()
+            .unwrap();
+        assert_eq!(toggle.name, "Back to the routine");
+        assert!(toggle.states.iter().any(|state| state == "selected"));
+
+        host.routine_editor = Some("draft-1".into());
+        let tree = host.snapshot();
+        assert!(!tree.find(ids::ROUTINE_OPEN_THREAD).unwrap().enabled);
+        assert!(!tree.find(ids::ROUTINE_RUN_NOW).unwrap().enabled);
+        assert!(host.click(ids::ROUTINE_RUN_NOW).is_err());
+        assert!(host.click(ids::ROUTINE_OPEN_THREAD).is_err());
+
+        host.routine_editor = Some("sch_1".into());
+        host.routines[0].notes = vec![("cant-run", crate::state::ROUTINE_RUN_UNAVAILABLE)];
+        let run = host.snapshot().find(ids::ROUTINE_RUN_NOW).cloned().unwrap();
+        assert!(!run.enabled);
+        assert_eq!(
+            run.value.as_deref(),
+            Some(crate::state::ROUTINE_RUN_UNAVAILABLE)
+        );
+        assert!(host.click(ids::ROUTINE_RUN_NOW).is_err());
+    }
+
+    /// Delete asks first, by click as by hand: the question is on the tree while it asks, with
+    /// its two answers, and an answer with no question asked is refused.
+    #[test]
+    fn delete_asks_first_and_the_question_is_answered_by_id() {
+        let mut host = host();
+        host.routines = vec![routine("sch_1", "cron")];
+        assert!(
+            host.click(ids::ROUTINE_DELETE_CONFIRM).is_err(),
+            "nothing asked"
+        );
+        host.routine_delete_question = Some((
+            "Delete \"Morning post\"?".into(),
+            crate::state::ROUTINE_DELETE_KEEPS.into(),
+        ));
+        let tree = host.snapshot();
+        let prompt = tree.find(ids::ROUTINE_DELETE_PROMPT).unwrap();
+        assert_eq!(prompt.name, "Delete \"Morning post\"?");
+        assert_eq!(
+            prompt.value.as_deref(),
+            Some("It stops running. Its past runs and conversation stay.")
+        );
+        host.click(ids::ROUTINE_DELETE_CANCEL).unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::CancelRoutineDelete)
+        ));
+        host.click(ids::ROUTINE_DELETE_CONFIRM).unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::ConfirmRoutineDelete)
+        ));
+    }
+
+    /// "When to run" on the open routine: + is dead while it has its one wake, saying why; the
+    /// wake is listed in words with ✎ live and 🗑 dead; ✎ is dead too where the server cannot
+    /// change a routine. The wake editor, while open, carries its tabs and the open tab's
+    /// controls, what was picked and Save, and clicks and `set_value` go to it, a dead one
+    /// refused in the words the panel says it in.
+    #[test]
+    fn when_to_run_lists_the_wake_and_the_editor_is_driven_by_id() {
+        use crate::state::{
+            LAST_WAKE_STAYS, ONE_WAKE_PER_ROUTINE, ROUTINE_EDIT_UNAVAILABLE, ScheduleSpec, WakeBox,
+            WakeEditor, WakeTab,
+        };
+        let mut host = host();
+        host.computer_open = true;
+        host.routines = vec![routine("sch_1", "cron"), routine("draft-1", "draft")];
+        host.routine_editor = Some("sch_1".into());
+        let tree = host.snapshot();
+        let add = tree.find(ids::ROUTINE_WAKE_ADD).unwrap();
+        assert!(!add.enabled);
+        assert_eq!(add.value.as_deref(), Some(ONE_WAKE_PER_ROUTINE));
+        assert_eq!(
+            tree.find(&ids::routine_wake(0)).unwrap().name,
+            "Every day at 9:00 AM UTC"
+        );
+        assert!(tree.find(&ids::routine_wake_edit(0)).unwrap().enabled);
+        let delete = tree.find(&ids::routine_wake_delete(0)).unwrap();
+        assert!(!delete.enabled);
+        assert_eq!(delete.value.as_deref(), Some(LAST_WAKE_STAYS));
+        assert!(host.click(ids::ROUTINE_WAKE_ADD).is_err());
+        assert!(host.click(&ids::routine_wake_delete(0)).is_err());
+        host.click(&ids::routine_wake_edit(0)).unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::OpenWakeEditor { index: Some(0) })
+        ));
+
+        host.routine_editor = Some("draft-1".into());
+        assert!(host.snapshot().find(ids::ROUTINE_WAKE_ADD).unwrap().enabled);
+        host.click(ids::ROUTINE_WAKE_ADD).unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::OpenWakeEditor { index: None })
+        ));
+
+        host.routine_editor = Some("sch_1".into());
+        host.routines[0].notes = vec![("cant-change", ROUTINE_EDIT_UNAVAILABLE)];
+        let edit = host
+            .snapshot()
+            .find(&ids::routine_wake_edit(0))
+            .cloned()
+            .unwrap();
+        assert!(!edit.enabled);
+        assert_eq!(edit.value.as_deref(), Some(ROUTINE_EDIT_UNAVAILABLE));
+        assert!(host.click(&ids::routine_wake_edit(0)).is_err());
+        host.routines[0].notes.clear();
+
+        assert!(
+            host.click(&ids::routine_wake_day(1)).is_err(),
+            "the editor is shut"
+        );
+        let mut spec = ScheduleSpec::advanced_daily(9, 0).on_tab(WakeTab::Weekly);
+        spec.weekdays = vec![1, 2, 3, 4, 5];
+        let editor = WakeEditor {
+            routine_id: "sch_1".into(),
+            index: Some(0),
+            kind: Some(crate::opengrok::ScheduleKind::Cron),
+            tab: WakeTab::Weekly,
+            spec,
+            every: "1".into(),
+            hour: "9".into(),
+            minute: "00".into(),
+            pm: false,
+            opened: 1,
+            resync: 0,
+        };
+        let status = editor.status(chrono::Utc::now());
+        host.routine_wake_editor = Some((editor, status));
+        let tree = host.snapshot();
+        let weekly = tree.find(&ids::routine_wake_tab(WakeTab::Weekly)).unwrap();
+        assert!(weekly.states.iter().any(|state| state == "selected"));
+        assert!(
+            !tree
+                .find(&ids::routine_wake_tab(WakeTab::Webhook))
+                .unwrap()
+                .enabled
+        );
+        assert_eq!(
+            tree.find(&ids::routine_wake_day(1)).unwrap().checked,
+            Some(true)
+        );
+        assert_eq!(
+            tree.find(&ids::routine_wake_day(0)).unwrap().checked,
+            Some(false)
+        );
+        assert_eq!(
+            tree.find(ids::routine_wake_box(WakeBox::Hour))
+                .unwrap()
+                .value
+                .as_deref(),
+            Some("9")
+        );
+        assert_eq!(
+            tree.find(ids::ROUTINE_WAKE_SUMMARY).unwrap().name,
+            "Weekdays at 9:00 AM UTC"
+        );
+        assert!(tree.find(ids::ROUTINE_WAKE_NEXT).is_some());
+        assert!(tree.find(ids::ROUTINE_WAKE_SAVE).unwrap().enabled);
+        assert!(
+            tree.find(&ids::routine_wake_date(1)).is_none(),
+            "the Monthly tab's"
+        );
+
+        let clicked = |host: &mut NativeChatHost, id: &str| {
+            host.click(id).unwrap();
+            host.take_command().unwrap()
+        };
+        assert!(matches!(
+            clicked(&mut host, &ids::routine_wake_tab(WakeTab::Daily)),
+            Command::PickWakeTab(WakeTab::Daily)
+        ));
+        assert!(
+            host.click(&ids::routine_wake_tab(WakeTab::Webhook))
+                .is_err()
+        );
+        assert!(matches!(
+            clicked(&mut host, &ids::routine_wake_day(6)),
+            Command::ToggleWakeDay(6)
+        ));
+        assert!(matches!(
+            clicked(&mut host, &ids::routine_wake_month(3)),
+            Command::ToggleWakeMonth(3)
+        ));
+        assert!(matches!(
+            clicked(&mut host, "routine-wake-hour-up"),
+            Command::StepWakeBox {
+                which: WakeBox::Hour,
+                up: true
+            }
+        ));
+        assert!(matches!(
+            clicked(&mut host, ids::ROUTINE_WAKE_PM),
+            Command::SetWakePm(true)
+        ));
+        assert!(matches!(
+            clicked(&mut host, ids::ROUTINE_WAKE_SAVE),
+            Command::SaveWake
+        ));
+        assert!(matches!(
+            clicked(&mut host, ids::ROUTINE_WAKE_CANCEL),
+            Command::CloseWakeEditor
+        ));
+        host.dispatch(&Op::SetValue {
+            target: ids::routine_wake_box(WakeBox::Hour).into(),
+            value: "7".into(),
+        })
+        .unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::SetWakeBox { which: WakeBox::Hour, text }) if text == "7"
+        ));
+
+        // A pick that is not a schedule: Save is dead, with the reason.
+        let (editor, _) = host.routine_wake_editor.take().unwrap();
+        let mut empty = editor.clone();
+        empty.spec.weekdays.clear();
+        let status = empty.status(chrono::Utc::now());
+        host.routine_wake_editor = Some((empty, status));
+        assert!(
+            !host
+                .snapshot()
+                .find(ids::ROUTINE_WAKE_SAVE)
+                .unwrap()
+                .enabled
+        );
+        let refused = host.click(ids::ROUTINE_WAKE_SAVE).unwrap_err();
+        assert!(refused.contains("day of the week"), "{refused}");
     }
 
     /// The driver's two routine verbs: Test run by name, and an edit saved the way the editor
@@ -7430,7 +8567,8 @@ mod tests {
     }
 
     /// A routine the server has opens its thread, by its button or by name. The chat then says
-    /// which routine it is and what fires it, and the way back is there only while it is open.
+    /// which routine it is and what fires it, and the way back is the Bot chip, which says it
+    /// goes home only while the thread is open. There is no Back link of its own any more.
     #[test]
     fn a_routines_thread_is_opened_and_left_by_id() {
         let mut host = host();
@@ -7441,20 +8579,20 @@ mod tests {
                 .find(&ids::routine_thread("draft-1"))
                 .is_none()
         );
-        assert!(host.snapshot().find(ids::CHAT_ROUTINE_BACK).is_none());
-        assert!(host.click(ids::CHAT_ROUTINE_BACK).is_err());
+        assert!(host.snapshot().find(ids::CHAT_ROUTINE_THREAD).is_none());
 
         host.click(&ids::routine_thread("sch-1-2")).unwrap();
         assert!(matches!(
             host.take_command().unwrap(),
             Command::OpenRoutineThread { routine_id } if routine_id == "sch-1-2"
         ));
-        // A line of its history opens the same thread, dashes in both ids and all.
+        // A line of its history opens the same thread at that run, dashes in both ids and all.
         host.routines[0].runs = vec![("run-a-1".into(), "Test run", "ok")];
         host.click(&ids::routine_run("sch-1-2", "run-a-1")).unwrap();
         assert!(matches!(
             host.take_command().unwrap(),
-            Command::OpenRoutineThread { routine_id } if routine_id == "sch-1-2"
+            Command::OpenRoutineRun { routine_id, run_id }
+                if routine_id == "sch-1-2" && run_id == "run-a-1"
         ));
         host.invoke("routine.thread", &serde_json::json!({ "id": "sch-1-2" }))
             .unwrap();
@@ -7464,15 +8602,39 @@ mod tests {
         ));
 
         host.routine_thread = Some(("Morning post".into(), "schedule".into()));
+        host.bot_chip_goes_home = true;
         let tree = host.snapshot();
         let badge = tree.find(ids::CHAT_ROUTINE_THREAD).unwrap();
         assert_eq!(badge.name, "Morning post");
         assert_eq!(badge.value.as_deref(), Some("schedule"));
-        host.click(ids::CHAT_ROUTINE_BACK).unwrap();
-        assert!(matches!(
-            host.take_command().unwrap(),
-            Command::BackToBotChat
-        ));
+        assert!(
+            tree.find("chat-routine-back").is_none(),
+            "the Back link is gone"
+        );
+        assert!(host.click("chat-routine-back").is_err());
+        let chip = tree.find(ids::HEADER_COWORKER).unwrap();
+        assert!(chip.states.iter().any(|state| state == "goes-home"));
+    }
+
+    /// The chip at the top of the chat names the open Bot and says when a press of it goes home:
+    /// in a routine's thread it goes back to the Bot's own chat (`goes-home`), and elsewhere it
+    /// opens the settings. Either way the click is the chip's own press, decided by the app.
+    #[test]
+    fn the_bot_chip_says_when_it_goes_home() {
+        let mut host = host();
+        let chip = host.snapshot().find(ids::HEADER_COWORKER).cloned().unwrap();
+        assert_eq!(chip.name, "Ada");
+        assert!(!chip.states.iter().any(|state| state == "goes-home"));
+
+        host.routine_thread = Some(("Morning post".into(), "schedule".into()));
+        host.bot_chip_goes_home = true;
+        let chip = host.snapshot().find(ids::HEADER_COWORKER).cloned().unwrap();
+        assert!(chip.states.iter().any(|state| state == "goes-home"));
+        host.click(ids::HEADER_COWORKER).unwrap();
+        assert!(matches!(host.take_command(), Some(Command::PressBotChip)));
+
+        host.sessions.clear();
+        assert!(host.click(ids::HEADER_COWORKER).is_err(), "no Bot, no chip");
     }
 
     /// A cron routine carries the line the server keeps, and nothing about a webhook it has
@@ -7577,7 +8739,7 @@ mod tests {
         ));
         assert!(matches!(
             opened(&mut host, &ids::routine_delete("sch-1-2")),
-            Command::DeleteRoutine { routine_id } if routine_id == "sch-1-2"
+            Command::AskDeleteRoutine { routine_id } if routine_id == "sch-1-2"
         ));
         assert!(matches!(
             opened(&mut host, &ids::routine_rotate("sch-1-2")),

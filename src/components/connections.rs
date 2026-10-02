@@ -8,10 +8,10 @@
 //! Nothing here holds a connection. The server keeps it, a sign-in happens in the person's
 //! browser and comes back to the server, and the app only ever reads the list again.
 
+use crate::components::switch::Switch;
 use crate::opengrok::{ConnectionView, Connector};
 use crate::state::{AccountConnections, AppState, ConnectionChange, ConnectionList, ConnectorList};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::switch::Switch;
 use gpui_kit::component::{ActiveTheme, Disableable, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;

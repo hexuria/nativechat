@@ -34,6 +34,7 @@ pub mod sidebar;
 pub mod sidebar_chat_item;
 pub mod skills;
 pub mod steps;
+pub mod switch;
 pub mod title_bar;
 mod transcript_chrome;
 pub mod transcript_scroll;
