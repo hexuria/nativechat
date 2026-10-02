@@ -5,13 +5,14 @@ use crate::chrome::{
     BOX_SCREEN_ASPECT, HEADER_PX, INFO_PANE_WIDTH, TITLE_BAR_H, box_screen_height_for_width,
     chrome_floats, computer_pane_screen_width,
 };
+use crate::components::agent_settings::sentence;
 use crate::components::alert_chrome::{
     attention_cta, attention_ctas, attention_glass, attention_shadow,
 };
 use crate::components::fields::field_input;
 use crate::opengrok::{
-    BoxHandoffResolution, LocalExecMode, ScheduleRunStatus, computer_attention_done_id,
-    computer_attention_id, computer_attention_skip_id,
+    BoxHandoffResolution, ComputerError, CoworkerComputer, LocalExecMode, ScheduleRunStatus,
+    computer_attention_done_id, computer_attention_id, computer_attention_skip_id,
 };
 use crate::state::{
     AgentRoutine, AppState, ComputerView, NewTrigger, RoutineTrigger, ScheduleDayKind,
@@ -23,7 +24,9 @@ use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
 use gpui_kit::component::popover::Popover;
 use gpui_kit::component::switch::Switch;
 use gpui_kit::component::tooltip::Tooltip;
-use gpui_kit::component::{ActiveTheme, Icon, Selectable, h_flex, v_flex};
+use gpui_kit::component::{
+    ActiveTheme, Disableable as _, Icon, Selectable, Sizable as _, h_flex, v_flex,
+};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 
@@ -329,15 +332,21 @@ impl ComputerPane {
                         .text_color(muted)
                         .child(format!("{agent_name}'s screen")),
                 )
-                .when(box_id.is_none(), |this| {
-                    this.child(
+                // The server's reason, when it has said why it could not give this Bot a
+                // computer, in place of the guess that the next turn may attach one.
+                .map(|this| match controls.no_computer.clone() {
+                    Some(why) => {
+                        this.child(no_computer_notice(why, controls.asking, app.clone(), theme))
+                    }
+                    None if box_id.is_none() => this.child(
                         div()
                             .w_full()
                             .text_center()
                             .text_xs()
                             .text_color(muted)
                             .child("No computer yet. The next turn may attach a local box."),
-                    )
+                    ),
+                    None => this,
                 })
                 .when_some(controls.error.clone(), |this, error| {
                     this.child(
@@ -781,7 +790,7 @@ impl ComputerPane {
     }
 }
 
-/// What the Update and Reset controls need to know, read once per frame.
+/// What the Update, Reset and Get a computer controls need to know, read once per frame.
 #[derive(Debug, Clone, Default)]
 pub struct ComputerControls {
     /// There is a box to act on.
@@ -794,6 +803,24 @@ pub struct ComputerControls {
     pub current: bool,
     /// Why the last action was refused, or how the last update failed.
     pub error: Option<String>,
+    /// Why the server could not give this Bot a computer, in its words ([`no_computer_line`]),
+    /// shown in place of "No computer yet": a turn will not attach a box the server has just
+    /// said it cannot make. Gone with the first status that names a box.
+    pub no_computer: Option<String>,
+    /// Get a computer is with the server; the button waits.
+    pub asking: bool,
+}
+
+/// The button under a reason the server gave for a Bot having no computer, which asks it again.
+pub const GET_A_COMPUTER: &str = "Get a computer";
+
+/// The line between that reason and the button.
+pub const GET_A_COMPUTER_AGAIN: &str = "Get a computer tries again.";
+
+/// The server's reason for a Bot having no computer, as the pane shows it: its own sentence,
+/// begun with a capital like the pane's other lines.
+pub fn no_computer_line(error: &ComputerError) -> String {
+    sentence(&error.message)
 }
 
 /// A computer button's label: its resting word, or "Updating…" while an update runs.
@@ -841,6 +868,12 @@ impl ComputerControls {
                     .filter(|u| !u.in_flight())
                     .map(|u| u.detail())
             }),
+            no_computer: state
+                .coworker_computer
+                .as_ref()
+                .and_then(CoworkerComputer::why_no_computer)
+                .map(no_computer_line),
+            asking: state.asking_for_computer(),
         }
     }
 
@@ -962,6 +995,50 @@ pub(crate) fn computer_attention_banner(
                         });
                     }),
                 )),
+        )
+}
+
+/// Why the server could not give this Bot a computer, in its words and in the red of the pane's
+/// other refusals, and the way to ask it again. Get a computer is the one control on the pane
+/// that asks for a box while there is none: Update and Reset act on a box, and the pane asks by
+/// itself only once per visit. It waits while an ask is with the server, as two at once could
+/// each make a box.
+fn no_computer_notice(
+    why: String,
+    asking: bool,
+    app: Entity<AppState>,
+    theme: &gpui_kit::component::Theme,
+) -> impl IntoElement {
+    v_flex()
+        .w_full()
+        .items_center()
+        .gap(px(6.))
+        .child(
+            div()
+                .id("computer-error")
+                .w_full()
+                .text_center()
+                .text_xs()
+                .text_color(theme.danger)
+                .child(why),
+        )
+        .child(
+            div()
+                .w_full()
+                .text_center()
+                .text_xs()
+                .text_color(theme.muted_foreground)
+                .child(GET_A_COMPUTER_AGAIN),
+        )
+        .child(
+            Button::new("computer-get")
+                .label(GET_A_COMPUTER)
+                .small()
+                .loading(asking)
+                .disabled(asking)
+                .on_click(move |_, _, cx| {
+                    app.update(cx, |state, cx| state.ensure_coworker_computer(cx));
+                }),
         )
 }
 
@@ -2160,4 +2237,42 @@ fn time_row(
                 })
                 .child(div().text_sm().child("×")),
         )
+}
+
+#[cfg(test)]
+mod tests {
+    // Named imports, not a glob: `use super::*` would pull GPUI's `test` attribute in over the
+    // one the test harness wants.
+    use super::{AppState, ComputerControls, CoworkerComputer};
+
+    fn recorded(recording: &str) -> CoworkerComputer {
+        let fixture: serde_json::Value = serde_json::from_str(recording).expect("the recording");
+        serde_json::from_value(fixture["body"].clone()).expect("the status")
+    }
+
+    /// A bot the server could not give a computer: the pane says the server's reason, in its
+    /// words, where it said "No computer yet", with Get a computer live under it, since Update
+    /// and Reset have no box to act on. The first status that names a box takes it away.
+    #[test]
+    fn the_pane_says_why_there_is_no_computer_until_a_box_comes() {
+        let mut state = AppState::new();
+        state.active_coworker_id = Some("cw_0199bb4e-0000-7000-8000-000000000001".into());
+        state.coworker_computer = Some(recorded(include_str!(
+            "../../fixtures/wire/rest/GET__coworkers__coworker_id__computer/200-a_hosted_hire_whose_ascii_create_fails_records_why_and_makes_no_box.json"
+        )));
+        let controls = ComputerControls::from_state(&state);
+        assert_eq!(
+            controls.no_computer.as_deref(),
+            Some("The box refused: 429 {\"error\":\"box creation rate limit reached\"}")
+        );
+        assert!(!controls.asking, "Get a computer is live");
+        assert!(!controls.present, "Update and Reset wait");
+
+        state.coworker_computer = Some(recorded(include_str!(
+            "../../fixtures/wire/rest/GET__coworkers__coworker_id__computer/200-a_healthy_local_vm_does_not_wear_another_scopes_failure.json"
+        )));
+        let controls = ComputerControls::from_state(&state);
+        assert_eq!(controls.no_computer, None);
+        assert!(controls.present);
+    }
 }
