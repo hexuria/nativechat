@@ -67,7 +67,9 @@ actions!(
         /// The picture overlay: close it, and step through the set it opened.
         CloseLightbox,
         LightboxPrev,
-        LightboxNext
+        LightboxNext,
+        /// The question Delete asks about a routine: Escape answers Cancel.
+        CancelRoutineDelete
     ]
 );
 

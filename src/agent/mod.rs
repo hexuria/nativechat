@@ -98,6 +98,11 @@
 //! `Back to the routine` with state `selected` while the panel shows the Run history alone in
 //! place of the routine's fields), `routine-open-thread`, `routine-run-now` and `routine-delete`;
 //! one that cannot act is disabled, with the reason as its value, and a click on it is refused.
+//! A click on `routine-delete` or `routine-{id}-delete` asks first, as a person's does:
+//! `routine-delete-prompt` (a dialog over the whole window, label `Delete "<name>"?`, value =
+//! what deleting it does, e.g. "It stops running. Its past runs and conversation stay.") with
+//! `routine-delete-cancel` and `routine-delete-confirm`, in the tree only while it asks. Escape
+//! answers Cancel in the window. Invoke `routine.delete` deletes outright, without asking.
 //! What an older server cannot do with a routine (one from before opengrok-server 18656e3), each
 //! in the tree only while it is so, label = the editor's words: `routine-{id}-cant-change` (it
 //! cannot change a routine once it is made: the fields are dead, and `routine.edit` is refused),

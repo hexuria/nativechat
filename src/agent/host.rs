@@ -123,6 +123,11 @@ pub mod ids {
     pub const ROUTINE_OPEN_THREAD: &str = "routine-open-thread";
     pub const ROUTINE_RUN_NOW: &str = "routine-run-now";
     pub const ROUTINE_DELETE: &str = "routine-delete";
+    /// The question Delete asks over the whole window (label = `Delete "<name>"?`, value = what
+    /// deleting it does), and its two answers. In the tree only while it asks.
+    pub const ROUTINE_DELETE_PROMPT: &str = "routine-delete-prompt";
+    pub const ROUTINE_DELETE_CANCEL: &str = "routine-delete-cancel";
+    pub const ROUTINE_DELETE_CONFIRM: &str = "routine-delete-confirm";
     /// Under `computer-status`, while the Computer pane says why the server could not give the
     /// bot a computer: the server's words as the pane shows them, with its code as the value.
     pub const COMPUTER_ERROR: &str = "computer-error";
@@ -879,6 +884,12 @@ pub enum Command {
     DeleteRoutine {
         routine_id: String,
     },
+    /// Delete, clicked: the question first, as a person's click asks it.
+    AskDeleteRoutine {
+        routine_id: String,
+    },
+    ConfirmRoutineDelete,
+    CancelRoutineDelete,
     /// Settings → Computer: take one of this Mac's standing rules off, named by its command.
     RemoveLocalRule {
         kind: RuleKind,
@@ -1143,6 +1154,9 @@ impl Command {
                     state.delete_routine(&coworker_id, &routine_id, cx);
                 }
             }
+            Self::AskDeleteRoutine { routine_id } => state.ask_delete_routine(&routine_id, cx),
+            Self::ConfirmRoutineDelete => state.confirm_routine_delete(cx),
+            Self::CancelRoutineDelete => state.cancel_routine_delete(cx),
             Self::RemoveLocalRule { kind, pattern } => state.remove_local_rule(kind, pattern, cx),
             Self::RefreshConnections => state.refresh_connections(cx),
             Self::ConnectService(connector) => state.connect_service(connector, cx),
@@ -2725,6 +2739,8 @@ pub struct NativeChatHost {
     routine_editor: Option<String>,
     /// The open routine's panel shows its Run history in place of its fields.
     routine_history_open: bool,
+    /// The question Delete is asking about a routine: its title and what deleting it does.
+    routine_delete_question: Option<(String, String)>,
     /// The open thread's routine, when it is one of the bot's routines' threads: its name and
     /// the server's word for what fires it.
     routine_thread: Option<(String, String)>,
@@ -3098,6 +3114,9 @@ impl NativeChatHost {
                 _ => None,
             },
             routine_history_open: state.routine_history_open,
+            routine_delete_question: state
+                .routine_delete_question()
+                .map(|(title, what)| (title, what.to_string())),
             routine_error: match (&state.computer_view, state.right_pane) {
                 (
                     crate::state::ComputerView::Editor { id: Some(open) },
@@ -3607,6 +3626,14 @@ impl NativeChatHost {
         }
         if let Some(lightbox) = self.lightbox_node() {
             page = page.with_child(lightbox);
+        }
+        if let Some((title, what)) = &self.routine_delete_question {
+            page = page.with_child(
+                UiNode::dialog(ids::ROUTINE_DELETE_PROMPT, title.clone())
+                    .with_value(what.clone())
+                    .with_child(UiNode::button(ids::ROUTINE_DELETE_CANCEL, "Cancel"))
+                    .with_child(UiNode::button(ids::ROUTINE_DELETE_CONFIRM, "Delete")),
+            );
         }
         for approval in &self.approvals {
             let id = format!("approval-{}", approval.call_id);
@@ -6031,6 +6058,17 @@ impl NativeChatHost {
             Command::CloseNetworkPolicy
         } else if target == ids::ROUTINE_NEW {
             Command::OpenRoutineEditor(None)
+        } else if target == ids::ROUTINE_DELETE_CONFIRM || target == ids::ROUTINE_DELETE_CANCEL {
+            if self.routine_delete_question.is_none() {
+                return Err(format!(
+                    "`{target}` answers Delete's question, which is not asked"
+                ));
+            }
+            if target == ids::ROUTINE_DELETE_CONFIRM {
+                Command::ConfirmRoutineDelete
+            } else {
+                Command::CancelRoutineDelete
+            }
         } else if [
             ids::ROUTINE_HISTORY_TOGGLE,
             ids::ROUTINE_OPEN_THREAD,
@@ -6433,7 +6471,7 @@ impl NativeChatHost {
             ),
             (
                 "-delete",
-                (|id| Command::DeleteRoutine { routine_id: id }) as fn(String) -> Command,
+                (|id| Command::AskDeleteRoutine { routine_id: id }) as fn(String) -> Command,
             ),
         ] {
             if let Some(id) = rest.strip_suffix(tail) {
@@ -6881,7 +6919,7 @@ impl NativeChatHost {
                 self.refuse_dead_test_run(target, &routine_id)?;
                 Command::RunRoutineNow { routine_id }
             }
-            _ => Command::DeleteRoutine { routine_id },
+            _ => Command::AskDeleteRoutine { routine_id },
         })
     }
 
@@ -7183,7 +7221,7 @@ mod tests {
         ));
         assert!(matches!(
             clicked(&mut host, ids::ROUTINE_DELETE),
-            Command::DeleteRoutine { routine_id } if routine_id == "sch_1"
+            Command::AskDeleteRoutine { routine_id } if routine_id == "sch_1"
         ));
 
         host.routine_history_open = true;
@@ -7211,6 +7249,39 @@ mod tests {
             Some(crate::state::ROUTINE_RUN_UNAVAILABLE)
         );
         assert!(host.click(ids::ROUTINE_RUN_NOW).is_err());
+    }
+
+    /// Delete asks first, by click as by hand: the question is on the tree while it asks, with
+    /// its two answers, and an answer with no question asked is refused.
+    #[test]
+    fn delete_asks_first_and_the_question_is_answered_by_id() {
+        let mut host = host();
+        host.routines = vec![routine("sch_1", "cron")];
+        assert!(
+            host.click(ids::ROUTINE_DELETE_CONFIRM).is_err(),
+            "nothing asked"
+        );
+        host.routine_delete_question = Some((
+            "Delete \"Morning post\"?".into(),
+            crate::state::ROUTINE_DELETE_KEEPS.into(),
+        ));
+        let tree = host.snapshot();
+        let prompt = tree.find(ids::ROUTINE_DELETE_PROMPT).unwrap();
+        assert_eq!(prompt.name, "Delete \"Morning post\"?");
+        assert_eq!(
+            prompt.value.as_deref(),
+            Some("It stops running. Its past runs and conversation stay.")
+        );
+        host.click(ids::ROUTINE_DELETE_CANCEL).unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::CancelRoutineDelete)
+        ));
+        host.click(ids::ROUTINE_DELETE_CONFIRM).unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::ConfirmRoutineDelete)
+        ));
     }
 
     /// The driver's two routine verbs: Test run by name, and an edit saved the way the editor
@@ -7419,7 +7490,7 @@ mod tests {
         ));
         assert!(matches!(
             opened(&mut host, &ids::routine_delete("sch-1-2")),
-            Command::DeleteRoutine { routine_id } if routine_id == "sch-1-2"
+            Command::AskDeleteRoutine { routine_id } if routine_id == "sch-1-2"
         ));
         assert!(matches!(
             opened(&mut host, &ids::routine_rotate("sch-1-2")),

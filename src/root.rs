@@ -22,6 +22,9 @@ pub struct RootView {
     /// The picture overlay is mounted here, not in the layout, because it covers the title
     /// bar and the panes alike.
     lightbox: Entity<LightboxView>,
+    /// The question Delete asks about a routine, mounted here for the same reason: it is over
+    /// the sidebar, the chat and the panel alike.
+    routine_delete: Entity<crate::components::computer::RoutineDeletePrompt>,
     circular_viz: Option<Entity<CircularVoiceViz>>,
     pub focus_handle: FocusHandle,
     show_fps: bool,
@@ -51,6 +54,8 @@ impl RootView {
     pub fn new(window: &mut Window, state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
         let layout = cx.new(|cx| Layout::new(window, state.clone(), cx));
         let lightbox = cx.new(|cx| LightboxView::new(state.clone(), cx));
+        let routine_delete =
+            cx.new(|cx| crate::components::computer::RoutineDeletePrompt::new(state.clone(), cx));
         let focus_handle = cx.focus_handle();
         // This is the window the pages are drawn in; a coworker's screen window hands its
         // "Recipes" over to it rather than drawing a page of its own.
@@ -81,6 +86,7 @@ impl RootView {
             layout,
             state,
             lightbox,
+            routine_delete,
             circular_viz: None,
             focus_handle,
             // Off: gpui-fps default headline is MAX = 1/mean_draw (how fast a
@@ -305,6 +311,7 @@ impl Render for RootView {
                 app_state.lightbox.is_some(),
             )
         };
+        let routine_delete_open = self.state.read(cx).routine_delete_prompt.is_some();
         if signed_in && !self.was_signed_in {
             click_away(window, &self.focus_handle, cx);
         }
@@ -589,6 +596,9 @@ impl Render for RootView {
             // A picture from the feed, over the whole window. It is mounted before the root
             // layers so that the note saying where a download landed still lands on top of it.
             .when(lightbox_open, |this| this.child(self.lightbox.clone()))
+            .when(routine_delete_open, |this| {
+                this.child(self.routine_delete.clone())
+            })
             // Root overlay layers
             .children(Root::render_dialog_layer(window, cx))
             .children(Root::render_sheet_layer(window, cx))
