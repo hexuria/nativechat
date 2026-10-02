@@ -324,8 +324,9 @@ impl TitleBar {
             state.sidebar_collapsed,
             state.sidebar_expanded_width,
         );
-        let (chat_left, chat_right, pill_width) =
-            floating_header_span(width, left, state.right_pane != RightPane::Closed);
+        let right_open = state.right_pane != RightPane::Closed;
+        let (chat_left, chat_right, pill_width) = floating_header_span(width, left, right_open);
+        let (fade_left, fade_right) = fade_span(width, left, right_open);
         let bot = state
             .active_coworker_id
             .as_ref()
@@ -348,8 +349,8 @@ impl TitleBar {
                 div()
                     .debug_selector(|| "header-fade".into())
                     .absolute()
-                    .left(px(chat_left))
-                    .right(px(chat_right))
+                    .left(px(fade_left))
+                    .right(px(fade_right))
                     .top_0()
                     .h(px(TITLE_BAR_H + 16.))
                     .bg(linear_gradient(
@@ -569,6 +570,19 @@ fn floating_header_span(width: f32, left: f32, right_open: bool) -> (f32, f32, f
     (left, right, half * 2.)
 }
 
+/// The fade's insets: the chat a person can see, between the sidebar and the right pane,
+/// whether they are docked beside it or floating over it.
+///
+/// The pill can stay centred on the window while the panes float, but the fade cannot reach
+/// out there with it. The header is painted after the panes, so a fade across the whole window
+/// washed a floating sidebar or pane in the chat's colour.
+fn fade_span(width: f32, left: f32, right_open: bool) -> (f32, f32) {
+    let right = if right_open { INFO_PANE_WIDTH } else { 0. };
+    // A floating pane can cover all of the chat the sidebar leaves, and then the fade has
+    // nothing to cover rather than less than nothing.
+    (left, right.min((width - left).max(0.)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::floating_header_span;
@@ -588,13 +602,23 @@ mod tests {
         }
     }
 
+    /// Below 900px the sidebar and the right pane float over the chat. The pill stays centred
+    /// on the window, but the fade stops at each pane that is showing: the sidebar's width on
+    /// the left, and the right pane's on the right while it is open.
     #[test]
     fn floating_panes_do_not_shift_pill() {
         for left in [0., 88., 280.] {
             for right in [false, true] {
                 assert_eq!(floating_header_span(700., left, right), (0., 0., 452.));
+                assert_eq!(
+                    super::fade_span(700., left, right),
+                    (left, if right { 320. } else { 0. }),
+                    "the fade beside a {left}px sidebar, right pane open: {right}"
+                );
             }
         }
+        // The widest sidebar and the right pane leave no chat between them to fade.
+        assert_eq!(super::fade_span(700., 400., true), (400., 300.));
     }
 
     /// The chat page as `Layout` paints it, pressed the way a person presses it: the chat, the
@@ -743,6 +767,37 @@ mod tests {
                 RightPane::Settings,
                 "the pill opens the bot's settings"
             );
+        }
+
+        /// Below 900px the sidebar and the right pane float over the chat, and the header is
+        /// painted over them. Whichever of them is showing, the fade covers the chat between
+        /// them and nothing of either pane.
+        #[gpui_kit::test]
+        fn the_fade_stops_at_floating_panes(cx: &mut TestAppContext) {
+            let (view, cx) = chat_page(cx, 700.);
+            for (hidden, collapsed, left) in
+                [(true, false, 0.), (false, true, 88.), (false, false, 280.)]
+            {
+                for (pane, right) in [
+                    (RightPane::Closed, 0.),
+                    (RightPane::Settings, INFO_PANE_WIDTH),
+                ] {
+                    view.update(cx, |page, cx| {
+                        page.app.update(cx, |state, cx| {
+                            state.sidebar_hidden = hidden;
+                            state.sidebar_collapsed = collapsed;
+                            state.right_pane = pane;
+                            cx.notify();
+                        });
+                    });
+                    let fade = cx.debug_bounds("header-fade").expect("the fade is drawn");
+                    assert_eq!(
+                        (fade.left(), fade.right()),
+                        (px(left), px(700. - right)),
+                        "the fade beside a {left}px sidebar with the right pane {pane:?}"
+                    );
+                }
+            }
         }
     }
 }
