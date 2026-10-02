@@ -8,7 +8,7 @@ use crate::config::Config;
 /// The routine editor's schedule and the cron line it becomes. Re-exported because every
 /// caller reads it as part of a routine, and a routine is a thing on `AppState`.
 pub use crate::cron_spec::{
-    ScheduleDayKind, ScheduleNotCron, ScheduleSpec, ScheduleUiMode, ScheduleUnit,
+    ScheduleDayKind, ScheduleNotCron, ScheduleSpec, ScheduleUiMode, ScheduleUnit, WakeTab,
 };
 use crate::opengrok::{
     Account, ActivityTick, AguiMessage, ApprovalSpec, BotActivity, BoxHandoffReply,
@@ -21049,13 +21049,22 @@ mod tests {
     /// showing the words it was chosen by rather than a line to decipher.
     #[test]
     fn a_cron_row_is_a_routine_with_the_picker_back_on_it() {
-        let routine = super::routine_from_schedule(
-            serde_json::from_value(serde_json::json!({
-                "id": "sch_1", "coworkerId": "cw_1", "kind": "cron", "cron": "0 9 * * 1,2,3,4,5",
-                "prompt": "Read the inbox", "name": "Morning post", "active": true
-            }))
-            .unwrap(),
+        let row = |cron: &str| {
+            super::routine_from_schedule(
+                serde_json::from_value(serde_json::json!({
+                    "id": "sch_1", "coworkerId": "cw_1", "kind": "cron", "cron": cron,
+                    "prompt": "Read the inbox", "name": "Morning post", "active": true
+                }))
+                .unwrap(),
+            )
+        };
+        // A line written with numbers reads the way the server runs it, which counts Sunday as
+        // 1: the editor's old "Weekdays", `1,2,3,4,5`, runs Sunday to Thursday, and says so.
+        assert_eq!(
+            row("0 0 9 * * 1,2,3,4,5").triggers[0].label(),
+            "Sun to Thu at 9:00 AM UTC"
         );
+        let routine = row("0 0 9 * * MON-FRI");
         assert_eq!(routine.id, "sch_1");
         assert_eq!(routine.name, "Morning post");
         assert_eq!(routine.instruction, "Read the inbox");
@@ -21064,7 +21073,7 @@ mod tests {
             panic!("a cron row is a schedule trigger: {:?}", routine.triggers);
         };
         assert_eq!(id, "sch_1", "the trigger is the schedule, so it is its id");
-        assert_eq!(spec.label(), "Weekdays at 9:00 AM");
+        assert_eq!(spec.label(), "Weekdays at 9:00 AM UTC");
     }
 
     /// The URL and key on a webhook routine are the server's and no others: the app used to
@@ -21153,10 +21162,10 @@ mod tests {
         );
     }
 
-    /// The server keeps a line in six fields (`0 0 9 * * 1`). Read the way the server shows it,
-    /// it is the picker's own Every week on Monday at 9:00: the editor opens on the picker and
-    /// not a line to decipher, switching the mode control keeps Monday at nine, and the picker
-    /// choosing that same schedule is no edit at all.
+    /// The server keeps a line in six fields (`0 0 9 * * 1`). Read the way the server shows it
+    /// and runs it, it is the Weekly tab's Sunday at 9:00, since the server counts Sunday as 1:
+    /// the editor opens on the tab and not a line to decipher, and the tab writing that same day
+    /// by name is no edit at all.
     #[test]
     fn the_servers_six_field_line_is_the_pickers_own_schedule() {
         let mut routine = super::routine_from_schedule(
@@ -21169,18 +21178,16 @@ mod tests {
         let super::RoutineTrigger::Schedule { spec, .. } = &mut routine.triggers[0] else {
             panic!("a cron row is a schedule trigger");
         };
-        assert_ne!(spec.mode, super::ScheduleUiMode::Custom, "{spec:?}");
-        assert_eq!(spec.to_cron().ok().as_deref(), Some("0 9 * * 1"));
-        *spec = super::ScheduleSpec::from_cron("0 9 * * 1");
+        assert_eq!(spec.tab(), super::WakeTab::Weekly, "{spec:?}");
+        assert_eq!(spec.to_cron().ok().as_deref(), Some("0 9 * * SUN"));
+        *spec = super::ScheduleSpec::from_cron("0 9 * * SUN");
         assert!(
             super::routine_edit(&routine).is_empty(),
-            "the picker's Monday at nine is the server's Monday at nine"
+            "the tab's Sunday at nine is the server's Sunday at nine"
         );
         assert_eq!(
-            super::ScheduleSpec::from_server_cron("@every 90m")
-                .to_cron()
-                .ok(),
-            super::ScheduleSpec::from_cron("@every 90m").to_cron().ok(),
+            super::ScheduleSpec::from_server_cron("@daily"),
+            super::ScheduleSpec::from_cron("@daily"),
             "a line with no seconds field is read as it is"
         );
     }
@@ -21288,18 +21295,24 @@ mod tests {
         assert!(!line(RunCause::Manual, ScheduleRunStatus::Ok).at.is_empty());
     }
 
-    /// A line the pickers cannot draw is still a routine: it lists, it pauses, it deletes, and
-    /// the line is shown as the server wrote it.
+    /// A line the tabs cannot draw is still a routine: it lists, it pauses, it deletes, and it
+    /// is said in words where it can be and shown as the server wrote it where it cannot.
     #[test]
     fn a_line_with_no_picker_for_it_is_still_a_routine() {
-        let routine = super::routine_from_schedule(
-            serde_json::from_value(serde_json::json!({
-                "id": "sch_3", "coworkerId": "cw_1", "kind": "cron", "cron": "@every 90m",
-                "prompt": "Sweep", "active": true
-            }))
-            .unwrap(),
+        let routine = |cron: &str| {
+            super::routine_from_schedule(
+                serde_json::from_value(serde_json::json!({
+                    "id": "sch_3", "coworkerId": "cw_1", "kind": "cron", "cron": cron,
+                    "prompt": "Sweep", "active": true
+                }))
+                .unwrap(),
+            )
+        };
+        assert_eq!(
+            routine("0 0 9,17 * * MON-FRI").triggers[0].label(),
+            "At 9:00 AM and 5:00 PM UTC, on weekdays"
         );
-        assert_eq!(routine.triggers[0].label(), "@every 90m");
+        assert_eq!(routine("@daily").triggers[0].label(), "@daily");
     }
 
     #[test]
@@ -25235,7 +25248,7 @@ mod tests {
         )
         .await;
         let mut state = routines_on(&server);
-        // Every minute, where the server has Mondays at nine, and a new name.
+        // Every minute, where the server has Sundays at nine, and a new name.
         if let Some(super::RoutineTrigger::Schedule { spec, .. }) = state
             .routine_mut("cw_1", "sch_1")
             .and_then(|row| row.triggers.first_mut())
@@ -25268,7 +25281,7 @@ mod tests {
             super::unsaved_lines(&edit),
             [
                 ("Name", "Daily".to_string()),
-                ("When", "Every minute".to_string())
+                ("When", "Every 1 minute".to_string())
             ]
         );
         let row = state.routine_mut("cw_1", "sch_1").expect("the routine");
@@ -25451,7 +25464,7 @@ mod tests {
         );
         let label = |routine: &super::AgentRoutine| routine.triggers[0].label();
         let row = state.routine_mut("cw_1", "sch_1").expect("the routine");
-        assert_eq!(label(row), "Every minute");
+        assert_eq!(label(row), "Every 1 minute");
         assert!(super::routine_edit(row).is_empty(), "nothing left to send");
         assert_eq!(state.computer_action_error, None);
         assert!(state.routine_unsaved.is_empty());
@@ -25460,7 +25473,7 @@ mod tests {
             state.routines.get("cw_1").map(Vec::as_slice),
             vec![serde_json::from_value(saved).unwrap()],
         );
-        assert_eq!(label(&listed[0]), "Every minute");
+        assert_eq!(label(&listed[0]), "Every 1 minute");
     }
 
     // ---- Stopping a turn --------------------------------------------------------------------

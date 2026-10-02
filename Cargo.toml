@@ -64,6 +64,9 @@ directories = "6"
 uuid = { version = "1.19.0", features = ["v4", "v7", "serde", "js"] }
 sqlx = { version = "0.9", features = ["runtime-tokio", "sqlite", "uuid"] }
 chrono = "0.4.42"
+# The cron parser opengrok-server runs a routine's line with, at the version it pins, so the wake
+# editor's next-run time and its refusals are the server's and cannot drift from them.
+cron = "=0.17.0"
 objc = "0.2"
 cocoa = "0.27"
 block = "0.1"
