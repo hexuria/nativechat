@@ -91,6 +91,10 @@ pub mod ids {
     pub const HEADER_LEFT_SIDEBAR: &str = "header-left-sidebar";
     pub const HEADER_RIGHT_SIDEBAR: &str = "header-right-sidebar";
     pub const HEADER_MONITOR: &str = "header-monitor";
+    /// The chip at the top of the chat that names the open Bot. A press opens its settings, or,
+    /// in one of its routines' threads, goes back to the Bot's own chat: state `goes-home` says
+    /// which it will do.
+    pub const HEADER_COWORKER: &str = "header-coworker";
     /// The open recipe's Run, the outcome of the run it started (value `running`, `ok`,
     /// `failed` or `interrupted`), and its run history.
     pub const RECIPE_RUN: &str = "recipe-run";
@@ -822,6 +826,8 @@ pub enum Command {
         routine_id: String,
     },
     BackToBotChat,
+    /// The Bot chip, pressed: the Bot's settings, or its own chat from a routine's thread.
+    PressBotChip,
     /// Run the open recipe on this bot.
     RunOpenRecipe(String),
     SetComputerExecMode {
@@ -1066,6 +1072,7 @@ impl Command {
             }
             Self::OpenRoutineThread { routine_id } => state.open_routine_thread(&routine_id, cx),
             Self::BackToBotChat => state.back_to_bot_chat(cx),
+            Self::PressBotChip => state.press_bot_chip(cx),
             Self::RunOpenRecipe(coworker_id) => state.run_open_recipe(coworker_id, cx),
             Self::SetComputerExecMode { machine_id, mode } => {
                 state.set_computer_exec_mode(machine_id, mode, cx)
@@ -2592,6 +2599,8 @@ pub struct NativeChatHost {
     /// The open thread's routine, when it is one of the bot's routines' threads: its name and
     /// the server's word for what fires it.
     routine_thread: Option<(String, String)>,
+    /// A press of the Bot chip goes back to the Bot's own chat (`AppState::bot_chip_goes_home`).
+    bot_chip_goes_home: bool,
     /// How many of the open routine thread's bubbles carry a routine's instruction caption.
     routine_instructions: usize,
     /// The composer's panel, when one is open: which list it is, and the rows in it.
@@ -2951,6 +2960,7 @@ impl NativeChatHost {
                         })
                         .count()
                 }),
+            bot_chip_goes_home: state.bot_chip_goes_home(),
             routine_thread: state
                 .active_thread_origin()
                 .map(|origin| (origin.routine_name.clone(), origin.word.clone())),
@@ -3358,6 +3368,13 @@ impl NativeChatHost {
             ));
             if self.sessions.iter().any(|session| session.active) {
                 page = page.with_child(UiNode::button(ids::HEADER_MONITOR, "Toggle computer pane"));
+            }
+            if let Some(bot) = self.sessions.iter().find(|session| session.active) {
+                let mut chip = UiNode::button(ids::HEADER_COWORKER, bot.title.clone());
+                if self.bot_chip_goes_home {
+                    chip.states.push("goes-home".into());
+                }
+                page = page.with_child(chip);
             }
         }
         if let Some(status) = &self.bot_status {
@@ -5617,6 +5634,11 @@ impl NativeChatHost {
             Command::ToggleSidebar
         } else if target == ids::HEADER_MONITOR {
             Command::ToggleComputerPane
+        } else if target == ids::HEADER_COWORKER {
+            if !self.sessions.iter().any(|session| session.active) {
+                return Err("the Bot chip is there only while a Bot is open".into());
+            }
+            Command::PressBotChip
         } else if target == ids::HEADER_RIGHT_SIDEBAR {
             if self.computer_open {
                 Command::ToggleComputerPane
@@ -6891,6 +6913,27 @@ mod tests {
             host.take_command().unwrap(),
             Command::BackToBotChat
         ));
+    }
+
+    /// The chip at the top of the chat names the open Bot and says when a press of it goes home:
+    /// in a routine's thread it goes back to the Bot's own chat (`goes-home`), and elsewhere it
+    /// opens the settings. Either way the click is the chip's own press, decided by the app.
+    #[test]
+    fn the_bot_chip_says_when_it_goes_home() {
+        let mut host = host();
+        let chip = host.snapshot().find(ids::HEADER_COWORKER).cloned().unwrap();
+        assert_eq!(chip.name, "Ada");
+        assert!(!chip.states.iter().any(|state| state == "goes-home"));
+
+        host.routine_thread = Some(("Morning post".into(), "schedule".into()));
+        host.bot_chip_goes_home = true;
+        let chip = host.snapshot().find(ids::HEADER_COWORKER).cloned().unwrap();
+        assert!(chip.states.iter().any(|state| state == "goes-home"));
+        host.click(ids::HEADER_COWORKER).unwrap();
+        assert!(matches!(host.take_command(), Some(Command::PressBotChip)));
+
+        host.sessions.clear();
+        assert!(host.click(ids::HEADER_COWORKER).is_err(), "no Bot, no chip");
     }
 
     /// A cron routine carries the line the server keeps, and nothing about a webhook it has

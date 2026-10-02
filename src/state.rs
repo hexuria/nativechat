@@ -11907,6 +11907,26 @@ impl AppState {
         }
     }
 
+    /// A press of the Bot chip, the pill at the top of the chat that names the open Bot.
+    ///
+    /// In one of the Bot's routines' threads it goes back to the Bot's own chat. That thread is
+    /// not a row of the sidebar, and the chip is the one thing on screen that names the Bot it
+    /// belongs to, so it is the way home. Anywhere else it opens and shuts the Bot's settings, as
+    /// it always has.
+    pub fn press_bot_chip(&mut self, cx: &mut Context<Self>) {
+        if self.bot_chip_goes_home() {
+            self.back_to_bot_chat(cx);
+        } else {
+            self.toggle_agent_settings(cx);
+        }
+    }
+
+    /// Whether the Bot chip goes back to the Bot's own chat rather than opening its settings:
+    /// while the open thread is one of its routines'.
+    pub fn bot_chip_goes_home(&self) -> bool {
+        self.active_thread_origin().is_some()
+    }
+
     /// The routine the open thread belongs to, when it is one of the bot's routines' threads.
     pub fn active_thread_origin(&self) -> Option<&ThreadOrigin> {
         let id = self.active_conversation_id.as_ref()?;

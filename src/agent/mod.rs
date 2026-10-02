@@ -11,6 +11,9 @@
 //! without opening a menu; the `sidebar.mini` action remains available to keyboard automation.
 //! `header-right-sidebar` (chat's window-level pane toggle),
 //! `header-monitor` (computer pane toggle while a bot is open),
+//! `header-coworker` (the chip at the top of the chat, while a bot is open: label = its name; a
+//! click opens the bot's settings, or, with state `goes-home` in one of its routines' threads,
+//! goes back to the bot's own chat),
 //! `composer`, `composer-panel`, `composer-panel-search`, `composer-recipe-bar`,
 //! `composer-skill` (the skill the next message is sent with, value = the id the turn names;
 //! in the tree only while one is on the draft),
