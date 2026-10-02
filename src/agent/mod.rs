@@ -199,7 +199,9 @@
 //! switch, or a read of this Bot's ceiling, is with the server) and `agent-ceiling-note` (the
 //! server's words about the last switch when no row is the one they are about, as a 409's "the
 //! tools changed since you looked"); and one `agent-ceiling-switch-{name}` per row of the bot's
-//! tool ceiling (opengrok-server#268): a switch named by the row's heading, value `builtin` /
+//! tool ceiling (opengrok-server#268): a switch named by the row's heading (the label the
+//! server gives the row, as `Routines` for the routine tools' one row, `routines`, else its
+//! name), value `builtin` /
 //! `plugin`, `checked` where it stands (where it was asked to go while that is with the server),
 //! enabled only while a click would send it, states `switching` and `unavailable`. Under it:
 //! `agent-ceiling-why-{name}` (why the server cannot offer it now),

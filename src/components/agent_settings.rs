@@ -1297,8 +1297,9 @@ pub(crate) const NOTHING_TO_SWITCH: &str = "Nothing to switch on or off.";
 pub(crate) struct ShownCeilingRow {
     /// The server's name for it, which is what its switch is known by.
     pub name: String,
-    /// What the row is headed with: a builtin's wire name, which is what the model is told, or a
-    /// plugin's label, or the plugin's name where it has none.
+    /// What the row is headed with: its label where the server gives one, as a plugin's, and
+    /// the routine tools' one row's `Routines` (opengrok-server #316); else its name, which for
+    /// a builtin is its wire name, what the model is told.
     pub title: String,
     pub builtin: bool,
     /// The first line of what the server says it is.
@@ -1416,9 +1417,6 @@ pub(crate) fn ceiling_line(
 
 /// What a row is headed with; see [`ShownCeilingRow::title`].
 fn ceiling_title(row: &CeilingRow) -> String {
-    if row.is_builtin() {
-        return row.name.clone();
-    }
     row.label
         .as_deref()
         .map(str::trim)
@@ -1530,6 +1528,9 @@ fn ceiling_row(
         connector,
         note,
     } = row;
+    // A builtin headed by its wire name is drawn as code, as the model is told it; one the server
+    // labels for people, as the routine tools' row, is drawn as a name.
+    let wire_name = builtin && title == name;
     // Every id under a row has a fixed word between `agent-ceiling-` and the server's name, and
     // the card's own lines have none, so no name a plugin can have makes one id another's.
     let switch_id = SharedString::from(format!("agent-ceiling-switch-{name}"));
@@ -1554,7 +1555,7 @@ fn ceiling_row(
                         .child(
                             div()
                                 .text_sm()
-                                .when(builtin, |this| this.font_family("Menlo"))
+                                .when(wire_name, |this| this.font_family("Menlo"))
                                 .child(title),
                         )
                         .when(!first_line.is_empty(), |this| {
@@ -1935,6 +1936,44 @@ mod tools_tests {
         }
     }
 
+    /// The routine tools are one row of the ceiling, a builtin the server labels for people
+    /// (opengrok-server #316, recorded at PR #334: `{name: "routines", kind: "builtin", label:
+    /// "Routines"}`), and it is headed by that label; its switch is still known by its name. A
+    /// builtin with no label is headed by its wire name, as before.
+    #[test]
+    fn a_builtin_the_server_labels_is_headed_by_its_label() {
+        let card = CeilingCard {
+            ceiling: ToolCeiling::Read(CeilingRead {
+                rows: rows(serde_json::json!([
+                    {"name": "routines", "kind": "builtin", "enabled": true, "label": "Routines",
+                        "description": "List, make, edit and delete your routines when you ask \
+                                        in chat. Deleting one always asks you first."},
+                    {"name": "message_bot", "kind": "builtin", "enabled": true}
+                ])),
+                version: Some(1),
+            }),
+            pending: None,
+            blocked: None,
+            note: None,
+        };
+        let shown = shown_ceiling_rows(&card);
+        assert_eq!(
+            shown
+                .iter()
+                .map(|row| (row.name.as_str(), row.title.as_str(), row.builtin))
+                .collect::<Vec<_>>(),
+            [
+                ("routines", "Routines", true),
+                ("message_bot", "message_bot", true)
+            ]
+        );
+        assert_eq!(
+            shown[0].first_line,
+            "List, make, edit and delete your routines when you ask in chat. Deleting one \
+             always asks you first."
+        );
+    }
+
     /// The card's line about the ceiling counts the switches as they stand on screen, and says
     /// why there are none when there are none. While it is being asked for it says nothing: the
     /// card's own line is saying that already.
@@ -1965,8 +2004,8 @@ mod tools_tests {
         );
     }
 
-    /// Each row is drawn as the server describes it: a builtin by its wire name, a plugin by its
-    /// label or else its name, the first line of its words, and why it cannot be offered when it
+    /// Each row is drawn as the server describes it: by its label or else its name, which for a
+    /// builtin is its wire name, the first line of its words, and why it cannot be offered when it
     /// cannot. Only a switch a click would send is live, and a builtin the server cannot offer
     /// now is one: the ceiling records what the owner allows.
     #[test]
