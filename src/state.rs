@@ -685,7 +685,6 @@ const RELAY_ADDRESS_UNREADABLE: &str =
 fn relay_cannot_start(why: &str) -> RelayReport {
     RelayReport {
         status: RelayStatus::Error(why.to_string()),
-        in_flight: 0,
         halted: true,
     }
 }
@@ -693,8 +692,9 @@ fn relay_cannot_start(why: &str) -> RelayReport {
 /// The relay's status line ([`AppState::relay_line`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RelayLine {
-    /// This computer holds the relay, answering this many calls right now.
-    Answering { in_flight: usize },
+    /// This computer holds the relay. Nothing of the calls it is answering: the tab says who is
+    /// relaying, and no live activity.
+    Answering,
     /// Another computer holds it, by its name when the server gave one.
     Another { label: Option<String> },
     /// Opening the stream.
@@ -8725,9 +8725,7 @@ impl AppState {
             .filter(|relay| relay.connected)
             .filter(|relay| relay.machine_id.as_deref() != this_mac || this_mac.is_none());
         match report.map(|report| &report.status) {
-            Some(RelayStatus::Answering) => RelayLine::Answering {
-                in_flight: report.map_or(0, |report| report.in_flight),
-            },
+            Some(RelayStatus::Answering) => RelayLine::Answering,
             Some(RelayStatus::Replaced) => RelayLine::Another {
                 label: another.and_then(|relay| relay.machine_label.clone()),
             },
@@ -37204,10 +37202,11 @@ mod tests {
         assert!(!state.relay_wanted());
     }
 
-    /// The status line says who is answering: this Mac by its relay's own word, with the calls in
-    /// flight; another Mac by the server's word, by its name, whether this Mac was replaced or is
-    /// switched off; and otherwise connecting, or not connected with why. The server saying this
-    /// Mac holds the relay while its relay is not running is not this Mac answering.
+    /// The status line says who is answering: this Mac by its relay's own word, and nothing of the
+    /// calls it is answering; another Mac by the server's word, by its name, whether this Mac was
+    /// replaced or is switched off; and otherwise connecting, or not connected with why. The
+    /// server saying this Mac holds the relay while its relay is not running is not this Mac
+    /// answering.
     #[test]
     fn the_status_line_says_who_is_answering() {
         use super::RelayLine;
@@ -37233,16 +37232,15 @@ mod tests {
             }),
         );
         assert_eq!(state.relay_line(), RelayLine::NotConnected { why: None });
-        let report = |status: RelayStatus, in_flight: usize| RelayReport {
+        let report = |status: RelayStatus| RelayReport {
             status,
-            in_flight,
             halted: false,
         };
-        state.relay_mac.report = Some(report(RelayStatus::Connecting, 0));
+        state.relay_mac.report = Some(report(RelayStatus::Connecting));
         assert_eq!(state.relay_line(), RelayLine::Connecting);
-        state.relay_mac.report = Some(report(RelayStatus::Answering, 2));
-        assert_eq!(state.relay_line(), RelayLine::Answering { in_flight: 2 });
-        state.relay_mac.report = Some(report(RelayStatus::Error("gone quiet".into()), 0));
+        state.relay_mac.report = Some(report(RelayStatus::Answering));
+        assert_eq!(state.relay_line(), RelayLine::Answering);
+        state.relay_mac.report = Some(report(RelayStatus::Error("gone quiet".into())));
         assert_eq!(
             state.relay_line(),
             RelayLine::NotConnected {
@@ -37251,7 +37249,7 @@ mod tests {
         );
 
         // Another Mac took over: by its name, once the server says it.
-        state.relay_mac.report = Some(report(RelayStatus::Replaced, 0));
+        state.relay_mac.report = Some(report(RelayStatus::Replaced));
         assert_eq!(state.relay_line(), RelayLine::Another { label: None });
         read_as(&mut state, with_relay(studio.clone()));
         assert_eq!(
@@ -37320,7 +37318,6 @@ mod tests {
         );
         state.relay_mac.report = Some(RelayReport {
             status: RelayStatus::Connecting,
-            in_flight: 0,
             halted: false,
         });
         assert_eq!(state.note_enrolment(&enrolment), Some(true));

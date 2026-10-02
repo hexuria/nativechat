@@ -14250,12 +14250,12 @@ mod tests {
         assert!(dead.contains(RELAY_NOT_ENROLLED), "{dead}");
         assert!(tree.ids_are_unique());
 
-        // Enrolled, relaying, with a key kept.
+        // Enrolled, relaying, with a key kept: who is relaying, and nothing of what it is doing.
         host.reply_source.relay = RelaySnap {
             on: true,
             switch_live: true,
             enrolled: true,
-            line: Some(RelayLine::Answering { in_flight: 1 }),
+            line: Some(RelayLine::Answering),
             detail: None,
             address: "http://127.0.0.1:8080".into(),
             has_key: true,
@@ -14268,11 +14268,18 @@ mod tests {
         let status = tree.find(ids::RELAY_STATUS).unwrap();
         assert_eq!(
             (status.name.as_str(), status.value.as_deref()),
-            (
-                "This computer is relaying · 1 reply in progress",
-                Some("answering")
-            )
+            ("This computer is relaying", Some("answering"))
         );
+        for node in &tree.find(ids::RELAY).unwrap().children {
+            assert!(
+                !node.name.contains("in progress")
+                    && node
+                        .value
+                        .as_deref()
+                        .is_none_or(|value| !value.contains("in progress")),
+                "{node:?}"
+            );
+        }
         let address = tree.find(ids::RELAY_ADDR).unwrap();
         assert_eq!(
             (address.name.as_str(), address.value.as_deref()),

@@ -214,12 +214,11 @@ pub enum RelayStatus {
     Error(String),
 }
 
-/// The relay's word on itself, as the window reads it.
+/// The relay's word on itself, as the window reads it: where it stands, and nothing of the calls
+/// it is answering, which the window does not show.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RelayReport {
     pub status: RelayStatus,
-    /// Model calls this Mac is answering right now.
-    pub in_flight: usize,
     /// It has stopped: another Mac took over, or the server turned the token away. Switching it
     /// off and on again starts it; after the token was turned away, so does this Mac enrolling
     /// again, which the relay follows by itself.
@@ -541,14 +540,6 @@ impl Relay {
         });
     }
 
-    fn count_in_flight(&self, calls: usize) {
-        self.report.send_if_modified(|report| {
-            let changed = report.in_flight != calls;
-            report.in_flight = calls;
-            changed
-        });
-    }
-
     /// One stream, opened with `machine`'s token, read until it ends. The calls it brings are
     /// answered with that token.
     async fn stream_once(
@@ -648,29 +639,27 @@ impl Relay {
         let call = tokio::spawn(async move {
             let answer = ask(Arc::clone(&relay)).await;
             relay.answer(&machine, &id, answer).await;
-            let left = {
-                let mut running = relay.running.lock().unwrap_or_else(PoisonError::into_inner);
-                running.remove(&id);
-                running.len()
-            };
-            relay.count_in_flight(left);
+            relay
+                .running
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .remove(&id);
         });
         running.insert(request_id, call);
-        self.count_in_flight(running.len());
     }
 
     /// The server gave up on a call: stop it there and then. Aborting its task drops the call to
     /// opencodex, which stops generating, and the upload to the server, which asked for this.
     /// A cancel for a call already answered finds nothing, which is right.
     fn cancel(&self, request_id: &str) {
-        let left = {
-            let mut running = self.running.lock().unwrap_or_else(PoisonError::into_inner);
-            if let Some(call) = running.remove(request_id) {
-                call.abort();
-            }
-            running.len()
-        };
-        self.count_in_flight(left);
+        if let Some(call) = self
+            .running
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(request_id)
+        {
+            call.abort();
+        }
     }
 
     /// One model call: opencodex's stream, or why there is none.
@@ -1217,7 +1206,6 @@ mod tests {
             relay.running.lock().unwrap().is_empty()
         })
         .await;
-        assert_eq!(relay.report.borrow().in_flight, 0);
     }
 
     /// A cancel stops the call it names there and then: opencodex's connection is dropped, and
@@ -1251,13 +1239,12 @@ mod tests {
             !opencodex.received_requests().await.unwrap().is_empty()
         })
         .await;
-        assert_eq!(relay.report.borrow().in_flight, 1);
+        assert_eq!(relay.running.lock().unwrap().len(), 1);
         relay.take_frame(
             RelayFrame::from_value(&json!({"type": "cancel", "requestId": "req_1"})),
             &machine(),
         );
         assert!(relay.running.lock().unwrap().is_empty());
-        assert_eq!(relay.report.borrow().in_flight, 0);
         // Long enough for opencodex's delayed answer, had the call gone on to post it.
         tokio::time::sleep(Duration::from_secs(4)).await;
         assert!(answers_to(&server, "req_1").await.is_empty());
@@ -1466,7 +1453,7 @@ mod tests {
             })
             .await;
             until("the call took itself out", async || {
-                handle.report().in_flight == 0
+                handle.running.lock().unwrap().is_empty()
             })
             .await;
             tokio::time::sleep(Duration::from_millis(200)).await;

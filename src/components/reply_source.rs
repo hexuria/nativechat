@@ -149,16 +149,10 @@ pub(crate) fn intro(per_bot: bool) -> &'static str {
     if per_bot { INTRO_PER_BOT } else { INTRO }
 }
 
-/// The relay's status line, as it reads.
+/// The relay's status line, as it reads: who is relaying, and nothing of what the relay is doing.
 pub(crate) fn relay_line_words(line: &RelayLine) -> String {
     match line {
-        RelayLine::Answering { in_flight: 0 } => "This computer is relaying".to_string(),
-        RelayLine::Answering { in_flight: 1 } => {
-            "This computer is relaying · 1 reply in progress".to_string()
-        }
-        RelayLine::Answering { in_flight } => {
-            format!("This computer is relaying · {in_flight} replies in progress")
-        }
+        RelayLine::Answering => "This computer is relaying".to_string(),
         RelayLine::Another { label: Some(label) } => {
             format!("Another computer ({label}) is relaying")
         }
@@ -174,7 +168,7 @@ pub(crate) fn relay_line_words(line: &RelayLine) -> String {
 #[cfg(any(feature = "agent", test))]
 pub(crate) fn relay_line_word(line: &RelayLine) -> &'static str {
     match line {
-        RelayLine::Answering { .. } => "answering",
+        RelayLine::Answering => "answering",
         RelayLine::Another { .. } => "another-mac",
         RelayLine::Connecting => "connecting",
         RelayLine::NotConnected { .. } => "not-connected",
@@ -392,7 +386,7 @@ impl ReplySourcePage {
         let switch_live = state.relay_switch_live();
         let line = state.relay_line();
         let words = relay_line_words(&line);
-        let answering = matches!(line, RelayLine::Answering { .. });
+        let answering = matches!(line, RelayLine::Answering);
         let detail = relay_detail(&line, relay);
         let failed = matches!(line, RelayLine::NotConnected { why: Some(_) });
         let has_key = relay.has_key;
@@ -811,9 +805,7 @@ mod tests {
         };
         use crate::state::{RELAY_ADDRESS_NOT_HERE, RelayLine};
         let lines = [
-            RelayLine::Answering { in_flight: 0 },
-            RelayLine::Answering { in_flight: 1 },
-            RelayLine::Answering { in_flight: 3 },
+            RelayLine::Answering,
             RelayLine::Another {
                 label: Some("NativeChat on studio".into()),
             },
@@ -861,8 +853,6 @@ mod tests {
             lines,
             [
                 "This computer is relaying",
-                "This computer is relaying · 1 reply in progress",
-                "This computer is relaying · 3 replies in progress",
                 "Another computer (NativeChat on studio) is relaying",
                 "Another computer is relaying",
                 "Connecting…",
@@ -910,6 +900,25 @@ mod tests {
         assert!(NEW_BOTS_LINE.contains("None leaves it to the server's default"));
     }
 
+    /// The relay tab says who is relaying and nothing of what the relay is doing: no count of the
+    /// replies in progress, nor any other word of live activity, while this computer is answering
+    /// calls.
+    #[test]
+    fn the_relay_tab_says_no_replies_in_progress() {
+        use super::relay_line_words;
+        use crate::opengrok::{RelayReport, RelayStatus};
+        let mut state = crate::state::AppState::new();
+        state.relay_mac.report = Some(RelayReport {
+            status: RelayStatus::Answering,
+            halted: false,
+        });
+        let said = relay_line_words(&state.relay_line());
+        assert_eq!(said, "This computer is relaying");
+        for activity in ["in progress", "repl", "call"] {
+            assert!(!said.contains(activity), "{said:?} says {activity:?}");
+        }
+    }
+
     /// The relay's status line says who is relaying, and its word for a driver; the line under
     /// it says why this computer is not connected, or, once another computer took the relay from
     /// it, how to take it back; and the card says why it takes no change when it takes none.
@@ -922,7 +931,7 @@ mod tests {
         use crate::opengrok::{RelayReport, RelayStatus};
         use crate::state::{RelayLine, RelayMac};
         let lines = [
-            (RelayLine::Answering { in_flight: 0 }, "answering"),
+            (RelayLine::Answering, "answering"),
             (
                 RelayLine::Another {
                     label: Some("NativeChat on studio".into()),
@@ -939,7 +948,6 @@ mod tests {
         let replaced = RelayMac {
             report: Some(RelayReport {
                 status: RelayStatus::Replaced,
-                in_flight: 0,
                 halted: true,
             }),
             ..RelayMac::default()
