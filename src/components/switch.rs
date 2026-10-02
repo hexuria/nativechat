@@ -290,4 +290,33 @@ mod tests {
             );
         }
     }
+
+    /// Every switch in the app is this one, so an off switch reads the same everywhere. The
+    /// Mac relay's card once drew the kit's own switch, whose knob vanished on the light
+    /// track, and sat beside "Show turn timing" looking like a different control.
+    #[test]
+    fn no_component_draws_the_kits_switch_directly() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/components");
+        let mut stack = vec![dir];
+        let mut offenders = Vec::new();
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).expect("components dir") {
+                let path = entry.expect("entry").path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension().is_some_and(|ext| ext == "rs")
+                    && !path.ends_with("switch.rs")
+                {
+                    let text = std::fs::read_to_string(&path).expect("source");
+                    if text.contains("gpui_kit::component::switch::Switch") {
+                        offenders.push(path.display().to_string());
+                    }
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "draw crate::components::switch::Switch instead: {offenders:?}"
+        );
+    }
 }

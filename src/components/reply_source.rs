@@ -22,6 +22,7 @@
 
 use crate::components::fields::field_input;
 use crate::components::model_picker;
+use crate::components::switch::Switch;
 use crate::opengrok::{DEFAULT_PROXY_URL, InferenceKind, RelayStatus, ReplySource, Via};
 use crate::state::{
     AppState, DefaultForNewBots, ProxyHealth, REPLY_SOURCE_NOT_ON_SERVER, REPLY_SOURCE_RETYPE_KEY,
@@ -30,7 +31,6 @@ use crate::state::{
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{InputEvent, InputState};
 use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
-use gpui_kit::component::switch::Switch;
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{
     ActiveTheme, Disableable, IconName, Sizable as _, Theme, h_flex, v_flex,
@@ -626,7 +626,6 @@ impl ReplySourcePage {
                         let app = app.clone();
                         Switch::new(RELAY_SWITCH)
                             .checked(on)
-                            .small()
                             .accessibility_label(RELAY_TITLE)
                             .disabled(!switch_live)
                             .on_click(move |next, _, cx| {
