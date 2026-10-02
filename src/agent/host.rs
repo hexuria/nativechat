@@ -608,6 +608,8 @@ pub enum Command {
     SetModelPicker(bool),
     /// The model's name in the popover, which opens the list, or the list's heading back.
     ToggleModelList,
+    /// What the list's search box holds, as typing it there would leave it.
+    SetModelSearch(String),
     /// A model in the list, by its group and its id: the Bot goes onto it at once.
     PickModel {
         source: crate::opengrok::InferenceKind,
@@ -927,6 +929,7 @@ impl Command {
             Self::ToggleModelPicker => state.toggle_model_picker(cx),
             Self::SetModelPicker(open) => state.set_model_picker_open(open, cx),
             Self::ToggleModelList => state.toggle_model_list(cx),
+            Self::SetModelSearch(query) => state.set_model_search(query, cx),
             Self::PickModel { source, base_id } => state.pick_model(source, &base_id, cx),
             Self::SetModelFast(on) => state.set_model_fast(on, cx),
             Self::SetModelEffort(word) => state.pick_model_effort(&word, cx),
@@ -1246,7 +1249,8 @@ fn not_editable(target: &str) -> String {
         "`{target}` is not editable (composer, login-email, login-password, \
          user-form-field-*, settings-logins-search, settings-skills-search, \
          settings-login-notes-*, settings-reply-source-url, settings-reply-source-key, \
-         settings-relay-addr, settings-relay-key, or \"\" for whatever holds the caret)"
+         settings-relay-addr, settings-relay-key, agent-model-search, or \"\" for whatever \
+         holds the caret)"
     )
 }
 
@@ -1258,17 +1262,20 @@ enum LoginField {
     Password,
 }
 
-/// Whether a target is one of the model picker's ids: the card, a part of its popover, or a row
-/// of its list.
+/// Whether a target is one of the model picker's ids: the card, a part of its popover, or a
+/// heading or a row of its list.
 fn is_picker_part(target: &str) -> bool {
     use model_picker::{
-        CARD, EFFORT, ERROR, FAST, LIST, NOTE, OPEN_LIST, PLAN, POP, RESET, ROUTINES, ROW,
+        CARD, EFFORT, ERROR, FAST, GROUP, LIST, NO_MATCH, NOTE, OPEN_LIST, PLAN, POP, RESET,
+        ROUTINES, ROW, SEARCH,
     };
     [
-        CARD, POP, FAST, RESET, EFFORT, OPEN_LIST, LIST, PLAN, NOTE, ROUTINES, ERROR,
+        CARD, POP, FAST, RESET, EFFORT, OPEN_LIST, SEARCH, LIST, PLAN, NOTE, ROUTINES, ERROR,
+        NO_MATCH,
     ]
     .contains(&target)
         || target.starts_with(ROW)
+        || target.starts_with(GROUP)
 }
 
 /// The slider's stops by the server's words, as a refusal names them.
@@ -2622,6 +2629,10 @@ pub struct NativeChatHost {
     /// Its popover is open, and whether it shows its list.
     model_picker_open: bool,
     model_list_open: bool,
+    /// What is typed in the list's search box, and the first model in the list's window among
+    /// those the search leaves.
+    model_search: String,
+    model_list_start: usize,
     /// The server's words for the picker's last change that did not go through.
     picker_note: Option<String>,
     /// `GET /models`' word on why its list is not fuller, which the popover's list shows.
@@ -2878,6 +2889,8 @@ impl NativeChatHost {
             model_pick: state.model_pick(),
             model_picker_open: state.model_picker_open,
             model_list_open: state.model_list_open,
+            model_search: state.model_search.clone(),
+            model_list_start: state.model_list_start,
             picker_note: state.picker_note().map(str::to_string),
             model_note: state.model_catalogue.note.clone(),
             computer_status: if state.computer_endpoint_missing {
@@ -4503,19 +4516,23 @@ impl NativeChatHost {
     /// `agent-model-effort` (a slider named as the effort reads and valued by the server's word,
     /// dead from a server that keeps no effort), `agent-model-open-list` (named by the model) and
     /// `agent-model-reset` (live while there is something to put back); and while it shows its
-    /// list, `agent-model-open-list` as the heading back (state `expanded`). `agent-model-list`
-    /// is always there, valued by how many models it offers and visible while shown, and holds
-    /// while shown an `agent-model-row-{source}-{id}` per model (valued by its door's word,
-    /// `selected` on the one that answers, `fast` where it has a fast version),
+    /// list, `agent-model-open-list` as the heading back (state `expanded`) and
+    /// `agent-model-search`, the search box (valued by what is typed). `agent-model-list` is
+    /// always there, valued by how many models the search leaves and visible while shown, and
+    /// holds while shown the window the list draws: at most five models, an
+    /// `agent-model-row-{source}-{id}` each (valued by its door's word, `selected` on the one
+    /// that answers, `fast` where it has a fast version), with an `agent-model-group-{source}`
+    /// heading ("Subscription", "Gateway") over each group's first model in view;
     /// `agent-model-plan` where a server without per-Bot doors has the account's plan model
-    /// answer, `agent-model-routines` where the Bot's own door is the person's plan and its
-    /// routines won't run, and `agent-model-note`, the server's word on why the list is not
-    /// fuller. `agent-model-error`, while open: the server's words for the last change it
-    /// refused.
+    /// answer, `agent-model-no-match` where the search leaves nothing of a list that has some,
+    /// `agent-model-routines` where the Bot's own door is the person's plan and its routines
+    /// won't run, and `agent-model-note`, the server's word on why the list is not fuller.
+    /// `agent-model-error`, while open: the server's words for the last change it refused.
     fn model_picker_node(&self) -> Option<UiNode> {
+        use crate::opengrok::{ListLine, group_title, list_window, row_count};
         use model_picker::{
-            CARD, EFFORT, ERROR, FAST, LIST, MODELS_TITLE, NOTE, OPEN_LIST, PLAN, POP, RESET,
-            ROUTINES,
+            CARD, EFFORT, ERROR, FAST, LIST, MODELS_TITLE, NO_MATCH, NO_MODEL_MATCHES, NOTE,
+            OPEN_LIST, PLAN, POP, RESET, ROUTINES, SEARCH, SEARCH_PLACEHOLDER, group_id,
         };
         let pick = self.model_pick.as_ref()?;
         let open = self.model_picker_open;
@@ -4555,14 +4572,20 @@ impl NativeChatHost {
                     UiNode::button(RESET, model_picker::RESET_LABEL).with_enabled(pick.can_reset()),
                 );
         }
+        // What the search leaves: the whole list while nothing is typed, which it always is while
+        // the list is shut.
+        let groups = pick.search(&self.model_search);
         let mut list = UiNode::list(LIST, MODELS_TITLE)
-            .with_value(pick.rows().count().to_string())
+            .with_value(row_count(&groups).to_string())
             .with_visible(list_open);
         if list_open {
             let mut back = UiNode::button(OPEN_LIST, MODELS_TITLE);
             back.states.push("expanded".into());
-            pop = pop.with_child(back);
-            if let Some(plan) = &pick.account_plan {
+            pop = pop.with_child(back).with_child(
+                UiNode::textbox(SEARCH, SEARCH_PLACEHOLDER).with_value(self.model_search.clone()),
+            );
+            let plan = pick.plan_line(&self.model_search);
+            if let Some(plan) = plan {
                 let model = plan.model.as_deref().map_or_else(
                     || crate::opengrok::NO_MODEL.to_string(),
                     crate::opengrok::base_label,
@@ -4571,17 +4594,30 @@ impl NativeChatHost {
                     UiNode::status(PLAN, model).with_value(plan.model.clone().unwrap_or_default()),
                 );
             }
-            for row in pick.rows() {
-                let mut item =
-                    UiNode::listitem(ids::model_row(row.source, &row.base_id), row.label.clone())
+            for line in list_window(&groups, self.model_list_start) {
+                list = list.with_child(match line {
+                    ListLine::Heading(source) => {
+                        UiNode::new(group_id(source), "heading", group_title(source))
+                    }
+                    ListLine::Row(row) => {
+                        let mut item = UiNode::listitem(
+                            ids::model_row(row.source, &row.base_id),
+                            row.label.clone(),
+                        )
                         .with_value(row.source.word());
-                if pick.is_current(row) {
-                    item.states.push("selected".into());
-                }
-                if row.has_fast {
-                    item.states.push("fast".into());
-                }
-                list = list.with_child(item);
+                        if pick.is_current(row) {
+                            item.states.push("selected".into());
+                        }
+                        if row.has_fast {
+                            item.states.push("fast".into());
+                        }
+                        item
+                    }
+                });
+            }
+            let offers_nothing = pick.groups.is_empty() && pick.account_plan.is_none();
+            if !offers_nothing && groups.is_empty() && plan.is_none() {
+                list = list.with_child(UiNode::status(NO_MATCH, NO_MODEL_MATCHES));
             }
             if let Some(line) = &pick.routines {
                 list = list.with_child(UiNode::status(ROUTINES, line.clone()));
@@ -4886,11 +4922,15 @@ impl NativeChatHost {
 
     /// A click on one of the picker's parts, refused while it is not on screen: the card while
     /// the Bot's settings are shut, a part of the popover while it is shut, its controls while it
-    /// shows its list, and a row while it does not. ⚡ where it is dead is refused with why, and ↺
-    /// with nothing to put back; the slider is set with `set_value`, not clicked.
+    /// shows its list, and its list's parts while it does not. ⚡ where it is dead is refused with
+    /// why, and ↺ with nothing to put back; the slider and the search box are set with
+    /// `set_value`, not clicked. A model is picked only while it is in the list's window, as a
+    /// person can click only what is in view: one further down is out of view until the search
+    /// box finds it.
     fn model_picker_control(&self, target: &str) -> Result<Command, String> {
         use model_picker::{
-            CARD, EFFORT, ERROR, FAST, LIST, NOTE, OPEN_LIST, PLAN, POP, RESET, ROUTINES, ROW,
+            CARD, EFFORT, ERROR, FAST, GROUP, LIST, NO_MATCH, NOTE, OPEN_LIST, PLAN, POP, RESET,
+            ROUTINES, ROW, SEARCH,
         };
         let Some(pick) = &self.model_pick else {
             return Err(format!("`{target}` is not on screen: no Bot is open"));
@@ -4916,7 +4956,9 @@ impl NativeChatHost {
                 "`{target}` is the popover: click one of its controls"
             )),
             OPEN_LIST => Ok(Command::ToggleModelList),
-            PLAN | NOTE | ROUTINES | ERROR => Err(format!("`{target}` is a line, not a control")),
+            PLAN | NOTE | ROUTINES | ERROR | NO_MATCH => {
+                Err(format!("`{target}` is a line, not a control"))
+            }
             FAST | EFFORT | RESET if list_open => Err(format!(
                 "`{target}` is not on screen: the popover shows its list, and `{OPEN_LIST}` goes \
                  back"
@@ -4937,37 +4979,94 @@ impl NativeChatHost {
             LIST => Err(format!(
                 "`{target}` is the list: click one of its models, `{ROW}{{source}}-{{id}}`"
             )),
-            row if !list_open => Err(format!(
-                "`{row}` is not on screen: the popover shows its controls, and `{OPEN_LIST}` \
+            part if !list_open => Err(format!(
+                "`{part}` is not on screen: the popover shows its controls, and `{OPEN_LIST}` \
                  opens the list"
             )),
+            SEARCH => Err(format!("`{target}` is a field: use set_value")),
+            heading if heading.starts_with(GROUP) => {
+                Err(format!("`{target}` is a group's heading, not a model"))
+            }
             row => {
+                use crate::opengrok::{LIST_ROWS, ListLine, list_window};
                 let rest = row.strip_prefix(ROW).unwrap_or(row);
                 let found = crate::opengrok::InferenceKind::ALL
                     .into_iter()
                     .find_map(|source| {
                         let base_id = rest.strip_prefix(source.word())?.strip_prefix('-')?;
                         pick.row(source, base_id)
-                            .map(|row| (source, row.base_id.clone()))
                     });
-                found
-                    .map(|(source, base_id)| Command::PickModel { source, base_id })
-                    .ok_or_else(|| {
-                        let offered: Vec<String> = pick
-                            .rows()
-                            .map(|row| ids::model_row(row.source, &row.base_id))
-                            .collect();
-                        format!(
-                            "no `{target}` in the list, which offers {}",
-                            if offered.is_empty() {
-                                "nothing".to_string()
-                            } else {
-                                offered.join(", ")
-                            }
-                        )
-                    })
+                let Some(found) = found else {
+                    let offered: Vec<String> = pick
+                        .rows()
+                        .map(|row| ids::model_row(row.source, &row.base_id))
+                        .collect();
+                    return Err(format!(
+                        "no `{target}` in the list, which offers {}",
+                        if offered.is_empty() {
+                            "nothing".to_string()
+                        } else {
+                            offered.join(", ")
+                        }
+                    ));
+                };
+                let query = self.model_search.as_str();
+                if !found.matches(query) {
+                    return Err(format!(
+                        "`{target}` is not on screen: the search `{query}` in `{SEARCH}` leaves \
+                         it out"
+                    ));
+                }
+                let groups = pick.search(query);
+                let in_view = list_window(&groups, self.model_list_start)
+                    .into_iter()
+                    .any(|line| line == ListLine::Row(found));
+                if !in_view {
+                    return Err(format!(
+                        "`{target}` is out of view: the list shows {LIST_ROWS} models at a time, \
+                         and `{SEARCH}` finds the rest"
+                    ));
+                }
+                Ok(Command::PickModel {
+                    source: found.source,
+                    base_id: found.base_id.clone(),
+                })
             }
         }
+    }
+
+    /// `set_value` on the list's search box, as typing it there would leave it: the list shows
+    /// only the models it leaves, from the top. Refused while the box is not on screen: the
+    /// popover shut, or showing its controls.
+    fn set_model_search(&mut self, target: &str, value: &str) -> Result<DispatchResult, String> {
+        if let Some(closed) = self.model_search_closed(target) {
+            return Err(closed);
+        }
+        self.model_search = value.to_string();
+        self.model_list_start = 0;
+        self.pending = Some(Command::SetModelSearch(value.to_string()));
+        Ok(DispatchResult::empty())
+    }
+
+    /// Why the list's search box takes no typing now, or `None` while it does.
+    fn model_search_closed(&self, target: &str) -> Option<String> {
+        if self.model_pick.is_none() {
+            return Some(format!("`{target}` is not on screen: no Bot is open"));
+        }
+        if !self.model_picker_open {
+            return Some(format!(
+                "`{target}` is in the model picker's popover, which is shut: open it with `{}`",
+                ids::AGENT_MODEL_CARD
+            ));
+        }
+        if !self.model_list_open {
+            return Some(format!(
+                "`{target}` is not on screen: the popover shows its controls, and `{}` opens the \
+                 list",
+                model_picker::OPEN_LIST
+            ));
+        }
+        None
     }
 
     /// `set_value` on the picker's slider: one of its five stops by the server's word, saved at
@@ -6316,6 +6415,9 @@ impl NativeChatHost {
         if target == model_picker::EFFORT {
             return self.set_model_effort(target, value);
         }
+        if target == model_picker::SEARCH {
+            return self.set_model_search(target, value);
+        }
         if let Some(refusal) = self.skill_sheet_field(target) {
             return refusal;
         }
@@ -6361,6 +6463,10 @@ impl NativeChatHost {
         }
         if target == ids::RELAY_KEY {
             return Err(self.relay_field_keys(target));
+        }
+        if target == model_picker::SEARCH {
+            let query = format!("{}{text}", self.model_search);
+            return self.set_model_search(target, &query);
         }
         if let Some(refusal) = self.skill_sheet_field(target) {
             return refusal;
@@ -6414,6 +6520,23 @@ impl NativeChatHost {
                 // would be the same lie as taking the text.
                 "enter" if self.account_open && self.skills_tab => Ok(DispatchResult::empty()),
                 "enter" => Err(skills_off_screen(target)),
+                other => Err(format!(
+                    "unhandled key `{other}` on `{target}` (Enter, Backspace)"
+                )),
+            };
+        }
+        if target == model_picker::SEARCH {
+            if let Some(closed) = self.model_search_closed(target) {
+                return Err(closed);
+            }
+            return match key_token(key)?.as_str() {
+                "backspace" => {
+                    let mut query = self.model_search.clone();
+                    query.pop();
+                    self.set_model_search(target, &query)
+                }
+                // The list filters as the text changes; Enter has nothing left to do.
+                "enter" => Ok(DispatchResult::empty()),
                 other => Err(format!(
                     "unhandled key `{other}` on `{target}` (Enter, Backspace)"
                 )),
@@ -12594,6 +12717,16 @@ mod tests {
 
         host.model_list_open = true;
         let tree = host.snapshot();
+        let search = tree.find("agent-model-search").unwrap();
+        assert_eq!(
+            (
+                search.role.as_str(),
+                search.name.as_str(),
+                search.value.as_deref()
+            ),
+            ("textbox", "Search models", Some("")),
+            "at the top of the list, nothing typed"
+        );
         let list = tree.find("agent-model-list").unwrap();
         assert!(list.visible);
         assert_eq!(list.value.as_deref(), Some("3"));
@@ -12612,11 +12745,13 @@ mod tests {
         assert_eq!(
             rows,
             [
+                ("agent-model-group-local_proxy", "Subscription", &[][..]),
                 (
                     "agent-model-row-local_proxy-gpt-6-luna",
                     "GPT-6 Luna",
                     &["selected".to_string(), "fast".to_string()][..]
                 ),
+                ("agent-model-group-gateway", "Gateway", &[][..]),
                 ("agent-model-row-gateway-oag/cheap", "Cheap (auto)", &[][..]),
                 ("agent-model-row-gateway-xai/grok-4.7", "Grok 4.7", &[][..]),
                 ("agent-model-routines", routines.as_str(), &[][..]),
@@ -12708,6 +12843,225 @@ mod tests {
         assert!(host.take_command().is_none());
     }
 
+    /// The list's search box filters both groups at once, whatever the case, by a model's name
+    /// and by its id, and the tree draws what it leaves, headings and all; a search that leaves
+    /// nothing says "No model matches". A driver writes the box with `set_value`, adds to it with
+    /// `type` and takes a letter off with Backspace, and is refused while the box is not on
+    /// screen. A model the search leaves out is not on screen to pick.
+    #[test]
+    fn the_model_search_filters_both_groups_and_a_driver_writes_it() {
+        let mut host = host();
+        host.model_pick = Some(a_pick(
+            Some(serde_json::json!("local_proxy")),
+            "gpt-6-luna",
+            "medium",
+        ));
+        host.agent_settings_open = true;
+        let shut = host.set_value("agent-model-search", "grok").unwrap_err();
+        assert!(shut.contains("which is shut"), "{shut}");
+        host.model_picker_open = true;
+        let controls = host.set_value("agent-model-search", "grok").unwrap_err();
+        assert!(controls.contains("agent-model-open-list"), "{controls}");
+        assert!(host.take_command().is_none());
+        host.model_list_open = true;
+        let field = host.click("agent-model-search").unwrap_err();
+        assert!(field.contains("use set_value"), "{field}");
+
+        let in_list = |host: &NativeChatHost| -> (Option<String>, Vec<(String, String)>) {
+            let tree = host.snapshot();
+            let list = tree.find("agent-model-list").unwrap();
+            (
+                list.value.clone(),
+                list.children
+                    .iter()
+                    .filter(|node| node.id != "agent-model-routines")
+                    .map(|node| (node.id.clone(), node.name.clone()))
+                    .collect(),
+            )
+        };
+        let line = |id: &str, name: &str| (id.to_string(), name.to_string());
+        host.set_value("agent-model-search", "GROK").unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::SetModelSearch(query)) if query == "GROK"
+        ));
+        assert_eq!(
+            in_list(&host),
+            (
+                Some("1".to_string()),
+                vec![
+                    line("agent-model-group-gateway", "Gateway"),
+                    line("agent-model-row-gateway-xai/grok-4.7", "Grok 4.7"),
+                ]
+            ),
+            "by name, whatever the case: the Subscription group has nothing left and goes"
+        );
+        let left_out = host
+            .click("agent-model-row-local_proxy-gpt-6-luna")
+            .unwrap_err();
+        assert!(left_out.contains("leaves it out"), "{left_out}");
+        host.click("agent-model-row-gateway-xai/grok-4.7").unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::PickModel { base_id, .. }) if base_id == "xai/grok-4.7"
+        ));
+
+        host.set_value("agent-model-search", "oag/").unwrap();
+        assert_eq!(
+            in_list(&host).1,
+            [
+                line("agent-model-group-gateway", "Gateway"),
+                line("agent-model-row-gateway-oag/cheap", "Cheap (auto)"),
+            ],
+            "by the raw id, which the name does not hold"
+        );
+
+        host.set_value("agent-model-search", "claude").unwrap();
+        assert_eq!(
+            in_list(&host),
+            (
+                Some("0".to_string()),
+                vec![line("agent-model-no-match", "No model matches")]
+            )
+        );
+        assert!(host.click("agent-model-no-match").is_err(), "a line");
+
+        host.set_value("agent-model-search", "lun").unwrap();
+        host.type_into("agent-model-search", "a").unwrap();
+        assert_eq!(host.model_search, "luna");
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::SetModelSearch(query)) if query == "luna"
+        ));
+        host.dispatch(&Op::key("agent-model-search", "backspace"))
+            .unwrap();
+        assert_eq!(host.model_search, "lun");
+        host.dispatch(&Op::key("agent-model-search", "enter"))
+            .unwrap();
+        assert_eq!(
+            in_list(&host).1,
+            [
+                line("agent-model-group-local_proxy", "Subscription"),
+                line("agent-model-row-local_proxy-gpt-6-luna", "GPT-6 Luna"),
+            ]
+        );
+    }
+
+    /// A long list is on the tree as the window draws it: five models at a time, each group's
+    /// heading over its first model in view and not one of the five, and the list valued by all
+    /// it holds. A model out of view is refused, as a person cannot click it without scrolling,
+    /// and the search box brings it into view; a heading is no model to pick.
+    #[test]
+    fn the_list_shows_five_models_at_a_time_and_a_driver_finds_the_rest_by_search() {
+        let mut host = host();
+        let bot = serde_json::from_value(serde_json::json!({
+            "id": "cw_1", "name": "Ada", "model": "oag/route-1", "effort": "medium",
+            "source": "gateway"
+        }))
+        .unwrap();
+        let catalogue = crate::opengrok::ModelCatalogue {
+            models: (0..6)
+                .map(|at| crate::opengrok::ModelEntry {
+                    id: format!("oag/route-{at}"),
+                    source: Some("gateway".into()),
+                    via: None,
+                })
+                .collect(),
+            note: None,
+            local_proxy: None,
+        };
+        let account = kept_source(crate::opengrok::InferenceKind::Gateway, true);
+        host.model_pick = Some(crate::opengrok::bot_pick(
+            &bot,
+            Some(&account),
+            &catalogue,
+            |_| {
+                ["gpt-6-luna", "gpt-5.6-sol", "grok-4.7"]
+                    .map(str::to_string)
+                    .to_vec()
+            },
+        ));
+        host.agent_settings_open = true;
+        host.model_picker_open = true;
+        host.model_list_open = true;
+        let ids_in_list = |host: &NativeChatHost| -> Vec<String> {
+            host.snapshot()
+                .find("agent-model-list")
+                .unwrap()
+                .children
+                .iter()
+                .map(|node| node.id.clone())
+                .collect()
+        };
+        assert_eq!(
+            host.snapshot()
+                .find("agent-model-list")
+                .unwrap()
+                .value
+                .as_deref(),
+            Some("9"),
+            "valued by all the list holds"
+        );
+        assert_eq!(
+            ids_in_list(&host),
+            [
+                "agent-model-group-local_proxy",
+                "agent-model-row-local_proxy-gpt-6-luna",
+                "agent-model-row-local_proxy-gpt-5.6-sol",
+                "agent-model-row-local_proxy-grok-4.7",
+                "agent-model-group-gateway",
+                "agent-model-row-gateway-oag/route-0",
+                "agent-model-row-gateway-oag/route-1",
+            ]
+        );
+        let out = host
+            .click("agent-model-row-gateway-oag/route-5")
+            .unwrap_err();
+        assert!(out.contains("out of view"), "{out}");
+        assert!(host.take_command().is_none());
+        let heading = host.click("agent-model-group-gateway").unwrap_err();
+        assert!(heading.contains("heading"), "{heading}");
+
+        // Scrolled to the end: the Gateway group's heading over its first model in view.
+        host.model_list_start = 4;
+        assert_eq!(
+            ids_in_list(&host),
+            [
+                "agent-model-group-gateway",
+                "agent-model-row-gateway-oag/route-1",
+                "agent-model-row-gateway-oag/route-2",
+                "agent-model-row-gateway-oag/route-3",
+                "agent-model-row-gateway-oag/route-4",
+                "agent-model-row-gateway-oag/route-5",
+            ]
+        );
+        host.click("agent-model-row-gateway-oag/route-5").unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::PickModel { base_id, .. }) if base_id == "oag/route-5"
+        ));
+
+        // From the top again, the search box finds it.
+        host.model_list_start = 0;
+        host.set_value("agent-model-search", "route-5").unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::SetModelSearch(query)) if query == "route-5"
+        ));
+        assert_eq!(
+            ids_in_list(&host),
+            [
+                "agent-model-group-gateway",
+                "agent-model-row-gateway-oag/route-5",
+            ]
+        );
+        host.click("agent-model-row-gateway-oag/route-5").unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::PickModel { base_id, .. }) if base_id == "oag/route-5"
+        ));
+    }
+
     /// ⚡ is dead where the list holds no fast version of the model, and says why: on the tree as
     /// its value, and as the refusal of a driver's click. ↺ puts back what there is to put back.
     #[test]
@@ -12781,6 +13135,7 @@ mod tests {
             ids_in_list,
             [
                 "agent-model-plan",
+                "agent-model-group-gateway",
                 "agent-model-row-gateway-oag/cheap",
                 "agent-model-note"
             ]
@@ -12824,7 +13179,9 @@ mod tests {
         assert_eq!(
             ids_in_list,
             [
+                "agent-model-group-local_proxy",
                 "agent-model-row-local_proxy-gpt-6-luna",
+                "agent-model-group-gateway",
                 "agent-model-row-gateway-oag/cheap",
                 "agent-model-row-gateway-xai/grok-4.7",
                 "agent-model-routines",
@@ -12864,8 +13221,8 @@ mod tests {
         }
     }
 
-    /// From the app: the card is the open Bot's picker, in the Bot's settings, and the chat page
-    /// holds none of it.
+    /// From the app: the card is the open Bot's picker, in the Bot's settings, the chat page holds
+    /// none of it, and the list on the tree is the one the state's search and window leave.
     #[test]
     fn the_picker_on_the_tree_is_the_open_bots() {
         let mut state = AppState::new();
@@ -12899,6 +13256,32 @@ mod tests {
             "under the Bot's settings"
         );
         assert!(tree.find("model-chip").is_none());
+        state.model_catalogue = crate::opengrok::ModelCatalogue {
+            models: vec![crate::opengrok::ModelEntry {
+                id: "oag/cheap".into(),
+                source: Some("gateway".into()),
+                via: None,
+            }],
+            note: None,
+            local_proxy: None,
+        };
+        state.model_picker_open = true;
+        state.model_list_open = true;
+        state.model_search = "cheap".into();
+        let tree = NativeChatHost::from_app(&state).snapshot();
+        assert_eq!(
+            tree.find("agent-model-search")
+                .and_then(|node| node.value.as_deref()),
+            Some("cheap")
+        );
+        assert!(
+            tree.find("agent-model-row-gateway-oag/cheap").is_some(),
+            "the search leaves it"
+        );
+        state.model_search = "luna".into();
+        let tree = NativeChatHost::from_app(&state).snapshot();
+        assert!(tree.find("agent-model-row-gateway-oag/cheap").is_none());
+        assert!(tree.find("agent-model-no-match").is_some());
     }
 
     /// A bot's skills as the server gives them (opengrok-server#270): the owner's `triage`

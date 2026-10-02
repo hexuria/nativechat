@@ -1,7 +1,9 @@
 //! A Bot's model, fast tier and effort, picked the way Codex picks them, on the Model card in the
 //! Bot's settings: the model's name, over its door, the effort and ⚡. The card opens a popover
-//! whose top row is ⚡, the effort, the model's name, which opens the list of models grouped by
-//! door, and ↺, over a slider of five stops of effort.
+//! whose top row is ⚡, the effort, the model's name, which opens the list of models, and ↺, over
+//! a slider of five stops of effort. The list is a combobox: a search box over the models grouped
+//! by door, Subscription (the person's own plan) and Gateway (the server's paid keys), five at a
+//! time, which the wheel scrolls.
 //!
 //! The card is the only place a Bot's model is picked. The composer has no chip for it: the model
 //! is the Bot's setting, changed where the Bot's other settings are, and every turn goes through
@@ -13,17 +15,22 @@
 //! gpui-agent tree (`agent/host.rs`) says what the window says.
 
 use crate::chrome::INFO_PANE_WIDTH;
+use crate::components::fields::field_input;
 use crate::opengrok::{
-    AccountPlan, ChoiceGroup, EFFORT_NOT_KEPT, EFFORT_STOPS, InferenceKind, ModelChoice, ModelPick,
-    NO_MODEL, PLAN_GROUP, base_label, effort_label, effort_stop, slider_stop, stop_word,
+    AccountPlan, EFFORT_NOT_KEPT, EFFORT_STOPS, InferenceKind, LIST_ROWS, ListLine, ModelChoice,
+    ModelPick, NO_MODEL, SUBSCRIPTION_GROUP, base_label, effort_label, effort_stop, group_title,
+    last_window_start, list_window, row_count, slider_stop, stop_word,
 };
 use crate::state::AppState;
+use gpui_kit::component::input::{InputEvent, InputState};
 use gpui_kit::component::popover::Popover;
 use gpui_kit::component::slider::{Slider, SliderEvent, SliderState};
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{ActiveTheme, Icon, IconName, Selectable, Theme, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
+use std::cell::Cell;
+use std::rc::Rc;
 
 /// The card in the Bot's settings, which opens the popover.
 pub(crate) const CARD: &str = "agent-model-card";
@@ -34,9 +41,15 @@ pub(crate) const RESET: &str = "agent-model-reset";
 pub(crate) const EFFORT: &str = "agent-model-effort";
 /// The model's name, which opens the list, and in the list the heading that goes back.
 pub(crate) const OPEN_LIST: &str = "agent-model-open-list";
+/// At the top of the list: the search box, which filters both groups as it is typed in.
+pub(crate) const SEARCH: &str = "agent-model-search";
 pub(crate) const LIST: &str = "agent-model-list";
+/// Before each group's heading's door ([`group_id`]).
+pub(crate) const GROUP: &str = "agent-model-group-";
 /// Before each row's door and id ([`row_id`]).
 pub(crate) const ROW: &str = "agent-model-row-";
+/// In the list, while what is typed in the search box leaves no model of a list that has some.
+pub(crate) const NO_MATCH: &str = "agent-model-no-match";
 /// In the list, on a server without per-Bot doors while the account is on the person's plan:
 /// the plan's model, which answers for every Bot there.
 pub(crate) const PLAN: &str = "agent-model-plan";
@@ -53,6 +66,11 @@ pub(crate) fn row_id(source: InferenceKind, base_id: &str) -> String {
     format!("{ROW}{}-{base_id}", source.word())
 }
 
+/// A group's heading in the list, by its door's wire word.
+pub(crate) fn group_id(source: InferenceKind) -> String {
+    format!("{GROUP}{}", source.word())
+}
+
 /// What a driver's tree names ⚡ and ↺ by, which the window draws as their marks alone.
 #[cfg(feature = "agent")]
 pub(crate) const FAST_LABEL: &str = "Fast";
@@ -60,12 +78,16 @@ pub(crate) const FAST_LABEL: &str = "Fast";
 pub(crate) const RESET_LABEL: &str = "Reset";
 
 pub(crate) const MODELS_TITLE: &str = "Models";
+/// What the search box says while nothing is typed in it, and what a driver's tree names it by.
+pub(crate) const SEARCH_PLACEHOLDER: &str = "Search models";
 /// In the list while it has nothing to offer.
 pub(crate) const NO_MODELS: &str = "The server lists no models to pick from yet.";
-/// Under the plan's line on a server without per-Bot doors: whose model it is, and when a Server
+/// In the list while the search leaves nothing of a list that has some.
+pub(crate) const NO_MODEL_MATCHES: &str = "No model matches";
+/// Under the plan's line on a server without per-Bot doors: whose model it is, and when a Gateway
 /// model picked here answers instead.
 pub(crate) const ACCOUNT_PLAN_LINE: &str = "Every Bot's on this server, set in Settings → Reply \
-     source. A Server model answers once replies there are on the server's paid keys.";
+     source. A Gateway model answers once replies there are on the server's paid keys.";
 const RESET_TIP: &str = "Default effort, and ⚡ off";
 const FAST_ON_TIP: &str = "Fast is on. Click to turn it off.";
 const FAST_OFF_TIP: &str = "Use this model's fast version";
@@ -73,12 +95,13 @@ const FAST_OFF_TIP: &str = "Use this model's fast version";
 /// The popover is the settings pane's width, as the card is.
 const CARD_WIDTH: f32 = INFO_PANE_WIDTH - 32.;
 
-/// The card's second line: the door, the effort, and ⚡ while it is on.
+/// A model's row in the list, which is also how far the wheel scrolls to move the window by one.
+const ROW_HEIGHT: f32 = 28.;
+
+/// The card's second line: the door, by the name of its group in the list, the effort, and ⚡
+/// while it is on.
 pub(crate) fn card_detail(pick: &ModelPick) -> String {
-    let door = pick.door.map(|door| match door {
-        InferenceKind::LocalProxy => "Your plan",
-        InferenceKind::Gateway => "Server",
-    });
+    let door = pick.door.map(group_title);
     let fast = pick.is_fast().then_some("⚡ Fast");
     let effort = effort_label(&pick.effort);
     door.into_iter()
@@ -97,6 +120,8 @@ struct Snap {
     list_open: bool,
     note: Option<String>,
     catalogue_note: Option<String>,
+    search: String,
+    list_start: usize,
 }
 
 impl Snap {
@@ -108,23 +133,33 @@ impl Snap {
             list_open: open && state.model_list_open,
             note: state.picker_note().map(str::to_string),
             catalogue_note: state.model_catalogue.note.clone(),
+            search: state.model_search.clone(),
+            list_start: state.model_list_start,
         }
     }
 }
 
-/// The picker on the Bot's card. Its own view, because the slider's state is an entity of its own
-/// that has to outlive every frame, and a drag of it is heard here.
+/// The picker on the Bot's card. Its own view, because the slider's state and the search box's
+/// are entities of their own that have to outlive every frame, and what is done to them is heard
+/// here.
 pub struct ModelPicker {
     state: Entity<AppState>,
     slider: Entity<SliderState>,
     /// The Bot and the effort the slider was last put at: it is moved when the Bot's effort
     /// changes (a pick saved, a refusal put back, another Bot opened), and never under a drag.
     slider_at: Option<(String, String)>,
+    /// The list's search box. What is typed in it is the state's (`AppState::model_search`), so
+    /// a person's typing and a driver's `set_value` filter the same list.
+    search: Entity<InputState>,
+    /// The search box took the caret when the list last opened, which it does once per opening.
+    search_focused: bool,
+    /// What the wheel has scrolled the list by and not yet moved it a whole model ([`wheel_rows`]).
+    scroll_rest: Rc<Cell<f32>>,
     snap: Snap,
 }
 
 impl ModelPicker {
-    pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
+    pub fn new(window: &mut Window, state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
         let last = (EFFORT_STOPS.len() - 1) as f32;
         let slider = cx.new(|_| {
             SliderState::new()
@@ -154,11 +189,25 @@ impl ModelPicker {
             }
         })
         .detach();
+        let search = cx.new(|cx| InputState::new(window, cx).placeholder(SEARCH_PLACEHOLDER));
+        // What is typed filters the list at once: the state keeps the copy, so the list, the
+        // wheel and a driver all read the same search.
+        cx.subscribe(&search, |this, input, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::Change) {
+                let query = input.read(cx).value().to_string();
+                this.state
+                    .update(cx, |state, cx| state.set_model_search(query, cx));
+            }
+        })
+        .detach();
         let snap = Snap::read(state.read(cx));
         Self {
             state,
             slider,
             slider_at: None,
+            search,
+            search_focused: false,
+            scroll_rest: Rc::new(Cell::new(0.)),
             snap,
         }
     }
@@ -174,6 +223,22 @@ impl ModelPicker {
             .update(cx, |slider, cx| slider.set_value(stop, window, cx));
         self.slider_at = Some(at);
     }
+
+    /// The search box follows the state, so a search a driver wrote shows in it and a list
+    /// opened afresh shows it empty; and it takes the caret as the list opens, so typing filters
+    /// at once. Only as it opens: a click elsewhere in the popover keeps the caret where it went.
+    fn sync_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let query = self.snap.search.clone();
+        if self.search.read(cx).value().as_ref() != query.as_str() {
+            self.search
+                .update(cx, |input, cx| input.set_value(query, window, cx));
+        }
+        let list_open = self.snap.list_open;
+        if list_open && !self.search_focused {
+            self.search.update(cx, |input, cx| input.focus(window, cx));
+        }
+        self.search_focused = list_open;
+    }
 }
 
 impl Render for ModelPicker {
@@ -182,6 +247,7 @@ impl Render for ModelPicker {
             return div().into_any_element();
         };
         self.sync_slider(&pick, window, cx);
+        self.sync_search(window, cx);
         let open = self.snap.open;
         let app = self.state.clone();
         let panel = Panel {
@@ -190,6 +256,10 @@ impl Render for ModelPicker {
             note: self.snap.note.clone(),
             catalogue_note: self.snap.catalogue_note.clone(),
             slider: self.slider.clone(),
+            search: self.search.clone(),
+            query: self.snap.search.clone(),
+            list_start: self.snap.list_start,
+            scroll_rest: self.scroll_rest.clone(),
         };
         let popover = Popover::new("agent-model-picker")
             .appearance(false)
@@ -290,6 +360,12 @@ struct Panel {
     note: Option<String>,
     catalogue_note: Option<String>,
     slider: Entity<SliderState>,
+    search: Entity<InputState>,
+    /// What is typed in the search box.
+    query: String,
+    /// The first model in the list's window, among those the search leaves.
+    list_start: usize,
+    scroll_rest: Rc<Cell<f32>>,
 }
 
 impl Panel {
@@ -474,11 +550,20 @@ impl Panel {
             })
     }
 
-    /// The models, grouped by door, under a heading that goes back to the controls.
+    /// The models, grouped by door, under a heading that goes back to the controls and a search
+    /// box that filters both groups at once. At most [`LIST_ROWS`] models are in view, each group's
+    /// heading over its first model in view and not counted among them; the wheel scrolls the
+    /// rest into view anywhere over the list.
     fn list(&self, app: &Entity<AppState>, theme: &Theme) -> impl IntoElement {
         let pick = &self.pick;
         let muted = theme.muted_foreground;
-        let empty = pick.groups.is_empty() && pick.account_plan.is_none();
+        let groups = pick.search(&self.query);
+        let plan = pick.plan_line(&self.query).cloned();
+        let total = row_count(&groups);
+        // A list with nothing in it is the server's to explain, whatever is typed; a search that
+        // leaves nothing of a list that has some is the search's.
+        let offers_nothing = pick.groups.is_empty() && pick.account_plan.is_none();
+        let no_match = !offers_nothing && total == 0 && plan.is_none();
         let back = {
             let app = app.clone();
             h_flex()
@@ -497,74 +582,113 @@ impl Panel {
                 )
                 .child(div().text_sm().child(MODELS_TITLE))
         };
-        v_flex().gap(px(8.)).child(back).child(
-            v_flex()
-                .id(LIST)
-                .max_h(px(320.))
-                .overflow_y_scroll()
-                .gap(px(10.))
-                .when_some(pick.account_plan.clone(), |this, plan| {
-                    this.child(account_plan(&plan, theme))
-                })
-                .children(
-                    pick.groups
-                        .iter()
-                        .map(|group| self.group(group, app, theme)),
-                )
-                .when(empty, |this| {
-                    this.child(
-                        div()
-                            .px(px(8.))
-                            .text_sm()
-                            .text_color(muted)
-                            .child(NO_MODELS),
-                    )
-                })
-                // Under the rows it is about, where a Server model to pick instead is in view.
-                .when_some(pick.routines.clone(), |this, line| {
-                    this.child(
-                        div()
-                            .id(ROUTINES)
-                            .px(px(8.))
-                            .text_xs()
-                            .text_color(muted)
-                            .child(line),
-                    )
-                })
-                .when_some(self.catalogue_note.clone(), |this, note| {
-                    this.child(
-                        div()
-                            .id(NOTE)
-                            .px(px(8.))
-                            .text_xs()
-                            .text_color(muted)
-                            .child(note),
-                    )
-                }),
-        )
+        let wheel = {
+            let app = app.clone();
+            let rest = self.scroll_rest.clone();
+            move |event: &ScrollWheelEvent, window: &mut Window, cx: &mut App| {
+                // The list scrolls, and nothing under the popover does.
+                cx.stop_propagation();
+                let dy = f32::from(event.delta.pixel_delta(window.line_height()).y);
+                let rows = wheel_rows(&rest, dy);
+                if rows != 0 {
+                    app.update(cx, |state, cx| state.scroll_model_list(rows, cx));
+                }
+            }
+        };
+        v_flex()
+            .gap(px(8.))
+            .child(back)
+            .child(
+                div()
+                    .id(SEARCH)
+                    .child(field_input(&self.search).cleanable(true)),
+            )
+            .child(
+                v_flex()
+                    .id(LIST)
+                    .gap(px(10.))
+                    .on_scroll_wheel(wheel)
+                    .when_some(plan, |this, plan| this.child(account_plan(&plan, theme)))
+                    .when(total > 0, |this| {
+                        this.child(self.window(&groups, total, app, theme))
+                    })
+                    .when(offers_nothing, |this| {
+                        this.child(
+                            div()
+                                .px(px(8.))
+                                .text_sm()
+                                .text_color(muted)
+                                .child(NO_MODELS),
+                        )
+                    })
+                    .when(no_match, |this| {
+                        this.child(
+                            div()
+                                .id(NO_MATCH)
+                                .px(px(8.))
+                                .text_sm()
+                                .text_color(muted)
+                                .child(NO_MODEL_MATCHES),
+                        )
+                    })
+                    // Under the rows it is about, where a Gateway model to pick instead is in
+                    // view.
+                    .when_some(pick.routines.clone(), |this, line| {
+                        this.child(
+                            div()
+                                .id(ROUTINES)
+                                .px(px(8.))
+                                .text_xs()
+                                .text_color(muted)
+                                .child(line),
+                        )
+                    })
+                    .when_some(self.catalogue_note.clone(), |this, note| {
+                        this.child(
+                            div()
+                                .id(NOTE)
+                                .px(px(8.))
+                                .text_xs()
+                                .text_color(muted)
+                                .child(note),
+                        )
+                    }),
+            )
     }
 
-    fn group(
+    /// The models in view ([`list_window`]), each group's heading over its first, and while the
+    /// list holds more than it shows, a thumb at the right edge saying where in it the window is.
+    fn window(
         &self,
-        group: &ChoiceGroup,
+        groups: &[crate::opengrok::ChoiceGroup],
+        total: usize,
         app: &Entity<AppState>,
         theme: &Theme,
     ) -> impl IntoElement {
+        let start = self.list_start.min(last_window_start(total));
+        let lines = list_window(groups, start);
         v_flex()
+            .relative()
             .gap(px(2.))
-            .child(
-                div()
-                    .px(px(8.))
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .child(group.title()),
-            )
-            .children(
-                group
-                    .rows
-                    .iter()
-                    .map(|row| self.row(row, app.clone(), theme)),
-            )
+            .children(lines.into_iter().enumerate().map(|(at, line)| match line {
+                // A heading under another group's rows stands off from them.
+                ListLine::Heading(source) => {
+                    group_heading(source, at > 0, theme).into_any_element()
+                }
+                ListLine::Row(row) => self.row(row, app.clone(), theme).into_any_element(),
+            }))
+            .when(total > LIST_ROWS, |this| {
+                this.child(
+                    div()
+                        .absolute()
+                        .right(px(0.))
+                        .top(relative(start as f32 / total as f32))
+                        .h(relative(LIST_ROWS as f32 / total as f32))
+                        .w(px(3.))
+                        .rounded_full()
+                        .bg(theme.muted_foreground.opacity(0.4)),
+                )
+            })
     }
 
     /// One model: a click puts the Bot on it, fast where ⚡ is on and it has a fast version.
@@ -574,9 +698,10 @@ impl Panel {
         let base_id = row.base_id.clone();
         h_flex()
             .id(SharedString::from(row_id(row.source, &row.base_id)))
+            .h(px(ROW_HEIGHT))
+            .flex_none()
             .gap(px(6.))
             .px(px(8.))
-            .py(px(5.))
             .rounded(px(6.))
             .items_center()
             .cursor_pointer()
@@ -612,6 +737,29 @@ impl Panel {
     }
 }
 
+/// A group's heading, over the first of its models in the window.
+fn group_heading(source: InferenceKind, stand_off: bool, theme: &Theme) -> impl IntoElement {
+    div()
+        .id(SharedString::from(group_id(source)))
+        .when(stand_off, |this| this.mt(px(8.)))
+        .px(px(8.))
+        .text_xs()
+        .text_color(theme.muted_foreground)
+        .child(group_title(source))
+}
+
+/// How many models the wheel moves the list's window: a model for every row's height scrolled,
+/// what is scrolled short of one kept in `rest` for the next event, so a trackpad's many small
+/// deltas move it as far as a wheel's few large ones. `dy` is toward the top above zero, as the
+/// event gives it, which is fewer models; scrolling the other way starts afresh.
+fn wheel_rows(rest: &Cell<f32>, dy: f32) -> isize {
+    let kept = rest.get();
+    let scrolled = if kept * dy < 0. { dy } else { kept + dy };
+    let rows = (scrolled / ROW_HEIGHT).trunc();
+    rest.set(scrolled - rows * ROW_HEIGHT);
+    -(rows as isize)
+}
+
 /// The plan's model on a server without per-Bot doors, while the account is on the person's
 /// plan: ticked, because it is what answers, and not a row to pick, because a Bot's pick of it
 /// would change nothing there.
@@ -628,7 +776,7 @@ fn account_plan(plan: &AccountPlan, theme: &Theme) -> impl IntoElement {
                 .px(px(8.))
                 .text_xs()
                 .text_color(muted)
-                .child(PLAN_GROUP),
+                .child(SUBSCRIPTION_GROUP),
         )
         .child(
             h_flex()
@@ -664,7 +812,7 @@ fn account_plan(plan: &AccountPlan, theme: &Theme) -> impl IntoElement {
 #[cfg(test)]
 mod tests {
     // Item by item rather than a glob: `use super::*` would drag in gpui_kit's own `test`.
-    use super::{card_detail, row_id};
+    use super::{card_detail, group_id, row_id, wheel_rows};
     use crate::opengrok::{InferenceKind, ModelCatalogue, bot_pick};
 
     fn pick(source: serde_json::Value, model: &str, effort: &str) -> crate::opengrok::ModelPick {
@@ -688,15 +836,32 @@ mod tests {
             row_id(InferenceKind::Gateway, "oag/cheap"),
             "agent-model-row-gateway-oag/cheap"
         );
+        assert_eq!(
+            InferenceKind::ALL.map(group_id),
+            ["agent-model-group-gateway", "agent-model-group-local_proxy"]
+        );
     }
 
-    /// The card's second line says the door, the effort and ⚡.
+    /// The wheel moves the window a model for every row's height scrolled: a trackpad's small
+    /// deltas add up, and a turn the other way starts afresh. Down the list is more.
+    #[test]
+    fn the_wheel_moves_the_window_a_model_for_every_rows_height() {
+        let rest = std::cell::Cell::new(0.);
+        assert_eq!(wheel_rows(&rest, -10.), 0);
+        assert_eq!(wheel_rows(&rest, -10.), 0);
+        assert_eq!(wheel_rows(&rest, -10.), 1, "a row's height gone by");
+        assert_eq!(wheel_rows(&rest, 30.), -1, "back up, starting afresh");
+        assert_eq!(wheel_rows(&rest, 2. * super::ROW_HEIGHT), -2);
+        assert_eq!(wheel_rows(&rest, 0.), 0);
+    }
+
+    /// The card's second line says the door, by its group's name in the list, the effort and ⚡.
     #[test]
     fn the_card_says_the_door_the_effort_and_fast() {
         let plan = pick(serde_json::json!("local_proxy"), "gpt-6-luna--fast", "max");
-        assert_eq!(card_detail(&plan), "Your plan · Ultra · ⚡ Fast");
+        assert_eq!(card_detail(&plan), "Subscription · Ultra · ⚡ Fast");
         let keys = pick(serde_json::json!("gateway"), "oag/cheap", "inherit");
-        assert_eq!(card_detail(&keys), "Server · Default");
+        assert_eq!(card_detail(&keys), "Gateway · Default");
         let follows = pick(serde_json::Value::Null, "oag/cheap", "low");
         assert_eq!(card_detail(&follows), "Light");
     }
