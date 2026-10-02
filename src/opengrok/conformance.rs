@@ -507,21 +507,7 @@ const WORDS_NOT_RECORDED_YET: &[(Slot, &str, &str)] = &[];
 /// Fixtures this app still reads wrongly, with the words their check fails with and why. The
 /// check has to fail with those words: one that passes means the drift is fixed and the entry
 /// goes, and one that fails some other way is a new problem, not this one.
-const KNOWN_DRIFT: &[(&str, &str, &str)] = &[
-    (
-        "agui/custom/run-awaiting-approval/a_delete_asks_first_naming_the_routine_as_stored.json",
-        "the card says \"delete_routine — a plugin tool",
-        "A Bot's delete of a routine always asks first (opengrok-server #316): the server's card \
-         sentence is its summary_for arm for the four routine tools (opengrok-tools cards.rs), \
-         and its why names the routine as stored. approval_summary has no such arm, so the card \
-         calls delete_routine a plugin tool, under a title about the Bot's computer.",
-    ),
-    (
-        "rest/GET__ag-ui_approvals/200-a_delete_asks_first_naming_the_routine_as_stored.json",
-        "the card says \"delete_routine — a plugin tool",
-        "The same card in the approvals queue, which reads it the same way.",
-    ),
-];
+const KNOWN_DRIFT: &[(&str, &str, &str)] = &[];
 
 /// How a 502, 503 or 504 the server wrote itself fails [`refusal`] when it is not in the shape
 /// that says so.

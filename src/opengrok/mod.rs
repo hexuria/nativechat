@@ -29,12 +29,13 @@ pub use credential::{
 #[cfg(test)]
 pub(crate) use gen_ui::capped;
 pub use gen_ui::{
-    ApprovalSpec, BarChartSpec, BarItem, ChatPart, ChoiceCard, CompletedUiTool, FormField,
-    FormSpec, FrameArrivals, LocalExecResolution, MAX_TURN_CONTINUES, ScreenshotSpec, StepSpec,
-    StepStatus, ThoughtSpec, TurnAssembler, UI_TOOL_RESULT, USER_MACHINE_SHELL, UiSpec, agui_tools,
-    approval_from_event, approval_summary, choice_index, choice_letter, collapse_open_approvals,
-    command_from_args, command_from_replay_events, keep_call_times, local_exec_outcome,
-    persons_messages, place_hitl_cards_in_document_order, policy_answer,
+    ApprovalSpec, BarChartSpec, BarItem, CREATE_ROUTINE, ChatPart, ChoiceCard, CompletedUiTool,
+    DELETE_ROUTINE, FormField, FormSpec, FrameArrivals, LIST_ROUTINES, LocalExecResolution,
+    MAX_TURN_CONTINUES, ScreenshotSpec, StepSpec, StepStatus, ThoughtSpec, TurnAssembler,
+    UI_TOOL_RESULT, UPDATE_ROUTINE, USER_MACHINE_SHELL, UiSpec, agui_tools, approval_from_event,
+    approval_summary, choice_index, choice_letter, collapse_open_approvals, command_from_args,
+    command_from_replay_events, keep_call_times, local_exec_outcome, persons_messages,
+    place_hitl_cards_in_document_order, policy_answer,
 };
 pub use inference::{
     DEFAULT_PROXY_URL, FallbackFor, HELD_FOR_RELAY_OFFLINE, INFERENCE_SOURCE_CUSTOM, InferenceKind,

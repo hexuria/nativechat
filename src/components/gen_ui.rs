@@ -1,8 +1,8 @@
 //! Native AG-UI widgets. Not markdown, not KaTeX.
 
 use crate::opengrok::{
-    ApprovalSpec, BarChartSpec, ChoiceCard, FormSpec, LocalExecResolution, ScreenshotSpec, UiSpec,
-    choice_letter,
+    ApprovalSpec, BarChartSpec, CREATE_ROUTINE, ChoiceCard, DELETE_ROUTINE, FormSpec,
+    LIST_ROUTINES, LocalExecResolution, ScreenshotSpec, UPDATE_ROUTINE, UiSpec, choice_letter,
 };
 use crate::state::{AppState, ApprovalDecision};
 use gpui_kit::component::tooltip::Tooltip;
@@ -372,6 +372,12 @@ pub fn render_approval(spec: &ApprovalSpec, app: Option<Entity<AppState>>, cx: &
 /// `card_lines`). The title used to be built from the tool's name, and read "Allow Hex to run
 /// computer on its computer?". A review card keeps its own title, and the local shell's card
 /// asks about this Mac's policy rather than one call, so neither changes.
+///
+/// The routine tools (opengrok-server #316) touch no computer, which the server's surface for
+/// them says nonetheless, so each asks about the person's routines. A delete always asks first,
+/// and its `why` is the server's own question naming the routine as it is stored ("Delete the
+/// routine "Weekly report"? It stops for good."): that question is the card's title
+/// ([`routine_question`]).
 pub(crate) fn approval_title(spec: &ApprovalSpec, bot: &str, review: bool) -> String {
     if review {
         return "Review an action".to_string();
@@ -379,10 +385,17 @@ pub(crate) fn approval_title(spec: &ApprovalSpec, bot: &str, review: bool) -> St
     if spec.runs_on_this_mac() {
         return format!("Allow {bot} to run this command on your local computer?");
     }
+    if let Some(question) = routine_question(spec) {
+        return question.to_string();
+    }
     match spec.tool.as_str() {
         "shell" => format!("Allow {bot} to run a command on its computer?"),
         "read_file" => format!("Allow {bot} to read a file on its computer?"),
         "write_file" => format!("Allow {bot} to write a file on its computer?"),
+        LIST_ROUTINES => format!("Allow {bot} to see your routines?"),
+        CREATE_ROUTINE => format!("Allow {bot} to make a routine?"),
+        UPDATE_ROUTINE => format!("Allow {bot} to change a routine?"),
+        DELETE_ROUTINE => format!("Allow {bot} to delete a routine?"),
         tool if tool.matches('.').count() >= 2 => {
             format!("Allow {bot} to use a connected service?")
         }
@@ -390,12 +403,25 @@ pub(crate) fn approval_title(spec: &ApprovalSpec, bot: &str, review: bool) -> St
     }
 }
 
+/// The server's question on a routine's delete card, which names the routine as it is stored
+/// (opengrok-server #316, PR #334 at 628dcff: `admit` in `crates/opengrok-tools/src/routine.rs`
+/// writes it as the card's `why`, live and in the approvals queue alike). `None` for any other
+/// card, and for a delete card that came without one.
+fn routine_question(spec: &ApprovalSpec) -> Option<&str> {
+    let why = spec.why.trim();
+    (spec.tool == DELETE_ROUTINE && !why.is_empty()).then_some(why)
+}
+
 /// The lines under the title, in the server's words. A card painted as a review card says why
 /// the call was stopped and then what it would do: the tunnel's reason is the same sentence
 /// for every call, and the summary is what tells a click from a page load. A consent card says
 /// only what the call would do, because a reason under a plain consent title would read as a
-/// review card's.
+/// review card's. A routine's delete card is its title alone: the server's question names the
+/// routine as stored, where its summary names it by id.
 fn card_lines(spec: &ApprovalSpec, review: bool) -> Vec<&str> {
+    if !review && routine_question(spec).is_some() {
+        return Vec::new();
+    }
     let why = if review { spec.why.trim() } else { "" };
     [why, spec.summary.as_str()]
         .into_iter()
@@ -856,6 +882,74 @@ mod tests {
             approval_title(&plugin, "Hex", false),
             "Allow Hex to use a connected service?"
         );
+    }
+
+    /// A routine's card asks about the person's routines, never about the Bot's computer, which
+    /// none of the four touches; and a delete, which always asks first, asks in the server's own
+    /// question, naming the routine as it is stored (opengrok-server #316, recorded at PR #334 as
+    /// `agui/custom/run-awaiting-approval/a_delete_asks_first_naming_the_routine_as_stored`).
+    /// That is its title, and nothing under it names the routine by its id; a delete card from
+    /// a frame without the question asks as the others do, and says what it would delete.
+    #[test]
+    fn a_routines_card_asks_about_routines_and_a_delete_in_the_servers_words() {
+        use crate::opengrok::{CREATE_ROUTINE, DELETE_ROUTINE, LIST_ROUTINES, UPDATE_ROUTINE};
+        let question = "Delete the routine \"Weekly report\"? It stops for good.";
+        let asked = |why: &str| {
+            card(
+                DELETE_ROUTINE,
+                json!({"routine": "sched_3", "name": "A harmless test"}),
+                "policy-approval",
+                why,
+            )
+        };
+        let delete = asked(question);
+        assert_eq!(approval_title(&delete, "Hex", false), question);
+        assert!(card_lines(&delete, false).is_empty(), "the title says it");
+        assert_eq!(arguments_box(&delete), None);
+        let unasked = asked("");
+        assert_eq!(
+            approval_title(&unasked, "Hex", false),
+            "Allow Hex to delete a routine?"
+        );
+        assert_eq!(
+            card_lines(&unasked, false),
+            vec!["Delete the routine sched_3"]
+        );
+
+        let make = card(
+            CREATE_ROUTINE,
+            json!({"prompt": "post the standup", "when": ["0 9 * * MON-FRI"]}),
+            "policy-approval",
+            "",
+        );
+        assert_eq!(
+            approval_title(&make, "Hex", false),
+            "Allow Hex to make a routine?"
+        );
+        assert_eq!(
+            card_lines(&make, false),
+            vec!["Make a routine that wakes at [\"0 9 * * MON-FRI\"]"]
+        );
+        let change = card(
+            UPDATE_ROUTINE,
+            json!({"routine": "sched_3", "name": "Standup"}),
+            "policy-approval",
+            "",
+        );
+        assert_eq!(
+            approval_title(&change, "Hex", false),
+            "Allow Hex to change a routine?"
+        );
+        assert_eq!(
+            card_lines(&change, false),
+            vec!["Change the routine sched_3"]
+        );
+        let list = card(LIST_ROUTINES, json!({}), "policy-approval", "");
+        assert_eq!(
+            approval_title(&list, "Hex", false),
+            "Allow Hex to see your routines?"
+        );
+        assert_eq!(card_lines(&list, false), vec!["List your routines"]);
     }
 
     /// A review card keeps its own title whatever the call is, and the local shell's card asks

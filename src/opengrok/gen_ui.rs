@@ -530,6 +530,15 @@ pub const USER_MACHINE_SHELL: &str = "user_machine_shell";
 /// and it is no row of the tool ceiling: `GET /coworkers/{id}/tools` lists it while it is offered.
 pub const USE_SKILL: &str = "use_skill";
 
+/// The four tools a Bot lists, makes, changes and deletes its person's routines with when they
+/// ask in chat (opengrok-server #316, PR #334 at 628dcff: `crates/opengrok-tools/src/routine.rs`).
+/// None of them touches a computer, and a delete always asks first, its card's `why` naming the
+/// routine as it is stored. The tool ceiling switches all four as one row, `routines`.
+pub const LIST_ROUTINES: &str = "list_routines";
+pub const CREATE_ROUTINE: &str = "create_routine";
+pub const UPDATE_ROUTINE: &str = "update_routine";
+pub const DELETE_ROUTINE: &str = "delete_routine";
+
 /// The CUSTOM `name` of a run parked on a card: a tool waiting on a yes, or a form waiting on the
 /// person (opengrok-harness `projection.rs` `awaiting_approval`).
 pub(crate) const RUN_AWAITING_APPROVAL: &str = "run-awaiting-approval";
@@ -2042,6 +2051,26 @@ pub fn approval_summary(tool: &str, arguments: &Value) -> String {
         USE_SKILL => format!(
             "Read the skill \"{}\"",
             clip(string_arg(arguments, "name").unwrap_or("(unnamed)"), 80)
+        ),
+        // The routine tools (#316, the same `summary_for` at PR #334, 628dcff): a routine by its
+        // id, never by a name the call wrote, since a delete's card names the routine as stored
+        // in its `why`; a create by its `when` as the call wrote it, as JSON.
+        LIST_ROUTINES => "List your routines".to_string(),
+        CREATE_ROUTINE => format!(
+            "Make a routine that wakes at {}",
+            clip(
+                &arguments.get("when").unwrap_or(&Value::Null).to_string(),
+                80
+            )
+        ),
+        UPDATE_ROUTINE | DELETE_ROUTINE => format!(
+            "{} the routine {}",
+            if tool == DELETE_ROUTINE {
+                "Delete"
+            } else {
+                "Change"
+            },
+            clip(string_arg(arguments, "routine").unwrap_or("(none)"), 80)
         ),
         other => format!(
             "{other} — a plugin tool this agent wants to call, with {}",
