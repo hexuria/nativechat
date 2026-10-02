@@ -9,7 +9,7 @@ use crate::components::chat_find::find_bar_element;
 use crate::components::chat_input::MessageInput;
 use crate::components::emoji_picker::{full_picker, reaction_strip};
 use crate::components::gen_ui::{render_approval, render_screenshots, render_ui_spec};
-use crate::components::message::{MessageBubble, TS_PEEK_MAX};
+use crate::components::message::{MessageBubble, TS_PEEK_MAX, TimestampPeek, turn_metadata};
 use crate::components::persona::PersonaMark;
 use crate::components::save_login::render_save_login;
 use crate::components::steps::{RunLayout, RunRow, render_run_row};
@@ -85,6 +85,7 @@ struct ChatFeedRev {
     steps: (usize, usize),
     expanded_steps: Vec<String>,
     show_turn_timing: bool,
+    action_times: Vec<Option<u64>>,
     /// Every row's, not the last one's: a resumed run finishes on a bubble that a later
     /// message may already sit below.
     clocks: Vec<(
@@ -292,7 +293,7 @@ impl ChatFeedRev {
                                     + step.result.as_ref().map_or(0, String::len),
                                 settled + usize::from(step.result.is_some()),
                             ),
-                            ChatPart::Reasoning(thought) => (held + thought.len(), settled),
+                            ChatPart::Reasoning(thought) => (held + thought.text.len(), settled),
                             _ => (held, settled),
                         },
                     )
@@ -304,6 +305,19 @@ impl ChatFeedRev {
                 keys
             },
             show_turn_timing: state.show_turn_timing,
+            action_times: conv
+                .map(|c| {
+                    c.messages
+                        .iter()
+                        .flat_map(|m| m.parts.iter())
+                        .filter_map(|part| match part {
+                            ChatPart::Step(step) => Some(step.took_ms),
+                            ChatPart::Reasoning(thought) => Some(thought.took_ms),
+                            _ => None,
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
             clocks: conv
                 .map(|c| {
                     c.messages
@@ -326,7 +340,8 @@ struct ChatRow {
     is_me: bool,
     timestamp: SharedString,
     duration: SharedString,
-    timing_debug: SharedString,
+    /// One total for the entire reply, beside the final row's timestamp.
+    turn_total: Option<SharedString>,
     is_native_speaking: bool,
     is_native_paused: bool,
     is_native_loading: bool,
@@ -359,8 +374,8 @@ struct ChatRow {
     screenshots: Vec<ScreenshotSpec>,
     user_form: Option<UserFormSpec>,
     save_login: Option<SaveLoginSpec>,
-    /// A step, a stretch of steps or a thought. Its `content` stays empty: none of it is words,
-    /// so find, copy and read aloud pass it by.
+    /// A step, a stretch of steps, or a thought. Its `content` stays
+    /// empty: none of it is words, so find, copy and read aloud pass it by.
     run: Option<RunRow>,
     /// The files one of the person's messages carried (#90), drawn as tiles under it.
     files: Vec<crate::opengrok::Attachment>,
@@ -378,7 +393,7 @@ impl ChatRow {
             is_me: false,
             timestamp: SharedString::from(""),
             duration: SharedString::from(""),
-            timing_debug: SharedString::from(""),
+            turn_total: None,
             is_native_speaking: false,
             is_native_paused: false,
             is_native_loading: false,
@@ -411,10 +426,12 @@ impl ChatRow {
     }
 
     /// Whether this is the same row, drawn the same way, as `other`: an opened step is a
-    /// different row from the shut one, because it is taller.
+    /// different row from the shut one, because it is taller. Adding or removing total-time
+    /// metadata needs a fresh render of its swipe rail.
     fn same_as(&self, other: &Self) -> bool {
         self.id == other.id
             && self.run.as_ref().map(RunRow::is_open) == other.run.as_ref().map(RunRow::is_open)
+            && self.turn_total.is_some() == other.turn_total.is_some()
     }
 }
 
@@ -513,24 +530,23 @@ fn splice_in_place(scroll: &mut TranscriptScroll, old: &[ChatRow], new: &[ChatRo
     }
 }
 
+/// Actions read as one compact sequence, not separate message bubbles. The scroller's
+/// default 32px message gap belongs only between ordinary transcript rows.
+fn transcript_row_gap(row: &ChatRow, next: Option<&ChatRow>) -> Pixels {
+    match next {
+        None => px(0.),
+        Some(next) if row.run.is_some() && next.run.is_some() => px(4.),
+        Some(next) if row.run.is_some() || next.run.is_some() => px(12.),
+        Some(_) => px(32.),
+    }
+}
+
 /// Whether a picture belongs to the strip the row before it already holds. Pictures are one
 /// set when they came from the same turn with nothing but pictures between them — that is
 /// what makes a strip, rather than a column of full-width screens nobody scrolls past.
 fn joins_previous_set(rows: &[ChatRow], message_id: &str) -> bool {
     rows.last()
         .is_some_and(|last| !last.screenshots.is_empty() && last.source_id == message_id)
-}
-
-/// Phase lines under an assistant bubble, when Settings → Show turn timing
-/// is on and the harness sent a CUSTOM `run-timing` frame.
-fn timing_debug(state: &AppState, msg: &crate::state::Message) -> String {
-    if msg.is_me || !state.show_turn_timing {
-        return String::new();
-    }
-    msg.run_timing
-        .as_ref()
-        .map(|timing| timing.debug_lines().join("\n"))
-        .unwrap_or_default()
 }
 
 /// The replies in the open thread that wear a badge, as the feed draws them, oldest first: the
@@ -604,7 +620,12 @@ fn snapshot_rows(state: &AppState) -> Arc<Vec<ChatRow>> {
         } else {
             vec![ChatPart::Text(msg.content.clone())]
         };
-        let runs = RunLayout::new(&msg.id, &display, &state.expanded_steps);
+        let runs = RunLayout::new(
+            &msg.id,
+            &display,
+            &state.expanded_steps,
+            state.show_turn_timing,
+        );
         let mut text_buf = String::new();
         let mut ui_n = 0usize;
         let mut text_n = 0usize;
@@ -640,7 +661,6 @@ fn snapshot_rows(state: &AppState) -> Arc<Vec<ChatRow>> {
                 is_me: msg.is_me,
                 timestamp: SharedString::from(msg.formatted_time()),
                 duration: SharedString::from(msg.formatted_duration().unwrap_or_default()),
-                timing_debug: SharedString::from(timing_debug(state, msg)),
                 queued: msg.is_me && state.is_send_queued(&msg.id),
                 is_native_speaking,
                 is_native_paused: state.native_tts.is_paused && is_native_speaking,
@@ -732,6 +752,21 @@ fn snapshot_rows(state: &AppState) -> Arc<Vec<ChatRow>> {
                 .find(|row| row.show_footer)
         {
             row.source_badge = Some(source.clone());
+        }
+        // Keep the total with the final row's metadata, whether it ends in words or a card.
+        // Never attach a wordless message's total to the preceding message.
+        if !msg.is_me
+            && state.show_turn_timing
+            && let Some(total) = msg
+                .run_timing
+                .as_ref()
+                .and_then(crate::opengrok::TurnTiming::total_line)
+            && let Some(last) = rows.last_mut().filter(|row| row.source_id == msg.id)
+        {
+            last.turn_total = Some(total.into());
+            last.timestamp = msg.formatted_time().into();
+            // The turn's measured total replaces the older wall-clock duration here.
+            last.duration = "".into();
         }
         // A person's files go on their message's last row of words, under the bubble. A message
         // of files alone gets a row of its own that is otherwise a message like any other: its
@@ -917,7 +952,9 @@ impl ChatTranscript {
             let change = RowsChange {
                 thread_opened,
                 steps_toggled: !thread_opened
-                    && this.feed_rev.expanded_steps != feed.expanded_steps,
+                    && (this.feed_rev.expanded_steps != feed.expanded_steps
+                        || this.feed_rev.clocks != feed.clocks
+                        || this.feed_rev.show_turn_timing != feed.show_turn_timing),
                 responding: feed.is_ai_responding,
             };
             let old = std::mem::replace(&mut this.rows, rows);
@@ -1555,7 +1592,7 @@ impl Render for ChatTranscript {
                                 .text_color(text_color)
                                 .timestamp(row.timestamp.to_string())
                                 .duration(row.duration.to_string())
-                                .timing_debug(row.timing_debug.to_string())
+                                .turn_total(row.turn_total.as_ref().map(ToString::to_string))
                                 .debug_mode(debug_mode)
                                 .can_read_aloud(can_read_aloud && show_footer)
                                 .is_native_speaking(row.is_native_speaking)
@@ -1605,23 +1642,34 @@ impl Render for ChatTranscript {
                             }
                             bubble.into_any_element()
                         };
+                        let row = &rows[ix];
+                        let body = row_body(ix, window, cx);
+                        let body = if !row.show_footer
+                            && let Some(total) = &row.turn_total
+                        {
+                            let peek = TimestampPeek::new(ts_peek, timestamps_ok);
+                            div()
+                                .relative()
+                                .w_full()
+                                .child(div().w_full().ml(px(-peek.shift)).child(body))
+                                .child(peek.rail(turn_metadata(&row.timestamp, total, cx)))
+                                .into_any_element()
+                        } else {
+                            body
+                        };
                         div()
                             .w_full()
                             .flex()
                             .justify_center()
                             .px_4()
+                            .pb(transcript_row_gap(&rows[ix], rows.get(ix + 1)))
                             // The transcript's own edges, carried by the rows that sit against
                             // them rather than by the list's padding (see `tail_room`).
                             .when(ix == 0, |this| this.pt(px(TRANSCRIPT_EDGE_GAP)))
                             .when_some(tail_room(ix, rows.len(), composer_height), |this, room| {
                                 this.pb(room)
                             })
-                            .child(
-                                div()
-                                    .w_full()
-                                    .max_w(px(CHAT_CONTENT_MAX))
-                                    .child(row_body(ix, window, cx)),
-                            )
+                            .child(div().w_full().max_w(px(CHAT_CONTENT_MAX)).child(body))
                     },
                 )
                 // Straight under the title bar, which holds the chat's header.
@@ -2199,9 +2247,9 @@ mod tests {
         ChatFeedRev, ChatRow, RowsChange, RunRow, ScreenshotSpec, TRANSCRIPT_EDGE_GAP, apply_rows,
         changed_rows, joins_previous_set, just_sent, snapshot_rows, tail_room, text_row_id,
     };
-    use crate::components::steps::step_key;
+    use crate::components::steps::{step_key, timing_key};
     use crate::components::transcript_scroll::TranscriptScroll;
-    use crate::opengrok::{ChatPart, StepSpec};
+    use crate::opengrok::{ChatPart, StepSpec, TurnTiming};
     use crate::state::AppState;
     use gpui_kit::{ListOffset, px};
 
@@ -2302,7 +2350,16 @@ mod tests {
             arguments: format!("{{\"command\":\"echo {call_id}\"}}"),
             result: result.map(|(content, _)| content.to_string()),
             ok: result.map(|(_, ok)| ok),
+            took_ms: None,
         })
+    }
+
+    /// A step that came back, timed by this app or not.
+    fn timed_step(call_id: &str, took_ms: Option<u64>) -> ChatPart {
+        let ChatPart::Step(step) = step(call_id, Some(("ok", true))) else {
+            unreachable!("a step");
+        };
+        ChatPart::Step(StepSpec { took_ms, ..step })
     }
 
     fn one_reply(parts: Vec<ChatPart>) -> AppState {
@@ -2347,18 +2404,32 @@ mod tests {
                     ..
                 }) => format!("{count} steps {} {}", status.mark(), open_word(*open)),
                 Some(RunRow::Step {
-                    step, open, group, ..
+                    step,
+                    open,
+                    group,
+                    took,
+                    ..
                 }) => format!(
-                    "{}step {} {}",
+                    "{}step {} {}{}",
                     if group.is_some() { "  " } else { "" },
                     step.call_id,
-                    open_word(*open)
+                    open_word(*open),
+                    took.as_ref()
+                        .map(|took| format!(" · {took}"))
+                        .unwrap_or_default()
                 ),
-                Some(RunRow::Thought { open, group, .. }) => format!(
-                    "{}thought {}",
+                Some(RunRow::Thought {
+                    open, group, took, ..
+                }) => format!(
+                    "{}thought {}{}",
                     if group.is_some() { "  " } else { "" },
-                    open_word(*open)
+                    open_word(*open),
+                    took.as_ref()
+                        .map(|took| format!(" · {took}"))
+                        .unwrap_or_default()
                 ),
+                #[cfg(feature = "agent")]
+                Some(RunRow::Timing { total, .. }) => format!("timing {total} shut"),
                 None => format!("words {}", row.content),
             })
             .collect()
@@ -2366,6 +2437,70 @@ mod tests {
 
     fn open_word(open: bool) -> &'static str {
         if open { "open" } else { "shut" }
+    }
+
+    #[test]
+    fn timing_keeps_each_action_visible_and_each_detail_collapsed() {
+        let mut state = one_reply(vec![
+            ChatPart::Reasoning(crate::opengrok::ThoughtSpec {
+                text: "Look first.".into(),
+                took_ms: Some(5000),
+            }),
+            timed_step("read-1", Some(2000)),
+            timed_step("read-2", Some(3000)),
+            timed_step("search", Some(8000)),
+            timed_step("write", Some(4000)),
+            timed_step("command", Some(8000)),
+            ChatPart::Text("Done.".into()),
+        ]);
+        state.show_turn_timing = true;
+        state.conversations[0].messages[0].run_timing = crate::opengrok::TurnTiming::from_value(
+            &serde_json::json!({"total_ms":30000,"model_ms":[5000],"tool_wait_ms":25000}),
+        );
+        assert_eq!(
+            feed(&state),
+            [
+                "thought shut · 5s",
+                "step read-1 shut · 2s",
+                "step read-2 shut · 3s",
+                "step search shut · 8s",
+                "step write shut · 4s",
+                "step command shut · 8s",
+                "words Done."
+            ]
+        );
+        let rows = snapshot_rows(&state);
+        let gaps: Vec<_> = rows
+            .iter()
+            .enumerate()
+            .map(|(ix, row)| super::transcript_row_gap(row, rows.get(ix + 1)))
+            .collect();
+        assert_eq!(
+            gaps,
+            [px(4.), px(4.), px(4.), px(4.), px(4.), px(12.), px(0.)]
+        );
+        assert_eq!(super::transcript_row_gap(&rows[6], Some(&rows[6])), px(32.));
+        let rev = ChatFeedRev::from_state(&state);
+        let ChatPart::Reasoning(thought) = &mut state.conversations[0].messages[0].parts[0] else {
+            panic!("thought");
+        };
+        thought.took_ms = Some(6000);
+        assert!(
+            rev != ChatFeedRev::from_state(&state),
+            "a timing-only update repaints"
+        );
+        state.mark_steps_open(&[step_key("m1", "command")], true);
+        assert_eq!(feed(&state)[5], "step command open · 8s");
+        assert_eq!(feed(&state).last().map(String::as_str), Some("words Done."));
+        let rows = snapshot_rows(&state);
+        assert_eq!(
+            rows.last().unwrap().turn_total.as_deref(),
+            Some("30s total")
+        );
+        assert_eq!(
+            rows.iter().filter(|row| row.turn_total.is_some()).count(),
+            1
+        );
     }
 
     /// Steps with no words between them are one "N steps" row until it is opened, a thought
@@ -2446,6 +2581,125 @@ mod tests {
         );
         let rows = snapshot_rows(&state);
         assert!(rows.last().is_some_and(|row| row.status_failed));
+    }
+
+    /// With Settings → Show turn timing on, each call this app timed says how long its answer
+    /// took at the end of its own row, and a call it could not time says nothing rather than a
+    /// guess. With the setting off, no row says it.
+    #[test]
+    fn each_call_s_time_is_at_the_end_of_its_own_row() {
+        let mut state = one_reply(vec![
+            ChatPart::Text("Let me look.".into()),
+            timed_step("c1", Some(1000)),
+            ChatPart::Text("Now the other one.".into()),
+            timed_step("c2", None),
+            ChatPart::Text("Done.".into()),
+        ]);
+        assert_eq!(
+            feed(&state),
+            vec![
+                "words Let me look.",
+                "step c1 shut",
+                "words Now the other one.",
+                "step c2 shut",
+                "words Done.",
+            ],
+            "the setting is off"
+        );
+        state.show_turn_timing = true;
+        assert_eq!(
+            feed(&state),
+            vec![
+                "words Let me look.",
+                "step c1 shut · 1s",
+                "words Now the other one.",
+                "step c2 shut",
+                "words Done.",
+            ]
+        );
+        // Open, it still says it: the time is on the line, not in what opening shows.
+        state.mark_steps_open(&[step_key("m1", "c1")], true);
+        assert_eq!(feed(&state)[1], "step c1 open · 1s");
+    }
+
+    /// A total belongs to the final reply row's metadata, not a separate transcript row,
+    /// even when the reply ends with a tool rather than words.
+    #[test]
+    fn a_reply_s_total_is_metadata_on_its_last_row() {
+        let mut state = one_reply(vec![
+            ChatPart::Text("Let me look.".into()),
+            timed_step("c1", Some(1000)),
+            ChatPart::Text("Done.".into()),
+            timed_step("c2", None),
+        ]);
+        state.conversations[0].messages[0].run_timing =
+            TurnTiming::from_value(&serde_json::json!({
+                "model_ms": [2000, 2000],
+                "tools": [{ "name": "shell", "ms": 1000 }],
+                "tool_wait_ms": 1000,
+                "auto_review_ms": 0,
+                "total_ms": 10000,
+                "tool_rounds": 1
+            }));
+        assert!(
+            !feed(&state).iter().any(|row| row.starts_with("timing")),
+            "the setting is off"
+        );
+
+        state.show_turn_timing = true;
+        let shut = snapshot_rows(&state);
+        assert_eq!(
+            shut.last().unwrap().turn_total.as_deref(),
+            Some("10s total")
+        );
+        assert_eq!(
+            shut.last().unwrap().timestamp,
+            state.conversations[0].messages[0].formatted_time()
+        );
+        assert!(shut.last().unwrap().duration.is_empty());
+        assert!(
+            shut[..shut.len() - 1]
+                .iter()
+                .all(|row| row.turn_total.is_none())
+        );
+        assert_eq!(
+            feed(&state),
+            vec![
+                "words Let me look.",
+                "step c1 shut · 1s",
+                "words Done.",
+                "step c2 shut",
+            ]
+        );
+
+        state.mark_steps_open(&[timing_key("m1")], true);
+        assert_eq!(
+            feed(&state).last().map(String::as_str),
+            Some("step c2 shut")
+        );
+        let open = snapshot_rows(&state);
+        assert_eq!(changed_rows(&shut, &open), (4..4, 0));
+        state.show_turn_timing = false;
+        assert!(
+            snapshot_rows(&state)
+                .iter()
+                .all(|row| row.turn_total.is_none())
+        );
+    }
+
+    #[test]
+    fn a_total_arriving_after_the_reply_remeasures_its_metadata_row() {
+        let mut state = one_reply(vec![ChatPart::Text("Done.".into())]);
+        state.show_turn_timing = true;
+        let before = snapshot_rows(&state);
+        state.conversations[0].messages[0].run_timing =
+            TurnTiming::from_value(&serde_json::json!({"total_ms":30000}));
+        let after = snapshot_rows(&state);
+        assert_eq!(after.len(), before.len(), "no separate total row");
+        assert_eq!(changed_rows(&before, &after), (0..1, 1));
+        assert_eq!(after[0].turn_total.as_deref(), Some("30s total"));
+        state.show_turn_timing = false;
+        assert_eq!(changed_rows(&after, &snapshot_rows(&state)), (0..1, 1));
     }
 
     /// Opening a row in the middle of the thread replaces only the rows that changed, so the

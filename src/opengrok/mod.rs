@@ -24,14 +24,15 @@ pub use credential::{
     CREDENTIAL_OFFER_SAVE, SaveLoginSpec, keep_local_save_offer, save_login_card_id,
     save_login_from_local, save_login_save_id, save_login_skip_id,
 };
+#[cfg(test)]
 pub(crate) use gen_ui::capped;
 pub use gen_ui::{
     ApprovalSpec, BarChartSpec, BarItem, ChatPart, ChoiceCard, CompletedUiTool, FormField,
-    FormSpec, LocalExecResolution, MAX_TURN_CONTINUES, ScreenshotSpec, StepSpec, StepStatus,
-    TurnAssembler, UI_TOOL_RESULT, USER_MACHINE_SHELL, UiSpec, agui_tools, approval_from_event,
-    approval_summary, choice_index, choice_letter, collapse_open_approvals, command_from_args,
-    command_from_replay_events, local_exec_outcome, persons_messages,
-    place_hitl_cards_in_document_order, policy_answer,
+    FormSpec, FrameArrivals, LocalExecResolution, MAX_TURN_CONTINUES, ScreenshotSpec, StepSpec,
+    StepStatus, ThoughtSpec, TurnAssembler, UI_TOOL_RESULT, USER_MACHINE_SHELL, UiSpec, agui_tools,
+    approval_from_event, approval_summary, choice_index, choice_letter, collapse_open_approvals,
+    command_from_args, command_from_replay_events, keep_call_times, local_exec_outcome,
+    persons_messages, place_hitl_cards_in_document_order, policy_answer,
 };
 pub use inference::{
     DEFAULT_PROXY_URL, INFERENCE_SOURCE_CUSTOM, InferenceKind, InferenceSource,

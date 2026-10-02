@@ -1309,6 +1309,7 @@ fn tool_call_start(frame: &Value) -> Check {
             arguments: String::new(),
             result: None,
             ok: None,
+            took_ms: None,
         })],
         Drawn::Widget | Drawn::UserForm => Vec::new(),
     };
@@ -1617,7 +1618,7 @@ fn reasoning(corpus: &Corpus, frame: &Value) -> Check {
     );
     let (plain, parts) = assembled(&message).snapshot();
     must!(
-        parts == vec![ChatPart::Reasoning(said.trim().to_string())],
+        parts == vec![ChatPart::Reasoning(said.trim().into())],
         "the reasoning should be one thought reading {said:?}, got {parts:?}"
     );
     must!(

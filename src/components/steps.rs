@@ -1,11 +1,14 @@
 //! What the coworker did and thought on the way to a reply, drawn between its words: a row per
-//! tool call it made, one "N steps" row for a stretch of them, and a "Thought" row for its
-//! reasoning. Every one of them is shut until it is opened, the way Grok Bot's tool-result card
-//! is a `<details>` that starts closed: a computer run of two hundred calls is one line of the
-//! reply until somebody wants to know what those calls were.
+//! tool call it made, one "N steps" row for a stretch of them while timing is off, and a
+//! "Thinking" row for its reasoning. Every detail starts closed: a computer run of two hundred
+//! calls is one line until somebody wants to know what those calls were. While Settings → Show turn timing
+//! is on, every action stays visible with its own observed duration. The total belongs to the
+//! final reply's swipe-revealed timestamp metadata.
 
 use std::collections::HashSet;
 
+#[cfg(feature = "agent")]
+use crate::opengrok::TurnTiming;
 use crate::opengrok::{ChatPart, StepSpec, StepStatus};
 use crate::state::AppState;
 use gpui_kit::component::{ActiveTheme, Icon, IconName, h_flex, v_flex};
@@ -27,6 +30,25 @@ pub(crate) fn thought_key(message_id: &str, n: usize) -> String {
 /// The key of a reply's `n`th stretch of steps (see [`step_runs`]).
 fn steps_key(message_id: &str, n: usize) -> String {
     format!("{message_id}/steps/{n}")
+}
+
+/// The stable key of a reply's total-time metadata.
+#[cfg(any(feature = "agent", test))]
+pub(crate) fn timing_key(message_id: &str) -> String {
+    format!("{message_id}/timing")
+}
+
+/// The agent's non-interactive total-time metadata. It is not a separate transcript row.
+/// Old expansion keys are deliberately ignored.
+#[cfg(feature = "agent")]
+pub(crate) fn timing_row(
+    message_id: &str,
+    timing: &TurnTiming,
+    _open: &HashSet<String>,
+) -> Option<RunRow> {
+    let total = timing.total_line()?;
+    let key = timing_key(message_id);
+    Some(RunRow::Timing { key, total })
 }
 
 /// A stretch of a reply with no words in it: the steps the coworker took there, and what it
@@ -84,12 +106,23 @@ pub(crate) enum RunRow {
         open: bool,
         /// The key of the open "N steps" it is drawn inside, when it is inside one.
         group: Option<String>,
+        /// How long the call took, at the end of its line ([`StepSpec::took`]): only while
+        /// Settings → Show turn timing is on, and only for a call this app timed.
+        took: Option<String>,
     },
     Thought {
         key: String,
         text: String,
         open: bool,
         group: Option<String>,
+        took: Option<String>,
+    },
+    /// Agent representation of the final reply's total-time metadata (see [`timing_row`]).
+    #[cfg(feature = "agent")]
+    Timing {
+        key: String,
+        /// `10s total`. Model/tool aggregate phases are not another disclosure.
+        total: String,
     },
 }
 
@@ -97,6 +130,8 @@ impl RunRow {
     pub(crate) fn key(&self) -> &str {
         match self {
             Self::Steps { key, .. } | Self::Step { key, .. } | Self::Thought { key, .. } => key,
+            #[cfg(feature = "agent")]
+            Self::Timing { key, .. } => key,
         }
     }
 
@@ -105,6 +140,8 @@ impl RunRow {
             Self::Steps { open, .. } | Self::Step { open, .. } | Self::Thought { open, .. } => {
                 *open
             }
+            #[cfg(feature = "agent")]
+            Self::Timing { .. } => false,
         }
     }
 }
@@ -132,18 +169,26 @@ pub(crate) struct RunLayout {
     runs: Vec<RunPlan>,
     /// The rows of this reply that are open.
     open: HashSet<String>,
+    /// Settings → Show turn timing: each step's line ends with how long it took.
+    timing: bool,
 }
 
 impl RunLayout {
     /// `parts` are the ones the feed draws for the reply, in its order; `open` is
-    /// [`AppState::expanded_steps`].
-    pub(crate) fn new(message_id: &str, parts: &[ChatPart], open: &HashSet<String>) -> Self {
+    /// [`AppState::expanded_steps`], and `timing` is [`AppState::show_turn_timing`].
+    pub(crate) fn new(
+        message_id: &str,
+        parts: &[ChatPart],
+        open: &HashSet<String>,
+        timing: bool,
+    ) -> Self {
         let mut layout = Self {
             message_id: message_id.to_string(),
             run_of: Vec::new(),
             thought_of: Vec::new(),
             runs: Vec::new(),
             open: HashSet::new(),
+            timing,
         };
         let stretches = step_runs(parts);
         if stretches.is_empty() {
@@ -221,7 +266,9 @@ impl RunLayout {
             return Vec::new();
         };
         let (n, run) = run;
-        let grouped = run.steps >= 2;
+        // With timing visible, hiding the action rows would hide the very breakdown the
+        // person asked to read. Their contents still start collapsed.
+        let grouped = run.steps >= 2 && !self.timing;
         let mut rows = Vec::new();
         if grouped && run.first == at {
             rows.push(RunRow::Steps {
@@ -242,16 +289,18 @@ impl RunLayout {
                 rows.push(RunRow::Step {
                     open: self.open.contains(&key),
                     key,
+                    took: self.timing.then(|| step.took()).flatten(),
                     step,
                     group,
                 });
             }
-            ChatPart::Reasoning(text) => {
+            ChatPart::Reasoning(thought) => {
                 let key = thought_key(&self.message_id, self.thought_of[at]);
                 rows.push(RunRow::Thought {
                     open: self.open.contains(&key),
                     key,
-                    text,
+                    text: thought.text.clone(),
+                    took: self.timing.then(|| thought.took()).flatten(),
                     group,
                 });
             }
@@ -261,13 +310,15 @@ impl RunLayout {
     }
 }
 
-/// How far rows inside an open "N steps" stand in under its line.
-const NESTED_INDENT: f32 = 20.0;
-/// Where an opened row's detail starts: under its label, past the chevron and the mark.
-const DETAIL_INDENT: f32 = 34.0;
 /// How wide an opened row's detail gets. The column is as wide as it is for words, and a
 /// shell's output read at that width is lines of two hundred characters.
 const DETAIL_MAX: f32 = 640.0;
+
+/// Disclosure contents share the transcript's left edge, not the label's inset.
+/// Group membership affects toggling only; it must not add a nested visual gutter.
+fn flat_column(gap: f32) -> Div {
+    v_flex().w_full().items_start().gap(px(gap))
+}
 
 /// One row of what the coworker did or thought, and what a click on it opens or shuts.
 pub(crate) fn render_run_row(row: &RunRow, app: Entity<AppState>, cx: &App) -> AnyElement {
@@ -302,6 +353,7 @@ pub(crate) fn render_run_row(row: &RunRow, app: Entity<AppState>, cx: &App) -> A
             step,
             open,
             group,
+            took,
         } => {
             let head = heading(
                 key,
@@ -311,67 +363,73 @@ pub(crate) fn render_run_row(row: &RunRow, app: Entity<AppState>, cx: &App) -> A
                 Toggle::row(key, *open, group),
                 app,
                 cx,
-            );
+            )
+            // On the line itself, open or shut, so a stretch of rows can be read down the side
+            // for where the time went without opening any of them.
+            .when_some(took.clone(), |this, took| {
+                this.child(
+                    div()
+                        .text_color(theme.muted_foreground.opacity(0.7))
+                        .child(format!("· {took}")),
+                )
+            });
             if !*open {
                 return head.into_any_element();
             }
-            let nested = group.is_some();
-            let mut detail = v_flex()
-                .gap(px(6.))
-                .pl(px(indent(nested) + DETAIL_INDENT))
-                .w_full()
-                .max_w(px(DETAIL_MAX + indent(nested) + DETAIL_INDENT));
+            let mut detail = flat_column(6.).max_w(px(DETAIL_MAX));
             if let Some(arguments) = step.shown_arguments() {
                 detail = detail.child(mono_block(arguments, cx));
             }
             if let Some(result) = &step.result {
                 detail = detail.child(mono_block(result.clone(), cx));
             }
-            v_flex()
-                .w_full()
-                .gap(px(4.))
-                .child(head)
-                .child(detail)
-                .into_any_element()
+            flat_column(4.).child(head).child(detail).into_any_element()
         }
         RunRow::Thought {
             key,
             text,
             open,
             group,
+            took,
         } => {
             let head = heading(
                 key,
                 *open,
                 None,
-                "Thought".to_string(),
+                "Thinking".to_string(),
                 Toggle::row(key, *open, group),
                 app,
                 cx,
-            );
+            )
+            .when_some(took.clone(), |this, took| {
+                this.child(
+                    div()
+                        .text_color(theme.muted_foreground.opacity(0.7))
+                        .child(format!("· {took}")),
+                )
+            });
             if !*open {
                 return head.into_any_element();
             }
-            let nested = group.is_some();
-            v_flex()
-                .w_full()
-                .gap(px(4.))
+            flat_column(4.)
                 .child(head)
                 .child(
                     div()
-                        .pl(px(indent(nested) + DETAIL_INDENT))
-                        .max_w(px(DETAIL_MAX + indent(nested) + DETAIL_INDENT))
+                        .max_w(px(DETAIL_MAX))
                         .text_sm()
                         .text_color(theme.muted_foreground)
                         .child(text.clone()),
                 )
                 .into_any_element()
         }
+        #[cfg(feature = "agent")]
+        RunRow::Timing { total, .. } => div()
+            .py(px(3.))
+            .text_xs()
+            .text_color(theme.muted_foreground)
+            .child(total.clone())
+            .into_any_element(),
     }
-}
-
-fn indent(nested: bool) -> f32 {
-    if nested { NESTED_INDENT } else { 0.0 }
 }
 
 /// What a click on a row's line does: sets `keys` open or shut and, for a row inside an open
@@ -407,18 +465,20 @@ fn heading(
 ) -> Stateful<Div> {
     let theme = cx.theme();
     let muted = theme.muted_foreground;
+    let hover_group = SharedString::from(format!("{key}/hover"));
     h_flex()
         .id(ElementId::Name(format!("{key}/heading").into()))
-        .ml(px(indent(toggle.group.is_some())))
+        .group(hover_group.clone())
+        // A disclosure is a text control, not a full-width button. Its hit target follows
+        // its content even when the surrounding reply column stretches.
+        .flex_none()
+        .self_start()
         .gap(px(6.))
-        .px(px(6.))
         .py(px(3.))
-        .rounded(px(6.))
         .items_center()
         .text_sm()
         .text_color(muted)
         .cursor_pointer()
-        .hover(|style| style.bg(theme.secondary))
         .on_mouse_down(MouseButton::Left, move |_, _, cx| {
             app.update(cx, |state, cx| {
                 if let Some(group) = &toggle.group {
@@ -447,7 +507,15 @@ fn heading(
                     .child(status.mark()),
             )
         })
-        .child(label)
+        .child(
+            div()
+                // Keep the label's hover state through layout so its text colour, not just
+                // paint-only styles, updates when entering the disclosure's hit target.
+                .id(SharedString::from(format!("{key}/label")))
+                .text_color(muted)
+                .group_hover(hover_group, |style| style.text_color(theme.foreground))
+                .child(label),
+        )
 }
 
 /// A step's arguments or its result, exactly as they are kept, in the font code is read in.
@@ -463,4 +531,24 @@ fn mono_block(text: String, cx: &App) -> Div {
         .font_family(theme.mono_font_family.clone())
         .text_color(theme.secondary_foreground)
         .child(text)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::flat_column;
+    use gpui_kit::{AlignItems, Styled, px};
+
+    #[test]
+    fn expanded_disclosures_do_not_indent_their_contents() {
+        // Both the header/content stack and the arguments/result stack use this
+        // production builder. Keep the outer gutter at zero; mono blocks still
+        // retain their own internal padding for readable command text.
+        for gap in [4., 6.] {
+            let mut column = flat_column(gap);
+            let style = column.style();
+            assert_eq!(style.padding.left.unwrap_or_default(), px(0.).into());
+            assert_eq!(style.margin.left.unwrap_or_default(), px(0.).into());
+            assert_eq!(style.align_items, Some(AlignItems::FlexStart));
+        }
+    }
 }
