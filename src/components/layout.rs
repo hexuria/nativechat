@@ -15,7 +15,7 @@ use gpui_kit::component::{ActiveTheme, Disableable, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 
-use crate::chrome::{INFO_PANE_WIDTH, chrome_floats, sidebar_width};
+use crate::chrome::{INFO_PANE_WIDTH, TITLE_BAR_H, chrome_floats, sidebar_width};
 use crate::state::AppState;
 
 fn cached_fill<V: Render>(view: Entity<V>) -> impl IntoElement {
@@ -450,6 +450,19 @@ impl Render for Layout {
                         }),
                 )
             })
+            // Paint chat chrome after the panes, but before scrims/dialogs. It takes no
+            // transcript height; the side columns and their dividers reach the window top.
+            .when(!recipes_page, |this| {
+                this.child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .right_0()
+                        .h(px(TITLE_BAR_H))
+                        .child(self.title_bar.clone()),
+                )
+            })
             .when(command_palette_open, |this| {
                 this.child(self.command_palette.clone())
             })
@@ -490,7 +503,7 @@ impl Render for Layout {
         v_flex()
             .size_full()
             .relative()
-            .child(self.title_bar.clone())
+            .when(recipes_page, |this| this.child(self.title_bar.clone()))
             .child(row)
             .when(app_settings_open, |this| {
                 this.child(app_settings_overlay(

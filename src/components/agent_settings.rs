@@ -418,9 +418,8 @@ fn notify_switch(on: bool) -> Div {
         )
 }
 
-/// The pane's header: "Settings", and the chevron that closes the pane. In the title bar
-/// over the pane while the pane is docked (then the title is a handle to drag the window
-/// by), in the pane itself while it floats over the chat.
+/// Chat has a single window-level pane toggle. Other pages retain a close control
+/// in their own header, where the settings title is also a window-drag handle.
 pub fn settings_header(app: Entity<AppState>, drag: bool) -> impl IntoElement {
     div()
         .id("agent-settings-header")
@@ -444,27 +443,25 @@ pub fn settings_header(app: Entity<AppState>, drag: bool) -> impl IntoElement {
                     this.on_mouse_down(MouseButton::Left, |_, window, _| window.start_window_move())
                 }),
         )
-        .child(
-            div()
-                .id("header-settings")
-                .size(px(28.))
-                .rounded(px(8.))
-                .flex()
-                .items_center()
-                .justify_center()
-                .cursor_pointer()
-                .hover(|s| s.bg(rgb(0x777777).opacity(0.2)))
-                .on_mouse_down(MouseButton::Left, move |_, _, cx| {
-                    app.update(cx, |state, cx| {
-                        state.close_right_pane(cx);
-                    });
-                })
-                .child(
-                    Icon::default()
-                        .path("icons/chevrons-right.svg")
-                        .size(px(16.)),
-                ),
-        )
+        .when(drag, |this| {
+            this.child(
+                div()
+                    .id("header-settings")
+                    .occlude()
+                    .size(px(28.))
+                    .rounded(px(8.))
+                    .cursor_pointer()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .hover(|s| s.bg(rgb(0x777777).opacity(0.2)))
+                    .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                        cx.stop_propagation();
+                        app.update(cx, |state, cx| state.close_right_pane(cx));
+                    })
+                    .child(Icon::default().path("icons/panel-right.svg").size(px(16.))),
+            )
+        })
 }
 
 impl Render for AgentSettings {
@@ -569,9 +566,7 @@ impl Render for AgentSettings {
                 crate::components::connections::agent_card(app.clone(), &coworker_id, cx)
                     .into_any_element()
             });
-        // Floating over the chat (a narrow window), the pane carries its own header; docked,
-        // the title bar shows it over the pane.
-        let floats = chrome_floats(f32::from(window.viewport_size().width));
+        let chat_page = self.state.read(cx).page == crate::state::MainPage::Chat;
 
         v_flex()
             .id("agent-settings")
@@ -591,7 +586,13 @@ impl Render for AgentSettings {
                     });
                 }
             })
-            .when(floats, |this| this.child(settings_header(app.clone(), false)))
+            .when(chat_page, |this| {
+                this.child(div().h(px(TITLE_BAR_H)).flex_shrink_0())
+                    .child(settings_header(app.clone(), false))
+            })
+            .when(!chat_page && chrome_floats(f32::from(window.viewport_size().width)), |this| {
+                this.child(settings_header(app.clone(), true))
+            })
             .child(
                 div()
                     .id("avatar-trigger-row")

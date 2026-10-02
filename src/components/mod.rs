@@ -34,6 +34,7 @@ pub mod sidebar_chat_item;
 pub mod skills;
 pub mod steps;
 pub mod title_bar;
+mod transcript_chrome;
 pub mod user_form;
 pub mod voice_mode_modal;
 pub mod voice_wave;

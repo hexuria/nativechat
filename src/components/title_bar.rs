@@ -1,7 +1,5 @@
-//! The window's title bar. The system one is transparent (see main.rs) and this row is
-//! painted in its place: the traffic lights' corner, then, as in Grok Bot, the chat's header
-//! over the chat column and the right pane's header over its column, each as wide as the
-//! column below it. Whatever in it is not a control drags the window.
+//! Floating chat chrome. The transcript continues behind the theme-coloured fade;
+//! only the pill and icon buttons have a surface. Other pages retain their own header.
 
 use crate::chrome::{
     HEADER_PX, INFO_PANE_WIDTH, TITLE_BAR_H, TITLE_BAR_LEFT_PAD, chrome_floats, sidebar_width,
@@ -53,6 +51,10 @@ impl TitleBar {
 
 impl Render for TitleBar {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let state = self.state.read(cx);
+        if state.is_signed_in() && state.page == MainPage::Chat && !state.is_app_settings_open {
+            return self.floating_header(window, cx);
+        }
         let theme = cx.theme().clone();
         let floats = chrome_floats(f32::from(window.viewport_size().width));
         let state = self.state.read(cx);
@@ -281,5 +283,285 @@ impl Render for TitleBar {
                         .child(header),
                 )
             })
+            .into_any_element()
+    }
+}
+
+impl TitleBar {
+    fn floating_header(&self, window: &mut Window, cx: &App) -> AnyElement {
+        let theme = cx.theme();
+        let state = self.state.read(cx);
+        let width = f32::from(window.viewport_size().width);
+        let left = sidebar_width(
+            state.sidebar_hidden,
+            state.sidebar_collapsed,
+            state.sidebar_expanded_width,
+        );
+        let (chat_left, chat_right, pill_width) =
+            floating_header_span(width, left, state.right_pane != RightPane::Closed);
+        let bot = state
+            .active_coworker_id
+            .as_ref()
+            .and_then(|id| state.coworkers.iter().find(|bot| &bot.id == id));
+        let app = self.state.clone();
+        let find_bar = self.chat.read(cx).find_bar(self.chat.clone(), cx);
+
+        div()
+            .id("main-window-header")
+            .w_full()
+            .h(px(TITLE_BAR_H))
+            .relative()
+            .text_color(theme.foreground)
+            .child(
+                window_drag(div())
+                    .absolute()
+                    .left(px(chat_left))
+                    .right(px(chat_right))
+                    .top_0()
+                    .h(px(TITLE_BAR_H + 16.))
+                    .occlude()
+                    .bg(linear_gradient(
+                        180.,
+                        linear_color_stop(theme.background.opacity(0.92), 0.),
+                        linear_color_stop(theme.background.opacity(0.), 1.),
+                    )),
+            )
+            .child(
+                div()
+                    .id("chat-header")
+                    .absolute()
+                    .left(px(chat_left))
+                    .right(px(chat_right))
+                    .top_0()
+                    .h(px(TITLE_BAR_H))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        div()
+                            .id("header-coworker")
+                            .occlude()
+                            .max_w(px(pill_width))
+                            .min_w_0()
+                            .h(px(36.))
+                            .px(px(12.))
+                            .rounded_full()
+                            .bg(theme.secondary.opacity(0.94))
+                            .border_1()
+                            .border_color(theme.border.opacity(0.5))
+                            .flex()
+                            .items_center()
+                            .gap(px(8.))
+                            .when_some(bot, |this, bot| {
+                                let name = if bot.name.trim().is_empty() {
+                                    "Bot"
+                                } else {
+                                    bot.name.trim()
+                                };
+                                this.cursor_pointer()
+                                    .hover(|s| s.bg(theme.secondary))
+                                    .on_mouse_down(MouseButton::Left, {
+                                        let app = app.clone();
+                                        move |_, _, cx| {
+                                            cx.stop_propagation();
+                                            app.update(cx, |state, cx| {
+                                                state.toggle_agent_settings(cx)
+                                            });
+                                        }
+                                    })
+                                    .child(
+                                        div().flex_shrink_0().child(
+                                            PersonaMark::new(bot.id.clone())
+                                                .shape(bot.avatar_shape.clone())
+                                                .color(bot.avatar_color.clone())
+                                                .size(px(24.))
+                                                .dark(theme.is_dark()),
+                                        ),
+                                    )
+                                    .child(
+                                        div()
+                                            .min_w_0()
+                                            .truncate()
+                                            .text_sm()
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .child(name.to_owned()),
+                                    )
+                            })
+                            .when(bot.is_none(), |this| this.child("Bots")),
+                    ),
+            )
+            .child(
+                header_icon(
+                    "header-left-sidebar",
+                    "icons/panel-left.svg",
+                    !state.sidebar_hidden,
+                )
+                .absolute()
+                .left(px(TITLE_BAR_LEFT_PAD))
+                .top(px(12.))
+                .on_mouse_down(MouseButton::Left, {
+                    let app = app.clone();
+                    move |_, _, cx| {
+                        cx.stop_propagation();
+                        app.update(cx, |state, cx| state.toggle_sidebar(cx));
+                    }
+                }),
+            )
+            .child(
+                h_flex()
+                    .absolute()
+                    .right(px(HEADER_PX))
+                    .top(px(12.))
+                    .gap(px(8.))
+                    .when(bot.is_some(), |this| {
+                        this.child(
+                            header_icon(
+                                "header-monitor",
+                                "icons/monitor.svg",
+                                state.right_pane == RightPane::Computer,
+                            )
+                            .on_mouse_down(MouseButton::Left, {
+                                let app = app.clone();
+                                move |_, _, cx| {
+                                    cx.stop_propagation();
+                                    app.update(cx, |state, cx| state.toggle_computer_pane(cx));
+                                }
+                            }),
+                        )
+                    })
+                    .child(
+                        header_icon(
+                            "header-right-sidebar",
+                            "icons/panel-right.svg",
+                            state.right_pane != RightPane::Closed,
+                        )
+                        .on_mouse_down(MouseButton::Left, {
+                            let app = app.clone();
+                            move |_, _, cx| {
+                                cx.stop_propagation();
+                                app.update(cx, |state, cx| {
+                                    if state.right_pane == RightPane::Closed {
+                                        state.toggle_agent_settings(cx);
+                                    } else {
+                                        state.close_right_pane(cx);
+                                    }
+                                });
+                            }
+                        }),
+                    ),
+            )
+            .when_some(state.active_thread_origin(), |this, origin| {
+                let name = bot
+                    .map(|bot| bot.name.clone())
+                    .unwrap_or_else(|| "Bot".into());
+                this.child(
+                    h_flex()
+                        .absolute()
+                        .left(px(chat_left + HEADER_PX))
+                        .top(px(TITLE_BAR_H))
+                        .occlude()
+                        .gap_2()
+                        .px_2()
+                        .py_1()
+                        .rounded(px(8.))
+                        .bg(theme.background.opacity(0.95))
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child(
+                            div()
+                                .id("header-routine-thread")
+                                .child(format!("Routine · {}", origin.routine_name)),
+                        )
+                        .child(
+                            div()
+                                .id("header-routine-back")
+                                .cursor_pointer()
+                                .hover(|s| s.text_color(theme.foreground))
+                                .on_mouse_down(MouseButton::Left, {
+                                    let app = app.clone();
+                                    move |_, _, cx| {
+                                        cx.stop_propagation();
+                                        app.update(cx, |state, cx| state.back_to_bot_chat(cx));
+                                    }
+                                })
+                                .child(format!("Back to {name}")),
+                        ),
+                )
+            })
+            .when_some(find_bar, |this, find| {
+                this.child(
+                    div()
+                        .absolute()
+                        .right(px(chat_right + HEADER_PX))
+                        .top(px(TITLE_BAR_H))
+                        .occlude()
+                        .rounded(px(8.))
+                        .bg(theme.background)
+                        .child(find),
+                )
+            })
+            .into_any_element()
+    }
+}
+
+fn header_icon(id: &'static str, path: &'static str, selected: bool) -> Stateful<Div> {
+    div()
+        .id(id)
+        .occlude()
+        .size(px(28.))
+        .rounded(px(8.))
+        .flex()
+        .items_center()
+        .justify_center()
+        .cursor_pointer()
+        .when(selected, |this| this.bg(rgb(0x777777).opacity(0.12)))
+        .hover(|s| s.bg(rgb(0x777777).opacity(0.2)))
+        .child(Icon::default().path(path).size(px(16.)))
+}
+
+/// Floating panes don't move the chat's centre. Docked panes do. Limit long names
+/// without moving the pill off-centre or covering the traffic lights/icon clusters.
+fn floating_header_span(width: f32, left: f32, right_open: bool) -> (f32, f32, f32) {
+    let floats = chrome_floats(width);
+    let left = if floats { 0. } else { left };
+    let right = if !floats && right_open {
+        INFO_PANE_WIDTH
+    } else {
+        0.
+    };
+    let centre = (left + width - right) / 2.;
+    let half = (centre - (TITLE_BAR_LEFT_PAD + 44.))
+        .min(width - 88. - centre)
+        .min((width - left - right) / 2. - HEADER_PX)
+        .max(0.);
+    (left, right, half * 2.)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::floating_header_span;
+
+    #[test]
+    fn pill_tracks_chat_centre_for_all_sidebar_states() {
+        for left in [0., 88., 280., 400.] {
+            for right in [false, true] {
+                let (start, end, max) = floating_header_span(1200., left, right);
+                assert_eq!(start, left);
+                assert_eq!(end, if right { 320. } else { 0. });
+                let centre = (start + 1200. - end) / 2.;
+                assert!(centre - max / 2. >= 124.);
+                assert!(centre + max / 2. <= 1112.);
+                assert!(max > 36.);
+            }
+        }
+    }
+
+    #[test]
+    fn floating_panes_do_not_shift_pill() {
+        for left in [0., 88., 280.] {
+            for right in [false, true] {
+                assert_eq!(floating_header_span(700., left, right), (0., 0., 452.));
+            }
+        }
     }
 }
