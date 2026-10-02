@@ -18,7 +18,28 @@ use gpui_kit::*;
 
 /// A run of the bar with no control in it: a handle to drag the window by.
 pub fn window_drag(el: Div) -> Div {
-    el.on_mouse_down(MouseButton::Left, |_, window, _| window.start_window_move())
+    el.on_mouse_down(MouseButton::Left, |_, window, _| move_window(window))
+}
+
+/// Hands the press being handled to the system, which moves the window with the pointer until
+/// the button comes up.
+///
+/// The test platform has no window to move, and its `start_window_move` is `unimplemented!`.
+/// Under test the press is counted instead, which is how a test tells the parts of the chrome
+/// that drag the window from the parts that leave a press to whatever is under them.
+fn move_window(window: &Window) {
+    #[cfg(test)]
+    let _ = window;
+    #[cfg(test)]
+    WINDOW_MOVES.set(WINDOW_MOVES.get() + 1);
+    #[cfg(not(test))]
+    window.start_window_move();
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The presses on this thread that would have moved the window (`move_window`).
+    static WINDOW_MOVES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 pub struct TitleBar {
@@ -318,14 +339,19 @@ impl TitleBar {
             .h(px(TITLE_BAR_H))
             .relative()
             .text_color(theme.foreground)
+            // THE FADE IS PAINT AND NOTHING ELSE. GPUI gives a press to an occluding element
+            // wherever it is, painted or clear, and the fade's last 16px hang below the bar over
+            // the transcript, where the gradient has run out. A fade that occluded and dragged
+            // the window took the presses meant for the images, links and text under it, so
+            // only the pill and the icon buttons take a press here.
             .child(
-                window_drag(div())
+                div()
+                    .debug_selector(|| "header-fade".into())
                     .absolute()
                     .left(px(chat_left))
                     .right(px(chat_right))
                     .top_0()
                     .h(px(TITLE_BAR_H + 16.))
-                    .occlude()
                     .bg(linear_gradient(
                         180.,
                         linear_color_stop(theme.background.opacity(0.92), 0.),
@@ -568,6 +594,155 @@ mod tests {
             for right in [false, true] {
                 assert_eq!(floating_header_span(700., left, right), (0., 0., 452.));
             }
+        }
+    }
+
+    /// The chat page as `Layout` paints it, pressed the way a person presses it: the chat, the
+    /// right pane beside it while one is open, and the title bar over both in a slot
+    /// `TITLE_BAR_H` tall that does not clip. The chat counts the presses that reach it.
+    mod chat_page_chrome {
+        use super::super::{TitleBar, WINDOW_MOVES};
+        use crate::chrome::{INFO_PANE_WIDTH, TITLE_BAR_H};
+        use crate::components::agent_settings::AgentSettings;
+        use crate::components::chat::ChatView;
+        use crate::components::computer::ComputerPane;
+        use crate::components::recipes::RecipesView;
+        use crate::state::{AppState, AuthStatus, RightPane};
+        use gpui_kit::prelude::FluentBuilder as _;
+        use gpui_kit::{
+            AppContext as _, Context, Entity, InteractiveElement as _, IntoElement, Modifiers,
+            MouseButton, ParentElement as _, Pixels, Point, Render, Styled as _, TestAppContext,
+            VisualTestContext, Window, div, point, px, size,
+        };
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        struct ChatPage {
+            app: Entity<AppState>,
+            title_bar: Entity<TitleBar>,
+            settings: Entity<AgentSettings>,
+            computer: Entity<ComputerPane>,
+            chat_presses: Rc<Cell<usize>>,
+        }
+
+        impl Render for ChatPage {
+            fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                let presses = self.chat_presses.clone();
+                let pane = match self.app.read(cx).right_pane {
+                    RightPane::Settings => Some(self.settings.clone().into_any_element()),
+                    RightPane::Computer => Some(self.computer.clone().into_any_element()),
+                    RightPane::Closed => None,
+                };
+                div()
+                    .size_full()
+                    .relative()
+                    .flex()
+                    .child(div().id("chat").flex_1().h_full().on_mouse_down(
+                        MouseButton::Left,
+                        move |_, _, _| {
+                            presses.set(presses.get() + 1);
+                        },
+                    ))
+                    .when_some(pane, |this, pane| {
+                        this.child(
+                            div()
+                                .w(px(INFO_PANE_WIDTH))
+                                .h_full()
+                                .flex_shrink_0()
+                                .child(pane),
+                        )
+                    })
+                    .child(
+                        div()
+                            .absolute()
+                            .top_0()
+                            .left_0()
+                            .right_0()
+                            .h(px(TITLE_BAR_H))
+                            .child(self.title_bar.clone()),
+                    )
+            }
+        }
+
+        /// A window `width` wide, signed in and open on Ada's chat.
+        fn chat_page(
+            cx: &mut TestAppContext,
+            width: f32,
+        ) -> (Entity<ChatPage>, &mut VisualTestContext) {
+            cx.update(gpui_kit::init);
+            let (view, cx) = cx.add_window_view(|window, cx| {
+                let mut state = AppState::new();
+                state.auth_status = AuthStatus::SignedIn;
+                state.account = Some(
+                    serde_json::from_value(
+                        serde_json::json!({ "id": "acc_1", "email": "ada@example.com" }),
+                    )
+                    .expect("an account"),
+                );
+                state.coworkers = vec![
+                    serde_json::from_value(serde_json::json!({ "id": "cw_1", "name": "Ada" }))
+                        .expect("a bot"),
+                ];
+                state.active_coworker_id = Some("cw_1".into());
+                let app = cx.new(|_| state);
+                cx.observe(&app, |_, _, cx| cx.notify()).detach();
+                let chat = cx.new(|cx| ChatView::new(window, app.clone(), cx));
+                let settings = cx.new(|cx| AgentSettings::new(window, app.clone(), cx));
+                let computer = cx.new(|cx| ComputerPane::new(window, app.clone(), cx));
+                let recipes = cx.new(|cx| RecipesView::new(window, app.clone(), cx));
+                let title_bar =
+                    cx.new(|cx| TitleBar::new(app.clone(), chat, computer.clone(), recipes, cx));
+                ChatPage {
+                    app,
+                    title_bar,
+                    settings,
+                    computer,
+                    chat_presses: Rc::default(),
+                }
+            });
+            cx.simulate_resize(size(px(width), px(640.)));
+            cx.run_until_parked();
+            (view, cx)
+        }
+
+        /// A click at `at`, after the pointer has moved there as a person's would.
+        fn press(cx: &mut VisualTestContext, at: Point<Pixels>) {
+            cx.simulate_mouse_move(at, None, Modifiers::none());
+            cx.simulate_click(at, Modifiers::none());
+        }
+
+        /// The fade under the chat's header takes no press. One in the clear tail it hangs over
+        /// the transcript below the bar, or in the bar beside the pill, reaches the chat under
+        /// it and moves no window. The pill keeps a surface of its own.
+        #[gpui_kit::test]
+        fn a_press_in_the_fade_reaches_the_chat(cx: &mut TestAppContext) {
+            let (view, cx) = chat_page(cx, 1200.);
+            let fade = cx.debug_bounds("header-fade").expect("the fade is drawn");
+            let presses = view.update(cx, |page, _| page.chat_presses.clone());
+            let moves = WINDOW_MOVES.get();
+            for (y, place) in [
+                (px(TITLE_BAR_H / 2.), "in the bar beside the pill"),
+                (fade.bottom() - px(4.), "in the clear tail below the bar"),
+            ] {
+                let before = presses.get();
+                press(cx, point(fade.left() + px(40.), y));
+                assert_eq!(presses.get(), before + 1, "a press {place} missed the chat");
+                assert_eq!(
+                    WINDOW_MOVES.get(),
+                    moves,
+                    "a press {place} moved the window"
+                );
+            }
+
+            // The pill is centred on the chat's span, which is the fade's.
+            let before = presses.get();
+            press(cx, point(fade.center().x, px(TITLE_BAR_H / 2.)));
+            assert_eq!(presses.get(), before, "the pill let its press through");
+            assert_eq!(
+                view.update(cx, |page, cx| page.app.read(cx).right_pane),
+                RightPane::Settings,
+                "the pill opens the bot's settings"
+            );
         }
     }
 }
