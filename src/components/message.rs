@@ -1,7 +1,7 @@
 use std::rc::Rc;
 
 use crate::actions::{CopyMessage, ToggleReadAloud};
-use crate::chrome::{BUBBLE_RADIUS, CHAT_CONTENT_MAX, chat_column_width};
+use crate::chrome::{BUBBLE_RADIUS, CHAT_BODY_REM, CHAT_CONTENT_MAX, chat_column_width};
 use crate::components::message_actions::{CONTROL_PX, MessageToolbar, TOOLBAR_W};
 use crate::state::{AppState, RightPane};
 use gpui_kit::component::text::TextView;
@@ -364,7 +364,8 @@ impl RenderOnce for MessageBubble {
         } else if self.is_me || !self.use_markdown {
             div()
                 .id(ElementId::Name(format!("msg-body-{row_key}").into()))
-                .text_sm()
+                .text_size(rems(CHAT_BODY_REM))
+                .font_weight(FontWeight::NORMAL)
                 .child(self.text.clone())
                 .into_any_element()
         } else {
@@ -372,6 +373,8 @@ impl RenderOnce for MessageBubble {
                 ElementId::Name(format!("md-{row_key}").into()),
                 self.text.clone(),
             )
+            .text_size(rems(CHAT_BODY_REM))
+            .font_weight(FontWeight::NORMAL)
             .into_any_element()
         };
 
@@ -506,7 +509,11 @@ impl RenderOnce for MessageBubble {
             if !self.show_footer {
                 return None;
             }
-            let preview = truncate_preview(&self.copy_text, 72);
+            let preview = crate::reply_preview::preview(
+                &self.copy_text,
+                !self.is_me && self.use_markdown,
+                72,
+            );
             let menu_state = menu_state.clone();
             Some(
                 MessageToolbar::new(app, row_key.clone(), source_id.clone())

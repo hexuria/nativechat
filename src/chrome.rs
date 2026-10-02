@@ -2,6 +2,10 @@
 //! from jumping vertically when it collapses.
 
 pub const SIDEBAR_ROW: f32 = 54.0;
+/// Body typography shared by plain and Markdown chat bubbles (14px at the default scale).
+pub const CHAT_BODY_REM: f32 = 0.875;
+pub const CONTROL_ICON_PX: f32 = 20.0;
+pub const COMPOSER_ICON_PX: f32 = 24.0;
 pub const SIDEBAR_GAP: f32 = 4.0;
 pub const SIDEBAR_EXPANDED: f32 = 280.0;
 pub const SIDEBAR_COLLAPSED: f32 = 88.0;

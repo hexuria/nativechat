@@ -573,6 +573,20 @@ fn snapshot_rows(state: &AppState) -> Arc<Vec<ChatRow>> {
     let retryable = state.retryable_turn();
     let mut rows = Vec::new();
     for msg in &conv.messages {
+        // Saved quotes may have been truncated in the middle of Markdown. Project the
+        // original when available; leave the stored text and model context untouched.
+        let reply_preview = msg
+            .reply_to_id
+            .as_ref()
+            .and_then(|id| conv.messages.iter().find(|source| &source.id == id))
+            .map(|source| {
+                crate::reply_preview::preview(
+                    &source.content,
+                    !source.is_me && looks_like_markdown(&source.content),
+                    88,
+                )
+            })
+            .or_else(|| msg.reply_preview.clone());
         // A message the person hid is still here — it is what keeps the thread from fetching
         // its turn back off the server — but it is never painted again.
         if msg.hidden {
@@ -670,7 +684,7 @@ fn snapshot_rows(state: &AppState) -> Arc<Vec<ChatRow>> {
                 use_markdown: !msg.is_me && looks_like_markdown(&text),
                 show_footer: true,
                 tts_text: SharedString::from(text),
-                reply_preview: msg.reply_preview.clone(),
+                reply_preview: reply_preview.clone(),
                 caption: crate::state::routine_instruction_caption(conv, msg),
                 reaction: state.message_reactions.get(&msg.id).cloned(),
                 ..ChatRow::slot(id, msg.id.clone())
@@ -800,7 +814,7 @@ fn snapshot_rows(state: &AppState) -> Arc<Vec<ChatRow>> {
                         // What Copy puts on the clipboard and what is read aloud: the files'
                         // names, the only words a files-alone message has.
                         tts_text: SharedString::from(names),
-                        reply_preview: msg.reply_preview.clone(),
+                        reply_preview: reply_preview.clone(),
                         reaction: state.message_reactions.get(&msg.id).cloned(),
                         files: files.clone(),
                         ..ChatRow::slot(text_row_id(&msg.id, 0), msg.id.clone())
@@ -2392,6 +2406,35 @@ mod tests {
             origin: None,
         });
         state
+    }
+
+    #[test]
+    fn saved_reply_quotes_project_the_original_before_truncation() {
+        let mut state = one_reply(Vec::new());
+        let messages = &mut state.conversations[0].messages;
+        messages[0].content = "Time is **Thursday, October 1**.".into();
+        let mut reply = messages[0].clone();
+        reply.id = "m2".into();
+        reply.content = "Do it again".into();
+        reply.is_me = true;
+        reply.reply_to_id = Some("m1".into());
+        reply.reply_preview = Some("Time is **Thursday…".into());
+        messages.push(reply);
+        let rows = snapshot_rows(&state);
+        assert_eq!(
+            rows[1].reply_preview.as_deref(),
+            Some("Time is Thursday, October 1.")
+        );
+        assert_eq!(
+            state.conversations[0].messages[1].reply_preview.as_deref(),
+            Some("Time is **Thursday…")
+        );
+
+        state.conversations[0].messages[0].is_me = true;
+        assert_eq!(
+            snapshot_rows(&state)[1].reply_preview.as_deref(),
+            Some("Time is **Thursday, October 1**.")
+        );
     }
 
     /// What each row is, in a word, so a test can say the feed in one line.
