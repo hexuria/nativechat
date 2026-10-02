@@ -638,13 +638,14 @@ impl ReplySourceSettings {
     }
 }
 
-/// What the composer's chip shows: which door the next turn goes through, and whether that is the
-/// person's pick for their turns rather than the account's own door.
+/// What the composer's chip shows: which door the next message goes through, and whether that is
+/// the person's pick for that one message rather than the account's own door.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TurnSourceChip {
     pub kind: InferenceKind,
-    /// A pick of the person's rather than the account's own door. Either way every turn names
-    /// the door the chip shows.
+    /// An override: the person's pick for the next message rather than the account's own door,
+    /// which the chip goes back to once that message has gone. Either way the message names the
+    /// door the chip shows.
     pub picked: bool,
     /// The model the person's plan answers with, as the server keeps it.
     pub local_model: Option<String>,
@@ -4635,11 +4636,13 @@ pub struct AppState {
     /// Numbers the reads and Saves of the reply source, so an answer that is not the newest, or
     /// that lands after a sign-out, is dropped.
     reply_source_generation: u64,
-    /// The door the person picked on the composer's chip where it is not the account's own. The
-    /// chip shows it, and every turn names what the chip shows, until they change it back, a
-    /// Save makes it the account's own, or they sign out; and it does not outlive the app,
-    /// because only this memory keeps it. The server keeps the account's door, and that is what
-    /// a relaunch starts from.
+    /// The door the person picked on the composer's chip where it is not the account's own: an
+    /// override for the next message only. The chip shows it, and the message sent or held
+    /// with it names it and spends it ([`Self::take_turn_source`]); switching Bot or thread,
+    /// clicking the chip back, a Save that makes it the account's own door, or signing out drops
+    /// it before then, and an Edit of a held send puts back the door that send was held with.
+    /// Otherwise the chip is at the account's door, as Settings → Reply source shows it, which
+    /// the server keeps and a relaunch starts from.
     turn_source_pick: Option<InferenceKind>,
     /// The composer is dictating: its chip is not drawn meanwhile, and a turn names the
     /// account's own door rather than the chip's.
@@ -7786,14 +7789,22 @@ impl AppState {
         Some(chip.kind)
     }
 
-    /// The door a turn names: a held send's is the one it was held with when the message was
-    /// sent, whatever the chip shows by the time it drains; any other turn's is the one a turn
-    /// sent now names ([`Self::turn_source_for_send`]).
-    fn turn_inference_source(&self, drained: Option<&QueuedSend>) -> Option<InferenceKind> {
-        match drained {
-            Some(held) => held.inference_source,
-            None => self.turn_source_for_send(),
+    /// The door a turn names, and the chip's pick spent on it. A held send's is the one it was
+    /// held with when the message was sent, whatever the chip shows by the time it drains, and
+    /// the chip is left alone: what it shows by then is for the message being written. Any
+    /// other turn's is the one a turn sent now names ([`Self::turn_source_for_send`]), and a
+    /// door picked on the chip was for that turn only, so the chip goes back to the account's
+    /// own door. A turn sent while the composer dictates names the account's door and not the
+    /// pick, which stays for the message the chip comes back to.
+    fn take_turn_source(&mut self, drained: Option<&QueuedSend>) -> Option<InferenceKind> {
+        if let Some(held) = drained {
+            return held.inference_source;
         }
+        let door = self.turn_source_for_send();
+        if !self.composer_dictating {
+            self.turn_source_pick = None;
+        }
+        door
     }
 
     /// The composer is dictating, or has stopped. The chip is not drawn meanwhile, so it is not
@@ -7805,8 +7816,9 @@ impl AppState {
         }
     }
 
-    /// A click on the composer's chip: the person's next turns go through the other door until
-    /// it is clicked again. The pick is not sent anywhere until a turn carries it.
+    /// A click on the composer's chip: the person's next message goes through the other door,
+    /// and a click back returns it to the account's own. The pick is not sent anywhere until a
+    /// turn carries it, and that turn spends it ([`Self::take_turn_source`]).
     pub fn toggle_turn_source(&mut self, cx: &mut Context<Self>) {
         if self.flip_turn_source() {
             cx.notify();
@@ -7824,8 +7836,10 @@ impl AppState {
     }
 
     /// After the account's setting changes: a pick on the chip that is now the account's own
-    /// door is no pick, and there is none while the setting makes for no chip. A chip that is
-    /// only out of sight while the composer dictates keeps its pick.
+    /// door is no pick, and there is none while the setting makes for no chip. Any other pick
+    /// stays an override for the next message, as it was made, and the chip goes back to the
+    /// new door after it. A chip that is only out of sight while the composer dictates keeps
+    /// its pick.
     fn settle_turn_source_pick(&mut self) {
         let account = self.reply_source.kept_source().map(|kept| kept.kind);
         if self.turn_source_chip().is_none() || self.turn_source_pick == account {
@@ -12708,7 +12722,7 @@ impl AppState {
     }
 
     pub fn select_conversation(&mut self, conversation_id: String, cx: &mut Context<Self>) {
-        self.active_conversation_id = Some(conversation_id.clone());
+        self.show_thread(&conversation_id);
         self.load_session_messages(conversation_id.clone(), cx);
         // Coming back to a thread whose turn never stopped. What the app is still holding is a
         // guess about a run it stopped watching; the server holds the run itself, so that is
@@ -12721,6 +12735,17 @@ impl AppState {
         // A message held while this thread was out of sight goes now if the thread is idle.
         self.drain_queued_send(&conversation_id, cx);
         cx.notify();
+    }
+
+    /// The part of [`Self::select_conversation`] that needs no window: the thread is the open
+    /// one. A door picked on the composer's chip was for the next message in the thread it was
+    /// picked in, so another thread, or another Bot's (whose chat is a thread of its own),
+    /// starts at the account's own door; the same thread opened again keeps it.
+    fn show_thread(&mut self, conversation_id: &str) {
+        if self.active_conversation_id.as_deref() != Some(conversation_id) {
+            self.turn_source_pick = None;
+        }
+        self.active_conversation_id = Some(conversation_id.to_string());
     }
 
     /// Re-attach a thread to the run the server is keeping for it.
@@ -13092,6 +13117,9 @@ impl AppState {
         // sent, and what the composer is holding now belongs to the message still being
         // written. Taking it here sent somebody's skill on a turn they never attached it to
         // and left the chip standing over a draft with nothing behind it.
+        //
+        // The door is the reply-source chip's, which says where the next turn goes, and this
+        // is that turn: a door picked there goes with it and is spent on it.
         self.send_opengrok_turn_with(conversation_id, content, recipe, None, None, None, cx);
     }
 
@@ -13193,8 +13221,9 @@ impl AppState {
         let pending_id = drained.as_ref().and_then(|held| held.pending_id.clone());
         let queued_message_id = drained.as_ref().map(|held| held.message_id.clone());
         // The door the chip shows as the turn leaves, or for a held send the one it showed when
-        // the message was sent: see `turn_inference_source`.
-        let turn_source = self.turn_inference_source(drained.as_ref());
+        // the message was sent; a pick on the chip goes with this turn and no further: see
+        // `take_turn_source`.
+        let turn_source = self.take_turn_source(drained.as_ref());
 
         // Both ids are minted here, before anything is sent. The run id because the server files
         // every frame under it and this is the app's only handle on the run once the stream is
@@ -17409,6 +17438,11 @@ impl AppState {
         self.reply_to = held.reply;
         self.active_recipe = None;
         self.active_skill = None;
+        // The door it was held with goes back on the chip, where it shows as a pick for this
+        // message whenever it is not the account's own: sent again, the message keeps the door
+        // it was typed under rather than taking the account's by having waited.
+        self.turn_source_pick = held.inference_source;
+        self.settle_turn_source_pick();
         let skill_kept = held.skill.as_deref().is_none_or(|id| self.attach_skill(id));
         let mut lost = Vec::new();
         // A `TurnRecipe` is an id and values, not the declaration the bar is drawn from.
@@ -17761,24 +17795,19 @@ impl AppState {
     }
 
     /// A message held back as it was sent: what the draft had on it, and the door a turn sent
-    /// then would name ([`Self::turn_source_for_send`]), which is the door its turn names when
-    /// it drains.
+    /// then would name, which is the door its turn names when it drains. A pick on the chip is
+    /// spent on it as on a turn sent then ([`Self::take_turn_source`]): held, the message has
+    /// gone from the composer, and the chip is back at the account's door for the next one.
     fn hold_for_send(
-        &self,
+        &mut self,
         message_id: String,
         content: String,
         recipe: Option<TurnRecipe>,
         skill: Option<String>,
         reply: Option<ReplyTo>,
     ) -> QueuedSend {
-        held_message(
-            message_id,
-            content,
-            recipe,
-            skill,
-            reply,
-            self.turn_source_for_send(),
-        )
+        let door = self.take_turn_source(None);
+        held_message(message_id, content, recipe, skill, reply, door)
     }
 
     /// The PATCH an edit of a held send makes: its new words, and the door it was held with
@@ -31966,15 +31995,15 @@ mod tests {
     /// The composer's chip starts where the account's setting is, and a turn sent from there
     /// names that door: the chip shows where the turn goes, and the turn goes there even if the
     /// setting has moved on another Mac since it was read. A click picks the other door for the
-    /// next turns and it sticks, named by each, until clicked back; and it is gone with a sign
-    /// out, which is also what a relaunch starts from, since nothing but this memory keeps it.
-    /// With no chip to draw a turn names nothing, and the account's setting decides; with the
-    /// chip hidden while the composer dictates, it names the account's own door.
+    /// next message, and a click back takes the pick away; so does a sign-out, which is also
+    /// what a relaunch starts from, since nothing but this memory keeps it. With no chip to draw
+    /// a turn names nothing, and the account's setting decides; with the chip hidden while the
+    /// composer dictates, it names the account's own door.
     #[test]
     fn a_turn_names_the_door_the_composer_chip_shows() {
         let mut state = signed_in_state();
         assert_eq!(chip(&state), None, "nothing read, no chip");
-        assert_eq!(state.turn_inference_source(None), None);
+        assert_eq!(state.take_turn_source(None), None);
         read_as(
             &mut state,
             kept(InferenceKind::LocalProxy, Some("gpt-5-codex")),
@@ -31989,7 +32018,7 @@ mod tests {
             "the account's own door"
         );
         assert_eq!(
-            state.turn_inference_source(None),
+            state.take_turn_source(None),
             Some(InferenceKind::LocalProxy),
             "the account's door, as the chip shows it, goes with the turn"
         );
@@ -31997,19 +32026,14 @@ mod tests {
         assert!(state.flip_turn_source());
         assert_eq!(chip(&state), Some((InferenceKind::Gateway, true)));
         assert_eq!(
-            state.turn_inference_source(None),
+            state.turn_source_for_send(),
             Some(InferenceKind::Gateway),
-            "the pick goes with the turn"
-        );
-        assert_eq!(
-            state.turn_inference_source(None),
-            Some(InferenceKind::Gateway),
-            "and with the one after it: it sticks"
+            "the pick is what a turn would name"
         );
         assert!(state.flip_turn_source());
         assert_eq!(chip(&state), Some((InferenceKind::LocalProxy, false)));
         assert_eq!(
-            state.turn_inference_source(None),
+            state.take_turn_source(None),
             Some(InferenceKind::LocalProxy),
             "clicked back: the account's door again"
         );
@@ -32018,13 +32042,10 @@ mod tests {
         let mut state = signed_in_state();
         read_as(&mut state, kept(InferenceKind::Gateway, Some("grok-4")));
         assert_eq!(chip(&state), Some((InferenceKind::Gateway, false)));
-        assert_eq!(
-            state.turn_inference_source(None),
-            Some(InferenceKind::Gateway)
-        );
+        assert_eq!(state.turn_source_for_send(), Some(InferenceKind::Gateway));
         assert!(state.flip_turn_source());
         assert_eq!(
-            state.turn_inference_source(None),
+            state.turn_source_for_send(),
             Some(InferenceKind::LocalProxy)
         );
         // A read that finds the account moved to the person's plan on another Mac: the pick is
@@ -32032,7 +32053,7 @@ mod tests {
         read_as(&mut state, kept(InferenceKind::LocalProxy, Some("grok-4")));
         assert_eq!(chip(&state), Some((InferenceKind::LocalProxy, false)));
         assert_eq!(
-            state.turn_inference_source(None),
+            state.turn_source_for_send(),
             Some(InferenceKind::LocalProxy)
         );
 
@@ -32043,7 +32064,7 @@ mod tests {
         state.composer_dictating = true;
         assert_eq!(chip(&state), None);
         assert_eq!(
-            state.turn_inference_source(None),
+            state.turn_source_for_send(),
             Some(InferenceKind::LocalProxy)
         );
         assert!(!state.flip_turn_source(), "no chip to click");
@@ -32054,14 +32075,95 @@ mod tests {
         // Signing out forgets the pick with the setting.
         state.forget_account();
         assert_eq!(chip(&state), None);
-        assert_eq!(state.turn_inference_source(None), None);
+        assert_eq!(state.take_turn_source(None), None);
 
         // No plan set up to switch to: no chip, and nothing a turn could carry.
         let mut state = signed_in_state();
         read_as(&mut state, kept(InferenceKind::Gateway, None));
         assert_eq!(chip(&state), None);
         assert!(!state.flip_turn_source());
-        assert_eq!(state.turn_inference_source(None), None);
+        assert_eq!(state.take_turn_source(None), None);
+    }
+
+    /// The owner's report on #155: Settings → Reply source said My subscription, and the chip
+    /// said Server from a click long before, with nothing saying it was overriding the setting.
+    /// A click is an override for the next message only: that message names the picked door,
+    /// and the chip is back at the account's own, as Settings shows it, for the one after. The
+    /// account's setting read again while the override shows (another model here) leaves the
+    /// override for that one message, and the chip goes back to the account's door after it.
+    #[test]
+    fn a_pick_on_the_chip_goes_with_the_next_message_and_no_further() {
+        let mut state = signed_in_state();
+        read_as(
+            &mut state,
+            kept(InferenceKind::LocalProxy, Some("gpt-5-codex")),
+        );
+        assert!(state.flip_turn_source());
+        assert_eq!(chip(&state), Some((InferenceKind::Gateway, true)));
+        assert_eq!(
+            state.take_turn_source(None),
+            Some(InferenceKind::Gateway),
+            "the next message goes through the pick"
+        );
+        assert_eq!(
+            chip(&state),
+            Some((InferenceKind::LocalProxy, false)),
+            "and the chip is back at the account's door"
+        );
+        assert_eq!(
+            state.take_turn_source(None),
+            Some(InferenceKind::LocalProxy),
+            "which the message after it names"
+        );
+
+        assert!(state.flip_turn_source());
+        read_as(&mut state, kept(InferenceKind::LocalProxy, Some("gpt-5")));
+        assert_eq!(
+            chip(&state),
+            Some((InferenceKind::Gateway, true)),
+            "the setting changed under an override that is not its door: still an override"
+        );
+        assert_eq!(state.take_turn_source(None), Some(InferenceKind::Gateway));
+        assert_eq!(chip(&state), Some((InferenceKind::LocalProxy, false)));
+    }
+
+    /// Opening another Bot, or another thread, puts the chip back at the account's door: the
+    /// pick was for the next message in the thread it was made in. Every switch of Bot opens that
+    /// Bot's own chat (`select_coworker` → `select_conversation`), and every switch of thread goes
+    /// through `select_conversation`, whose part without a window is `show_thread`. The same
+    /// thread opened again, as a click on the open Bot's row does, keeps it.
+    #[test]
+    fn switching_bot_or_thread_puts_the_chip_back_at_the_accounts_door() {
+        let mut state = signed_in_state();
+        read_as(
+            &mut state,
+            kept(InferenceKind::LocalProxy, Some("gpt-5-codex")),
+        );
+        state.active_coworker_id = Some("cw_1".into());
+        state.show_thread("cw_1");
+        assert!(state.flip_turn_source());
+        state.show_thread("cw_1");
+        assert_eq!(
+            chip(&state),
+            Some((InferenceKind::Gateway, true)),
+            "the same thread: the pick stays"
+        );
+        state.active_coworker_id = Some("cw_2".into());
+        state.show_thread("cw_2");
+        assert_eq!(
+            chip(&state),
+            Some((InferenceKind::LocalProxy, false)),
+            "another Bot's chat starts at the account's door"
+        );
+        assert_eq!(
+            state.take_turn_source(None),
+            Some(InferenceKind::LocalProxy)
+        );
+
+        // A routine's thread under the same Bot is another thread too.
+        assert!(state.flip_turn_source());
+        state.show_thread("rt_1");
+        assert_eq!(chip(&state), Some((InferenceKind::LocalProxy, false)));
     }
 
     /// Coming back to the window reads the account's door again whenever somebody is signed
@@ -32102,8 +32204,12 @@ mod tests {
 
     /// A message sent while a turn runs is held with the door the chip showed when it was sent,
     /// and its turn names that door when it drains, whatever the chip shows by then; the row
-    /// the server keeps for it names it too. One held while the composer dictated keeps the
-    /// account's own door, which is what a turn sent then names. One held while there was no
+    /// the server keeps for it names it too. Held, the message has left the composer, so a pick
+    /// on the chip is spent on it and the chip is back at the account's door; a drain leaves the
+    /// chip alone, since what it shows by then is for the message being written. An Edit of the
+    /// hold puts its door back on the chip, so the message sent again goes where it was typed
+    /// to. One held while the composer dictated keeps the account's own door, which is what a
+    /// turn sent then names, and leaves the pick it did not carry. One held while there was no
     /// chip to draw names none, even if a chip is drawn by the time it goes.
     #[test]
     fn a_held_send_keeps_the_door_it_was_sent_under() {
@@ -32123,21 +32229,67 @@ mod tests {
 
         // The chip is clicked to Server before the thread goes idle.
         assert!(state.flip_turn_source());
-        assert_eq!(
-            state.turn_inference_source(None),
-            Some(InferenceKind::Gateway)
-        );
         let drained = state.pop_queued_send("cw_1").expect("the hold drains");
         assert_eq!(
-            state.turn_inference_source(Some(&drained)),
+            state.take_turn_source(Some(&drained)),
             Some(InferenceKind::LocalProxy),
             "sent under My plan, it goes through My plan"
         );
+        assert_eq!(
+            chip(&state),
+            Some((InferenceKind::Gateway, true)),
+            "the drain leaves the pick to the message being written"
+        );
+
+        // That message held in its turn: it keeps Server, and the chip is back at My plan.
+        let picked = state.hold_for_send("m_2".into(), "and this".into(), None, None, None);
+        assert_eq!(picked.inference_source, Some(InferenceKind::Gateway));
+        assert_eq!(
+            serde_json::to_value(super::pending_write_for(&picked)).unwrap()["inferenceSource"],
+            "gateway"
+        );
+        assert_eq!(
+            chip(&state),
+            Some((InferenceKind::LocalProxy, false)),
+            "the pick went with the held message"
+        );
+        state.enqueue_hold("cw_1".into(), picked);
+        let drained = state.pop_queued_send("cw_1").expect("the hold drains");
+        assert_eq!(
+            state.take_turn_source(Some(&drained)),
+            Some(InferenceKind::Gateway),
+            "held under Server, it goes through Server"
+        );
+
+        // Edit takes a held message back to the composer, and its door back to the chip.
+        assert!(state.flip_turn_source());
+        let picked = state.hold_for_send("m_3".into(), "fix me".into(), None, None, None);
+        state.enqueue_hold("cw_1".into(), picked);
+        assert_eq!(chip(&state), Some((InferenceKind::LocalProxy, false)));
+        state
+            .take_hold_for_edit("m_3", "")
+            .expect("the hold comes back");
+        assert_eq!(
+            chip(&state),
+            Some((InferenceKind::Gateway, true)),
+            "edited, the message is still for Server"
+        );
+        // One held at the account's door comes back at it, whatever the chip showed meanwhile.
+        assert!(state.flip_turn_source());
+        let plain = state.hold_for_send("m_4".into(), "as is".into(), None, None, None);
+        state.enqueue_hold("cw_1".into(), plain);
+        assert!(state.flip_turn_source());
+        state
+            .take_hold_for_edit("m_4", "")
+            .expect("the hold comes back");
+        assert_eq!(chip(&state), Some((InferenceKind::LocalProxy, false)));
 
         // Held while the composer dictated, with the chip picked to Server out of sight: the
-        // account's own door, now and when it drains, once the chip is back on its pick.
+        // account's own door, now and when it drains, and the pick it did not carry is still
+        // there when the chip comes back.
+        assert!(state.flip_turn_source());
         state.composer_dictating = true;
-        let dictated = state.hold_for_send("m_2".into(), "and this".into(), None, None, None);
+        let dictated = state.hold_for_send("m_5".into(), "and this".into(), None, None, None);
         assert_eq!(dictated.inference_source, Some(InferenceKind::LocalProxy));
         assert_eq!(
             serde_json::to_value(super::pending_write_for(&dictated)).unwrap()["inferenceSource"],
@@ -32148,7 +32300,7 @@ mod tests {
         state.enqueue_hold("cw_1".into(), dictated);
         let drained = state.pop_queued_send("cw_1").expect("the hold drains");
         assert_eq!(
-            state.turn_inference_source(Some(&drained)),
+            state.take_turn_source(Some(&drained)),
             Some(InferenceKind::LocalProxy)
         );
 
@@ -32168,7 +32320,7 @@ mod tests {
         );
         state.enqueue_hold("cw_1".into(), quiet);
         let drained = state.pop_queued_send("cw_1").expect("the hold drains");
-        assert_eq!(state.turn_inference_source(Some(&drained)), None);
+        assert_eq!(state.take_turn_source(Some(&drained)), None);
     }
 
     /// A turn sent while the composer dictates, its chip given over to the dictation's buttons,
@@ -32176,26 +32328,27 @@ mod tests {
     /// see: an account on the person's plan with Server picked goes through the plan, and one on
     /// the server's keys with My plan picked goes through the keys. It names nothing where no
     /// door is known (the setting not read, or a server without reply sources) and where there
-    /// is no chip to hide, as a turn typed then would.
+    /// is no chip to hide, as a turn typed then would. The pick it did not carry is not spent:
+    /// the chip comes back with it, and the message typed next goes through it.
     #[test]
     fn a_turn_sent_while_dictating_names_the_accounts_own_door() {
         let mut state = signed_in_state();
         state.composer_dictating = true;
-        assert_eq!(state.turn_inference_source(None), None, "nothing read");
+        assert_eq!(state.take_turn_source(None), None, "nothing read");
         state.reply_source.kept = Some(ReplySourceRead::NotOnServer);
         assert_eq!(
-            state.turn_inference_source(None),
+            state.take_turn_source(None),
             None,
             "a server without reply sources"
         );
         read_as(&mut state, kept(InferenceKind::Gateway, None));
         assert_eq!(
-            state.turn_inference_source(None),
+            state.take_turn_source(None),
             None,
             "no plan to switch to, so no chip to hide"
         );
         state.composer_dictating = false;
-        assert_eq!(state.turn_inference_source(None), None, "as when typed");
+        assert_eq!(state.take_turn_source(None), None, "as when typed");
 
         for (account, pick) in [
             (InferenceKind::LocalProxy, InferenceKind::Gateway),
@@ -32204,20 +32357,22 @@ mod tests {
             let mut state = signed_in_state();
             read_as(&mut state, kept(account, Some("gpt-5-codex")));
             assert!(state.flip_turn_source());
-            assert_eq!(state.turn_inference_source(None), Some(pick), "typed");
+            assert_eq!(state.turn_source_for_send(), Some(pick), "typed");
             state.composer_dictating = true;
             assert_eq!(chip(&state), None);
             assert_eq!(
-                state.turn_inference_source(None),
+                state.take_turn_source(None),
                 Some(account),
                 "dictated: the account's door, not the hidden pick"
             );
             state.composer_dictating = false;
+            assert_eq!(chip(&state), Some((pick, true)), "the pick comes back");
             assert_eq!(
-                state.turn_inference_source(None),
+                state.take_turn_source(None),
                 Some(pick),
-                "the pick again"
+                "and goes with the message typed next"
             );
+            assert_eq!(chip(&state), Some((account, false)));
         }
     }
 
