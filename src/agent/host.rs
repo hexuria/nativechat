@@ -496,17 +496,14 @@ pub mod ids {
     /// Relay your plan from this computer: the card and each of its controls and lines.
     pub const RELAY: &str = reply_source::RELAY;
     pub const RELAY_SWITCH: &str = reply_source::RELAY_SWITCH;
+    /// Under the switch: what became of what it sent the account, when that did not go as asked.
+    pub const RELAY_SWITCH_ERROR: &str = reply_source::RELAY_SWITCH_ERROR;
     pub const RELAY_STATUS: &str = reply_source::RELAY_STATUS;
     pub const RELAY_DETAIL: &str = reply_source::RELAY_DETAIL;
     pub const RELAY_ADDR: &str = reply_source::RELAY_ADDR;
     pub const RELAY_KEY: &str = reply_source::RELAY_KEY;
     pub const RELAY_KEY_REMOVE: &str = reply_source::RELAY_KEY_REMOVE;
     pub const RELAY_UNAVAILABLE: &str = reply_source::RELAY_UNAVAILABLE;
-    /// While the relay is on and the account still asks the server's own machine first: the
-    /// line, Use this computer instead, and what became of it.
-    pub const RELAY_VIA: &str = reply_source::RELAY_VIA;
-    pub const RELAY_VIA_USE: &str = reply_source::RELAY_VIA_USE;
-    pub const RELAY_VIA_ERROR: &str = reply_source::RELAY_VIA_ERROR;
     /// Default for new Bots, on Settings → Relay: the section, the line saying it is coming, and
     /// the picker's card in it, which is dead until the server keeps such a default.
     pub const NEW_BOTS: &str = reply_source::NEW_BOTS;
@@ -1058,15 +1055,13 @@ pub enum Command {
     /// Send this reply on Server instead: the turn the person's plan could not answer, again, on
     /// the server's paid keys.
     SendOnServer,
-    /// The relay: its switch, which acts at once; and opencodex's address and key on this
-    /// computer, each waiting for Save as on the page.
+    /// The relay: its switch, which acts at once, and on points the account at this computer;
+    /// and opencodex's address and key on this computer, each waiting for Save as on the page.
     SetRelayOn(bool),
     SetRelayAddress(String),
     SetRelayKey(RedactedSecret),
     /// Remove key for this computer's opencodex, or Keep key to take it back.
     ToggleRemoveRelayKey,
-    /// Use this computer instead: the account's way to the plan moved to the relay, at once.
-    UseThisComputer,
     Shutdown,
 }
 
@@ -1345,7 +1340,6 @@ impl Command {
             Self::SetRelayAddress(address) => state.set_relay_address(address, cx),
             Self::SetRelayKey(key) => state.set_relay_key(&key.0, cx),
             Self::ToggleRemoveRelayKey => state.toggle_remove_relay_key(cx),
-            Self::UseThisComputer => state.use_this_computer(cx),
             Self::Shutdown => {}
         }
     }
@@ -5501,7 +5495,8 @@ impl NativeChatHost {
     }
 
     /// The relay as the card draws it: the switch (checked while on, enabled while a click would
-    /// move it), why the card takes no change when it takes none, the status line (value
+    /// move it) and under it what became of what it sent the account when that did not go as
+    /// asked, why the card takes no change when it takes none, the status line (value
     /// `answering` / `another-mac` / `connecting` / `not-connected`) and the line under it,
     /// opencodex's address, and the key field (never its text: states `set` while the Keychain
     /// holds a key, `typed` while one waits for Save) with Remove key.
@@ -5515,6 +5510,9 @@ impl NativeChatHost {
                 .with_checked(relay.on)
                 .with_enabled(relay.switch_live),
         );
+        if let Some(note) = settings.change_note(crate::state::AccountChange::Relay) {
+            card = card.with_child(UiNode::status(ids::RELAY_SWITCH_ERROR, note));
+        }
         if let Some(line) =
             reply_source::relay_unavailable_line(settings.knows_relay(), relay.enrolled)
         {
@@ -5532,20 +5530,6 @@ impl NativeChatHost {
                 }
                 card = card.with_child(node);
             }
-        }
-        if settings.asks_the_servers_machine_first(relay.on) {
-            card = card
-                .with_child(
-                    UiNode::status(ids::RELAY_VIA, reply_source::VIA_LOOPBACK_LINE)
-                        .with_value(crate::opengrok::Via::Loopback.word()),
-                )
-                .with_child(
-                    UiNode::button(ids::RELAY_VIA_USE, reply_source::USE_THIS_COMPUTER)
-                        .with_enabled(settings.changing.is_none()),
-                );
-        }
-        if let Some(note) = settings.change_note(crate::state::AccountChange::Via) {
-            card = card.with_child(UiNode::status(ids::RELAY_VIA_ERROR, note));
         }
         card = card.with_child(
             UiNode::textbox(ids::RELAY_ADDR, reply_source::RELAY_ADDR_LABEL)
@@ -5958,25 +5942,12 @@ impl NativeChatHost {
         if target == ids::RELAY_ADDR || target == ids::RELAY_KEY {
             return Err(format!("`{target}` is a field: use set_value"));
         }
-        if target == ids::RELAY_VIA_USE {
-            return if !settings.asks_the_servers_machine_first(relay.on) {
-                Err(format!(
-                    "no `{target}` on screen: it is there while the relay is on and the account \
-                     still asks the server's own machine first"
-                ))
-            } else if settings.changing.is_some() {
-                Err(format!("`{target}` is dead: a change is with the server"))
-            } else {
-                Ok(Command::UseThisComputer)
-            };
-        }
         let lines = [
             ids::RELAY,
+            ids::RELAY_SWITCH_ERROR,
             ids::RELAY_STATUS,
             ids::RELAY_DETAIL,
             ids::RELAY_UNAVAILABLE,
-            ids::RELAY_VIA,
-            ids::RELAY_VIA_ERROR,
         ];
         if lines.contains(&target) {
             return Err(format!("`{target}` is a line on the card, not a control"));
@@ -10203,6 +10174,7 @@ mod tests {
                 via: None,
                 relay: None,
                 new_bot_default: None,
+                relay_enabled: None,
             }))
         };
         state.reply_source.kept = read(InferenceKind::Gateway);
@@ -13441,6 +13413,7 @@ mod tests {
             via: None,
             relay: None,
             new_bot_default: None,
+            relay_enabled: None,
         }
     }
 
@@ -14112,77 +14085,113 @@ mod tests {
         );
     }
 
-    /// While the relay is on here and the account still asks the server's own machine first, the
-    /// card says so in the owner's words, with Use this computer instead beside it, which a click
-    /// sends. It is dead while a change is with the server, and the server's words for a refusal
-    /// are under it. With the relay off, or the account's way already the relay, neither is there,
-    /// and the button is refused as not on screen.
+    /// The relay card has no line or button of its own for the account's way to the plan: the
+    /// switch points the account at this computer as it goes on. With the relay on, whatever way
+    /// the account keeps, and a refusal of the switch's change said, neither the line, its button
+    /// nor a line under them is on the tree, and each is refused as not on the card, with nothing
+    /// sent.
     #[test]
-    fn the_relay_card_offers_this_computer_while_the_account_asks_the_servers_machine() {
-        use crate::components::reply_source::{USE_THIS_COMPUTER, VIA_LOOPBACK_LINE};
+    fn the_relay_card_has_no_line_or_button_for_the_accounts_way() {
         use crate::state::{AccountChange, ChangeNote, RelayLine};
+        let gone = [
+            "settings-relay-via",
+            "settings-relay-via-use",
+            "settings-relay-via-error",
+        ];
         let mut host = host();
         host.account_open = true;
         host.reply_source_tab = true;
-        host.reply_source.settings.kept = relay_read("loopback");
         host.reply_source.relay = RelaySnap {
+            on: true,
             switch_live: true,
             enrolled: true,
             line: Some(RelayLine::NotConnected { why: None }),
             address: "http://127.0.0.1:8080".into(),
             ..RelaySnap::default()
         };
-        let tree = host.snapshot();
-        assert!(tree.find(ids::RELAY_VIA).is_none(), "the relay is off");
-        let off = host.click(ids::RELAY_VIA_USE).unwrap_err();
-        assert!(off.contains("on screen"), "{off}");
-
-        host.reply_source.relay.on = true;
-        let tree = host.snapshot();
-        let line = tree.find(ids::RELAY_VIA).unwrap();
-        assert_eq!(
-            (line.name.as_str(), line.value.as_deref()),
-            (VIA_LOOPBACK_LINE, Some("loopback"))
-        );
-        assert_eq!(
-            VIA_LOOPBACK_LINE,
-            "Your account still asks the server's own machine first"
-        );
-        let button = tree.find(ids::RELAY_VIA_USE).unwrap();
-        assert_eq!(
-            (button.name.as_str(), button.enabled),
-            (USE_THIS_COMPUTER, true)
-        );
-        assert_eq!(USE_THIS_COMPUTER, "Use this computer instead");
-        assert!(tree.ids_are_unique());
-        host.click(ids::RELAY_VIA_USE).unwrap();
-        assert!(matches!(
-            host.take_command(),
-            Some(Command::UseThisComputer)
-        ));
-        let line = host.click(ids::RELAY_VIA).unwrap_err();
-        assert!(line.contains("a line on the card"), "{line}");
-
-        host.reply_source.settings.changing = Some((7, AccountChange::Via));
-        assert!(!host.snapshot().find(ids::RELAY_VIA_USE).unwrap().enabled);
-        let busy = host.click(ids::RELAY_VIA_USE).unwrap_err();
-        assert!(busy.contains("a change is with the server"), "{busy}");
-        host.reply_source.settings.changing = None;
         host.reply_source.settings.change_note = Some((
-            AccountChange::Via,
+            AccountChange::Relay,
             ChangeNote::Refused("via must be \"loopback\" or \"mac\"".into()),
         ));
-        assert_eq!(
-            host.snapshot().find(ids::RELAY_VIA_ERROR).unwrap().name,
-            "via must be \"loopback\" or \"mac\""
+        for way in ["loopback", "mac", "helper"] {
+            host.reply_source.settings.kept = relay_read(way);
+            let tree = host.snapshot();
+            assert!(tree.find(ids::RELAY_SWITCH).is_some(), "{way}");
+            for id in gone {
+                assert!(tree.find(id).is_none(), "{way}: {id}");
+                let refused = host.click(id).unwrap_err();
+                assert!(
+                    refused.contains(&format!("no `{id}` on")),
+                    "{way}: {id}: {refused}"
+                );
+            }
+            assert!(host.take_command().is_none(), "{way}");
+        }
+    }
+
+    /// What became of the switch's change is under the switch, as a line and not a control: a
+    /// refusal in the server's words, or that nobody knows whether it was kept. The switch stays
+    /// as the person put it, on, and still goes off at a click. A pick for new Bots' words are its
+    /// own, under its picker.
+    #[test]
+    fn a_refusal_of_the_switchs_change_is_under_the_switch_and_the_switch_stays_on() {
+        use crate::state::{ACCOUNT_CHANGE_UNKNOWN, AccountChange, ChangeNote, RelayLine};
+        let said = "via \"helper\" is not built yet (#293); use \"loopback\" or \"mac\"";
+        let mut host = host();
+        host.account_open = true;
+        host.reply_source_tab = true;
+        host.reply_source.settings.kept = relay_read("loopback");
+        host.reply_source.relay = RelaySnap {
+            on: true,
+            switch_live: true,
+            enrolled: true,
+            line: Some(RelayLine::Connecting),
+            address: "http://127.0.0.1:8080".into(),
+            ..RelaySnap::default()
+        };
+        assert!(
+            host.snapshot().find(ids::RELAY_SWITCH_ERROR).is_none(),
+            "nothing said"
         );
 
-        host.reply_source.settings.kept = relay_read("mac");
-        host.reply_source.settings.change_note = None;
+        host.reply_source.settings.change_note =
+            Some((AccountChange::Relay, ChangeNote::Refused(said.into())));
         let tree = host.snapshot();
-        assert!(tree.find(ids::RELAY_VIA).is_none() && tree.find(ids::RELAY_VIA_USE).is_none());
-        assert!(host.click(ids::RELAY_VIA_USE).is_err());
-        assert!(host.take_command().is_none());
+        let switch = tree.find(ids::RELAY_SWITCH).unwrap();
+        assert_eq!((switch.checked, switch.enabled), (Some(true), true));
+        assert_eq!(tree.find(ids::RELAY_SWITCH_ERROR).unwrap().name, said);
+        assert_eq!(
+            tree.find(ids::RELAY)
+                .unwrap()
+                .children
+                .iter()
+                .map(|node| node.id.as_str())
+                .take(3)
+                .collect::<Vec<_>>(),
+            [
+                ids::RELAY_SWITCH,
+                ids::RELAY_SWITCH_ERROR,
+                ids::RELAY_STATUS
+            ],
+            "under the switch"
+        );
+        assert!(tree.ids_are_unique());
+        let line = host.click(ids::RELAY_SWITCH_ERROR).unwrap_err();
+        assert!(line.contains("a line on the card"), "{line}");
+        host.click(ids::RELAY_SWITCH).unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::SetRelayOn(false))
+        ));
+
+        host.reply_source.settings.change_note = Some((AccountChange::Relay, ChangeNote::Unknown));
+        assert_eq!(
+            host.snapshot().find(ids::RELAY_SWITCH_ERROR).unwrap().name,
+            ACCOUNT_CHANGE_UNKNOWN
+        );
+        host.reply_source.settings.change_note =
+            Some((AccountChange::NewBots, ChangeNote::Refused(said.into())));
+        assert!(host.snapshot().find(ids::RELAY_SWITCH_ERROR).is_none());
     }
 
     /// The relay is on the tree as the card draws it, from a server that knows the relay: the
@@ -14289,14 +14298,12 @@ mod tests {
             [
                 ids::RELAY_SWITCH,
                 ids::RELAY_STATUS,
-                ids::RELAY_VIA,
-                ids::RELAY_VIA_USE,
                 ids::RELAY_ADDR,
                 ids::RELAY_KEY,
                 ids::RELAY_KEY_REMOVE
             ],
-            "no model of the relay's own; and the relay is on while the account still asks the \
-             server's own machine first, which the card says"
+            "no model of the relay's own, and nothing of the account's way: the relay is on while \
+             the account still asks the server's own machine first, and the card says nothing of it"
         );
         assert!(tree.ids_are_unique());
 

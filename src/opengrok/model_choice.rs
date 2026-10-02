@@ -902,6 +902,7 @@ mod tests {
             via: None,
             relay: None,
             new_bot_default: None,
+            relay_enabled: None,
         }
     }
 

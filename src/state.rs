@@ -318,12 +318,14 @@ impl AccountConnections {
 /// person has changed it on the page and not saved.
 ///
 /// The setting is the server's and lives nowhere else: this app never keeps it, and never calls a
-/// model either way. What the page shows as kept is only ever what the server last said. The page
-/// changes nothing of it: not the door, the way to the plan or the plan's model (a Bot's model,
-/// and with it its door, is picked on its card in its settings), and not the plan on the server's
-/// own machine, whose address and key the server keeps as they are. What the page does change is
-/// this computer's: opencodex's address and key for the relay, which wait on the page, marked
-/// unsaved, until Save keeps them here. Nothing here is written to disk.
+/// model either way. What the page shows as kept is only ever what the server last said. Of it,
+/// the page changes only the way to the plan, which the relay switch points at this computer as
+/// it goes on ([`AppState::begin_relay_change`]), and the default for new Bots: not the door or
+/// the plan's model (a Bot's model, and with it its door, is picked on its card in its settings),
+/// and not the plan on the server's own machine, whose address and key the server keeps as they
+/// are. What else the page changes is this computer's: opencodex's address and key for the relay,
+/// which wait on the page, marked unsaved, until Save keeps them here. Nothing here is written to
+/// disk.
 ///
 /// Not `Clone`: it can hold a key the person typed, and nothing copies that. The gpui-agent tree
 /// takes [`Self::without_key`].
@@ -357,8 +359,11 @@ pub struct ReplySourceSettings {
     pub changing: Option<(u64, AccountChange)>,
     /// What became of the last change sent at once that did not go as asked, by what it was
     /// about. A refusal stays until the next change of its kind; a change nobody heard back from
-    /// goes with the read that answers it.
+    /// goes with the read, or the answer to a later change, that says what the server keeps.
     pub change_note: Option<(AccountChange, ChangeNote)>,
+    /// The relay switch moved while another change was with the server: what it says goes once
+    /// that one is answered ([`AppState::begin_owed_relay_change`]).
+    pub relay_change_owed: bool,
 }
 
 /// What Settings → Relay says, under Save, about the last thing that did not go as asked.
@@ -511,19 +516,8 @@ impl ReplySourceSettings {
             relay_retype_key: self.relay_retype_key,
             changing: self.changing,
             change_note: self.change_note.clone(),
+            relay_change_owed: self.relay_change_owed,
         }
-    }
-
-    /// The account still asks the server's own machine first while this computer relays: its way
-    /// to the plan, as a server that knows the relay keeps it, is the loopback, so a Bot on the
-    /// plan names that way on its turns, and the relay `relay_on` answers none of them. A way this
-    /// app cannot name says nothing either way, and the relay's own way, `mac` or `computer`, is
-    /// not this.
-    pub fn asks_the_servers_machine_first(&self, relay_on: bool) -> bool {
-        relay_on
-            && self
-                .kept_source()
-                .is_some_and(|kept| kept.knows_relay() && kept.default_via() == Some(Via::Loopback))
     }
 
     /// What the page says, where a change of `about`'s kind was asked, of the last one that did
@@ -542,8 +536,9 @@ impl ReplySourceSettings {
 pub enum AccountChange {
     /// A pick in Default for new Bots' picker, or None.
     NewBots,
-    /// Use this computer instead: the account's way to the plan moved to the relay.
-    Via,
+    /// The relay switch: the account's way to the plan pointed at this computer as it goes on,
+    /// and a server that keeps whether the relay is on told so either way.
+    Relay,
 }
 
 /// What became of a change sent at once that did not go as asked.
@@ -8123,6 +8118,11 @@ impl AppState {
                     Some(AfterChange::ReadModels) => state.refresh_models(cx),
                     Some(AfterChange::ReadAgain) => state.read_reply_source(cx),
                 }
+                // The relay switch moved while this one was out: what it says goes now, and its
+                // answer, the newest word there will be, overtakes a read begun above.
+                if let Some(send) = state.begin_owed_relay_change() {
+                    state.send_account_change(send, cx);
+                }
                 state.ensure_relay(cx);
                 cx.notify();
             });
@@ -8150,10 +8150,15 @@ impl AppState {
         Some(match answer {
             Ok(kept) => {
                 settings.kept = Some(ReplySourceRead::Read(kept));
+                // What the server keeps now answers a change nobody heard back from, as a read's
+                // answer does: one the relay switch sent after it overtook that read.
+                if matches!(settings.change_note, Some((_, ChangeNote::Unknown))) {
+                    settings.change_note = None;
+                }
                 match about {
                     AccountChange::NewBots => AfterChange::Done,
                     // The pickers' Subscription group is the account's way's models.
-                    AccountChange::Via => AfterChange::ReadModels,
+                    AccountChange::Relay => AfterChange::ReadModels,
                 }
             }
             // A bare 404 is a server from before the route; the server's own 404 is not that.
@@ -8177,41 +8182,61 @@ impl AppState {
         })
     }
 
-    /// Whether Settings → Relay says the account still asks the server's own machine first
-    /// ([`ReplySourceSettings::asks_the_servers_machine_first`]), with Use this computer instead
-    /// beside it: the relay is switched on here, and the account's way is the loopback.
+    /// Begin what the relay switch sends the account now that it says [`RelayMac::on`], for the
+    /// caller to send: one `PUT /account/inference-source` with the kind the server keeps.
     ///
-    /// Turning the relay on does not move the account's way by itself. The way is the account's,
-    /// on the server, and every Bot on the person's plan that names none goes by it, on this
-    /// computer and on any other: moving it there and then would be a change to the account that
-    /// nobody asked for, made by a switch that is this computer's. So the page says it, and the
-    /// person moves it.
-    pub fn asks_the_servers_machine_first(&self) -> bool {
-        self.reply_source
-            .asks_the_servers_machine_first(self.relay_mac.on)
-    }
-
-    /// Use this computer instead: the account's way to the plan moved to the relay, at once, as
-    /// `PUT /account/inference-source` `{kind, via: "mac"}` with the kind the server keeps
-    /// (opengrok-server #292: `apply` in `crates/opengrok-harness/src/local_proxy.rs`, which keeps
-    /// `via` as the account's way whatever the kind). `mac` is the word every server with the
-    /// relay reads, whatever this app calls it.
-    pub fn use_this_computer(&mut self, cx: &mut Context<Self>) {
-        if let Some(send) = self.begin_use_this_computer() {
-            self.send_account_change(send, cx);
+    /// On, it points the account at this computer, `{kind, via: "mac"}` (opengrok-server #292:
+    /// `apply` in `crates/opengrok-harness/src/local_proxy.rs`, which keeps `via` as the account's
+    /// way whatever the kind), `mac` being the word every server with the relay reads, whatever
+    /// this app calls it. The relay answers only the turns that ask through this computer, and a
+    /// Bot on the plan that names no way of its own asks by the account's: switched on while the
+    /// account still asked the server's own machine, the relay would answer none of them. Off,
+    /// the account keeps its way.
+    ///
+    /// A server that keeps whether the relay is on, which its read says by carrying
+    /// `relayEnabled` (opengrok-server relay-off fallback contract, agreed 2026-10-03, not yet
+    /// built), is told so in the same body: `relayEnabled: true` beside the way, and off,
+    /// `{kind, relayEnabled: false}` with no way. Any other is sent the way alone, and nothing as
+    /// the switch goes off.
+    ///
+    /// One change of the account's at a time: while another is with the server this sends
+    /// nothing, and what the switch says once that one is answered goes then
+    /// ([`Self::begin_owed_relay_change`]). What was said of the switch's last change was said of
+    /// a switch that has moved since, and goes.
+    fn begin_relay_change(&mut self) -> Option<AccountChangeSend> {
+        let on = self.relay_mac.on;
+        let settings = &mut self.reply_source;
+        settings.relay_change_owed = false;
+        if settings
+            .change_note
+            .as_ref()
+            .is_some_and(|(about, _)| *about == AccountChange::Relay)
+        {
+            settings.change_note = None;
         }
-    }
-
-    /// Begin Use this computer instead: only while the page offers it.
-    fn begin_use_this_computer(&mut self) -> Option<AccountChangeSend> {
-        if !self.asks_the_servers_machine_first() {
+        let keeps_enabled = settings.kept_source()?.relay_enabled.is_some();
+        if !on && !keeps_enabled {
             return None;
         }
-        self.begin_account_change(AccountChange::Via, |kind| InferenceSourceUpdate {
+        if settings.changing.is_some() {
+            settings.relay_change_owed = true;
+            return None;
+        }
+        self.begin_account_change(AccountChange::Relay, |kind| InferenceSourceUpdate {
             kind,
-            via: Some(Via::Mac),
+            via: on.then_some(Via::Mac),
+            relay_enabled: keeps_enabled.then_some(on),
             new_bot_default: None,
         })
+    }
+
+    /// The relay switch's change, when the switch moved while the change just answered was out
+    /// ([`Self::begin_relay_change`]).
+    fn begin_owed_relay_change(&mut self) -> Option<AccountChangeSend> {
+        if !self.reply_source.relay_change_owed {
+            return None;
+        }
+        self.begin_relay_change()
     }
 
     /// Settings has changed what it shows. Relay coming on screen reads the setting, for where the
@@ -8527,13 +8552,19 @@ impl AppState {
     }
 
     /// Answer with this Mac's switch. On, the relay starts (once this Mac is enrolled and the
-    /// server knows the relay); off, it stops, with every call it was answering. Turning it off
-    /// and on is also how a relay that stopped for good starts again: after another Mac took
-    /// over, it takes the relay back. Kept on this Mac, for the account signed in.
+    /// server knows the relay), and the same press points the account at this computer; off, it
+    /// stops, with every call it was answering, and the account keeps its way
+    /// ([`Self::begin_relay_change`]). A refusal of what the switch sent is said under it, in the
+    /// server's words, and moves neither the switch nor the relay. Turning it off and on is also
+    /// how a relay that stopped for good starts again: after another Mac took over, it takes the
+    /// relay back. Kept on this Mac, for the account signed in.
     pub fn set_relay_on(&mut self, on: bool, cx: &mut Context<Self>) {
         if self.note_relay_on(on) {
             self.stop_relay();
             self.ensure_relay(cx);
+            if let Some(send) = self.begin_relay_change() {
+                self.send_account_change(send, cx);
+            }
             cx.notify();
         }
     }
@@ -12912,6 +12943,7 @@ impl AppState {
             kind,
             via: None,
             new_bot_default: Some(default),
+            relay_enabled: None,
         })
     }
 
@@ -35044,6 +35076,7 @@ mod tests {
             via: None,
             relay: None,
             new_bot_default: None,
+            relay_enabled: None,
         }
     }
 
@@ -36763,112 +36796,230 @@ mod tests {
         assert_eq!(state.reply_source.kept, None);
     }
 
-    /// Settings → Relay says the account still asks the server's own machine first only while
-    /// the relay is switched on here and the account's way to the plan, as a server that knows
-    /// the relay keeps it, is the server's machine. The relay's own way, by either of its names, a
-    /// way this app cannot name, the relay off, and a server without the relay say nothing. And
-    /// switching the relay on moves nothing of the account's by itself.
-    #[test]
-    fn the_page_says_the_account_still_asks_the_servers_machine_only_while_the_relay_is_on() {
+    // ---- The relay switch: this computer relays, and the account asks through it --------------
+
+    /// The account's setting as a server that knows the relay answers it: on the plan, its way
+    /// `via`, nobody's computer holding the relay, and `relayEnabled` as given, `None` being a
+    /// server that sends no such key, as every server does until it builds the relay-off
+    /// fallback (opengrok-server relay-off fallback contract, agreed 2026-10-03, not yet built).
+    fn relay_answer(via: &str, relay_enabled: Option<bool>) -> serde_json::Value {
+        let mut body = json!({
+            "kind": "local_proxy", "via": via, "baseUrl": "http://127.0.0.1:8080",
+            "localModel": "gpt-5-codex", "healthy": true, "hasApiKey": false,
+            "relay": {"connected": false, "machineId": null, "machineLabel": null,
+                      "localModel": null}
+        });
+        if let Some(enabled) = relay_enabled {
+            body["relayEnabled"] = json!(enabled);
+        }
+        body
+    }
+
+    /// Somebody signed in to `server` on an enrolled computer with the relay switched off, and
+    /// the account's way to the plan still the server's own machine, as a read of
+    /// [`relay_answer`] brings it.
+    async fn ready_to_relay(
+        server: &wiremock::MockServer,
+        relay_enabled: Option<bool>,
+    ) -> AppState {
         let mut state = signed_in_state();
+        state.opengrok = Some(client_signed_in_to(server).await);
         state.local_exec_machine_id = Some("mac_1".into());
         read_as(
             &mut state,
-            relay_kept(InferenceKind::LocalProxy, "loopback", None),
+            serde_json::from_value(relay_answer("loopback", relay_enabled)).expect("a setting"),
         );
-        assert!(!state.asks_the_servers_machine_first(), "the relay is off");
-        assert!(state.begin_use_this_computer().is_none());
-        assert!(state.note_relay_on(true));
-        assert!(state.asks_the_servers_machine_first());
-        assert_eq!(state.reply_source.changing, None, "the switch sent nothing");
-        assert_eq!(
-            state
-                .reply_source
-                .kept_source()
-                .and_then(InferenceSource::default_via),
-            Some(crate::opengrok::Via::Loopback),
-            "the account's way is as the server keeps it"
-        );
-        for way in ["mac", "computer", "helper"] {
-            read_as(&mut state, relay_kept(InferenceKind::LocalProxy, way, None));
-            assert!(!state.asks_the_servers_machine_first(), "{way}");
-        }
-        read_as(&mut state, kept(InferenceKind::LocalProxy, Some("m")));
-        assert!(
-            !state.asks_the_servers_machine_first(),
-            "a server without the relay"
-        );
+        state
     }
 
-    /// Use this computer instead moves the account's way to the relay at once: one `PUT` of the
-    /// kind the server keeps and `via: "mac"`, the word every server with the relay reads, with
-    /// nothing else in it. The server's answer is what the page shows, so the line goes, and the
-    /// models are read again for the pickers' Subscription group. A refusal is said under the line
-    /// in the server's words, and the line stays.
+    /// Turning the relay on points the account at this computer in the same press: one `PUT` of
+    /// the kind the server keeps and `via: "mac"`, the word every server with the relay reads,
+    /// with nothing else in it. The server's answer is what the page shows, and the models are
+    /// read again for the pickers' Subscription group. Turning it off moves no way: a server whose
+    /// read carries no `relayEnabled` is sent nothing at all, and the account keeps this computer
+    /// as its way.
     #[tokio::test]
-    async fn use_this_computer_puts_the_relay_as_the_accounts_way() {
-        use super::{AccountChange, AfterChange};
+    async fn turning_the_relay_on_points_the_account_at_this_computer_and_off_moves_no_way() {
+        use super::AfterChange;
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("PUT"))
             .and(wiremock::matchers::path("/account/inference-source"))
             .and(wiremock::matchers::body_json(
                 json!({"kind": "local_proxy", "via": "mac"}),
             ))
-            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
-                "kind": "local_proxy", "via": "mac", "baseUrl": "http://127.0.0.1:8080",
-                "localModel": "gpt-5-codex", "healthy": true, "hasApiKey": false,
-                "relay": {"connected": true, "machineId": "mac_1", "machineLabel": null,
-                          "localModel": null}
-            })))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(relay_answer("mac", None)),
+            )
             .expect(1)
             .mount(&server)
             .await;
-        let mut state = signed_in_state();
-        state.opengrok = Some(client_signed_in_to(&server).await);
-        state.local_exec_machine_id = Some("mac_1".into());
-        read_as(
-            &mut state,
-            relay_kept(InferenceKind::LocalProxy, "loopback", None),
-        );
+        let mut state = ready_to_relay(&server, None).await;
+        assert!(!state.reply_source.on_mac());
         assert!(state.note_relay_on(true));
-        let send = state.begin_use_this_computer().expect("the line offers it");
-        assert_eq!(
-            serde_json::to_value(&send.update).unwrap(),
-            json!({"kind": "local_proxy", "via": "mac"})
-        );
-        assert!(state.begin_use_this_computer().is_none(), "one at a time");
+        let send = state.begin_relay_change().expect("turning it on sends");
         let answer = send.client.set_inference_source(&send.update).await;
         assert_eq!(
             state.settle_account_change(send.generation, send.about, answer),
             Some(AfterChange::ReadModels)
         );
-        assert!(!state.asks_the_servers_machine_first());
-        assert!(state.reply_source.on_mac());
-        assert!(
-            state.begin_use_this_computer().is_none(),
-            "nothing to move now"
-        );
+        assert!(state.reply_source.on_mac(), "as the server answered");
 
-        let said = "via \"helper\" is not built yet (#293); use \"loopback\" or \"mac\"";
-        read_as(
-            &mut state,
-            relay_kept(InferenceKind::LocalProxy, "loopback", None),
-        );
-        let send = state.begin_use_this_computer().expect("offered again");
+        assert!(state.note_relay_on(false));
+        assert!(state.begin_relay_change().is_none(), "off sends nothing");
+        assert_eq!(state.reply_source.changing, None);
+        assert!(state.reply_source.on_mac(), "the account keeps its way");
         assert_eq!(
-            state.settle_account_change(
-                send.generation,
-                send.about,
-                Err(OpenGrokError::from_opengrok(400, said))
-            ),
+            puts_sent(&server).await,
+            [json!({"kind": "local_proxy", "via": "mac"})]
+        );
+    }
+
+    /// A server whose read carries `relayEnabled` (opengrok-server relay-off fallback contract,
+    /// agreed 2026-10-03, not yet built) hears the switch both ways, each in one `PUT` with the
+    /// kind the server keeps: on, `{kind, relayEnabled: true, via: "mac"}`; off,
+    /// `{kind, relayEnabled: false}` and no way, which the account keeps.
+    #[tokio::test]
+    async fn a_server_that_keeps_relay_enabled_hears_the_switch_both_ways() {
+        use super::AfterChange;
+        let on = json!({"kind": "local_proxy", "relayEnabled": true, "via": "mac"});
+        let off = json!({"kind": "local_proxy", "relayEnabled": false});
+        let server = wiremock::MockServer::start().await;
+        for (sent, answered) in [
+            (on.clone(), relay_answer("mac", Some(true))),
+            (off.clone(), relay_answer("mac", Some(false))),
+        ] {
+            wiremock::Mock::given(wiremock::matchers::method("PUT"))
+                .and(wiremock::matchers::path("/account/inference-source"))
+                .and(wiremock::matchers::body_json(sent))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(answered))
+                .expect(1)
+                .mount(&server)
+                .await;
+        }
+        let mut state = ready_to_relay(&server, Some(true)).await;
+        for switched in [true, false] {
+            assert!(state.note_relay_on(switched));
+            let send = state
+                .begin_relay_change()
+                .expect("the server keeps whether the relay is on");
+            let answer = send.client.set_inference_source(&send.update).await;
+            assert_eq!(
+                state.settle_account_change(send.generation, send.about, answer),
+                Some(AfterChange::ReadModels),
+                "{switched}"
+            );
+        }
+        assert!(state.reply_source.on_mac(), "off moved no way");
+        assert_eq!(puts_sent(&server).await, [on, off]);
+    }
+
+    /// The server refusing to point the account at this computer is said under the switch, in its
+    /// own words, and nothing else gives: the switch stays on and the relay runs on, since whether
+    /// this computer relays is this computer's to say, and the account's way stays as the server
+    /// keeps it. Turning the switch off takes the words away with the change they were about.
+    #[tokio::test]
+    async fn a_refused_relay_change_shows_the_servers_words_and_the_switch_stays_on() {
+        use super::{AccountChange, AfterChange};
+        let said = "via \"helper\" is not built yet (#293); use \"loopback\" or \"mac\"";
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .and(wiremock::matchers::path("/account/inference-source"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(400).set_body_json(json!({"error": said})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut state = ready_to_relay(&server, None).await;
+        assert!(state.note_relay_on(true));
+        let send = state.begin_relay_change().expect("turning it on sends");
+        let answer = send.client.set_inference_source(&send.update).await;
+        assert_eq!(
+            state.settle_account_change(send.generation, send.about, answer),
             Some(AfterChange::Done)
         );
         assert_eq!(
-            state.reply_source.change_note(AccountChange::Via),
+            state.reply_source.change_note(AccountChange::Relay),
             Some(said)
         );
         assert_eq!(state.reply_source.change_note(AccountChange::NewBots), None);
-        assert!(state.asks_the_servers_machine_first(), "the line stays");
+        assert!(state.relay_mac.on, "the switch stays on");
+        assert!(state.relay_wanted(), "and the relay runs on");
+        assert!(!state.reply_source.on_mac(), "nothing was kept");
+
+        assert!(state.note_relay_on(false));
+        assert!(state.begin_relay_change().is_none());
+        assert_eq!(state.reply_source.change_note(AccountChange::Relay), None);
+    }
+
+    /// One change of the account's at a time. The switch moved while a pick for new Bots is with
+    /// the server moves this computer's relay at once, and what it sends the account waits for
+    /// that pick's answer, then goes once, as the switch says by then. Its answer, the newest word
+    /// there is, also settles a pick nobody heard back from.
+    #[test]
+    fn a_switch_moved_while_a_change_is_out_is_sent_once_that_one_is_answered() {
+        use super::{AccountChange, AfterChange};
+        let mut state = signed_in_state();
+        state.local_exec_machine_id = Some("mac_1".into());
+        read_as(&mut state, with_new_bots(None));
+        let pick = state
+            .begin_new_bots_change(Some(luna("high")))
+            .expect("a pick goes out");
+        assert!(state.note_relay_on(true), "the switch moves at once");
+        assert!(state.relay_wanted());
+        assert!(state.begin_relay_change().is_none(), "one at a time");
+        assert!(state.begin_owed_relay_change().is_none(), "the pick is out");
+        assert_eq!(
+            state.settle_account_change(
+                pick.generation,
+                pick.about,
+                Ok(with_new_bots(Some(luna("high"))))
+            ),
+            Some(AfterChange::Done)
+        );
+        let send = state.begin_owed_relay_change().expect("its turn now");
+        assert_eq!(
+            serde_json::to_value(&send.update).unwrap(),
+            json!({"kind": "gateway", "via": "mac"})
+        );
+        assert!(state.begin_owed_relay_change().is_none(), "sent once");
+        assert_eq!(
+            state.settle_account_change(send.generation, send.about, Ok(with_new_bots(None))),
+            Some(AfterChange::ReadModels)
+        );
+
+        // Off and on again while a pick is out, and the pick unanswered: the switch's change goes
+        // as it says by then, and its answer settles the pick's doubt.
+        let pick = state
+            .begin_new_bots_change(Some(luna("low")))
+            .expect("a pick goes out");
+        assert!(state.note_relay_on(false));
+        assert!(state.begin_relay_change().is_none());
+        assert!(state.note_relay_on(true));
+        assert!(state.begin_relay_change().is_none());
+        assert_eq!(
+            state.settle_account_change(
+                pick.generation,
+                pick.about,
+                Err(OpenGrokError::message("error sending request"))
+            ),
+            Some(AfterChange::ReadAgain)
+        );
+        let send = state.begin_owed_relay_change().expect("its turn now");
+        assert_eq!(
+            serde_json::to_value(&send.update).unwrap(),
+            json!({"kind": "gateway", "via": "mac"})
+        );
+        assert!(
+            state
+                .reply_source
+                .change_note(AccountChange::NewBots)
+                .is_some(),
+            "nobody knows yet"
+        );
+        state.settle_account_change(send.generation, send.about, Ok(with_new_bots(None)));
+        assert_eq!(state.reply_source.change_note(AccountChange::NewBots), None);
+        assert_eq!(state.reply_source.changing, None);
     }
 
     // ---- The account's time zone: this computer's, for its routines (opengrok-server PR #322) ---

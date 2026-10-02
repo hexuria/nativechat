@@ -7038,6 +7038,7 @@ mod tests {
                 kind: InferenceKind::Gateway,
                 via: Some(Via::Mac),
                 new_bot_default: None,
+                relay_enabled: None,
             })
             .await
             .unwrap();
@@ -7068,6 +7069,7 @@ mod tests {
                 kind: InferenceKind::LocalProxy,
                 via: Some(Via::Mac),
                 new_bot_default: None,
+                relay_enabled: None,
             })
             .await
             .unwrap_err();
@@ -7103,6 +7105,7 @@ mod tests {
                     kind: InferenceKind::Gateway,
                     via: None,
                     new_bot_default: None,
+                    relay_enabled: None,
                 })
                 .await
                 .map(drop),

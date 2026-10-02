@@ -247,6 +247,12 @@ pub struct InferenceSource {
     /// out, a server before it, which keeps no such default; `Some(None)` is `null`, none set.
     #[serde(default, deserialize_with = "keyed")]
     pub new_bot_default: Option<Option<NewBotDefault>>,
+    /// Whether the relay is switched on for the account, from a server that keeps it, which sends
+    /// it on every read, `true` until it is told otherwise (opengrok-server relay-off fallback
+    /// contract, agreed 2026-10-03, not yet built). `None` is the key left out, a server before
+    /// it, which is never sent one: the relay switch tells only a server that keeps it.
+    #[serde(default)]
+    pub relay_enabled: Option<bool>,
 }
 
 /// A key that is there, `null` or not: `Some(None)` for `null` and `Some(Some(_))` for a value,
@@ -354,7 +360,7 @@ pub struct RelayRead {
 }
 
 /// A `PUT /account/inference-source` body, as this app sends one: `{"kind", "via"?,
-/// "newBotDefault"?}`.
+/// "relayEnabled"?, "newBotDefault"?}`.
 ///
 /// The server takes no `PUT` without a kind (`apply` in
 /// `crates/opengrok-harness/src/local_proxy.rs`), and this app switches no kind, so `kind` is the
@@ -376,6 +382,12 @@ pub struct InferenceSourceUpdate {
     /// 47a5d6b), which keeps it as the account's way whatever the kind.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub via: Option<Via>,
+    /// Whether the relay is switched on, sent by the relay switch in the same body as what else it
+    /// changes, and only to a server whose read carries the key (opengrok-server relay-off fallback
+    /// contract, agreed 2026-10-03, not yet built): `true` with `via: "mac"` as it goes on, and
+    /// `false` with no way as it goes off.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relay_enabled: Option<bool>,
     /// Default for new Bots, sent whole when the app changes it, only to a server whose read
     /// carries the key, and `null` to take it away (opengrok-server PR #322 new-bot-default, not
     /// yet on main: `apply` in `crates/opengrok-harness/src/local_proxy.rs`): absent keeps it,
@@ -587,6 +599,7 @@ mod tests {
                 via: None,
                 relay: None,
                 new_bot_default: None,
+                relay_enabled: None,
             }
         );
         let unset: InferenceSource = serde_json::from_value(json!({
@@ -618,6 +631,7 @@ mod tests {
                 kind,
                 via: None,
                 new_bot_default: None,
+                relay_enabled: None,
             };
             assert_eq!(
                 serde_json::to_value(&bare).unwrap(),
@@ -629,6 +643,7 @@ mod tests {
             kind: InferenceKind::Gateway,
             via: Some(Via::Mac),
             new_bot_default: None,
+            relay_enabled: None,
         };
         let body = serde_json::to_value(&moved).unwrap();
         assert_eq!(body, json!({"kind": "gateway", "via": "mac"}));
@@ -810,6 +825,7 @@ mod tests {
             serde_json::to_value(InferenceSourceUpdate {
                 kind: InferenceKind::Gateway,
                 via: None,
+                relay_enabled: None,
                 new_bot_default,
             })
             .unwrap()
@@ -827,6 +843,53 @@ mod tests {
                 "newBotDefault": {"source": "local_proxy", "model": "gpt-6-sol--fast", "effort": "high"}
             }),
             "whole"
+        );
+    }
+
+    /// Whether the relay is switched on reads as the agreed contract writes it (opengrok-server
+    /// relay-off fallback contract, agreed 2026-10-03, not yet built), a bool on every read of a
+    /// server that keeps it, and as no key from one before it. A `PUT` carries it only when the
+    /// relay switch sends it: with the relay's way as the switch goes on, and with none as it goes
+    /// off.
+    #[test]
+    fn whether_the_relay_is_on_reads_and_puts_as_the_contract_writes_it() {
+        let read = |relay_enabled: Option<Value>| {
+            let mut body = json!({
+                "kind": "local_proxy", "via": "loopback", "baseUrl": null, "localModel": null,
+                "healthy": false, "hasApiKey": false,
+                "relay": {"connected": false, "machineId": null, "machineLabel": null,
+                          "localModel": null}
+            });
+            if let Some(enabled) = relay_enabled {
+                body["relayEnabled"] = enabled;
+            }
+            serde_json::from_value::<InferenceSource>(body).unwrap()
+        };
+        assert_eq!(read(None).relay_enabled, None, "a server before it");
+        assert_eq!(read(Some(json!(true))).relay_enabled, Some(true));
+        assert_eq!(read(Some(json!(false))).relay_enabled, Some(false));
+
+        let put = |via, relay_enabled| {
+            serde_json::to_value(InferenceSourceUpdate {
+                kind: InferenceKind::LocalProxy,
+                via,
+                relay_enabled,
+                new_bot_default: None,
+            })
+            .unwrap()
+        };
+        assert_eq!(
+            put(Some(Via::Mac), Some(true)),
+            json!({"kind": "local_proxy", "relayEnabled": true, "via": "mac"})
+        );
+        assert_eq!(
+            put(None, Some(false)),
+            json!({"kind": "local_proxy", "relayEnabled": false})
+        );
+        assert_eq!(
+            put(Some(Via::Mac), None),
+            json!({"kind": "local_proxy", "via": "mac"}),
+            "left alone, kept"
         );
     }
 

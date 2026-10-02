@@ -676,6 +676,22 @@ const REST_FIELDS_NOT_RECORDED_YET: &[(&str, &str, &str)] = &[
          and the answer carries it as a read does. Default for new Bots' picker sends it at \
          once. Its recording comes with the corpus re-vendored from a main that has #322.",
     ),
+    (
+        "GET__account_inference-source",
+        "relayEnabled",
+        "opengrok-server relay-off fallback contract, agreed 2026-10-03, not yet built: the \
+         account's setting says on every read whether the relay is switched on, a bool, true by \
+         default, and Settings → Relay's switch sends it only where the read carries the key. Its \
+         recording comes with the corpus re-vendored from a main that builds it.",
+    ),
+    (
+        "PUT__account_inference-source",
+        "relayEnabled",
+        "opengrok-server relay-off fallback contract, agreed 2026-10-03, not yet built: the relay \
+         switch sends relayEnabled true with via \"mac\" in one PUT as it goes on, and false with \
+         no via as it goes off, only where the read carries the key, and the answer carries it as \
+         a read does. Its recording comes with the corpus re-vendored from a main that builds it.",
+    ),
 ];
 
 // ---- the corpus ----
@@ -3782,6 +3798,13 @@ fn inference_source(_: u16, body: &Value) -> Check {
             ));
         }
     }
+    // Whether the relay is switched on, from a server that keeps it (opengrok-server relay-off
+    // fallback contract, agreed 2026-10-03, not yet built): read as sent, and as no key from one
+    // before it, which the relay switch then tells nothing.
+    must!(
+        read.relay_enabled == body.get("relayEnabled").and_then(Value::as_bool),
+        "whether the relay is on should come through as sent: {read:?} from {body}"
+    );
     Ok(())
 }
 

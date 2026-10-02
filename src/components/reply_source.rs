@@ -9,7 +9,9 @@
 //! its own opencodex and streams the answer back (`opengrok::relay`). The page has the switch that
 //! makes this computer the relay, where the relay stands, and opencodex's address and key here,
 //! which Save keeps on this computer, the key in its secure storage (the Keychain). The window
-//! still calls no model, and the key never goes to the server.
+//! still calls no model, and the key never goes to the server. The relay answers only the turns
+//! that ask through this computer, so the same press that turns it on points the account's way to
+//! the plan here (`via: "mac"`); turning it off moves no way (`AppState::begin_relay_change`).
 //!
 //! The page no longer sets up the plan on the server's own machine, the proxy address and key the
 //! server dials on its loopback, and sends neither: whatever the account keeps there stays as the
@@ -66,6 +68,9 @@ pub(crate) const BOT_USAGE_PLAN: &str = "agent-usage-plan";
 /// Relay your plan from this computer: the card, and each of its controls and lines.
 pub(crate) const RELAY: &str = "settings-relay";
 pub(crate) const RELAY_SWITCH: &str = "settings-relay-switch";
+/// Under the switch: what became of what it sent the account when that did not go as asked, a
+/// refusal in the server's words or that nobody knows whether it was kept.
+pub(crate) const RELAY_SWITCH_ERROR: &str = "settings-relay-switch-error";
 /// Where the relay stands: this computer relaying, another computer, connecting, or not
 /// connected.
 pub(crate) const RELAY_STATUS: &str = "settings-relay-status";
@@ -77,12 +82,6 @@ pub(crate) const RELAY_KEY: &str = "settings-relay-key";
 pub(crate) const RELAY_KEY_REMOVE: &str = "settings-relay-key-remove";
 /// Why the relay takes no change: a server without the relay, or a computer not enrolled.
 pub(crate) const RELAY_UNAVAILABLE: &str = "settings-relay-unavailable";
-/// While the relay is on here and the account still asks the server's own machine first: the
-/// line saying so, Use this computer instead beside it, and under them what became of it when it
-/// did not go as asked.
-pub(crate) const RELAY_VIA: &str = "settings-relay-via";
-pub(crate) const RELAY_VIA_USE: &str = "settings-relay-via-use";
-pub(crate) const RELAY_VIA_ERROR: &str = "settings-relay-via-error";
 /// Default for new Bots: the section, the line saying why it takes no change, and the picker's
 /// card in it, whose popover's parts are `model_picker::NEW_BOTS_IDS`.
 pub(crate) const NEW_BOTS: &str = "settings-new-bots";
@@ -125,10 +124,6 @@ pub(crate) const RELAY_KEY_GOES: &str =
     "The key leaves this computer's secure storage when you save.";
 /// Where the relay's key was typed and the page left before a Save.
 pub(crate) const RELAY_RETYPE_KEY: &str = "Type the key again to keep it on this computer.";
-/// While the relay is on here and the account's way to the plan is the server's own machine
-/// (`AppState::asks_the_servers_machine_first`), in the owner's words.
-pub(crate) const VIA_LOOPBACK_LINE: &str = "Your account still asks the server's own machine first";
-pub(crate) const USE_THIS_COMPUTER: &str = "Use this computer instead";
 /// Under the status line once another computer took the relay from this one.
 pub(crate) const RELAY_TAKE_BACK: &str =
     "Turn this off and on to relay from this computer instead.";
@@ -383,8 +378,10 @@ fn labelled(label: &'static str, muted: Hsla, control: impl IntoElement) -> impl
 
 impl ReplySourcePage {
     /// Relay your plan from this computer: the switch that makes this computer the relay, where
-    /// the relay stands, and opencodex's address and key here. The switch acts at once and is this
-    /// computer's; the address and the key wait for Save.
+    /// the relay stands, and opencodex's address and key here. The switch acts at once, and as it
+    /// goes on it also points the account at this computer (`AppState::set_relay_on`), with what
+    /// became of that under it when it did not go as asked; the address and the key wait for
+    /// Save.
     fn relay_card(&self, state: &AppState, theme: &Theme) -> impl IntoElement {
         let muted = theme.muted_foreground;
         let app = self.state.clone();
@@ -403,9 +400,9 @@ impl ReplySourcePage {
         let key_live = settings.relay_key_editable();
         let retype = settings.relay_retype_key;
         let on = relay.on;
-        let via_line = state.asks_the_servers_machine_first();
-        let changing = settings.changing.is_some();
-        let via_note = settings.change_note(AccountChange::Via).map(str::to_string);
+        let switch_note = settings
+            .change_note(AccountChange::Relay)
+            .map(str::to_string);
         card()
             .flex()
             .flex_col()
@@ -437,6 +434,17 @@ impl ReplySourcePage {
                             })
                     }),
             )
+            // The server's words for what the switch sent the account, when it did not keep it.
+            // The switch stays as the person put it, and the relay runs as it says.
+            .when_some(switch_note, |this, note| {
+                this.child(
+                    div()
+                        .id(RELAY_SWITCH_ERROR)
+                        .text_xs()
+                        .text_color(theme.danger)
+                        .child(note),
+                )
+            })
             .when_some(unavailable, |this, line| {
                 this.child(
                     div()
@@ -465,44 +473,6 @@ impl ReplySourcePage {
                         .text_xs()
                         .text_color(if failed { theme.danger } else { muted })
                         .child(detail),
-                )
-            })
-            // The relay answers only the turns that ask through this computer, and the account's
-            // own way is still the server's machine: one press moves it, and nothing moves it by
-            // itself.
-            .when(via_line, |this| {
-                let app = app.clone();
-                this.child(
-                    h_flex()
-                        .gap(px(8.))
-                        .items_center()
-                        .child(
-                            div()
-                                .id(RELAY_VIA)
-                                .flex_1()
-                                .min_w(px(0.))
-                                .text_xs()
-                                .text_color(muted)
-                                .child(VIA_LOOPBACK_LINE),
-                        )
-                        .child(
-                            Button::new(RELAY_VIA_USE)
-                                .label(USE_THIS_COMPUTER)
-                                .small()
-                                .disabled(changing)
-                                .on_click(move |_, _, cx| {
-                                    app.update(cx, |state, cx| state.use_this_computer(cx));
-                                }),
-                        ),
-                )
-            })
-            .when_some(via_note, |this, note| {
-                this.child(
-                    div()
-                        .id(RELAY_VIA_ERROR)
-                        .text_xs()
-                        .text_color(theme.danger)
-                        .child(note),
                 )
             })
             .child(labelled(
@@ -834,7 +804,7 @@ mod tests {
             NEW_BOTS_TITLE, NOT_SAVED, RELAY_ADDR_LABEL, RELAY_INTRO, RELAY_KEY_GOES,
             RELAY_KEY_KEPT, RELAY_KEY_LABEL, RELAY_KEY_PLACEHOLDER, RELAY_NOT_ENROLLED,
             RELAY_NOT_ON_SERVER, RELAY_RETYPE_KEY, RELAY_TAKE_BACK, RELAY_TITLE, REMOVE_KEY_LABEL,
-            SAVE_LABEL, TAB_LABEL, USE_THIS_COMPUTER, VIA_LOOPBACK_LINE, relay_line_words,
+            SAVE_LABEL, TAB_LABEL, relay_line_words,
         };
         use crate::opengrok::{
             SERVER_QUIET, SERVER_UNREACHED, SERVER_WITHOUT_RELAY, TOKEN_REFUSED,
@@ -874,8 +844,6 @@ mod tests {
             NEW_BOTS_TITLE,
             NEW_BOTS_COMING_SOON,
             NEW_BOTS_LINE,
-            VIA_LOOPBACK_LINE,
-            USE_THIS_COMPUTER,
             ASKING,
             RELAY_ADDRESS_NOT_HERE,
             TOKEN_REFUSED,
@@ -909,7 +877,6 @@ mod tests {
             RELAY_TAKE_BACK,
             RELAY_NOT_ON_SERVER,
             TOKEN_REFUSED,
-            USE_THIS_COMPUTER,
         ] {
             assert!(said.contains("computer"), "{said:?}");
         }

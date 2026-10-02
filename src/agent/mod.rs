@@ -367,18 +367,18 @@
 //! words below are as they were. `settings-relay`, Relay your plan from this computer:
 //! `settings-relay-switch` (a switch, checked while on; it acts at once and waits on no Save, off
 //! always, on once this computer is enrolled; after another computer took the relay, turning it
-//! off and on takes it back), `settings-relay-unavailable` (why the card takes no change: this
-//! computer not enrolled), `settings-relay-status` (label the line, `This computer is relaying` /
-//! `Another computer (<label>) is relaying` / `Connecting…` / `Not connected`; value `answering` /
-//! `another-mac` / `connecting` / `not-connected`), `settings-relay-detail` (under it: why this
-//! computer is not connected, state `trouble`, or how to take the relay back),
-//! `settings-relay-via` and `settings-relay-via-use` (only while the relay is switched on here
-//! and the account's way to the plan, as the server keeps it, is still the server's own machine:
-//! the line "Your account still asks the server's own machine first", valued `loopback`, and the
-//! button "Use this computer instead", which moves the account's way at once as
-//! `PUT /account/inference-source` `{kind, via: "mac"}` with the kind the server keeps; dead
-//! while a change is with the server), `settings-relay-via-error` (the server's words for a
-//! refusal of it, or that nobody knows whether it was kept),
+//! off and on takes it back. Turning it on also points the account at this computer in the same
+//! press, as `PUT /account/inference-source` `{kind, via: "mac"}` with the kind the server keeps,
+//! and `relayEnabled: true` in the same body to a server whose read carries that key; turning it
+//! off moves no way, and sends `{kind, relayEnabled: false}` to such a server and nothing to
+//! another. One change of the account's at a time: the switch moved while one is out sends once
+//! that one is answered), `settings-relay-switch-error` (under the switch: the server's words for
+//! a refusal of what it sent, or that nobody knows whether it was kept; the switch stays as it was
+//! put and the relay runs as it says), `settings-relay-unavailable` (why the card takes no change:
+//! this computer not enrolled), `settings-relay-status` (label the line, `This computer is
+//! relaying` / `Another computer (<label>) is relaying` / `Connecting…` / `Not connected`; value
+//! `answering` / `another-mac` / `connecting` / `not-connected`), `settings-relay-detail` (under
+//! it: why this computer is not connected, state `trouble`, or how to take the relay back),
 //! `settings-relay-addr` (named `opencodex address`, value = opencodex's address on this
 //! computer; `set_value` and `type` write it; an address not on this computer is refused by Save
 //! with a hint, an emptied one goes back to the default), `settings-relay-key` (named `opencodex
