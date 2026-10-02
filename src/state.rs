@@ -1,8 +1,8 @@
 use crate::actions::TtsSource;
 use crate::audio::AudioInput;
 use crate::chrome::{
-    ResponsiveCollapse, SIDEBAR_EXPANDED, SidebarChrome, SidebarMode, collapse_for_width,
-    remember_choice, sidebar_from_resize,
+    ResponsiveCollapse, SIDEBAR_EXPANDED, SidebarChrome, collapse_for_width, remember_choice,
+    sidebar_from_resize,
 };
 use crate::config::Config;
 /// The routine editor's schedule and the cron line it becomes. Re-exported because every
@@ -4421,7 +4421,6 @@ pub struct AppState {
     edit_slot: Option<EditSlot>,
     pub audio_input: Option<AudioInput>,
     pub sidebar_collapsed: bool,
-    pub sidebar_menu_open: bool,
     pub sidebar_hidden: bool,
     pub sidebar_expanded_width: f32,
     pub sidebar_responsive: ResponsiveCollapse,
@@ -5146,7 +5145,6 @@ impl AppState {
             edit_slot: None,
             audio_input: None,
             sidebar_collapsed: false,
-            sidebar_menu_open: false,
             sidebar_hidden: false,
             sidebar_expanded_width: SIDEBAR_EXPANDED,
             sidebar_responsive: ResponsiveCollapse::default(),
@@ -17170,43 +17168,29 @@ impl AppState {
 
     pub fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
         self.sidebar_hidden = !self.sidebar_hidden;
-        self.sidebar_menu_open = false;
         cx.notify();
     }
 
-    pub fn set_sidebar_menu_open(&mut self, open: bool, cx: &mut Context<Self>) {
-        let open = open && !self.sidebar_hidden;
-        if self.sidebar_menu_open != open {
-            self.sidebar_menu_open = open;
-            cx.notify();
-        }
-    }
-
-    pub fn set_sidebar_mode(&mut self, mode: SidebarMode, cx: &mut Context<Self>) {
-        self.sidebar_menu_open = false;
-        self.sidebar_hidden = mode == SidebarMode::Hidden;
-        if mode != SidebarMode::Hidden {
-            self.sidebar_collapsed = mode == SidebarMode::Mini;
-            // An explicit menu choice is a preference even while the pane floats.
-            self.sidebar_responsive.preferred = self.sidebar_collapsed;
-            self.auto_collapsed = false;
-        }
+    /// Right-click changes the remembered size without changing visibility.
+    pub fn toggle_sidebar_size(&mut self, cx: &mut Context<Self>) {
+        self.sidebar_collapsed = !self.sidebar_collapsed;
+        self.auto_collapsed = false;
+        // An explicit mouse choice is remembered even while the sidebar floats.
+        self.sidebar_responsive.preferred = self.sidebar_collapsed;
         cx.notify();
     }
 
     /// Close the topmost temporary pane. The caller establishes that the window is narrow.
     pub fn dismiss_floating_chrome(&mut self, cx: &mut Context<Self>) {
-        if self.sidebar_menu_open {
-            self.set_sidebar_menu_open(false, cx);
-        } else if self.right_pane != RightPane::Closed {
+        if self.right_pane != RightPane::Closed {
             self.close_right_pane(cx);
         } else {
-            self.set_sidebar_mode(SidebarMode::Hidden, cx);
+            self.sidebar_hidden = true;
+            cx.notify();
         }
     }
 
     pub fn toggle_mini_sidebar(&mut self, cx: &mut Context<Self>) {
-        self.sidebar_menu_open = false;
         if self.sidebar_hidden {
             self.sidebar_hidden = false;
             self.sidebar_collapsed = false;
@@ -17219,7 +17203,6 @@ impl AppState {
     }
 
     pub fn resize_sidebar(&mut self, width: f32, cx: &mut Context<Self>) {
-        self.sidebar_menu_open = false;
         let next = sidebar_from_resize(
             SidebarChrome {
                 hidden: self.sidebar_hidden,
@@ -19990,17 +19973,14 @@ fn skill_bundle(found: Vec<(String, Vec<u8>)>) -> Result<(String, Vec<SkillFile>
 #[cfg(test)]
 mod tests {
     #[gpui_kit::test]
-    fn sidebar_modes_restore_last_size_and_hidden_stays_hidden(cx: &mut gpui_kit::TestAppContext) {
-        use crate::chrome::SidebarMode;
+    fn sidebar_click_restores_last_size_and_hidden_stays_hidden(cx: &mut gpui_kit::TestAppContext) {
         use gpui_kit::AppContext as _;
         let app = cx.new(|_| super::AppState::new());
         app.update(cx, |state, cx| {
-            for mode in [SidebarMode::Expanded, SidebarMode::Mini] {
-                state.set_sidebar_mode(mode, cx);
-                let collapsed = mode == SidebarMode::Mini;
-                state.set_sidebar_menu_open(true, cx);
-                state.set_sidebar_mode(SidebarMode::Hidden, cx);
-                assert!(!state.sidebar_menu_open);
+            for collapsed in [false, true] {
+                state.set_sidebar_collapsed(collapsed, false, cx);
+                state.sidebar_hidden = false;
+                state.toggle_sidebar(cx);
                 for width in [720., 1200., 899., 900., 600., 1400.] {
                     state.apply_responsive_sidebar(width, cx);
                     assert!(state.sidebar_hidden);
@@ -20014,26 +19994,50 @@ mod tests {
     }
 
     #[gpui_kit::test]
-    fn floating_dismissal_closes_menu_before_sidebar_and_remembers_mini(
-        cx: &mut gpui_kit::TestAppContext,
-    ) {
-        use crate::chrome::SidebarMode;
+    fn floating_dismissal_hides_sidebar_and_remembers_size(cx: &mut gpui_kit::TestAppContext) {
         use gpui_kit::AppContext as _;
         let app = cx.new(|_| super::AppState::new());
         app.update(cx, |state, cx| {
-            state.set_sidebar_mode(SidebarMode::Mini, cx);
-            state.set_sidebar_menu_open(true, cx);
-            state.dismiss_floating_chrome(cx);
-            assert!(!state.sidebar_menu_open);
-            assert!(!state.sidebar_hidden);
-            state.dismiss_floating_chrome(cx);
-            assert!(state.sidebar_hidden);
-            assert!(state.sidebar_collapsed);
-            state.set_sidebar_menu_open(true, cx);
-            assert!(!state.sidebar_menu_open);
-            state.toggle_sidebar(cx);
-            assert!(!state.sidebar_hidden);
-            assert!(state.sidebar_collapsed);
+            for collapsed in [false, true] {
+                state.set_sidebar_collapsed(collapsed, false, cx);
+                state.sidebar_hidden = false;
+                state.dismiss_floating_chrome(cx);
+                state.dismiss_floating_chrome(cx);
+                assert!(state.sidebar_hidden);
+                assert_eq!(state.sidebar_collapsed, collapsed);
+                state.toggle_sidebar(cx);
+                assert!(!state.sidebar_hidden);
+                assert_eq!(state.sidebar_collapsed, collapsed);
+            }
+        });
+    }
+
+    #[gpui_kit::test]
+    fn sidebar_size_click_preserves_visibility_and_remembers_choice(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        use gpui_kit::AppContext as _;
+        let app = cx.new(|_| super::AppState::new());
+        app.update(cx, |state, cx| {
+            for narrow in [false, true] {
+                for hidden in [false, true] {
+                    for collapsed in [false, true] {
+                        state.sidebar_hidden = hidden;
+                        state.sidebar_collapsed = collapsed;
+                        state.sidebar_responsive.was_narrow = narrow;
+                        state.sidebar_responsive.preferred = collapsed;
+                        state.toggle_sidebar_size(cx);
+                        assert_eq!(state.sidebar_hidden, hidden);
+                        assert_eq!(state.sidebar_collapsed, !collapsed);
+                        assert_eq!(state.sidebar_responsive.preferred, !collapsed);
+                        assert!(!state.auto_collapsed);
+                        state.toggle_sidebar_size(cx);
+                        assert_eq!(state.sidebar_hidden, hidden);
+                        assert_eq!(state.sidebar_collapsed, collapsed);
+                        assert_eq!(state.sidebar_responsive.preferred, collapsed);
+                    }
+                }
+            }
         });
     }
 
