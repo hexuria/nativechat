@@ -4,10 +4,11 @@
 //! agree. `fixtures/wire/` is the server's side of that, recorded by the server itself: every
 //! AG-UI frame and REST body its own tests drove, teed off its router by the recorder of
 //! opengrok-server#258 and written out by its `examples/wire_corpus.rs`. It is vendored whole from
-//! the server's `tests/fixtures/wire/` at server main 06db932 (#309, after #308, a retry of a
-//! queued send's reply), pin b6ca457, the commit its `MANIFEST.json` names as the one it was
-//! recorded at. The layout is opengrok-server#255's: `agui/<type>/<slug>.json`, a CUSTOM under
-//! `agui/custom/<name>/`, and `rest/<METHOD>_<route>/<status>-<slug>.json` holding
+//! the server's `tests/fixtures/wire/` at PR #334 (branch `routine-tools`, the server half of
+//! #316: a Bot's routine tools, a routine's own zone, the one-minute floor and skipped runs) at
+//! 628dcff, recorded at 80cb795, the commit its `MANIFEST.json` names, on top of server main
+//! 73064e2 (#333, after #322). The layout is opengrok-server#255's: `agui/<type>/<slug>.json`, a
+//! CUSTOM under `agui/custom/<name>/`, and `rest/<METHOD>_<route>/<status>-<slug>.json` holding
 //! `{method, path, status, body}`, one file per distinct shape, named after the first test that
 //! produced it; and since the relay, the frames of its stream under `relay/<type>/<slug>.json`,
 //! which are not AG-UI and which the Mac, not the chat, reads. `MANIFEST.json` names the server
@@ -473,6 +474,15 @@ const CLIENT_IGNORES: &[(Slot, &str, &str)] = &[
          the turn, so on the stream a stop reads as a finish.",
     ),
     (
+        Slot::CustomName,
+        "opengrok.timeline",
+        "A row of a Bot's main chat (opengrok-server #314, built in #325: TIMELINE_NAME in \
+         opengrok-wire pair.rs), sent live beside the stored row a replay carries in timeline: a \
+         messaged row says the Bot messaged another, and its chip opens the two Bots' pair \
+         thread. This app has no client half of #314 yet, so the frame leaves the turn as it was \
+         and the row is not shown; the turn's own frames still paint what the Bot said.",
+    ),
+    (
         Slot::ApprovalReason,
         "exec-consent",
         "The default card. approval_from_event fills this word in when a frame has none, and \
@@ -497,7 +507,37 @@ const WORDS_NOT_RECORDED_YET: &[(Slot, &str, &str)] = &[];
 /// Fixtures this app still reads wrongly, with the words their check fails with and why. The
 /// check has to fail with those words: one that passes means the drift is fixed and the entry
 /// goes, and one that fails some other way is a new problem, not this one.
-const KNOWN_DRIFT: &[(&str, &str, &str)] = &[];
+const KNOWN_DRIFT: &[(&str, &str, &str)] = &[
+    (
+        "rest/GET__schedules__id__runs/200-a_due_routine_with_no_mac_is_skipped_and_its_clock_moves_on.json",
+        "invalid type: null, expected a string",
+        "A firing the server skipped because the Bot's own plan could not answer (opengrok-server \
+         #316, `history` in autonomy/routes.rs) is a line of the history with runId, status and \
+         startedAtMs null, beside its own at, state skipped, the code and the server's reason. \
+         ScheduleRun takes a run id, a status and a start on every line, so the whole history \
+         fails to parse: the read's error goes on the routine's red line, and none of its runs is \
+         listed.",
+    ),
+    (
+        "rest/GET__schedules__id__runs/200-run_now_with_no_mac_answers_409_and_records_the_skip.json",
+        "invalid type: null, expected a string",
+        "The same skipped line, recorded by a Run it now refused with 409 while the Mac was away \
+         (cause manual): the history it is in does not parse.",
+    ),
+    (
+        "agui/custom/run-awaiting-approval/a_delete_asks_first_naming_the_routine_as_stored.json",
+        "the card says \"delete_routine — a plugin tool",
+        "A Bot's delete of a routine always asks first (opengrok-server #316): the server's card \
+         sentence is its summary_for arm for the four routine tools (opengrok-tools cards.rs), \
+         and its why names the routine as stored. approval_summary has no such arm, so the card \
+         calls delete_routine a plugin tool, under a title about the Bot's computer.",
+    ),
+    (
+        "rest/GET__ag-ui_approvals/200-a_delete_asks_first_naming_the_routine_as_stored.json",
+        "the card says \"delete_routine — a plugin tool",
+        "The same card in the approvals queue, which reads it the same way.",
+    ),
+];
 
 /// How a 502, 503 or 504 the server wrote itself fails [`refusal`] when it is not in the shape
 /// that says so.
@@ -623,15 +663,7 @@ const REST_NOT_READ: &[(&str, &str, &str)] = &[
 ///
 /// Only routes built ahead of a recording are listed. Routes this app asks that no test on the
 /// server drives are a different gap, and not this list's.
-const REST_NOT_RECORDED_YET: &[(&str, &str, &str)] = &[(
-    "PUT__account",
-    "/account",
-    "opengrok-server PR #322 new-bot-default, not yet on main: `put_me` in \
-     crates/opengrok-server/src/account_api.rs keeps the IANA zone a person's routines default \
-     to (#316), and this app sends this computer's after sign-in and when it moves, only where the \
-     account's read carries timeZone and the zone differs. Its recording comes with the corpus \
-     re-vendored from a main that has #322.",
-)];
+const REST_NOT_RECORDED_YET: &[(&str, &str, &str)] = &[];
 
 /// Routes this app asks with this Mac's machine token (`local_exec.rs` `MachineCredential`)
 /// rather than the person's session, so they never pass through `send_json_within`: a 401 on one
@@ -651,32 +683,6 @@ const MACHINE_TOKEN_ROUTES: &[&str] = &[
 /// has gone stale and comes off this list, and
 /// [`every_key_asked_ahead_of_its_recording_is_read_and_not_recorded_yet`] fails until it does.
 const REST_FIELDS_NOT_RECORDED_YET: &[(&str, &str, &str)] = &[
-    (
-        "GET__account",
-        "timeZone",
-        "opengrok-server PR #322 new-bot-default, not yet on main: `account_json` in \
-         crates/opengrok-server/src/account_api.rs sends the account's IANA time zone on every \
-         read, null until set (#316), and this app sends its own only where the read carries the \
-         key. Its recording comes with the corpus re-vendored from a main that has #322.",
-    ),
-    (
-        "GET__account_inference-source",
-        "newBotDefault",
-        "opengrok-server #322, on main c0bb6ae: `described` in \
-         crates/opengrok-harness/src/local_proxy.rs sends the account's default for new Bots on \
-         every read, null until set, and Settings → General's Default for new Bots is live only \
-         where the read carries the key. Its recording comes with the corpus re-vendored from \
-         the restamp after #322, PR #333.",
-    ),
-    (
-        "PUT__account_inference-source",
-        "newBotDefault",
-        "opengrok-server #322, on main c0bb6ae: `apply` in \
-         crates/opengrok-harness/src/local_proxy.rs takes newBotDefault whole, null clears it, \
-         and the answer carries it as a read does. Default for new Bots' picker sends it at \
-         once. Its recording comes with the corpus re-vendored from the restamp after #322, PR \
-         #333.",
-    ),
     (
         "GET__account_inference-source",
         "relayEnabled",
@@ -2274,6 +2280,8 @@ const REST_ROUTES: &[(&str, RestCheck)] = &[
     ("POST__auth_refresh", session_in_cookies),
     ("POST__auth_logout", read_as_done),
     ("GET__account", account),
+    // The time zone this computer keeps on the account (`set_time_zone`), answered as a read is.
+    ("PUT__account", account),
     // Turns, threads and the queue of sends waiting on a busy coworker.
     ("POST__ag-ui", turn_stream),
     ("GET__ag-ui_threads", thread_list),
@@ -2319,6 +2327,11 @@ const REST_ROUTES: &[(&str, RestCheck)] = &[
     ("GET__connections__connector__authorize", sign_in_link),
     ("GET__coworkers__coworker_id__usage", coworker_usage),
     ("GET__coworkers__coworker_id__computer", computer),
+    // Get a computer, Update and Reset (`ensure_coworker_computer`, `update_coworker_computer`,
+    // `reset_coworker_computer`) each answer with the status a read gives.
+    ("POST__coworkers__coworker_id__computer", computer),
+    ("POST__coworkers__coworker_id__computer_update", computer),
+    ("POST__coworkers__coworker_id__computer_reset", computer),
     ("GET__coworkers__coworker_id__screen", screen),
     (
         "PUT__coworkers__coworker_id__computer_egress-policy",
@@ -4468,8 +4481,9 @@ fn account(_: u16, body: &Value) -> Check {
             && me.is_admin == body.get("isAdmin").and_then(Value::as_bool),
         "the account came through changed: {me:?}"
     );
-    // The time zone, from a server that keeps one (opengrok-server PR #322 new-bot-default, not
-    // yet on main): read exactly when the key is sent, null as none set.
+    // The time zone, from a server that keeps one (opengrok-server #322, on main since c0bb6ae:
+    // `account_json` in `crates/opengrok-server/src/account_api.rs`), on a read and on the answer
+    // to `PUT /account`: read exactly when the key is sent, null as none set.
     let sent = body
         .get("timeZone")
         .map(|zone| zone.as_str().map(str::to_string));
@@ -5806,13 +5820,18 @@ fn every_recorded_setting_is_from_a_server_that_knows_the_relay() {
 /// bf99845): the roster's, a hire's and a PATCH's. So every recorded row reads
 /// as one from a server that keeps a door per Bot, which is what lets a Bot's model picker offer
 /// the person's plan and send the Bot's door with a pick; a server from before per-Bot doors
-/// writes no `source`, and is taken to keep none. A hire answers `null`, a Bot that follows the
-/// account's door until it is given one of its own, and the recording holds a row on each of the
-/// Bot's own two doors, so every reading of the key meets the server's own words.
+/// writes no `source`, and is taken to keep none. A hire whose body names its model answers
+/// `null`, a Bot that follows the account's door until it is given one of its own; since #322 (on
+/// main since c0bb6ae: `hire` in the same file, and `Coworker::born_on`), one hired with no model
+/// is born on its hirer's default for new Bots, door and all. The recording holds a hire of each,
+/// and a row on the Bot's own plan. A row on its other door, `gateway`, is the same shape to the
+/// recorder, which keeps one file per shape, and the recording at PR #334 (628dcff) keeps none, so
+/// that word is read beyond the recording ([`a_bots_door_is_read_beyond_the_recording`]).
 #[test]
 fn every_recorded_coworker_row_is_from_a_server_that_keeps_a_door_per_bot() {
     let corpus = Corpus::load();
     let mut doors = Vec::new();
+    let mut hires = Vec::new();
     for (file, fixture) in &corpus.bodies {
         let route = file.split('/').nth(1).unwrap_or("");
         let rows = match (route, &fixture["body"]) {
@@ -5833,11 +5852,7 @@ fn every_recorded_coworker_row_is_from_a_server_that_keeps_a_door_per_bot() {
                 "{file}: a server that keeps a door per Bot writes it on every row: {bot:?}"
             );
             if route == "POST__coworkers" {
-                assert_eq!(
-                    bot.source,
-                    CoworkerSource::AccountDefault,
-                    "{file}: a hire follows the account's door until it is given one: {bot:?}"
-                );
+                hires.push(bot.source.clone());
             }
             if !doors.contains(&bot.source) {
                 doors.push(bot.source);
@@ -5846,7 +5861,6 @@ fn every_recorded_coworker_row_is_from_a_server_that_keeps_a_door_per_bot() {
     }
     for door in [
         CoworkerSource::AccountDefault,
-        CoworkerSource::Kind(InferenceKind::Gateway),
         CoworkerSource::Kind(InferenceKind::LocalProxy),
     ] {
         assert!(
@@ -5854,12 +5868,23 @@ fn every_recorded_coworker_row_is_from_a_server_that_keeps_a_door_per_bot() {
             "the recording holds a Bot whose door reads {door:?}: {doors:?}"
         );
     }
+    assert!(
+        hires.contains(&CoworkerSource::AccountDefault),
+        "the recording holds a hire that follows the account's door: {hires:?}"
+    );
+    assert!(
+        hires
+            .iter()
+            .any(|door| matches!(door, CoworkerSource::Kind(_))),
+        "the recording holds a hire born on its hirer's default for new Bots: {hires:?}"
+    );
 }
 
-/// A Bot's door, read beyond the recording, which holds rows with `null` and each of the server's
-/// two words, a hire's and a PATCH's among them, and the PATCH's 400s for a Bot left on the
-/// person's plan with a model the allowlist does not take (opengrok-server main d6f640e (#307,
-/// after #304), pin bf99845): a row whose door is a word
+/// A Bot's door, read beyond the recording, which holds rows with `null` and `local_proxy`, a
+/// hire's and a PATCH's among them, and the PATCH's 400s for a Bot left on the person's plan with
+/// a model the allowlist does not take (opengrok-server main d6f640e (#307, after #304), pin
+/// bf99845): a row on the server's other word, `gateway`, which the recording at PR #334
+/// (628dcff) keeps no file of, a row whose door is a word
 /// this app has not heard of, and one from a server before per-Bot doors, with no `source` at
 /// all, each read as sent, and a row whose parse lost its door caught; and the 400 for a `source`
 /// that is neither word, which the recorder keeps no file of, having one 400 of that shape
@@ -5879,7 +5904,11 @@ fn a_bots_door_is_read_beyond_the_recording() {
         }
         row
     };
-    let roster = json!([row("cw_odd", Some(json!("byok"))), row("cw_old", None)]);
+    let roster = json!([
+        row("cw_keys", Some(json!("gateway"))),
+        row("cw_odd", Some(json!("byok"))),
+        row("cw_old", None)
+    ]);
     read_fixture(
         "GET__coworkers",
         &json!({"method": "GET", "path": "/coworkers", "status": 200, "body": roster}),

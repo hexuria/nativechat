@@ -2,5 +2,7 @@
   "method": "POST",
   "path": "/schedules",
   "status": 422,
-  "body": "a cron routine needs a cron expression"
+  "body": {
+    "error": "a cron routine needs a cron expression"
+  }
 }

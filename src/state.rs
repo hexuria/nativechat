@@ -5908,7 +5908,7 @@ impl AppState {
     }
 
     /// Keep this computer's time zone on the account, for the routines that default to it
-    /// (opengrok-server PR #322 new-bot-default, not yet on main: `PUT /account` `{timeZone}`):
+    /// (opengrok-server #322, on main since c0bb6ae: `PUT /account` `{timeZone}`):
     /// now, as somebody has just signed in, and then whenever the system's zone has moved, looked
     /// at every [`TIME_ZONE_CHECK`] until they sign out.
     fn watch_time_zone(&mut self, cx: &mut Context<Self>) {

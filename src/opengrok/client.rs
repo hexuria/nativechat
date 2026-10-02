@@ -623,7 +623,7 @@ impl OpenGrokClient {
 
     /// `PUT /account` `{timeZone}`: keep `zone`, this computer's IANA time zone, as the one the
     /// person's routines default to, answered with the account as `GET /account` answers it
-    /// (opengrok-server PR #322 new-bot-default, not yet on main: `put_me` in
+    /// (opengrok-server #322, on main since c0bb6ae: `put_me` in
     /// `crates/opengrok-server/src/account_api.rs`, #316). The same zone again changes nothing
     /// there. A zone its database does not know is a 422 `{error}` in its words, a body naming
     /// none a 400, and signed out a 401.
@@ -6943,11 +6943,11 @@ mod tests {
         assert_eq!(cat.models[0].id, "xai/grok-4.6@sub");
     }
 
-    /// The account's time zone reads as opengrok-server PR #322 (new-bot-default, not yet on
-    /// main) writes it on `GET /account`: left out by a server that keeps none, `null` until
-    /// set, and the zone once set. `PUT /account` sends `{timeZone}` alone, and reads the account
-    /// it is answered with; a zone the server's database does not know is refused with a 422 in
-    /// its words, as the branch's recording has them.
+    /// The account's time zone reads as opengrok-server #322 (on main since c0bb6ae) writes it
+    /// on `GET /account`: left out by a server that keeps none, `null` until set, and the zone
+    /// once set. `PUT /account` sends `{timeZone}` alone, and reads the account it is answered
+    /// with; a zone the server's database does not know is refused with a 422 in its words, as
+    /// its recording has them (`PUT__account/422-an_unknown_time_zone_is_refused_in_words`).
     #[tokio::test]
     async fn the_time_zone_is_read_off_the_account_and_put_alone() {
         let read = |zone: Option<serde_json::Value>| -> Account {
@@ -9179,7 +9179,8 @@ mod tests {
             refused.computer_error,
             Some(ComputerError {
                 code: "quota_exceeded".into(),
-                message: "the box refused: 429 {\"error\":\"box creation rate limit reached\"}"
+                message: "the box refused: 429 {\"error\":\"box creation rate limit reached: \
+                          https://api.box.ascii.dev/v1/boxes?key=«redacted»\"}"
                     .into(),
                 updated_at_ms: 1_790_000_000_000,
             })

@@ -19,12 +19,15 @@
 //! `crates/opengrok-harness/src/local_proxy.rs`, and the door's words and the models a
 //! subscription may answer in `crates/opengrok-core/src/inference.rs`. The conformance ledger
 //! reads the two routes and the CUSTOM frame against the server's recording, vendored in
-//! `fixtures/wire/` from opengrok-server main 06db932 (#309, after #308), pin b6ca457. These
-//! shapes are as they were at main cad36fd (#303, after #298): #306 changed no crate, #304 puts
-//! a Bot's own door between a turn's and the account's (`route` in
-//! `crates/opengrok-harness/src/local_proxy.rs`), and #308 lets a retry of a queued send's reply
+//! `fixtures/wire/` from opengrok-server PR #334 at 628dcff (recorded at 80cb795, on top of main
+//! 73064e2). These shapes are as they were at main cad36fd (#303, after #298): #306 changed no
+//! crate, #304 puts a Bot's own door between a turn's and the account's (`route` in
+//! `crates/opengrok-harness/src/local_proxy.rs`), #308 lets a retry of a queued send's reply
 //! name its own door over the one the send was queued with (`consume_for_turn` in
-//! `crates/opengrok-server/src/agui/pending.rs`).
+//! `crates/opengrok-server/src/agui/pending.rs`), and #322 adds the account's default for new
+//! Bots (`newBotDefault`, in `described` and `apply`). #325 and #316 change where a Bot's message
+//! and a routine's firing are answered (`for_message` there, and `routine_route` in the server's
+//! `crates/opengrok-server/src/autonomy/mod.rs`), and no shape read here.
 //!
 //! The relay (opengrok-server #292, built in #298, whose recording holds its words) lifts the
 //! one-machine limit: the server sends a turn's model calls down a stream to the person's
@@ -586,8 +589,9 @@ pub const HELD_FOR_RELAY_OFFLINE: &str = "relay_offline";
 /// never offers what a Save would be refused for, even should a list ever carry one (a list held
 /// from before, or a server that tags a row `local_proxy` without asking): `subscription_model`
 /// in opengrok-server's `crates/opengrok-core/src/inference.rs`, anchored since #296 and unchanged
-/// at the vendored main 06db932 (#309, after #308), pin b6ca457, where a Bot's own plan model is
-/// held to it too, as it has been since #304.
+/// in the vendored recording (PR #334 at 628dcff, on top of main 73064e2), where a Bot's own plan
+/// model is held to it too, as it has been since #304, and so is a default for new Bots on the
+/// plan, since #322.
 ///
 /// An allowlist, not a denylist: an id it does not recognise is refused, so a provider nobody
 /// has looked at is not offered by being new. With an `openai/` or `xai/` prefix and the `--fast`

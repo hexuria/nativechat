@@ -2590,7 +2590,10 @@ mod tests {
         let controls = ComputerControls::from_state(&state);
         assert_eq!(
             controls.no_computer.as_deref(),
-            Some("The box refused: 429 {\"error\":\"box creation rate limit reached\"}")
+            Some(
+                "The box refused: 429 {\"error\":\"box creation rate limit reached: \
+                 https://api.box.ascii.dev/v1/boxes?key=«redacted»\"}"
+            )
         );
         assert!(!controls.asking, "Get a computer is live");
         assert!(!controls.present, "Update and Reset wait");

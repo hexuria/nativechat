@@ -11625,7 +11625,8 @@ mod tests {
             .expect("the reason, under the status");
         assert_eq!(
             error.name,
-            "The box refused: 429 {\"error\":\"box creation rate limit reached\"}"
+            "The box refused: 429 {\"error\":\"box creation rate limit reached: \
+             https://api.box.ascii.dev/v1/boxes?key=«redacted»\"}"
         );
         assert_eq!(error.value.as_deref(), Some("quota_exceeded"));
         let get = tree.find(ids::COMPUTER_GET).expect("Get a computer");
