@@ -17,18 +17,14 @@ use crate::opengrok::{
     computer_attention_skip_id,
 };
 use crate::state::{
-    AgentRoutine, AppState, ComputerView, NewTrigger, ROUTINE_RUN_UNAVAILABLE,
-    ROUTINE_RUNS_UNAVAILABLE, RoutineTrigger, ScheduleDayKind, ScheduleSpec, ScheduleUiMode,
-    ScheduleUnit, routine_notes, routine_trouble_line, unsaved_lines,
+    AgentRoutine, AppState, ComputerView, LAST_WAKE_STAYS, NUMBERED_WEEKDAYS, ONE_WAKE_PER_ROUTINE,
+    ROUTINE_RUN_UNAVAILABLE, ROUTINE_RUNS_UNAVAILABLE, RoutineTrigger, ScheduleUnit, WakeBox,
+    WakeEditor, WakeTab, routine_notes, routine_trouble_line, unsaved_lines,
 };
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::input::{InputState, Textarea, TextareaState};
-use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
-use gpui_kit::component::popover::Popover;
+use gpui_kit::component::input::{InputEvent, InputState, Textarea, TextareaState};
 use gpui_kit::component::tooltip::Tooltip;
-use gpui_kit::component::{
-    ActiveTheme, Disableable as _, Icon, Selectable, Sizable as _, h_flex, v_flex,
-};
+use gpui_kit::component::{ActiveTheme, Disableable as _, Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 
@@ -36,11 +32,22 @@ pub struct ComputerPane {
     state: Entity<AppState>,
     name_input: Entity<InputState>,
     instruction_input: Entity<TextareaState>,
-    custom_cron: Entity<InputState>,
     /// The routine the fields were last filled from, and the `routine_resync` they were
     /// filled at.
     loaded_editor: Option<(Option<String>, u64)>,
-    webhook_popover: Option<String>,
+    /// The wake editor's typed boxes: the Every number, the hour, the minute and the Cron line.
+    wake_boxes: [(WakeBox, Entity<InputState>); 4],
+    /// The opening of the wake editor the boxes were last written for, and its `resync` then.
+    loaded_wake: Option<(u64, u64)>,
+}
+
+/// One of the wake editor's typed boxes, empty, saying what goes in it.
+fn wake_input(
+    placeholder: &'static str,
+    window: &mut Window,
+    cx: &mut Context<ComputerPane>,
+) -> Entity<InputState> {
+    cx.new(|cx| InputState::new(window, cx).placeholder(placeholder))
 }
 
 impl ComputerPane {
@@ -51,16 +58,71 @@ impl ComputerPane {
                 .placeholder("What should this routine do each time it runs?")
                 .auto_grow(3, 8)
         });
-        let custom_cron = cx.new(|cx| InputState::new(window, cx).placeholder("0 9 * * MON-FRI"));
+        let wake_boxes = [
+            (WakeBox::Every, wake_input("30", window, cx)),
+            (WakeBox::Hour, wake_input("9", window, cx)),
+            (WakeBox::Minute, wake_input("00", window, cx)),
+            // A real line, and one the server reads as meant: it counts days of the week from
+            // Sunday as 1, so a numbered example would teach the wrong days.
+            (WakeBox::Cron, wake_input("0 9 * * MON-FRI", window, cx)),
+        ];
+        // What a person types goes to the editor as it is typed. A value written into a box from
+        // outside it (`set_value`) says nothing, so the box and the editor never chase each other.
+        for (which, input) in &wake_boxes {
+            let which = *which;
+            cx.subscribe_in(
+                input,
+                window,
+                move |this, input, event: &InputEvent, _, cx| {
+                    if matches!(event, InputEvent::Change) {
+                        let text = input.read(cx).value().to_string();
+                        this.state
+                            .update(cx, |state, cx| state.set_wake_box(which, text, true, cx));
+                    }
+                },
+            )
+            .detach();
+        }
         cx.observe(&state, |_this, _, cx| cx.notify()).detach();
         Self {
             state,
             name_input,
             instruction_input,
-            custom_cron,
             loaded_editor: None,
-            webhook_popover: None,
+            wake_boxes,
+            loaded_wake: None,
         }
+    }
+
+    /// The wake editor's boxes, written from what it holds when it opens or a value changes from
+    /// outside them; never while a person types in one, which is the box's own.
+    fn sync_wake(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(editor) = self.state.read(cx).routine_wake_editor.clone() else {
+            self.loaded_wake = None;
+            return;
+        };
+        let key = (editor.opened, editor.resync);
+        if self.loaded_wake == Some(key) {
+            return;
+        }
+        self.loaded_wake = Some(key);
+        for (which, input) in &self.wake_boxes {
+            let text = match which {
+                WakeBox::Every => editor.every.clone(),
+                WakeBox::Hour => editor.hour.clone(),
+                WakeBox::Minute => editor.minute.clone(),
+                WakeBox::Cron => editor.spec.expr.clone(),
+            };
+            input.update(cx, |input, cx| input.set_value(text, window, cx));
+        }
+    }
+
+    fn wake_box(&self, which: WakeBox) -> Entity<InputState> {
+        self.wake_boxes
+            .iter()
+            .find(|(box_of, _)| *box_of == which)
+            .map(|(_, input)| input.clone())
+            .expect("every box is made with the pane")
     }
 
     fn sync_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -103,28 +165,13 @@ impl ComputerPane {
         self.instruction_input.update(cx, |input, cx| {
             input.set_value(instruction, window, cx);
         });
-        let cron = routine
-            .as_ref()
-            .and_then(|r| {
-                r.triggers.iter().rev().find_map(|t| match t {
-                    RoutineTrigger::Schedule { spec, .. }
-                        if spec.mode == ScheduleUiMode::Custom =>
-                    {
-                        Some(spec.expr.clone())
-                    }
-                    _ => None,
-                })
-            })
-            .unwrap_or_default();
-        self.custom_cron.update(cx, |input, cx| {
-            input.set_value(cron, window, cx);
-        });
     }
 }
 
 impl Render for ComputerPane {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sync_editor(window, cx);
+        self.sync_wake(window, cx);
         let theme = cx.theme().clone();
         let muted = theme.muted_foreground;
         let app = self.state.clone();
@@ -234,28 +281,13 @@ impl ComputerPane {
     ) -> Rc<dyn Fn(&mut App)> {
         let name_input = self.name_input.clone();
         let instruction_input = self.instruction_input.clone();
-        let custom_cron = self.custom_cron.clone();
         Rc::new(move |cx: &mut App| {
             let Some(rid) = id.clone() else {
                 return;
             };
             let name = name_input.read(cx).value().to_string();
             let instruction = instruction_input.read(cx).value().to_string();
-            let cron = custom_cron.read(cx).value().to_string();
             app.update(cx, |state, cx| {
-                // The typed cron line first, so the save below sends the line on screen.
-                if let Some(sid) = state.routine_mut(&coworker_id, &rid).and_then(|row| {
-                    row.triggers.iter().rev().find_map(|t| match t {
-                        RoutineTrigger::Schedule { id, .. } => Some(id.clone()),
-                        _ => None,
-                    })
-                }) && let Some(row) = state.routine_mut(&coworker_id, &rid)
-                    && let Some(RoutineTrigger::Schedule { spec, .. }) =
-                        row.triggers.iter_mut().find(|t| t.id() == sid)
-                    && spec.mode == ScheduleUiMode::Custom
-                {
-                    spec.expr = cron;
-                }
                 state.save_routine_fields(&coworker_id, &rid, name, instruction, cx);
             });
         })
@@ -517,10 +549,6 @@ impl ComputerPane {
             .as_ref()
             .and_then(|rid| routines.iter().find(|row| &row.id == rid).cloned());
         let active = existing.as_ref().map(|r| r.active).unwrap_or(true);
-        let triggers = existing
-            .as_ref()
-            .map(|r| r.triggers.clone())
-            .unwrap_or_default();
         let runs = existing
             .as_ref()
             .map(|r| r.runs.clone())
@@ -630,16 +658,12 @@ impl ComputerPane {
                         )
                         .child(field_label("Instruction", muted))
                         .child(field_textarea(&self.instruction_input, theme).disabled(!can_change))
-                        .child(field_label("When to run", muted))
-                        .child(self.triggers_box(
-                            &triggers,
-                            &coworker_id,
-                            id.clone(),
+                        .child(self.wake_section(
+                            existing.as_ref(),
+                            can_change,
                             muted,
                             app.clone(),
                             theme,
-                            persist.clone(),
-                            can_change,
                             cx,
                         ))
                     }
@@ -647,91 +671,297 @@ impl ComputerPane {
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn triggers_box(
+    /// "When to run": the routine's wakes, one row each, with + to add one, and in their place
+    /// the wake editor while one is being picked.
+    fn wake_section(
         &self,
-        triggers: &[RoutineTrigger],
-        coworker_id: &str,
-        routine_id: Option<String>,
+        routine: Option<&AgentRoutine>,
+        can_change: bool,
         muted: Hsla,
         app: Entity<AppState>,
         theme: &gpui_kit::component::Theme,
-        persist: Rc<dyn Fn(&mut App) + 'static>,
-        can_change: bool,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let last_schedule = triggers.iter().rev().find_map(|t| match t {
-            RoutineTrigger::Schedule { id, spec } => Some((id.clone(), spec.clone())),
-            _ => None,
-        });
-        // One routine is one schedule on the server, so the trigger is offered while there is
-        // none and gone once there is: a second one would be a second routine.
-        let add = triggers.is_empty().then(|| {
-            add_trigger_button(
-                "+ Add trigger",
-                coworker_id.to_string(),
-                routine_id.clone(),
-                app.clone(),
-                persist,
-            )
-        });
+        cx: &App,
+    ) -> AnyElement {
+        let editor = app
+            .read(cx)
+            .routine_wake_editor
+            .clone()
+            .filter(|editor| routine.is_some_and(|row| row.id == editor.routine_id));
+        let can_add = routine.is_some_and(AppState::can_add_wake);
+        let routine_id = routine.map(|row| row.id.clone()).unwrap_or_default();
+        let heading = h_flex()
+            .w_full()
+            .justify_between()
+            .items_center()
+            .child(field_label("When to run", muted))
+            // One wake per routine is the server's rule today (`ONE_WAKE_PER_ROUTINE`);
+            // opengrok-server#315 lifts it, and is what turns + on for a routine that has one.
+            .child(routine_icon(
+                "routine-wake-add",
+                "icons/plus.svg",
+                if can_add {
+                    "Choose when it runs"
+                } else {
+                    ONE_WAKE_PER_ROUTINE
+                },
+                can_add && editor.is_none(),
+                false,
+                theme,
+                {
+                    let app = app.clone();
+                    let routine_id = routine_id.clone();
+                    move |cx| {
+                        app.update(cx, |state, cx| {
+                            state.open_wake_editor(&routine_id, None, cx)
+                        })
+                    }
+                },
+            ));
         v_flex()
             .w_full()
-            .gap(px(10.))
-            .child(
-                v_flex()
-                    .w_full()
-                    .rounded(px(10.))
-                    .border_1()
-                    .border_color(theme.border)
-                    .p(px(10.))
-                    .gap(px(10.))
-                    .children({
-                        let view = cx.entity();
-                        let open_id = self.webhook_popover.clone();
-                        let theme = theme.clone();
-                        let app = app.clone();
-                        let coworker_id = coworker_id.to_string();
-                        triggers.iter().map(move |trigger| {
-                            if let RoutineTrigger::Webhook {
-                                id,
-                                url,
-                                key,
-                                header,
-                            } = trigger
-                            {
-                                webhook_popover_row(
-                                    id.clone(),
-                                    coworker_id.clone(),
-                                    url.clone(),
-                                    key.clone(),
-                                    header.clone(),
-                                    muted,
-                                    open_id.as_ref() == Some(id),
-                                    view.clone(),
-                                    app.clone(),
-                                    theme.clone(),
-                                )
-                            } else {
-                                trigger_row(trigger, muted)
-                            }
-                        })
-                    })
-                    .children(add),
-            )
-            .when_some(last_schedule, |this, (sid, spec)| {
-                this.child(schedule_editor(
-                    coworker_id.to_string(),
-                    routine_id.clone(),
-                    sid,
-                    spec,
-                    app.clone(),
-                    self.custom_cron.clone(),
-                    muted,
-                    theme,
-                    can_change,
-                ))
+            .gap(px(8.))
+            .child(heading)
+            .child(match editor {
+                Some(editor) => self
+                    .wake_editor(&editor, routine, muted, app, theme)
+                    .into_any_element(),
+                None => wake_rows(routine, can_change, muted, app, theme),
             })
+            .into_any_element()
+    }
+
+    /// The wake editor: a tab for each shape of schedule, what that tab picks, one sentence
+    /// saying exactly what was picked and when it would next run, and Cancel and Save. Nothing
+    /// reaches the routine before Save.
+    fn wake_editor(
+        &self,
+        editor: &WakeEditor,
+        routine: Option<&AgentRoutine>,
+        muted: Hsla,
+        app: Entity<AppState>,
+        theme: &gpui_kit::component::Theme,
+    ) -> impl IntoElement {
+        let status = editor.status(chrono::Utc::now());
+        let time = || self.time_picker(editor, muted, app.clone(), theme);
+        let body = match editor.tab {
+            WakeTab::Every => self
+                .every_picker(editor, muted, app.clone(), theme)
+                .into_any_element(),
+            WakeTab::Daily => v_flex()
+                .gap(px(12.))
+                .child(time())
+                .child(month_chips(editor, muted, app.clone(), theme))
+                .into_any_element(),
+            WakeTab::Weekly => v_flex()
+                .gap(px(12.))
+                .child(weekday_chips(editor, muted, app.clone(), theme))
+                .child(time())
+                .child(month_chips(editor, muted, app.clone(), theme))
+                .into_any_element(),
+            WakeTab::Monthly => v_flex()
+                .gap(px(12.))
+                .child(date_grid(editor, muted, app.clone(), theme))
+                .child(time())
+                .child(month_chips(editor, muted, app.clone(), theme))
+                .into_any_element(),
+            WakeTab::Webhook => webhook_details(routine, muted, app.clone(), theme),
+            WakeTab::Cron => v_flex()
+                .gap(px(6.))
+                .child(field_label(
+                    "Minute, hour, day of the month, month and day of the week",
+                    muted,
+                ))
+                .child(
+                    div()
+                        .debug_selector(|| "routine-wake-cron".into())
+                        .child(field_input(&self.wake_box(WakeBox::Cron))),
+                )
+                .when(status.numbered_weekdays, |this| {
+                    this.child(
+                        div()
+                            .id("routine-wake-cron-note")
+                            .text_xs()
+                            .text_color(muted)
+                            .child(NUMBERED_WEEKDAYS),
+                    )
+                })
+                .into_any_element(),
+        };
+        let done = if editor.kind == Some(crate::opengrok::ScheduleKind::Webhook) {
+            "Done"
+        } else {
+            "Save"
+        };
+        v_flex()
+            .id("routine-wake-editor")
+            .debug_selector(|| "routine-wake-editor".into())
+            .w_full()
+            .gap(px(12.))
+            .p(px(10.))
+            .rounded(px(10.))
+            .border_1()
+            .border_color(theme.border)
+            .child(wake_tabs(editor, app.clone(), theme))
+            .child(body)
+            .child(
+                div()
+                    .id("routine-wake-summary")
+                    .debug_selector(|| "routine-wake-summary".into())
+                    .text_sm()
+                    .font_weight(FontWeight::MEDIUM)
+                    .child(status.summary.clone()),
+            )
+            .when_some(status.next.clone(), |this, next| {
+                this.child(
+                    div()
+                        .id("routine-wake-next")
+                        .text_xs()
+                        .text_color(muted)
+                        .child(next),
+                )
+            })
+            .when_some(status.error.clone(), |this, error| {
+                this.child(
+                    div()
+                        .id("routine-wake-error")
+                        .text_xs()
+                        .text_color(theme.danger)
+                        .child(error),
+                )
+            })
+            .child(
+                h_flex()
+                    .w_full()
+                    .justify_end()
+                    .gap(px(8.))
+                    .child(
+                        Button::new("routine-wake-cancel")
+                            .ghost()
+                            .label("Cancel")
+                            .on_click({
+                                let app = app.clone();
+                                move |_, _, cx| {
+                                    app.update(cx, |state, cx| state.close_wake_editor(cx))
+                                }
+                            }),
+                    )
+                    .child(
+                        Button::new("routine-wake-save")
+                            .debug_selector(|| "routine-wake-save".into())
+                            .primary()
+                            .label(done)
+                            .disabled(!status.can_save())
+                            .on_click({
+                                let name_input = self.name_input.clone();
+                                let instruction_input = self.instruction_input.clone();
+                                move |_, _, cx| {
+                                    // What is typed for the routine goes with its wake: a
+                                    // routine's first wake is what makes it on the server.
+                                    let name = name_input.read(cx).value().to_string();
+                                    let instruction =
+                                        instruction_input.read(cx).value().to_string();
+                                    app.update(cx, |state, cx| {
+                                        state.save_wake(name, instruction, cx);
+                                    });
+                                }
+                            }),
+                    ),
+            )
+    }
+
+    /// The Every tab: a number, and minutes, hours or days.
+    fn every_picker(
+        &self,
+        editor: &WakeEditor,
+        muted: Hsla,
+        app: Entity<AppState>,
+        theme: &gpui_kit::component::Theme,
+    ) -> impl IntoElement {
+        h_flex()
+            .w_full()
+            .flex_wrap()
+            .gap(px(8.))
+            .items_center()
+            .child(div().text_sm().text_color(muted).child("Every"))
+            .child(number_box(
+                "routine-wake-every",
+                &self.wake_box(WakeBox::Every),
+                WakeBox::Every,
+                app.clone(),
+                theme,
+            ))
+            .child(segments(
+                [
+                    ("routine-wake-unit-minutes", "min", ScheduleUnit::Minutes),
+                    ("routine-wake-unit-hours", "hours", ScheduleUnit::Hours),
+                    ("routine-wake-unit-days", "days", ScheduleUnit::Days),
+                ]
+                .map(|(id, label, unit)| {
+                    let app = app.clone();
+                    Segment {
+                        id,
+                        label,
+                        selected: editor.spec.unit == unit,
+                        on_press: Rc::new(move |cx: &mut App| {
+                            app.update(cx, |state, cx| state.set_wake_unit(unit, cx))
+                        }),
+                    }
+                }),
+                theme,
+            ))
+    }
+
+    /// A time of day: the hour and the minute, typed or stepped, and AM or PM. On the server's
+    /// clock, which is UTC, and the label says so.
+    fn time_picker(
+        &self,
+        editor: &WakeEditor,
+        muted: Hsla,
+        app: Entity<AppState>,
+        theme: &gpui_kit::component::Theme,
+    ) -> impl IntoElement {
+        v_flex()
+            .gap(px(4.))
+            .child(field_label("Time (UTC)", muted))
+            .child(
+                h_flex()
+                    .flex_wrap()
+                    .gap(px(6.))
+                    .items_center()
+                    .child(number_box(
+                        "routine-wake-hour",
+                        &self.wake_box(WakeBox::Hour),
+                        WakeBox::Hour,
+                        app.clone(),
+                        theme,
+                    ))
+                    .child(div().text_sm().child(":"))
+                    .child(number_box(
+                        "routine-wake-minute",
+                        &self.wake_box(WakeBox::Minute),
+                        WakeBox::Minute,
+                        app.clone(),
+                        theme,
+                    ))
+                    .child(segments(
+                        [
+                            ("routine-wake-am", "AM", false),
+                            ("routine-wake-pm", "PM", true),
+                        ]
+                        .map(|(id, label, pm)| {
+                            let app = app.clone();
+                            Segment {
+                                id,
+                                label,
+                                selected: editor.pm == pm,
+                                on_press: Rc::new(move |cx: &mut App| {
+                                    app.update(cx, |state, cx| state.set_wake_pm(pm, cx))
+                                }),
+                            }
+                        }),
+                        theme,
+                    )),
+            )
     }
 }
 
@@ -971,16 +1201,18 @@ fn routine_icons(icons: RoutineIcons) -> impl IntoElement {
 /// be done, the tooltip then saying why; filled while `selected`, for the one that is a state.
 #[allow(clippy::too_many_arguments)]
 fn routine_icon(
-    id: &'static str,
+    id: impl Into<SharedString>,
     icon: &'static str,
-    tooltip: &'static str,
+    tooltip: impl Into<SharedString>,
     enabled: bool,
     selected: bool,
     theme: &gpui_kit::component::Theme,
     on_press: impl Fn(&mut App) + 'static,
 ) -> Stateful<Div> {
+    let id: SharedString = id.into();
+    let tooltip: SharedString = tooltip.into();
     div()
-        .id(id)
+        .id(id.clone())
         .debug_selector(move || id.to_string())
         .size(px(28.))
         .rounded(px(8.))
@@ -1000,7 +1232,7 @@ fn routine_icon(
                 })
         })
         .when(!enabled, |this| this.opacity(0.35))
-        .tooltip(move |window, cx| Tooltip::new(tooltip).build(window, cx))
+        .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
         .child(
             Icon::default()
                 .path(icon)
@@ -1824,156 +2056,6 @@ fn field_textarea(state: &Entity<TextareaState>, theme: &gpui_kit::component::Th
         .bg(theme.input_background())
 }
 
-fn trigger_row(trigger: &RoutineTrigger, muted: Hsla) -> AnyElement {
-    let icon = match trigger {
-        RoutineTrigger::Webhook { .. } => "icons/globe.svg",
-        RoutineTrigger::Schedule { .. } => "icons/clock.svg",
-        RoutineTrigger::Event { kind, .. } if *kind == "git" => "icons/sparkles.svg",
-        _ => "icons/sparkles.svg",
-    };
-    h_flex()
-        .w_full()
-        .gap(px(8.))
-        .items_center()
-        .child(Icon::default().path(icon).size(px(14.)).text_color(muted))
-        .child(div().text_sm().child(trigger.label()))
-        .into_any_element()
-}
-
-#[derive(IntoElement)]
-struct WebhookRowTrigger {
-    selected: bool,
-    muted: Hsla,
-}
-
-impl Selectable for WebhookRowTrigger {
-    fn selected(mut self, selected: bool) -> Self {
-        self.selected = selected;
-        self
-    }
-
-    fn is_selected(&self) -> bool {
-        self.selected
-    }
-}
-
-impl RenderOnce for WebhookRowTrigger {
-    fn render(self, _window: &mut Window, _cx: &mut App) -> impl IntoElement {
-        h_flex()
-            .w_full()
-            .gap(px(8.))
-            .items_center()
-            .cursor_pointer()
-            .py(px(2.))
-            .child(
-                Icon::default()
-                    .path("icons/globe.svg")
-                    .size(px(14.))
-                    .text_color(self.muted),
-            )
-            .child(div().text_sm().child("When a webhook fires"))
-    }
-}
-
-/// The webhook trigger's row, and what opens under it: the URL, the key and the header the
-/// server minted, shown as they are.
-///
-/// Read-only, and that is the change. These three used to be fields somebody could type into,
-/// over values this app had made up — a URL pointing at a route that did not exist and a key
-/// nothing had ever been told about. Now they are the server's, and a field somebody could
-/// type into would be a field somebody could believe they had changed. Each copies, and the
-/// key can be replaced by asking the server for another one.
-#[allow(clippy::too_many_arguments)]
-fn webhook_popover_row(
-    routine_id: String,
-    coworker_id: String,
-    url: String,
-    key: String,
-    header: String,
-    muted: Hsla,
-    open: bool,
-    view: Entity<ComputerPane>,
-    app: Entity<AppState>,
-    theme: gpui_kit::component::Theme,
-) -> AnyElement {
-    let panel_bg = theme.sidebar;
-    Popover::new(SharedString::from(format!("webhook-pop-{routine_id}")))
-        .appearance(false)
-        .overlay_closable(true)
-        .open(open)
-        .on_open_change({
-            let view = view.clone();
-            let routine_id = routine_id.clone();
-            move |is_open, _, cx| {
-                view.update(cx, |this, cx| {
-                    this.webhook_popover = if *is_open {
-                        Some(routine_id.clone())
-                    } else {
-                        None
-                    };
-                    cx.notify();
-                });
-            }
-        })
-        .trigger(WebhookRowTrigger {
-            selected: open,
-            muted,
-        })
-        .content(move |_, _, _| {
-            let rotate_id = SharedString::from(format!("routine-{routine_id}-rotate"));
-            let app = app.clone();
-            let coworker_id = coworker_id.clone();
-            let rotating_id = routine_id.clone();
-            v_flex()
-                .id("webhook-pop-panel")
-                .w(px(280.))
-                .p(px(12.))
-                .gap(px(8.))
-                .rounded(px(12.))
-                .border_1()
-                .border_color(theme.border)
-                .bg(panel_bg)
-                .shadow_lg()
-                .occlude()
-                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                .child(field_label("POST to", muted))
-                .child(copy_row(
-                    format!("routine-{routine_id}-webhook-url"),
-                    url.clone(),
-                    muted,
-                    &theme,
-                ))
-                .child(field_label("key", muted))
-                .child(copy_row(
-                    format!("routine-{routine_id}-webhook-key"),
-                    key.clone(),
-                    muted,
-                    &theme,
-                ))
-                .child(field_label("header", muted))
-                .child(copy_row(
-                    format!("routine-{routine_id}-webhook-header"),
-                    header.clone(),
-                    muted,
-                    &theme,
-                ))
-                .child(
-                    Button::new(rotate_id)
-                        .ghost()
-                        .label("Rotate key")
-                        .tooltip("The old key stops working at once.")
-                        .on_click(move |_, _, cx| {
-                            let coworker_id = coworker_id.clone();
-                            let routine_id = rotating_id.clone();
-                            app.update(cx, |state, cx| {
-                                state.rotate_routine_webhook(&coworker_id, &routine_id, cx);
-                            });
-                        }),
-                )
-        })
-        .into_any_element()
-}
-
 /// One value the server minted, as it is, with the button that puts it on the clipboard.
 fn copy_row(
     id: String,
@@ -2024,610 +2106,456 @@ fn copy_row(
         )
 }
 
-#[allow(clippy::type_complexity)]
-fn add_trigger_button(
-    label: &'static str,
-    coworker_id: String,
-    routine_id: Option<String>,
-    app: Entity<AppState>,
-    persist: Rc<dyn Fn(&mut App) + 'static>,
-) -> impl IntoElement {
-    Button::new("add-trigger")
-        .ghost()
-        .label(label)
-        .dropdown_menu(move |menu, window, cx| {
-            let webhook = {
-                let app = app.clone();
-                let persist = persist.clone();
-                let coworker_id = coworker_id.clone();
-                let routine_id = routine_id.clone();
-                move |cx: &mut App| {
-                    // The name and the prompt go to the server with the trigger, so whatever
-                    // is in the fields has to be on the routine before this asks for one.
-                    persist(cx);
-                    let Some(rid) = routine_id.clone() else {
-                        return;
-                    };
-                    app.update(cx, |state, cx| {
-                        state.add_routine_trigger(&coworker_id, &rid, NewTrigger::Webhook, cx);
-                    });
-                }
-            };
-            menu.submenu("On a schedule", window, cx, {
-                let push_sched: Rc<dyn Fn(&'static str, &mut App)> = Rc::new({
-                    let persist = persist.clone();
-                    let app = app.clone();
-                    let coworker_id = coworker_id.clone();
-                    let routine_id = routine_id.clone();
-                    move |preset: &'static str, cx: &mut App| {
-                        persist(cx);
-                        if let Some(rid) = routine_id.clone() {
-                            app.update(cx, |state, cx| {
-                                state.add_routine_trigger(
-                                    &coworker_id,
-                                    &rid,
-                                    NewTrigger::Schedule(ScheduleSpec::from_preset(preset)),
-                                    cx,
-                                );
-                            });
-                        }
-                    }
-                });
-                move |menu, _, _| {
-                    let item =
-                        |label: &'static str, push_sched: Rc<dyn Fn(&'static str, &mut App)>| {
-                            PopupMenuItem::new(label).on_click({
-                                let push_sched = push_sched.clone();
-                                move |_, _, cx| push_sched(label, cx)
-                            })
-                        };
-                    menu.item(item("Every hour", push_sched.clone()))
-                        .item(item("Every day", push_sched.clone()))
-                        .item(item("Weekdays", push_sched.clone()))
-                        .item(item("Every week", push_sched.clone()))
-                        .item(item("Every month", push_sched.clone()))
-                        .item(item("Interval", push_sched.clone()))
-                        .item(item("Advanced...", push_sched.clone()))
-                }
-            })
-            .item(PopupMenuItem::new("Webhook").on_click(move |_, _, cx| webhook(cx)))
-        })
-}
-
-#[allow(clippy::too_many_arguments)]
-fn schedule_editor(
-    coworker_id: String,
-    routine_id: Option<String>,
-    trigger_id: String,
-    spec: ScheduleSpec,
-    app: Entity<AppState>,
-    custom_cron: Entity<InputState>,
+/// A routine's wakes, one row each: what sets it off in words, ✎ and 🗑.
+fn wake_rows(
+    routine: Option<&AgentRoutine>,
+    can_change: bool,
     muted: Hsla,
+    app: Entity<AppState>,
     theme: &gpui_kit::component::Theme,
-    enabled: bool,
-) -> impl IntoElement {
-    let patch = {
-        let app = app.clone();
-        let coworker_id = coworker_id.clone();
-        let routine_id = routine_id.clone();
-        let trigger_id = trigger_id.clone();
-        Rc::new(move |spec: ScheduleSpec, cx: &mut App| {
-            if let Some(rid) = routine_id.clone() {
-                app.update(cx, |state, cx| {
-                    state.update_schedule_spec(&coworker_id, &rid, &trigger_id, spec, cx);
-                });
-            }
-        })
+) -> AnyElement {
+    let Some(routine) = routine else {
+        return div().into_any_element();
     };
-
+    if routine.triggers.is_empty() {
+        return div()
+            .id("routine-wakes-empty")
+            .text_sm()
+            .text_color(muted)
+            .child("Not set yet: + chooses when it runs.")
+            .into_any_element();
+    }
+    let can_remove = AppState::can_remove_wake(routine);
     v_flex()
-        .w_full()
-        .rounded(px(10.))
-        .border_1()
-        .border_color(theme.border)
-        .p(px(10.))
-        .gap(px(8.))
-        .child(mode_row(spec.clone(), patch.clone(), enabled))
-        .child(match spec.mode {
-            ScheduleUiMode::Interval => interval_row(spec, patch, enabled).into_any_element(),
-            ScheduleUiMode::Custom => field_input(&custom_cron)
-                .disabled(!enabled)
-                .into_any_element(),
-            ScheduleUiMode::Advanced => {
-                advanced_editor(spec, patch, muted, enabled).into_any_element()
-            }
-        })
-}
-
-#[allow(clippy::type_complexity)]
-fn mode_row(
-    spec: ScheduleSpec,
-    patch: Rc<dyn Fn(ScheduleSpec, &mut App)>,
-    enabled: bool,
-) -> impl IntoElement {
-    let label = match spec.mode {
-        ScheduleUiMode::Interval => "Interval",
-        ScheduleUiMode::Custom => "Custom",
-        ScheduleUiMode::Advanced => "Advanced",
-    };
-    Button::new("sched-mode")
-        .ghost()
-        .label(label)
-        .disabled(!enabled)
-        .dropdown_menu(move |menu, _, _| {
-            let item = |name: &'static str,
-                        mode: ScheduleUiMode,
-                        spec: ScheduleSpec,
-                        patch: Rc<dyn Fn(ScheduleSpec, &mut App)>| {
-                PopupMenuItem::new(name).on_click({
-                    let patch = patch.clone();
-                    move |_, _, cx| {
-                        // The line starts from the schedule as it was, never from a shorthand:
-                        // the server takes five fields and refuses `@every`.
-                        let next = if mode == ScheduleUiMode::Custom {
-                            spec.on_tab(crate::state::WakeTab::Cron)
-                        } else {
-                            let mut next = spec.clone();
-                            next.mode = mode;
-                            next
-                        };
-                        patch(next, cx);
-                    }
-                })
-            };
-            menu.item(item(
-                "Interval",
-                ScheduleUiMode::Interval,
-                spec.clone(),
-                patch.clone(),
-            ))
-            .item(item(
-                "Custom",
-                ScheduleUiMode::Custom,
-                spec.clone(),
-                patch.clone(),
-            ))
-            .item(item(
-                "Advanced",
-                ScheduleUiMode::Advanced,
-                spec.clone(),
-                patch.clone(),
-            ))
-        })
-}
-
-#[allow(clippy::type_complexity)]
-fn interval_row(
-    spec: ScheduleSpec,
-    patch: Rc<dyn Fn(ScheduleSpec, &mut App)>,
-    enabled: bool,
-) -> impl IntoElement {
-    h_flex()
         .w_full()
         .gap(px(6.))
-        .items_center()
-        .child(div().text_sm().text_color(rgb(0x888888)).child("every"))
-        .child({
-            let spec = spec.clone();
-            let patch = patch.clone();
-            Button::new("sched-every")
-                .ghost()
-                .label(spec.every.to_string())
-                .disabled(!enabled)
-                .dropdown_menu(move |menu, _, _| {
-                    let mut menu = menu;
-                    for n in [1, 2, 5, 10, 15, 30, 45, 60] {
-                        let spec = spec.clone();
-                        let patch = patch.clone();
-                        menu = menu.item(PopupMenuItem::new(n.to_string()).on_click(
-                            move |_, _, cx| {
-                                let mut next = spec.clone();
-                                next.every = n;
-                                patch(next, cx);
-                            },
-                        ));
-                    }
-                    menu
-                })
-        })
-        .child({
-            let unit_label = match spec.unit {
-                ScheduleUnit::Minutes => "minutes",
-                ScheduleUnit::Hours => "hours",
-                ScheduleUnit::Days => "days",
-            };
-            Button::new("sched-unit")
-                .ghost()
-                .label(unit_label)
-                .disabled(!enabled)
-                .dropdown_menu(move |menu, _, _| {
-                    let item =
-                        |name: &'static str,
-                         unit: ScheduleUnit,
-                         spec: ScheduleSpec,
-                         patch: Rc<dyn Fn(ScheduleSpec, &mut App)>| {
-                            PopupMenuItem::new(name).on_click(move |_, _, cx| {
-                                let mut next = spec.clone();
-                                next.unit = unit;
-                                patch(next, cx);
-                            })
-                        };
-                    menu.item(item(
-                        "minutes",
-                        ScheduleUnit::Minutes,
-                        spec.clone(),
-                        patch.clone(),
-                    ))
-                    .item(item(
-                        "hours",
-                        ScheduleUnit::Hours,
-                        spec.clone(),
-                        patch.clone(),
-                    ))
-                    .item(item(
-                        "days",
-                        ScheduleUnit::Days,
-                        spec.clone(),
-                        patch.clone(),
-                    ))
-                })
-        })
-}
-
-#[allow(clippy::type_complexity)]
-fn advanced_editor(
-    spec: ScheduleSpec,
-    patch: Rc<dyn Fn(ScheduleSpec, &mut App)>,
-    muted: Hsla,
-    enabled: bool,
-) -> impl IntoElement {
-    v_flex()
-        .w_full()
-        .gap(px(8.))
-        .child(
+        .children(routine.triggers.iter().enumerate().map(|(at, trigger)| {
+            let webhook = matches!(trigger, RoutineTrigger::Webhook { .. });
+            // ✎ on a schedule changes it, which a server that cannot change a routine refuses;
+            // on a webhook it shows the address and the key, which any server can.
+            let can_edit = webhook || can_change;
             h_flex()
+                .id(SharedString::from(format!("routine-wake-{at}")))
+                .w_full()
                 .gap(px(8.))
                 .items_center()
-                .child(div().text_xs().text_color(muted).w(px(52.)).child("Months"))
-                .child(months_menu(spec.clone(), patch.clone(), enabled)),
-        )
-        .child(
-            h_flex()
-                .gap(px(8.))
-                .items_center()
-                .child(div().text_xs().text_color(muted).w(px(52.)).child("Days"))
-                .child(days_menu(spec.clone(), patch.clone(), enabled))
-                .when(spec.day_kind == ScheduleDayKind::DaysOfMonth, |this| {
-                    this.child(month_day_menu(spec.clone(), patch.clone(), enabled))
-                }),
-        )
-        .when(spec.day_kind == ScheduleDayKind::Weekdays, |this| {
-            this.child(weekday_chips(spec.clone(), patch.clone(), enabled))
-        })
-        .child(
-            h_flex()
-                .gap(px(8.))
-                .items_start()
+                .px(px(10.))
+                .py(px(6.))
+                .rounded(px(8.))
+                .border_1()
+                .border_color(theme.border)
                 .child(
-                    div()
-                        .text_xs()
-                        .text_color(muted)
-                        .w(px(52.))
-                        .pt(px(6.))
-                        .child("Time"),
-                )
-                .child(
-                    v_flex()
-                        .gap(px(6.))
-                        .children(spec.times.iter().enumerate().map(|(i, (h, m))| {
-                            time_row(i, *h, *m, spec.clone(), patch.clone(), enabled)
-                        }))
-                        .child({
-                            let spec = spec.clone();
-                            let patch = patch.clone();
-                            div()
-                                .id("add-time")
-                                .px(px(8.))
-                                .py(px(4.))
-                                .rounded(px(6.))
-                                .when(enabled, |this| {
-                                    this.cursor_pointer()
-                                        .hover(|s| s.bg(rgb(0x777777).opacity(0.12)))
-                                        .on_mouse_down(MouseButton::Left, move |_, _, cx| {
-                                            let mut next = spec.clone();
-                                            next.times.push((9, 0));
-                                            patch(next, cx);
-                                        })
-                                })
-                                .when(!enabled, |this| this.opacity(0.5))
-                                .child(div().text_sm().child("+ Add time"))
-                        }),
-                ),
-        )
-}
-
-#[allow(clippy::type_complexity)]
-fn months_menu(
-    spec: ScheduleSpec,
-    patch: Rc<dyn Fn(ScheduleSpec, &mut App)>,
-    enabled: bool,
-) -> impl IntoElement {
-    let label = if spec.months.is_empty() {
-        "Any month"
-    } else {
-        "Selected months"
-    };
-    Button::new("sched-months")
-        .ghost()
-        .label(label)
-        .disabled(!enabled)
-        .dropdown_menu(move |menu, _, _| {
-            let names = [
-                "January",
-                "February",
-                "March",
-                "April",
-                "May",
-                "June",
-                "July",
-                "August",
-                "September",
-                "October",
-                "November",
-                "December",
-            ];
-            let mut menu = menu.item(PopupMenuItem::new("Any month").on_click({
-                let spec = spec.clone();
-                let patch = patch.clone();
-                move |_, _, cx| {
-                    let mut next = spec.clone();
-                    next.months.clear();
-                    patch(next, cx);
-                }
-            }));
-            for (i, name) in names.iter().enumerate() {
-                let month = (i + 1) as u8;
-                let on = spec.months.contains(&month);
-                let spec = spec.clone();
-                let patch = patch.clone();
-                menu = menu.item(PopupMenuItem::new(*name).checked(on).on_click(
-                    move |_, _, cx| {
-                        let mut next = spec.clone();
-                        if let Some(pos) = next.months.iter().position(|m| *m == month) {
-                            next.months.remove(pos);
+                    Icon::default()
+                        .path(if webhook {
+                            "icons/webhook.svg"
                         } else {
-                            next.months.push(month);
-                            next.months.sort();
-                        }
-                        patch(next, cx);
+                            "icons/clock.svg"
+                        })
+                        .size(px(14.))
+                        .text_color(muted),
+                )
+                .child(div().flex_1().min_w_0().text_sm().child(trigger.label()))
+                .child(routine_icon(
+                    format!("routine-wake-edit-{at}"),
+                    "icons/pencil.svg",
+                    if !can_edit {
+                        crate::state::ROUTINE_EDIT_UNAVAILABLE
+                    } else if webhook {
+                        "Its address and key"
+                    } else {
+                        "Change when it runs"
                     },
-                ));
-            }
-            menu
-        })
+                    can_edit,
+                    false,
+                    theme,
+                    {
+                        let app = app.clone();
+                        let routine_id = routine.id.clone();
+                        move |cx| {
+                            app.update(cx, |state, cx| {
+                                state.open_wake_editor(&routine_id, Some(at), cx)
+                            })
+                        }
+                    },
+                ))
+                // Taking one wake off a routine with several is opengrok-server#315's to offer;
+                // until then a routine has one, and it stays.
+                .child(routine_icon(
+                    format!("routine-wake-delete-{at}"),
+                    "icons/trash.svg",
+                    if can_remove {
+                        "Remove this schedule"
+                    } else {
+                        LAST_WAKE_STAYS
+                    },
+                    false,
+                    false,
+                    theme,
+                    |_| {},
+                ))
+        }))
+        .into_any_element()
 }
 
-#[allow(clippy::type_complexity)]
-fn days_menu(
-    spec: ScheduleSpec,
-    patch: Rc<dyn Fn(ScheduleSpec, &mut App)>,
-    enabled: bool,
+/// The wake editor's tabs, in two rows of three so that all six fit the panel: the selected one
+/// filled, and one the routine's kind rules out dead, saying why.
+fn wake_tabs(
+    editor: &WakeEditor,
+    app: Entity<AppState>,
+    theme: &gpui_kit::component::Theme,
 ) -> impl IntoElement {
-    let label = match spec.day_kind {
-        ScheduleDayKind::EveryDay => "Every day",
-        ScheduleDayKind::Weekdays => "Days of the week",
-        ScheduleDayKind::DaysOfMonth => "Days of the month",
-    };
-    Button::new("sched-days")
-        .ghost()
-        .label(label)
-        .disabled(!enabled)
-        .dropdown_menu(move |menu, _, _| {
-            let item = |name: &'static str,
-                        kind: ScheduleDayKind,
-                        spec: ScheduleSpec,
-                        patch: Rc<dyn Fn(ScheduleSpec, &mut App)>| {
-                PopupMenuItem::new(name).on_click(move |_, _, cx| {
-                    let mut next = spec.clone();
-                    next.day_kind = kind;
-                    patch(next, cx);
-                })
-            };
-            menu.item(item(
-                "Every day",
-                ScheduleDayKind::EveryDay,
-                spec.clone(),
-                patch.clone(),
-            ))
-            .item(item(
-                "Days of the week",
-                ScheduleDayKind::Weekdays,
-                spec.clone(),
-                patch.clone(),
-            ))
-            .item(item(
-                "Days of the month",
-                ScheduleDayKind::DaysOfMonth,
-                spec.clone(),
-                patch.clone(),
-            ))
-        })
-}
-
-#[allow(clippy::type_complexity)]
-fn month_day_menu(
-    spec: ScheduleSpec,
-    patch: Rc<dyn Fn(ScheduleSpec, &mut App)>,
-    enabled: bool,
-) -> impl IntoElement {
-    let label = spec
-        .month_days
-        .first()
-        .copied()
-        .map(|d| match d {
-            1 => "1st".into(),
-            2 => "2nd".into(),
-            3 => "3rd".into(),
-            n => format!("{n}th"),
-        })
-        .unwrap_or_else(|| "1st".into());
-    Button::new("sched-mdays")
-        .ghost()
-        .label(label)
-        .disabled(!enabled)
-        .dropdown_menu(move |menu, _, _| {
-            let mut menu = menu;
-            for d in 1u8..=31 {
-                let on = spec.month_days.contains(&d);
-                let name = match d {
-                    1 => "1st".into(),
-                    2 => "2nd".into(),
-                    3 => "3rd".into(),
-                    n => format!("{n}th"),
-                };
-                let spec = spec.clone();
-                let patch = patch.clone();
-                menu = menu.item(
-                    PopupMenuItem::new(name)
-                        .checked(on)
-                        .on_click(move |_, _, cx| {
-                            let mut next = spec.clone();
-                            if let Some(pos) = next.month_days.iter().position(|x| *x == d) {
-                                next.month_days.remove(pos);
-                            } else {
-                                next.month_days.push(d);
-                                next.month_days.sort();
-                            }
-                            patch(next, cx);
-                        }),
-                );
-            }
-            menu
-        })
-}
-
-#[allow(clippy::type_complexity)]
-fn weekday_chips(
-    spec: ScheduleSpec,
-    patch: Rc<dyn Fn(ScheduleSpec, &mut App)>,
-    enabled: bool,
-) -> impl IntoElement {
-    let names = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
-    h_flex().gap(px(4.)).children((0u8..7).map(|d| {
-        let on = spec.weekdays.contains(&d);
-        let spec = spec.clone();
-        let patch = patch.clone();
+    let tab = |tab: WakeTab| {
+        let open = editor.tab_open(tab);
+        let selected = editor.tab == tab;
+        let id = format!("routine-wake-tab-{}", tab.word());
+        let why = if tab == WakeTab::Webhook {
+            "A routine stays a schedule once made: make a new routine for a webhook"
+        } else {
+            "A routine stays a webhook once made: make a new routine for a schedule"
+        };
+        let app = app.clone();
         div()
-            .id(SharedString::from(format!("wd-{d}")))
-            .px(px(8.))
+            .id(SharedString::from(id.clone()))
+            .debug_selector(move || id)
+            .flex_1()
             .py(px(4.))
             .rounded(px(6.))
-            .bg(rgb(0x777777).opacity(if on { 0.28 } else { 0.1 }))
-            .when(enabled, |this| {
+            .text_xs()
+            .text_center()
+            .when(selected, |this| {
+                this.bg(theme.primary).text_color(theme.primary_foreground)
+            })
+            .when(open && !selected, |this| {
                 this.cursor_pointer()
+                    .hover(|s| s.bg(rgb(0x777777).opacity(0.2)))
                     .on_mouse_down(MouseButton::Left, move |_, _, cx| {
-                        let mut next = spec.clone();
-                        if let Some(pos) = next.weekdays.iter().position(|x| *x == d) {
-                            next.weekdays.remove(pos);
-                        } else {
-                            next.weekdays.push(d);
-                            next.weekdays.sort();
-                        }
-                        patch(next, cx);
+                        app.update(cx, |state, cx| state.pick_wake_tab(tab, cx));
                     })
             })
-            .when(!enabled, |this| this.opacity(0.5))
-            .child(div().text_xs().child(names[d as usize]))
-    }))
+            .when(!open, |this| {
+                this.opacity(0.35)
+                    .tooltip(move |window, cx| Tooltip::new(why).build(window, cx))
+            })
+            .child(tab.label())
+    };
+    v_flex()
+        .w_full()
+        .gap(px(4.))
+        .p(px(3.))
+        .rounded(px(8.))
+        .border_1()
+        .border_color(theme.border)
+        .child(
+            h_flex()
+                .w_full()
+                .gap(px(4.))
+                .children([WakeTab::Every, WakeTab::Daily, WakeTab::Weekly].map(tab)),
+        )
+        .child(
+            h_flex()
+                .w_full()
+                .gap(px(4.))
+                .children([WakeTab::Monthly, WakeTab::Webhook, WakeTab::Cron].map(&tab)),
+        )
 }
 
-#[allow(clippy::type_complexity)]
-fn time_row(
-    index: usize,
-    hour: u8,
-    minute: u8,
-    spec: ScheduleSpec,
-    patch: Rc<dyn Fn(ScheduleSpec, &mut App)>,
-    enabled: bool,
+/// One choice of a segmented control.
+struct Segment {
+    id: &'static str,
+    label: &'static str,
+    selected: bool,
+    on_press: Rc<dyn Fn(&mut App)>,
+}
+
+/// A row of choices, one of them picked: the Every tab's unit, AM and PM.
+fn segments<const N: usize>(
+    choices: [Segment; N],
+    theme: &gpui_kit::component::Theme,
 ) -> impl IntoElement {
-    let label = {
-        let (h12, am) = if hour == 0 {
-            (12, true)
-        } else if hour < 12 {
-            (hour, true)
-        } else if hour == 12 {
-            (12, false)
-        } else {
-            (hour - 12, false)
-        };
-        format!("{}:{:02} {}", h12, minute, if am { "AM" } else { "PM" })
+    h_flex()
+        .gap(px(2.))
+        .p(px(2.))
+        .rounded(px(8.))
+        .border_1()
+        .border_color(theme.border)
+        .children(choices.map(|choice| {
+            let Segment {
+                id,
+                label,
+                selected,
+                on_press,
+            } = choice;
+            div()
+                .id(id)
+                .debug_selector(move || id.to_string())
+                .px(px(8.))
+                .py(px(3.))
+                .rounded(px(6.))
+                .text_xs()
+                .when(selected, |this| {
+                    this.bg(theme.primary).text_color(theme.primary_foreground)
+                })
+                .when(!selected, |this| {
+                    this.cursor_pointer()
+                        .hover(|s| s.bg(rgb(0x777777).opacity(0.2)))
+                        .on_mouse_down(MouseButton::Left, move |_, _, cx| on_press(cx))
+                })
+                .child(label)
+        }))
+}
+
+/// A number typed in a box, with ▲ and ▼ beside it to step it.
+fn number_box(
+    id: &'static str,
+    input: &Entity<InputState>,
+    which: WakeBox,
+    app: Entity<AppState>,
+    theme: &gpui_kit::component::Theme,
+) -> impl IntoElement {
+    let step = |up: bool| {
+        let app = app.clone();
+        let stepper = format!("{id}-{}", if up { "up" } else { "down" });
+        div()
+            .id(SharedString::from(stepper.clone()))
+            .debug_selector(move || stepper)
+            .w(px(18.))
+            .h(px(14.))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded(px(4.))
+            .cursor_pointer()
+            .hover(|s| s.bg(rgb(0x777777).opacity(0.2)))
+            .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                app.update(cx, |state, cx| state.step_wake_box(which, up, cx));
+            })
+            .child(
+                Icon::default()
+                    .path(if up {
+                        "icons/chevron-up.svg"
+                    } else {
+                        "icons/chevron-down.svg"
+                    })
+                    .size(px(12.))
+                    .text_color(theme.foreground),
+            )
     };
     h_flex()
-        .gap(px(6.))
+        .gap(px(2.))
         .items_center()
         .child(
-            Button::new(SharedString::from(format!("time-{index}")))
-                .ghost()
-                .label(label)
-                .disabled(!enabled)
-                .dropdown_menu({
-                    let spec = spec.clone();
-                    let patch = patch.clone();
-                    move |menu, _, _| {
-                        let mut menu = menu;
-                        for h in 0u8..24 {
-                            for m in [0u8, 15, 30, 45] {
-                                let spec = spec.clone();
-                                let patch = patch.clone();
-                                let (h12, am) = if h == 0 {
-                                    (12, true)
-                                } else if h < 12 {
-                                    (h, true)
-                                } else if h == 12 {
-                                    (12, false)
-                                } else {
-                                    (h - 12, false)
-                                };
-                                let name =
-                                    format!("{}:{:02} {}", h12, m, if am { "AM" } else { "PM" });
-                                menu = menu.item(PopupMenuItem::new(name).on_click(
-                                    move |_, _, cx| {
-                                        let mut next = spec.clone();
-                                        if let Some(slot) = next.times.get_mut(index) {
-                                            *slot = (h, m);
-                                        }
-                                        patch(next, cx);
-                                    },
-                                ));
-                            }
-                        }
-                        menu
+            div()
+                .debug_selector(move || id.to_string())
+                .w(px(52.))
+                .child(field_input(input)),
+        )
+        .child(v_flex().child(step(true)).child(step(false)))
+}
+
+/// A chip that is in or out: a day of the week, a date, a month.
+fn chip(
+    id: String,
+    label: impl Into<SharedString>,
+    on: bool,
+    theme: &gpui_kit::component::Theme,
+    on_press: impl Fn(&mut App) + 'static,
+) -> Stateful<Div> {
+    div()
+        .id(SharedString::from(id.clone()))
+        .debug_selector(move || id)
+        .min_w(px(30.))
+        .h(px(28.))
+        .px(px(6.))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(6.))
+        .text_xs()
+        .border_1()
+        .border_color(if on { theme.primary } else { theme.border })
+        .when(on, |this| {
+            this.bg(theme.primary).text_color(theme.primary_foreground)
+        })
+        .cursor_pointer()
+        .on_mouse_down(MouseButton::Left, move |_, _, cx| on_press(cx))
+        .child(label.into())
+}
+
+/// The Weekly tab's days: S M T W T F S, Sunday first, wrapping rather than running off the
+/// panel.
+fn weekday_chips(
+    editor: &WakeEditor,
+    muted: Hsla,
+    app: Entity<AppState>,
+    theme: &gpui_kit::component::Theme,
+) -> impl IntoElement {
+    const LETTERS: [&str; 7] = ["S", "M", "T", "W", "T", "F", "S"];
+    v_flex()
+        .gap(px(4.))
+        .child(field_label("Days of the week", muted))
+        .child(
+            h_flex()
+                .debug_selector(|| "routine-wake-days".into())
+                .w_full()
+                .flex_wrap()
+                .gap(px(4.))
+                .children((0u8..7).map(|day| {
+                    let app = app.clone();
+                    chip(
+                        format!("routine-wake-day-{day}"),
+                        LETTERS[usize::from(day)],
+                        editor.spec.weekdays.contains(&day),
+                        theme,
+                        move |cx| app.update(cx, |state, cx| state.toggle_wake_weekday(day, cx)),
+                    )
+                    .tooltip(move |window, cx| {
+                        Tooltip::new(crate::cron_spec::WEEKDAYS[usize::from(day)]).build(window, cx)
+                    })
+                })),
+        )
+}
+
+/// The Monthly tab's dates: a grid seven wide, 1 to 31. No "last day": the server's parser has
+/// no `L` (opengrok-server reads lines with the `cron` crate 0.17).
+fn date_grid(
+    editor: &WakeEditor,
+    muted: Hsla,
+    app: Entity<AppState>,
+    theme: &gpui_kit::component::Theme,
+) -> impl IntoElement {
+    v_flex()
+        .debug_selector(|| "routine-wake-dates".into())
+        .w_full()
+        .gap(px(4.))
+        .child(field_label("Days of the month", muted))
+        .children((0u8..5).map(|week| {
+            h_flex()
+                .w_full()
+                .gap(px(4.))
+                .children((1..=7u8).map(|place| {
+                    let date = week * 7 + place;
+                    if date > 31 {
+                        // The last row's empty places keep the grid's columns.
+                        return div().flex_1().into_any_element();
                     }
+                    let app = app.clone();
+                    chip(
+                        format!("routine-wake-date-{date}"),
+                        date.to_string(),
+                        editor.spec.month_days.contains(&date),
+                        theme,
+                        move |cx| app.update(cx, |state, cx| state.toggle_wake_date(date, cx)),
+                    )
+                    .flex_1()
+                    .min_w(px(0.))
+                    .into_any_element()
+                }))
+        }))
+}
+
+/// The months a schedule is kept to: twelve chips, any number picked, none picked for every
+/// month, wrapping rather than running off the panel.
+fn month_chips(
+    editor: &WakeEditor,
+    muted: Hsla,
+    app: Entity<AppState>,
+    theme: &gpui_kit::component::Theme,
+) -> impl IntoElement {
+    v_flex()
+        .gap(px(4.))
+        .child(field_label("Months", muted))
+        .child(
+            h_flex()
+                .debug_selector(|| "routine-wake-months".into())
+                .w_full()
+                .flex_wrap()
+                .gap(px(4.))
+                .children((1u8..=12).map(|month| {
+                    let app = app.clone();
+                    chip(
+                        format!("routine-wake-month-{month}"),
+                        crate::cron_spec::MONTHS[usize::from(month) - 1],
+                        editor.spec.months.contains(&month),
+                        theme,
+                        move |cx| app.update(cx, |state, cx| state.toggle_wake_month(month, cx)),
+                    )
+                })),
+        )
+        .when(editor.spec.months.is_empty(), |this| {
+            this.child(
+                div()
+                    .text_xs()
+                    .text_color(muted)
+                    .child("None picked: every month."),
+            )
+        })
+}
+
+/// The Webhook tab: for a routine that is one, the address the server made for it, the key and
+/// the header to send it with, each to copy, and a new key on asking. For a routine's first
+/// wake, what a webhook is; the address comes with Save.
+fn webhook_details(
+    routine: Option<&AgentRoutine>,
+    muted: Hsla,
+    app: Entity<AppState>,
+    theme: &gpui_kit::component::Theme,
+) -> AnyElement {
+    let hook = routine.and_then(|row| {
+        row.triggers.iter().find_map(|trigger| match trigger {
+            RoutineTrigger::Webhook {
+                url, key, header, ..
+            } => Some((row.id.clone(), url.clone(), key.clone(), header.clone())),
+            _ => None,
+        })
+    });
+    let Some((routine_id, url, key, header)) = hook else {
+        return div()
+            .text_sm()
+            .text_color(muted)
+            .child(
+                "It runs when something POSTs to an address the server makes for it. The \
+                 address and its key are here once it is saved.",
+            )
+            .into_any_element();
+    };
+    v_flex()
+        .w_full()
+        .gap(px(8.))
+        .child(field_label("POST to", muted))
+        .child(copy_row(
+            format!("routine-{routine_id}-webhook-url"),
+            url,
+            muted,
+            theme,
+        ))
+        .child(field_label("key", muted))
+        .child(copy_row(
+            format!("routine-{routine_id}-webhook-key"),
+            key,
+            muted,
+            theme,
+        ))
+        .child(field_label("header", muted))
+        .child(copy_row(
+            format!("routine-{routine_id}-webhook-header"),
+            header,
+            muted,
+            theme,
+        ))
+        .child(
+            Button::new(SharedString::from(format!("routine-{routine_id}-rotate")))
+                .ghost()
+                .label("Rotate key")
+                .tooltip("The old key stops working at once.")
+                .on_click(move |_, _, cx| {
+                    app.update(cx, |state, cx| {
+                        if let Some(coworker_id) = state.active_coworker_id.clone() {
+                            state.rotate_routine_webhook(&coworker_id, &routine_id, cx);
+                        }
+                    });
                 }),
         )
-        .child(
-            div()
-                .id(SharedString::from(format!("time-x-{index}")))
-                .size(px(20.))
-                .flex()
-                .items_center()
-                .justify_center()
-                .when(enabled, |this| {
-                    this.cursor_pointer().on_mouse_down(MouseButton::Left, {
-                        let spec = spec.clone();
-                        let patch = patch.clone();
-                        move |_, _, cx| {
-                            let mut next = spec.clone();
-                            if index < next.times.len() {
-                                next.times.remove(index);
-                            }
-                            patch(next, cx);
-                        }
-                    })
-                })
-                .when(!enabled, |this| this.opacity(0.5))
-                .child(div().text_sm().child("×")),
-        )
+        .into_any_element()
 }
 
 #[cfg(test)]
@@ -2747,6 +2675,102 @@ mod tests {
         cx.simulate_click(toggle, Modifiers::none());
         assert!(drawn(cx, "routine-name").is_some(), "the fields again");
         assert!(drawn(cx, "routine-history").is_none());
+    }
+
+    /// "When to run" lists the routine's one wake, with + dead beside it (the server keeps one
+    /// per routine), and ✎ opens the wake editor in its place: its chips wrap inside the editor
+    /// rather than run off the panel, the dates are a grid seven wide, a stepper moves the time,
+    /// and Save puts what was picked on the routine.
+    #[gpui_kit::test]
+    fn a_routines_wake_is_listed_and_edited_in_the_panel(cx: &mut gpui_kit::TestAppContext) {
+        use gpui_kit::{AppContext as _, Bounds, Modifiers, Pixels, px, size};
+        cx.update(gpui_kit::init);
+        let (pane, cx) = cx.add_window_view(|window, cx| {
+            let state = cx.new(|_| routine_open());
+            super::ComputerPane::new(window, state, cx)
+        });
+        // Tall enough that nothing of the editor is scrolled out of the panel.
+        cx.simulate_resize(size(px(320.), px(2400.)));
+        let drawn = |cx: &mut gpui_kit::VisualTestContext, id: &'static str| {
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            cx.debug_bounds(id)
+        };
+        let press = |cx: &mut gpui_kit::VisualTestContext, bounds: Bounds<Pixels>| {
+            cx.simulate_mouse_move(bounds.center(), None, Modifiers::none());
+            cx.simulate_click(bounds.center(), Modifiers::none());
+        };
+        let editor_open = |pane: &gpui_kit::Entity<super::ComputerPane>,
+                           cx: &mut gpui_kit::VisualTestContext| {
+            pane.update(cx, |pane, cx| {
+                pane.state.read(cx).routine_wake_editor.is_some()
+            })
+        };
+
+        let add = drawn(cx, "routine-wake-add").expect("+ is beside the heading");
+        press(cx, add);
+        assert!(
+            !editor_open(&pane, cx),
+            "+ is dead while the routine has its wake"
+        );
+
+        let edit = drawn(cx, "routine-wake-edit-0").expect("✎ on the wake");
+        press(cx, edit);
+        assert!(editor_open(&pane, cx));
+        assert!(drawn(cx, "routine-wake-editor").is_some());
+
+        let inside = |cx: &mut gpui_kit::VisualTestContext, id: String| {
+            let editor = cx.debug_bounds("routine-wake-editor").unwrap();
+            let bounds = cx
+                .debug_bounds(Box::leak(id.clone().into_boxed_str()))
+                .unwrap_or_else(|| panic!("{id} is drawn"));
+            assert!(
+                bounds.left() >= editor.left() && bounds.right() <= editor.right(),
+                "{id} runs out of the editor: {bounds:?} in {editor:?}"
+            );
+            bounds
+        };
+        let weekly = drawn(cx, "routine-wake-tab-weekly").unwrap();
+        press(cx, weekly);
+        drawn(cx, "routine-wake-editor");
+        for day in 0..7 {
+            inside(cx, format!("routine-wake-day-{day}"));
+        }
+        for month in 1..=12 {
+            inside(cx, format!("routine-wake-month-{month}"));
+        }
+
+        let monthly = drawn(cx, "routine-wake-tab-monthly").unwrap();
+        press(cx, monthly);
+        drawn(cx, "routine-wake-editor");
+        let first = inside(cx, "routine-wake-date-1".into());
+        let seventh = inside(cx, "routine-wake-date-7".into());
+        let eighth = inside(cx, "routine-wake-date-8".into());
+        inside(cx, "routine-wake-date-31".into());
+        assert_eq!(first.top(), seventh.top(), "a week of dates to a row");
+        assert!(eighth.top() > first.top(), "the 8th starts the next");
+
+        let up = drawn(cx, "routine-wake-hour-up").unwrap();
+        press(cx, up);
+        assert_eq!(
+            pane.update(cx, |pane, cx| pane
+                .state
+                .read(cx)
+                .routine_wake_editor
+                .as_ref()
+                .map(|editor| editor.summary())),
+            Some("Monthly on the 1st at 10:00 AM UTC".to_string())
+        );
+
+        let save = drawn(cx, "routine-wake-save").unwrap();
+        press(cx, save);
+        assert!(!editor_open(&pane, cx));
+        assert_eq!(
+            pane.update(cx, |pane, cx| pane.state.read(cx).coworker_routines("cw_1")
+                [0]
+            .triggers[0]
+                .label()),
+            "Monthly on the 1st at 10:00 AM UTC"
+        );
     }
 
     /// Delete's question sits in the middle of the whole window, not of the panel, and holds

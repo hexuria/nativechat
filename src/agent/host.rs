@@ -123,6 +123,71 @@ pub mod ids {
     pub const ROUTINE_OPEN_THREAD: &str = "routine-open-thread";
     pub const ROUTINE_RUN_NOW: &str = "routine-run-now";
     pub const ROUTINE_DELETE: &str = "routine-delete";
+    /// "When to run" on the open routine: + (dead, with the reason as its value, while the
+    /// routine has its one wake), and the wake editor's Save and Cancel.
+    pub const ROUTINE_WAKE_ADD: &str = "routine-wake-add";
+    pub const ROUTINE_WAKE_EDITOR: &str = "routine-wake-editor";
+    pub const ROUTINE_WAKE_SUMMARY: &str = "routine-wake-summary";
+    pub const ROUTINE_WAKE_NEXT: &str = "routine-wake-next";
+    pub const ROUTINE_WAKE_ERROR: &str = "routine-wake-error";
+    pub const ROUTINE_WAKE_CRON_NOTE: &str = "routine-wake-cron-note";
+    pub const ROUTINE_WAKE_SAVE: &str = "routine-wake-save";
+    pub const ROUTINE_WAKE_CANCEL: &str = "routine-wake-cancel";
+    pub const ROUTINE_WAKE_AM: &str = "routine-wake-am";
+    pub const ROUTINE_WAKE_PM: &str = "routine-wake-pm";
+
+    /// One of the open routine's wakes (label = what sets it off, in words), and its ✎ and 🗑.
+    pub fn routine_wake(at: usize) -> String {
+        format!("routine-wake-{at}")
+    }
+
+    pub fn routine_wake_edit(at: usize) -> String {
+        format!("routine-wake-edit-{at}")
+    }
+
+    pub fn routine_wake_delete(at: usize) -> String {
+        format!("routine-wake-delete-{at}")
+    }
+
+    /// A tab of the wake editor, by its word: `every`, `daily`, `weekly`, `monthly`, `webhook`,
+    /// `cron`.
+    pub fn routine_wake_tab(tab: crate::state::WakeTab) -> String {
+        format!("routine-wake-tab-{}", tab.word())
+    }
+
+    /// One of the wake editor's typed boxes, and its ▲ and ▼.
+    pub fn routine_wake_box(which: crate::state::WakeBox) -> &'static str {
+        match which {
+            crate::state::WakeBox::Every => "routine-wake-every",
+            crate::state::WakeBox::Hour => "routine-wake-hour",
+            crate::state::WakeBox::Minute => "routine-wake-minute",
+            crate::state::WakeBox::Cron => "routine-wake-cron",
+        }
+    }
+
+    /// The Every tab's unit, by its word: `minutes`, `hours`, `days`.
+    pub fn routine_wake_unit(unit: crate::state::ScheduleUnit) -> &'static str {
+        match unit {
+            crate::state::ScheduleUnit::Minutes => "routine-wake-unit-minutes",
+            crate::state::ScheduleUnit::Hours => "routine-wake-unit-hours",
+            crate::state::ScheduleUnit::Days => "routine-wake-unit-days",
+        }
+    }
+
+    /// The Weekly tab's day chips (0 is Sunday), the Monthly tab's dates (1 to 31) and the month
+    /// chips (1 is January).
+    pub fn routine_wake_day(day: u8) -> String {
+        format!("routine-wake-day-{day}")
+    }
+
+    pub fn routine_wake_date(date: u8) -> String {
+        format!("routine-wake-date-{date}")
+    }
+
+    pub fn routine_wake_month(month: u8) -> String {
+        format!("routine-wake-month-{month}")
+    }
+
     /// The question Delete asks over the whole window (label = `Delete "<name>"?`, value = what
     /// deleting it does), and its two answers. In the tree only while it asks.
     pub const ROUTINE_DELETE_PROMPT: &str = "routine-delete-prompt";
@@ -866,6 +931,28 @@ pub enum Command {
     },
     /// The open routine's history icon: its Run history in place of its fields, or back.
     ToggleRoutineHistory,
+    /// ✎ on one of the open routine's wakes, or + on one with none.
+    OpenWakeEditor {
+        index: Option<usize>,
+    },
+    CloseWakeEditor,
+    PickWakeTab(crate::state::WakeTab),
+    /// A typed box of the wake editor, set the way a driver sets a field.
+    SetWakeBox {
+        which: crate::state::WakeBox,
+        text: String,
+    },
+    StepWakeBox {
+        which: crate::state::WakeBox,
+        up: bool,
+    },
+    SetWakePm(bool),
+    SetWakeUnit(crate::state::ScheduleUnit),
+    ToggleWakeDay(u8),
+    ToggleWakeDate(u8),
+    ToggleWakeMonth(u8),
+    /// The wake editor's Save, with the routine's name and instruction as they stand.
+    SaveWake,
     /// The Bot chip, pressed: the Bot's settings, or its own chat from a routine's thread.
     PressBotChip,
     /// Run the open recipe on this bot.
@@ -1121,6 +1208,35 @@ impl Command {
                 state.open_routine_run(&routine_id, &run_id, cx)
             }
             Self::ToggleRoutineHistory => state.toggle_routine_history(cx),
+            Self::OpenWakeEditor { index } => {
+                if let crate::state::ComputerView::Editor { id: Some(open) } =
+                    state.computer_view.clone()
+                {
+                    state.open_wake_editor(&open, index, cx);
+                }
+            }
+            Self::CloseWakeEditor => state.close_wake_editor(cx),
+            Self::PickWakeTab(tab) => state.pick_wake_tab(tab, cx),
+            Self::SetWakeBox { which, text } => state.set_wake_box(which, text, false, cx),
+            Self::StepWakeBox { which, up } => state.step_wake_box(which, up, cx),
+            Self::SetWakePm(pm) => state.set_wake_pm(pm, cx),
+            Self::SetWakeUnit(unit) => state.set_wake_unit(unit, cx),
+            Self::ToggleWakeDay(day) => state.toggle_wake_weekday(day, cx),
+            Self::ToggleWakeDate(date) => state.toggle_wake_date(date, cx),
+            Self::ToggleWakeMonth(month) => state.toggle_wake_month(month, cx),
+            Self::SaveWake => {
+                let fields = state.routine_wake_editor.as_ref().and_then(|editor| {
+                    let bot = state.active_coworker_id.as_deref()?;
+                    state
+                        .coworker_routines(bot)
+                        .iter()
+                        .find(|row| row.id == editor.routine_id)
+                        .map(|row| (row.name.clone(), row.instruction.clone()))
+                });
+                if let Some((name, instruction)) = fields {
+                    state.save_wake(name, instruction, cx);
+                }
+            }
             Self::PressBotChip => state.press_bot_chip(cx),
             Self::RunOpenRecipe(coworker_id) => state.run_open_recipe(coworker_id, cx),
             Self::SetComputerExecMode { machine_id, mode } => {
@@ -1546,6 +1662,8 @@ struct RoutineSnap {
     runs_unavailable: bool,
     /// What the person typed that the server did not keep, line by line.
     unsaved: Vec<(&'static str, String)>,
+    /// Its wakes, in order: what sets each off in words, and whether it is a webhook.
+    wakes: Vec<(String, bool)>,
 }
 
 impl RoutineSnap {
@@ -2170,6 +2288,16 @@ fn routine_snap(routine: &crate::state::AgentRoutine, state: &AppState) -> Routi
             .get(&routine.id)
             .map(crate::state::unsaved_lines)
             .unwrap_or_default(),
+        wakes: routine
+            .triggers
+            .iter()
+            .map(|trigger| {
+                (
+                    trigger.label(),
+                    matches!(trigger, crate::state::RoutineTrigger::Webhook { .. }),
+                )
+            })
+            .collect(),
     };
     match routine.triggers.first() {
         Some(crate::state::RoutineTrigger::Schedule { spec, .. }) => {
@@ -2219,6 +2347,174 @@ fn routine_header_nodes(routine: &RoutineSnap, history_open: bool) -> Vec<UiNode
         run,
         UiNode::button(ids::ROUTINE_DELETE, "Delete"),
     ]
+}
+
+/// "When to run" on the open routine: +, a node per wake with its ✎ and 🗑, and the wake editor
+/// while it is open, each enabled while a click would act and with the reason as the value of
+/// one that would not.
+fn routine_wake_nodes(
+    open: &RoutineSnap,
+    editor: Option<&(crate::state::WakeEditor, crate::state::WakeStatus)>,
+) -> Vec<UiNode> {
+    use crate::state::{LAST_WAKE_STAYS, ONE_WAKE_PER_ROUTINE, ROUTINE_EDIT_UNAVAILABLE};
+    let can_add = open.wakes.is_empty();
+    let mut add = UiNode::button(ids::ROUTINE_WAKE_ADD, "Add a schedule")
+        .with_enabled(can_add && editor.is_none());
+    if !can_add {
+        add = add.with_value(ONE_WAKE_PER_ROUTINE);
+    }
+    let mut nodes = vec![add];
+    for (at, (summary, webhook)) in open.wakes.iter().enumerate() {
+        let can_edit = *webhook || !open.cant_change();
+        let mut edit = UiNode::button(ids::routine_wake_edit(at), "Edit").with_enabled(can_edit);
+        if !can_edit {
+            edit = edit.with_value(ROUTINE_EDIT_UNAVAILABLE);
+        }
+        nodes.push(
+            UiNode::status(ids::routine_wake(at), summary.clone())
+                .with_child(edit)
+                .with_child(
+                    UiNode::button(ids::routine_wake_delete(at), "Delete")
+                        .with_enabled(false)
+                        .with_value(LAST_WAKE_STAYS),
+                ),
+        );
+    }
+    if let Some((editor, status)) = editor {
+        nodes.push(wake_editor_node(editor, status));
+    }
+    nodes
+}
+
+/// The wake editor as the panel draws it: the tabs, what the open tab picks with, and under
+/// them what was picked, when it would next run or why it cannot be saved, and the two buttons.
+fn wake_editor_node(
+    editor: &crate::state::WakeEditor,
+    status: &crate::state::WakeStatus,
+) -> UiNode {
+    use crate::state::{WakeBox, WakeTab};
+    let mut node =
+        UiNode::dialog(ids::ROUTINE_WAKE_EDITOR, "When to run").with_value(editor.tab.word());
+    for tab in WakeTab::ALL {
+        let mut button = UiNode::button(ids::routine_wake_tab(tab), tab.label())
+            .with_enabled(editor.tab_open(tab));
+        if editor.tab == tab {
+            button.states.push("selected".into());
+        }
+        node = node.with_child(button);
+    }
+    let typed = |which: WakeBox, label: &str, value: &str| {
+        UiNode::textbox(ids::routine_wake_box(which), label).with_value(value)
+    };
+    let steppers = |which: WakeBox| {
+        [true, false].map(|up| {
+            UiNode::button(
+                format!(
+                    "{}-{}",
+                    ids::routine_wake_box(which),
+                    if up { "up" } else { "down" }
+                ),
+                if up { "Up" } else { "Down" },
+            )
+        })
+    };
+    let chip =
+        |id: String, label: String, on: bool| UiNode::new(id, "checkbox", label).with_checked(on);
+    let time_tab = matches!(
+        editor.tab,
+        WakeTab::Daily | WakeTab::Weekly | WakeTab::Monthly
+    );
+    match editor.tab {
+        WakeTab::Every => {
+            node = node.with_child(typed(WakeBox::Every, "Every", &editor.every));
+            for stepper in steppers(WakeBox::Every) {
+                node = node.with_child(stepper);
+            }
+            for unit in [
+                crate::state::ScheduleUnit::Minutes,
+                crate::state::ScheduleUnit::Hours,
+                crate::state::ScheduleUnit::Days,
+            ] {
+                let mut button = UiNode::button(ids::routine_wake_unit(unit), format!("{unit:?}"));
+                if editor.spec.unit == unit {
+                    button.states.push("selected".into());
+                }
+                node = node.with_child(button);
+            }
+        }
+        WakeTab::Weekly => {
+            for day in 0u8..7 {
+                node = node.with_child(chip(
+                    ids::routine_wake_day(day),
+                    crate::cron_spec::WEEKDAYS[usize::from(day)].to_string(),
+                    editor.spec.weekdays.contains(&day),
+                ));
+            }
+        }
+        WakeTab::Monthly => {
+            for date in 1u8..=31 {
+                node = node.with_child(chip(
+                    ids::routine_wake_date(date),
+                    date.to_string(),
+                    editor.spec.month_days.contains(&date),
+                ));
+            }
+        }
+        WakeTab::Cron => {
+            node = node.with_child(typed(WakeBox::Cron, "Cron line", &editor.spec.expr));
+            if status.numbered_weekdays {
+                node = node.with_child(UiNode::status(
+                    ids::ROUTINE_WAKE_CRON_NOTE,
+                    crate::state::NUMBERED_WEEKDAYS,
+                ));
+            }
+        }
+        WakeTab::Daily | WakeTab::Webhook => {}
+    }
+    if time_tab {
+        node = node.with_child(typed(WakeBox::Hour, "Hour", &editor.hour));
+        for stepper in steppers(WakeBox::Hour) {
+            node = node.with_child(stepper);
+        }
+        node = node.with_child(typed(WakeBox::Minute, "Minute", &editor.minute));
+        for stepper in steppers(WakeBox::Minute) {
+            node = node.with_child(stepper);
+        }
+        for (id, label, pm) in [
+            (ids::ROUTINE_WAKE_AM, "AM", false),
+            (ids::ROUTINE_WAKE_PM, "PM", true),
+        ] {
+            let mut button = UiNode::button(id, label);
+            if editor.pm == pm {
+                button.states.push("selected".into());
+            }
+            node = node.with_child(button);
+        }
+        for month in 1u8..=12 {
+            node = node.with_child(chip(
+                ids::routine_wake_month(month),
+                crate::cron_spec::MONTHS[usize::from(month) - 1].to_string(),
+                editor.spec.months.contains(&month),
+            ));
+        }
+    }
+    node = node.with_child(UiNode::status(
+        ids::ROUTINE_WAKE_SUMMARY,
+        status.summary.clone(),
+    ));
+    if let Some(next) = &status.next {
+        node = node.with_child(UiNode::status(ids::ROUTINE_WAKE_NEXT, next.clone()));
+    }
+    if let Some(error) = &status.error {
+        node = node.with_child(UiNode::status(ids::ROUTINE_WAKE_ERROR, error.clone()));
+    }
+    let done = if editor.kind == Some(crate::opengrok::ScheduleKind::Webhook) {
+        "Done"
+    } else {
+        "Save"
+    };
+    node.with_child(UiNode::button(ids::ROUTINE_WAKE_SAVE, done).with_enabled(status.can_save()))
+        .with_child(UiNode::button(ids::ROUTINE_WAKE_CANCEL, "Cancel"))
 }
 
 /// The routine's row and everything reachable from it.
@@ -2741,6 +3037,8 @@ pub struct NativeChatHost {
     routine_history_open: bool,
     /// The question Delete is asking about a routine: its title and what deleting it does.
     routine_delete_question: Option<(String, String)>,
+    /// The wake editor while it is open, and what it says under what is picked.
+    routine_wake_editor: Option<(crate::state::WakeEditor, crate::state::WakeStatus)>,
     /// The open thread's routine, when it is one of the bot's routines' threads: its name and
     /// the server's word for what fires it.
     routine_thread: Option<(String, String)>,
@@ -3117,6 +3415,10 @@ impl NativeChatHost {
             routine_delete_question: state
                 .routine_delete_question()
                 .map(|(title, what)| (title, what.to_string())),
+            routine_wake_editor: state.routine_wake_editor.clone().map(|editor| {
+                let status = editor.status(chrono::Utc::now());
+                (editor, status)
+            }),
             routine_error: match (&state.computer_view, state.right_pane) {
                 (
                     crate::state::ComputerView::Editor { id: Some(open) },
@@ -3727,6 +4029,9 @@ impl NativeChatHost {
         }
         if let Some(open) = self.open_routine() {
             for node in routine_header_nodes(open, self.routine_history_open) {
+                computer = computer.with_child(node);
+            }
+            for node in routine_wake_nodes(open, self.routine_wake_editor.as_ref()) {
                 computer = computer.with_child(node);
             }
         }
@@ -6069,6 +6374,8 @@ impl NativeChatHost {
             } else {
                 Command::CancelRoutineDelete
             }
+        } else if let Some(cmd) = self.wake_command(target) {
+            cmd?
         } else if [
             ids::ROUTINE_HISTORY_TOGGLE,
             ids::ROUTINE_OPEN_THREAD,
@@ -6122,6 +6429,24 @@ impl NativeChatHost {
         }
         if target == ids::REPLY_SOURCE_URL || target == ids::REPLY_SOURCE_KEY {
             return self.set_reply_source_field(target, value);
+        }
+        if let Some(which) = [
+            crate::state::WakeBox::Every,
+            crate::state::WakeBox::Hour,
+            crate::state::WakeBox::Minute,
+            crate::state::WakeBox::Cron,
+        ]
+        .into_iter()
+        .find(|which| target == ids::routine_wake_box(*which))
+        {
+            if self.routine_wake_editor.is_none() {
+                return Err(format!("`{target}` is in the wake editor, which is shut"));
+            }
+            self.pending = Some(Command::SetWakeBox {
+                which,
+                text: value.to_string(),
+            });
+            return Ok(DispatchResult::empty());
         }
         if let Some(refusal) = self.skill_sheet_field(target) {
             return refusal;
@@ -6923,6 +7248,102 @@ impl NativeChatHost {
         })
     }
 
+    /// A click on "When to run" or in the wake editor, refused where the panel's control is dead,
+    /// in the words it says it in. `None` for a target that is not one of theirs.
+    fn wake_command(&self, target: &str) -> Option<Result<Command, String>> {
+        use crate::state::{WakeBox, WakeTab};
+        let rest = target.strip_prefix("routine-wake-")?;
+        let Some(open) = self.open_routine() else {
+            return Some(Err(format!(
+                "`{target}` is in a routine's panel, and none is open"
+            )));
+        };
+        let editor = self.routine_wake_editor.as_ref();
+        let dead = |why: &str| Some(Err(format!("`{target}` is dead: {why}")));
+        if target == ids::ROUTINE_WAKE_ADD {
+            if !open.wakes.is_empty() {
+                return dead(crate::state::ONE_WAKE_PER_ROUTINE);
+            }
+            if editor.is_some() {
+                return dead("the wake editor is open");
+            }
+            return Some(Ok(Command::OpenWakeEditor { index: None }));
+        }
+        if let Some(at) = rest
+            .strip_prefix("edit-")
+            .and_then(|at| at.parse::<usize>().ok())
+        {
+            let Some((_, webhook)) = open.wakes.get(at) else {
+                return Some(Err(format!("the open routine has no wake {at}")));
+            };
+            if !webhook && open.cant_change() {
+                return dead(crate::state::ROUTINE_EDIT_UNAVAILABLE);
+            }
+            return Some(Ok(Command::OpenWakeEditor { index: Some(at) }));
+        }
+        if rest.starts_with("delete-") {
+            return dead(crate::state::LAST_WAKE_STAYS);
+        }
+        let Some((editor, status)) = editor else {
+            return Some(Err(format!(
+                "`{target}` is in the wake editor, which is shut"
+            )));
+        };
+        let cmd = if let Some(word) = rest.strip_prefix("tab-") {
+            let tab = WakeTab::ALL.into_iter().find(|tab| tab.word() == word)?;
+            if !editor.tab_open(tab) {
+                return dead("a routine stays the kind it was made");
+            }
+            Command::PickWakeTab(tab)
+        } else if let Some((which, up)) = [WakeBox::Every, WakeBox::Hour, WakeBox::Minute]
+            .into_iter()
+            .flat_map(|which| [(which, true), (which, false)])
+            .find(|(which, up)| {
+                target
+                    == format!(
+                        "{}-{}",
+                        ids::routine_wake_box(*which),
+                        if *up { "up" } else { "down" }
+                    )
+            })
+        {
+            Command::StepWakeBox { which, up }
+        } else if let Some(unit) = [
+            crate::state::ScheduleUnit::Minutes,
+            crate::state::ScheduleUnit::Hours,
+            crate::state::ScheduleUnit::Days,
+        ]
+        .into_iter()
+        .find(|unit| target == ids::routine_wake_unit(*unit))
+        {
+            Command::SetWakeUnit(unit)
+        } else if target == ids::ROUTINE_WAKE_AM || target == ids::ROUTINE_WAKE_PM {
+            Command::SetWakePm(target == ids::ROUTINE_WAKE_PM)
+        } else if let Some(day) = rest.strip_prefix("day-").and_then(|d| d.parse::<u8>().ok()) {
+            Command::ToggleWakeDay(day)
+        } else if let Some(date) = rest
+            .strip_prefix("date-")
+            .and_then(|d| d.parse::<u8>().ok())
+        {
+            Command::ToggleWakeDate(date)
+        } else if let Some(month) = rest
+            .strip_prefix("month-")
+            .and_then(|m| m.parse::<u8>().ok())
+        {
+            Command::ToggleWakeMonth(month)
+        } else if target == ids::ROUTINE_WAKE_SAVE {
+            if let Some(why) = &status.error {
+                return dead(why);
+            }
+            Command::SaveWake
+        } else if target == ids::ROUTINE_WAKE_CANCEL {
+            Command::CloseWakeEditor
+        } else {
+            return None;
+        };
+        Some(Ok(cmd))
+    }
+
     /// The routine open in the Computer pane, as the tree lists it.
     fn open_routine(&self) -> Option<&RoutineSnap> {
         let open = self.routine_editor.as_deref()?;
@@ -7043,6 +7464,11 @@ mod tests {
             notes: Vec::new(),
             runs_unavailable: false,
             unsaved: Vec::new(),
+            wakes: match kind {
+                "cron" => vec![("Every day at 9:00 AM UTC".into(), false)],
+                "webhook" => vec![("When a webhook fires".into(), true)],
+                _ => Vec::new(),
+            },
         }
     }
 
@@ -7282,6 +7708,183 @@ mod tests {
             host.take_command(),
             Some(Command::ConfirmRoutineDelete)
         ));
+    }
+
+    /// "When to run" on the open routine: + is dead while it has its one wake, saying why; the
+    /// wake is listed in words with ✎ live and 🗑 dead; ✎ is dead too where the server cannot
+    /// change a routine. The wake editor, while open, carries its tabs and the open tab's
+    /// controls, what was picked and Save, and clicks and `set_value` go to it, a dead one
+    /// refused in the words the panel says it in.
+    #[test]
+    fn when_to_run_lists_the_wake_and_the_editor_is_driven_by_id() {
+        use crate::state::{
+            LAST_WAKE_STAYS, ONE_WAKE_PER_ROUTINE, ROUTINE_EDIT_UNAVAILABLE, ScheduleSpec, WakeBox,
+            WakeEditor, WakeTab,
+        };
+        let mut host = host();
+        host.computer_open = true;
+        host.routines = vec![routine("sch_1", "cron"), routine("draft-1", "draft")];
+        host.routine_editor = Some("sch_1".into());
+        let tree = host.snapshot();
+        let add = tree.find(ids::ROUTINE_WAKE_ADD).unwrap();
+        assert!(!add.enabled);
+        assert_eq!(add.value.as_deref(), Some(ONE_WAKE_PER_ROUTINE));
+        assert_eq!(
+            tree.find(&ids::routine_wake(0)).unwrap().name,
+            "Every day at 9:00 AM UTC"
+        );
+        assert!(tree.find(&ids::routine_wake_edit(0)).unwrap().enabled);
+        let delete = tree.find(&ids::routine_wake_delete(0)).unwrap();
+        assert!(!delete.enabled);
+        assert_eq!(delete.value.as_deref(), Some(LAST_WAKE_STAYS));
+        assert!(host.click(ids::ROUTINE_WAKE_ADD).is_err());
+        assert!(host.click(&ids::routine_wake_delete(0)).is_err());
+        host.click(&ids::routine_wake_edit(0)).unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::OpenWakeEditor { index: Some(0) })
+        ));
+
+        host.routine_editor = Some("draft-1".into());
+        assert!(host.snapshot().find(ids::ROUTINE_WAKE_ADD).unwrap().enabled);
+        host.click(ids::ROUTINE_WAKE_ADD).unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::OpenWakeEditor { index: None })
+        ));
+
+        host.routine_editor = Some("sch_1".into());
+        host.routines[0].notes = vec![("cant-change", ROUTINE_EDIT_UNAVAILABLE)];
+        let edit = host
+            .snapshot()
+            .find(&ids::routine_wake_edit(0))
+            .cloned()
+            .unwrap();
+        assert!(!edit.enabled);
+        assert_eq!(edit.value.as_deref(), Some(ROUTINE_EDIT_UNAVAILABLE));
+        assert!(host.click(&ids::routine_wake_edit(0)).is_err());
+        host.routines[0].notes.clear();
+
+        assert!(
+            host.click(&ids::routine_wake_day(1)).is_err(),
+            "the editor is shut"
+        );
+        let mut spec = ScheduleSpec::advanced_daily(9, 0).on_tab(WakeTab::Weekly);
+        spec.weekdays = vec![1, 2, 3, 4, 5];
+        let editor = WakeEditor {
+            routine_id: "sch_1".into(),
+            index: Some(0),
+            kind: Some(crate::opengrok::ScheduleKind::Cron),
+            tab: WakeTab::Weekly,
+            spec,
+            every: "1".into(),
+            hour: "9".into(),
+            minute: "00".into(),
+            pm: false,
+            opened: 1,
+            resync: 0,
+        };
+        let status = editor.status(chrono::Utc::now());
+        host.routine_wake_editor = Some((editor, status));
+        let tree = host.snapshot();
+        let weekly = tree.find(&ids::routine_wake_tab(WakeTab::Weekly)).unwrap();
+        assert!(weekly.states.iter().any(|state| state == "selected"));
+        assert!(
+            !tree
+                .find(&ids::routine_wake_tab(WakeTab::Webhook))
+                .unwrap()
+                .enabled
+        );
+        assert_eq!(
+            tree.find(&ids::routine_wake_day(1)).unwrap().checked,
+            Some(true)
+        );
+        assert_eq!(
+            tree.find(&ids::routine_wake_day(0)).unwrap().checked,
+            Some(false)
+        );
+        assert_eq!(
+            tree.find(ids::routine_wake_box(WakeBox::Hour))
+                .unwrap()
+                .value
+                .as_deref(),
+            Some("9")
+        );
+        assert_eq!(
+            tree.find(ids::ROUTINE_WAKE_SUMMARY).unwrap().name,
+            "Weekdays at 9:00 AM UTC"
+        );
+        assert!(tree.find(ids::ROUTINE_WAKE_NEXT).is_some());
+        assert!(tree.find(ids::ROUTINE_WAKE_SAVE).unwrap().enabled);
+        assert!(
+            tree.find(&ids::routine_wake_date(1)).is_none(),
+            "the Monthly tab's"
+        );
+
+        let clicked = |host: &mut NativeChatHost, id: &str| {
+            host.click(id).unwrap();
+            host.take_command().unwrap()
+        };
+        assert!(matches!(
+            clicked(&mut host, &ids::routine_wake_tab(WakeTab::Daily)),
+            Command::PickWakeTab(WakeTab::Daily)
+        ));
+        assert!(
+            host.click(&ids::routine_wake_tab(WakeTab::Webhook))
+                .is_err()
+        );
+        assert!(matches!(
+            clicked(&mut host, &ids::routine_wake_day(6)),
+            Command::ToggleWakeDay(6)
+        ));
+        assert!(matches!(
+            clicked(&mut host, &ids::routine_wake_month(3)),
+            Command::ToggleWakeMonth(3)
+        ));
+        assert!(matches!(
+            clicked(&mut host, "routine-wake-hour-up"),
+            Command::StepWakeBox {
+                which: WakeBox::Hour,
+                up: true
+            }
+        ));
+        assert!(matches!(
+            clicked(&mut host, ids::ROUTINE_WAKE_PM),
+            Command::SetWakePm(true)
+        ));
+        assert!(matches!(
+            clicked(&mut host, ids::ROUTINE_WAKE_SAVE),
+            Command::SaveWake
+        ));
+        assert!(matches!(
+            clicked(&mut host, ids::ROUTINE_WAKE_CANCEL),
+            Command::CloseWakeEditor
+        ));
+        host.dispatch(&Op::SetValue {
+            target: ids::routine_wake_box(WakeBox::Hour).into(),
+            value: "7".into(),
+        })
+        .unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::SetWakeBox { which: WakeBox::Hour, text }) if text == "7"
+        ));
+
+        // A pick that is not a schedule: Save is dead, with the reason.
+        let (editor, _) = host.routine_wake_editor.take().unwrap();
+        let mut empty = editor.clone();
+        empty.spec.weekdays.clear();
+        let status = empty.status(chrono::Utc::now());
+        host.routine_wake_editor = Some((empty, status));
+        assert!(
+            !host
+                .snapshot()
+                .find(ids::ROUTINE_WAKE_SAVE)
+                .unwrap()
+                .enabled
+        );
+        let refused = host.click(ids::ROUTINE_WAKE_SAVE).unwrap_err();
+        assert!(refused.contains("day of the week"), "{refused}");
     }
 
     /// The driver's two routine verbs: Test run by name, and an edit saved the way the editor
