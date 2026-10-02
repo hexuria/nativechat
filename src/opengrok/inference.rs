@@ -18,10 +18,12 @@
 //! `crates/opengrok-harness/src/local_proxy.rs`, and the door's words and the models a
 //! subscription may answer in `crates/opengrok-core/src/inference.rs`. The conformance ledger
 //! reads the two routes and the CUSTOM frame against the server's recording, vendored in
-//! `fixtures/wire/` from opengrok-server main d6f640e (#307, after #304), pin bf99845. These
-//! shapes are as they were at main cad36fd (#303, after #298): #306 changed no crate, and #304
-//! puts a Bot's own door between a turn's and the account's (`route` in
-//! `crates/opengrok-harness/src/local_proxy.rs`).
+//! `fixtures/wire/` from opengrok-server main 06db932 (#309, after #308), pin b6ca457. These
+//! shapes are as they were at main cad36fd (#303, after #298): #306 changed no crate, #304 puts
+//! a Bot's own door between a turn's and the account's (`route` in
+//! `crates/opengrok-harness/src/local_proxy.rs`), and #308 lets a retry of a queued send's reply
+//! name its own door over the one the send was queued with (`consume_for_turn` in
+//! `crates/opengrok-server/src/agui/pending.rs`).
 //!
 //! The Mac relay (opengrok-server #292, built in #298, whose recording holds its words) lifts
 //! the one-machine limit: the server sends a turn's model calls down a stream to the person's Mac,
@@ -480,8 +482,8 @@ pub const HELD_FOR_RELAY_OFFLINE: &str = "relay_offline";
 /// never offers what a Save would be refused for, even should a list ever carry one (a list held
 /// from before, or a server that tags a row `local_proxy` without asking): `subscription_model`
 /// in opengrok-server's `crates/opengrok-core/src/inference.rs`, anchored since #296 and unchanged
-/// at the vendored main d6f640e (#307, after #304), pin bf99845, where a Bot's own plan model is
-/// held to it too.
+/// at the vendored main 06db932 (#309, after #308), pin b6ca457, where a Bot's own plan model is
+/// held to it too, as it has been since #304.
 ///
 /// An allowlist, not a denylist: an id it does not recognise is refused, so a provider nobody
 /// has looked at is not offered by being new. With an `openai/` or `xai/` prefix and the `--fast`
