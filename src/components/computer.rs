@@ -961,7 +961,8 @@ fn routine_icons(icons: RoutineIcons) -> impl IntoElement {
             false,
             &theme,
             move |cx| {
-                app.update(cx, |state, cx| state.delete_routine(&coworker_id, &id, cx));
+                // Asks first, over the whole window (`RoutineDeletePrompt`).
+                app.update(cx, |state, cx| state.ask_delete_routine(&id, cx));
             },
         ))
 }
@@ -1010,6 +1011,135 @@ fn routine_icon(
                     theme.foreground
                 }),
         )
+}
+
+/// The question Delete asks about a routine, centred over the whole window: the sidebar, the
+/// chat and the panel dimmed under it, because it is about the routine for good and not about
+/// the panel. Cancel, Escape or a press beside it leaves the routine as it is; Delete deletes it.
+///
+/// A view of its own, mounted by the root as the picture overlay is, so that it can hold focus
+/// while it asks: Escape is bound in its own key context, which is only in the dispatch path
+/// while it has focus, so it takes focus the moment it opens.
+pub struct RoutineDeletePrompt {
+    state: Entity<AppState>,
+    focus_handle: FocusHandle,
+    was_open: bool,
+    pending_focus: bool,
+}
+
+impl RoutineDeletePrompt {
+    pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
+        let open = state.read(cx).routine_delete_prompt.is_some();
+        cx.observe(&state, |this, state, cx| {
+            let open = state.read(cx).routine_delete_prompt.is_some();
+            if open && !this.was_open {
+                this.pending_focus = true;
+            }
+            this.was_open = open;
+            cx.notify();
+        })
+        .detach();
+        Self {
+            state,
+            focus_handle: cx.focus_handle(),
+            was_open: open,
+            pending_focus: open,
+        }
+    }
+}
+
+impl Render for RoutineDeletePrompt {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.pending_focus {
+            self.pending_focus = false;
+            self.focus_handle.focus(window, cx);
+        }
+        let Some((title, what_happens)) = self.state.read(cx).routine_delete_question() else {
+            return div().into_any_element();
+        };
+        let theme = cx.theme().clone();
+        let cancel = {
+            let app = self.state.clone();
+            move |cx: &mut App| app.update(cx, |state, cx| state.cancel_routine_delete(cx))
+        };
+        div()
+            .id("routine-delete-overlay")
+            .track_focus(&self.focus_handle)
+            .key_context("RoutineDelete")
+            .absolute()
+            .inset_0()
+            .occlude()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(gpui::black().opacity(0.32))
+            .on_mouse_down(MouseButton::Left, {
+                let cancel = cancel.clone();
+                move |_, _, cx| cancel(cx)
+            })
+            .on_action({
+                let cancel = cancel.clone();
+                move |_: &crate::actions::CancelRoutineDelete, _: &mut Window, cx: &mut App| {
+                    cancel(cx)
+                }
+            })
+            .child(
+                v_flex()
+                    .id("routine-delete-dialog")
+                    .debug_selector(|| "routine-delete-dialog".into())
+                    .w(px(420.))
+                    .bg(theme.popover)
+                    .text_color(theme.foreground)
+                    .border_1()
+                    .border_color(theme.border)
+                    .rounded(px(14.))
+                    .shadow_lg()
+                    .px(px(20.))
+                    .py(px(18.))
+                    .gap(px(10.))
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(title),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child(what_happens),
+                    )
+                    .child(
+                        h_flex()
+                            .w_full()
+                            .justify_end()
+                            .gap(px(8.))
+                            .pt(px(6.))
+                            .child(
+                                Button::new("routine-delete-cancel")
+                                    .debug_selector(|| "routine-delete-cancel".into())
+                                    .label("Cancel")
+                                    .on_click(move |_, _, cx| cancel(cx)),
+                            )
+                            .child(
+                                Button::new("routine-delete-confirm")
+                                    .debug_selector(|| "routine-delete-confirm".into())
+                                    .danger()
+                                    .label("Delete")
+                                    .on_click({
+                                        let app = self.state.clone();
+                                        move |_, _, cx| {
+                                            app.update(cx, |state, cx| {
+                                                state.confirm_routine_delete(cx)
+                                            });
+                                        }
+                                    }),
+                            ),
+                    ),
+            )
+            .into_any_element()
+    }
 }
 
 /// What the Update, Reset and Get a computer controls need to know, read once per frame.
@@ -2617,5 +2747,78 @@ mod tests {
         cx.simulate_click(toggle, Modifiers::none());
         assert!(drawn(cx, "routine-name").is_some(), "the fields again");
         assert!(drawn(cx, "routine-history").is_none());
+    }
+
+    /// Delete's question sits in the middle of the whole window, not of the panel, and holds
+    /// focus: Escape answers Cancel, and so does a press beside it, and the routine is still
+    /// there; its Delete deletes it.
+    #[gpui_kit::test]
+    fn delete_asks_in_the_middle_of_the_window_and_escape_cancels(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        use gpui_kit::{AppContext as _, KeyBinding, Modifiers, point, px, size};
+        cx.update(gpui_kit::init);
+        cx.update(|cx| {
+            cx.bind_keys([KeyBinding::new(
+                "escape",
+                crate::actions::CancelRoutineDelete,
+                Some("RoutineDelete"),
+            )])
+        });
+        let asking = || {
+            let mut state = routine_open();
+            state.routine_delete_prompt = Some("sch_1".into());
+            state
+        };
+        let state = cx.new(|_| asking());
+        let (_, cx) = cx.add_window_view({
+            let state = state.clone();
+            move |_, cx| super::RoutineDeletePrompt::new(state, cx)
+        });
+        cx.simulate_resize(size(px(1200.), px(800.)));
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let dialog = cx.debug_bounds("routine-delete-dialog").expect("asked");
+        assert!(
+            (dialog.center().x - px(600.)).abs() < px(1.)
+                && (dialog.center().y - px(400.)).abs() < px(1.),
+            "centred on the window: {dialog:?}"
+        );
+        assert_eq!(
+            state.read_with(cx, |state, _| state.routine_delete_question()),
+            Some((
+                "Delete \"Say hello\"?".to_string(),
+                crate::state::ROUTINE_DELETE_KEEPS
+            ))
+        );
+
+        cx.simulate_keystrokes("escape");
+        assert_eq!(
+            state.read_with(cx, |state, _| state.routine_delete_prompt.clone()),
+            None
+        );
+        assert_eq!(
+            state.read_with(cx, |state, _| state.coworker_routines("cw_1").len()),
+            1
+        );
+
+        state.update(cx, |state, cx| state.ask_delete_routine("sch_1", cx));
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.simulate_mouse_move(point(px(20.), px(20.)), None, Modifiers::none());
+        cx.simulate_click(point(px(20.), px(20.)), Modifiers::none());
+        assert_eq!(
+            state.read_with(cx, |state, _| state.routine_delete_prompt.clone()),
+            None,
+            "a press beside it is Cancel"
+        );
+
+        state.update(cx, |state, cx| state.ask_delete_routine("sch_1", cx));
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let delete = cx
+            .debug_bounds("routine-delete-confirm")
+            .expect("its Delete")
+            .center();
+        cx.simulate_mouse_move(delete, None, Modifiers::none());
+        cx.simulate_click(delete, Modifiers::none());
+        assert!(state.read_with(cx, |state, _| state.coworker_routines("cw_1").is_empty()));
     }
 }

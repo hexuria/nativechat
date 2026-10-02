@@ -3509,6 +3509,15 @@ pub struct AgentRoutine {
 pub const ROUTINE_IS_ONE_SCHEDULE: &str =
     "A routine is one schedule on the server: make another routine for a second trigger.";
 
+/// What deleting a routine the server has does, as Delete's question says it. The server only
+/// marks the routine deleted (opengrok-server `autonomy/routes.rs`, `delete_schedule`, which
+/// appends `ScheduleEvent::Deleted`): it stops firing and refuses edits, and its runs and its
+/// thread are kept.
+pub const ROUTINE_DELETE_KEEPS: &str = "It stops running. Its past runs and conversation stay.";
+
+/// The same question about a draft, which never reached the server.
+pub const DRAFT_DELETE_KEEPS: &str = "It was never saved, so nothing else changes.";
+
 /// What a routine's Run history says on a server that cannot list a routine's runs.
 pub const ROUTINE_RUNS_UNAVAILABLE: &str = "This server can't show a routine's runs yet.";
 
@@ -4611,6 +4620,8 @@ pub struct AppState {
     /// typed, kept on screen beside the server's values the fields went back to, so it is not
     /// lost to a refusal it had no part in.
     pub routine_unsaved: HashMap<String, ScheduleEdit>,
+    /// The routine Delete is asking about, while its question is over the window.
+    pub routine_delete_prompt: Option<String>,
     /// The open routine's panel shows its Run history and nothing else, in place of its fields.
     /// Per routine opened: the next one to open shows its fields again.
     pub routine_history_open: bool,
@@ -5300,6 +5311,7 @@ impl AppState {
             routine_routes_missing: RoutineRoutesMissing::default(),
             routine_unsaved: HashMap::new(),
             routine_history_open: false,
+            routine_delete_prompt: None,
             reveal_run: None,
             model_picker_open: false,
             avatar_editor_open: false,
@@ -11158,6 +11170,53 @@ impl AppState {
                 false
             }
         }
+    }
+
+    /// Delete, pressed on a routine: a question over the whole window first, because a routine
+    /// deleted stops running for good.
+    pub fn ask_delete_routine(&mut self, routine_id: &str, cx: &mut Context<Self>) {
+        self.routine_delete_prompt = Some(routine_id.to_string());
+        cx.notify();
+    }
+
+    /// Cancel, Escape, or a press beside the question: nothing is deleted.
+    pub fn cancel_routine_delete(&mut self, cx: &mut Context<Self>) {
+        if self.routine_delete_prompt.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// The question's Delete.
+    pub fn confirm_routine_delete(&mut self, cx: &mut Context<Self>) {
+        let (Some(routine_id), Some(coworker_id)) = (
+            self.routine_delete_prompt.take(),
+            self.active_coworker_id.clone(),
+        ) else {
+            return;
+        };
+        self.delete_routine(&coworker_id, &routine_id, cx);
+    }
+
+    /// What Delete asks: the routine by its name, and what deleting it does. Nothing while it is
+    /// not asking, or about a routine gone from the open bot's meanwhile.
+    pub fn routine_delete_question(&self) -> Option<(String, &'static str)> {
+        let routine_id = self.routine_delete_prompt.as_deref()?;
+        let routine = self
+            .coworker_routines(self.active_coworker_id.as_deref()?)
+            .iter()
+            .find(|row| row.id == routine_id)?;
+        let name = match routine.name.trim() {
+            "" => "Untitled routine",
+            name => name,
+        };
+        Some((
+            format!("Delete \"{name}\"?"),
+            if routine.saved.is_some() {
+                ROUTINE_DELETE_KEEPS
+            } else {
+                DRAFT_DELETE_KEEPS
+            },
+        ))
     }
 
     /// Drop the routine here and on the server.
@@ -25057,6 +25116,43 @@ mod tests {
             assert!(
                 !state.routine_history_open,
                 "and so does this one, opened again"
+            );
+        });
+    }
+
+    /// Delete asks before it deletes: the question names the routine and says what deleting it
+    /// does, which is not the same for a draft that never reached the server. Cancel leaves the
+    /// routine; Delete takes it off the list.
+    #[gpui_kit::test]
+    fn delete_asks_before_it_deletes(cx: &mut gpui_kit::TestAppContext) {
+        use gpui_kit::AppContext as _;
+        let app = cx.new(|_| with_routines());
+        app.update(cx, |state, cx| {
+            assert_eq!(state.routine_delete_question(), None);
+            state.ask_delete_routine("sch_1", cx);
+            assert_eq!(
+                state.routine_delete_question(),
+                Some((
+                    "Delete \"Weekly\"?".to_string(),
+                    super::ROUTINE_DELETE_KEEPS
+                ))
+            );
+            state.cancel_routine_delete(cx);
+            assert_eq!(state.routine_delete_question(), None);
+            assert_eq!(state.coworker_routines("cw_1").len(), 2, "nothing deleted");
+
+            state.ask_delete_routine("draft-1", cx);
+            assert_eq!(
+                state.routine_delete_question().map(|(_, what)| what),
+                Some(super::DRAFT_DELETE_KEEPS)
+            );
+            state.confirm_routine_delete(cx);
+            assert_eq!(state.routine_delete_prompt, None);
+            assert!(
+                state
+                    .coworker_routines("cw_1")
+                    .iter()
+                    .all(|row| row.id != "draft-1")
             );
         });
     }
