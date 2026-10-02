@@ -1232,16 +1232,6 @@ impl CeilingRead {
     }
 }
 
-/// The Bot's model picker's two presentations (`components::model_picker`), each with a popover
-/// of its own over the same Bot's setting.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum PickerPlace {
-    /// The chip in the composer, beside the button that sends.
-    Composer,
-    /// The Model card in the Bot's settings.
-    Card,
-}
-
 /// The open Bot's skills, as far as its settings know them: every skill of the account's library
 /// its owner may attach to it, and which of them are, which is what the Skills card's switches
 /// change (opengrok-server#270).
@@ -4738,10 +4728,9 @@ pub struct AppState {
     /// edit's answer, or a refused edit put back), so the editor's fields follow it. Per routine
     /// because an answer for one must leave another's half-typed fields alone.
     routine_resyncs: HashMap<String, u64>,
-    /// Where the Bot's model picker has its popover open, if anywhere: over the composer's chip,
-    /// or under the Model card in the Bot's settings. One at a time, since both are the open
-    /// Bot's (`components::model_picker`).
-    pub model_picker: Option<PickerPlace>,
+    /// The Bot's model picker has its popover open under the Model card in the Bot's settings,
+    /// the one place a Bot's model is picked (`components::model_picker`).
+    pub model_picker_open: bool,
     /// The open popover shows its list of models, grouped by door, instead of its controls.
     pub model_list_open: bool,
     /// The server's words for the last change the picker made that did not go through, with the
@@ -4883,9 +4872,6 @@ pub struct AppState {
     /// Numbers the reads and Saves of the reply source, so an answer that is not the newest, or
     /// that lands after a sign-out, is dropped.
     reply_source_generation: u64,
-    /// The composer is dictating: the model picker's chip gives its place to the dictation's
-    /// buttons meanwhile, and is not in a driver's tree either.
-    pub(crate) composer_dictating: bool,
     /// Numbers the reads of `/models`, so only the newest answer lands
     /// ([`Self::begin_models_read`]).
     models_generation: u64,
@@ -5425,7 +5411,7 @@ impl AppState {
             routine_runs_asked: HashMap::new(),
             routine_latest_edit: HashMap::new(),
             routine_resyncs: HashMap::new(),
-            model_picker: None,
+            model_picker_open: false,
             model_list_open: false,
             model_pick_note: None,
             avatar_editor_open: false,
@@ -5486,7 +5472,6 @@ impl AppState {
             connect_asks: 0,
             reply_source: ReplySourceSettings::default(),
             reply_source_generation: 0,
-            composer_dictating: false,
             models_generation: 0,
             reply_source_page_shown: false,
             relay_mac: RelayMac::default(),
@@ -6565,7 +6550,7 @@ impl AppState {
         self.reply_source_page_shown = false;
         self.reply_source_generation += 1;
         // The picker was open on one of their Bots, and what it last said was about theirs.
-        self.model_picker = None;
+        self.model_picker_open = false;
         self.model_list_open = false;
         self.model_pick_note = None;
         // The relay answered for them, and stops with every call it was answering; the switch was
@@ -6573,7 +6558,6 @@ impl AppState {
         self.stop_relay();
         self.relay_mac.on = false;
         self.plan_failures.clear();
-        self.composer_dictating = false;
         // And any list of models still being asked for was asked as them, and the plan's models
         // listed were their plan's: the gateway's routes are the deployment's and stay.
         self.models_generation += 1;
@@ -8135,23 +8119,14 @@ impl AppState {
     /// [`Self::send_on_server`]) names them, whatever the Bot's door and the account's, and the
     /// server lets a turn's own pick win over both for that turn (`local_proxy::route` in
     /// opengrok-server's `crates/opengrok-harness/src/local_proxy.rs`, server main d6f640e (#307,
-    /// after #304), pin bf99845). Any other turn names [`Self::turn_inference_source`]'s. Since
-    /// the composer's chip picks the Bot's model and no longer the turn's door, this is the one
-    /// way a single turn goes through another door than the Bot's.
+    /// after #304), pin bf99845). Any other turn names [`Self::turn_inference_source`]'s. The
+    /// model picker on the Bot's card picks the Bot's model and door, and never one turn's, so
+    /// this is the one way a single turn goes through another door than the Bot's.
     fn turn_door(&self, drained: Option<&QueuedSend>, on_server: bool) -> Option<TurnSource> {
         if on_server {
             Some(TurnSource::GATEWAY)
         } else {
             self.turn_inference_source(drained)
-        }
-    }
-
-    /// The composer is dictating, or has stopped. The model picker's chip is not drawn
-    /// meanwhile, so it is not in a driver's tree either.
-    pub fn set_composer_dictating(&mut self, dictating: bool, cx: &mut Context<Self>) {
-        if self.composer_dictating != dictating {
-            self.composer_dictating = dictating;
-            cx.notify();
         }
     }
 
@@ -9021,7 +8996,7 @@ impl AppState {
         }
         self.set_right_pane(RightPane::Closed, cx);
         self.computer_view = ComputerView::Overview;
-        self.model_picker = None;
+        self.model_picker_open = false;
         self.model_list_open = false;
         self.avatar_editor_open = false;
         self.record_nav();
@@ -9063,12 +9038,9 @@ impl AppState {
         }
         self.set_right_pane(RightPane::Computer, cx);
         self.computer_view = ComputerView::Overview;
-        // The Bot's card goes with its settings; the composer's chip stays, and so may its
-        // popover.
-        if self.model_picker == Some(PickerPlace::Card) {
-            self.model_picker = None;
-            self.model_list_open = false;
-        }
+        // The Model card goes with the Bot's settings, and its popover with it.
+        self.model_picker_open = false;
+        self.model_list_open = false;
         self.avatar_editor_open = false;
         self.record_nav();
         cx.notify();
@@ -11610,10 +11582,10 @@ impl AppState {
     }
 
     pub fn dismiss_popovers(&mut self, cx: &mut Context<Self>) {
-        if self.model_picker.is_none() && !self.avatar_editor_open && self.emoji_picker.is_none() {
+        if !self.model_picker_open && !self.avatar_editor_open && self.emoji_picker.is_none() {
             return;
         }
-        self.model_picker = None;
+        self.model_picker_open = false;
         self.model_list_open = false;
         self.avatar_editor_open = false;
         self.emoji_picker = None;
@@ -11929,16 +11901,14 @@ impl AppState {
     }
 
     pub fn set_avatar_editor_open(&mut self, open: bool, cx: &mut Context<Self>) {
-        if self.avatar_editor_open == open
-            && (!open || self.model_picker != Some(PickerPlace::Card))
-        {
+        if self.avatar_editor_open == open && (!open || !self.model_picker_open) {
             return;
         }
         self.avatar_editor_open = open;
         // The avatar editor and the Model card's popover share the settings pane, and one opens
         // over the other.
-        if open && self.model_picker == Some(PickerPlace::Card) {
-            self.model_picker = None;
+        if open {
+            self.model_picker_open = false;
             self.model_list_open = false;
         }
         cx.notify();
@@ -12020,8 +11990,8 @@ impl AppState {
 
     // ---- The Bot's model picker: its door, model, fast tier and effort ----------------------------
 
-    /// The open Bot's picker, as both of its presentations draw it and a driver reads it: `None`
-    /// with no Bot open.
+    /// The open Bot's picker, as its card draws it and a driver reads it: `None` with no Bot
+    /// open.
     pub fn model_pick(&self) -> Option<ModelPick> {
         let id = self.active_coworker_id.as_deref()?;
         let bot = self.coworkers.iter().find(|bot| bot.id == id)?;
@@ -12042,38 +12012,29 @@ impl AppState {
             .any(|bot| bot.source != CoworkerSource::NotKept)
     }
 
-    /// Open the picker's popover in one place, or shut it. Opening one shuts the other, and the
-    /// avatar editor, which shares the settings pane with the card; and a popover opens on its
+    /// Open the picker's popover under the Model card, or shut it. Opening it shuts the avatar
+    /// editor, which shares the settings pane with the card; and the popover opens on its
     /// controls, not on the list it was last left at.
-    pub fn set_model_picker(&mut self, place: Option<PickerPlace>, cx: &mut Context<Self>) {
-        if self.model_picker == place {
+    pub fn set_model_picker_open(&mut self, open: bool, cx: &mut Context<Self>) {
+        if self.model_picker_open == open {
             return;
         }
-        self.model_picker = place;
+        self.model_picker_open = open;
         self.model_list_open = false;
-        if place.is_some() {
+        if open {
             self.avatar_editor_open = false;
         }
         cx.notify();
     }
 
-    /// Shut the popover in `place` if it is the one open. A popover hears a click outside it
-    /// after the click has opened the other one as often as before, and must not shut that one.
-    pub fn close_model_picker(&mut self, place: PickerPlace, cx: &mut Context<Self>) {
-        if self.model_picker == Some(place) {
-            self.set_model_picker(None, cx);
-        }
-    }
-
-    /// A click on the chip, or on the card.
-    pub fn toggle_model_picker(&mut self, place: PickerPlace, cx: &mut Context<Self>) {
-        let next = (self.model_picker != Some(place)).then_some(place);
-        self.set_model_picker(next, cx);
+    /// A click on the card.
+    pub fn toggle_model_picker(&mut self, cx: &mut Context<Self>) {
+        self.set_model_picker_open(!self.model_picker_open, cx);
     }
 
     /// The model's name in the popover opens its list; the list's heading goes back.
     pub fn toggle_model_list(&mut self, cx: &mut Context<Self>) {
-        if self.model_picker.is_some() {
+        if self.model_picker_open {
             self.model_list_open = !self.model_list_open;
             cx.notify();
         }
@@ -12120,7 +12081,7 @@ impl AppState {
     }
 
     /// Send a change the picker made, at once, as a pick from the old model list always was: the
-    /// roster takes it before the server answers so both presentations follow the click, and a
+    /// roster takes it before the server answers so the card follows the click, and a
     /// refusal puts the roster back ([`Self::patch_active_agent_then`]) and is said in the popover
     /// in the server's words, as well as on the settings pane's red line.
     fn save_model_pick(&mut self, patch: CoworkerPatch, cx: &mut Context<Self>) {
@@ -32979,7 +32940,7 @@ mod tests {
     /// A turn names the open Bot's own door, whatever the account's is. A Bot that follows the
     /// account's door, a server that keeps no door per Bot, and a door this app cannot name
     /// name none, and the server goes by what it keeps. Moving the Bot moves its next turn with
-    /// it; dictating changes nothing about where a turn goes; and a sign-out forgets it all.
+    /// it, and a sign-out forgets it all.
     #[test]
     fn a_turn_names_the_bots_own_door() {
         let mut state = signed_in_state();
@@ -32999,13 +32960,6 @@ mod tests {
             state.turn_inference_source(None),
             Some(TurnSource::plan(None))
         );
-        state.composer_dictating = true;
-        assert_eq!(
-            state.turn_inference_source(None),
-            Some(TurnSource::plan(None)),
-            "dictated, the same door"
-        );
-        state.composer_dictating = false;
         for (none, why) in [
             (
                 CoworkerSource::AccountDefault,
@@ -33846,7 +33800,7 @@ mod tests {
             }),
         };
         let pick = state.model_pick().expect("a Bot is open");
-        assert_eq!(pick.chip_label(), "GPT-6 Luna · High ⚡");
+        assert_eq!(pick.summary(), "GPT-6 Luna · High ⚡");
         let groups: Vec<(&str, Vec<&str>)> = pick
             .groups
             .iter()
@@ -33870,7 +33824,7 @@ mod tests {
         // account's plan model is what answers.
         state.coworkers[0].source = CoworkerSource::NotKept;
         let pick = state.model_pick().expect("a Bot is open");
-        assert_eq!(pick.chip_label(), "GPT-5 Codex · High");
+        assert_eq!(pick.summary(), "GPT-5 Codex · High");
         assert_eq!(
             pick.groups
                 .iter()

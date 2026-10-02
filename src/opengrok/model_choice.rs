@@ -2,8 +2,8 @@
 //! person in the two groups a Bot can be answered from; the effort slider's five stops; and what
 //! each change the picker makes sends to the server.
 //!
-//! No GPUI. The composer's chip and the Bot's card in its settings both draw what is here
-//! (`components::model_picker`), and the gpui-agent tree names it, so the three always agree.
+//! No GPUI. The Model card in the Bot's settings draws what is here (`components::model_picker`),
+//! and the gpui-agent tree names it, so the two always agree.
 //!
 //! A Bot's setting is three things its row keeps: the door (`source`, opengrok-server main
 //! d6f640e (#307, after #304), pin bf99845), the model it is pinned to
@@ -12,7 +12,7 @@
 //! the server's allowlist takes the tier off before it reads the rest ([`is_subscription_model`]),
 //! so ⚡ is the pin moved to the twin and back, offered only where the list holds both.
 //!
-//! What the chip says is what the server would run the Bot's next turn on, as far as this app can
+//! What the card says is what the server would run the Bot's next turn on, as far as this app can
 //! tell, and never a pin the server would ignore. On the person's plan the server asks the Bot's
 //! pin only where the Bot's own door is the plan (`source: "local_proxy"`) and its allowlist takes
 //! the pin, and the account's plan model otherwise (`ahead_of_the_setting` in opengrok-server's
@@ -58,7 +58,7 @@ pub const FAST_ACCOUNT_PLAN: &str =
 /// Why the slider is dead: a server from before opengrok-server#271 keeps no effort, and a pick
 /// would look saved and change nothing.
 pub const EFFORT_NOT_KEPT: &str = "This server has nowhere to keep an effort yet.";
-/// What the chip names while there is no model to name: a Bot with no pin, or on a plan that
+/// What the card names while there is no model to name: a Bot with no pin, or on a plan that
 /// keeps no model.
 pub const NO_MODEL: &str = "No model";
 /// What the list says under its rows for a Bot whose own door is the person's plan
@@ -519,15 +519,15 @@ impl ModelPick {
         self.model.as_deref().is_some_and(is_fast)
     }
 
-    /// The model's name as the chip and the list's opener say it, ⚡ apart.
+    /// The model's name as the card and the list's opener say it, ⚡ apart.
     pub fn model_label(&self) -> String {
         self.model
             .as_deref()
             .map_or_else(|| NO_MODEL.to_string(), base_label)
     }
 
-    /// What the chip reads: "GPT-6 Luna · Medium ⚡".
-    pub fn chip_label(&self) -> String {
+    /// The picker in a line, as a driver's tree names the card: "GPT-6 Luna · Medium ⚡".
+    pub fn summary(&self) -> String {
         let fast = if self.is_fast() { " ⚡" } else { "" };
         format!(
             "{} · {}{fast}",
@@ -879,7 +879,7 @@ mod tests {
         );
     }
 
-    /// A Bot on its own plan with a model the list has a twin of: the chip names the model, the
+    /// A Bot on its own plan with a model the list has a twin of: the card names the model, the
     /// effort and ⚡; ⚡ moves the pin to the twin and back, and never re-sends the door the Bot
     /// already has; a stop of the slider sends its word.
     #[test]
@@ -893,7 +893,7 @@ mod tests {
         );
         assert!(pick.per_bot);
         assert_eq!(pick.door, Some(InferenceKind::LocalProxy));
-        assert_eq!(pick.chip_label(), "GPT-6 Luna · Medium");
+        assert_eq!(pick.summary(), "GPT-6 Luna · Medium");
         assert_eq!(pick.fast_blocked, None);
         assert_eq!(
             pick.groups
@@ -932,7 +932,7 @@ mod tests {
             &catalogue(SERVER),
             plan(PLAN),
         );
-        assert_eq!(pick.chip_label(), "GPT-6 Luna · Ultra ⚡");
+        assert_eq!(pick.summary(), "GPT-6 Luna · Ultra ⚡");
         assert!(pick.is_fast());
         assert_eq!(
             pick.current.as_ref().map(|row| row.base_id.as_str()),
@@ -999,7 +999,7 @@ mod tests {
             plan(PLAN),
         );
         assert_eq!(pick.door, Some(InferenceKind::Gateway));
-        assert_eq!(pick.chip_label(), "Grok 4.7 · High");
+        assert_eq!(pick.summary(), "Grok 4.7 · High");
         assert_eq!(pick.fast_blocked, Some(FAST_NO_TWIN));
         assert_eq!(pick.fast_patch(true), Err(FAST_NO_TWIN));
         assert_eq!(
@@ -1030,7 +1030,7 @@ mod tests {
             &catalogue(SERVER),
             plan(PLAN),
         );
-        assert_eq!(pick.chip_label(), "GPT-6 Luna · Default");
+        assert_eq!(pick.summary(), "GPT-6 Luna · Default");
         assert!(!pick.can_reset());
         let effort_only = bot(Some(json!("gateway")), "oag/cheap", Some("low"));
         let pick = bot_pick(&effort_only, None, &catalogue(SERVER), plan(PLAN));
@@ -1041,7 +1041,7 @@ mod tests {
     }
 
     /// A server whose rows carry no `source` keeps no door per Bot. The list offers the Server
-    /// group alone and no pick sends a door; while the account is on the person's plan, the chip
+    /// group alone and no pick sends a door; while the account is on the person's plan, the card
     /// names the account's plan model, which answers for every Bot there, a read-only line says
     /// so, and ⚡ is dead, since a pin would change nothing.
     #[test]
@@ -1059,7 +1059,7 @@ mod tests {
             "no plan rows for a Bot"
         );
         assert_eq!(pick.model.as_deref(), Some("gpt-5-codex"));
-        assert_eq!(pick.chip_label(), "GPT-5 Codex · Medium");
+        assert_eq!(pick.summary(), "GPT-5 Codex · Medium");
         assert_eq!(
             pick.account_plan,
             Some(AccountPlan {
@@ -1089,7 +1089,7 @@ mod tests {
             &catalogue(SERVER),
             plan(PLAN),
         );
-        assert_eq!(pick.chip_label(), "Cheap (auto) · Medium");
+        assert_eq!(pick.summary(), "Cheap (auto) · Medium");
         assert_eq!(pick.account_plan, None);
         assert_eq!(
             pick.current.as_ref().map(|row| row.base_id.as_str()),
@@ -1098,12 +1098,12 @@ mod tests {
 
         // The account's door not read yet: the pin, and ⚡ cannot tell its group.
         let pick = bot_pick(&old, None, &catalogue(SERVER), plan(PLAN));
-        assert_eq!(pick.chip_label(), "Cheap (auto) · Medium");
+        assert_eq!(pick.summary(), "Cheap (auto) · Medium");
         assert_eq!(pick.fast_blocked, Some(FAST_DOOR_UNKNOWN));
     }
 
     /// On the person's plan a Bot that follows the account runs on the account's plan model, a
-    /// gateway pin as much as any, and the chip says so; ⚡ and a pick then pin that model with its
+    /// gateway pin as much as any, and the card says so; ⚡ and a pick then pin that model with its
     /// door, so the pick sticks. On its own plan a Bot runs on a pin the allowlist takes.
     #[test]
     fn a_pin_the_plan_would_not_take_shows_the_accounts_plan_model() {
@@ -1114,7 +1114,7 @@ mod tests {
         assert_eq!(pick.bot_door, None);
         assert_eq!(pick.door, Some(InferenceKind::LocalProxy));
         assert_eq!(pick.model.as_deref(), Some("gpt-6-luna"));
-        assert_eq!(pick.chip_label(), "GPT-6 Luna · Medium");
+        assert_eq!(pick.summary(), "GPT-6 Luna · Medium");
         assert_eq!(
             pick.account_plan, None,
             "the Bot's own plan rows are offered"
@@ -1126,7 +1126,7 @@ mod tests {
         // On its own plan, a pin the allowlist takes is the Bot's, and the account's model is not.
         let pinned = bot(Some(json!("local_proxy")), "gpt-5.6-sol", Some("medium"));
         let pick = bot_pick(&pinned, Some(&on_plan), &catalogue(SERVER), plan(PLAN));
-        assert_eq!(pick.chip_label(), "GPT-5.6 Sol · Medium");
+        assert_eq!(pick.summary(), "GPT-5.6 Sol · Medium");
         // An account with no plan model and a pin it will not take: no model to name.
         let pick = bot_pick(
             &follows,
@@ -1134,13 +1134,13 @@ mod tests {
             &catalogue(SERVER),
             plan(PLAN),
         );
-        assert_eq!(pick.chip_label(), "No model · Medium");
+        assert_eq!(pick.summary(), "No model · Medium");
     }
 
     /// On the person's plan the server asks a Bot's pin only when the Bot's own door is the plan
     /// (opengrok-server main d6f640e (#307, after #304), pin bf99845).
     /// A Bot that follows the account there runs on the account's plan model even with a pin the
-    /// allowlist takes: the chip names that model, the list ticks it, and ⚡ moves to its twin
+    /// allowlist takes: the card names that model, the list ticks it, and ⚡ moves to its twin
     /// with the Bot's own door, so the pick sticks. A pick of the pin's own row sends the door
     /// alone. The same Bot on its own plan runs on its pin.
     #[test]
@@ -1151,7 +1151,7 @@ mod tests {
         let pick = bot_pick(&follows, Some(&on_plan), &catalogue(SERVER), plan(LISTED));
         assert_eq!(pick.door, Some(InferenceKind::LocalProxy));
         assert_eq!(pick.model.as_deref(), Some("gpt-6-luna"));
-        assert_eq!(pick.chip_label(), "GPT-6 Luna · Medium");
+        assert_eq!(pick.summary(), "GPT-6 Luna · Medium");
         assert_eq!(
             pick.current.as_ref().map(|row| row.base_id.as_str()),
             Some("gpt-6-luna")
@@ -1174,7 +1174,7 @@ mod tests {
         let own = bot(Some(json!("local_proxy")), "gpt-6-sol", Some("medium"));
         let pick = bot_pick(&own, Some(&on_plan), &catalogue(SERVER), plan(LISTED));
         assert_eq!(pick.model.as_deref(), Some("gpt-6-sol"));
-        assert_eq!(pick.chip_label(), "GPT-6 Sol · Medium");
+        assert_eq!(pick.summary(), "GPT-6 Sol · Medium");
         assert_eq!(
             pick.current.as_ref().map(|row| row.base_id.as_str()),
             Some("gpt-6-sol")
@@ -1203,7 +1203,7 @@ mod tests {
         };
         let follows = bot(Some(Value::Null), "oag/cheap", Some("high"));
         let pick = bot_pick(&follows, Some(&relayed("mac")), &catalogue(SERVER), lists);
-        assert_eq!(pick.chip_label(), "Grok 4.7 · High");
+        assert_eq!(pick.summary(), "Grok 4.7 · High");
         assert_eq!(
             ids(&pick.groups[0].rows),
             [("grok-4.7", true)],
@@ -1213,7 +1213,7 @@ mod tests {
         // Following the account, a pin the allowlist takes is not asked through the Mac either.
         let pinned = bot(Some(Value::Null), "gpt-6-sol", Some("high"));
         let pick = bot_pick(&pinned, Some(&relayed("mac")), &catalogue(SERVER), lists);
-        assert_eq!(pick.chip_label(), "Grok 4.7 · High");
+        assert_eq!(pick.summary(), "Grok 4.7 · High");
 
         let pick = bot_pick(
             &follows,
@@ -1228,7 +1228,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             [InferenceKind::Gateway]
         );
-        assert_eq!(pick.chip_label(), "No model · High");
+        assert_eq!(pick.summary(), "No model · High");
     }
 
     /// From a server that keeps no effort (before opengrok-server#271) the Bot reads Default and
@@ -1243,7 +1243,7 @@ mod tests {
             plan(PLAN),
         );
         assert!(!pick.effort_kept);
-        assert_eq!(pick.chip_label(), "GPT-6 Luna · Default ⚡");
+        assert_eq!(pick.summary(), "GPT-6 Luna · Default ⚡");
         assert_eq!(pick.effort_patch("high"), Err(EFFORT_NOT_KEPT.to_string()));
         assert_eq!(
             serde_json::to_value(pick.reset_patch().unwrap()).unwrap(),

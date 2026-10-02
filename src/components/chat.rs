@@ -1895,7 +1895,7 @@ impl Render for ChatView {
             .bg(theme.background)
             .on_mouse_down(MouseButton::Left, move |_, _, cx| {
                 app.update(cx, |state, cx| {
-                    if state.model_picker.is_some() || state.avatar_editor_open {
+                    if state.model_picker_open || state.avatar_editor_open {
                         state.dismiss_popovers(cx);
                     }
                 });
@@ -2030,8 +2030,7 @@ impl Render for ChatView {
                                 let app = self.state.clone();
                                 move |_, _, cx| {
                                     app.update(cx, |state, cx| {
-                                        if state.model_picker.is_some() || state.avatar_editor_open
-                                        {
+                                        if state.model_picker_open || state.avatar_editor_open {
                                             state.dismiss_popovers(cx);
                                         }
                                     });

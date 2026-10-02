@@ -152,40 +152,37 @@
 //! attached, though it can always be detached. The Tools card's switches and these are apart:
 //! neither waits on the other.
 //!
-//! The Bot's model picker, one control in two places: `model-chip`, the composer's chip, in the
-//! tree while a Bot is open and the composer is not dictating, and `agent-model-card`, the Model
-//! card in the Bot's settings. Each is a button named as the chip reads (`GPT-6 Luna · Medium
-//! ⚡`) and valued by the model the Bot's next turn runs on, with its door's wire word as a state
-//! (`gateway` / `local_proxy`), `fast` while ⚡ is on, and `expanded` while its popover is open; a
-//! click opens or shuts the popover, the card's only while the settings are open. The popover,
-//! `model-pop`, visible while open, holds `model-fast` (a switch, checked while on; dead, with why
-//! as its value, where the list holds no fast version of the model or the account's plan model
-//! answers for every Bot), `model-effort` (a slider named as the effort reads, `Light` … `Ultra`
-//! or `Default`, and valued by the server's word; `set_value` takes `low`, `medium`, `high`,
-//! `xhigh` or `max`; dead from a server that keeps no effort, one from before
-//! opengrok-server#271), `model-open-list` (named by the model; it opens the list) and
-//! `model-reset` (↺: Default effort and ⚡ off, the model left alone; live while there is
-//! something to put back). While the list shows, those give way to `model-open-list` as the
-//! heading back (state `expanded`) and to the rows of `model-list` (always in the tree, valued by
-//! how many models it offers): a `model-row-{source}-{id}` per model, by its door's wire word and
+//! The Bot's model picker, on the Model card in the Bot's settings, which is the one place a
+//! Bot's model is picked: the composer has no chip for it, and no `model-*` id outside the card
+//! is the picker's. `agent-model-card`, in the tree while a Bot is open, is a button named as the
+//! picker reads in a line (`GPT-6 Luna · Medium ⚡`) and valued by the model the Bot's next turn
+//! runs on, with its door's wire word as a state (`gateway` / `local_proxy`), `fast` while ⚡ is
+//! on, and `expanded` while its popover is open; a click opens or shuts the popover, only while
+//! the settings are open. The popover, `agent-model-pop`, visible while open, holds
+//! `agent-model-fast` (a switch, checked while on; dead, with why as its value, where the list
+//! holds no fast version of the model or the account's plan model answers for every Bot),
+//! `agent-model-effort` (a slider named as the effort reads, `Light` … `Ultra` or `Default`, and
+//! valued by the server's word; `set_value` takes `low`, `medium`, `high`, `xhigh` or `max`; dead
+//! from a server that keeps no effort, one from before opengrok-server#271),
+//! `agent-model-open-list` (named by the model; it opens the list) and `agent-model-reset` (↺:
+//! Default effort and ⚡ off, the model left alone; live while there is something to put back).
+//! While the list shows, those give way to `agent-model-open-list` as the heading back (state
+//! `expanded`) and to the rows of `agent-model-list` (always in the tree, valued by how many
+//! models it offers): an `agent-model-row-{source}-{id}` per model, by its door's wire word and
 //! the id a pick pins with ⚡ off (valued by its door's word, state `selected` on the one that
 //! answers and `fast` where the list holds its fast twin; a click puts the Bot on it, fast where
-//! ⚡ is on and it has a twin, and goes back to the controls), `model-plan` (on a server whose
-//! rows carry no `source`, while the account is on the person's plan: the account's plan model,
-//! which answers for every Bot there; a line, not a row), `model-routines` (on a Bot whose own
-//! door is the person's plan, whatever it is pinned to: the line saying its routines won't run,
-//! since they run on the server's paid keys and the server refuses every routine of such a Bot
-//! (opengrok-server #304), and to pick a Server model to run it on a schedule; a line, not a
-//! row) and `model-note` (the server's word on why the list is not fuller).
-//! `model-error` is the server's words for the last change it refused. Every change is saved on
-//! the Bot at once, `source`, `model` and `effort` on `PATCH /coworkers/{id}` (opengrok-server
-//! main d6f640e (#307, after #304), pin bf99845). The card's parts
-//! are the chip's with `agent-` before them: `agent-model-pop`, `agent-model-fast`,
-//! `agent-model-effort`, `agent-model-open-list`, `agent-model-reset`, `agent-model-list`,
-//! `agent-model-row-{source}-{id}`, `agent-model-plan`, `agent-model-routines`,
-//! `agent-model-note` and `agent-model-error`. Invoke `model.picker`, `model.picker.open` and
-//! `model.picker.close` work the card's popover, and a click on `agent-model-dismiss` shuts
-//! whichever is open.
+//! ⚡ is on and it has a twin, and goes back to the controls), `agent-model-plan` (on a server
+//! whose rows carry no `source`, while the account is on the person's plan: the account's plan
+//! model, which answers for every Bot there; a line, not a row), `agent-model-routines` (on a Bot
+//! whose own door is the person's plan, whatever it is pinned to: the line saying its routines
+//! won't run, since they run on the server's paid keys and the server refuses every routine of
+//! such a Bot (opengrok-server #304), and to pick a Server model to run it on a schedule; a line,
+//! not a row) and `agent-model-note` (the server's word on why the list is not fuller).
+//! `agent-model-error` is the server's words for the last change it refused. Every change is
+//! saved on the Bot at once, `source`, `model` and `effort` on `PATCH /coworkers/{id}`
+//! (opengrok-server main d6f640e (#307, after #304), pin bf99845). Invoke `model.picker`,
+//! `model.picker.open` and `model.picker.close` work the popover, and a click on
+//! `agent-model-dismiss` shuts it.
 //!
 //! In the bot's settings: `agent-settings-error` is the pane's red line over Save: a refused Save
 //! or pick, in the server's words.
