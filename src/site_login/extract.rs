@@ -44,13 +44,49 @@ pub struct LoginFields {
     pub password_id: String,
 }
 
-/// What a card can take from the vault: a login (name and password), an authenticator code
-/// (one otp field), or a passkey (no fields at all, marked by the Bot).
+/// What a card can take from the vault: a login (name and password on one page), an
+/// authenticator code (one otp field), or a passkey (no fields at all, marked by the Bot).
+///
+/// A sign-in that asks for the name and the password on two pages (Google's) is two cards,
+/// and each takes half of a login. `Username` is the name page: one field a name could go in
+/// and no password, where a pick fills the name alone. `Password` is the page after it: one
+/// password field and nothing a name could go in, where a pick fills the password the way a
+/// login's is filled.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CardTarget {
     Login(LoginFields),
+    Username { username_id: String },
+    Password { password_id: String },
     Code { code_id: String },
     Passkey { register: bool },
+}
+
+impl CardTarget {
+    /// The field a pick's name is typed into, where the card asks for one.
+    pub fn name_field(&self) -> Option<&str> {
+        match self {
+            Self::Login(fields) => Some(&fields.username_id),
+            Self::Username { username_id } => Some(username_id),
+            _ => None,
+        }
+    }
+
+    /// The field a pick's secret goes to: a password, or the code minted from a seed. The
+    /// card shows dots there, never the secret.
+    pub fn secret_field(&self) -> Option<&str> {
+        match self {
+            Self::Login(fields) => Some(&fields.password_id),
+            Self::Password { password_id } => Some(password_id),
+            Self::Code { code_id } => Some(code_id),
+            _ => None,
+        }
+    }
+
+    /// The field the account list belongs to: the name where the card asks for one, else the
+    /// one field a pick fills. A passkey card has no field and lists its passkeys on the card.
+    pub fn list_field(&self) -> Option<&str> {
+        self.name_field().or_else(|| self.secret_field())
+    }
 }
 
 pub fn card_target(spec: &UserFormSpec) -> Option<CardTarget> {
@@ -62,25 +98,34 @@ pub fn card_target(spec: &UserFormSpec) -> Option<CardTarget> {
     if let Some(fields) = login_fields(spec) {
         return Some(CardTarget::Login(fields));
     }
-    let mut otp = spec
-        .fields
-        .iter()
-        .filter(|field| field.kind == UserFormFieldKind::Otp);
-    let code_id = otp.next()?.id.clone();
-    if otp.next().is_some()
-        || spec
-            .fields
+    let of_kind = |kind: UserFormFieldKind| {
+        spec.fields
             .iter()
-            .any(|field| field.kind == UserFormFieldKind::Password)
-    {
-        return None;
+            .filter(|field| field.kind == kind)
+            .collect::<Vec<_>>()
+    };
+    match (
+        of_kind(UserFormFieldKind::Otp).as_slice(),
+        of_kind(UserFormFieldKind::Password).as_slice(),
+    ) {
+        ([code], []) => Some(CardTarget::Code {
+            code_id: code.id.clone(),
+        }),
+        // One password field, and (as `login_fields` found) nothing a name could go in.
+        ([], [password]) if !another_challenge(spec) => Some(CardTarget::Password {
+            password_id: password.id.clone(),
+        }),
+        ([], []) if !another_challenge(spec) => {
+            name_page_field(spec).map(|username_id| CardTarget::Username { username_id })
+        }
+        // Two codes, a code beside a password, or two passwords (a sign-up or a change).
+        _ => None,
     }
-    Some(CardTarget::Code { code_id })
 }
 
-/// A card takes a saved login when it has a password field and a field for the name: an
-/// email field, else one named like one (email, user, login, phone), else the first plain
-/// text or phone field. An OTP-only or password-only card takes none.
+/// A card takes a whole saved login when it has one password field and a field for the name
+/// beside it (`name_field_in`). A card with only one of the two is a page of a two-step
+/// sign-in instead ([`card_target`]).
 pub fn login_fields(spec: &UserFormSpec) -> Option<LoginFields> {
     // Two password fields is a sign-up or a change, not a login.
     let mut passwords = spec
@@ -91,16 +136,30 @@ pub fn login_fields(spec: &UserFormSpec) -> Option<LoginFields> {
     if passwords.next().is_some() {
         return None;
     }
-    let candidates = spec.fields.iter().filter(|field| {
+    let username_id = name_field_in(spec)?;
+    Some(LoginFields {
+        username_id,
+        password_id,
+    })
+}
+
+/// The fields a name could go in: email, plain text or phone, and not masked.
+fn name_candidates(spec: &UserFormSpec) -> impl Iterator<Item = &UserFormField> {
+    spec.fields.iter().filter(|field| {
         matches!(
             field.kind,
             UserFormFieldKind::Email | UserFormFieldKind::Text | UserFormFieldKind::Tel
         ) && !field.masked()
-    });
+    })
+}
+
+/// The field for the name: an email field, else one named like one (email, user, login,
+/// phone), else the first plain text or phone field.
+fn name_field_in(spec: &UserFormSpec) -> Option<String> {
     let mut email = None;
     let mut named = None;
     let mut first = None;
-    for field in candidates {
+    for field in name_candidates(spec) {
         if field.kind == UserFormFieldKind::Email && email.is_none() {
             email = Some(field.id.clone());
         }
@@ -117,11 +176,27 @@ pub fn login_fields(spec: &UserFormSpec) -> Option<LoginFields> {
             first = Some(field.id.clone());
         }
     }
-    let username_id = email.or(named).or(first)?;
-    Some(LoginFields {
-        username_id,
-        password_id,
-    })
+    email.or(named).or(first)
+}
+
+/// The name page's one field. Exactly one field a name could go in, so the same rules as a
+/// login's pick it with nothing to choose between: two such fields are a form (a first and a
+/// last name, say), not the page that asks who is signing in.
+fn name_page_field(spec: &UserFormSpec) -> Option<String> {
+    if name_candidates(spec).count() != 1 {
+        return None;
+    }
+    name_field_in(spec)
+}
+
+/// The Bot marks a code, a captcha or a page outside its box with a challenge kind of its own,
+/// and neither page of a sign-in is one of those. A code the Bot put in a text or password
+/// field is still a code, and is offered no name and no password.
+fn another_challenge(spec: &UserFormSpec) -> bool {
+    matches!(
+        spec.challenge_kind.as_deref(),
+        Some("otp" | "captcha" | "outside_sandbox")
+    )
 }
 
 /// Username + password + origin from the card the person just continued.
@@ -252,6 +327,7 @@ mod tests {
             UserFormFieldKind::Password => "password",
             UserFormFieldKind::Otp => "otp",
             UserFormFieldKind::Tel => "tel",
+            UserFormFieldKind::Checkbox => "checkbox",
             _ => "text",
         };
         json!({"id": id, "label": id, "type": kind, "required": true})
@@ -336,13 +412,18 @@ mod tests {
         ]);
         assert!(matches!(card_target(&login), Some(CardTarget::Login(_))));
         assert_eq!(
-            card_target(&card_with(vec![field("note", UserFormFieldKind::Text)])),
+            card_target(&card_with(vec![
+                field("first", UserFormFieldKind::Text),
+                field("last", UserFormFieldKind::Text)
+            ])),
             None
         );
     }
 
+    /// The name and the password of one login, on one page. A card with only one of the two
+    /// is a page of a two-step sign-in, and takes that half ([`card_target`]).
     #[test]
-    fn a_password_only_or_otp_card_takes_no_saved_login() {
+    fn a_whole_login_needs_the_name_and_one_password() {
         assert_eq!(
             login_fields(&card_with(vec![field(
                 "password",
@@ -359,6 +440,152 @@ mod tests {
         );
         assert_eq!(
             login_fields(&card_with(vec![field("username", UserFormFieldKind::Text)])),
+            None
+        );
+    }
+
+    /// Google asks for the email on one page and the password on the next, and the Bot raises
+    /// a card for each; the owner's first card was "Google sign-in — email", one "Email or
+    /// phone" field. Neither card holds a whole login. Each is one page of one, its list sits
+    /// under its one field, and a pick fills that field and no other.
+    #[test]
+    fn the_two_pages_of_a_two_step_sign_in_are_told_apart() {
+        let email = UserFormSpec::parse(
+            &json!({
+                "entryId": "e_email",
+                "formRequest": {
+                    "title": "Google sign-in — email",
+                    "domain": "accounts.google.com",
+                    "fields": [
+                        {"id": "email", "label": "Email or phone", "type": "email", "required": true}
+                    ]
+                }
+            }),
+            None,
+        )
+        .expect("form");
+        let name_page = card_target(&email).expect("the name page");
+        assert_eq!(
+            name_page,
+            CardTarget::Username {
+                username_id: "email".to_string()
+            }
+        );
+        assert_eq!(
+            (
+                name_page.list_field(),
+                name_page.name_field(),
+                name_page.secret_field()
+            ),
+            (Some("email"), Some("email"), None)
+        );
+        assert_eq!(login_origin(&email).as_deref(), Some("google.com"));
+
+        // The Bot marks the second page as a password challenge; unmarked it is the same page.
+        let mut password = card_with(vec![field("password", UserFormFieldKind::Password)]);
+        for mark in [None, Some("password")] {
+            password.challenge_kind = mark.map(str::to_string);
+            let password_page = card_target(&password).expect("the password page");
+            assert_eq!(
+                password_page,
+                CardTarget::Password {
+                    password_id: "password".to_string()
+                }
+            );
+            assert_eq!(
+                (
+                    password_page.list_field(),
+                    password_page.name_field(),
+                    password_page.secret_field()
+                ),
+                (Some("password"), None, Some("password"))
+            );
+        }
+
+        // The name page's field is found the way a login's name field is: named like a name,
+        // or the only field there is, whatever the Bot typed it as. A box to tick beside it
+        // does not change the page.
+        for (id, kind) in [
+            ("username", UserFormFieldKind::Text),
+            ("phone", UserFormFieldKind::Tel),
+            ("account-id", UserFormFieldKind::Text),
+        ] {
+            assert_eq!(
+                card_target(&card_with(vec![
+                    field(id, kind),
+                    field("remember", UserFormFieldKind::Checkbox)
+                ])),
+                Some(CardTarget::Username {
+                    username_id: id.to_string()
+                }),
+                "{id}"
+            );
+        }
+    }
+
+    /// Only a page of a sign-in is read as one. Two fields a name could go in are a form, not
+    /// the page asking who is signing in; and a card the Bot marked as a code, a captcha or a
+    /// page outside its box is that, whatever its one field was typed as.
+    #[test]
+    fn a_card_that_is_no_page_of_a_sign_in_takes_neither_half() {
+        assert_eq!(
+            card_target(&card_with(vec![
+                field("email", UserFormFieldKind::Email),
+                field("nickname", UserFormFieldKind::Text)
+            ])),
+            None
+        );
+        for mark in ["otp", "captcha", "outside_sandbox"] {
+            for kind in [UserFormFieldKind::Text, UserFormFieldKind::Password] {
+                let mut card = card_with(vec![field("answer", kind)]);
+                card.challenge_kind = Some(mark.to_string());
+                assert_eq!(card_target(&card), None, "{mark} in a {kind:?} field");
+            }
+        }
+    }
+
+    /// What the two-step reading leaves as it was: a sign-up or a password change (two
+    /// password fields) takes nothing, with a name beside them or without; a code card takes a
+    /// code, with a name beside it too; two codes, or a code beside a password, take nothing.
+    #[test]
+    fn sign_up_change_and_code_cards_keep_their_targets() {
+        let sign_up = card_with(vec![
+            field("email", UserFormFieldKind::Email),
+            field("password", UserFormFieldKind::Password),
+            field("confirm", UserFormFieldKind::Password),
+        ]);
+        assert_eq!(card_target(&sign_up), None);
+        let change = card_with(vec![
+            field("current", UserFormFieldKind::Password),
+            field("new", UserFormFieldKind::Password),
+        ]);
+        assert_eq!(card_target(&change), None);
+        let code = Some(CardTarget::Code {
+            code_id: "code".to_string(),
+        });
+        assert_eq!(
+            card_target(&card_with(vec![field("code", UserFormFieldKind::Otp)])),
+            code
+        );
+        assert_eq!(
+            card_target(&card_with(vec![
+                field("email", UserFormFieldKind::Email),
+                field("code", UserFormFieldKind::Otp)
+            ])),
+            code
+        );
+        assert_eq!(
+            card_target(&card_with(vec![
+                field("code", UserFormFieldKind::Otp),
+                field("password", UserFormFieldKind::Password)
+            ])),
+            None
+        );
+        assert_eq!(
+            card_target(&card_with(vec![
+                field("one", UserFormFieldKind::Otp),
+                field("two", UserFormFieldKind::Otp)
+            ])),
             None
         );
     }
