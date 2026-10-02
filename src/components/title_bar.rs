@@ -11,8 +11,9 @@ use crate::components::computer::ComputerPane;
 use crate::components::persona::PersonaMark;
 use crate::components::recipes::{RecipesView, recipes_header};
 use crate::components::sidebar::sidebar_toggle_button;
+use crate::opengrok::Coworker;
 use crate::state::{AppState, MainPage, RightPane};
-use gpui_kit::component::{ActiveTheme, Icon, h_flex};
+use gpui_kit::component::{ActiveTheme, Icon, Theme, h_flex};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 
@@ -156,7 +157,7 @@ impl Render for TitleBar {
                             .on_mouse_down(MouseButton::Left, {
                                 let app = app.clone();
                                 move |_, _, cx| {
-                                    app.update(cx, |state, cx| state.toggle_agent_settings(cx));
+                                    app.update(cx, |state, cx| state.press_bot_chip(cx));
                                 }
                             })
                             .child(
@@ -343,58 +344,7 @@ impl TitleBar {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .child(
-                        div()
-                            .id("header-coworker")
-                            .occlude()
-                            .max_w(px(pill_width))
-                            .min_w_0()
-                            .h(px(36.))
-                            .px(px(12.))
-                            .rounded_full()
-                            .bg(theme.secondary.opacity(0.94))
-                            .border_1()
-                            .border_color(theme.border.opacity(0.5))
-                            .flex()
-                            .items_center()
-                            .gap(px(8.))
-                            .when_some(bot, |this, bot| {
-                                let name = if bot.name.trim().is_empty() {
-                                    "Bot"
-                                } else {
-                                    bot.name.trim()
-                                };
-                                this.cursor_pointer()
-                                    .hover(|s| s.bg(theme.secondary))
-                                    .on_mouse_down(MouseButton::Left, {
-                                        let app = app.clone();
-                                        move |_, _, cx| {
-                                            cx.stop_propagation();
-                                            app.update(cx, |state, cx| {
-                                                state.toggle_agent_settings(cx)
-                                            });
-                                        }
-                                    })
-                                    .child(
-                                        div().flex_shrink_0().child(
-                                            PersonaMark::new(bot.id.clone())
-                                                .shape(bot.avatar_shape.clone())
-                                                .color(bot.avatar_color.clone())
-                                                .size(px(24.))
-                                                .dark(theme.is_dark()),
-                                        ),
-                                    )
-                                    .child(
-                                        div()
-                                            .min_w_0()
-                                            .truncate()
-                                            .text_sm()
-                                            .font_weight(FontWeight::SEMIBOLD)
-                                            .child(name.to_owned()),
-                                    )
-                            })
-                            .when(bot.is_none(), |this| this.child("Bots")),
-                    ),
+                    .child(bot_chip(app.clone(), bot, pill_width, theme)),
             )
             .when(
                 header_sidebar_toggle_visible(state.sidebar_hidden),
@@ -510,6 +460,64 @@ impl TitleBar {
     }
 }
 
+/// The pill at the top centre of the chat that names the open Bot, or says Bots while none is.
+///
+/// A press opens and shuts the Bot's settings, or, in one of its routines' threads, goes back to
+/// the Bot's own chat (`AppState::press_bot_chip`).
+fn bot_chip(
+    app: Entity<AppState>,
+    bot: Option<&Coworker>,
+    pill_width: f32,
+    theme: &Theme,
+) -> Stateful<Div> {
+    div()
+        .id("header-coworker")
+        .debug_selector(|| "header-coworker".into())
+        .occlude()
+        .max_w(px(pill_width))
+        .min_w_0()
+        .h(px(36.))
+        .px(px(12.))
+        .rounded_full()
+        .bg(theme.secondary.opacity(0.94))
+        .border_1()
+        .border_color(theme.border.opacity(0.5))
+        .flex()
+        .items_center()
+        .gap(px(8.))
+        .when_some(bot, |this, bot| {
+            let name = if bot.name.trim().is_empty() {
+                "Bot"
+            } else {
+                bot.name.trim()
+            };
+            this.cursor_pointer()
+                .hover(|s| s.bg(theme.secondary))
+                .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                    cx.stop_propagation();
+                    app.update(cx, |state, cx| state.press_bot_chip(cx));
+                })
+                .child(
+                    div().flex_shrink_0().child(
+                        PersonaMark::new(bot.id.clone())
+                            .shape(bot.avatar_shape.clone())
+                            .color(bot.avatar_color.clone())
+                            .size(px(24.))
+                            .dark(theme.is_dark()),
+                    ),
+                )
+                .child(
+                    div()
+                        .min_w_0()
+                        .truncate()
+                        .text_sm()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child(name.to_owned()),
+                )
+        })
+        .when(bot.is_none(), |this| this.child("Bots"))
+}
+
 fn header_icon(id: &'static str, path: &'static str, selected: bool) -> Stateful<Div> {
     div()
         .id(id)
@@ -546,6 +554,104 @@ fn floating_header_span(width: f32, left: f32, right_open: bool) -> (f32, f32, f
 #[cfg(test)]
 mod tests {
     use super::floating_header_span;
+    use crate::state::{AppState, Conversation, RightPane, ThreadOrigin};
+    use gpui_kit::component::ActiveTheme as _;
+    use gpui_kit::{
+        AppContext as _, Context, Entity, IntoElement, Modifiers, ParentElement as _, Render,
+        TestAppContext, Window, div,
+    };
+
+    /// The chat's top chip on its own, over the app state.
+    struct Chip {
+        app: Entity<AppState>,
+    }
+
+    impl Render for Chip {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let state = self.app.read(cx);
+            let bot = state
+                .active_coworker_id
+                .as_ref()
+                .and_then(|id| state.coworkers.iter().find(|bot| &bot.id == id));
+            div().child(super::bot_chip(self.app.clone(), bot, 240., cx.theme()))
+        }
+    }
+
+    fn thread(id: &str, origin: Option<ThreadOrigin>) -> Conversation {
+        Conversation {
+            id: id.into(),
+            title: id.into(),
+            created_at: String::new(),
+            updated_at: String::new(),
+            messages: Vec::new(),
+            unread_count: 0,
+            origin,
+        }
+    }
+
+    /// New Bot, open on the thread its routine "Say hello" runs in.
+    fn in_a_routines_thread() -> AppState {
+        let mut state = AppState::new();
+        state.coworkers = vec![
+            serde_json::from_value(serde_json::json!({ "id": "cw_1", "name": "New Bot" }))
+                .expect("a coworker"),
+        ];
+        state.active_coworker_id = Some("cw_1".into());
+        state.conversations = vec![
+            thread("cw_1", None),
+            thread(
+                "sch_1",
+                Some(ThreadOrigin {
+                    word: "schedule".into(),
+                    routine_name: "Say hello".into(),
+                    coworker_id: "cw_1".into(),
+                }),
+            ),
+        ];
+        state.active_conversation_id = Some("sch_1".into());
+        state
+    }
+
+    /// The chip, pressed the way a person presses it. In a routine's thread it goes back to the
+    /// Bot's own chat and leaves the settings shut; in the Bot's own chat the same chip opens the
+    /// settings, as it always has.
+    #[gpui_kit::test]
+    fn the_bot_chip_goes_home_from_a_routines_thread(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (view, cx) = cx.add_window_view(|_, cx| Chip {
+            app: cx.new(|_| in_a_routines_thread()),
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let chip = cx
+            .debug_bounds("header-coworker")
+            .expect("the chip is drawn")
+            .center();
+        cx.simulate_mouse_move(chip, None, Modifiers::none());
+        cx.simulate_click(chip, Modifiers::none());
+        view.update(cx, |view, cx| {
+            let state = view.app.read(cx);
+            assert_eq!(
+                state.active_conversation_id.as_deref(),
+                Some("cw_1"),
+                "the chip goes back to the Bot's own chat"
+            );
+            assert_eq!(
+                state.right_pane,
+                RightPane::Closed,
+                "and opens nothing on the way"
+            );
+        });
+
+        view.update(cx, |_, cx| cx.notify());
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.simulate_mouse_move(chip, None, Modifiers::none());
+        cx.simulate_click(chip, Modifiers::none());
+        view.update(cx, |view, cx| {
+            let state = view.app.read(cx);
+            assert_eq!(state.right_pane, RightPane::Settings);
+            assert_eq!(state.active_conversation_id.as_deref(), Some("cw_1"));
+        });
+    }
 
     #[test]
     fn pill_tracks_chat_centre_for_all_sidebar_states() {
