@@ -10,6 +10,7 @@ use crate::components::alert_chrome::{
     attention_cta, attention_ctas, attention_glass, attention_shadow,
 };
 use crate::components::fields::field_input;
+use crate::components::switch::Switch;
 use crate::opengrok::{
     BoxHandoffResolution, ComputerError, CoworkerComputer, LocalExecMode, ScheduleRunStatus,
     computer_attention_done_id, computer_attention_id, computer_attention_skip_id,
@@ -22,7 +23,6 @@ use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{InputState, Textarea, TextareaState};
 use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
 use gpui_kit::component::popover::Popover;
-use gpui_kit::component::switch::Switch;
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{
     ActiveTheme, Disableable as _, Icon, Selectable, Sizable as _, h_flex, v_flex,
@@ -523,7 +523,9 @@ impl ComputerPane {
                         .child(
                             Switch::new("routine-active")
                                 .checked(active)
-                                .label("Active")
+                                // Says what the position means, so off reads as a state the
+                                // routine is in and not as a label the switch has lost.
+                                .label(if active { "Active" } else { "Paused" })
                                 .on_click({
                                     let app = app.clone();
                                     let coworker_id = coworker_id.clone();

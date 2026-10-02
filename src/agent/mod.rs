@@ -81,7 +81,9 @@
 //! `settings-local-rule-error-allow|deny-{n}` (why its last Remove did not go through);
 //! `settings-local-rules-empty` while there are none, `settings-local-rules-error` while they
 //! could not be read. Nothing for a machine that is not this Mac.
-//! `routine-new`, `routine-{id}`, `routine-{id}-trigger-schedule`,
+//! `routine-new`, `routine-{id}`, `routine-{id}-active` (the editor's Active switch: label
+//! `Active`, or `Paused` while it is off; checked while the routine runs on its own; a click
+//! asks for the other way), `routine-{id}-trigger-schedule`,
 //! `routine-{id}-trigger-webhook`, `routine-{id}-webhook-url`,
 //! `routine-{id}-webhook-key`, `routine-{id}-rotate`, `routine-{id}-test` (Test run, on a
 //! routine the server has), `routine-{id}-run-{runId}` (one Run history line: label `Test run` /
