@@ -15,7 +15,9 @@ use gpui_kit::component::{ActiveTheme, Disableable, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 
-use crate::chrome::{INFO_PANE_WIDTH, TITLE_BAR_H, chrome_floats, sidebar_width};
+use crate::chrome::{
+    INFO_PANE_WIDTH, TITLE_BAR_H, chrome_floats, floating_chrome_needs_scrim, sidebar_width,
+};
 use crate::state::AppState;
 
 fn cached_fill<V: Render>(view: Entity<V>) -> impl IntoElement {
@@ -314,7 +316,8 @@ impl Render for Layout {
         let floats = chrome_floats(f32::from(window_width));
         let right_open = right_pane != RightPane::Closed;
         let dragging = self.resize_drag.is_some() && !floats;
-        let show_scrim = floats && (right_open || (left > 0.0 && !collapsed));
+        let show_scrim =
+            floating_chrome_needs_scrim(f32::from(window_width), hidden, collapsed, right_open);
         let sidebar_view = self.sidebar.clone();
         let right_child = match right_pane {
             RightPane::Settings => self.agent_settings.clone().into_any_element(),
@@ -407,12 +410,16 @@ impl Render for Layout {
                         .bg(gpui::black().opacity(0.28))
                         .on_mouse_down(MouseButton::Left, {
                             let state = self.state.clone();
+                            let menu_open = state.read(cx).sidebar_menu_open;
                             move |_, _, cx| {
+                                cx.stop_propagation();
                                 state.update(cx, |state, cx| {
-                                    if state.right_pane != RightPane::Closed {
-                                        state.close_right_pane(cx);
+                                    // The popover's outside handler can run first. The state
+                                    // at paint time decides what this one click dismisses.
+                                    if menu_open {
+                                        state.set_sidebar_menu_open(false, cx);
                                     } else {
-                                        state.set_sidebar_collapsed(true, false, cx);
+                                        state.dismiss_floating_chrome(cx);
                                     }
                                 });
                             }

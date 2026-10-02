@@ -2,7 +2,8 @@
 //! only the pill and icon buttons have a surface. Other pages retain their own header.
 
 use crate::chrome::{
-    HEADER_PX, INFO_PANE_WIDTH, TITLE_BAR_H, TITLE_BAR_LEFT_PAD, chrome_floats, sidebar_width,
+    HEADER_PX, INFO_PANE_WIDTH, TITLE_BAR_H, TITLE_BAR_LEFT_PAD, chrome_floats,
+    header_sidebar_toggle_visible, sidebar_width,
 };
 use crate::components::agent_settings::settings_header;
 use crate::components::chat::ChatView;
@@ -390,22 +391,27 @@ impl TitleBar {
                             .when(bot.is_none(), |this| this.child("Bots")),
                     ),
             )
-            .child(
-                header_icon(
-                    "header-left-sidebar",
-                    "icons/panel-left.svg",
-                    !state.sidebar_hidden,
-                )
-                .absolute()
-                .left(px(TITLE_BAR_LEFT_PAD))
-                .top(px(12.))
-                .on_mouse_down(MouseButton::Left, {
-                    let app = app.clone();
-                    move |_, _, cx| {
-                        cx.stop_propagation();
-                        app.update(cx, |state, cx| state.toggle_sidebar(cx));
-                    }
-                }),
+            .when(
+                header_sidebar_toggle_visible(state.sidebar_hidden),
+                |this| {
+                    this.child(
+                        header_icon(
+                            "header-left-sidebar",
+                            "icons/panel-left.svg",
+                            !state.sidebar_hidden,
+                        )
+                        .absolute()
+                        .left(px(TITLE_BAR_LEFT_PAD))
+                        .top(px(12.))
+                        .on_mouse_down(MouseButton::Left, {
+                            let app = app.clone();
+                            move |_, _, cx| {
+                                cx.stop_propagation();
+                                app.update(cx, |state, cx| state.toggle_sidebar(cx));
+                            }
+                        }),
+                    )
+                },
             )
             .child(
                 h_flex()
