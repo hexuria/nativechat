@@ -623,7 +623,15 @@ const REST_NOT_READ: &[(&str, &str, &str)] = &[
 ///
 /// Only routes built ahead of a recording are listed. Routes this app asks that no test on the
 /// server drives are a different gap, and not this list's.
-const REST_NOT_RECORDED_YET: &[(&str, &str, &str)] = &[];
+const REST_NOT_RECORDED_YET: &[(&str, &str, &str)] = &[(
+    "PUT__account",
+    "/account",
+    "opengrok-server PR #322 new-bot-default, not yet on main: `put_me` in \
+     crates/opengrok-server/src/account_api.rs keeps the IANA zone a person's routines default \
+     to (#316), and this app sends this computer's after sign-in and when it moves, only where the \
+     account's read carries timeZone and the zone differs. Its recording comes with the corpus \
+     re-vendored from a main that has #322.",
+)];
 
 /// Routes this app asks with this Mac's machine token (`local_exec.rs` `MachineCredential`)
 /// rather than the person's session, so they never pass through `send_json_within`: a 401 on one
@@ -643,6 +651,14 @@ const MACHINE_TOKEN_ROUTES: &[&str] = &[
 /// has gone stale and comes off this list, and
 /// [`every_key_asked_ahead_of_its_recording_is_read_and_not_recorded_yet`] fails until it does.
 const REST_FIELDS_NOT_RECORDED_YET: &[(&str, &str, &str)] = &[
+    (
+        "GET__account",
+        "timeZone",
+        "opengrok-server PR #322 new-bot-default, not yet on main: `account_json` in \
+         crates/opengrok-server/src/account_api.rs sends the account's IANA time zone on every \
+         read, null until set (#316), and this app sends its own only where the read carries the \
+         key. Its recording comes with the corpus re-vendored from a main that has #322.",
+    ),
     (
         "GET__account_inference-source",
         "newBotDefault",
@@ -4383,6 +4399,16 @@ fn account(_: u16, body: &Value) -> Check {
             && Some(me.enabled) == body.get("enabled").and_then(Value::as_bool)
             && me.is_admin == body.get("isAdmin").and_then(Value::as_bool),
         "the account came through changed: {me:?}"
+    );
+    // The time zone, from a server that keeps one (opengrok-server PR #322 new-bot-default, not
+    // yet on main): read exactly when the key is sent, null as none set.
+    let sent = body
+        .get("timeZone")
+        .map(|zone| zone.as_str().map(str::to_string));
+    must!(
+        me.time_zone == sent,
+        "the time zone should be read exactly as it is sent: {:?} from {body}",
+        me.time_zone
     );
     Ok(())
 }

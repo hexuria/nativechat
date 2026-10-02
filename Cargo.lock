@@ -4894,6 +4894,7 @@ dependencies = [
  "gpui-agent",
  "gpui-fps",
  "gpui-kit",
+ "iana-time-zone",
  "libc",
  "log",
  "markdown",

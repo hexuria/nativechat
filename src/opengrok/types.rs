@@ -19,6 +19,12 @@ pub struct Account {
     pub enabled: bool,
     #[serde(default)]
     pub is_admin: Option<bool>,
+    /// The IANA zone the person's routines default to, from a server that keeps one, which
+    /// sends the key on every read, `null` until set (opengrok-server PR #322 new-bot-default,
+    /// not yet on main: `account_json` in `crates/opengrok-server/src/account_api.rs`, #316).
+    /// `None` is the key left out: a server before it, which is never sent one.
+    #[serde(default, deserialize_with = "super::inference::keyed")]
+    pub time_zone: Option<Option<String>>,
 }
 
 impl Account {

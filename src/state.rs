@@ -617,6 +617,23 @@ pub struct PickerView {
     pub list_start: usize,
 }
 
+/// A `PUT /account` of this computer's time zone that has begun: what to send, and the sign-in it
+/// is for, so an answer that lands after a sign-out lands on nothing.
+struct TimeZoneSend {
+    client: OpenGrokClient,
+    epoch: u64,
+    zone: String,
+}
+
+/// How often this computer's time zone is looked at while somebody is signed in: a zone changed
+/// in System Settings, or by travelling, reaches the account within this.
+const TIME_ZONE_CHECK: Duration = Duration::from_secs(60);
+
+/// This computer's IANA time zone as the system says it now, or `None` when it cannot say.
+fn system_time_zone() -> Option<String> {
+    iana_time_zone::get_timezone().ok()
+}
+
 /// A change sent at once that has begun: what to send, and what it is, for its answer.
 struct AccountChangeSend {
     client: OpenGrokClient,
@@ -5063,6 +5080,12 @@ pub struct AppState {
     /// Settings → Relay was on screen when Settings last changed what it shows, so its arrival
     /// and its leaving are each told once ([`Self::settle_reply_source_page`]).
     reply_source_page_shown: bool,
+    /// The time zone a `PUT /account` is out with, or that the server refused: it is not sent
+    /// again until this computer's zone moves off it ([`Self::begin_time_zone`]).
+    time_zone_sent: Option<String>,
+    /// The sign-in the time-zone watch is for: a new one starts it again, a sign-out ends it, and
+    /// an answer from another lands on nothing.
+    time_zone_epoch: u64,
     /// The relay: the switch, this computer's opencodex, and the running relay's word on itself
     /// (hexuria/nativechat #156, opengrok-server #292).
     pub relay_mac: RelayMac,
@@ -5611,6 +5634,8 @@ impl AppState {
             reveal_run: None,
             model_picker: PickerView::default(),
             new_bots_picker: PickerView::default(),
+            time_zone_sent: None,
+            time_zone_epoch: 0,
             model_pick_note: None,
             avatar_editor_open: false,
             hiring: false,
@@ -5809,6 +5834,7 @@ impl AppState {
                         state.auth_status = AuthStatus::SignedIn;
                         state.auth_error = None;
                         state.note_server_answered(cx);
+                        state.watch_time_zone(cx);
                         state.load_relay_switch();
                         state.start_local_exec(cx);
                         state.refresh_coworkers(cx);
@@ -5841,6 +5867,116 @@ impl AppState {
 
     pub fn is_signed_in(&self) -> bool {
         self.auth_status == AuthStatus::SignedIn && self.account.is_some()
+    }
+
+    /// Keep this computer's time zone on the account, for the routines that default to it
+    /// (opengrok-server PR #322 new-bot-default, not yet on main: `PUT /account` `{timeZone}`):
+    /// now, as somebody has just signed in, and then whenever the system's zone has moved, looked
+    /// at every [`TIME_ZONE_CHECK`] until they sign out.
+    fn watch_time_zone(&mut self, cx: &mut Context<Self>) {
+        self.time_zone_epoch += 1;
+        self.time_zone_sent = None;
+        let epoch = self.time_zone_epoch;
+        self.keep_time_zone(cx);
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(TIME_ZONE_CHECK).await;
+                let watching = this.update(cx, |state, cx| {
+                    let watching = state.time_zone_epoch == epoch;
+                    if watching {
+                        state.keep_time_zone(cx);
+                    }
+                    watching
+                });
+                if !matches!(watching, Ok(true)) {
+                    return;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// Send this computer's time zone to the account if it is not the one the account keeps.
+    fn keep_time_zone(&mut self, cx: &mut Context<Self>) {
+        let Some(send) = self.begin_time_zone(system_time_zone()) else {
+            return;
+        };
+        let TimeZoneSend {
+            client,
+            epoch,
+            zone,
+        } = send;
+        cx.spawn(async move |this, cx| {
+            let answer = client.set_time_zone(&zone).await;
+            let _ = this.update(cx, |state, cx| {
+                if state.settle_time_zone(epoch, &zone, answer) {
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Begin keeping `system`, this computer's zone, on the account: only where the account's
+    /// read carries `timeZone`, a server that keeps one, and the zone differs from the one it
+    /// keeps; and not again while that zone is out, or after the server refused it, until this
+    /// computer's zone moves off it.
+    fn begin_time_zone(&mut self, system: Option<String>) -> Option<TimeZoneSend> {
+        let client = self.opengrok.clone()?;
+        if !self.is_signed_in() {
+            return None;
+        }
+        let kept = self.account.as_ref()?.time_zone.clone()?;
+        let zone = system
+            .map(|zone| zone.trim().to_string())
+            .filter(|zone| !zone.is_empty())?;
+        if kept.as_deref() == Some(zone.as_str()) {
+            self.time_zone_sent = None;
+            return None;
+        }
+        if self.time_zone_sent.as_deref() == Some(zone.as_str()) {
+            return None;
+        }
+        self.time_zone_sent = Some(zone.clone());
+        Some(TimeZoneSend {
+            client,
+            epoch: self.time_zone_epoch,
+            zone,
+        })
+    }
+
+    /// The server's answer to this computer's time zone, `false` when it is not this sign-in's.
+    /// Kept, the account is what the server answers with. Not answered, the zone is sent again
+    /// at the next look. Refused (a zone the server's database does not know), it is not sent
+    /// again until this computer's zone moves off it, and the refusal goes to stderr, there being
+    /// no page that asked.
+    fn settle_time_zone(
+        &mut self,
+        epoch: u64,
+        zone: &str,
+        answer: Result<Account, OpenGrokError>,
+    ) -> bool {
+        if epoch != self.time_zone_epoch || self.time_zone_sent.as_deref() != Some(zone) {
+            return false;
+        }
+        match answer {
+            Ok(account) => {
+                self.time_zone_sent = None;
+                if self.account.as_ref().map(|kept| &kept.id) == Some(&account.id) {
+                    self.account = Some(account);
+                }
+            }
+            Err(error) if error.unreachable().is_some() || error.status.is_none() => {
+                self.time_zone_sent = None;
+            }
+            Err(error) => {
+                eprintln!(
+                    "NativeChat: the server did not keep this computer's time zone {zone}: {}",
+                    error.message
+                );
+            }
+        }
+        true
     }
 
     /// The working line under the open thread, which is that thread's own or nothing.
@@ -6675,6 +6811,7 @@ impl AppState {
                         state.site_login_notice = None;
                         state.reload_site_logins(cx);
                         state.note_server_answered(cx);
+                        state.watch_time_zone(cx);
                         state.load_relay_switch();
                         state.start_local_exec(cx);
                         state.refresh_coworkers(cx);
@@ -6756,6 +6893,9 @@ impl AppState {
         self.reply_source = ReplySourceSettings::default();
         self.reply_source_page_shown = false;
         self.reply_source_generation += 1;
+        // The time-zone watch was for them, and so is a PUT of it still out.
+        self.time_zone_epoch += 1;
+        self.time_zone_sent = None;
         // The pickers were open on one of their Bots and on their default for new Bots, and what
         // the Bot's last said was about theirs.
         self.model_picker = PickerView::default();
@@ -36729,6 +36869,150 @@ mod tests {
         );
         assert_eq!(state.reply_source.change_note(AccountChange::NewBots), None);
         assert!(state.asks_the_servers_machine_first(), "the line stays");
+    }
+
+    // ---- The account's time zone: this computer's, for its routines (opengrok-server PR #322) ---
+
+    /// The account as `GET /account` and `PUT /account` answer it, with `timeZone` as given.
+    fn account_in(zone: Option<&str>) -> crate::opengrok::Account {
+        serde_json::from_value(json!({
+            "id": "acc_1", "email": "ada@example.com", "isAdmin": false, "timeZone": zone
+        }))
+        .expect("an account")
+    }
+
+    /// This computer's zone is sent only where the account's read carries `timeZone` and the zone
+    /// differs from the one kept there: not to a server that keeps none, not when they are the
+    /// same, not while the same zone is out, and not again after the server refused it, until
+    /// this computer's zone moves. An answer kept is the account after; one nobody heard is sent
+    /// again at the next look; and an answer after a sign-out lands on nothing.
+    #[test]
+    fn the_time_zone_is_sent_only_where_it_differs() {
+        let mut state = signed_in_state();
+        let zone = |name: &str| Some(name.to_string());
+        assert!(
+            state.begin_time_zone(zone("Asia/Manila")).is_none(),
+            "a server that keeps none"
+        );
+        state.account = Some(account_in(Some("Asia/Manila")));
+        assert!(
+            state.begin_time_zone(zone("Asia/Manila")).is_none(),
+            "the same zone"
+        );
+        assert!(
+            state.begin_time_zone(None).is_none(),
+            "the system cannot say"
+        );
+        let send = state
+            .begin_time_zone(zone(" Europe/London "))
+            .expect("a zone that differs");
+        assert_eq!(send.zone, "Europe/London");
+        assert!(
+            state.begin_time_zone(zone("Europe/London")).is_none(),
+            "out already"
+        );
+
+        let said = "\"Europe/London\" is not an IANA time zone this server knows; send one like \
+                    \"Europe/London\"";
+        assert!(state.settle_time_zone(
+            send.epoch,
+            &send.zone,
+            Err(OpenGrokError::from_opengrok(422, said))
+        ));
+        assert!(
+            state.begin_time_zone(zone("Europe/London")).is_none(),
+            "refused: not sent again"
+        );
+        let moved = state
+            .begin_time_zone(zone("Asia/Tokyo"))
+            .expect("the zone moved");
+        assert!(state.settle_time_zone(
+            moved.epoch,
+            &moved.zone,
+            Err(OpenGrokError::message("error sending request"))
+        ));
+        let again = state
+            .begin_time_zone(zone("Asia/Tokyo"))
+            .expect("not heard: sent again at the next look");
+        assert!(state.settle_time_zone(
+            again.epoch,
+            &again.zone,
+            Ok(account_in(Some("Asia/Tokyo")))
+        ));
+        assert_eq!(
+            state
+                .account
+                .as_ref()
+                .and_then(|account| account.time_zone.clone()),
+            Some(zone("Asia/Tokyo"))
+        );
+        assert!(
+            state.begin_time_zone(zone("Asia/Tokyo")).is_none(),
+            "kept: the same now"
+        );
+
+        state.account = Some(account_in(None));
+        let first = state
+            .begin_time_zone(zone("Asia/Tokyo"))
+            .expect("none kept yet: any zone differs");
+        state.forget_account();
+        assert!(!state.settle_time_zone(
+            first.epoch,
+            &first.zone,
+            Ok(account_in(Some("Asia/Tokyo")))
+        ));
+        assert_eq!(state.account, None);
+    }
+
+    /// A zone that differs from the one the server keeps goes in one `PUT /account` of
+    /// `{timeZone}` alone, and the account the server answers with is the app's after, so the same
+    /// zone is not sent again.
+    #[tokio::test]
+    async fn a_zone_that_differs_is_put_once_with_nothing_else() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .and(wiremock::matchers::path("/account"))
+            .and(wiremock::matchers::body_json(
+                json!({"timeZone": "Asia/Manila"}),
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
+                "id": "acc_1", "email": "ada@example.com", "firstName": "Ada",
+                "lastName": "", "avatarUrl": null, "orgId": null, "verified": true,
+                "enabled": true, "timeZone": "Asia/Manila", "isAdmin": false
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut state = signed_in_state();
+        state.opengrok = Some(client_signed_in_to(&server).await);
+        state.account = Some(account_in(Some("Europe/London")));
+        assert!(
+            state
+                .begin_time_zone(Some("Europe/London".into()))
+                .is_none()
+        );
+        let send = state
+            .begin_time_zone(Some("Asia/Manila".into()))
+            .expect("a zone that differs");
+        let answer = send.client.set_time_zone(&send.zone).await;
+        assert!(state.settle_time_zone(send.epoch, &send.zone, answer));
+        assert_eq!(
+            state
+                .account
+                .as_ref()
+                .and_then(|account| account.time_zone.clone()),
+            Some(Some("Asia/Manila".to_string()))
+        );
+        assert!(state.begin_time_zone(Some("Asia/Manila".into())).is_none());
+        let puts: Vec<serde_json::Value> = server
+            .received_requests()
+            .await
+            .expect("the recorder is on")
+            .iter()
+            .filter(|request| request.method.as_str() == "PUT" && request.url.path() == "/account")
+            .map(|request| serde_json::from_slice(&request.body).expect("a JSON body"))
+            .collect();
+        assert_eq!(puts, [json!({"timeZone": "Asia/Manila"})]);
     }
 
     /// The relay runs only for somebody signed in, with its switch on for them, on an enrolled

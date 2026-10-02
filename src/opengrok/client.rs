@@ -621,6 +621,23 @@ impl OpenGrokClient {
         Self::json_or_error(response).await
     }
 
+    /// `PUT /account` `{timeZone}`: keep `zone`, this computer's IANA time zone, as the one the
+    /// person's routines default to, answered with the account as `GET /account` answers it
+    /// (opengrok-server PR #322 new-bot-default, not yet on main: `put_me` in
+    /// `crates/opengrok-server/src/account_api.rs`, #316). The same zone again changes nothing
+    /// there. A zone its database does not know is a 422 `{error}` in its words, a body naming
+    /// none a 400, and signed out a 401.
+    pub async fn set_time_zone(&self, zone: &str) -> Result<Account, OpenGrokError> {
+        let response = self
+            .send_json(
+                reqwest::Method::PUT,
+                "/account",
+                Some(&json!({ "timeZone": zone })),
+            )
+            .await?;
+        Self::json_or_error(response).await
+    }
+
     /// The person's saved site logins on the server. Never the passwords.
     pub async fn list_site_logins(&self) -> Result<Vec<RemoteSiteLogin>, OpenGrokError> {
         let response = self
@@ -6924,6 +6941,62 @@ mod tests {
         let cat = client.list_models().await.unwrap();
         assert_eq!(cat.models.len(), 2);
         assert_eq!(cat.models[0].id, "xai/grok-4.6@sub");
+    }
+
+    /// The account's time zone reads as opengrok-server PR #322 (new-bot-default, not yet on
+    /// main) writes it on `GET /account`: left out by a server that keeps none, `null` until
+    /// set, and the zone once set. `PUT /account` sends `{timeZone}` alone, and reads the account
+    /// it is answered with; a zone the server's database does not know is refused with a 422 in
+    /// its words, as the branch's recording has them.
+    #[tokio::test]
+    async fn the_time_zone_is_read_off_the_account_and_put_alone() {
+        let read = |zone: Option<serde_json::Value>| -> Account {
+            let mut body = json!({
+                "id": "acct_1", "email": "ada@example.com", "firstName": "Ada", "lastName": "",
+                "avatarUrl": null, "orgId": null, "verified": true, "enabled": true,
+                "isAdmin": false
+            });
+            if let Some(zone) = zone {
+                body["timeZone"] = zone;
+            }
+            serde_json::from_value(body).expect("an account")
+        };
+        assert_eq!(read(None).time_zone, None, "a server that keeps none");
+        assert_eq!(read(Some(serde_json::Value::Null)).time_zone, Some(None));
+        assert_eq!(
+            read(Some(json!("Europe/London"))).time_zone,
+            Some(Some("Europe/London".to_string()))
+        );
+
+        let said = "\"Mars/Olympus_Mons\" is not an IANA time zone this server knows; send one \
+                    like \"Europe/London\"";
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/account"))
+            .and(body_json(json!({"timeZone": "Asia/Manila"})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "acct_1", "email": "ada@example.com", "firstName": "Ada",
+                "lastName": "", "avatarUrl": null, "orgId": null, "verified": true,
+                "enabled": true, "timeZone": "Asia/Manila", "isAdmin": false
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/account"))
+            .and(body_json(json!({"timeZone": "Mars/Olympus_Mons"})))
+            .respond_with(ResponseTemplate::new(422).set_body_json(json!({ "error": said })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        let kept = client.set_time_zone("Asia/Manila").await.unwrap();
+        assert_eq!(kept.time_zone, Some(Some("Asia/Manila".to_string())));
+        let refused = client.set_time_zone("Mars/Olympus_Mons").await.unwrap_err();
+        assert_eq!(
+            (refused.status, refused.message.as_str(), refused.failure()),
+            (Some(422), said, Failure::Verdict)
+        );
     }
 
     /// The account's setting as the contract writes it: `GET` reads it, and a change is one

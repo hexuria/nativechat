@@ -251,7 +251,7 @@ pub struct InferenceSource {
 
 /// A key that is there, `null` or not: `Some(None)` for `null` and `Some(Some(_))` for a value,
 /// so the field's default, `None`, is the key left out.
-fn keyed<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+pub(super) fn keyed<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
 where
     D: serde::Deserializer<'de>,
     T: Deserialize<'de>,

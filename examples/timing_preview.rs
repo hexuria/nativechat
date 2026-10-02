@@ -58,6 +58,7 @@ fn fixture() -> AppState {
         verified: true,
         enabled: true,
         is_admin: None,
+        time_zone: None,
     });
     state.show_turn_timing = true;
     state.sidebar_hidden = true;
