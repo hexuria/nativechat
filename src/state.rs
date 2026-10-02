@@ -24556,6 +24556,135 @@ mod tests {
             .expect("the bubble")
     }
 
+    /// A frame of the running turn, landed the way `send_opengrok_turn_with`'s stream lands it:
+    /// folded into the turn's assembler, then written into the row the turn was started with,
+    /// found by its name, unless the turn has been settled or replaced since.
+    fn stream_into(state: &mut AppState, assembler: &mut TurnAssembler, frame: serde_json::Value) {
+        let LiveTurn {
+            run_id, message_id, ..
+        } = in_flight();
+        assembler.push_event(&frame);
+        let (plain, parts) = assembler.snapshot();
+        if !state.turn_is_unsettled("cw_1", &run_id) {
+            return;
+        }
+        if let Some(message) = streaming_message_mut(&mut state.conversations, "cw_1", &message_id)
+        {
+            message.content = plain;
+            message.parts = parts;
+        }
+    }
+
+    /// A message sent while the turn runs, held the way `SendPlan::Queue` holds it: its bubble
+    /// goes on the end of the thread, and its hold into the queue.
+    fn hold_a_send(state: &mut AppState, id: &str, words: &str) {
+        assert!(state.would_queue(false), "a send now waits for the turn");
+        state.conversations[0]
+            .messages
+            .push(message(id, true, words));
+        state.enqueue_hold(
+            "cw_1".to_string(),
+            super::held_message(id.to_string(), words.to_string(), None, None, None),
+        );
+    }
+
+    /// The bug the person reported: a message sent while a reply was streaming was held, as it
+    /// should be, and from that moment the reply stood still on screen with "is working" still
+    /// lit, until the run ended and the whole of it landed at once. The thread had every word
+    /// all along; what stopped was the transcript looking at the row they went into, because that
+    /// row was no longer the last one. Taking the held message back to the composer and sending
+    /// it again, or cancelling it, leaves a bubble under the reply too, shown or hidden, and the
+    /// reply has to keep coming through each of those as well.
+    #[test]
+    fn a_reply_goes_on_streaming_while_a_message_is_held_under_it() {
+        use crate::components::chat::ShownFeed;
+        let mut state = mid_turn(at(message("m_live", false, ""), 20));
+        let mut assembler = TurnAssembler::default();
+        let mut screen = ShownFeed::of(&state);
+        let words = |delta: &str| json!({ "type": "TEXT_MESSAGE_CONTENT", "messageId": "msg_1", "delta": delta });
+        let reply_on_screen = |screen: &ShownFeed| -> String {
+            screen
+                .words()
+                .into_iter()
+                .filter(|(id, _, _)| id == "m_live")
+                .map(|(_, said, _)| said)
+                .collect()
+        };
+        for frame in [
+            json!({ "type": "RUN_STARTED", "threadId": "cw_1", "runId": "run_1" }),
+            json!({ "type": "TEXT_MESSAGE_START", "messageId": "msg_1", "role": "assistant" }),
+            words("The draft, humanized: "),
+        ] {
+            stream_into(&mut state, &mut assembler, frame);
+            screen.observe(&state);
+        }
+        assert_eq!(reply_on_screen(&screen), "The draft, humanized: ");
+
+        // Sent mid-stream, it waits for the turn, under the reply it arrived during.
+        hold_a_send(&mut state, "m_held", "make it shorter");
+        screen.observe(&state);
+        let row = |id: &str, said: &str, queued: bool| (id.to_string(), said.to_string(), queued);
+        assert_eq!(
+            screen.words(),
+            [
+                row("m_ask", "open youtube", false),
+                row("m_live", "The draft, humanized: ", false),
+                row("m_held", "make it shorter", true),
+            ],
+            "the held bubble sits under the reply and says it is queued"
+        );
+
+        stream_into(&mut state, &mut assembler, words("first line"));
+        screen.observe(&state);
+        assert_eq!(
+            bubble(&state, "m_live").content,
+            "The draft, humanized: first line",
+            "the thread has the words"
+        );
+        assert_eq!(
+            reply_on_screen(&screen),
+            "The draft, humanized: first line",
+            "and the screen shows them while the run is still going"
+        );
+
+        // Edit: the hold goes back to the composer and its bubble is hidden where it stood. Sent
+        // again, the words are a new bubble on the end, in the hold's old place in the queue.
+        let refill = state
+            .take_hold_for_edit("m_held", "")
+            .expect("the hold comes off");
+        state.hide_message_in_memory("m_held");
+        hold_a_send(&mut state, "m_again", &format!("{} please", refill.content));
+        screen.observe(&state);
+        stream_into(&mut state, &mut assembler, words(", second line"));
+        screen.observe(&state);
+        assert_eq!(
+            reply_on_screen(&screen),
+            "The draft, humanized: first line, second line",
+            "an edited send is held under the reply as well, and the reply keeps coming"
+        );
+        assert_eq!(
+            screen.words().last(),
+            Some(&row("m_again", "make it shorter please", true))
+        );
+
+        // Cancel: the hold comes off and its bubble is hidden, still the last thing in the
+        // thread, and the reply goes on arriving above it.
+        state.hide_message_in_memory("m_again");
+        assert!(!state.is_send_queued("m_again"));
+        screen.observe(&state);
+        stream_into(&mut state, &mut assembler, words(", third line"));
+        screen.observe(&state);
+        assert_eq!(
+            reply_on_screen(&screen),
+            "The draft, humanized: first line, second line, third line",
+            "a cancelled send leaves the reply streaming"
+        );
+        assert!(
+            state.is_active_bot_responding(),
+            "all of it before the run ended"
+        );
+    }
+
     /// Cancel and Delete both go through `delete_message`: the hold comes off in the same call
     /// that hides the bubble, so the pill drops and going idle has nothing to post.
     #[test]

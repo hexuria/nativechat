@@ -45,8 +45,14 @@ struct ChatFeedRev {
     /// the feed would decide nothing had changed and leave the bubble on screen.
     hidden_count: usize,
     last_id: Option<String>,
-    last_len: usize,
-    last_ui: usize,
+    /// How much each row holds: its words, its parts, and the output under its approval cards.
+    /// Every row's, not the last one's, because the row a run is painting into is not always
+    /// last. A message sent while the reply streams is held on the end of the thread, under it,
+    /// and something stays there when that message is edited (a new bubble on the end) or
+    /// cancelled (hidden, not removed). Read off the last row alone, the reply stood still on
+    /// screen from the moment a message was held, "working" still lit, and landed whole only
+    /// when the run's clock changed at its end.
+    bodies: Vec<(usize, usize, usize)>,
     form_picks: Vec<(String, String, String)>,
     /// A card put away with its ✕ changes nothing else here: the thread and its parts stay
     /// as they were, so without this the card would keep asking.
@@ -72,7 +78,6 @@ struct ChatFeedRev {
     reply_to: Option<String>,
     emoji_for: Option<String>,
     approvals: Vec<(String, String)>,
-    last_output: usize,
     expanded_output: Vec<String>,
     /// How much the thread's steps and thoughts hold, and how many steps have come back. A
     /// step's arguments and result arrive into a part that is already there, so the part count
@@ -107,8 +112,26 @@ impl ChatFeedRev {
                 .map(|c| c.messages.iter().filter(|m| m.hidden).count())
                 .unwrap_or(0),
             last_id: last.map(|m| m.id.clone()),
-            last_len: last.map(|m| m.content.len()).unwrap_or(0),
-            last_ui: last.map(|m| m.parts.len()).unwrap_or(0),
+            bodies: conv
+                .map(|c| {
+                    c.messages
+                        .iter()
+                        .map(|m| {
+                            let output = m
+                                .parts
+                                .iter()
+                                .map(|part| match part {
+                                    ChatPart::Approval(spec) => {
+                                        spec.output.as_ref().map_or(0, String::len)
+                                    }
+                                    _ => 0,
+                                })
+                                .sum();
+                            (m.content.len(), m.parts.len(), output)
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
             form_picks: {
                 let mut picks: Vec<(String, String, String)> = state
                     .form_picks
@@ -254,19 +277,6 @@ impl ChatFeedRev {
                 pairs.sort();
                 pairs
             },
-            last_output: last
-                .map(|msg| {
-                    msg.parts
-                        .iter()
-                        .map(|part| match part {
-                            ChatPart::Approval(spec) => {
-                                spec.output.as_ref().map(String::len).unwrap_or(0)
-                            }
-                            _ => 0,
-                        })
-                        .sum()
-                })
-                .unwrap_or(0),
             expanded_output: {
                 let mut ids: Vec<String> = state.expanded_shell_output.iter().cloned().collect();
                 ids.sort();
@@ -688,6 +698,45 @@ fn snapshot_rows(state: &AppState) -> Arc<Vec<ChatRow>> {
         }
     }
     Arc::new(rows)
+}
+
+/// The rows the transcript is showing, kept the way `ChatTranscript`'s observer keeps them, for
+/// a test that drives a thread from `state.rs`: taken again from the state only when
+/// [`ChatFeedRev`] has moved. That rule decides what reaches the screen, so a change the
+/// fingerprint does not see is one the person never sees, however true it is in the state.
+#[cfg(test)]
+pub(crate) struct ShownFeed {
+    rev: ChatFeedRev,
+    rows: Arc<Vec<ChatRow>>,
+}
+
+#[cfg(test)]
+impl ShownFeed {
+    pub(crate) fn of(state: &AppState) -> Self {
+        Self {
+            rev: ChatFeedRev::from_state(state),
+            rows: snapshot_rows(state),
+        }
+    }
+
+    /// The state notified: the observer either returns early or takes the rows again.
+    pub(crate) fn observe(&mut self, state: &AppState) {
+        let rev = ChatFeedRev::from_state(state);
+        if rev != self.rev {
+            self.rev = rev;
+            self.rows = snapshot_rows(state);
+        }
+    }
+
+    /// The words on screen, one entry per row that has any: whose message the row is, what it
+    /// says, and whether it wears the queued line.
+    pub(crate) fn words(&self) -> Vec<(String, String, bool)> {
+        self.rows
+            .iter()
+            .filter(|row| !row.content.is_empty())
+            .map(|row| (row.source_id.clone(), row.content.to_string(), row.queued))
+            .collect()
+    }
 }
 
 #[derive(Clone)]
