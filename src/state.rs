@@ -4373,6 +4373,12 @@ pub struct AppState {
     /// The files on the draft, as (name, `uploading` / `ready` / `failed`), published by the
     /// composer for a driver like its chips.
     pub composer_files: Vec<(String, &'static str)>,
+    /// Whether the transcript keeps its newest row in view, as the transcript publishes it.
+    ///
+    /// The list lives in the transcript's own view and nothing outside that view can read it.
+    /// A driver is handed this state and nothing else, and this is what lets it scroll up and
+    /// see that the transcript let go of the newest row, and stayed let go.
+    pub transcript_following: bool,
     /// Files a driver asked the composer to attach, by path: the OS picker is not something a
     /// driver can work, so it hands the composer the paths it would have picked.
     pub attach_requests: Vec<std::path::PathBuf>,
@@ -5101,6 +5107,8 @@ impl AppState {
             active_recipe: None,
             active_skill: None,
             composer_files: Vec::new(),
+            // A thread opens at its newest row.
+            transcript_following: true,
             attach_requests: Vec::new(),
             detach_requests: Vec::new(),
             composer_chips: Vec::new(),
@@ -11026,6 +11034,13 @@ impl AppState {
     pub fn request_attach(&mut self, path: std::path::PathBuf, cx: &mut Context<Self>) {
         self.attach_requests.push(path);
         cx.notify();
+    }
+
+    /// Say whether the transcript follows its newest row, for a driver: the list is the
+    /// transcript's own. Nothing on screen reads this, so it notifies nobody, and a scroll
+    /// gesture does not redraw the whole window.
+    pub fn set_transcript_following(&mut self, following: bool) {
+        self.transcript_following = following;
     }
 
     /// Say which chips the draft holds, for a driver: the field is the composer's own.

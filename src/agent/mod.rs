@@ -9,6 +9,12 @@
 //! `composer`, `composer-panel`, `composer-panel-search`, `composer-recipe-bar`,
 //! `composer-skill` (the skill the next message is sent with, value = the id the turn names;
 //! in the tree only while one is on the draft),
+//! `transcript` (the chat's transcript, a scroll node: value `following` while it keeps the
+//! newest row in view, `detached` once the person has scrolled back up. Any step toward older
+//! messages detaches it, however small, and only the person makes it follow again: a step to
+//! the very bottom, a drag of the scrollbar to its end, Jump to latest, or a message of their
+//! own. No op scrolls it: gpui-agent has no scroll op and this host no scroll invoke, so a live
+//! check scrolls with the trackpad or the wheel and asserts the value),
 //! `image-thumb-{n}`, `lightbox`, `user-form-{key}`, `user-form-field-{key}-{id}`,
 //! `user-form-continue-{key}`, `user-form-dismiss-{key}`, `user-form-screen-{key}`,
 //! `user-form-pill-{key}`, `computer-handoff-{key}`,
