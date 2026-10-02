@@ -412,9 +412,12 @@
 //! computer by Save, the key in the Keychain, and never sent to the server.
 //!
 //! `reply-source-{messageId}` is the badge of each reply in the open thread that wears one, as the
-//! feed draws it (label `paid key` / `your plan` / `your plan · Mac`, with ` ⚡` after it where the
-//! model that answered is a fast twin; value = the door, state `via-mac` on one the person's Mac
-//! answered), holding `reply-source-model-{messageId}` (label = the model
+//! feed draws it (label `paid key` / `paid key · relay off` / `your plan` / `your plan · Mac`, with
+//! ` ⚡` after it where the model that answered is a fast twin; value = the door, state `via-mac`
+//! on one the person's Mac answered, and `relay-off` on one the server's keys answered because the
+//! relay is off, as the run's frame says in `fallbackFor: "relay_disabled"` (opengrok-server
+//! relay-off fallback contract, agreed 2026-10-03, not yet built)), holding
+//! `reply-source-model-{messageId}` (label = the model
 //! the server named, which the badge shows on hover) when it named one. A reply whose run
 //! ended because the person's plan could not answer (a `RUN_ERROR` code: the relay's, where the
 //! Mac could not, or `plan_unavailable`, where the person's own setting left the plan nothing to

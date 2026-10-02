@@ -37,7 +37,7 @@ pub use gen_ui::{
     persons_messages, place_hitl_cards_in_document_order, policy_answer,
 };
 pub use inference::{
-    DEFAULT_PROXY_URL, HELD_FOR_RELAY_OFFLINE, INFERENCE_SOURCE_CUSTOM, InferenceKind,
+    DEFAULT_PROXY_URL, FallbackFor, HELD_FOR_RELAY_OFFLINE, INFERENCE_SOURCE_CUSTOM, InferenceKind,
     InferenceSource, InferenceSourceUpdate, NewBotDefault, PlanFallback, RelayRead, ReplySource,
     RunErrorCode, TurnSource, Via, is_loopback, is_subscription_model,
 };

@@ -69,8 +69,8 @@ use super::gen_ui::{
     is_ui_tool,
 };
 use super::inference::{
-    INFERENCE_SOURCE_CUSTOM, InferenceKind, InferenceSource, RunErrorCode, TurnSource, Via,
-    is_subscription_model,
+    FallbackFor, INFERENCE_SOURCE_CUSTOM, InferenceKind, InferenceSource, RunErrorCode, TurnSource,
+    Via, is_subscription_model,
 };
 use super::pending::{
     CUSTOM_NAME as PENDING_CUSTOM, PendingCustom, PendingList, PendingMutation, PendingOp,
@@ -1864,6 +1864,16 @@ fn inference_source_frame(frame: &Value) -> Check {
     must!(
         source.via == via,
         "the badge should say the way as sent: {source:?} from {value}"
+    );
+    // Why the server's keys answered (opengrok-server relay-off fallback contract, agreed
+    // 2026-10-03, not yet built): as sent on the gateway's badge, when it is a reason this app
+    // knows.
+    let fallback_for = opt_str(value, "fallbackFor")
+        .and_then(FallbackFor::from_word)
+        .filter(|_| source.kind == InferenceKind::Gateway);
+    must!(
+        source.fallback_for == fallback_for,
+        "the badge should say why the server's keys answered as sent: {source:?} from {value}"
     );
     Ok(())
 }
@@ -6153,6 +6163,28 @@ fn a_replys_way_is_read_beyond_the_recording() {
         inference_source_frame(&frame(value.clone()))
             .unwrap_or_else(|why| panic!("{value}: {why}"));
     }
+}
+
+/// The CUSTOM frame's reason for a reply on the server's keys, fed a frame written as the agreed
+/// contract writes it, which no recording holds yet (opengrok-server relay-off fallback contract,
+/// agreed 2026-10-03, not yet built): `fallbackFor: "relay_disabled"` is read as sent, and the
+/// reply's badge says the relay was off.
+#[test]
+fn a_replys_fallback_is_read_beyond_the_recording() {
+    use serde_json::json;
+    let frame = json!({
+        "type": "CUSTOM", "name": INFERENCE_SOURCE_CUSTOM,
+        "value": {"kind": "gateway", "model": "oag/cheap", "fallbackFor": "relay_disabled"}
+    });
+    inference_source_frame(&frame).unwrap_or_else(|why| panic!("{frame}: {why}"));
+    let assembler = assembled(&[&frame]);
+    let source = assembler
+        .reply_source()
+        .expect("the frame gives the reply its badge");
+    assert_eq!(
+        crate::components::reply_source::badge_words(source),
+        "paid key · relay off"
+    );
 }
 
 /// This Mac's answers, read beyond the ones the server's recording holds (a 204, a 401, a 404 and

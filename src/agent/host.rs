@@ -4080,6 +4080,10 @@ impl NativeChatHost {
             if source.via == Some(crate::opengrok::Via::Mac) {
                 node.states.push(VIA_MAC.into());
             }
+            // The server's keys answered a Bot on the person's plan because the relay is off.
+            if source.relay_off() {
+                node.states.push("relay-off".into());
+            }
             if let Some(model) = &source.model {
                 node = node.with_child(UiNode::status(
                     ids::reply_badge_model(message_id),
@@ -14822,6 +14826,67 @@ mod tests {
         assert_eq!(host.reply_source.settings.relay_key_draft, None);
     }
 
+    /// A reply the server's paid keys answered because the relay is off wears its badge on the
+    /// tree as the feed draws it: `paid key · relay off`, valued by its door, with state
+    /// `relay-off`.
+    #[test]
+    fn a_reply_answered_because_the_relay_is_off_says_so_on_the_tree() {
+        use crate::opengrok::ReplySource;
+        let mut state = AppState::new();
+        state.auth_status = crate::state::AuthStatus::SignedIn;
+        state.account = Some(
+            serde_json::from_value(serde_json::json!({ "id": "acct_1", "email": "a@b.c" }))
+                .unwrap(),
+        );
+        state.coworkers = vec![
+            serde_json::from_value(serde_json::json!({ "id": "cw_1", "name": "Ada" })).unwrap(),
+        ];
+        state.active_coworker_id = Some("cw_1".into());
+        state.active_conversation_id = Some("cw_1".into());
+        let source = ReplySource::from_event(&serde_json::json!({
+            "type": "CUSTOM", "name": "opengrok.inferenceSource",
+            "value": {"kind": "gateway", "model": "oag/cheap", "fallbackFor": "relay_disabled"}
+        }));
+        state.conversations.push(crate::state::Conversation {
+            id: "cw_1".into(),
+            title: "Ada".into(),
+            created_at: String::new(),
+            updated_at: String::new(),
+            messages: vec![crate::state::Message {
+                id: "m_1".into(),
+                sender: "AI".into(),
+                content: "Here it is.".into(),
+                sent_at: std::time::SystemTime::UNIX_EPOCH,
+                finished_at: None,
+                run_timing: None,
+                reply_source: source,
+                is_me: false,
+                reply_preview: None,
+                reply_to_id: None,
+                reply_is_me: false,
+                parts: Vec::new(),
+                run_id: None,
+                hidden: false,
+            }],
+            unread_count: 0,
+            origin: None,
+        });
+        let tree = NativeChatHost::from_app(&state).snapshot();
+        let badge = tree.find(&ids::reply_badge("m_1")).unwrap();
+        assert_eq!(
+            (
+                badge.name.as_str(),
+                badge.value.as_deref(),
+                badge.states.as_slice()
+            ),
+            (
+                "paid key · relay off",
+                Some("gateway"),
+                &["relay-off".to_string()][..]
+            )
+        );
+    }
+
     /// Each reply's badge is on the tree as the feed draws it: under a reply with words, and not
     /// under one that said nothing but its status line.
     #[test]
@@ -14856,6 +14921,7 @@ mod tests {
                 kind,
                 model: Some("gpt-5-codex".into()),
                 via: None,
+                fallback_for: None,
             }),
             is_me: false,
             reply_preview: None,

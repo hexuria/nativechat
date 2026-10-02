@@ -424,10 +424,30 @@ pub struct InferenceSourceUpdate {
     pub plan_fallback: Option<Option<PlanFallback>>,
 }
 
+/// Why a reply came through the server's paid keys and not the door its Bot asks for, as the
+/// run's `opengrok.inferenceSource` CUSTOM says in `fallbackFor` (opengrok-server relay-off
+/// fallback contract, agreed 2026-10-03, not yet built). The one reason this app knows is
+/// `relay_disabled`: a Bot on the person's plan answered by the account's Relay-off fallback,
+/// because the relay is off. A word this app has not heard of is no reason it can name, and the
+/// badge says only whose keys paid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FallbackFor {
+    RelayDisabled,
+}
+
+impl FallbackFor {
+    /// The reason a wire word names, or `None` for one this app has not heard of.
+    pub fn from_word(word: &str) -> Option<Self> {
+        (word == "relay_disabled").then_some(Self::RelayDisabled)
+    }
+}
+
 /// Which door one reply came through, as the run's `opengrok.inferenceSource` CUSTOM says:
-/// `value {"kind", "model"}`, and from a server with the Mac relay `{"kind", "via", "model"}`.
-/// It is what the reply's badge shows, live and when the thread is read back, and what the
-/// reply's row keeps on disk (the same JSON column, so a `via` needs no migration).
+/// `value {"kind", "model"}`, and from a server with the Mac relay `{"kind", "via", "model"}`,
+/// and `fallbackFor` beside them on a reply the Relay-off fallback answered. It is what the
+/// reply's badge shows, live and when the thread is read back, and what the reply's row keeps on
+/// disk (the same JSON column, so a `via` or a `fallbackFor` needs no migration).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReplySource {
     pub kind: InferenceKind,
@@ -439,6 +459,14 @@ pub struct ReplySource {
     /// The model that answered, when the server named one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Why the server's paid keys answered, when the frame named a reason this app knows
+    /// ([`FallbackFor`]). Only ever on the gateway's.
+    #[serde(
+        default,
+        rename = "fallbackFor",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub fallback_for: Option<FallbackFor>,
 }
 
 impl ReplySource {
@@ -453,8 +481,9 @@ impl ReplySource {
         Self::from_value(event.get("value")?)
     }
 
-    /// `{"kind", "via"?, "model"}`, as the frame's `value` and a saved row both hold it. A way
-    /// this app cannot name leaves the badge saying only whose it was.
+    /// `{"kind", "via"?, "model", "fallbackFor"?}`, as the frame's `value` and a saved row both
+    /// hold it. A way this app cannot name, or a reason, leaves the badge saying only whose it
+    /// was: each is read only where it is a word this app knows, on the door it can be on.
     pub fn from_value(value: &Value) -> Option<Self> {
         let kind = InferenceKind::from_word(value.get("kind")?.as_str()?)?;
         let via = value
@@ -468,7 +497,22 @@ impl ReplySource {
             .map(str::trim)
             .filter(|model| !model.is_empty())
             .map(str::to_string);
-        Some(Self { kind, via, model })
+        let fallback_for = value
+            .get("fallbackFor")
+            .and_then(Value::as_str)
+            .and_then(FallbackFor::from_word)
+            .filter(|_| kind == InferenceKind::Gateway);
+        Some(Self {
+            kind,
+            via,
+            model,
+            fallback_for,
+        })
+    }
+
+    /// The server's paid keys answered a Bot on the person's plan because the relay is off.
+    pub fn relay_off(&self) -> bool {
+        self.fallback_for == Some(FallbackFor::RelayDisabled)
     }
 
     /// As a reply's row keeps it in sqlite.
@@ -724,6 +768,7 @@ mod tests {
                 kind: InferenceKind::LocalProxy,
                 model: Some("gpt-5-codex".into()),
                 via: None,
+                fallback_for: None,
             })
         );
         assert_eq!(
@@ -732,6 +777,7 @@ mod tests {
                 kind: InferenceKind::Gateway,
                 model: None,
                 via: None,
+                fallback_for: None,
             })
         );
         assert_eq!(
@@ -740,6 +786,7 @@ mod tests {
                 kind: InferenceKind::Gateway,
                 model: None,
                 via: None,
+                fallback_for: None,
             })
         );
         assert_eq!(
@@ -765,12 +812,14 @@ mod tests {
             kind: InferenceKind::LocalProxy,
             model: Some("grok-4".into()),
             via: None,
+            fallback_for: None,
         };
         assert_eq!(ReplySource::from_json(&source.to_json()), Some(source));
         let bare = ReplySource {
             kind: InferenceKind::Gateway,
             model: None,
             via: None,
+            fallback_for: None,
         };
         assert_eq!(bare.to_json(), r#"{"kind":"gateway"}"#);
         assert_eq!(ReplySource::from_json(&bare.to_json()), Some(bare));
@@ -781,6 +830,7 @@ mod tests {
             kind: InferenceKind::LocalProxy,
             via: Some(Via::Mac),
             model: Some("gpt-5-codex".into()),
+            fallback_for: None,
         };
         assert_eq!(
             mac.to_json(),
@@ -1182,6 +1232,7 @@ mod tests {
                 kind: InferenceKind::LocalProxy,
                 via: Some(Via::Mac),
                 model: Some("gpt-5-codex".into()),
+                fallback_for: None,
             })
         );
         for (value, via) in [

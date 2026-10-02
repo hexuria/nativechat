@@ -2469,6 +2469,7 @@ mod tests {
                 kind: InferenceKind::LocalProxy,
                 model: Some("gpt-5-codex".into()),
                 via: None,
+                fallback_for: None,
             }),
             "on the reply before a word of it has come"
         );
@@ -2537,6 +2538,7 @@ mod tests {
                 kind: InferenceKind::LocalProxy,
                 model: Some("gpt-5.5".into()),
                 via: None,
+                fallback_for: None,
             })
         );
         assert_eq!(

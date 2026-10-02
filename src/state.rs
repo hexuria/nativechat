@@ -24601,6 +24601,7 @@ mod tests {
             kind: InferenceKind::LocalProxy,
             model: Some("gpt-5-codex".into()),
             via: None,
+            fallback_for: None,
         };
         let target = super::followed_bubble(&live_turns, Some("cw_1"), "run_old");
         assert_eq!(target, None, "the live turn is another run's");
@@ -37983,6 +37984,7 @@ mod tests {
             kind: InferenceKind::LocalProxy,
             model: Some("gpt-5-codex".into()),
             via: None,
+            fallback_for: None,
         };
         let (plain, _, source) = super::replayed_run(&events, "finished");
         assert_eq!((plain.as_str(), source.as_ref()), ("Done.", Some(&badge)));
@@ -38020,6 +38022,7 @@ mod tests {
             kind: InferenceKind::Gateway,
             model: Some("oag/cheap".into()),
             via: None,
+            fallback_for: None,
         });
         keep_reply(
             &db,
@@ -38085,6 +38088,7 @@ mod tests {
             kind: InferenceKind::LocalProxy,
             model: Some("gpt-5-codex".into()),
             via: None,
+            fallback_for: None,
         };
         let frames = [
             json!({"type": "RUN_STARTED", "runId": "run_1", "threadId": "cw_1"}),
@@ -38177,11 +38181,13 @@ mod tests {
             kind: InferenceKind::LocalProxy,
             model: Some("gpt-5-codex".into()),
             via: None,
+            fallback_for: None,
         };
         let paid = ReplySource {
             kind: InferenceKind::Gateway,
             model: Some("oag/cheap".into()),
             via: None,
+            fallback_for: None,
         };
         // As a replay opens a run: the person's own message first, then the frame that says
         // which door the run went through.
@@ -38278,6 +38284,7 @@ mod tests {
             kind: InferenceKind::LocalProxy,
             model: Some("gpt-5-codex".into()),
             via: None,
+            fallback_for: None,
         });
         let write = |run: &'static str, stamp: SaveStamp| {
             let db = db.clone();
@@ -38311,6 +38318,7 @@ mod tests {
             kind: InferenceKind::Gateway,
             model: Some("oag/cheap".into()),
             via: None,
+            fallback_for: None,
         };
         let mut known = reply.save_stamp();
         known.source_json = Some(gateway.to_json());
@@ -38328,6 +38336,7 @@ mod tests {
             kind: InferenceKind::LocalProxy,
             model: Some("gpt-5-codex".into()),
             via: None,
+            fallback_for: None,
         };
         let journal = |run: &str, source: Option<serde_json::Value>| {
             let mut events = vec![json!({"type": "RUN_STARTED", "runId": run, "threadId": "cw_1"})];
