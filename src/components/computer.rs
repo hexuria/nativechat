@@ -515,100 +515,14 @@ impl ComputerPane {
                 .px(px(16.))
                 .py(px(12.))
                 .gap(px(16.))
-                .child(
-                    h_flex()
-                        .w_full()
-                        .gap(px(8.))
-                        .items_center()
-                        .child(
-                            Switch::new("routine-active")
-                                .checked(active)
-                                // Says what the position means, so off reads as a state the
-                                // routine is in and not as a label the switch has lost.
-                                .label(if active { "Active" } else { "Paused" })
-                                .on_click({
-                                    let app = app.clone();
-                                    let coworker_id = coworker_id.clone();
-                                    let id = id.clone();
-                                    move |checked, _, cx| {
-                                        if let Some(id) = id.clone() {
-                                            app.update(cx, |state, cx| {
-                                                state.set_routine_active(
-                                                    &coworker_id,
-                                                    &id,
-                                                    *checked,
-                                                    cx,
-                                                );
-                                            });
-                                        }
-                                    }
-                                }),
-                        )
-                        .child(div().flex_1())
-                        .when(id.is_some(), |this| {
-                            this.child(
-                                Button::new(SharedString::from(format!(
-                                    "routine-{}-delete",
-                                    id.as_deref().unwrap_or_default()
-                                )))
-                                .ghost()
-                                .label("Delete")
-                                .on_click({
-                                    let app = app.clone();
-                                    let coworker_id = coworker_id.clone();
-                                    let id = id.clone();
-                                    move |_, _, cx| {
-                                        if let Some(id) = id.clone() {
-                                            app.update(cx, |state, cx| {
-                                                state.delete_routine(&coworker_id, &id, cx);
-                                            });
-                                        }
-                                    }
-                                }),
-                            )
-                        })
-                        // What the routine said each time it ran, and any card it is waiting on,
-                        // are in its own thread; only a routine the server has has one.
-                        .when(id.is_some() && !triggers.is_empty(), |this| {
-                            this.child(
-                                Button::new("routine-open-thread")
-                                    .ghost()
-                                    .label("Open thread")
-                                    .on_click({
-                                        let persist = persist.clone();
-                                        let app = app.clone();
-                                        let id = id.clone();
-                                        move |_, _, cx| {
-                                            persist(cx);
-                                            if let Some(id) = id.clone() {
-                                                app.update(cx, |state, cx| {
-                                                    state.open_routine_thread(&id, cx);
-                                                });
-                                            }
-                                        }
-                                    }),
-                            )
-                        })
-                        .child(
-                            Button::new("routine-test")
-                                .primary()
-                                .label("Test run")
-                                .on_click({
-                                    let persist = persist.clone();
-                                    let app = app.clone();
-                                    let coworker_id = coworker_id.clone();
-                                    let id = id.clone();
-                                    move |_, _, cx| {
-                                        persist(cx);
-                                        if let Some(id) = id.clone() {
-                                            app.update(cx, |state, cx| {
-                                                state.run_routine_now(&coworker_id, &id, cx);
-                                            });
-                                        }
-                                    }
-                                }),
-                        ),
-                )
+                .child(routine_actions(
+                    app.clone(),
+                    coworker_id.clone(),
+                    id.clone(),
+                    active,
+                    id.is_some() && !triggers.is_empty(),
+                    persist.clone(),
+                ))
                 .when_some(trouble, |this, trouble| {
                     this.child(
                         div()
@@ -793,6 +707,119 @@ impl ComputerPane {
                 ))
             })
     }
+}
+
+/// The space between the routine editor's controls, across and down alike.
+const ACTION_GAP: f32 = 8.;
+
+/// The routine editor's row of controls: the Active switch, then Delete, Open thread and Test
+/// run.
+///
+/// It wraps rather than running on past the pane's edge. On one line the four are wider than the
+/// pane, and Test run, the last of them, was the one cut off. The buttons keep together after the
+/// switch, beside it while they fit and under it once they do not, and wrap among themselves in
+/// turn, every gap the same across and down, so each control is whole at whatever width the pane
+/// is.
+fn routine_actions(
+    app: Entity<AppState>,
+    coworker_id: String,
+    id: Option<String>,
+    active: bool,
+    has_thread: bool,
+    persist: Rc<dyn Fn(&mut App)>,
+) -> impl IntoElement {
+    h_flex()
+        .debug_selector(|| "routine-actions".into())
+        .w_full()
+        .flex_wrap()
+        .justify_between()
+        .gap(px(ACTION_GAP))
+        .child(
+            div().debug_selector(|| "routine-active".into()).child(
+                Switch::new("routine-active")
+                    .checked(active)
+                    // Says what the position means, so off reads as a state the routine is in
+                    // and not as a label the switch has lost.
+                    .label(if active { "Active" } else { "Paused" })
+                    .on_click({
+                        let app = app.clone();
+                        let coworker_id = coworker_id.clone();
+                        let id = id.clone();
+                        move |checked, _, cx| {
+                            if let Some(id) = id.clone() {
+                                app.update(cx, |state, cx| {
+                                    state.set_routine_active(&coworker_id, &id, *checked, cx);
+                                });
+                            }
+                        }
+                    }),
+            ),
+        )
+        .child(
+            h_flex()
+                .flex_wrap()
+                .gap(px(ACTION_GAP))
+                .when(id.is_some(), |this| {
+                    this.child(
+                        Button::new(SharedString::from(format!(
+                            "routine-{}-delete",
+                            id.as_deref().unwrap_or_default()
+                        )))
+                        .debug_selector(|| "routine-delete".into())
+                        .ghost()
+                        .label("Delete")
+                        .on_click({
+                            let app = app.clone();
+                            let coworker_id = coworker_id.clone();
+                            let id = id.clone();
+                            move |_, _, cx| {
+                                if let Some(id) = id.clone() {
+                                    app.update(cx, |state, cx| {
+                                        state.delete_routine(&coworker_id, &id, cx);
+                                    });
+                                }
+                            }
+                        }),
+                    )
+                })
+                // What the routine said each time it ran, and any card it is waiting on, are in
+                // its own thread; only a routine the server has has one.
+                .when(has_thread, |this| {
+                    this.child(
+                        Button::new("routine-open-thread")
+                            .debug_selector(|| "routine-open-thread".into())
+                            .ghost()
+                            .label("Open thread")
+                            .on_click({
+                                let persist = persist.clone();
+                                let app = app.clone();
+                                let id = id.clone();
+                                move |_, _, cx| {
+                                    persist(cx);
+                                    if let Some(id) = id.clone() {
+                                        app.update(cx, |state, cx| {
+                                            state.open_routine_thread(&id, cx);
+                                        });
+                                    }
+                                }
+                            }),
+                    )
+                })
+                .child(
+                    Button::new("routine-test")
+                        .debug_selector(|| "routine-test".into())
+                        .primary()
+                        .label("Test run")
+                        .on_click(move |_, _, cx| {
+                            persist(cx);
+                            if let Some(id) = id.clone() {
+                                app.update(cx, |state, cx| {
+                                    state.run_routine_now(&coworker_id, &id, cx);
+                                });
+                            }
+                        }),
+                ),
+        )
 }
 
 /// What the Update, Reset and Get a computer controls need to know, read once per frame.
@@ -2281,5 +2308,91 @@ mod tests {
         let controls = ComputerControls::from_state(&state);
         assert_eq!(controls.no_computer, None);
         assert!(controls.present);
+    }
+
+    /// The routine editor's row of controls as the pane lays it out: as wide as the pane's
+    /// content, which is the pane less 16px either side.
+    struct ActionRow {
+        app: gpui_kit::Entity<AppState>,
+        active: bool,
+    }
+
+    impl gpui_kit::Render for ActionRow {
+        fn render(
+            &mut self,
+            _: &mut gpui_kit::Window,
+            _: &mut gpui_kit::Context<Self>,
+        ) -> impl gpui_kit::IntoElement {
+            use gpui_kit::{ParentElement as _, Styled as _};
+            gpui_kit::div()
+                .w(gpui_kit::px(crate::chrome::INFO_PANE_WIDTH - 32.))
+                .child(super::routine_actions(
+                    self.app.clone(),
+                    "cw_1".into(),
+                    Some("sch_1".into()),
+                    self.active,
+                    true,
+                    std::rc::Rc::new(|_| {}),
+                ))
+        }
+    }
+
+    /// Every one of the routine editor's controls is whole inside the pane, whichever way the
+    /// switch reads. On one line the four ran past the pane's edge and Test run, the last, was cut
+    /// off; now the buttons go under the switch together and wrap among themselves, every gap the
+    /// same across and down.
+    #[gpui_kit::test]
+    fn every_routine_control_is_whole_inside_the_pane(cx: &mut gpui_kit::TestAppContext) {
+        use gpui_kit::{AppContext as _, Bounds, Pixels, px};
+        cx.update(gpui_kit::init);
+        let gap = px(super::ACTION_GAP);
+        let close = |a: Pixels, b: Pixels| (a - b).abs() < px(0.5);
+        for active in [true, false] {
+            let (_, window) = cx.add_window_view(|_, cx| ActionRow {
+                app: cx.new(|_| AppState::new()),
+                active,
+            });
+            window.update(|window, cx| window.draw(cx).clear(cx));
+            let mut drawn = |id: &'static str| -> Bounds<Pixels> {
+                window
+                    .debug_bounds(id)
+                    .unwrap_or_else(|| panic!("{id} is not drawn"))
+            };
+            let row = drawn("routine-actions");
+            let controls = [
+                "routine-active",
+                "routine-delete",
+                "routine-open-thread",
+                "routine-test",
+            ]
+            .map(|id| (id, drawn(id)));
+            for (id, control) in &controls {
+                assert!(
+                    control.left() >= row.left() && control.right() <= row.right(),
+                    "{id} runs past the pane (switch {active}): {control:?} in {row:?}"
+                );
+            }
+            let switch = controls[0].1;
+            let delete = controls[1].1;
+            assert!(
+                close(delete.top() - switch.bottom(), gap),
+                "the buttons go under the switch, {gap:?} below it: {switch:?}, {delete:?}"
+            );
+            for pair in controls[1..].windows(2) {
+                let ((before_id, before), (after_id, after)) = (pair[0], pair[1]);
+                if close(after.top(), before.top()) {
+                    assert!(
+                        close(after.left() - before.right(), gap),
+                        "{before_id} and {after_id} are not {gap:?} apart: {before:?}, {after:?}"
+                    );
+                } else {
+                    assert!(
+                        close(after.top() - before.bottom(), gap)
+                            && close(after.left(), row.left()),
+                        "{after_id} does not wrap {gap:?} under {before_id}: {before:?}, {after:?}"
+                    );
+                }
+            }
+        }
     }
 }
