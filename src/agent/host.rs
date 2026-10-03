@@ -5595,7 +5595,7 @@ impl NativeChatHost {
                 .with_enabled(!card.switching),
             )
             .with_child(
-                UiNode::status(ids::computer_status(machine), card.state.words())
+                UiNode::status(ids::computer_status(machine), card.status_words())
                     .with_value(card.state.word()),
             );
         if let Some(note) = &card.note {
@@ -10411,6 +10411,7 @@ mod tests {
             relay_on: true,
             switching: false,
             state: computers::RelayState::NotRelaying,
+            tried: None,
             detail: None,
             note: None,
         }

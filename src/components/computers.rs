@@ -19,8 +19,9 @@
 //! This computer's card alone also holds what its relay needs of this computer: opencodex's address
 //! and its key, which Save keeps here, the key in its secure storage (the Keychain). The window still
 //! calls no model, and the key never goes to the server. The server starts every computer's relay on,
-//! so a computer offers to relay only once it has been given opencodex's address; until then its card
-//! says so, where it would say "Not relaying" alone.
+//! so this computer offers to relay only where opencodex answers (the relay asks it before it opens
+//! its stream); where it does not, its card says so, with the address it asked, where it would say
+//! "Not relaying" alone.
 //!
 //! The words and element ids live here so the gpui-agent tree (`agent/host.rs`) says what the
 //! window says and names what the window names.
@@ -54,9 +55,11 @@ pub(crate) const RELAYING: &str = "Relaying";
 /// The status line of a computer that does not relay: its switch is off, or it is on and the app is
 /// open on it but its stream is not up (yet).
 pub(crate) const NOT_RELAYING: &str = "Not relaying";
-/// The status line of this computer while its switch is on and it has no address for opencodex, which
-/// is why it does not offer to relay.
-pub(crate) const NEEDS_ADDRESS: &str = "Not relaying: set this computer's opencodex address";
+/// The status line of this computer while its relay is on and opencodex does not answer on it, which
+/// is why it does not offer to relay. The address that was asked follows in parentheses
+/// ([`ComputerCard::status_words`]).
+pub(crate) const OPENCODEX_SILENT: &str =
+    "Not relaying: opencodex isn't answering on this computer";
 /// The status line of a computer whose relay is on, which is not relaying, and which the server
 /// cannot reach: the app is not open on it, or the computer is asleep.
 pub(crate) const ON_BUT_ASLEEP: &str = "On, but asleep: it can't answer right now";
@@ -138,9 +141,9 @@ pub(crate) enum RelayState {
     /// Its switch is on, it is not relaying, and the server cannot reach it: asleep, or the app is
     /// not open on it.
     OnButAsleep,
-    /// This computer, with its switch on and no address for opencodex: it does not offer to relay
-    /// until it has one, and says so.
-    NeedsAddress,
+    /// This computer, with its switch on, whose opencodex does not answer: it does not offer to
+    /// relay until it does, and says so.
+    OpencodexSilent,
 }
 
 impl RelayState {
@@ -150,18 +153,18 @@ impl RelayState {
             Self::Relaying => RELAYING,
             Self::NotRelaying => NOT_RELAYING,
             Self::OnButAsleep => ON_BUT_ASLEEP,
-            Self::NeedsAddress => NEEDS_ADDRESS,
+            Self::OpencodexSilent => OPENCODEX_SILENT,
         }
     }
 
     /// The status line's word for a driver: `relaying`, `not-relaying`, `asleep` or
-    /// `needs-address`.
+    /// `opencodex-silent`.
     pub(crate) fn word(self) -> &'static str {
         match self {
             Self::Relaying => "relaying",
             Self::NotRelaying => "not-relaying",
             Self::OnButAsleep => "asleep",
-            Self::NeedsAddress => "needs-address",
+            Self::OpencodexSilent => "opencodex-silent",
         }
     }
 }
@@ -207,7 +210,8 @@ pub(crate) fn relay_detail(report: Option<&RelayReport>) -> Option<RelayDetail> 
             words: TAKE_BACK.to_string(),
             trouble: false,
         }),
-        RelayStatus::Answering | RelayStatus::Off => None,
+        // The status line says it, with the address that was tried.
+        RelayStatus::Answering | RelayStatus::Off | RelayStatus::OpencodexSilent(_) => None,
     }
 }
 
@@ -228,12 +232,28 @@ pub(crate) struct ComputerCard {
     /// The switch is with the server, and takes no click until it answers.
     pub switching: bool,
     pub state: RelayState,
+    /// The address opencodex did not answer on, while the state says so ([`ComputerCard::status_words`]).
+    pub tried: Option<String>,
     /// This computer's own relay's word on itself; never on another computer's card, which this
     /// app has no relay of.
     pub detail: Option<RelayDetail>,
     /// Under the switch: the server's words for a refusal, or that nobody knows whether a switch
     /// was kept.
     pub note: Option<String>,
+}
+
+impl ComputerCard {
+    /// The status line's words: the state's own, and where opencodex does not answer, the address
+    /// that was asked: "Not relaying: opencodex isn't answering on this computer
+    /// (http://127.0.0.1:8080)".
+    pub(crate) fn status_words(&self) -> String {
+        match (self.state, self.tried.as_deref()) {
+            (RelayState::OpencodexSilent, Some(address)) => {
+                format!("{} ({address})", RelayState::OpencodexSilent.words())
+            }
+            (state, _) => state.words().to_string(),
+        }
+    }
 }
 
 /// The cards, in the roster's order, which has this computer first.
@@ -251,14 +271,18 @@ pub(crate) fn cards(state: &AppState) -> Vec<ComputerCard> {
             let relaying = computer.relaying
                 || report.is_some_and(|report| report.status == RelayStatus::Answering);
             let online = computer.online || this;
-            // The server has this computer's relay on, and it will not offer to relay without an
-            // address for opencodex: its card says what it waits for, where it would say only
-            // "Not relaying".
-            let relay = match relay_state(relay_on, relaying, online) {
-                RelayState::NotRelaying if this && relay_on && state.relay_needs_address() => {
-                    RelayState::NeedsAddress
+            // The server has this computer's relay on, and its relay found no opencodex to answer
+            // with where it asked: the card says that, with the address it asked, where it would
+            // say "Not relaying" alone.
+            let silent = report.and_then(|report| match &report.status {
+                RelayStatus::OpencodexSilent(address) => Some(address.clone()),
+                _ => None,
+            });
+            let (relay, tried) = match (relay_state(relay_on, relaying, online), silent) {
+                (RelayState::NotRelaying, Some(address)) if relay_on => {
+                    (RelayState::OpencodexSilent, Some(address))
                 }
-                other => other,
+                (other, _) => (other, None),
             };
             ComputerCard {
                 machine_id: computer.machine_id.clone(),
@@ -269,6 +293,7 @@ pub(crate) fn cards(state: &AppState) -> Vec<ComputerCard> {
                 relay_on,
                 switching: switch.is_some(),
                 state: relay,
+                tried,
                 detail: relay_on.then(|| relay_detail(report)).flatten(),
                 note: state
                     .computer_relay_note(&computer.machine_id)
@@ -408,7 +433,7 @@ pub(crate) fn relay_section(
                 .when(card.state != RelayState::Relaying, |this| {
                     this.text_color(muted)
                 })
-                .child(card.state.words()),
+                .child(card.status_words()),
         )
         .when_some(detail, |this, detail| {
             this.child(
@@ -709,8 +734,8 @@ mod tests {
 
     /// The words the owner approved for a card, exactly: the section, the pill, the switch, and the
     /// three lines that say where a computer's relay stands, with the state a driver reads each as;
-    /// and the fourth, which a review asked for, that this computer says while it has no address
-    /// for opencodex and so does not offer to relay.
+    /// and the fourth, which a review asked for, that this computer says while its opencodex does
+    /// not answer and so does not offer to relay (the address it asked follows it on the card).
     #[test]
     fn the_cards_say_the_approved_words() {
         assert_eq!(SECTION_TITLE, "Your computers");
@@ -720,7 +745,7 @@ mod tests {
             RelayState::Relaying,
             RelayState::NotRelaying,
             RelayState::OnButAsleep,
-            RelayState::NeedsAddress,
+            RelayState::OpencodexSilent,
         ]
         .map(|state| (state.words(), state.word()))
         .into();
@@ -731,8 +756,8 @@ mod tests {
                 ("Not relaying", "not-relaying"),
                 ("On, but asleep: it can't answer right now", "asleep"),
                 (
-                    "Not relaying: set this computer's opencodex address",
-                    "needs-address"
+                    "Not relaying: opencodex isn't answering on this computer",
+                    "opencodex-silent"
                 ),
             ]
         );

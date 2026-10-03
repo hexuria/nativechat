@@ -342,7 +342,7 @@ pub struct ReplySourceSettings {
     /// What the page says about the last thing that did not go as asked, under Save.
     pub note: Option<ReplySourceNote>,
     /// This computer's opencodex address as typed and not saved; `None` shows the one kept here.
-    /// An emptied field forgets the one kept, and a computer with none does not offer to relay.
+    /// An emptied field goes back to where opencodex listens by default.
     pub relay_address_draft: Option<String>,
     /// A key for this computer's opencodex, typed and not kept. Save puts it in the Keychain and
     /// it leaves the page then, or when the page is left or the person signs out before a Save.
@@ -704,7 +704,7 @@ enum AfterChange {
 }
 
 /// What a Save keeps on this computer ([`ReplySourceSettings::take_changes_here`]): opencodex's
-/// address, `Some(None)` to forget it, and its key, `Some(None)` to forget it.
+/// address, `Some(None)` back to its default, and its key, `Some(None)` to forget it.
 #[derive(Debug, Default)]
 struct RelayChangesHere {
     address: Option<Option<String>>,
@@ -718,11 +718,12 @@ struct RelayChangesHere {
 /// address is this computer's pref; the key never leaves the Keychain but for the relay.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RelayMac {
-    /// opencodex's address as saved on this computer, or `None` while none has been given. A
-    /// computer offers to relay only with one ([`AppState::relay_wanted`]): the server starts
-    /// every computer's relay on, and one with no opencodex to answer with would be sent the plan's
-    /// turns and fail them.
+    /// opencodex's address as saved on this computer, or `None` for where it listens by default.
     pub address: Option<String>,
+    /// Where opencodex is looked for while no address is saved: `None` is where it listens by
+    /// default ([`crate::opengrok::DEFAULT_PROXY_URL`]). Nothing but a test sets it, so that none
+    /// asks the real `127.0.0.1:8080`.
+    pub default_address: Option<String>,
     /// The Keychain holds a key for this computer's opencodex.
     pub has_key: bool,
     /// The running relay's word on itself; `None` while it does not run.
@@ -746,12 +747,13 @@ fn relay_cannot_start(why: &str) -> RelayReport {
 }
 
 impl RelayMac {
-    /// What the opencodex address field shows while nothing is typed: the address saved on this
-    /// computer, and nothing while none is, with where opencodex listens by default as its
-    /// placeholder. "None given" is a state the field can be in, since a computer offers to relay
-    /// only once it has an address, and the default can be given as any other can.
+    /// The address the relay calls, and the field shows while nothing is typed: the one saved on
+    /// this computer, or where opencodex listens by default.
     pub fn shown_address(&self) -> String {
-        self.address.clone().unwrap_or_default()
+        self.address
+            .clone()
+            .or_else(|| self.default_address.clone())
+            .unwrap_or_else(|| crate::opengrok::DEFAULT_PROXY_URL.to_string())
     }
 }
 
@@ -8677,27 +8679,15 @@ impl AppState {
         self.local_exec_machine_id.is_some()
     }
 
-    /// The relay could be running here: somebody is signed in, this Mac is enrolled, and the
-    /// server knows the relay.
-    fn relay_possible(&self) -> bool {
-        self.is_signed_in() && self.relay_enrolled() && self.reply_source.knows_relay()
-    }
-
-    /// The relay should be running: it could, and this computer has been given opencodex's
-    /// address. The server starts every computer's relay on when it is enrolled
-    /// (`relay_enabled` defaults true, opengrok-server #342 (main 2136ffc)), so a computer with
-    /// no opencodex to answer with must not offer itself, or it would be sent the plan's turns
-    /// and fail them. Not whether this computer's switch is on: the server says so on the stream
+    /// The relay should be running: somebody is signed in, this Mac is enrolled, and the server
+    /// knows the relay. Not whether this computer's switch is on: the server says so on the stream
     /// (`disabled`, or a refusal of the stream with `relay_disabled`), and a relay it has switched
     /// off waits for its own row to read on again without opening the stream ([`RelayHandle`]).
+    /// Nor whether opencodex answers: the relay that runs asks it before it opens its stream, and
+    /// says so where it does not ([`RelayStatus::OpencodexSilent`]), so that a computer with no
+    /// opencodex does not offer to relay, though the server starts every computer's relay on.
     fn relay_wanted(&self) -> bool {
-        self.relay_possible() && self.relay_mac.address.is_some()
-    }
-
-    /// This computer could relay and does not, for want of an address for opencodex: what its card
-    /// asks the person for.
-    pub fn relay_needs_address(&self) -> bool {
-        self.relay_possible() && self.relay_mac.address.is_none()
+        self.is_signed_in() && self.relay_enrolled() && self.reply_source.knows_relay()
     }
 
     /// Start the relay where it should run and does not, and stop it where it runs and should
@@ -8873,11 +8863,9 @@ impl AppState {
         self.relay_mac.report = None;
     }
 
-    /// Where the relay calls opencodex: the address saved on this Mac, which it must be given
-    /// ([`Self::relay_wanted`]) and which can still be one this computer does not have, by a
-    /// preferences file written by hand.
+    /// Where the relay calls opencodex: the address saved on this Mac, or its default.
     fn relay_address(&self) -> Option<crate::opengrok::OpencodexAddress> {
-        crate::opengrok::OpencodexAddress::parse(self.relay_mac.address.as_deref()?).ok()
+        crate::opengrok::OpencodexAddress::parse(&self.relay_mac.shown_address()).ok()
     }
 
     /// This Mac's opencodex address as the field holds it now; it waits for Save. The one kept
@@ -37640,7 +37628,7 @@ mod tests {
 
     /// opencodex's address and key for the relay are this computer's: Save keeps them here and
     /// sends the server neither. An address that is not this computer is refused before Save, an
-    /// emptied one forgets the address kept, and a key typed and left behind with the page is
+    /// emptied one goes back to the default, and a key typed and left behind with the page is
     /// dropped and asked for again.
     #[test]
     fn this_computers_address_and_key_are_kept_here_and_never_sent() {
@@ -37650,10 +37638,7 @@ mod tests {
             &mut state,
             relay_kept(InferenceKind::Gateway, "loopback", None),
         );
-        assert!(
-            !state.note_relay_address(String::new()),
-            "the field as it shows while none is kept: no change"
-        );
+        assert!(!state.note_relay_address(crate::opengrok::DEFAULT_PROXY_URL.into()));
         assert!(state.note_relay_address("http://192.168.1.5:8080".into()));
         assert_eq!(state.reply_source_hint(), Some(RELAY_ADDRESS_NOT_HERE));
         assert!(!state.reply_source_can_save());
@@ -37693,7 +37678,7 @@ mod tests {
         let here = state.begin_reply_source_save().unwrap();
         assert_eq!(here.key, Some(None), "Save forgets it");
 
-        // An emptied address forgets the one kept.
+        // An emptied address goes back to the default.
         state.relay_mac.address = Some("http://127.0.0.1:9090".into());
         assert!(state.note_relay_address(String::new()));
         let here = state.begin_reply_source_save().unwrap();
@@ -39305,68 +39290,14 @@ mod tests {
         assert_eq!(puts, [json!({"timeZone": "Asia/Manila"})]);
     }
 
-    /// The server starts every computer a person enrols with its relay on, so a computer that has no
-    /// opencodex to answer with must not offer itself: the server would send it the plan's turns
-    /// and they would fail there (opengrok-server #342 (main 2136ffc): `relay_enabled` defaults
-    /// true on every `local_exec_daemon` row). The relay opens its stream only on a computer that
-    /// has been given opencodex's address; signed in and enrolled, on a server that knows the
-    /// relay, with none saved, `ensure_relay` starts nothing and says nothing of a relay, and the
-    /// address saved starts it, and forgotten stops it.
-    #[gpui_kit::test]
-    fn a_computer_with_no_opencodex_address_does_not_offer_to_relay(
-        cx: &mut gpui_kit::TestAppContext,
-    ) {
-        use crate::opengrok::MachineCredential;
-        use gpui_kit::AppContext as _;
-        let (_enrolled, enrolment) =
-            tokio::sync::watch::channel(Some(MachineCredential::new("mac_1", "tok_1")));
-        let app = cx.new(|_| signed_in_state());
-        app.update(cx, |state, cx| {
-            read_as(state, relay_kept(InferenceKind::Gateway, "loopback", None));
-            state.local_exec_enrolment = Some(enrolment);
-            state.local_exec_machine_id = Some("mac_1".into());
-            assert_eq!(state.relay_mac.address, None, "nothing given");
-
-            assert!(!state.relay_wanted(), "no address, no offer");
-            state.ensure_relay(cx);
-            assert!(
-                state.relay_starting.is_none()
-                    && state.relay_worker.is_none()
-                    && state.relay_mac.report.is_none(),
-                "no stream is opened, and the card has no relay to say anything of"
-            );
-
-            state.relay_mac.address = Some("http://127.0.0.1:8080".into());
-            assert!(state.relay_wanted(), "with one it offers");
-            state.ensure_relay(cx);
-            assert!(
-                state.relay_starting.is_some(),
-                "and starts to open its stream"
-            );
-            state.stop_relay();
-
-            // Saving an address is what starts it, and forgetting the address stops it.
-            state.relay_mac.address = None;
-            let keep =
-                |address: Option<Option<String>>| super::RelayChangesHere { address, key: None };
-            state.keep_changes_here(keep(Some(Some("http://127.0.0.1:9090".into()))), cx);
-            assert!(state.relay_starting.is_some(), "an address saved starts it");
-            state.keep_changes_here(keep(Some(None)), cx);
-            assert!(
-                state.relay_starting.is_none() && state.relay_worker.is_none(),
-                "an address forgotten stops it"
-            );
-            assert!(!state.relay_wanted(), "and is no offer");
-        });
-    }
-
-    /// This computer's card says why it is not relaying while it has no address for opencodex,
-    /// where its relay is on and the app is open on it: "Not relaying: set this computer's
-    /// opencodex address", and not "Not relaying" alone, or the line a computer asleep gets. Another
-    /// computer's card is not this computer's to say it of, and a computer whose switch is off is
-    /// not asked for an address. An address given says what it always said.
+    /// Where this computer's relay found no opencodex is said on this computer's card alone, and
+    /// only while its relay is on: another computer's card is not this computer's to say it of, and
+    /// a computer whose switch is off is not asked to do anything about opencodex, so each reads as
+    /// it did, "On, but asleep" included. A relay that is answering again takes the words back.
     #[test]
-    fn this_computers_card_says_to_set_its_opencodex_address_while_it_has_none() {
+    fn only_this_computers_card_with_its_relay_on_says_opencodex_is_silent() {
+        use crate::components::computers::{RelayState, cards};
+        use crate::opengrok::{RelayReport, RelayStatus};
         let mut state = signed_in_state();
         read_as(
             &mut state,
@@ -39378,87 +39309,331 @@ mod tests {
             computer("mac_2", false, true, false, false),
             computer("mac_3", false, false, false, true),
         ];
+        let silent = "http://127.0.0.1:8080";
+        let report = |status: RelayStatus| {
+            Some(RelayReport {
+                status,
+                halted: false,
+            })
+        };
         let words = |state: &AppState| {
-            crate::components::computers::cards(state)
+            cards(state)
                 .iter()
-                .map(|card| card.state.words())
+                .map(|card| card.status_words())
                 .collect::<Vec<_>>()
         };
+        state.relay_mac.report = report(RelayStatus::OpencodexSilent(silent.into()));
         assert_eq!(
             words(&state),
             [
-                "Not relaying: set this computer's opencodex address",
-                "On, but asleep: it can't answer right now",
-                "Not relaying"
+                format!("Not relaying: opencodex isn't answering on this computer ({silent})"),
+                "On, but asleep: it can't answer right now".to_string(),
+                "Not relaying".to_string(),
             ]
         );
-        state.relay_mac.address = Some("http://127.0.0.1:8080".into());
         assert_eq!(
-            words(&state)[0],
-            "Not relaying",
-            "an address given: it is on its way"
+            cards(&state)[0].detail,
+            None,
+            "the status line says it, and nothing is said twice"
         );
-        state.relay_mac.address = None;
         state.computers[0].relay_enabled = false;
         assert_eq!(
             words(&state)[0],
             "Not relaying",
-            "its switch is off, and nothing is asked of it"
+            "its switch is off, and nothing is asked of opencodex"
         );
+        state.computers[0].relay_enabled = true;
+        state.relay_mac.report = report(RelayStatus::Answering);
+        assert_eq!(cards(&state)[0].state, RelayState::Relaying);
+        state.relay_mac.report = report(RelayStatus::Connecting);
+        assert_eq!(words(&state)[0], "Not relaying");
     }
 
-    /// An address for opencodex is what lets a computer offer to relay, so the field can say
-    /// nothing is given: it is empty while none is kept, with where opencodex listens by default
-    /// as its placeholder, and that default can be given as it is typed, as any other address can,
-    /// where a computer that has opencodex at the default would otherwise have no way to say so.
-    /// Typing back the address kept is no change, and an emptied field forgets it.
-    #[test]
-    fn the_default_address_can_be_given_and_an_empty_field_is_none_given() {
+    /// An address on this Mac that nothing answers on: a port bound, read, and let go.
+    fn nothing_answers() -> String {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("a port")
+            .local_addr()
+            .expect("an address")
+            .port();
+        format!("http://127.0.0.1:{port}")
+    }
+
+    /// A window signed in on an enrolled computer, `mac_1`, against a server that knows the relay,
+    /// as the relay finds it: `server` makes this Mac the relay on each stream it is asked for, and
+    /// answers the setting and the roster as the window asks for them once the relay answers.
+    /// `saved` is the address kept on this computer, and `default_address` where opencodex is looked
+    /// for while none is, which a test points at its own opencodex, so that none asks the real
+    /// 8080. The sender is the enrolment's: the window keeps what it holds as long as it is.
+    fn a_window_that_could_relay(
+        runtime: &tokio::runtime::Runtime,
+        server: &wiremock::MockServer,
+        saved: Option<&str>,
+        default_address: Option<&str>,
+    ) -> (
+        AppState,
+        tokio::sync::watch::Sender<Option<crate::opengrok::MachineCredential>>,
+    ) {
+        use wiremock::matchers::{method, path};
+        runtime.block_on(async {
+            wiremock::Mock::given(method("GET"))
+                .and(path("/inference-relay/requests"))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_raw(
+                    "data: {\"type\":\"ready\",\"machineId\":\"mac_1\"}\n\n",
+                    "text/event-stream",
+                ))
+                .mount(server)
+                .await;
+            wiremock::Mock::given(method("GET"))
+                .and(path("/account/inference-source"))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(recorded_body(
+                    include_str!(
+                        "../fixtures/wire/rest/GET__account_inference-source/200-a_turn_skips_a_computer_switched_off_while_another_serves.json"
+                    ),
+                )))
+                .mount(server)
+                .await;
+            wiremock::Mock::given(method("GET"))
+                .and(path("/local-exec/daemon"))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
+                    "machines": [{
+                        "machineId": "mac_1", "label": "NativeChat on mac_1",
+                        "enrolledAtMs": 1_790_000_000_000_i64, "revoked": false,
+                        "connected": true, "relayEnabled": true, "relaying": false
+                    }]
+                })))
+                .mount(server)
+                .await;
+        });
+        let (enrolled, enrolment) = tokio::sync::watch::channel(Some(
+            crate::opengrok::MachineCredential::new("mac_1", "tok_1"),
+        ));
         let mut state = signed_in_state();
+        state.opengrok = Some(OpenGrokClient::new(&server.uri()).expect("a URL"));
         read_as(
             &mut state,
             relay_kept(InferenceKind::Gateway, "loopback", None),
         );
-        assert_eq!(state.relay_mac.shown_address(), "", "none given");
-        assert!(
-            !state.note_relay_address(String::new()),
-            "an empty field is none given, which is no change"
-        );
-        assert!(
-            state.note_relay_address(crate::opengrok::DEFAULT_PROXY_URL.into()),
-            "the default is an address given, and can be saved"
-        );
-        let here = state.begin_reply_source_save().expect("a Save begins");
-        assert_eq!(
-            here.address,
-            Some(Some(crate::opengrok::DEFAULT_PROXY_URL.to_string()))
-        );
-
-        state.relay_mac.address = Some(crate::opengrok::DEFAULT_PROXY_URL.into());
-        assert_eq!(
-            state.relay_mac.shown_address(),
-            crate::opengrok::DEFAULT_PROXY_URL
-        );
-        assert!(
-            !state.note_relay_address(crate::opengrok::DEFAULT_PROXY_URL.into()),
-            "the one kept, typed back, is no change"
-        );
-        assert!(state.note_relay_address(String::new()));
-        let here = state.begin_reply_source_save().expect("a Save begins");
-        assert_eq!(here.address, Some(None), "an emptied field forgets it");
+        state.local_exec_enrolment = Some(enrolment);
+        state.local_exec_machine_id = Some("mac_1".into());
+        state.computers = vec![computer("mac_1", true, true, false, true)];
+        state.relay_mac.address = saved.map(str::to_string);
+        state.relay_mac.default_address = default_address.map(str::to_string);
+        (state, enrolled)
     }
 
-    /// The relay runs for somebody signed in, on an enrolled computer that has an address for
-    /// opencodex, against a server that knows the relay, and for no other reason: not a switch of
-    /// this computer's own, which is the server's to say on the stream (`disabled`, or a refusal
-    /// with `relay_disabled`) and which the relay waits on for itself. Not before the setting is
-    /// read, not before this Mac is enrolled, and not from a server that does not know the relay;
-    /// signing out stops it, and forgets what it said. (A computer with no address does not offer
-    /// to relay: `a_computer_with_no_opencodex_address_does_not_offer_to_relay`.)
+    /// An opencodex that answers a look at its model list, `GET /v1/models`, as the relay takes one
+    /// before it offers to relay, and only with `key` where it is given.
+    fn an_opencodex_that_answers(
+        runtime: &tokio::runtime::Runtime,
+        key: Option<&str>,
+    ) -> wiremock::MockServer {
+        use wiremock::matchers::{header, method, path};
+        let opencodex = runtime.block_on(wiremock::MockServer::start());
+        let mock = wiremock::Mock::given(method("GET")).and(path("/v1/models"));
+        let mock = match key {
+            Some(key) => mock.and(header("authorization", format!("Bearer {key}").as_str())),
+            None => mock,
+        };
+        runtime.block_on(
+            mock.respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(json!({"data": []})),
+            )
+            .mount(&opencodex),
+        );
+        opencodex
+    }
+
+    /// How many times `server` was asked for `at`.
+    fn asked_for(
+        runtime: &tokio::runtime::Runtime,
+        server: &wiremock::MockServer,
+        at: &str,
+    ) -> usize {
+        runtime
+            .block_on(server.received_requests())
+            .expect("the recorder is on")
+            .iter()
+            .filter(|request| request.url.path() == at)
+            .count()
+    }
+
+    /// Wait, in real time, for what another thread does: the relay's words land on the executor
+    /// from the runtime's own.
+    fn wait_for(
+        cx: &mut gpui_kit::TestAppContext,
+        what: &str,
+        mut done: impl FnMut(&mut gpui_kit::TestAppContext) -> bool,
+    ) {
+        let mut waited = 0;
+        while !done(cx) {
+            assert!(waited < 2000, "{what}");
+            cx.run_until_parked();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            waited += 1;
+        }
+    }
+
+    /// A runtime the relay's own tasks run on, entered, for a test of the road the window takes to
+    /// start it: its answers land from this runtime's threads, so the test waits for them in real
+    /// time, which the scheduler is told it may.
+    fn a_runtime_for_the_relay(cx: &mut gpui_kit::TestAppContext) -> tokio::runtime::Runtime {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("a runtime");
+        cx.executor().allow_parking();
+        runtime
+    }
+
+    /// Nobody saved an address on this computer, and opencodex answers where it listens by default:
+    /// the relay is offered as it always was. The window asks opencodex there before it opens the
+    /// stream, so a computer that has opencodex at its default address needs to be told nothing, and
+    /// the field shows that address, as it always did. (The default is a mock's here: no test asks
+    /// the real 8080.)
+    #[gpui_kit::test]
+    fn a_computer_with_no_saved_address_relays_when_opencodex_answers_at_the_default(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        use gpui_kit::AppContext as _;
+        let runtime = a_runtime_for_the_relay(cx);
+        let _enter = runtime.enter();
+        let server = runtime.block_on(wiremock::MockServer::start());
+        let opencodex = an_opencodex_that_answers(&runtime, None);
+        let (state, _enrolled) =
+            a_window_that_could_relay(&runtime, &server, None, Some(&opencodex.uri()));
+        let app = cx.new(|_| state);
+        app.update(cx, |state, cx| {
+            assert_eq!(state.relay_mac.address, None, "nothing saved");
+            assert_eq!(
+                state.relay_mac.shown_address(),
+                opencodex.uri(),
+                "the field shows where opencodex is looked for"
+            );
+            state.ensure_relay(cx);
+        });
+        wait_for(cx, "the stream was opened", |_| {
+            asked_for(&runtime, &server, "/inference-relay/requests") >= 1
+        });
+        assert!(
+            asked_for(&runtime, &opencodex, "/v1/models") >= 1,
+            "opencodex was asked at the default address before the stream was opened"
+        );
+        app.update(cx, |state, _| state.stop_relay());
+        cx.run_until_parked();
+    }
+
+    /// Nobody saved an address and nothing answers where opencodex listens by default: the relay
+    /// is not offered, so the server's plan turns are not sent here to fail, and this computer's
+    /// card says why, with the address it asked: "Not relaying: opencodex isn't answering on this
+    /// computer (http://127.0.0.1:8080)", in the status line the driver reads as `opencodex-silent`.
+    #[gpui_kit::test]
+    fn a_computer_whose_opencodex_does_not_answer_is_not_offered_and_its_card_says_why(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        use crate::components::computers::{RelayState, cards};
+        use crate::opengrok::RelayStatus;
+        use gpui_kit::AppContext as _;
+        let runtime = a_runtime_for_the_relay(cx);
+        let _enter = runtime.enter();
+        let server = runtime.block_on(wiremock::MockServer::start());
+        let silent = nothing_answers();
+        let (state, _enrolled) = a_window_that_could_relay(&runtime, &server, None, Some(&silent));
+        let app = cx.new(|_| state);
+        app.update(cx, |state, cx| state.ensure_relay(cx));
+        wait_for(cx, "the relay says opencodex is silent", |cx| {
+            app.read_with(cx, |state, _| {
+                matches!(
+                    state.relay_mac.report.as_ref().map(|report| &report.status),
+                    Some(RelayStatus::OpencodexSilent(_))
+                )
+            })
+        });
+        // It only waits: a stream would have been asked for by now.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        cx.run_until_parked();
+        assert_eq!(
+            asked_for(&runtime, &server, "/inference-relay/requests"),
+            0,
+            "no stream is opened"
+        );
+        app.read_with(cx, |state, _| {
+            let card = &cards(state)[0];
+            assert_eq!(
+                card.status_words(),
+                format!("Not relaying: opencodex isn't answering on this computer ({silent})")
+            );
+            assert_eq!(
+                (card.state, card.state.word(), card.tried.as_deref()),
+                (
+                    RelayState::OpencodexSilent,
+                    "opencodex-silent",
+                    Some(silent.as_str())
+                )
+            );
+            assert_eq!(
+                state.relay_mac.shown_address(),
+                silent,
+                "the address it tried"
+            );
+            assert!(
+                !state
+                    .relay_mac
+                    .report
+                    .as_ref()
+                    .is_some_and(|report| report.halted),
+                "it waits to be answered, it is not done"
+            );
+        });
+        app.update(cx, |state, _| state.stop_relay());
+        cx.run_until_parked();
+    }
+
+    /// A saved address that answers is relayed for, and is the one asked, not where opencodex
+    /// listens by default (which here is nothing); the look carries the key kept for it, as every
+    /// call does, and an opencodex that wants one answers only with it.
+    #[gpui_kit::test]
+    fn a_saved_address_that_answers_is_relayed_for_and_asked_with_its_key(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        use gpui_kit::AppContext as _;
+        let runtime = a_runtime_for_the_relay(cx);
+        let _enter = runtime.enter();
+        let server = runtime.block_on(wiremock::MockServer::start());
+        let opencodex = an_opencodex_that_answers(&runtime, Some("opencodex-test-key"));
+        let (state, _enrolled) = a_window_that_could_relay(
+            &runtime,
+            &server,
+            Some(&opencodex.uri()),
+            Some(&nothing_answers()),
+        );
+        state
+            .relay_keys
+            .keep(&crate::opengrok::RelayKey::new("opencodex-test-key").expect("a key"))
+            .expect("kept");
+        let app = cx.new(|_| state);
+        app.update(cx, |state, cx| state.ensure_relay(cx));
+        wait_for(cx, "the stream was opened", |_| {
+            asked_for(&runtime, &server, "/inference-relay/requests") >= 1
+        });
+        assert!(
+            asked_for(&runtime, &opencodex, "/v1/models") >= 1,
+            "the saved address was asked, with its key, before the stream was opened"
+        );
+        app.update(cx, |state, _| state.stop_relay());
+        cx.run_until_parked();
+    }
+
+    /// The relay runs for somebody signed in, on an enrolled computer, against a server that knows
+    /// the relay, and for no other reason: not a switch of this computer's own, which is the
+    /// server's to say on the stream (`disabled`, or a refusal with `relay_disabled`) and which the
+    /// relay waits on for itself. Not before the setting is read, not before this Mac is enrolled,
+    /// and not from a server that does not know the relay; signing out stops it, and forgets what
+    /// it said.
     #[test]
     fn the_relay_runs_for_an_enrolled_mac_signed_in_on_a_server_that_knows_it() {
         let mut state = signed_in_state();
-        state.relay_mac.address = Some("http://127.0.0.1:8080".into());
         assert!(!state.relay_wanted(), "the setting not read");
         read_as(
             &mut state,
@@ -39511,7 +39686,6 @@ mod tests {
 
         let mut state = signed_in_state();
         state.local_exec_machine_id = Some("mac_1".into());
-        state.relay_mac.address = Some("http://127.0.0.1:8080".into());
         state.computers = vec![
             computer("mac_1", true, true, false, true),
             computer("mac_2", false, true, false, false),

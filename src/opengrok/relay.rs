@@ -41,10 +41,16 @@
 //! again as after any drop, with the newest token this Mac holds; one refused for an old token
 //! waits for the new.
 //!
-//! The window starts this relay only on a computer that has been given an address for opencodex
-//! (`AppState::relay_wanted`). The server starts every computer's relay on when it is enrolled
-//! (`relay_enabled` defaults true, opengrok-server #342 (main 2136ffc)), so a computer with no
-//! opencodex to answer with would offer itself, be sent the plan's turns, and fail them.
+//! The server starts every computer's relay on when it is enrolled (`relay_enabled` defaults true,
+//! opengrok-server #342 (main 2136ffc)), so a computer with no opencodex to answer with would
+//! offer itself, be sent the plan's turns, and fail them. The relay therefore offers itself only
+//! where opencodex answers: before it opens a stream it asks opencodex, at the address the window
+//! gives it (the one saved on this computer, else where opencodex listens by default) and with
+//! the key if there is one, for its model list, `GET /v1/models`, within [`RelayTimings::probe`].
+//! Where it does not answer, no stream is opened and the relay says where it looked
+//! ([`RelayStatus::OpencodexSilent`]); it asks again every [`RelayTimings::recheck`], and at once
+//! when the address or the key is changed or the person switches the relay on here. A stream that
+//! is open is left alone if opencodex stops answering later: its calls fail in a sentence.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -196,13 +202,16 @@ impl fmt::Debug for RelayTarget {
 /// stream gone quiet, however it looks from here. The wait between attempts doubles after each
 /// one that fails, up to a ceiling, and starts again from the floor once a stream is answering.
 /// A relay the server switched off asks for this computer's own row every `recheck` to see
-/// whether it was switched on again, which can be done from any computer.
+/// whether it was switched on again, which can be done from any computer, and a relay whose
+/// opencodex does not answer asks opencodex again every `recheck`; one look at opencodex waits
+/// `probe` for its answer.
 #[derive(Debug, Clone, Copy)]
 pub struct RelayTimings {
     pub quiet: Duration,
     pub first_wait: Duration,
     pub longest_wait: Duration,
     pub recheck: Duration,
+    pub probe: Duration,
 }
 
 impl Default for RelayTimings {
@@ -212,6 +221,7 @@ impl Default for RelayTimings {
             first_wait: Duration::from_secs(1),
             longest_wait: Duration::from_secs(30),
             recheck: Duration::from_secs(20),
+            probe: Duration::from_secs(3),
         }
     }
 }
@@ -231,6 +241,12 @@ pub enum RelayStatus {
     Replaced,
     /// Something is wrong, in a sentence: while it is trying again, and when it has stopped.
     Error(String),
+    /// opencodex does not answer where this computer's relay asks it, at the address this holds: the
+    /// relay is not offered, so the stream is not opened, and opencodex is asked again every
+    /// [`RelayTimings::recheck`] and at once when the address or the key changes. The server starts
+    /// every computer's relay on, so a computer with no opencodex to answer with would otherwise be
+    /// sent the plan's turns and fail them.
+    OpencodexSilent(String),
 }
 
 /// The relay's word on itself, as the window reads it: where it stands, and nothing of the calls
@@ -380,8 +396,9 @@ impl RelayHandle {
     }
 
     /// Tell a relay the server switched off to look at this computer's own row now, rather than at
-    /// its next look: the person has just switched it on here. A relay that is not waiting for
-    /// that has nothing to look for, and the word is kept for the next time it does.
+    /// its next look: the person has just switched it on here. A relay whose opencodex does not
+    /// answer asks it again now too. A relay that is not waiting for either has nothing to look
+    /// for, and the word is kept for the next time it does.
     pub fn wake(&self) {
         self.woken.notify_one();
     }
@@ -513,6 +530,11 @@ async fn serve(
             wait = timings.first_wait;
             relay.set_status(RelayStatus::Connecting, false);
         }
+        // The server starts every computer's relay on, so the relay is offered only where opencodex
+        // answers: the stream is not opened before it does. The Mac may have enrolled again while
+        // opencodex was silent, and the newest token is the one to open the stream with.
+        relay.wait_until_opencodex_answers(&timings).await;
+        let machine = enrolment.borrow().clone().unwrap_or(machine);
         match relay.stream_once(&machine, &mut halts, timings.quiet).await {
             Ended::Replaced => {
                 relay.set_status(RelayStatus::Replaced, true);
@@ -598,6 +620,57 @@ impl Relay {
             report.halted = halted;
             changed
         });
+    }
+
+    /// Wait until opencodex answers where this computer's relay asks it, which is looked at now,
+    /// and again every `recheck`, and at once when the address or the key changes
+    /// ([`RelayHandle::readdress`], [`RelayHandle::rekey`]) and when the person switches the relay
+    /// on here ([`RelayHandle::wake`]). While it does not, the relay says where it looked
+    /// ([`RelayStatus::OpencodexSilent`]) and opens no stream; once it does, that word is taken
+    /// back. A stream that is open is left to its own calls: opencodex failing under one is said in
+    /// a sentence, as it always was.
+    async fn wait_until_opencodex_answers(&self, timings: &RelayTimings) {
+        let mut changes = self.target.clone();
+        loop {
+            let target = changes.borrow_and_update().clone();
+            if self.opencodex_answers(&target, timings.probe).await {
+                if matches!(self.report.borrow().status, RelayStatus::OpencodexSilent(_)) {
+                    self.set_status(RelayStatus::Connecting, false);
+                }
+                return;
+            }
+            self.set_status(
+                RelayStatus::OpencodexSilent(target.address.as_str().to_string()),
+                false,
+            );
+            // A target no one can change again changes nothing, and is waited for no longer.
+            let changed = async {
+                if changes.changed().await.is_err() {
+                    std::future::pending::<()>().await;
+                }
+            };
+            tokio::select! {
+                () = tokio::time::sleep(timings.recheck) => {}
+                () = self.woken.notified() => {}
+                () = changed => {}
+            }
+        }
+    }
+
+    /// Whether opencodex answers at `target`: one look at its model list, `GET /v1/models`, with
+    /// the key if there is one, which is the first thing any call it relays would ask of it. An
+    /// answer that is a success within `within` is an opencodex to relay for; nothing listening,
+    /// no answer in time and a refusal (a key it would not take, or opencodex itself failing) are
+    /// not.
+    async fn opencodex_answers(&self, target: &RelayTarget, within: Duration) -> bool {
+        let mut look = self
+            .opencodex
+            .get(target.address.endpoint("/v1/models"))
+            .timeout(within);
+        if let Some(key) = &target.key {
+            look = look.bearer_auth(key.expose());
+        }
+        matches!(look.send().await, Ok(response) if response.status().is_success())
     }
 
     /// Wait until this computer's own row says its relay is switched on, which is asked of the
@@ -1076,6 +1149,7 @@ mod tests {
             first_wait: Duration::from_millis(50),
             longest_wait: Duration::from_millis(200),
             recheck: Duration::from_millis(100),
+            probe: Duration::from_secs(2),
         }
     }
 
@@ -1238,7 +1312,8 @@ mod tests {
     async fn the_key_never_shows_in_any_debug_output() {
         let key = RelayKey::new(KEY).unwrap();
         assert!(!format!("{key:?}").contains(KEY));
-        let target = target("http://127.0.0.1:8080", Some(KEY));
+        let opencodex = opencodex().await;
+        let target = target(&opencodex.uri(), Some(KEY));
         let printed = format!("{target:?}");
         assert!(
             !printed.contains(KEY) && printed.contains("redacted"),
@@ -1519,6 +1594,7 @@ mod tests {
         for status in [404, 409, 413] {
             let server = MockServer::start().await;
             let opencodex = MockServer::start().await;
+            answering(&opencodex).await;
             Mock::given(method("POST"))
                 .and(path("/v1/chat/completions"))
                 .respond_with(
@@ -1610,10 +1686,11 @@ mod tests {
             .mount(&server)
             .await;
         let (_enrolled, enrolment) = enrolled();
+        let opencodex = opencodex().await;
         let handle = start_relay(
             OpenGrokClient::new(&server.uri()).unwrap(),
             enrolment,
-            target("http://127.0.0.1:8080", None),
+            target(&opencodex.uri(), None),
             quick(),
         );
         let mut reports = handle.reports();
@@ -1637,6 +1714,35 @@ mod tests {
             .count();
         assert_eq!(opened, 1, "no stream is opened after replaced");
         assert_eq!(handle.report().status, RelayStatus::Replaced);
+    }
+
+    /// An opencodex that answers the one look the relay takes at it before it offers to relay,
+    /// `GET /v1/models`, with its model list.
+    async fn answering(opencodex: &MockServer) {
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"object": "list", "data": []})),
+            )
+            .mount(opencodex)
+            .await;
+    }
+
+    /// A new opencodex, answering.
+    async fn opencodex() -> MockServer {
+        let opencodex = MockServer::start().await;
+        answering(&opencodex).await;
+        opencodex
+    }
+
+    /// An address on this Mac that nothing answers on: a port bound, read, and let go.
+    fn nothing_answers() -> String {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        format!("http://127.0.0.1:{port}")
     }
 
     /// How many times the relay's stream was opened, with any token.
@@ -1689,10 +1795,11 @@ mod tests {
             .mount(&server)
             .await;
         let (_enrolled, enrolment) = enrolled();
+        let opencodex = opencodex().await;
         let handle = start_relay(
             OpenGrokClient::new(&server.uri()).unwrap(),
             enrolment,
-            target("http://127.0.0.1:8080", None),
+            target(&opencodex.uri(), None),
             quick(),
         );
         let mut reports = handle.reports();
@@ -1731,10 +1838,11 @@ mod tests {
             .mount(&server)
             .await;
         let (_enrolled, enrolment) = enrolled();
+        let opencodex = opencodex().await;
         let handle = start_relay(
             OpenGrokClient::new(&server.uri()).unwrap(),
             enrolment,
-            target("http://127.0.0.1:8080", None),
+            target(&opencodex.uri(), None),
             quick(),
         );
         let mut reports = handle.reports();
@@ -1763,10 +1871,11 @@ mod tests {
             .mount(&server)
             .await;
         let (_enrolled, enrolment) = enrolled();
+        let opencodex = opencodex().await;
         let handle = start_relay(
             OpenGrokClient::new(&server.uri()).unwrap(),
             enrolment,
-            target("http://127.0.0.1:8080", None),
+            target(&opencodex.uri(), None),
             quick(),
         );
         until("the stream was asked for again", async || {
@@ -1774,6 +1883,265 @@ mod tests {
         })
         .await;
         assert!(matches!(handle.report().status, RelayStatus::Error(_)));
+    }
+
+    /// opencodex's answers to the one look the relay takes at it before it offers to relay, which
+    /// the test moves between "answering" and "not".
+    struct Opencodex(Arc<std::sync::atomic::AtomicBool>);
+
+    impl wiremock::Respond for Opencodex {
+        fn respond(&self, _: &wiremock::Request) -> ResponseTemplate {
+            if self.0.load(std::sync::atomic::Ordering::SeqCst) {
+                ResponseTemplate::new(200).set_body_json(json!({"object": "list", "data": []}))
+            } else {
+                ResponseTemplate::new(503)
+            }
+        }
+    }
+
+    /// A server that makes this Mac the relay on each stream it is asked for.
+    async fn a_server_that_makes_it_the_relay() -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/inference-relay/requests"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                sse(&[json!({"type": "ready", "machineId": "mac_1"})]),
+                "text/event-stream",
+            ))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    /// The server starts every computer's relay on, so the relay is offered only where opencodex
+    /// answers: before it opens its stream it asks opencodex for its model list, with the key it
+    /// holds, and opens the stream once opencodex answers. The look is no call of the person's, and
+    /// the key goes to opencodex alone.
+    #[tokio::test]
+    async fn the_relay_is_offered_where_opencodex_answers() {
+        let server = a_server_that_makes_it_the_relay().await;
+        let opencodex = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .and(header("authorization", format!("Bearer {KEY}").as_str()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": []})))
+            .mount(&opencodex)
+            .await;
+        let (_enrolled, enrolment) = enrolled();
+        let handle = start_relay(
+            OpenGrokClient::new(&server.uri()).unwrap(),
+            enrolment,
+            target(&opencodex.uri(), Some(KEY)),
+            quick(),
+        );
+        until("the stream was opened", async || {
+            streams_opened(&server).await >= 1
+        })
+        .await;
+        let looked: Vec<_> = opencodex
+            .received_requests()
+            .await
+            .expect("the recorder is on")
+            .into_iter()
+            .map(|request| (request.method.to_string(), request.url.path().to_string()))
+            .collect();
+        assert_eq!(
+            looked.first(),
+            Some(&("GET".to_string(), "/v1/models".to_string())),
+            "opencodex was asked, with its key, before the stream was opened: {looked:?}"
+        );
+        for request in server.received_requests().await.unwrap() {
+            assert!(
+                !request.url.path().starts_with("/v1/"),
+                "the server is asked nothing of opencodex"
+            );
+            assert!(
+                !String::from_utf8_lossy(&request.body).contains(KEY)
+                    && !format!("{:?}", request.headers).contains(KEY),
+                "and is sent no key"
+            );
+        }
+        drop(handle);
+    }
+
+    /// Where opencodex does not answer, the relay is not offered: no stream is opened, however long
+    /// it waits, and it says where it looked, so the window can say so. Nothing listening, a refusal
+    /// of the look (a key opencodex would not take, or opencodex itself failing), and an answer
+    /// that comes too late are all no answer. It is not stopped for good: it only waits.
+    #[tokio::test]
+    async fn a_relay_whose_opencodex_does_not_answer_opens_no_stream_and_says_where_it_looked() {
+        let refusing = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(401).set_body_json(json!({"error": "no key"})))
+            .mount(&refusing)
+            .await;
+        let late = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(5)))
+            .mount(&late)
+            .await;
+        for (what, address, probe) in [
+            (
+                "nothing listening",
+                nothing_answers(),
+                Duration::from_secs(2),
+            ),
+            ("a refusal", refusing.uri(), Duration::from_secs(2)),
+            ("an answer too late", late.uri(), Duration::from_millis(200)),
+        ] {
+            let server = a_server_that_makes_it_the_relay().await;
+            let (_enrolled, enrolment) = enrolled();
+            let handle = start_relay(
+                OpenGrokClient::new(&server.uri()).unwrap(),
+                enrolment,
+                target(&address, None),
+                RelayTimings { probe, ..quick() },
+            );
+            let mut reports = handle.reports();
+            let said = tokio::time::timeout(
+                Duration::from_secs(10),
+                reports.wait_for(|report| matches!(report.status, RelayStatus::OpencodexSilent(_))),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("{what}: the relay says opencodex is silent"))
+            .expect("the relay reports")
+            .clone();
+            assert_eq!(
+                (said.status, said.halted),
+                (RelayStatus::OpencodexSilent(address.clone()), false),
+                "{what}: where it looked, and it only waits"
+            );
+            // Several times the wait between looks: no stream is opened.
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            assert_eq!(streams_opened(&server).await, 0, "{what}: not offered");
+            assert_eq!(
+                handle.report().status,
+                RelayStatus::OpencodexSilent(address.clone())
+            );
+        }
+    }
+
+    /// An opencodex that starts answering later is offered by itself, on the cadence the relay
+    /// asks for its own row at: nothing is saved or switched, and the relay that said it was
+    /// silent opens its stream and stops saying so.
+    #[tokio::test]
+    async fn an_opencodex_that_starts_answering_is_offered_when_next_asked() {
+        let server = a_server_that_makes_it_the_relay().await;
+        let answering_now = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let opencodex = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(Opencodex(Arc::clone(&answering_now)))
+            .mount(&opencodex)
+            .await;
+        let (_enrolled, enrolment) = enrolled();
+        let handle = start_relay(
+            OpenGrokClient::new(&server.uri()).unwrap(),
+            enrolment,
+            target(&opencodex.uri(), None),
+            quick(),
+        );
+        let mut reports = handle.reports();
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            reports.wait_for(|report| matches!(report.status, RelayStatus::OpencodexSilent(_))),
+        )
+        .await
+        .expect("it says opencodex is silent")
+        .expect("the relay reports");
+        let asked = || async {
+            opencodex
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .filter(|request| request.url.path() == "/v1/models")
+                .count()
+        };
+        until("it asked again while opencodex was silent", async || {
+            asked().await >= 3
+        })
+        .await;
+        assert_eq!(streams_opened(&server).await, 0, "and offered nothing");
+
+        answering_now.store(true, std::sync::atomic::Ordering::SeqCst);
+        until("it offered itself", async || {
+            streams_opened(&server).await >= 1
+        })
+        .await;
+        until("it stopped saying opencodex was silent", async || {
+            !matches!(handle.report().status, RelayStatus::OpencodexSilent(_))
+        })
+        .await;
+    }
+
+    /// An address saved, or a key, asks opencodex again at once, whatever the wait for the next
+    /// look: a relay silent for want of an address is offered the moment the person gives it, and
+    /// switching the relay on here asks once more as well.
+    #[tokio::test]
+    async fn a_new_address_or_a_wake_asks_opencodex_again_at_once() {
+        let server = a_server_that_makes_it_the_relay().await;
+        let opencodex = opencodex().await;
+        let timings = RelayTimings {
+            recheck: Duration::from_secs(3600),
+            ..quick()
+        };
+        let (_enrolled, enrolment) = enrolled();
+        let handle = start_relay(
+            OpenGrokClient::new(&server.uri()).unwrap(),
+            enrolment,
+            target(&nothing_answers(), None),
+            timings,
+        );
+        let mut reports = handle.reports();
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            reports.wait_for(|report| matches!(report.status, RelayStatus::OpencodexSilent(_))),
+        )
+        .await
+        .expect("it says opencodex is silent")
+        .expect("the relay reports");
+        assert_eq!(streams_opened(&server).await, 0);
+
+        handle.readdress(OpencodexAddress::parse(&opencodex.uri()).unwrap());
+        until("it was offered at the new address", async || {
+            streams_opened(&server).await >= 1
+        })
+        .await;
+        drop(handle);
+
+        // Waking asks again too: opencodex that started answering is found without the hour.
+        let answering_now = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let later = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(Opencodex(Arc::clone(&answering_now)))
+            .mount(&later)
+            .await;
+        let server = a_server_that_makes_it_the_relay().await;
+        let (_enrolled, enrolment) = enrolled();
+        let handle = start_relay(
+            OpenGrokClient::new(&server.uri()).unwrap(),
+            enrolment,
+            target(&later.uri(), None),
+            timings,
+        );
+        let mut reports = handle.reports();
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            reports.wait_for(|report| matches!(report.status, RelayStatus::OpencodexSilent(_))),
+        )
+        .await
+        .expect("it says opencodex is silent")
+        .expect("the relay reports");
+        answering_now.store(true, std::sync::atomic::Ordering::SeqCst);
+        handle.wake();
+        until("it was offered when woken", async || {
+            streams_opened(&server).await >= 1
+        })
+        .await;
     }
 
     /// A relay the server switched off opens its stream again once its own row says on, and not
@@ -1808,10 +2176,11 @@ mod tests {
             .mount(&server)
             .await;
         let (_enrolled, enrolment) = enrolled();
+        let opencodex = opencodex().await;
         let handle = start_relay(
             OpenGrokClient::new(&server.uri()).unwrap(),
             enrolment,
-            target("http://127.0.0.1:8080", None),
+            target(&opencodex.uri(), None),
             quick(),
         );
         let mut reports = handle.reports();
@@ -1880,10 +2249,11 @@ mod tests {
             recheck: Duration::from_secs(3600),
             ..quick()
         };
+        let opencodex = opencodex().await;
         let handle = start_relay(
             OpenGrokClient::new(&server.uri()).unwrap(),
             enrolment,
-            target("http://127.0.0.1:8080", None),
+            target(&opencodex.uri(), None),
             timings,
         );
         let mut reports = handle.reports();
@@ -1926,10 +2296,11 @@ mod tests {
             .mount(&server)
             .await;
         let (_enrolled, enrolment) = enrolled();
+        let opencodex = opencodex().await;
         let handle = start_relay(
             OpenGrokClient::new(&server.uri()).unwrap(),
             enrolment,
-            target("http://127.0.0.1:8080", None),
+            target(&opencodex.uri(), None),
             quick(),
         );
         let mut reports = handle.reports();
@@ -1994,6 +2365,7 @@ mod tests {
     async fn a_relay_stopped_for_a_retired_token_starts_again_once_this_mac_enrols_again() {
         let server = MockServer::start().await;
         let opencodex = MockServer::start().await;
+        answering(&opencodex).await;
         Mock::given(method("POST"))
             .and(path("/v1/chat/completions"))
             .respond_with(
@@ -2130,10 +2502,11 @@ mod tests {
             longest_wait: Duration::from_millis(500),
             ..quick()
         };
+        let opencodex = opencodex().await;
         let handle = start_relay(
             OpenGrokClient::new(&server.uri()).unwrap(),
             enrolment,
-            target("http://127.0.0.1:8080", None),
+            target(&opencodex.uri(), None),
             timings,
         );
         until("the stream opened", async || {
@@ -2157,6 +2530,7 @@ mod tests {
     async fn an_answer_turned_away_for_an_old_token_stops_nothing_on_the_new_one() {
         let server = MockServer::start().await;
         let opencodex = MockServer::start().await;
+        answering(&opencodex).await;
         // opencodex takes its time, so the answer goes once this Mac has enrolled again.
         Mock::given(method("POST"))
             .and(path("/v1/chat/completions"))
@@ -2268,10 +2642,11 @@ mod tests {
             ..quick()
         };
         let (_enrolled, enrolment) = enrolled();
+        let opencodex = opencodex().await;
         let handle = start_relay(
             OpenGrokClient::new(&format!("http://{address}")).unwrap(),
             enrolment,
-            target("http://127.0.0.1:8080", None),
+            target(&opencodex.uri(), None),
             timings,
         );
         until("the quiet stream was opened again", async || {
