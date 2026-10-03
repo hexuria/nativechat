@@ -13,7 +13,9 @@ pub mod computer;
 /// The coworker's screen in a window: a `wry` WebView, which only builds on macOS here.
 #[cfg(target_os = "macos")]
 pub mod computer_screen;
+pub mod computers;
 pub mod connections;
+pub mod default_models;
 pub mod emoji_picker;
 pub mod fields;
 pub mod gen_ui;
@@ -24,6 +26,7 @@ pub mod login;
 pub mod logins;
 pub mod message;
 pub mod message_actions;
+pub mod model_picker;
 pub mod multi_select;
 pub mod persona;
 pub mod recipes;
@@ -33,7 +36,10 @@ pub mod sidebar;
 pub mod sidebar_chat_item;
 pub mod skills;
 pub mod steps;
+pub mod switch;
 pub mod title_bar;
+mod transcript_chrome;
+pub mod transcript_scroll;
 pub mod user_form;
 pub mod voice_mode_modal;
 pub mod voice_wave;

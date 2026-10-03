@@ -9,10 +9,11 @@ use crate::components::chat_find::find_bar_element;
 use crate::components::chat_input::MessageInput;
 use crate::components::emoji_picker::{full_picker, reaction_strip};
 use crate::components::gen_ui::{render_approval, render_screenshots, render_ui_spec};
-use crate::components::message::{MessageBubble, TS_PEEK_MAX};
+use crate::components::message::{MessageBubble, TS_PEEK_MAX, TimestampPeek, turn_metadata};
 use crate::components::persona::PersonaMark;
 use crate::components::save_login::render_save_login;
 use crate::components::steps::{RunLayout, RunRow, render_run_row};
+use crate::components::transcript_scroll::{TranscriptScroll, TranscriptScroller};
 use crate::components::user_form::{
     UserFormInputMap, UserFormTextareaMap, field_key, render_user_form,
 };
@@ -26,9 +27,13 @@ use crate::state::{
     is_unsent_turn_note,
 };
 use crate::tts_text::{looks_like_markdown, map_utf16_range_to_utf8};
+
+/// Beside the line of a turn the person's plan could not answer: the turn again, on the server's
+/// paid keys.
+pub(crate) const SEND_ON_SERVER: &str = "run-error-send-on-server";
+pub(crate) const SEND_ON_SERVER_LABEL: &str = "Send this reply on Server instead";
 use gpui_kit::base::{Align, Placement, Positioner};
 use gpui_kit::component::input::{InputEvent, InputState, TextareaState};
-use gpui_kit::component::message_scroller::{MessageScroller, MessageScrollerState};
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{ActiveTheme, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder;
@@ -45,8 +50,14 @@ struct ChatFeedRev {
     /// the feed would decide nothing had changed and leave the bubble on screen.
     hidden_count: usize,
     last_id: Option<String>,
-    last_len: usize,
-    last_ui: usize,
+    /// How much each row holds: its words, its parts, and the output under its approval cards.
+    /// Every row's, not the last one's, because the row a run is painting into is not always
+    /// last. A message sent while the reply streams is held on the end of the thread, under it,
+    /// and something stays there when that message is edited (a new bubble on the end) or
+    /// cancelled (hidden, not removed). Read off the last row alone, the reply stood still on
+    /// screen from the moment a message was held, "working" still lit, and landed whole only
+    /// when the run's clock changed at its end.
+    bodies: Vec<(usize, usize, usize)>,
     form_picks: Vec<(String, String, String)>,
     /// A card put away with its ✕ changes nothing else here: the thread and its parts stay
     /// as they were, so without this the card would keep asking.
@@ -72,7 +83,6 @@ struct ChatFeedRev {
     reply_to: Option<String>,
     emoji_for: Option<String>,
     approvals: Vec<(String, String)>,
-    last_output: usize,
     expanded_output: Vec<String>,
     /// How much the thread's steps and thoughts hold, and how many steps have come back. A
     /// step's arguments and result arrive into a part that is already there, so the part count
@@ -80,6 +90,7 @@ struct ChatFeedRev {
     steps: (usize, usize),
     expanded_steps: Vec<String>,
     show_turn_timing: bool,
+    action_times: Vec<Option<u64>>,
     /// Every row's, not the last one's: a resumed run finishes on a bubble that a later
     /// message may already sit below.
     clocks: Vec<(
@@ -88,6 +99,12 @@ struct ChatFeedRev {
     )>,
     /// Every reply's badge: the frame that brings one changes nothing else a row is drawn from.
     sources: Vec<Option<crate::opengrok::ReplySource>>,
+    /// The reply the person's plan could not answer, which offers itself on the server's keys: a
+    /// run's code arrives with the same words a row already shows.
+    plan_failed: Option<String>,
+    /// The held sends the server holds for the person's Mac: a row's `heldFor` changes nothing
+    /// else a bubble is drawn from.
+    waiting_for_mac: Vec<String>,
 }
 
 impl ChatFeedRev {
@@ -107,8 +124,26 @@ impl ChatFeedRev {
                 .map(|c| c.messages.iter().filter(|m| m.hidden).count())
                 .unwrap_or(0),
             last_id: last.map(|m| m.id.clone()),
-            last_len: last.map(|m| m.content.len()).unwrap_or(0),
-            last_ui: last.map(|m| m.parts.len()).unwrap_or(0),
+            bodies: conv
+                .map(|c| {
+                    c.messages
+                        .iter()
+                        .map(|m| {
+                            let output = m
+                                .parts
+                                .iter()
+                                .map(|part| match part {
+                                    ChatPart::Approval(spec) => {
+                                        spec.output.as_ref().map_or(0, String::len)
+                                    }
+                                    _ => 0,
+                                })
+                                .sum();
+                            (m.content.len(), m.parts.len(), output)
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
             form_picks: {
                 let mut picks: Vec<(String, String, String)> = state
                     .form_picks
@@ -254,19 +289,6 @@ impl ChatFeedRev {
                 pairs.sort();
                 pairs
             },
-            last_output: last
-                .map(|msg| {
-                    msg.parts
-                        .iter()
-                        .map(|part| match part {
-                            ChatPart::Approval(spec) => {
-                                spec.output.as_ref().map(String::len).unwrap_or(0)
-                            }
-                            _ => 0,
-                        })
-                        .sum()
-                })
-                .unwrap_or(0),
             expanded_output: {
                 let mut ids: Vec<String> = state.expanded_shell_output.iter().cloned().collect();
                 ids.sort();
@@ -282,7 +304,7 @@ impl ChatFeedRev {
                                     + step.result.as_ref().map_or(0, String::len),
                                 settled + usize::from(step.result.is_some()),
                             ),
-                            ChatPart::Reasoning(thought) => (held + thought.len(), settled),
+                            ChatPart::Reasoning(thought) => (held + thought.text.len(), settled),
                             _ => (held, settled),
                         },
                     )
@@ -294,6 +316,19 @@ impl ChatFeedRev {
                 keys
             },
             show_turn_timing: state.show_turn_timing,
+            action_times: conv
+                .map(|c| {
+                    c.messages
+                        .iter()
+                        .flat_map(|m| m.parts.iter())
+                        .filter_map(|part| match part {
+                            ChatPart::Step(step) => Some(step.took_ms),
+                            ChatPart::Reasoning(thought) => Some(thought.took_ms),
+                            _ => None,
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
             clocks: conv
                 .map(|c| {
                     c.messages
@@ -305,6 +340,8 @@ impl ChatFeedRev {
             sources: conv
                 .map(|c| c.messages.iter().map(|m| m.reply_source.clone()).collect())
                 .unwrap_or_default(),
+            plan_failed: state.plan_failed_turn(),
+            waiting_for_mac: state.sends_waiting_for_mac(),
         }
     }
 }
@@ -316,7 +353,8 @@ struct ChatRow {
     is_me: bool,
     timestamp: SharedString,
     duration: SharedString,
-    timing_debug: SharedString,
+    /// One total for the entire reply, beside the final row's timestamp.
+    turn_total: Option<SharedString>,
     is_native_speaking: bool,
     is_native_paused: bool,
     is_native_loading: bool,
@@ -326,6 +364,9 @@ struct ChatRow {
     is_cached: bool,
     /// The person's message is on screen but its turn is held until the thread is idle.
     queued: bool,
+    /// Held by the server until a Mac holds the relay again: the queued line says it waits for
+    /// the person's Mac.
+    waiting_for_mac: bool,
     highlight_range: Option<std::ops::Range<usize>>,
     highlight_native: bool,
     use_markdown: bool,
@@ -344,13 +385,16 @@ struct ChatRow {
     status_failed: bool,
     /// A status line for a turn that never left, which carries the offer to send it again.
     status_retry: bool,
+    /// A status line for a turn the person's plan could not answer, which carries the offer to
+    /// send it again on the server's keys.
+    status_send_on_server: bool,
     /// The pictures of one stretch of a turn, which the row paints as one strip and the
     /// lightbox pages through as one set.
     screenshots: Vec<ScreenshotSpec>,
     user_form: Option<UserFormSpec>,
     save_login: Option<SaveLoginSpec>,
-    /// A step, a stretch of steps or a thought. Its `content` stays empty: none of it is words,
-    /// so find, copy and read aloud pass it by.
+    /// A step, a stretch of steps, or a thought. Its `content` stays
+    /// empty: none of it is words, so find, copy and read aloud pass it by.
     run: Option<RunRow>,
     /// The files one of the person's messages carried (#90), drawn as tiles under it.
     files: Vec<crate::opengrok::Attachment>,
@@ -368,7 +412,7 @@ impl ChatRow {
             is_me: false,
             timestamp: SharedString::from(""),
             duration: SharedString::from(""),
-            timing_debug: SharedString::from(""),
+            turn_total: None,
             is_native_speaking: false,
             is_native_paused: false,
             is_native_loading: false,
@@ -377,6 +421,7 @@ impl ChatRow {
             is_ai_loading: false,
             is_cached: false,
             queued: false,
+            waiting_for_mac: false,
             highlight_range: None,
             highlight_native: false,
             use_markdown: false,
@@ -391,6 +436,7 @@ impl ChatRow {
             status_line: None,
             status_failed: false,
             status_retry: false,
+            status_send_on_server: false,
             files: Vec::new(),
             screenshots: Vec::new(),
             user_form: None,
@@ -401,10 +447,12 @@ impl ChatRow {
     }
 
     /// Whether this is the same row, drawn the same way, as `other`: an opened step is a
-    /// different row from the shut one, because it is taller.
+    /// different row from the shut one, because it is taller. Adding or removing total-time
+    /// metadata needs a fresh render of its swipe rail.
     fn same_as(&self, other: &Self) -> bool {
         self.id == other.id
             && self.run.as_ref().map(RunRow::is_open) == other.run.as_ref().map(RunRow::is_open)
+            && self.turn_total.is_some() == other.turn_total.is_some()
     }
 }
 
@@ -426,24 +474,113 @@ fn changed_rows(old: &[ChatRow], new: &[ChatRow]) -> (std::ops::Range<usize>, us
     (head..old.len() - tail, new.len() - tail - head)
 }
 
+/// Whether the rows now end on a message of the person's own that the old rows did not have,
+/// which is what a send looks like from here: the message goes on the end of the thread at
+/// once, whether it went to the coworker then, waits behind a running turn, or steered a card.
+fn just_sent(old: &[ChatRow], new: &[ChatRow]) -> bool {
+    new.last()
+        .is_some_and(|last| last.is_me && !old.iter().any(|row| row.source_id == last.source_id))
+}
+
+/// What changed about the thread besides its rows, for [`apply_rows`].
+#[derive(Clone, Copy, Debug, Default)]
+struct RowsChange {
+    /// Another thread was opened in the transcript.
+    thread_opened: bool,
+    /// A step or a thought was opened or shut, which adds or takes away rows under it.
+    steps_toggled: bool,
+    /// The coworker is replying, so its last row may have grown.
+    responding: bool,
+}
+
+/// Bring the transcript's list up to date with the thread's rows: `old` is what the list was
+/// drawn from, `new` what it is drawn from now.
+///
+/// Rows arriving are no reason to go back to the newest row. A person who went back up the
+/// thread stays where they are while a reply streams in below them, a step arrives or a message
+/// is hidden: only the rows that changed are replaced, and the list keeps its place. Starting
+/// the list over whenever the number of rows changed, as it once did, carried them back down
+/// with every row a turn added. The newest row is taken back only by another thread opening, or
+/// by a message of the person's own: they sent it, and whoever sends wants to see what comes
+/// back.
+fn apply_rows(scroll: &mut TranscriptScroll, old: &[ChatRow], new: &[ChatRow], change: RowsChange) {
+    // A scrollbar movement can arrive before the next render. Hear it before a row update
+    // decides whether the person still wants to follow the newest row.
+    scroll.sync_frame();
+    let count = new.len();
+    // The list and the old rows agree on how many there are, unless something replaced the rows
+    // without telling the list (the read-aloud pump does). A splice would then point into rows
+    // that are not there, so the list starts over at the newest row instead, as it always did.
+    let in_step = scroll.item_count() == old.len();
+    if change.steps_toggled && in_step {
+        // A step opened or shut in the middle of the thread adds or takes away rows there, and a
+        // list reset for that would carry the person off to the bottom of the thread, away from
+        // the very row they clicked. Only the rows that changed are replaced.
+        let (span, added) = changed_rows(old, new);
+        scroll.splice(span, added);
+    } else if change.thread_opened || just_sent(old, new) {
+        scroll.reset(count);
+    } else if count != scroll.item_count() {
+        if scroll.is_following() || !in_step {
+            scroll.reset(count);
+        } else {
+            splice_in_place(scroll, old, new);
+        }
+    } else if change.responding && count > 0 {
+        scroll.remeasure_items(count - 1..count);
+    }
+}
+
+/// Replace the rows that changed while the person reads further up the thread, keeping the row
+/// at the top of their view where it is, and as far into it. A splice keeps that place by
+/// itself unless the row is one of those replaced; then it is found again by its id, where a
+/// splice alone would put the view at the top of the rows replaced.
+fn splice_in_place(scroll: &mut TranscriptScroll, old: &[ChatRow], new: &[ChatRow]) {
+    let (span, added) = changed_rows(old, new);
+    let anchor = scroll.anchor();
+    let held = old
+        .get(anchor.item_ix)
+        .filter(|_| span.contains(&anchor.item_ix))
+        .map(|row| row.id.as_str());
+    scroll.splice(span, added);
+    if let Some(item_ix) = held.and_then(|id| new.iter().position(|row| row.id == id)) {
+        scroll.hold(ListOffset {
+            item_ix,
+            offset_in_item: anchor.offset_in_item,
+        });
+    }
+}
+
+/// Actions read as one compact sequence, not separate message bubbles. The scroller's
+/// default 32px message gap belongs only between ordinary transcript rows.
+fn transcript_row_gap(row: &ChatRow, next: Option<&ChatRow>) -> Pixels {
+    match next {
+        None => px(0.),
+        Some(next) if row.run.is_some() && next.run.is_some() => px(4.),
+        Some(next) if row.run.is_some() || next.run.is_some() => px(12.),
+        Some(_) => px(32.),
+    }
+}
+
+/// The first row of a routine's run in a thread: the instruction it opened with, which a replay
+/// names `{runId}-prompt` (opengrok-server `agui/history.rs`, `routine_prompt`), or else the first
+/// row of any message of that run.
+fn run_row(rows: &[ChatRow], run_id: &str) -> Option<usize> {
+    let prompt = format!("{run_id}-prompt");
+    rows.iter()
+        .position(|row| row.source_id == prompt)
+        .or_else(|| {
+            rows.iter()
+                .position(|row| row.source_id.starts_with(run_id))
+        })
+}
+
 /// Whether a picture belongs to the strip the row before it already holds. Pictures are one
 /// set when they came from the same turn with nothing but pictures between them — that is
 /// what makes a strip, rather than a column of full-width screens nobody scrolls past.
 fn joins_previous_set(rows: &[ChatRow], message_id: &str) -> bool {
     rows.last()
         .is_some_and(|last| !last.screenshots.is_empty() && last.source_id == message_id)
-}
-
-/// Phase lines under an assistant bubble, when Settings → Show turn timing
-/// is on and the harness sent a CUSTOM `run-timing` frame.
-fn timing_debug(state: &AppState, msg: &crate::state::Message) -> String {
-    if msg.is_me || !state.show_turn_timing {
-        return String::new();
-    }
-    msg.run_timing
-        .as_ref()
-        .map(|timing| timing.debug_lines().join("\n"))
-        .unwrap_or_default()
 }
 
 /// The replies in the open thread that wear a badge, as the feed draws them, oldest first: the
@@ -468,8 +605,24 @@ fn snapshot_rows(state: &AppState) -> Arc<Vec<ChatRow>> {
     // The one turn the thread would send again, if it has one. Asked once rather than per row,
     // and by id, because only the thread's last turn is the one a retry would be about.
     let retryable = state.retryable_turn();
+    // And the one the person's plan could not answer, which goes again on the server's keys.
+    let plan_failed = state.plan_failed_turn();
     let mut rows = Vec::new();
     for msg in &conv.messages {
+        // Saved quotes may have been truncated in the middle of Markdown. Project the
+        // original when available; leave the stored text and model context untouched.
+        let reply_preview = msg
+            .reply_to_id
+            .as_ref()
+            .and_then(|id| conv.messages.iter().find(|source| &source.id == id))
+            .map(|source| {
+                crate::reply_preview::preview(
+                    &source.content,
+                    !source.is_me && looks_like_markdown(&source.content),
+                    88,
+                )
+            })
+            .or_else(|| msg.reply_preview.clone());
         // A message the person hid is still here — it is what keeps the thread from fetching
         // its turn back off the server — but it is never painted again.
         if msg.hidden {
@@ -517,7 +670,12 @@ fn snapshot_rows(state: &AppState) -> Arc<Vec<ChatRow>> {
         } else {
             vec![ChatPart::Text(msg.content.clone())]
         };
-        let runs = RunLayout::new(&msg.id, &display, &state.expanded_steps);
+        let runs = RunLayout::new(
+            &msg.id,
+            &display,
+            &state.expanded_steps,
+            state.show_turn_timing,
+        );
         let mut text_buf = String::new();
         let mut ui_n = 0usize;
         let mut text_n = 0usize;
@@ -542,6 +700,7 @@ fn snapshot_rows(state: &AppState) -> Arc<Vec<ChatRow>> {
                         && text.trim() != STOPPED_TURN_NOTE
                         && !is_unsent_turn_note(&text),
                     status_retry: retryable.as_ref() == Some(&msg.id),
+                    status_send_on_server: plan_failed.as_ref() == Some(&msg.id),
                     content: SharedString::from(text.clone()),
                     status_line: Some(text),
                     ..ChatRow::slot(id, msg.id.clone())
@@ -553,8 +712,8 @@ fn snapshot_rows(state: &AppState) -> Arc<Vec<ChatRow>> {
                 is_me: msg.is_me,
                 timestamp: SharedString::from(msg.formatted_time()),
                 duration: SharedString::from(msg.formatted_duration().unwrap_or_default()),
-                timing_debug: SharedString::from(timing_debug(state, msg)),
                 queued: msg.is_me && state.is_send_queued(&msg.id),
+                waiting_for_mac: msg.is_me && state.is_send_waiting_for_mac(&msg.id),
                 is_native_speaking,
                 is_native_paused: state.native_tts.is_paused && is_native_speaking,
                 is_native_loading: state.native_tts.is_loading && is_native_speaking,
@@ -563,7 +722,7 @@ fn snapshot_rows(state: &AppState) -> Arc<Vec<ChatRow>> {
                 use_markdown: !msg.is_me && looks_like_markdown(&text),
                 show_footer: true,
                 tts_text: SharedString::from(text),
-                reply_preview: msg.reply_preview.clone(),
+                reply_preview: reply_preview.clone(),
                 caption: crate::state::routine_instruction_caption(conv, msg),
                 reaction: state.message_reactions.get(&msg.id).cloned(),
                 ..ChatRow::slot(id, msg.id.clone())
@@ -646,6 +805,21 @@ fn snapshot_rows(state: &AppState) -> Arc<Vec<ChatRow>> {
         {
             row.source_badge = Some(source.clone());
         }
+        // Keep the total with the final row's metadata, whether it ends in words or a card.
+        // Never attach a wordless message's total to the preceding message.
+        if !msg.is_me
+            && state.show_turn_timing
+            && let Some(total) = msg
+                .run_timing
+                .as_ref()
+                .and_then(crate::opengrok::TurnTiming::total_line)
+            && let Some(last) = rows.last_mut().filter(|row| row.source_id == msg.id)
+        {
+            last.turn_total = Some(total.into());
+            last.timestamp = msg.formatted_time().into();
+            // The turn's measured total replaces the older wall-clock duration here.
+            last.duration = "".into();
+        }
         // A person's files go on their message's last row of words, under the bubble. A message
         // of files alone gets a row of its own that is otherwise a message like any other: its
         // time, its toolbar (reply, delete), its queued line (#136).
@@ -674,11 +848,12 @@ fn snapshot_rows(state: &AppState) -> Arc<Vec<ChatRow>> {
                         is_native_loading: state.native_tts.is_loading && is_native_speaking,
                         timestamp: SharedString::from(msg.formatted_time()),
                         queued: state.is_send_queued(&msg.id),
+                        waiting_for_mac: state.is_send_waiting_for_mac(&msg.id),
                         show_footer: true,
                         // What Copy puts on the clipboard and what is read aloud: the files'
                         // names, the only words a files-alone message has.
                         tts_text: SharedString::from(names),
-                        reply_preview: msg.reply_preview.clone(),
+                        reply_preview: reply_preview.clone(),
                         reaction: state.message_reactions.get(&msg.id).cloned(),
                         files: files.clone(),
                         ..ChatRow::slot(text_row_id(&msg.id, 0), msg.id.clone())
@@ -688,6 +863,45 @@ fn snapshot_rows(state: &AppState) -> Arc<Vec<ChatRow>> {
         }
     }
     Arc::new(rows)
+}
+
+/// The rows the transcript is showing, kept the way `ChatTranscript`'s observer keeps them, for
+/// a test that drives a thread from `state.rs`: taken again from the state only when
+/// [`ChatFeedRev`] has moved. That rule decides what reaches the screen, so a change the
+/// fingerprint does not see is one the person never sees, however true it is in the state.
+#[cfg(test)]
+pub(crate) struct ShownFeed {
+    rev: ChatFeedRev,
+    rows: Arc<Vec<ChatRow>>,
+}
+
+#[cfg(test)]
+impl ShownFeed {
+    pub(crate) fn of(state: &AppState) -> Self {
+        Self {
+            rev: ChatFeedRev::from_state(state),
+            rows: snapshot_rows(state),
+        }
+    }
+
+    /// The state notified: the observer either returns early or takes the rows again.
+    pub(crate) fn observe(&mut self, state: &AppState) {
+        let rev = ChatFeedRev::from_state(state);
+        if rev != self.rev {
+            self.rev = rev;
+            self.rows = snapshot_rows(state);
+        }
+    }
+
+    /// The words on screen, one entry per row that has any: whose message the row is, what it
+    /// says, and whether it wears the queued line.
+    pub(crate) fn words(&self) -> Vec<(String, String, bool)> {
+        self.rows
+            .iter()
+            .filter(|row| !row.content.is_empty())
+            .map(|row| (row.source_id.clone(), row.content.to_string(), row.queued))
+            .collect()
+    }
 }
 
 #[derive(Clone)]
@@ -719,13 +933,14 @@ impl ChatPalette {
 /// The air the transcript keeps at either end: above the first bubble, and between the last
 /// one and the composer floating over it, on top of the composer's own height.
 ///
-/// `MessageScroller` gives its list this much as `py_2`, and the rows have to carry it
-/// instead, because the list must have no padding at all. GPUI measures the list's scroll
-/// twice and only one of the two counts that padding: the wheel reads the offset in the items'
-/// own space, where the floor is `items + padding - viewport`, while the mask that turns the
-/// wheel into an offset clamps against `items - viewport` and writes the clamped value back.
-/// Room held in the padding is therefore a teleport of exactly that much on the first scroll
-/// away from the bottom. Room held inside a row is part of `items` and both readings agree.
+/// `MessageScroller` gave its list this much as `py_2`. The transcript's own scroller gives its
+/// list none, and the rows carry it instead, because the list must have no padding at all. GPUI
+/// measures the list's scroll twice and only one of the two counts that padding: the wheel
+/// reads the offset in the items' own space, where the floor is `items + padding - viewport`,
+/// while the mask that turns the wheel into an offset clamps against `items - viewport` and
+/// writes the clamped value back. Room held in the padding is therefore a teleport of exactly
+/// that much on the first scroll away from the bottom. Room held inside a row is part of
+/// `items` and both readings agree.
 const TRANSCRIPT_EDGE_GAP: f32 = 8.0;
 
 /// The room a row keeps beneath itself, which only the last one has any of.
@@ -740,7 +955,9 @@ fn tail_room(ix: usize, row_count: usize, composer_height: Pixels) -> Option<Pix
 struct ChatTranscript {
     app_state: Entity<AppState>,
     input: Entity<MessageInput>,
-    scroller: Entity<MessageScrollerState>,
+    /// The list, and whether it keeps to the newest row: the person's decision, never the
+    /// list's (see `transcript_scroll`).
+    scroll: TranscriptScroll,
     rows: Arc<Vec<ChatRow>>,
     feed_rev: ChatFeedRev,
     last_conversation_id: Option<String>,
@@ -774,45 +991,41 @@ impl ChatTranscript {
                 app.active_conversation_id.clone(),
             )
         };
-        let scroller = cx.new(|cx| MessageScrollerState::new(rows.len(), cx));
+        let scroll = TranscriptScroll::new(rows.len());
         cx.observe(&state, |this, state, cx| {
             let (feed, rows) = {
                 let app = state.read(cx);
                 let feed = ChatFeedRev::from_state(app);
                 if this.feed_rev == feed {
+                    // The rows are the same, but a run of this very thread may have been asked
+                    // for from the routine's Run history.
+                    this.reveal_asked_run(&state, cx);
                     return;
                 }
                 (feed, snapshot_rows(app))
             };
-            let conv_changed = this.feed_rev.conversation_id != feed.conversation_id;
-            // A step opened or shut in the middle of the thread adds or takes away rows there,
-            // and a list reset for that would carry the person off to the bottom of the thread,
-            // away from the very row they clicked. Only the rows that changed are replaced.
-            let opened = (!conv_changed && this.feed_rev.expanded_steps != feed.expanded_steps)
-                .then(|| changed_rows(&this.rows, &rows));
-            let was = this.rows.len();
-            let is_ai_responding = feed.is_ai_responding;
-            this.rows = rows;
+            let thread_opened = this.feed_rev.conversation_id != feed.conversation_id;
+            let change = RowsChange {
+                thread_opened,
+                steps_toggled: !thread_opened
+                    && (this.feed_rev.expanded_steps != feed.expanded_steps
+                        || this.feed_rev.clocks != feed.clocks
+                        || this.feed_rev.show_turn_timing != feed.show_turn_timing),
+                responding: feed.is_ai_responding,
+            };
+            let old = std::mem::replace(&mut this.rows, rows);
             this.debug_mode = feed.debug_mode;
             this.can_read_aloud = feed.can_read_aloud;
             this.last_conversation_id = feed.conversation_id.clone();
             this.palette = ChatPalette::from_cx(cx);
             this.feed_rev = feed;
-            let count = this.rows.len();
-            this.scroller.update(cx, |scroller, cx| {
-                let old = scroller.item_count();
-                if let Some((span, added)) = opened.filter(|_| old == was) {
-                    scroller.splice(span, added, cx);
-                } else if conv_changed || count != old {
-                    scroller.reset(count, cx);
-                } else if is_ai_responding && count > 0 {
-                    scroller.remeasure_items(count - 1..count, cx);
-                }
-            });
+            apply_rows(&mut this.scroll, &old, &this.rows, change);
+            this.publish_tail(cx);
             if this.feed_rev.native_speaking_id.is_some() {
                 this.start_highlight_pump(cx);
             }
             this.recompute_find(false, cx);
+            this.reveal_asked_run(&state, cx);
             cx.notify();
         })
         .detach();
@@ -820,7 +1033,7 @@ impl ChatTranscript {
         let mut this = Self {
             app_state: state,
             input,
-            scroller,
+            scroll,
             rows,
             feed_rev,
             last_conversation_id,
@@ -859,12 +1072,18 @@ impl ChatTranscript {
         // The room belongs to the last row's own height, so the list is holding a measurement
         // of that row taken against the composer as it used to stand. Nothing else about the
         // row changed, so only that one is worth taking again.
-        self.scroller.update(cx, |scroller, cx| {
-            if let Some(last) = scroller.item_count().checked_sub(1) {
-                let _ = scroller.remeasure_items(last..last + 1, cx);
-            }
-        });
+        if let Some(last) = self.scroll.item_count().checked_sub(1) {
+            self.scroll.remeasure_items(last..last + 1);
+        }
         cx.notify();
+    }
+
+    /// Say whether the transcript follows its newest row, for a driver (see
+    /// [`AppState::transcript_following`]).
+    fn publish_tail(&self, cx: &mut Context<Self>) {
+        let following = self.scroll.is_following();
+        self.app_state
+            .update(cx, |state, _| state.set_transcript_following(following));
     }
 
     fn set_find_query(&mut self, query: String, cx: &mut Context<Self>) {
@@ -932,15 +1151,39 @@ impl ChatTranscript {
         cx.notify();
     }
 
+    /// Bring the routine's run that the person asked for from its Run history into view, once the
+    /// open thread has a row of it. A thread rebuilt from the server may not have it the first
+    /// time its rows are taken, so this is asked again each time they change; it is let go once
+    /// shown, or once the person is in another thread.
+    fn reveal_asked_run(&mut self, state: &Entity<AppState>, cx: &mut Context<Self>) {
+        let Some((thread_id, run_id)) = state.read(cx).reveal_run.clone() else {
+            return;
+        };
+        if self.last_conversation_id.as_deref() != Some(thread_id.as_str()) {
+            state.update(cx, |state, _| state.reveal_run = None);
+            return;
+        }
+        let Some(row) = run_row(&self.rows, &run_id) else {
+            return;
+        };
+        // Going to a run is the person going somewhere in the thread, as going to a find hit is.
+        self.scroll.scroll_to_item(row);
+        self.scroll.remeasure_items(row..row + 1);
+        self.publish_tail(cx);
+        state.update(cx, |state, _| state.reveal_run = None);
+        cx.notify();
+    }
+
     fn scroll_to_hit(&mut self, index: usize, cx: &mut Context<Self>) {
         let Some(hit) = self.find_hits.get(index) else {
             return;
         };
         let row = hit.row;
-        self.scroller.update(cx, |scroller, cx| {
-            scroller.scroll_to_item(row, cx);
-            let _ = scroller.remeasure_items(row..row + 1, cx);
-        });
+        // Going to a hit is the person going somewhere in the thread, so the transcript lets
+        // go of the newest row there, as it does for a step up.
+        self.scroll.scroll_to_item(row);
+        self.scroll.remeasure_items(row..row + 1);
+        self.publish_tail(cx);
     }
 
     fn arm_peek_release(&mut self, cx: &mut Context<Self>) {
@@ -1154,6 +1397,11 @@ impl ChatTranscript {
 impl Render for ChatTranscript {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sync_user_form_fields(window, cx);
+        // The scrollbar moves the list without telling anyone. What it did is read here, before
+        // the list is laid out again, and only a drag of it can take the newest row back.
+        if self.scroll.sync_frame() {
+            self.publish_tail(cx);
+        }
         let rows = self.rows.clone();
         let app_state = self.app_state.clone();
         let user_form_inputs = self.user_form_inputs.clone();
@@ -1223,9 +1471,10 @@ impl Render for ChatTranscript {
                 .inset_0()
             })
             .child(
-                MessageScroller::new(
+                TranscriptScroller::new(
                     "chat-messages",
-                    self.scroller.clone(),
+                    // The list, and whether it keeps to the newest row (see `transcript_scroll`).
+                    &self.scroll,
                     move |ix, window, cx| {
                         // Every row is laid out in the same centred column the transcript used to
                         // sit in, so bubbles and timestamps do not move — only the scrollbar did.
@@ -1314,6 +1563,28 @@ impl Render for ChatTranscript {
                                                     },
                                                 )
                                                 .child("Try again"),
+                                        )
+                                    })
+                                    // A turn the person's plan could not answer: the sentence says
+                                    // why, and the turn can go again on the server's paid keys,
+                                    // this once, without the person's message sent twice.
+                                    .when(row.status_send_on_server, |this| {
+                                        let state = app_state.clone();
+                                        this.child(
+                                            div()
+                                                .id(SEND_ON_SERVER)
+                                                .text_sm()
+                                                .text_color(palette.primary)
+                                                .cursor_pointer()
+                                                .on_mouse_down(
+                                                    MouseButton::Left,
+                                                    move |_, _, cx| {
+                                                        state.update(cx, |state, cx| {
+                                                            state.send_on_server(cx);
+                                                        });
+                                                    },
+                                                )
+                                                .child(SEND_ON_SERVER_LABEL),
                                         )
                                     })
                                     .into_any_element();
@@ -1423,7 +1694,7 @@ impl Render for ChatTranscript {
                                 .text_color(text_color)
                                 .timestamp(row.timestamp.to_string())
                                 .duration(row.duration.to_string())
-                                .timing_debug(row.timing_debug.to_string())
+                                .turn_total(row.turn_total.as_ref().map(ToString::to_string))
                                 .debug_mode(debug_mode)
                                 .can_read_aloud(can_read_aloud && show_footer)
                                 .is_native_speaking(row.is_native_speaking)
@@ -1434,6 +1705,7 @@ impl Render for ChatTranscript {
                                 .is_ai_loading(row.is_ai_loading)
                                 .is_cached(row.is_cached)
                                 .queued(row.queued)
+                                .waiting_for_mac(row.waiting_for_mac)
                                 .files(row.files.clone())
                                 .source_badge(row.source_badge.clone())
                                 .highlight_range(row.highlight_range.clone())
@@ -1473,36 +1745,74 @@ impl Render for ChatTranscript {
                             }
                             bubble.into_any_element()
                         };
+                        let row = &rows[ix];
+                        let body = row_body(ix, window, cx);
+                        let body = if !row.show_footer
+                            && let Some(total) = &row.turn_total
+                        {
+                            let peek = TimestampPeek::new(ts_peek, timestamps_ok);
+                            div()
+                                .relative()
+                                .w_full()
+                                .child(div().w_full().ml(px(-peek.shift)).child(body))
+                                .child(peek.rail(turn_metadata(&row.timestamp, total, cx)))
+                                .into_any_element()
+                        } else {
+                            body
+                        };
                         div()
                             .w_full()
                             .flex()
                             .justify_center()
                             .px_4()
+                            .pb(transcript_row_gap(&rows[ix], rows.get(ix + 1)))
                             // The transcript's own edges, carried by the rows that sit against
                             // them rather than by the list's padding (see `tail_room`).
-                            .when(ix == 0, |this| this.pt(px(TRANSCRIPT_EDGE_GAP)))
+                            .when(ix == 0, |this| {
+                                this.pt(px(crate::chrome::TITLE_BAR_H + TRANSCRIPT_EDGE_GAP))
+                            })
                             .when_some(tail_room(ix, rows.len(), composer_height), |this, room| {
                                 this.pb(room)
                             })
-                            .child(
-                                div()
-                                    .w_full()
-                                    .max_w(px(CHAT_CONTENT_MAX))
-                                    .child(row_body(ix, window, cx)),
-                            )
+                            .child(div().w_full().max_w(px(CHAT_CONTENT_MAX)).child(body))
                     },
                 )
-                // Straight under the title bar, which holds the chat's header.
-                .pt(px(20.0))
-                // No padding on the list. The room at both ends travels with the rows, so
-                // that the height of the items is the whole of the transcript and the two
-                // ways GPUI measures the scroll cannot disagree — see `TRANSCRIPT_EDGE_GAP`.
-                .with_list_style(StyleRefinement::default().py(px(0.)))
+                // Only the first row reserves room for the floating header; scrolled
+                // messages use the full viewport behind its fade.
                 // The chevron belongs over the chat, not behind the composer, so lift it off
                 // the scroller's floor by exactly what the composer covers; the rem the
                 // scroller already holds it by then reads from the composer's top edge.
-                .with_jump_button_style(StyleRefinement::default().mb(composer_height))
-                .with_jump_button_transition(Duration::ZERO),
+                .jump_lift(composer_height)
+                // Every step of the wheel is heard before the list moves by it: a step toward
+                // older messages lets go of the newest row, however small, and only the person
+                // takes it back (see `transcript_scroll`).
+                .on_wheel({
+                    let this = cx.entity().downgrade();
+                    move |event, line_height, _, cx| {
+                        let Some(this) = this.upgrade() else {
+                            return;
+                        };
+                        this.update(cx, |this, cx| {
+                            if this.scroll.wheel(event, line_height) {
+                                this.publish_tail(cx);
+                                cx.notify();
+                            }
+                        });
+                    }
+                })
+                .on_jump({
+                    let this = cx.entity().downgrade();
+                    move |_, cx| {
+                        let Some(this) = this.upgrade() else {
+                            return;
+                        };
+                        this.update(cx, |this, cx| {
+                            this.scroll.follow();
+                            this.publish_tail(cx);
+                            cx.notify();
+                        });
+                    }
+                }),
             )
     }
 }
@@ -1846,7 +2156,7 @@ impl Render for ChatView {
             .bg(theme.background)
             .on_mouse_down(MouseButton::Left, move |_, _, cx| {
                 app.update(cx, |state, cx| {
-                    if state.model_picker_open || state.avatar_editor_open {
+                    if state.model_picker.open || state.avatar_editor_open {
                         state.dismiss_popovers(cx);
                     }
                 });
@@ -1981,7 +2291,7 @@ impl Render for ChatView {
                                 let app = self.state.clone();
                                 move |_, _, cx| {
                                     app.update(cx, |state, cx| {
-                                        if state.model_picker_open || state.avatar_editor_open {
+                                        if state.model_picker.open || state.avatar_editor_open {
                                             state.dismiss_popovers(cx);
                                         }
                                     });
@@ -2039,13 +2349,35 @@ fn text_row_id(msg_id: &str, n: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ChatFeedRev, ChatRow, RunRow, ScreenshotSpec, TRANSCRIPT_EDGE_GAP, changed_rows,
-        joins_previous_set, snapshot_rows, tail_room, text_row_id,
+        ChatFeedRev, ChatRow, RowsChange, RunRow, ScreenshotSpec, TRANSCRIPT_EDGE_GAP, apply_rows,
+        changed_rows, joins_previous_set, just_sent, run_row, snapshot_rows, tail_room,
+        text_row_id,
     };
-    use crate::components::steps::step_key;
-    use crate::opengrok::{ChatPart, StepSpec};
+    use crate::components::steps::{step_key, timing_key};
+    use crate::components::transcript_scroll::TranscriptScroll;
+    use crate::opengrok::{ChatPart, StepSpec, TurnTiming};
     use crate::state::AppState;
-    use gpui_kit::px;
+    use gpui_kit::{ListOffset, px};
+
+    /// A line of a routine's Run history lands on the run's first row in the thread: the
+    /// instruction it opened with, or failing that the first row of anything the run said. A run
+    /// the thread does not hold yet has no row, and is waited for rather than guessed at.
+    #[test]
+    fn a_runs_line_lands_on_the_runs_first_row() {
+        let rows = [
+            ChatRow::slot("r0".into(), "client-q1".into()),
+            ChatRow::slot("r1".into(), "run_01a-prompt".into()),
+            ChatRow::slot("r2".into(), "run_01a-reply".into()),
+            ChatRow::slot("r3".into(), "run_02b-reply".into()),
+        ];
+        assert_eq!(run_row(&rows, "run_01a"), Some(1));
+        assert_eq!(
+            run_row(&rows, "run_02b"),
+            Some(3),
+            "no instruction row: its first"
+        );
+        assert_eq!(run_row(&rows, "run_03c"), None);
+    }
 
     /// The room is the last bubble's alone: give it to every row and the transcript would be
     /// mostly air, and the rows above the composer would each hold a composer's worth of it.
@@ -2144,7 +2476,16 @@ mod tests {
             arguments: format!("{{\"command\":\"echo {call_id}\"}}"),
             result: result.map(|(content, _)| content.to_string()),
             ok: result.map(|(_, ok)| ok),
+            took_ms: None,
         })
+    }
+
+    /// A step that came back, timed by this app or not.
+    fn timed_step(call_id: &str, took_ms: Option<u64>) -> ChatPart {
+        let ChatPart::Step(step) = step(call_id, Some(("ok", true))) else {
+            unreachable!("a step");
+        };
+        ChatPart::Step(StepSpec { took_ms, ..step })
     }
 
     fn one_reply(parts: Vec<ChatPart>) -> AppState {
@@ -2177,6 +2518,35 @@ mod tests {
         state
     }
 
+    #[test]
+    fn saved_reply_quotes_project_the_original_before_truncation() {
+        let mut state = one_reply(Vec::new());
+        let messages = &mut state.conversations[0].messages;
+        messages[0].content = "Time is **Thursday, October 1**.".into();
+        let mut reply = messages[0].clone();
+        reply.id = "m2".into();
+        reply.content = "Do it again".into();
+        reply.is_me = true;
+        reply.reply_to_id = Some("m1".into());
+        reply.reply_preview = Some("Time is **Thursday…".into());
+        messages.push(reply);
+        let rows = snapshot_rows(&state);
+        assert_eq!(
+            rows[1].reply_preview.as_deref(),
+            Some("Time is Thursday, October 1.")
+        );
+        assert_eq!(
+            state.conversations[0].messages[1].reply_preview.as_deref(),
+            Some("Time is **Thursday…")
+        );
+
+        state.conversations[0].messages[0].is_me = true;
+        assert_eq!(
+            snapshot_rows(&state)[1].reply_preview.as_deref(),
+            Some("Time is **Thursday, October 1**.")
+        );
+    }
+
     /// What each row is, in a word, so a test can say the feed in one line.
     fn feed(state: &AppState) -> Vec<String> {
         snapshot_rows(state)
@@ -2189,18 +2559,32 @@ mod tests {
                     ..
                 }) => format!("{count} steps {} {}", status.mark(), open_word(*open)),
                 Some(RunRow::Step {
-                    step, open, group, ..
+                    step,
+                    open,
+                    group,
+                    took,
+                    ..
                 }) => format!(
-                    "{}step {} {}",
+                    "{}step {} {}{}",
                     if group.is_some() { "  " } else { "" },
                     step.call_id,
-                    open_word(*open)
+                    open_word(*open),
+                    took.as_ref()
+                        .map(|took| format!(" · {took}"))
+                        .unwrap_or_default()
                 ),
-                Some(RunRow::Thought { open, group, .. }) => format!(
-                    "{}thought {}",
+                Some(RunRow::Thought {
+                    open, group, took, ..
+                }) => format!(
+                    "{}thought {}{}",
                     if group.is_some() { "  " } else { "" },
-                    open_word(*open)
+                    open_word(*open),
+                    took.as_ref()
+                        .map(|took| format!(" · {took}"))
+                        .unwrap_or_default()
                 ),
+                #[cfg(feature = "agent")]
+                Some(RunRow::Timing { total, .. }) => format!("timing {total} shut"),
                 None => format!("words {}", row.content),
             })
             .collect()
@@ -2208,6 +2592,70 @@ mod tests {
 
     fn open_word(open: bool) -> &'static str {
         if open { "open" } else { "shut" }
+    }
+
+    #[test]
+    fn timing_keeps_each_action_visible_and_each_detail_collapsed() {
+        let mut state = one_reply(vec![
+            ChatPart::Reasoning(crate::opengrok::ThoughtSpec {
+                text: "Look first.".into(),
+                took_ms: Some(5000),
+            }),
+            timed_step("read-1", Some(2000)),
+            timed_step("read-2", Some(3000)),
+            timed_step("search", Some(8000)),
+            timed_step("write", Some(4000)),
+            timed_step("command", Some(8000)),
+            ChatPart::Text("Done.".into()),
+        ]);
+        state.show_turn_timing = true;
+        state.conversations[0].messages[0].run_timing = crate::opengrok::TurnTiming::from_value(
+            &serde_json::json!({"total_ms":30000,"model_ms":[5000],"tool_wait_ms":25000}),
+        );
+        assert_eq!(
+            feed(&state),
+            [
+                "thought shut · 5s",
+                "step read-1 shut · 2s",
+                "step read-2 shut · 3s",
+                "step search shut · 8s",
+                "step write shut · 4s",
+                "step command shut · 8s",
+                "words Done."
+            ]
+        );
+        let rows = snapshot_rows(&state);
+        let gaps: Vec<_> = rows
+            .iter()
+            .enumerate()
+            .map(|(ix, row)| super::transcript_row_gap(row, rows.get(ix + 1)))
+            .collect();
+        assert_eq!(
+            gaps,
+            [px(4.), px(4.), px(4.), px(4.), px(4.), px(12.), px(0.)]
+        );
+        assert_eq!(super::transcript_row_gap(&rows[6], Some(&rows[6])), px(32.));
+        let rev = ChatFeedRev::from_state(&state);
+        let ChatPart::Reasoning(thought) = &mut state.conversations[0].messages[0].parts[0] else {
+            panic!("thought");
+        };
+        thought.took_ms = Some(6000);
+        assert!(
+            rev != ChatFeedRev::from_state(&state),
+            "a timing-only update repaints"
+        );
+        state.mark_steps_open(&[step_key("m1", "command")], true);
+        assert_eq!(feed(&state)[5], "step command open · 8s");
+        assert_eq!(feed(&state).last().map(String::as_str), Some("words Done."));
+        let rows = snapshot_rows(&state);
+        assert_eq!(
+            rows.last().unwrap().turn_total.as_deref(),
+            Some("30s total")
+        );
+        assert_eq!(
+            rows.iter().filter(|row| row.turn_total.is_some()).count(),
+            1
+        );
     }
 
     /// Steps with no words between them are one "N steps" row until it is opened, a thought
@@ -2290,6 +2738,125 @@ mod tests {
         assert!(rows.last().is_some_and(|row| row.status_failed));
     }
 
+    /// With Settings → Show turn timing on, each call this app timed says how long its answer
+    /// took at the end of its own row, and a call it could not time says nothing rather than a
+    /// guess. With the setting off, no row says it.
+    #[test]
+    fn each_call_s_time_is_at_the_end_of_its_own_row() {
+        let mut state = one_reply(vec![
+            ChatPart::Text("Let me look.".into()),
+            timed_step("c1", Some(1000)),
+            ChatPart::Text("Now the other one.".into()),
+            timed_step("c2", None),
+            ChatPart::Text("Done.".into()),
+        ]);
+        assert_eq!(
+            feed(&state),
+            vec![
+                "words Let me look.",
+                "step c1 shut",
+                "words Now the other one.",
+                "step c2 shut",
+                "words Done.",
+            ],
+            "the setting is off"
+        );
+        state.show_turn_timing = true;
+        assert_eq!(
+            feed(&state),
+            vec![
+                "words Let me look.",
+                "step c1 shut · 1s",
+                "words Now the other one.",
+                "step c2 shut",
+                "words Done.",
+            ]
+        );
+        // Open, it still says it: the time is on the line, not in what opening shows.
+        state.mark_steps_open(&[step_key("m1", "c1")], true);
+        assert_eq!(feed(&state)[1], "step c1 open · 1s");
+    }
+
+    /// A total belongs to the final reply row's metadata, not a separate transcript row,
+    /// even when the reply ends with a tool rather than words.
+    #[test]
+    fn a_reply_s_total_is_metadata_on_its_last_row() {
+        let mut state = one_reply(vec![
+            ChatPart::Text("Let me look.".into()),
+            timed_step("c1", Some(1000)),
+            ChatPart::Text("Done.".into()),
+            timed_step("c2", None),
+        ]);
+        state.conversations[0].messages[0].run_timing =
+            TurnTiming::from_value(&serde_json::json!({
+                "model_ms": [2000, 2000],
+                "tools": [{ "name": "shell", "ms": 1000 }],
+                "tool_wait_ms": 1000,
+                "auto_review_ms": 0,
+                "total_ms": 10000,
+                "tool_rounds": 1
+            }));
+        assert!(
+            !feed(&state).iter().any(|row| row.starts_with("timing")),
+            "the setting is off"
+        );
+
+        state.show_turn_timing = true;
+        let shut = snapshot_rows(&state);
+        assert_eq!(
+            shut.last().unwrap().turn_total.as_deref(),
+            Some("10s total")
+        );
+        assert_eq!(
+            shut.last().unwrap().timestamp,
+            state.conversations[0].messages[0].formatted_time()
+        );
+        assert!(shut.last().unwrap().duration.is_empty());
+        assert!(
+            shut[..shut.len() - 1]
+                .iter()
+                .all(|row| row.turn_total.is_none())
+        );
+        assert_eq!(
+            feed(&state),
+            vec![
+                "words Let me look.",
+                "step c1 shut · 1s",
+                "words Done.",
+                "step c2 shut",
+            ]
+        );
+
+        state.mark_steps_open(&[timing_key("m1")], true);
+        assert_eq!(
+            feed(&state).last().map(String::as_str),
+            Some("step c2 shut")
+        );
+        let open = snapshot_rows(&state);
+        assert_eq!(changed_rows(&shut, &open), (4..4, 0));
+        state.show_turn_timing = false;
+        assert!(
+            snapshot_rows(&state)
+                .iter()
+                .all(|row| row.turn_total.is_none())
+        );
+    }
+
+    #[test]
+    fn a_total_arriving_after_the_reply_remeasures_its_metadata_row() {
+        let mut state = one_reply(vec![ChatPart::Text("Done.".into())]);
+        state.show_turn_timing = true;
+        let before = snapshot_rows(&state);
+        state.conversations[0].messages[0].run_timing =
+            TurnTiming::from_value(&serde_json::json!({"total_ms":30000}));
+        let after = snapshot_rows(&state);
+        assert_eq!(after.len(), before.len(), "no separate total row");
+        assert_eq!(changed_rows(&before, &after), (0..1, 1));
+        assert_eq!(after[0].turn_total.as_deref(), Some("30s total"));
+        state.show_turn_timing = false;
+        assert_eq!(changed_rows(&after, &snapshot_rows(&state)), (0..1, 1));
+    }
+
     /// Opening a row in the middle of the thread replaces only the rows that changed, so the
     /// list keeps its place instead of being reset to the bottom.
     #[test]
@@ -2307,6 +2874,222 @@ mod tests {
         assert_eq!(changed_rows(&shut, &open), (1..2, 3));
         assert_eq!(changed_rows(&open, &shut), (1..4, 1));
         assert_eq!(changed_rows(&open, &open), (5..5, 0));
+    }
+
+    /// A message in the thread, said by the person or by the coworker.
+    fn said(id: &str, content: &str, is_me: bool) -> crate::state::Message {
+        crate::state::Message {
+            id: id.into(),
+            sender: if is_me { "Me" } else { "AI" }.into(),
+            content: content.into(),
+            sent_at: std::time::SystemTime::UNIX_EPOCH,
+            finished_at: None,
+            run_timing: None,
+            is_me,
+            reply_preview: None,
+            reply_to_id: None,
+            reply_is_me: false,
+            parts: Vec::new(),
+            run_id: None,
+            reply_source: None,
+            hidden: false,
+        }
+    }
+
+    /// Where the view begins: the row at its top, and how far into that row.
+    fn place(scroll: &TranscriptScroll) -> (usize, gpui_kit::Pixels) {
+        let anchor = scroll.anchor();
+        (anchor.item_ix, anchor.offset_in_item)
+    }
+
+    /// A transcript whose reader has gone back up the thread, to `row` and `into` pixels into it.
+    fn read_back(rows: usize, row: usize, into: f32) -> TranscriptScroll {
+        let mut scroll = TranscriptScroll::new(rows);
+        assert!(scroll.scroll_to_item(row));
+        scroll.hold(ListOffset {
+            item_ix: row,
+            offset_in_item: px(into),
+        });
+        scroll
+    }
+
+    /// The reply goes on below the person while they read further up: a step arrives, then the
+    /// words after it. Until this fix every row a turn added started the list over at the newest
+    /// row, and whoever had scrolled up was carried back down with it. Now the rows are spliced
+    /// in and the person stays on the row they were reading, as far into it as they were.
+    #[test]
+    fn rows_that_arrive_while_reading_back_leave_the_reader_where_they_are() {
+        let mut state = one_reply(vec![
+            ChatPart::Text("Let me look.".into()),
+            step("c1", Some(("a", true))),
+        ]);
+        let before = snapshot_rows(&state);
+        let mut scroll = read_back(before.len(), 0, 12.);
+
+        let reply = &mut state.conversations[0].messages[0].parts;
+        reply.push(step("c2", Some(("b", true))));
+        reply.push(ChatPart::Text("Done.".into()));
+        let after = snapshot_rows(&state);
+        assert!(after.len() > before.len(), "the turn added rows");
+        let responding = RowsChange {
+            responding: true,
+            ..RowsChange::default()
+        };
+        apply_rows(&mut scroll, &before, &after, responding);
+
+        assert!(!scroll.is_following(), "the reader was not taken back down");
+        assert!(!scroll.list().is_following_tail(), "nor was GPUI's list");
+        assert_eq!(
+            scroll.item_count(),
+            after.len(),
+            "the list has the new rows"
+        );
+        assert_eq!(
+            place(&scroll),
+            (0, px(12.)),
+            "the reader is where they were"
+        );
+
+        // The coworker's next message is not the person's, so it does not take them down either.
+        state.conversations[0]
+            .messages
+            .push(said("m2", "Anything else?", false));
+        let next = snapshot_rows(&state);
+        apply_rows(&mut scroll, &after, &next, responding);
+        assert!(!scroll.is_following());
+        assert_eq!(place(&scroll), (0, px(12.)));
+    }
+
+    /// At the newest row, rows arriving keep the person there, as they always did.
+    #[test]
+    fn at_the_newest_row_rows_arriving_keep_the_reader_there() {
+        let mut state = one_reply(vec![ChatPart::Text("Let me look.".into())]);
+        let before = snapshot_rows(&state);
+        let mut scroll = TranscriptScroll::new(before.len());
+        state.conversations[0]
+            .messages
+            .push(said("m2", "Found it.", false));
+        let after = snapshot_rows(&state);
+        apply_rows(&mut scroll, &before, &after, RowsChange::default());
+        assert!(scroll.is_following() && scroll.list().is_following_tail());
+        assert_eq!(scroll.item_count(), after.len());
+    }
+
+    /// The scrollbar moves GPUI's list before the transcript's next render hears about it. A
+    /// reply can add a row in between, and must leave the reader where the scrollbar put them.
+    #[test]
+    fn rows_arriving_before_the_next_frame_preserve_the_scrollbar_position() {
+        let before: Vec<_> = (0..12)
+            .map(|ix| ChatRow::slot(format!("row-{ix}"), format!("message-{ix}")))
+            .collect();
+        let mut after = before.clone();
+        after.push(ChatRow::slot("new-row".into(), "new-message".into()));
+        let mut scroll = TranscriptScroll::new(before.len());
+        // Height hints give the list scrollable content without drawing a window. Moving the
+        // list directly models the scrollbar's off-bottom result before render synchronizes it.
+        scroll.list().clone().with_uniform_item_height(px(100.));
+        scroll.list().scroll_to(ListOffset {
+            item_ix: 3,
+            offset_in_item: px(12.),
+        });
+        assert!(!scroll.list().is_following_tail());
+        assert!(scroll.is_following(), "the transcript has not rendered yet");
+
+        apply_rows(&mut scroll, &before, &after, RowsChange::default());
+
+        assert_eq!(place(&scroll), (3, px(12.)), "still on the row being read");
+        assert!(!scroll.is_following() && !scroll.list().is_following_tail());
+        assert_eq!(scroll.item_count(), after.len());
+    }
+
+    /// Streaming can grow a row without adding one. It still has to hear a scrollbar movement
+    /// before it publishes whether the transcript follows, so a later row cannot reset it.
+    #[test]
+    fn a_growing_reply_before_the_next_frame_hears_the_scrollbar_position() {
+        let mut state = one_reply(vec![ChatPart::Text("Let me look.".into())]);
+        let before = snapshot_rows(&state);
+        let mut scroll = TranscriptScroll::new(before.len());
+        scroll.list().clone().with_uniform_item_height(px(100.));
+        scroll.list().scroll_to(ListOffset {
+            item_ix: 0,
+            offset_in_item: px(12.),
+        });
+        state.conversations[0].messages[0].parts =
+            vec![ChatPart::Text("Let me look at the logs.".into())];
+        let after = snapshot_rows(&state);
+        assert_eq!(before.len(), after.len());
+
+        apply_rows(
+            &mut scroll,
+            &before,
+            &after,
+            RowsChange {
+                responding: true,
+                ..RowsChange::default()
+            },
+        );
+
+        assert!(!scroll.is_following() && !scroll.list().is_following_tail());
+        assert_eq!(place(&scroll), (0, px(12.)));
+    }
+
+    /// A message of the person's own takes them to the newest row from wherever they were
+    /// reading: they sent it, and whoever sends wants to see what comes back. So does opening
+    /// another thread.
+    #[test]
+    fn a_send_or_another_thread_takes_the_reader_to_the_newest_row() {
+        let mut state = one_reply(vec![ChatPart::Text("Let me look.".into())]);
+        let before = snapshot_rows(&state);
+        let mut scroll = read_back(before.len(), 0, 12.);
+        state.conversations[0]
+            .messages
+            .push(said("q2", "And the logs?", true));
+        let after = snapshot_rows(&state);
+        apply_rows(&mut scroll, &before, &after, RowsChange::default());
+        assert!(scroll.is_following() && scroll.list().is_following_tail());
+
+        let mut scroll = read_back(after.len(), 0, 12.);
+        let opened = RowsChange {
+            thread_opened: true,
+            ..RowsChange::default()
+        };
+        apply_rows(&mut scroll, &after, &before, opened);
+        assert!(scroll.is_following() && scroll.list().is_following_tail());
+    }
+
+    /// A send is a message of the person's own that is new on the end of the thread. The
+    /// coworker's words there are not one, and neither is the person's message seen again, as
+    /// when a queued send goes out and its row changes.
+    #[test]
+    fn a_send_is_a_new_message_of_the_persons_own_on_the_end() {
+        let row = |id: &str, is_me: bool| ChatRow {
+            is_me,
+            ..ChatRow::slot(id.into(), id.into())
+        };
+        let before = vec![row("m1", false)];
+        let sent = vec![row("m1", false), row("q2", true)];
+        assert!(just_sent(&before, &sent));
+        assert!(!just_sent(&before, &[row("m1", false), row("m2", false)]));
+        assert!(!just_sent(&sent, &sent));
+    }
+
+    /// The row at the top of the reader's view can be one of the rows a change replaces, as when
+    /// a line above it goes and a row arrives at the end in the same change. It is found again
+    /// by its id, so the view stays on it, as far into it as it was, where a plain splice would
+    /// have moved the view to the top of the rows replaced.
+    #[test]
+    fn the_row_being_read_keeps_its_place_when_the_rows_around_it_change() {
+        let rows = |ids: &[&str]| -> Vec<ChatRow> {
+            ids.iter()
+                .map(|id| ChatRow::slot(id.to_string(), "m1".into()))
+                .collect()
+        };
+        let before = rows(&["a", "note", "b", "c"]);
+        let after = rows(&["a", "b", "c", "d", "e"]);
+        let mut scroll = read_back(before.len(), 2, 30.);
+        apply_rows(&mut scroll, &before, &after, RowsChange::default());
+        assert!(!scroll.is_following());
+        assert_eq!(place(&scroll), (1, px(30.)), "still on b, thirty pixels in");
     }
 
     /// A driver's click opens the very row the feed draws: the keys the host's click hands the

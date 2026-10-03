@@ -1,0 +1,21 @@
+{
+  "method": "GET",
+  "path": "/models",
+  "status": 200,
+  "body": {
+    "models": [
+      {
+        "id": "xai/grok-4.6",
+        "points": null,
+        "source": "gateway",
+        "efforts": null,
+        "ownEffort": null
+      }
+    ],
+    "note": null,
+    "localProxy": {
+      "healthy": false,
+      "relayConnected": false
+    }
+  }
+}

@@ -2,6 +2,10 @@
 //! from jumping vertically when it collapses.
 
 pub const SIDEBAR_ROW: f32 = 54.0;
+/// Body typography shared by plain and Markdown chat bubbles (14px at the default scale).
+pub const CHAT_BODY_REM: f32 = 0.875;
+pub const CONTROL_ICON_PX: f32 = 20.0;
+pub const COMPOSER_ICON_PX: f32 = 24.0;
 pub const SIDEBAR_GAP: f32 = 4.0;
 pub const SIDEBAR_EXPANDED: f32 = 280.0;
 pub const SIDEBAR_COLLAPSED: f32 = 88.0;
@@ -228,6 +232,20 @@ pub fn chrome_floats(window_width: f32) -> bool {
     is_narrow_viewport(window_width)
 }
 
+/// A floating pane owns the next outside click; a docked pane does not.
+pub fn floating_chrome_needs_scrim(
+    window_width: f32,
+    sidebar_hidden: bool,
+    _sidebar_collapsed: bool,
+    right_open: bool,
+) -> bool {
+    chrome_floats(window_width) && (right_open || !sidebar_hidden)
+}
+
+pub fn header_sidebar_toggle_visible(sidebar_hidden: bool) -> bool {
+    sidebar_hidden
+}
+
 pub fn chat_column_width(
     window_width: f32,
     hidden: bool,
@@ -379,6 +397,30 @@ fn shipped_shape_hash(value: &str) -> u32 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn every_visible_floating_sidebar_owns_the_outside_click() {
+        for collapsed in [false, true] {
+            assert!(super::floating_chrome_needs_scrim(
+                720., false, collapsed, false
+            ));
+            assert!(!super::floating_chrome_needs_scrim(
+                720., true, collapsed, false
+            ));
+            assert!(!super::floating_chrome_needs_scrim(
+                1200., false, collapsed, false
+            ));
+            assert!(super::floating_chrome_needs_scrim(
+                720., true, collapsed, true
+            ));
+        }
+    }
+
+    #[test]
+    fn the_header_toggle_only_restores_a_hidden_sidebar() {
+        assert!(super::header_sidebar_toggle_visible(true));
+        assert!(!super::header_sidebar_toggle_visible(false));
+    }
+
     use super::*;
 
     #[test]

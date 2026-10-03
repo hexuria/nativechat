@@ -1,0 +1,35 @@
+{
+  "method": "GET",
+  "path": "/schedules",
+  "status": 200,
+  "body": [
+    {
+      "id": "sched_0199bb4e-0000-7000-8000-000000000001",
+      "coworkerId": "cw_0199bb4e-0000-7000-8000-000000000002",
+      "name": "Standup",
+      "cron": "0 0 9 * * MON-FRI",
+      "prompt": "post the standup",
+      "kind": "cron",
+      "active": true,
+      "nextDueMs": 1790000000000,
+      "runLimits": {
+        "maxRounds": null,
+        "maxComputerRounds": null,
+        "maxWallMs": null
+      },
+      "lastRun": {
+        "runId": "run_0199bb4e-0000-7000-8000-000000000003",
+        "status": "finished",
+        "startedAtMs": 1790000001000,
+        "finishedAtMs": 1790000002000,
+        "summary": "Routine Standup ran: nothing to do",
+        "cause": "bot",
+        "by": {
+          "coworkerId": "cw_0199bb4e-0000-7000-8000-000000000004",
+          "name": "Luna"
+        }
+      },
+      "tz": "UTC"
+    }
+  ]
+}

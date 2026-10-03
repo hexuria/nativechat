@@ -31,6 +31,7 @@ agent = ["dep:gpui-agent"]
 
 [dependencies]
 gpui-kit = "0.6"
+markdown = "1.0"
 # Grapheme boundaries for the composer's caret and deletes (#40): one press of Backspace is one
 # thing a person sees, an emoji with its modifiers or a letter with its accent.
 unicode-segmentation = "1.12"
@@ -63,6 +64,13 @@ directories = "6"
 uuid = { version = "1.19.0", features = ["v4", "v7", "serde", "js"] }
 sqlx = { version = "0.9", features = ["runtime-tokio", "sqlite", "uuid"] }
 chrono = "0.4.42"
+# This computer's IANA time zone, which the account keeps for its routines' default
+# (opengrok-server PR #322). Already in the tree under chrono; asked of the system each time, so a
+# zone changed while the app runs is the one it reads.
+iana-time-zone = "0.1"
+# The cron parser opengrok-server runs a routine's line with, at the version it pins, so the wake
+# editor's next-run time and its refusals are the server's and cannot drift from them.
+cron = "=0.17.0"
 objc = "0.2"
 cocoa = "0.27"
 block = "0.1"
@@ -72,6 +80,7 @@ totp-rs = { version = "6", features = ["otpauth"] }
 zip = { version = "8", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
+gpui-kit = { version = "0.6", features = ["test-support"] }
 wiremock = "0.6"
 tokio = { version = "1.36", features = ["full", "test-util"] }
 # A real folder on disk, for the one part of this app that reads the person's own files: a

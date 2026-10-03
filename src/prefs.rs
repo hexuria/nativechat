@@ -8,6 +8,17 @@ use std::path::{Path, PathBuf};
 
 const ON_SEND: &str = "on_send";
 const SHOW_TURN_TIMING: &str = "show_turn_timing";
+const RELAY: &str = "relay";
+
+/// The relay, as this Mac keeps it: where this Mac's opencodex listens. The key for opencodex is in
+/// the Keychain (`crate::relay_key`), never here. Whether the relay is on is no pref: it is this
+/// computer's own switch on the server, on its row of `GET /local-exec/daemon`. An `onFor` an older
+/// build saved is left behind: it is read by nothing, and the next save does not write it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RelayPrefs {
+    /// opencodex's address as saved, or `None` for where it listens unless told otherwise.
+    pub address: Option<String>,
+}
 
 pub fn prefs_path(data_dir: &Path) -> PathBuf {
     data_dir.join("prefs.json")
@@ -53,6 +64,39 @@ pub fn save_show_turn_timing(data_dir: &Path, on: bool) {
 pub fn save_show_turn_timing_to(path: &Path, on: bool) {
     let mut prefs = read_object(path);
     prefs.insert(SHOW_TURN_TIMING.to_string(), on.into());
+    write_object(path, prefs);
+}
+
+pub fn load_relay(data_dir: &Path) -> RelayPrefs {
+    load_relay_from(&prefs_path(data_dir))
+}
+
+pub fn load_relay_from(path: &Path) -> RelayPrefs {
+    let prefs = read_object(path);
+    let field = |key: &str| {
+        prefs
+            .get(RELAY)
+            .and_then(|relay| relay.get(key))
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    };
+    RelayPrefs {
+        address: field("address"),
+    }
+}
+
+pub fn save_relay(data_dir: &Path, relay: &RelayPrefs) {
+    save_relay_to(&prefs_path(data_dir), relay);
+}
+
+pub fn save_relay_to(path: &Path, relay: &RelayPrefs) {
+    let mut prefs = read_object(path);
+    prefs.insert(
+        RELAY.to_string(),
+        serde_json::json!({ "address": relay.address }),
+    );
     write_object(path, prefs);
 }
 
@@ -133,6 +177,44 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
         assert_eq!(value["on_send"], "steer");
         assert_eq!(value["later_build"]["x"], 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The relay keeps its opencodex address beside the other prefs without touching them, and
+    /// keeps no switch: an `onFor` an older build saved is read by nothing and is gone with the
+    /// next save.
+    #[test]
+    fn the_relay_keeps_its_address_and_no_switch() {
+        let dir = scratch("relay");
+        let path = prefs_path(&dir);
+        assert_eq!(load_relay_from(&path), RelayPrefs::default(), "no file yet");
+        save_on_send_to(&path, OnSend::Steer);
+        let kept = RelayPrefs {
+            address: Some("http://127.0.0.1:9090".into()),
+        };
+        save_relay_to(&path, &kept);
+        assert_eq!(load_relay_from(&path), kept);
+        assert_eq!(
+            load_on_send_from(&path),
+            OnSend::Steer,
+            "the other prefs stay"
+        );
+        save_relay_to(&path, &RelayPrefs::default());
+        assert_eq!(load_relay_from(&path), RelayPrefs::default());
+
+        std::fs::write(
+            &path,
+            r#"{"relay":{"onFor":"acc_1","address":"http://127.0.0.1:9091"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            load_relay_from(&path).address.as_deref(),
+            Some("http://127.0.0.1:9091"),
+            "an older build's file reads"
+        );
+        save_relay_to(&path, &load_relay_from(&path));
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(!raw.contains("onFor"), "{raw}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -10,7 +10,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::inference::InferenceKind;
+use super::inference::{HELD_FOR_RELAY_OFFLINE, TurnSource};
 
 /// Writes that name another number are refused unread. Missing `v` is v1.
 pub const PAYLOAD_V: u32 = 1;
@@ -49,27 +49,44 @@ pub struct PendingUserMessage {
     pub drained_at_ms: Option<i64>,
     #[serde(default)]
     pub drained_run_id: Option<String>,
-    /// The door the send was queued with, `gateway` or `local_proxy`: what the composer's chip
-    /// showed when it was held. Present only when the send named one; absent, the account's
-    /// setting decides, which is not the row's to say. The server keeps it from the write that
+    /// The door the send was queued with, `gateway` or `local_proxy`: the Bot's own when it was
+    /// held. Present only when the send named one; absent, the server goes by the Bot's door or
+    /// the account's, which is not the row's to say. The server keeps it from the write that
     /// queued the send (`inferenceSource`, the word `forwardedProps.inferenceSource` is on a live
     /// turn) and honours it with the turn's precedence when the row drains, here or on another
     /// machine. Agreed with opengrok-server 2026-09-30 and built in its #294 (`message_json`,
     /// `WriteBody` and `consume_for_turn` in `crates/opengrok-server/src/agui/pending.rs`, the
-    /// column in `crates/opengrok-store/src/pending.rs`), whose recording the ledger reads. Kept as the word sent and read through
+    /// column in `crates/opengrok-store/src/pending.rs`), whose recording the ledger reads. With
+    /// the Mac relay a send may name its way to the plan too, and the row keeps the door as
+    /// `{"kind", "via"}` (opengrok-server #292: server main cad36fd (#303, after #298), pin
+    /// 47a5d6b). Kept as sent, the bare word or the object, and read through
     /// [`Self::inference_source`], so one row's word never fails the queue.
     #[serde(default)]
-    pub inference_source: Option<String>,
+    pub inference_source: Option<Value>,
+    /// Why the server is holding this send rather than letting it go: `relay_offline` while the
+    /// turn it names goes through the person's Mac and no Mac holds the relay (opengrok-server
+    /// #292: `Held` in `crates/opengrok-server/src/agui/pending.rs`, server main cad36fd (#303,
+    /// after #298), pin 47a5d6b), on a snapshot and on the row a held fire
+    /// is answered with. Absent otherwise. Kept as sent and read through [`Self::waits_for_mac`],
+    /// so a word in a shape this app does not expect never fails the queue.
+    #[serde(default)]
+    pub held_for: Option<Value>,
 }
 
 impl PendingUserMessage {
     /// The door this send was queued with. A row that names none, or a door this app cannot
     /// name, is `None`: the turn that fires it then names none either, and the server goes by
     /// the row's own word or the account's setting.
-    pub fn inference_source(&self) -> Option<InferenceKind> {
+    pub fn inference_source(&self) -> Option<TurnSource> {
         self.inference_source
-            .as_deref()
-            .and_then(InferenceKind::from_word)
+            .as_ref()
+            .and_then(TurnSource::from_value)
+    }
+
+    /// The server is holding this send until a Mac holds the relay again: its queue line says
+    /// it waits for the person's Mac rather than for the coworker.
+    pub fn waits_for_mac(&self) -> bool {
+        self.held_for.as_ref().and_then(Value::as_str) == Some(HELD_FOR_RELAY_OFFLINE)
     }
 
     /// The bubble this row is about. NativeChat's id is `clientMessageId`; a
@@ -227,14 +244,15 @@ pub struct PendingWrite {
     pub recipe_values: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub skill_id: Option<String>,
-    /// The door the send was queued with, as the composer's chip showed it: the row's
+    /// The door the send was queued with, the Bot's own as it was sent: the row's
     /// `inferenceSource` (opengrok-server #294: `WriteBody.inference_source` in
-    /// `crates/opengrok-server/src/agui/pending.rs`). An edit
-    /// carries it too, so the row matches the hold whichever machine queued it. Left out when no
-    /// chip was drawn: the account's setting decides then, and an edit that leaves it out keeps
-    /// the row's.
+    /// `crates/opengrok-server/src/agui/pending.rs`), the bare word or, naming a way to the plan,
+    /// `{"kind", "via"}` (#292: server main cad36fd (#303, after #298), pin 47a5d6b). An edit
+    /// carries it too, so the row matches the hold whichever machine queued it. Left out for a
+    /// Bot that follows the account's door: the server decides then, and an edit that leaves it
+    /// out keeps the row's.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub inference_source: Option<InferenceKind>,
+    pub inference_source: Option<TurnSource>,
 }
 
 impl PendingWrite {
@@ -245,7 +263,7 @@ impl PendingWrite {
         recipe_id: Option<String>,
         recipe_values: Option<Value>,
         skill_id: Option<String>,
-        inference_source: Option<InferenceKind>,
+        inference_source: Option<TurnSource>,
     ) -> Self {
         Self {
             v: PAYLOAD_V,
@@ -265,7 +283,7 @@ impl PendingWrite {
 
     /// An edit of a held send: its new words, and the door it was held with when it has one.
     /// Every other field is left out, and the server keeps the row's.
-    pub fn edit(content: String, inference_source: Option<InferenceKind>) -> Self {
+    pub fn edit(content: String, inference_source: Option<TurnSource>) -> Self {
         Self {
             v: PAYLOAD_V,
             content: Some(content),
@@ -309,6 +327,7 @@ impl PendingMutation {
 
 #[cfg(test)]
 mod tests {
+    use super::super::inference::{InferenceKind, Via};
     use super::*;
     use serde_json::json;
 
@@ -387,15 +406,19 @@ mod tests {
         assert!(body.get("inferenceSource").is_none(), "{body}");
     }
 
-    /// A send queued while the composer's chip showed a door carries it to the server as the
-    /// word a live turn names it by, so a machine that drains the row asks through that door.
-    /// An edit carries the hold's door; one with none leaves it out, and the server keeps the
-    /// row's.
+    /// A send queued while the Bot had a door of its own carries it to the server as a live
+    /// turn names it, so a machine that drains the row asks through that door: the bare word,
+    /// or with the relay `{"kind", "via"}`. An edit carries the hold's door; one with none
+    /// leaves it out, and the server keeps the row's.
     #[test]
     fn a_queued_send_names_the_door_it_was_queued_with() {
-        for (kind, word) in [
-            (InferenceKind::LocalProxy, "local_proxy"),
-            (InferenceKind::Gateway, "gateway"),
+        for (door, sent) in [
+            (TurnSource::plan(None), json!("local_proxy")),
+            (TurnSource::GATEWAY, json!("gateway")),
+            (
+                TurnSource::plan(Some(Via::Mac)),
+                json!({"kind": "local_proxy", "via": "mac"}),
+            ),
         ] {
             let body = serde_json::to_value(PendingWrite::enqueue(
                 "later".into(),
@@ -404,10 +427,10 @@ mod tests {
                 None,
                 None,
                 None,
-                Some(kind),
+                Some(door),
             ))
             .expect("json");
-            assert_eq!(body["inferenceSource"], word, "{body}");
+            assert_eq!(body["inferenceSource"], sent, "{body}");
         }
         let patch =
             serde_json::to_value(PendingWrite::content_patch("instead".into())).expect("json");
@@ -415,12 +438,21 @@ mod tests {
         // An edit carries the door the send was held with, and only that beside the words.
         let edit = serde_json::to_value(PendingWrite::edit(
             "instead".into(),
-            Some(InferenceKind::LocalProxy),
+            Some(InferenceKind::LocalProxy.into()),
         ))
         .expect("json");
         assert_eq!(
             edit,
             json!({ "v": 1, "content": "instead", "inferenceSource": "local_proxy" })
+        );
+        let through_the_mac = serde_json::to_value(PendingWrite::edit(
+            "instead".into(),
+            Some(TurnSource::plan(Some(Via::Mac))),
+        ))
+        .expect("json");
+        assert_eq!(
+            through_the_mac["inferenceSource"],
+            json!({"kind": "local_proxy", "via": "mac"})
         );
     }
 
@@ -456,6 +488,9 @@ mod tests {
                 row(None),
                 row(Some(Value::Null)),
                 row(Some(json!("byok"))),
+                row(Some(json!({"kind": "local_proxy", "via": "mac"}))),
+                row(Some(json!({"kind": "local_proxy", "via": "helper"}))),
+                row(Some(json!(["local_proxy"]))),
             ],
             "pendingEvents": [
                 custom_event("snapshot", Some(row(Some(json!("local_proxy"))))),
@@ -463,7 +498,7 @@ mod tests {
             ]
         }))
         .expect("one row's word never fails the queue");
-        let doors: Vec<Option<InferenceKind>> = list
+        let doors: Vec<Option<TurnSource>> = list
             .pending_user_messages
             .iter()
             .map(PendingUserMessage::inference_source)
@@ -471,19 +506,45 @@ mod tests {
         assert_eq!(
             doors,
             vec![
-                Some(InferenceKind::LocalProxy),
-                Some(InferenceKind::Gateway),
+                Some(TurnSource::plan(None)),
+                Some(TurnSource::GATEWAY),
                 None,
                 None,
-                None
+                None,
+                Some(TurnSource::plan(Some(Via::Mac))),
+                None,
+                None,
             ]
         );
-        let live: Vec<Option<InferenceKind>> = list
+        let live: Vec<Option<TurnSource>> = list
             .live_messages()
             .iter()
             .map(PendingUserMessage::inference_source)
             .collect();
-        assert_eq!(live, vec![Some(InferenceKind::LocalProxy), None]);
+        assert_eq!(live, vec![Some(TurnSource::plan(None)), None]);
+    }
+
+    /// A row the server holds for the person's Mac says so (`heldFor: "relay_offline"`, as
+    /// opengrok-server PR #298 records it); any other row, and any other word, is not waiting for
+    /// it.
+    #[test]
+    fn a_row_held_for_the_mac_says_so() {
+        let row = |held_for: Option<Value>| -> PendingUserMessage {
+            let mut row = json!({"id": "pum_1", "content": "later", "clientMessageId": "m_1"});
+            if let Some(held_for) = held_for {
+                row["heldFor"] = held_for;
+            }
+            serde_json::from_value(row).expect("a row")
+        };
+        assert!(row(Some(json!("relay_offline"))).waits_for_mac());
+        for other in [
+            None,
+            Some(Value::Null),
+            Some(json!("something_else")),
+            Some(json!({"why": "relay_offline"})),
+        ] {
+            assert!(!row(other.clone()).waits_for_mac(), "{other:?}");
+        }
     }
 
     #[test]

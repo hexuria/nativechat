@@ -8,31 +8,35 @@ use crate::config::Config;
 /// The routine editor's schedule and the cron line it becomes. Re-exported because every
 /// caller reads it as part of a routine, and a routine is a thing on `AppState`.
 pub use crate::cron_spec::{
-    ScheduleDayKind, ScheduleNotCron, ScheduleSpec, ScheduleUiMode, ScheduleUnit,
+    ScheduleDayKind, ScheduleNotCron, ScheduleSpec, ScheduleUiMode, ScheduleUnit, WakeTab,
 };
 use crate::opengrok::{
     Account, ActivityTick, AguiMessage, ApprovalSpec, BotActivity, BoxHandoffReply,
     BoxHandoffResolution, BoxShareScope, ChatPart, ChoiceCard, ComputerHandoffStatus,
-    ConnectedComputer, Coworker, CoworkerComputer, CoworkerPatch, EFFORT_INHERIT, Failure,
-    FormResolution, FormSpec, ImageVisibility, InferenceKind, InferenceSource,
-    InferenceSourceUpdate, LocalExecMode, LocalExecPolicy, LocalExecResolution, ModelCatalogue,
-    ModelEntry, NewSchedule, NewSkill, OpenGrokClient, OpenGrokError, PendingCustom, PendingOp,
-    PendingUserMessage, PendingWrite, ProfileUpdate, ProxyKey, QueuedApproval, RecipeDetail,
-    RecipeKind, RecipeParameter, RecipeRun, RecipeRunResult, RecipeShareTarget, RecipeStep,
-    RecipeSummary, ReplyQuote, ReplySource, RunCause, RunRecipeResponse, RunReplay,
-    SKILL_BODY_CHARS, SKILL_BUNDLE_FILES, SKILL_BUNDLE_LIMIT, SaveLoginSpec, ScheduleEdit,
-    ScheduleKind, ScheduleRow, ScheduleRun, ScheduleRunStatus, ScreenshotSpec, SkillDetail,
-    SkillFile, SkillPatch, SkillSource, SkillSummary, ThreadListing, ThreadReplay, ThreadRun,
-    ToolCallTracker, TurnAssembler, TurnRecipe, TurnTiming, USER_FORM_SERVER_FILL_AVAILABLE,
-    Unreachable, UserFormDismissMode, UserFormHttpSettle, UserFormValues, UserFormVerb,
-    WAITING_FOR_YOU, activity_from_replay, approval_summary, box_handoff_resolve_entry_id,
-    collapse_computer_roster, command_from_args, command_from_replay_events, deeds_from_replay,
-    enrol_this_machine, env_egress_tunnel_enabled, host_egress_tunnel_available,
-    host_egress_tunnel_flag, keep_local_save_offer, persons_messages,
-    place_hitl_cards_in_document_order, policy_answer, reads_as_gateway_unreachable, retry_enqueue,
-    save_login_from_local, serve_local_exec, stamp_duration, stored_machine_id, tool_standin,
+    ConnectedComputer, Coworker, CoworkerComputer, CoworkerPatch, CoworkerSource, DaemonMachine,
+    Enrolment, Failure, FormResolution, FormSpec, ImageVisibility, InferenceKind, InferenceSource,
+    InferenceSourceUpdate, LocalExecMode, LocalExecPolicy, LocalExecResolution, LocalExecStopped,
+    ModelCatalogue, ModelEntry, ModelPick, NewBotDefault, NewSchedule, NewSkill, OpenGrokClient,
+    OpenGrokError, PendingCustom, PendingOp, PendingUserMessage, PendingWrite, PlanFallback,
+    ProfileUpdate, QueuedApproval, RecipeDetail, RecipeKind, RecipeParameter, RecipeRun,
+    RecipeRunResult, RecipeShareTarget, RecipeStep, RecipeSummary, RelayHandle, RelayKey,
+    RelayReport, RelayStatus, RelayTarget, RelayTimings, ReplyQuote, ReplySource, RunCause,
+    RunErrorCode, RunRecipeResponse, RunReplay, SKILL_BODY_CHARS, SKILL_BUNDLE_FILES,
+    SKILL_BUNDLE_LIMIT, SaveLoginSpec, ScheduleEdit, ScheduleKind, ScheduleRow, ScheduleRun,
+    ScheduleRunStatus, ScreenshotSpec, SkillDetail, SkillFile, SkillPatch, SkillSource,
+    SkillSummary, ThreadListing, ThreadReplay, ThreadRun, ToolCallTracker, TurnAssembler,
+    TurnRecipe, TurnSource, TurnTiming, USER_FORM_SERVER_FILL_AVAILABLE, Unreachable,
+    UserFormDismissMode, UserFormHttpSettle, UserFormValues, UserFormVerb, Via, WAITING_FOR_YOU,
+    activity_from_replay, approval_summary, box_handoff_resolve_entry_id, collapse_computer_roster,
+    command_from_args, command_from_replay_events, deeds_from_replay, enrol_this_machine,
+    env_egress_tunnel_enabled, host_egress_tunnel_available, host_egress_tunnel_flag,
+    keep_local_save_offer, persons_messages, place_hitl_cards_in_document_order, policy_answer,
+    reads_as_gateway_unreachable, retry_enqueue, save_login_from_local, serve_local_exec,
+    stamp_duration, start_relay, stored_machine_id, tool_standin,
 };
+use crate::opengrok::{FrameArrivals, keep_call_times};
 use crate::reachability::Reachability;
+use crate::relay_key::RelayKeyStore;
 use crate::send_policy::{Busy, OnSend, SendPlan, plan_send};
 use crate::services::database::{
     ChatMessage, ChatSession, DatabaseService, MessagePart, ReplyRef, SaveStamp,
@@ -309,134 +313,107 @@ impl AccountConnections {
     }
 }
 
-/// Settings → Reply source, and what the composer's chip defaults from: where the server keeps
-/// the account's replies paid from, and what the person has picked on the page and not saved.
+/// The account's reply source as the server keeps it, whose kind is the door every Bot that has
+/// picked none of its own follows, and this computer's half of the relay as the person has changed
+/// it on its card in Settings → Computer and not saved. Settings → General's Default models read
+/// and change the same setting.
 ///
 /// The setting is the server's and lives nowhere else: this app never keeps it, and never calls a
-/// model either way. What the page shows as kept is only ever what the server last said, from a
-/// read or from its answer to a Save. A pick waits on the page, marked unsaved, until Save sends
-/// the door and whatever on the page differs from what the server keeps (a field left alone is
-/// left out, and the server keeps it); a Save the server refuses leaves the kept setting as it
-/// was, with the server's words under Save and the picks still there to fix. Nothing here is
-/// written to disk.
+/// model either way. What the card shows as kept is only ever what the server last said. Of it,
+/// the app changes only the way to the plan, which a computer's relay switch points at the relay as
+/// it goes on ([`AppState::begin_relay_change`]): not the door or the plan's model (a Bot's model,
+/// and with it its door, is picked on its card in its settings), not the plan on the server's own
+/// machine, whose address and key the server keeps as they are, and never whether the relay is on:
+/// that is each computer's own switch (`PATCH /local-exec/daemon/{machine_id}`), and the account's
+/// `relayEnabled` is read from them, so no `PUT` carries it. What else this card changes is this
+/// computer's: opencodex's address and key for the relay, which wait on the card, marked unsaved,
+/// until Save keeps them here. Nothing here is written to disk.
 ///
 /// Not `Clone`: it can hold a key the person typed, and nothing copies that. The gpui-agent tree
 /// takes [`Self::without_key`].
 #[derive(Debug, Default, PartialEq)]
 pub struct ReplySourceSettings {
-    /// What `GET /account/inference-source` last said, or the last Save's answer. `None` until it
-    /// has been asked since sign-in.
+    /// What `GET /account/inference-source` last said. `None` until it has been asked since
+    /// sign-in.
     pub kept: Option<ReplySourceRead>,
-    /// The door picked on the page and not saved. `None` shows the kept one.
-    pub kind_pick: Option<InferenceKind>,
-    /// The proxy URL as typed and not saved. `None` shows the kept one, or the default; an empty
-    /// one is the address taken away.
-    pub url_draft: Option<String>,
-    /// The model picked and not saved: `None` shows the kept one, `Some(None)` is the model taken
-    /// away, and `Some(Some(id))` one picked from the plan's list.
-    pub model_pick: Option<Option<String>>,
-    /// A key for the proxy, typed and not sent. It goes with the next Save and is dropped the
-    /// moment that Save leaves, whatever becomes of it, and when the page is left or the person
-    /// signs out before a Save: the server keeps it, and `hasApiKey` is all that ever comes back.
-    /// Never on disk, never in a driver's tree, never printed, never cloned.
-    pub key_draft: Option<ProxyKey>,
-    /// Remove key was pressed: the next Save asks the server to forget the key it holds.
-    pub remove_key: bool,
-    /// A key typed here is gone and the server may not have it: it went with a Save that was
-    /// refused or never answered, or the page was left before a Save. Dropping it is right, since
-    /// nothing here keeps a key; the page says so, and asks for it again, until one is typed or a
-    /// Save is kept.
-    pub retype_key: bool,
-    /// The app's server runs on this Mac: its address is loopback. The server calls opencodex on
-    /// its own machine, so the person's plan can be set up only from there; anywhere else the
-    /// plan's half of the page is read-only and says why. Set with every read.
-    pub server_on_this_mac: bool,
-    /// The read with the server, by its number. Save waits for it: what the page shows of the
-    /// setting is about to be replaced by what the read brings, and a Save of the old could undo
-    /// a change made on another Mac. The picks are the person's, and wait on top of either.
+    /// The read with the server, by its number. Save waits for it, as it always has: the page is
+    /// about to show what it brings.
     pub reading: Option<u64>,
-    /// The Save with the server, by its number. Every control on the page is dead while it is
-    /// out, and no read begins meanwhile: its answer is the newest word there will be.
-    pub saving: Option<u64>,
     /// What the page says about the last thing that did not go as asked, under Save.
     pub note: Option<ReplySourceNote>,
+    /// This computer's opencodex address as typed and not saved; `None` shows the one kept here.
+    /// An emptied field goes back to where opencodex listens by default.
+    pub relay_address_draft: Option<String>,
+    /// A key for this computer's opencodex, typed and not kept. Save puts it in the Keychain and
+    /// it leaves the page then, or when the page is left or the person signs out before a Save.
+    /// Never on disk but the Keychain, never sent to the server, never in a driver's tree, never
+    /// printed, never cloned.
+    pub relay_key_draft: Option<RelayKey>,
+    /// Remove key was pressed for this computer's opencodex key: Save takes it out of the
+    /// Keychain.
+    pub relay_remove_key: bool,
+    /// A key for this computer's opencodex typed here went when the page was left before a Save,
+    /// and the page asks for it again, until one is typed or kept.
+    pub relay_retype_key: bool,
+    /// The change sent at once that is with the server, by its number and what it is about
+    /// ([`AppState::begin_account_change`]). While it is out no other is sent and no read
+    /// begins: its answer is the newest word there will be.
+    pub changing: Option<(u64, AccountChange)>,
+    /// What became of the last change sent at once that did not go as asked, by what it was
+    /// about. A refusal stays until the next change of its kind; a change nobody heard back from
+    /// goes with the read, or the answer to a later change, that says what the server keeps.
+    pub change_note: Option<(AccountChange, ChangeNote)>,
+    /// A computer's relay switch went on while another change was with the server: pointing the
+    /// account's way at the relay goes once that one is answered
+    /// ([`AppState::begin_owed_relay_change`]).
+    pub relay_change_owed: bool,
+    /// The computer whose switch sent, or owes, the account's way to the relay, by machine id: its
+    /// card says what became of it when that did not go as asked.
+    pub relay_change_for: Option<String>,
 }
 
-/// What Settings → Reply source says, under Save, about the last thing that did not go as asked.
+/// What this computer's card says, under Save, about the last thing that did not go as asked.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReplySourceNote {
-    /// The server refused the last Save, in its own words, and kept nothing. It stays until the
-    /// next Save.
-    Refused(String),
-    /// A Save went out and no answer came back: it may have been kept or not, and the setting is
-    /// read again to find out. The read's answer clears it. Not trouble yet, so the page draws it
-    /// muted.
-    Unknown,
     /// A read failed while an earlier one's answer is still on the page, and why. The next read
     /// that lands clears it.
     ReadFailed(String),
+    /// The Keychain would not keep, or forget, the key for this computer's opencodex, in its
+    /// words. It stays until the next Save.
+    KeyNotKept(String),
 }
 
 impl ReplySourceNote {
     /// The line the page shows.
     pub fn line(&self) -> &str {
         match self {
-            Self::Refused(said) | Self::ReadFailed(said) => said,
-            Self::Unknown => REPLY_SOURCE_SAVE_UNKNOWN,
+            Self::ReadFailed(said) | Self::KeyNotKept(said) => said,
         }
     }
 }
 
 /// The account's reply source, as far as the app knows it.
+// The setting is carried in its own variant, unboxed: the app holds one of these, the account's,
+// and reads it in place everywhere, so its size costs nothing and a Box would only add noise.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq)]
 pub enum ReplySourceRead {
     Loading,
     Read(InferenceSource),
     /// The server has no reply sources: it answered the read with a bare 404, as a server from
-    /// before the route does. Every control on the page is dead and the composer has no chip,
-    /// because a switch the server does not read would be a switch that changes nothing.
+    /// before the route does. Every control on the page is dead, because a switch the server does
+    /// not read would be a switch that changes nothing.
     NotOnServer,
     /// It could not be read, in the server's words or the app's.
     Unavailable(String),
 }
 
-/// Whether opencodex answers the server, as Settings → Reply source's health line says it
-/// ([`AppState::proxy_health`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ProxyHealth {
-    /// The server keeps no proxy address, so there is nothing to ask.
-    NoAddress,
-    Running,
-    NotRunning,
-}
-
-/// What Settings → Reply source says on a server without the route.
+/// What this computer's card says on a server without the route.
 pub(crate) const REPLY_SOURCE_NOT_ON_SERVER: &str =
     "This server can't switch where your replies come from yet.";
 
-/// What it says when a Save went out and no answer came back: the server may have kept it or not,
-/// and the page reads the setting again to find out.
-pub(crate) const REPLY_SOURCE_SAVE_UNKNOWN: &str =
-    "The server did not answer, so the change may or may not have been kept. Checking again…";
-
-/// What it says when a key typed on the page is gone and the server may not have it
-/// ([`ReplySourceSettings::retype_key`]).
-pub(crate) const REPLY_SOURCE_RETYPE_KEY: &str = "Type the key again to save it.";
-
-/// Why Save will not send My subscription with no model while the server lists some: the server
-/// would keep it and then turn every reply away until a model was set.
-pub(crate) const REPLY_SOURCE_PICK_MODEL: &str = "Pick a model from your plan first.";
-
-/// Why Save will not send My subscription with the address taken away: the server would keep it
-/// and then turn every reply away until one was set.
-pub(crate) const REPLY_SOURCE_NEEDS_ADDRESS: &str = "Give the proxy's address first.";
-
-/// What Save does with My subscription picked while the server lists no model of the plan yet:
-/// it keeps the address, which is what lets the server list them, and leaves the door on the
-/// server's keys, so no reply is turned away meanwhile.
-pub(crate) const REPLY_SOURCE_HOLDS_GATEWAY: &str = "No model of your plan is listed yet. Save \
-     keeps the address so the server can list them; replies stay on the server's paid keys until \
-     you pick one.";
+/// Why Save will not keep an opencodex address that is not on this computer, beside why not.
+pub(crate) const RELAY_ADDRESS_NOT_HERE: &str = "Give opencodex's address on this computer first.";
 
 impl ReplySourceSettings {
     /// The setting as the server last gave it, once there is one.
@@ -447,206 +424,337 @@ impl ReplySourceSettings {
         }
     }
 
-    /// The door the page shows picked: the person's unsaved pick, or the kept one.
-    pub fn shown_kind(&self) -> Option<InferenceKind> {
-        self.kind_pick
-            .or_else(|| self.kept_source().map(|source| source.kind))
-    }
-
-    /// The proxy URL the field shows: as typed, or as the server keeps it, or where opencodex
-    /// listens by default.
-    pub fn shown_url(&self) -> String {
-        self.url_draft
-            .clone()
-            .or_else(|| {
-                self.kept_source()
-                    .and_then(|source| source.base_url.clone())
-            })
-            .unwrap_or_else(|| crate::opengrok::DEFAULT_PROXY_URL.to_string())
-    }
-
-    /// The model the picker shows: the person's unsaved pick, none when they took it away, or
-    /// the kept one.
-    pub fn shown_model(&self) -> Option<&str> {
-        match &self.model_pick {
-            Some(pick) => pick.as_deref(),
-            None => self
-                .kept_source()
-                .and_then(|source| source.local_model.as_deref()),
-        }
-    }
-
-    /// What Save asks of the proxy URL: `None` leaves the server's alone, `Some(None)` clears it,
-    /// and `Some(Some(url))` keeps `url`. The address the field shows counts whenever it is not
-    /// the server's, the default included while the server keeps none, so a first Save sends it:
-    /// without one the server lists none of the plan's models. None is asked where the server is
-    /// not on this Mac, whose field is read-only.
-    fn url_change(&self) -> Option<Option<String>> {
-        if !self.server_on_this_mac {
-            return None;
-        }
-        let kept = self.kept_source()?;
-        let shown = self.shown_url();
-        let wanted = Some(shown.trim())
-            .filter(|url| !url.is_empty())
-            .map(str::to_string);
-        (wanted != kept.base_url).then_some(wanted)
-    }
-
-    /// What Save asks of the model, as [`Self::url_change`] does of the URL.
-    fn model_change(&self) -> Option<Option<String>> {
-        if !self.server_on_this_mac {
-            return None;
-        }
-        let kept = self.kept_source()?;
-        let pick = self.model_pick.as_ref()?;
-        (*pick != kept.local_model).then(|| pick.clone())
-    }
-
-    /// Something on the page differs from what the server keeps.
-    pub fn is_unsaved(&self) -> bool {
-        let Some(kept) = self.kept_source() else {
-            return false;
-        };
-        self.kind_pick.is_some_and(|kind| kind != kept.kind)
-            || self.url_change().is_some()
-            || self.model_change().is_some()
-            || self.key_draft.is_some()
-            || self.remove_key
-    }
-
-    /// The page's controls take a change: the setting has been read, and no Save is with the
-    /// server.
-    pub fn can_edit(&self) -> bool {
-        self.kept_source().is_some() && self.saving.is_none()
-    }
-
-    /// The plan's half of the page takes a change: the page does, and the server is on this Mac,
-    /// the only place the person's plan can be set up from.
-    pub fn plan_editable(&self) -> bool {
-        self.can_edit() && self.server_on_this_mac
-    }
-
-    /// The key field takes typing: the plan's half of the page does, and Remove key is not
-    /// picked, which draws the field read-only until Keep key takes it back.
-    pub fn key_editable(&self) -> bool {
-        self.plan_editable() && !self.remove_key
-    }
-
-    /// Why Save will not send the page as it shows it: My subscription without what a turn on it
-    /// needs, an address, or a model while `plan_models` says the server lists some to pick from.
-    /// The server would keep either, and then turn every reply away until the gap was filled.
-    pub fn blocker(&self, plan_models: bool) -> Option<&'static str> {
-        if self.shown_kind()? != InferenceKind::LocalProxy || !self.server_on_this_mac {
-            return None;
-        }
-        if self.shown_url().trim().is_empty() {
-            return Some(REPLY_SOURCE_NEEDS_ADDRESS);
-        }
-        (self.shown_model().is_none() && plan_models).then_some(REPLY_SOURCE_PICK_MODEL)
-    }
-
-    /// My subscription is shown with an address and no model, and the server lists none of the
-    /// plan's yet: Save keeps the address, which is what lets the server list them, and leaves
-    /// the door on the server's keys until a model is picked. The app never saves the person's
-    /// plan without a model.
-    pub fn holds_gateway(&self, plan_models: bool) -> bool {
-        self.server_on_this_mac
-            && self.shown_kind() == Some(InferenceKind::LocalProxy)
-            && self.shown_model().is_none()
-            && !plan_models
-            && !self.shown_url().trim().is_empty()
-    }
-
-    /// The line beside Save about what it will or will not do with the page as it stands.
-    pub fn hint(&self, plan_models: bool) -> Option<&'static str> {
-        self.blocker(plan_models).or_else(|| {
-            (self.holds_gateway(plan_models) && self.is_unsaved())
-                .then_some(REPLY_SOURCE_HOLDS_GATEWAY)
+    /// The account's replies on the person's plan go through their computer, as a server that
+    /// knows the relay keeps it.
+    pub fn on_mac(&self) -> bool {
+        self.kept_source().is_some_and(|kept| {
+            kept.kind == InferenceKind::LocalProxy
+                && kept.knows_relay()
+                && kept.default_via() == Some(Via::Mac)
         })
     }
 
-    /// The door a Save keeps: the one shown, but the server's keys while
-    /// [`Self::holds_gateway`].
-    fn saved_kind(&self, plan_models: bool) -> Option<InferenceKind> {
-        if self.holds_gateway(plan_models) {
-            return Some(InferenceKind::Gateway);
-        }
-        self.shown_kind()
+    /// The server knows the relay, so the page offers it.
+    pub fn knows_relay(&self) -> bool {
+        self.kept_source().is_some_and(InferenceSource::knows_relay)
     }
 
-    /// Save would send something: a change the server would keep has been made, nothing stands
-    /// in its way, and nothing is with the server.
-    pub fn can_save(&self, plan_models: bool) -> bool {
-        let Some(kept) = self.kept_source() else {
-            return false;
-        };
-        let changes = self.saved_kind(plan_models) != Some(kept.kind)
-            || self.url_change().is_some()
-            || self.model_change().is_some()
-            || self.key_draft.is_some()
-            || self.remove_key;
-        self.can_edit()
-            && self.reading.is_none()
-            && self.is_unsaved()
-            && self.blocker(plan_models).is_none()
-            && changes
+    /// Something on the page that this computer keeps: opencodex's address, or its key typed or
+    /// taken away. It is all the page has to save: nothing on it is the server's to keep.
+    fn changes_here(&self) -> bool {
+        self.relay_address_draft.is_some()
+            || self.relay_key_draft.is_some()
+            || self.relay_remove_key
     }
 
-    /// The `PUT` a Save sends: the door it keeps, and each field the page changed. The typed key
-    /// is taken, not copied: it leaves the page with this Save, whatever becomes of it.
-    fn take_update(&mut self, plan_models: bool) -> Option<InferenceSourceUpdate> {
-        let kind = self.saved_kind(plan_models)?;
-        let api_key = match (self.key_draft.take(), self.remove_key) {
+    /// Something on the page differs from what this computer keeps.
+    pub fn is_unsaved(&self) -> bool {
+        self.kept_source().is_some() && self.changes_here()
+    }
+
+    /// The page's controls take a change: the setting has been read.
+    pub fn can_edit(&self) -> bool {
+        self.kept_source().is_some()
+    }
+
+    /// The relay's half of the page takes a change: the page does, and the server knows the
+    /// relay. It is live wherever the server runs: the relay is what lets a computer that is not
+    /// the server's answer for the person.
+    pub fn relay_editable(&self) -> bool {
+        self.can_edit() && self.knows_relay()
+    }
+
+    /// The field for this computer's opencodex key takes typing: the relay's half of the page
+    /// does, and Remove key is not picked, which draws the field read-only until Keep key takes
+    /// it back.
+    pub fn relay_key_editable(&self) -> bool {
+        self.relay_editable() && !self.relay_remove_key
+    }
+
+    /// Why Save will not keep the page as it shows it: this computer's opencodex address
+    /// somewhere that is not this computer.
+    pub fn blocker(&self) -> Option<&'static str> {
+        let address = self
+            .relay_address_draft
+            .as_deref()
+            .filter(|typed| !typed.trim().is_empty());
+        address
+            .is_some_and(|typed| crate::opengrok::OpencodexAddress::parse(typed).is_err())
+            .then_some(RELAY_ADDRESS_NOT_HERE)
+    }
+
+    /// Save would do something: a change this computer would keep has been made, nothing stands
+    /// in its way, and no read is out.
+    pub fn can_save(&self) -> bool {
+        self.can_edit() && self.reading.is_none() && self.is_unsaved() && self.blocker().is_none()
+    }
+
+    /// What a Save keeps on this computer: opencodex's address, and its key typed or taken away.
+    /// Taken off the page, the key with it.
+    fn take_changes_here(&mut self) -> RelayChangesHere {
+        let key = match (self.relay_key_draft.take(), self.relay_remove_key) {
             (Some(key), _) => Some(Some(key)),
             (None, true) => Some(None),
             (None, false) => None,
         };
-        Some(InferenceSourceUpdate {
-            kind,
-            base_url: self.url_change(),
-            local_model: self.model_change(),
-            api_key,
-        })
+        self.relay_remove_key = false;
+        let address = self.relay_address_draft.take().map(|typed| {
+            crate::opengrok::OpencodexAddress::parse(&typed)
+                .ok()
+                .map(|address| address.as_str().to_string())
+        });
+        RelayChangesHere { address, key }
     }
 
-    /// Put the page back to what the server keeps: every unsaved pick goes.
+    /// Put the page back to what this computer keeps: every unsaved change goes.
     fn forget_picks(&mut self) {
-        self.kind_pick = None;
-        self.url_draft = None;
-        self.model_pick = None;
-        self.key_draft = None;
-        self.remove_key = false;
+        self.relay_address_draft = None;
+        self.relay_key_draft = None;
+        self.relay_remove_key = false;
     }
 
     /// Everything but the typed key, for the gpui-agent tree, which says only that one waits.
     pub fn without_key(&self) -> Self {
         Self {
             kept: self.kept.clone(),
-            kind_pick: self.kind_pick,
-            url_draft: self.url_draft.clone(),
-            model_pick: self.model_pick.clone(),
-            key_draft: None,
-            remove_key: self.remove_key,
-            retype_key: self.retype_key,
-            server_on_this_mac: self.server_on_this_mac,
             reading: self.reading,
-            saving: self.saving,
             note: self.note.clone(),
+            relay_address_draft: self.relay_address_draft.clone(),
+            relay_key_draft: None,
+            relay_remove_key: self.relay_remove_key,
+            relay_retype_key: self.relay_retype_key,
+            changing: self.changing,
+            change_note: self.change_note.clone(),
+            relay_change_owed: self.relay_change_owed,
+            relay_change_for: self.relay_change_for.clone(),
+        }
+    }
+
+    /// What the page says, where a change of `about`'s kind was asked, of the last one that did
+    /// not go as asked.
+    pub fn change_note(&self, about: AccountChange) -> Option<&str> {
+        self.change_note
+            .as_ref()
+            .filter(|(was, _)| *was == about)
+            .map(|(_, note)| note.line())
+    }
+}
+
+/// A change of the account's setting sent the server at once, with no Save: what it is about, so
+/// what becomes of it is said where it was asked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccountChange {
+    /// A pick in Default for new Bots' picker, or None.
+    NewBots,
+    /// A pick in the Relay-off fallback's picker, or None.
+    PlanFallback,
+    /// A computer's relay switch going on: the account's way to the plan pointed at the relay,
+    /// once, when it is not that already. Whether the relay is on is each computer's own switch
+    /// and no part of this.
+    Relay,
+}
+
+/// What became of a change sent at once that did not go as asked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChangeNote {
+    /// The server refused it, in its own words, and kept nothing. It stays until the next change
+    /// of its kind.
+    Refused(String),
+    /// It went out and no answer came back: the server may have kept it or not, and the setting
+    /// is read again to find out. The read's answer clears it. Not trouble yet.
+    Unknown,
+}
+
+impl ChangeNote {
+    /// The line the page shows.
+    pub fn line(&self) -> &str {
+        match self {
+            Self::Refused(said) => said,
+            Self::Unknown => ACCOUNT_CHANGE_UNKNOWN,
         }
     }
 }
 
-/// What the composer's chip shows: which door the next turn goes through, and whether that is the
-/// person's pick for their turns rather than the account's own door.
+/// What the page says when a change went out and no answer came back: the server may have kept it
+/// or not, and the page reads the setting again to find out.
+pub(crate) const ACCOUNT_CHANGE_UNKNOWN: &str =
+    "The server did not answer, so the change may or may not have been kept. Checking again…";
+
+/// Settings → General's Default for new Bots: where a newly hired Bot starts, its model, and with
+/// it its door and fast tier, and its effort, which the section shows in the picker's card
+/// ([`AppState::default_for_new_bots`]).
+///
+/// It is the account's (opengrok-server #322, on main c0bb6ae: `NewBotDefault` in
+/// `crates/opengrok-core/src/inference.rs`), read with the reply source, which carries it as
+/// `newBotDefault` on every read from a server that keeps one, `null` until the person sets one. A
+/// server without it sends no such key, and the section then says the default is coming and its
+/// card takes no click, since a control that changes nothing on the server must not look as if it
+/// does.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum DefaultForNewBots {
+    /// The server keeps no default for new Bots, or the setting has not been read.
+    #[default]
+    NotOnServer,
+    /// The server keeps one: the person's, or `None` while they have set none, which leaves a new
+    /// Bot to the server's own default.
+    Kept(Option<NewBotDefault>),
+}
+
+/// Settings → General's Relay-off fallback: what a Bot on the person's plan answers with while the
+/// relay is off, a Gateway model and its effort ([`AppState::relay_off_fallback`]).
+///
+/// It is the account's (opengrok-server #332 (PR #338 at 66b9f7b): `PlanFallback` in
+/// `crates/opengrok-core/src/inference.rs`), read with the reply source, which carries it as
+/// `planFallback` on every read from a server that keeps one, `null` until the person sets one. A
+/// server without it sends no such key, and the section then says the fallback is coming and its
+/// card takes no click.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum RelayOffFallback {
+    /// The server keeps no Relay-off fallback, or the setting has not been read.
+    #[default]
+    NotOnServer,
+    /// The server keeps one: the person's, or `None` while they have set none.
+    Kept(Option<PlanFallback>),
+}
+
+/// Which model picker: the open Bot's, on the Model card in its settings, or Default for new
+/// Bots' or the Relay-off fallback's, on Settings → General. They are the same card and popover
+/// (`components::model_picker`); what differs is what they show and where a change goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PickerFor {
+    Bot,
+    NewBots,
+    PlanFallback,
+}
+
+/// Where a picker's popover is.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PickerView {
+    /// The popover is open under the card.
+    pub open: bool,
+    /// The open popover shows its list of models, grouped by door, instead of its controls.
+    pub list_open: bool,
+    /// What is typed in the list's search box: the list shows only the models whose name or id
+    /// holds it, whatever the case (`ModelPick::search`). Emptied whenever the list opens or
+    /// shuts, so it opens afresh each time.
+    pub search: String,
+    /// The first model in the list's window, among those the search leaves: the list shows
+    /// `opengrok::LIST_ROWS` from it (`opengrok::list_window`), and the wheel moves it.
+    pub list_start: usize,
+    /// What the popover says under the slider after a pick put the effort back on the model's own
+    /// level, because the model picked has no such level of its own to keep it on
+    /// ([`ModelPick::pick_effort_note`]).
+    pub effort_note: Option<EffortNote>,
+}
+
+/// A line the popover says of a pick, and the model it is about.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TurnSourceChip {
-    pub kind: InferenceKind,
-    /// A pick of the person's rather than the account's own door. Either way every turn names
-    /// the door the chip shows.
-    pub picked: bool,
-    /// The model the person's plan answers with, as the server keeps it.
-    pub local_model: Option<String>,
+pub struct EffortNote {
+    /// The model the pick put the picker on, by the id its row pins with ⚡ off.
+    pub base_id: String,
+    /// The line: "GPT-6 Luna has no Ultra, so it's on Medium, its own level."
+    pub line: String,
+}
+
+impl PickerView {
+    /// The line the popover shows under its slider for the model now on the card: the pick's
+    /// line while that model is the one on the card. A refused pick leaves the card on the model
+    /// it was on, and the line says nothing then.
+    pub fn effort_note_for(&self, pick: &ModelPick) -> Option<&str> {
+        let note = self.effort_note.as_ref()?;
+        let now = pick.current.as_ref()?;
+        (now.base_id == note.base_id).then_some(note.line.as_str())
+    }
+}
+
+/// A `PUT /account` of this computer's time zone that has begun: what to send, and the sign-in it
+/// is for, so an answer that lands after a sign-out lands on nothing.
+struct TimeZoneSend {
+    client: OpenGrokClient,
+    epoch: u64,
+    zone: String,
+}
+
+/// How often this computer's time zone is looked at while somebody is signed in: a zone changed
+/// in System Settings, or by travelling, reaches the account within this.
+const TIME_ZONE_CHECK: Duration = Duration::from_secs(60);
+
+/// This computer's IANA time zone as the system says it now, or `None` when it cannot say.
+fn system_time_zone() -> Option<String> {
+    iana_time_zone::get_timezone().ok()
+}
+
+/// A change sent at once that has begun: what to send, and what it is, for its answer.
+struct AccountChangeSend {
+    client: OpenGrokClient,
+    generation: u64,
+    about: AccountChange,
+    update: InferenceSourceUpdate,
+}
+
+/// What follows a change's answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AfterChange {
+    /// Nothing more to ask.
+    Done,
+    /// Read the models again: the pickers' Subscription group lists the account's way's.
+    ReadModels,
+    /// Read the setting again: nobody knows whether the change was kept.
+    ReadAgain,
+}
+
+/// What a Save keeps on this computer ([`ReplySourceSettings::take_changes_here`]): opencodex's
+/// address, `Some(None)` back to its default, and its key, `Some(None)` to forget it.
+#[derive(Debug, Default)]
+struct RelayChangesHere {
+    address: Option<Option<String>>,
+    key: Option<Option<RelayKey>>,
+}
+
+/// This computer's side of the relay (opengrok-server #292): where this computer's opencodex
+/// listens and whether the Keychain holds a key for it, and the running relay's word on itself.
+/// Whether the relay is switched on is not here: it is this computer's own switch on the server
+/// (`relayEnabled` on its row, [`ConnectedComputer::relay_enabled`]), which the relay follows. The
+/// address is this computer's pref; the key never leaves the Keychain but for the relay.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RelayMac {
+    /// opencodex's address as saved on this computer, or `None` for where it listens by default.
+    pub address: Option<String>,
+    /// Where opencodex is looked for while no address is saved: `None` is where it listens by
+    /// default ([`crate::opengrok::DEFAULT_PROXY_URL`]). Nothing but a test sets it, so that none
+    /// asks the real `127.0.0.1:8080`.
+    pub default_address: Option<String>,
+    /// The Keychain holds a key for this computer's opencodex.
+    pub has_key: bool,
+    /// The running relay's word on itself; `None` while it does not run.
+    pub report: Option<RelayReport>,
+}
+
+/// Why the relay did not start: local-exec holds no credential for this computer to answer with.
+const RELAY_NO_CREDENTIAL: &str =
+    "This computer's enrolment could not be read. Sign out and in again to enrol it.";
+
+/// Why the relay did not start: the address saved for opencodex is not one on this computer.
+const RELAY_ADDRESS_UNREADABLE: &str =
+    "The address saved for opencodex isn't one on this computer. Give it again and save.";
+
+/// A relay that could not start, and why, as its status line says it.
+fn relay_cannot_start(why: &str) -> RelayReport {
+    RelayReport {
+        status: RelayStatus::Error(why.to_string()),
+        halted: true,
+    }
+}
+
+impl RelayMac {
+    /// The address the relay calls, and the field shows while nothing is typed: the one saved on
+    /// this computer, or where opencodex listens by default.
+    pub fn shown_address(&self) -> String {
+        self.address
+            .clone()
+            .or_else(|| self.default_address.clone())
+            .unwrap_or_else(|| crate::opengrok::DEFAULT_PROXY_URL.to_string())
+    }
 }
 
 /// What coming back to the window asks the server for again ([`AppState::window_activated`]).
@@ -656,37 +764,11 @@ struct ActivationReads {
     connections: bool,
     /// The account's reply source.
     reply_source: bool,
-    /// `/models`, for Settings → Reply source's picker.
+    /// `/models`, while Settings → General is on screen: the models a computer relaying lists.
     models: bool,
-}
-
-/// What follows a Save's answer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AfterReplySourceSave {
-    /// Nothing more to ask.
-    Done,
-    /// Read the models again: the server lists opencodex's for the setting it now keeps.
-    ReadModels,
-    /// Read the setting again: nobody knows whether the Save was kept.
-    ReadAgain,
-}
-
-/// What a Save that has gone out carried, for its answer to be read by.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct SentSave {
-    generation: u64,
-    /// It carried a key typed on the page, which is gone from the page now.
-    key_sent: bool,
-    /// The door shown that it did not keep yet: My subscription, held on the server's keys
-    /// until a model is picked ([`ReplySourceSettings::holds_gateway`]).
-    held: Option<InferenceKind>,
-}
-
-/// A Save of the reply source that has begun: what to send, and what it carried.
-struct ReplySourceSave {
-    client: OpenGrokClient,
-    sent: SentSave,
-    update: InferenceSourceUpdate,
+    /// The person's computers, while Settings → Computer is on screen: a relay switch moved from
+    /// another computer meanwhile is on their cards.
+    computers: bool,
 }
 
 /// The open Bot's tool ceiling, as far as its settings know it: everything it could be offered
@@ -1007,29 +1089,6 @@ impl CeilingRead {
             })
             .map(|row| row.name.clone())
             .collect()
-    }
-}
-
-/// The open bot's Effort control, as its settings draw it and a driver reads it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EffortControl {
-    /// The word the server keeps for the bot, or `None` from a server that keeps no effort (one
-    /// from before opengrok-server#271). The control is dead then: that server would drop a pick
-    /// without a word, and the control would claim a setting nothing keeps.
-    pub kept: Option<String>,
-    /// The word the control shows: the person's pick while it waits for Save, or the kept one.
-    pub shown: String,
-}
-
-impl EffortControl {
-    /// What the bot's turns run with now, in the server's word: `inherit` where it keeps none.
-    pub fn kept_word(&self) -> &str {
-        self.kept.as_deref().unwrap_or(EFFORT_INHERIT)
-    }
-
-    /// A pick is waiting for Save.
-    pub fn unsaved(&self) -> bool {
-        self.shown != self.kept_word()
     }
 }
 
@@ -1523,7 +1582,7 @@ fn saved_parts(parts: &[ChatPart]) -> Vec<MessagePart> {
             }
             ChatPart::Reasoning(thought) => {
                 close_text_run(&mut words, &mut saved);
-                saved.push(MessagePart::Reasoning(thought.clone()));
+                saved.push(MessagePart::Reasoning(thought.stored()));
             }
         }
     }
@@ -1600,9 +1659,9 @@ fn restored_parts(content: &str, saved: Vec<MessagePart>) -> Vec<ChatPart> {
                 .and_then(|value| crate::opengrok::StepSpec::from_value(call_id, &value))
                 .map(ChatPart::Step),
             // Held to the size a thought is kept at, whichever build wrote it.
-            MessagePart::Reasoning(thought) => {
-                Some(ChatPart::Reasoning(crate::opengrok::capped(&thought)))
-            }
+            MessagePart::Reasoning(thought) => Some(ChatPart::Reasoning(
+                crate::opengrok::ThoughtSpec::from_stored(&thought),
+            )),
         })
         .collect()
 }
@@ -2012,8 +2071,82 @@ fn connectors_unavailable(error: &OpenGrokError) -> String {
     )
 }
 
-/// Why the account's reply source could not be read, in words for Settings → Reply source.
-/// Nothing from something in front of the server is shown as the server's words.
+/// The roster as Settings → Computer draws it: the computers the server lists, this one marked by
+/// the machine id it is known by (`this_id`) and always online, since the app is running on it,
+/// one row to a computer that enrolled twice, and this computer first.
+fn settle_roster(
+    mut computers: Vec<ConnectedComputer>,
+    this_id: Option<&str>,
+) -> Vec<ConnectedComputer> {
+    for computer in &mut computers {
+        computer.this_machine = this_id == Some(computer.machine_id.as_str());
+        if computer.this_machine {
+            computer.online = true;
+        }
+    }
+    let mut computers = collapse_computer_roster(computers);
+    computers.sort_by_key(|computer| !computer.this_machine);
+    computers
+}
+
+/// Whether the relay's word on itself moving from `before` to `now` is the server's row for this
+/// computer moving too: it started or stopped answering (`relaying`), or the server switched it off
+/// and told it so (`relayEnabled`), which can be from another computer.
+fn relay_moved_the_row(before: Option<&RelayStatus>, now: &RelayStatus) -> bool {
+    let answering = |status: Option<&RelayStatus>| status == Some(&RelayStatus::Answering);
+    answering(before) != answering(Some(now))
+        || (*now == RelayStatus::Off && before != Some(&RelayStatus::Off))
+}
+
+/// A computer's relay switch that is with the server: where the click asked to take it, and which
+/// switch it is. Its answer is settled by `token` and by nothing else, as a tool switch's is
+/// ([`CeilingSwitch`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ComputerRelaySwitch {
+    pub on: bool,
+    token: u64,
+}
+
+/// A computer's relay switch that has begun: where to send it, and which it is, for its answer.
+struct ComputerRelaySend {
+    client: OpenGrokClient,
+    machine_id: String,
+    on: bool,
+    token: u64,
+}
+
+/// What follows a computer's relay switch's answer ([`AppState::settle_computer_relay`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AfterComputerRelay {
+    /// Not the switch that is out any more: nothing was touched.
+    Dropped,
+    /// The server kept it, and says the computer's switch is `on` now.
+    Kept { on: bool },
+    /// The server refused it, and its words are under the switch. Nothing more to ask.
+    Refused,
+    /// The roster is out of date, or nobody knows whether the switch was kept: read it again.
+    ReadAgain,
+}
+
+/// What a computer's card says under its switch of a server that has no such route yet.
+pub(crate) const COMPUTER_RELAY_NOT_ON_SERVER: &str =
+    "This server can't switch a computer's relay yet.";
+
+/// A refused change of the account's setting, as the page says it where it was asked: the
+/// server's own sentence when it wrote one (a model a plan may not answer, an effort it does not
+/// know), as it wrote it.
+fn account_change_refusal(error: &OpenGrokError) -> String {
+    if error.is_signed_out() {
+        return "Sign in again to change it.".to_string();
+    }
+    if error.written_by_opengrok() && !error.message.trim().is_empty() {
+        return error.message.clone();
+    }
+    rules_refusal("Not saved", error)
+}
+
+/// Why the account's reply source could not be read, in words for this computer's card. Nothing
+/// from something in front of the server is shown as the server's words.
 fn reply_source_unreadable(error: &OpenGrokError) -> String {
     if error.unreachable().is_some() {
         return "Could not reach the server to ask where your replies come from.".to_string();
@@ -2022,19 +2155,6 @@ fn reply_source_unreadable(error: &OpenGrokError) -> String {
         return "Sign in again to see where your replies come from.".to_string();
     }
     rules_refusal("Where your replies come from could not be read", error)
-}
-
-/// A refused Save of the reply source, as the page says it: the server's own sentence when it
-/// wrote one (a URL that is not loopback, a model it will not route a subscription to), as it
-/// wrote it.
-fn reply_source_refusal(error: &OpenGrokError) -> String {
-    if error.is_signed_out() {
-        return "Sign in again to change where your replies come from.".to_string();
-    }
-    if error.written_by_opengrok() && !error.message.trim().is_empty() {
-        return error.message.clone();
-    }
-    rules_refusal("Not saved", error)
 }
 
 /// Why the open Bot's ceiling has no switches, in words for its Tools card.
@@ -2267,15 +2387,15 @@ impl Conversation {
 /// A held message WAS the draft, so it keeps what the draft had on it rather than reading the
 /// composer again when the thread finally goes idle — by which time the draft is the next
 /// message somebody is writing. Every part of it travels here, and [`AppState::drain_queued_send`]
-/// hands the turn what this row holds and nothing else: the door included, which is the one the
-/// composer's chip showed when the message was sent, whatever the chip shows by the time it goes.
+/// hands the turn what this row holds and nothing else: the door included, which is the Bot's own
+/// when the message was sent, wherever the Bot has been moved by the time it goes.
 fn held_message(
     message_id: String,
     content: String,
     recipe: Option<TurnRecipe>,
     skill: Option<String>,
     reply: Option<ReplyTo>,
-    inference_source: Option<InferenceKind>,
+    inference_source: Option<TurnSource>,
 ) -> QueuedSend {
     QueuedSend {
         message_id,
@@ -2284,6 +2404,7 @@ fn held_message(
         skill,
         reply,
         inference_source,
+        waits_for_mac: false,
         pending_id: None,
         posted: false,
         stale: StaleRefusal::Fresh,
@@ -2306,12 +2427,18 @@ pub struct QueuedSend {
     skill: Option<String>,
     /// The message this one answers, for the quote the coworker is sent.
     reply: Option<ReplyTo>,
-    /// The door the composer's chip showed when the message was sent, which its turn names when
-    /// it drains: the chip may have been clicked since, and this message was sent under the old
-    /// one. `None` when no chip was drawn, and the account's setting decides. A row read back
-    /// from the server brings its own (`inferenceSource`), and one from a server that keeps
-    /// none leaves this Mac's in place.
-    inference_source: Option<InferenceKind>,
+    /// The Bot's own door when the message was sent, which its turn names when it drains: the
+    /// Bot may have been moved since, and this message was sent under the old one. `None` for a
+    /// Bot that follows the account's door, and the server decides. A row read back from the
+    /// server brings its own (`inferenceSource`), and one from a server that keeps none leaves
+    /// this Mac's in place. On the person's plan it names the account's way to it too, the
+    /// person's Mac included.
+    inference_source: Option<TurnSource>,
+    /// The server holds this send until a Mac holds the relay again (`heldFor:
+    /// "relay_offline"` on its row, opengrok-server #292): its queue line says it waits for the
+    /// person's Mac rather than for the coworker, and the drain passes over it, since the server
+    /// sends it itself when a Mac opens the relay. The row's word, read with every row.
+    waits_for_mac: bool,
     /// The `pum_…` row on OpenGrok, once enqueue has landed. Absent while offline, or on an
     /// OpenGrok that has not shipped pending-user-messages yet.
     pending_id: Option<String>,
@@ -2487,7 +2614,7 @@ fn recipe_from_pending(item: &PendingUserMessage) -> Option<TurnRecipe> {
 }
 
 /// The row a held send asks OpenGrok to keep: its words under its bubble's id, the quote, the
-/// recipe with its values, the skill, and the door its chip showed, as the hold carries them.
+/// recipe with its values, the skill, and the Bot's door, as the hold carries them.
 fn pending_write_for(hold: &QueuedSend) -> PendingWrite {
     PendingWrite::enqueue(
         hold.content.clone(),
@@ -2510,6 +2637,7 @@ fn hold_from_row(item: &PendingUserMessage) -> QueuedSend {
         skill: item.skill_id.clone().filter(|id| !id.is_empty()),
         reply: reply_from_pending(item.reply_to.as_ref()),
         inference_source: item.inference_source(),
+        waits_for_mac: item.waits_for_mac(),
         pending_id: Some(item.id.clone()).filter(|id| !id.is_empty()),
         posted: true,
         stale: StaleRefusal::Fresh,
@@ -2581,6 +2709,16 @@ pub struct LiveTurn {
     /// time; the turn itself is not let go until the write lands, because until then the
     /// database still does not have it.
     pub persisting: bool,
+}
+
+/// A failed reply taken out of its thread so that its turn can be sent again
+/// ([`AppState::begin_retry`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Retry {
+    conversation_id: String,
+    /// The run the failed reply came out of, which the retry names to the server as the one it
+    /// retries (`retryOf`). None for a reply that names no run, which goes again naming none.
+    of: Option<String>,
 }
 
 /// What one thread's turn is doing, as the app would say it out loud.
@@ -2675,8 +2813,9 @@ fn apply_reload(
 /// An empty catalogue with no note is a real answer — this key routes to nothing — and is taken.
 ///
 /// Each door's list is kept by the same rule, apart, because `/models` answers for two machines
-/// at once: the gateway's routes, which a Bot's Model field offers, and the person's own plan's,
-/// listed by opencodex, which Settings → Reply source offers. Either can be down while the other
+/// at once: the gateway's routes, the Gateway group of a Bot's model picker, and the person's own
+/// plan's, listed by opencodex, which the picker's Subscription group offers.
+/// Either can be down while the other
 /// answers, and a list that came back with only the other's entries must not empty this one's.
 /// The gateway's reason is the note; opencodex's is `localProxy.healthy: false`. A plan list that
 /// comes back empty while opencodex answers, or with no proxy address kept (no `localProxy` at
@@ -2694,13 +2833,30 @@ fn apply_catalogue(held: &mut ModelCatalogue, fresh: ModelCatalogue) -> Option<S
     } else {
         fresh_gateway
     };
+    // The plan's models come two ways with the Mac relay: opencodex on the server's machine, and
+    // the opencodex of the Mac holding the relay, listed by it (`via`, opengrok-server #292). Each
+    // is kept by the same rule, apart: the server's own opencodex down says nothing of the Mac's,
+    // and no Mac holding the relay (`relayConnected: false`) is the Mac's list's reason.
+    let is_mac = |entry: &ModelEntry| entry.plan_via() == Some(Via::Mac);
+    let (fresh_mac, fresh_here): (Vec<ModelEntry>, Vec<ModelEntry>) =
+        fresh_plan.into_iter().partition(is_mac);
+    let (held_mac, held_here): (Vec<ModelEntry>, Vec<ModelEntry>) =
+        held_plan.into_iter().partition(is_mac);
     let proxy_down = fresh.local_proxy.is_some_and(|proxy| !proxy.healthy);
-    let plan = if fresh_plan.is_empty() && proxy_down {
-        held_plan
+    let here = if fresh_here.is_empty() && proxy_down {
+        held_here
     } else {
-        fresh_plan
+        fresh_here
     };
-    held.models = gateway.into_iter().chain(plan).collect();
+    let relay_down = fresh
+        .local_proxy
+        .is_some_and(|proxy| !proxy.relay_connected);
+    let mac = if fresh_mac.is_empty() && relay_down {
+        held_mac
+    } else {
+        fresh_mac
+    };
+    held.models = gateway.into_iter().chain(here).chain(mac).collect();
     held.note = note.clone();
     held.local_proxy = fresh.local_proxy;
     note
@@ -2894,9 +3050,18 @@ fn replayed_run(
     events: &[serde_json::Value],
     status: &str,
 ) -> (String, Vec<ChatPart>, Option<ReplySource>) {
+    reply_from_followed(events, status, &FrameArrivals::default())
+}
+
+/// Replay with locally observed frame arrivals, retaining the reply's source badge.
+fn reply_from_followed(
+    events: &[serde_json::Value],
+    status: &str,
+    arrivals: &FrameArrivals,
+) -> (String, Vec<ChatPart>, Option<ReplySource>) {
     let mut assembler = TurnAssembler::default();
     for event in events {
-        assembler.push_event(event);
+        assembler.push_event_at(event, arrivals.at(event));
     }
     if status != "running" {
         assembler.finish();
@@ -2930,6 +3095,8 @@ struct RecoveredReply {
     run_timing: Option<TurnTiming>,
     /// Which door the reply came through, when the journal carried its CUSTOM.
     reply_source: Option<ReplySource>,
+    /// The run ended because the person's plan could not answer, and why.
+    plan_failure: Option<RunErrorCode>,
 }
 
 /// Something the person said that a replay brought back and this thread does not hold.
@@ -3002,6 +3169,7 @@ fn missing_replies(messages: &[Message], runs: &[ThreadRun]) -> Vec<RecoveredRep
                 finished_at: recovered_finished_at(run),
                 run_timing: TurnTiming::from_events(&run.events),
                 reply_source,
+                plan_failure: plan_failure_of(&run.events),
             })
         })
         .collect()
@@ -3338,6 +3506,21 @@ fn replayed_ending(
     }
 }
 
+/// Why the person's plan could not answer a run, when its journal says so: the code on its
+/// `RUN_ERROR` ([`RunErrorCode`]), journaled with it for the relay's (opengrok-server #292: server
+/// main cad36fd (#303, after #298), pin 47a5d6b) and for `plan_unavailable` (#304: server main
+/// d6f640e (#307, after #304), pin bf99845), for a replay to offer the turn again on the server's
+/// keys as the live stream does.
+fn plan_failure_of(events: &[serde_json::Value]) -> Option<RunErrorCode> {
+    events
+        .iter()
+        .rev()
+        .find(|event| event.get("type").and_then(serde_json::Value::as_str) == Some("RUN_ERROR"))
+        .and_then(|event| event.get("code"))
+        .and_then(serde_json::Value::as_str)
+        .and_then(RunErrorCode::from_code)
+}
+
 /// A time as a row carries it. Rows written before times were kept to the millisecond have
 /// whole seconds, and both read the same; both sort beside each other, since a whole second
 /// sorts before any fraction of it.
@@ -3488,6 +3671,57 @@ pub struct AgentRoutine {
     /// The name, prompt and cron line as the server last answered them, for a routine it has.
     /// An edit sends only what differs from this. A draft has none.
     pub saved: Option<ScheduleEdit>,
+    /// The zone the server reads its line in, as its row says it (`ScheduleRow::tz`); `None` on
+    /// a draft and on a routine from a server before zones. Read through [`RoutineZone::of`].
+    pub tz: Option<String>,
+}
+
+/// The zone a routine's times are in, and whether it is this computer's own, which is when its
+/// times need no zone named beside them (opengrok-server #316, #334, on main 8e7387f: the server
+/// reads a routine's line in the IANA zone on its row, `tz`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RoutineZone {
+    /// The zone's IANA name, as the server keeps it.
+    pub name: String,
+    /// It is the zone this computer's system names now.
+    pub here: bool,
+}
+
+/// The zone the server read every routine's line in before routines had one of their own, and
+/// the one a routine stored before them replays as (`UTC` in opengrok-core `schedule.rs`).
+const UTC_ZONE: &str = "UTC";
+
+impl RoutineZone {
+    /// The zone `routine`'s line is read in: its own; on a routine whose server names none, UTC;
+    /// and on a draft, the one the server will give it, since this app names none on a create:
+    /// the account's `timeZone`, else UTC (`zone_of` in opengrok-server's
+    /// `crates/opengrok-server/src/autonomy/desk.rs`). `account` is the account's zone as last
+    /// read, and `mac` this computer's, when the system can say.
+    pub fn of(routine: &AgentRoutine, account: Option<&str>, mac: Option<&str>) -> Self {
+        let named = |zone: Option<&str>| {
+            zone.map(str::trim)
+                .filter(|zone| !zone.is_empty())
+                .map(str::to_string)
+        };
+        let name = match routine.saved {
+            Some(_) => named(routine.tz.as_deref()),
+            None => named(account),
+        }
+        .unwrap_or_else(|| UTC_ZONE.to_string());
+        let here = named(mac).as_deref() == Some(name.as_str());
+        Self { name, here }
+    }
+
+    /// The zone's name where it is not this computer's: the small word beside a routine's times.
+    /// Nothing where it is, since those times are the person's own.
+    pub fn note(&self) -> Option<&str> {
+        (!self.here).then_some(self.name.as_str())
+    }
+
+    /// UTC by name, which needs no zone database to read a line in.
+    fn is_utc(&self) -> bool {
+        matches!(self.name.as_str(), "UTC" | "Etc/UTC")
+    }
 }
 
 /// What the app says when somebody asks a routine for a second way of firing.
@@ -3497,6 +3731,355 @@ pub struct AgentRoutine {
 /// have both is to have two routines.
 pub const ROUTINE_IS_ONE_SCHEDULE: &str =
     "A routine is one schedule on the server: make another routine for a second trigger.";
+
+/// What deleting a routine the server has does, as Delete's question says it. The server only
+/// marks the routine deleted (opengrok-server `autonomy/routes.rs`, `delete_schedule`, which
+/// appends `ScheduleEvent::Deleted`): it stops firing and refuses edits, and its runs and its
+/// thread are kept.
+pub const ROUTINE_DELETE_KEEPS: &str = "It stops running. Its past runs and conversation stay.";
+
+/// The same question about a draft, which never reached the server.
+pub const DRAFT_DELETE_KEEPS: &str = "It was never saved, so nothing else changes.";
+
+/// What + says, dead, on a routine that has its one wake. opengrok-server keeps one wake per
+/// routine (`opengrok-core` `schedule.rs`: a schedule is one `Wake`); opengrok-server#315 lets a
+/// routine have several, and is what will let + add another.
+pub const ONE_WAKE_PER_ROUTINE: &str = "This server allows one schedule per routine";
+
+/// What 🗑 says, dead, on a routine's only wake: a routine with none would never run, and
+/// stopping it is what deleting the routine does.
+pub const LAST_WAKE_STAYS: &str = "A routine needs a schedule: delete the routine to stop it";
+
+/// One of the wake editor's typed boxes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WakeBox {
+    /// The Every tab's number.
+    Every,
+    /// The hour, on a 12-hour clock.
+    Hour,
+    Minute,
+    /// The Cron tab's line.
+    Cron,
+}
+
+/// A wake of a routine being picked in the wake editor, before Save: what has been picked, and
+/// what the routine already is.
+#[derive(Clone, Debug, PartialEq)]
+pub struct WakeEditor {
+    pub routine_id: String,
+    /// The wake being changed, by its place in the routine's list; `None` while one is added.
+    pub index: Option<usize>,
+    /// The kind the routine already is, which an edit cannot change: the server refuses ("a
+    /// routine's kind cannot change; create a new routine instead", opengrok-server
+    /// `autonomy/routes.rs`, `edit_schedule`). `None` for a routine's first wake.
+    pub kind: Option<ScheduleKind>,
+    pub tab: WakeTab,
+    /// What the time tabs and the Cron tab have picked.
+    pub spec: ScheduleSpec,
+    /// The Every number, the hour and the minute as they are in their boxes: what the person
+    /// sees, kept even while one of them is not a number, so the schedule says it is not one
+    /// rather than keep an older value the box no longer shows.
+    pub every: String,
+    pub hour: String,
+    pub minute: String,
+    pub pm: bool,
+    /// Which opening of the editor this is, unique to it, and bumped with every change to a
+    /// box's text from outside the box (a stepper, a tab, a driver): together they tell the pane
+    /// when to write the boxes again. A person's typing is the box's own.
+    pub opened: u64,
+    pub resync: u64,
+    /// The zone the routine's line is read in, which the times picked are in.
+    pub zone: RoutineZone,
+}
+
+/// What the wake editor says under what was picked, worked out once for the pane and the
+/// driver's tree alike.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WakeStatus {
+    /// The one sentence that says exactly what was picked.
+    pub summary: String,
+    /// When it would next run, in the person's own time.
+    pub next: Option<String>,
+    /// Why Save cannot go: what was picked is not a schedule the server would take.
+    pub error: Option<String>,
+    /// On the Cron tab, the line's days of the week are numbers, which [`NUMBERED_WEEKDAYS`]
+    /// says how the server counts.
+    pub numbered_weekdays: bool,
+}
+
+/// What the Cron tab says beside a line that numbers its days of the week: how the server counts
+/// them, standard cron's way (opengrok-server #331, on main 5567f91), which a person who counts
+/// them another way would otherwise not know.
+pub const NUMBERED_WEEKDAYS: &str = "Days of the week count as in standard cron: 0 and 7 are \
+                                     Sunday and 1 is Monday, so 1-5 is Monday to Friday.";
+
+impl WakeStatus {
+    pub fn can_save(&self) -> bool {
+        self.error.is_none()
+    }
+}
+
+impl WakeEditor {
+    fn new(
+        routine_id: String,
+        index: Option<usize>,
+        kind: Option<ScheduleKind>,
+        spec: ScheduleSpec,
+        zone: RoutineZone,
+    ) -> Self {
+        let tab = if kind == Some(ScheduleKind::Webhook) {
+            WakeTab::Webhook
+        } else {
+            spec.tab()
+        };
+        let (hour, minute) = spec.times.first().copied().unwrap_or((9, 0));
+        let (h12, am) = crate::cron_spec::twelve_hour(hour);
+        Self {
+            routine_id,
+            index,
+            kind,
+            tab,
+            every: spec.every.to_string(),
+            hour: h12.to_string(),
+            minute: format!("{minute:02}"),
+            pm: !am,
+            spec,
+            opened: 0,
+            resync: 0,
+            zone,
+        }
+    }
+
+    /// The editor's lines for what is picked now: its summary, its next run after `now` in the
+    /// person's time (by the server's own parser, `cron_next`, the line read in the routine's
+    /// zone), or why it cannot be saved.
+    ///
+    /// The next run is said where this app can read the line in the routine's zone: this
+    /// computer's own, or UTC. A routine in a third zone (one a Bot made for somewhere else, or
+    /// one from before this computer moved) is still held to the server's parser, which no zone
+    /// changes, and its next run is left unsaid rather than worked out on another clock.
+    pub fn status(&self, now: chrono::DateTime<chrono::Utc>) -> WakeStatus {
+        let mut status = WakeStatus {
+            summary: self.summary(),
+            next: None,
+            error: None,
+            numbered_weekdays: false,
+        };
+        if self.tab == WakeTab::Webhook {
+            return status;
+        }
+        let line = match self.spec.to_cron() {
+            Ok(line) => line,
+            Err(not_cron) => {
+                status.error = Some(not_cron.sentence().to_string());
+                return status;
+            }
+        };
+        status.numbered_weekdays =
+            self.tab == WakeTab::Cron && crate::cron_spec::numbered_weekdays(&line);
+        let next = if self.zone.here {
+            crate::cron_next::next_run(&line, now, &chrono::Local)
+        } else {
+            crate::cron_next::next_run(&line, now, &chrono::Utc)
+        };
+        match next {
+            Ok(Some(when)) if self.zone.here || self.zone.is_utc() => {
+                status.next = Some(crate::cron_next::next_run_words(when, &chrono::Local));
+            }
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                status.error = Some("No date matches this line, so it would never run.".into());
+            }
+            Err(why) => status.error = Some(format!("The server would refuse this line: {why}")),
+        }
+        status
+    }
+
+    /// Whether `tab` can be picked: no webhook for a routine that is a schedule, and no schedule
+    /// for one that is a webhook.
+    pub fn tab_open(&self, tab: WakeTab) -> bool {
+        match self.kind {
+            Some(ScheduleKind::Webhook) => tab == WakeTab::Webhook,
+            Some(ScheduleKind::Cron) => tab != WakeTab::Webhook,
+            None => true,
+        }
+    }
+
+    /// What was picked, as the trigger the server will be asked for, or why it is not one.
+    pub fn picked(&self) -> Result<NewTrigger, ScheduleNotCron> {
+        if self.tab == WakeTab::Webhook {
+            return Ok(NewTrigger::Webhook);
+        }
+        self.spec
+            .to_cron()
+            .map(|_| NewTrigger::Schedule(self.spec.clone()))
+    }
+
+    /// The one sentence under the editor that says exactly what was picked.
+    pub fn summary(&self) -> String {
+        match self.tab {
+            WakeTab::Webhook => "When a webhook fires".into(),
+            _ => self.spec.label(),
+        }
+    }
+
+    /// The time boxes, read into the schedule: no time at all while either is not one, which
+    /// the schedule then says.
+    fn read_time(&mut self) {
+        let hour = self
+            .hour
+            .trim()
+            .parse::<u8>()
+            .ok()
+            .filter(|h| (1..=12).contains(h));
+        let minute = self.minute.trim().parse::<u8>().ok().filter(|m| *m <= 59);
+        self.spec.times = match (hour, minute) {
+            (Some(hour), Some(minute)) => vec![(hour % 12 + if self.pm { 12 } else { 0 }, minute)],
+            _ => Vec::new(),
+        };
+    }
+
+    /// The boxes written from the schedule, after a change from outside them.
+    fn write_boxes(&mut self) {
+        self.every = self.spec.every.to_string();
+        if let Some(&(hour, minute)) = self.spec.times.first() {
+            let (h12, am) = crate::cron_spec::twelve_hour(hour);
+            self.hour = h12.to_string();
+            self.minute = format!("{minute:02}");
+            self.pm = !am;
+        }
+        self.resync += 1;
+    }
+}
+
+/// What Save did with the wake picked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WakeSaved {
+    /// Nothing: there was no editor, or the pick is not a schedule the server takes and the
+    /// editor stays open saying why.
+    Nothing,
+    /// The routine's first wake: the routine is made on the server with it.
+    Created,
+    /// A new wake on a routine the server has, sent with the rest of what changed.
+    Changed,
+    /// A webhook's: there is nothing to change on one, so the editor closes.
+    Closed,
+}
+
+/// What a routine's Run history says on a server that cannot list a routine's runs.
+pub const ROUTINE_RUNS_UNAVAILABLE: &str = "This server can't show a routine's runs yet.";
+
+/// What a routine's editor says on a server that cannot change a routine once it is made.
+pub const ROUTINE_EDIT_UNAVAILABLE: &str = "This server can't change a routine after it's made.";
+
+/// What a routine's editor says on a server that cannot start a routine when asked.
+pub const ROUTINE_RUN_UNAVAILABLE: &str = "This server can't run a routine on demand yet.";
+
+/// What the open server has shown it cannot do with a routine, learnt from its answers.
+///
+/// An opengrok-server from before it could change a routine, run one on demand and list what one
+/// ran (opengrok-server 18656e3, `autonomy/routes.rs`) has none of the three routes, and answers
+/// them the way it answers any route it lacks (`OpenGrokError::route_missing`). That is a fact
+/// about the server and so about every routine on it, kept for as long as the app talks to it:
+/// the history says what it cannot show, the fields stop taking edits that would not be kept, and
+/// Test run stops offering a run that would not start. None of them is asked again.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RoutineRoutesMissing {
+    /// `GET /schedules/{id}/runs`.
+    pub runs: bool,
+    /// `PATCH /schedules/{id}`.
+    pub edit: bool,
+    /// `POST /schedules/{id}/run`.
+    pub run_now: bool,
+}
+
+/// What the routine editor says a server cannot do with a routine, beside the controls it
+/// leaves dead, as each line's id (after `routine-{id}-`) and its words. `on_the_server` is
+/// whether the server has the routine: a draft is made by a route every server has, so it can
+/// still be written whatever the server cannot change once it is made.
+pub fn routine_notes(
+    missing: RoutineRoutesMissing,
+    on_the_server: bool,
+) -> Vec<(&'static str, &'static str)> {
+    [
+        (on_the_server && missing.edit).then_some(("cant-change", ROUTINE_EDIT_UNAVAILABLE)),
+        missing
+            .run_now
+            .then_some(("cant-run", ROUTINE_RUN_UNAVAILABLE)),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
+}
+
+/// The editor's red line for a routine: the last refusal, unless one of its notes already says
+/// it, which would say it twice.
+pub fn routine_trouble_line(
+    trouble: Option<&str>,
+    notes: &[(&'static str, &'static str)],
+) -> Option<String> {
+    trouble
+        .filter(|line| !notes.iter().any(|(_, note)| note == line))
+        .map(str::to_string)
+}
+
+/// A refused routine call, as the Computer pane says it.
+///
+/// The server's own words when it wrote some, begun with a capital as the pane's other lines
+/// are. An answer with nothing in it is said as what the server answered, never as the client's
+/// stand-in, "request failed", which tells nobody what happened; and a server that could not be
+/// reached at all is said as that.
+fn routine_trouble(error: &OpenGrokError) -> String {
+    if error.unreachable() == Some(Unreachable::Server) {
+        return "Could not reach the server.".to_string();
+    }
+    match error.status {
+        Some(status) if error.said_nothing() => {
+            format!("The server answered {status} without saying why.")
+        }
+        _ => crate::components::agent_settings::sentence(error.message.trim()),
+    }
+}
+
+/// In if out, out if in: a chip.
+fn toggle(picked: &mut Vec<u8>, value: u8) {
+    match picked.iter().position(|v| *v == value) {
+        Some(at) => {
+            picked.remove(at);
+        }
+        None => {
+            picked.push(value);
+            picked.sort_unstable();
+        }
+    }
+}
+
+/// What has to follow an edit's answer, which the answer alone decides.
+#[derive(Debug, PartialEq, Eq)]
+enum AfterRoutineEdit {
+    Nothing,
+    /// A Test run pressed while the edit was out, now that the routine is the one it changed to.
+    RunNow,
+    /// The server's copy, read again over an edit it refused (`restore_routine`).
+    ReadBack,
+}
+
+/// What a person typed into a routine that a server without `PATCH /schedules/{id}` refused, as
+/// the editor lists it beside the server's values: the name, the instruction, and when it was to
+/// run, in the words the schedule picker uses.
+pub fn unsaved_lines(edit: &ScheduleEdit) -> Vec<(&'static str, String)> {
+    let mut lines = Vec::new();
+    if let Some(name) = &edit.name {
+        lines.push(("Name", name.clone()));
+    }
+    if let Some(prompt) = &edit.prompt {
+        lines.push(("Instruction", prompt.clone()));
+    }
+    if let Some(cron) = &edit.cron {
+        lines.push(("When", ScheduleSpec::from_cron(cron).label()));
+    }
+    lines
+}
 
 /// One schedule as the editor draws it.
 fn routine_from_schedule(row: ScheduleRow) -> AgentRoutine {
@@ -3516,6 +4099,7 @@ fn routine_from_schedule(row: ScheduleRow) -> AgentRoutine {
         runs: Vec::new(),
         saved: Some(saved),
         id: row.id,
+        tz: row.tz,
     }
 }
 
@@ -3532,7 +4116,7 @@ fn with_unlisted_runs(
         .filter(|run| {
             run.unsettled()
                 && now_ms - run.started_at_ms < UNLISTED_RUN_MS
-                && !listed.iter().any(|listed| listed.run_id == run.run_id)
+                && !listed.iter().any(|listed| listed.run_id() == run.run_id())
         })
         .cloned()
         .collect();
@@ -3559,8 +4143,8 @@ fn relisted(before: Option<&[AgentRoutine]>, rows: Vec<ScheduleRow>) -> Vec<Agen
 /// what the server last said, and nothing else.
 ///
 /// The cron line is compared as the schedule it means rather than as text: the server hands a
-/// line back in its own six-field form (`0 0 9 * * 1` for Mondays at 9), which is read the way
-/// the server shows it (`from_server_cron`), so the picker's `0 9 * * 1` is no change. A
+/// line back in its own six-field form (`0 0 9 * * MON` for Mondays at 9), which is read the way
+/// the server shows it (`from_server_cron`), so the picker's `0 9 * * MON` is no change. A
 /// schedule the picker cannot turn into one line is not sent at all; the editor already says
 /// why, and the server would refuse it.
 fn routine_edit(routine: &AgentRoutine) -> ScheduleEdit {
@@ -3653,12 +4237,42 @@ impl RoutineTrigger {
 /// One line of a routine's Run history, from the server's.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RoutineRun {
-    pub run_id: String,
-    /// When it started, as the row reads.
+    /// When it started, or for a skipped firing when it was due, as the row reads.
     pub at: String,
     pub started_at_ms: i64,
     pub cause: RunCause,
-    pub status: ScheduleRunStatus,
+    /// The name of the Bot that started it, as the server called it then, where one did (opengrok-server
+    /// #337, built in #342: `by` on the line); `None` for the clock, a webhook and the person's own
+    /// Test run, which the line says nothing more of.
+    pub by: Option<String>,
+    pub outcome: RunOutcome,
+}
+
+/// What came of one firing of a routine.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RunOutcome {
+    /// A run, which its line opens in the routine's thread, and where it got to.
+    Ran {
+        run_id: String,
+        status: ScheduleRunStatus,
+    },
+    /// No run: the Bot answers on its person's own plan, and the plan could not answer when the
+    /// routine was due (opengrok-server #316, #334, on main 8e7387f). The line says the server's
+    /// sentence for why, and has nothing to open.
+    Skipped { reason: String },
+}
+
+/// A moment of a routine's history as its line reads it, in the person's own time: "Oct 3 at
+/// 9:05 AM".
+fn history_time(at_ms: i64) -> String {
+    chrono::DateTime::from_timestamp_millis(at_ms)
+        .map(|at| {
+            at.with_timezone(&chrono::Local)
+                .format("%b %d at %I:%M %p")
+                .to_string()
+                .replace(" 0", " ")
+        })
+        .unwrap_or_default()
 }
 
 /// How long a Test run the server has named stays on screen before its history lists it. The
@@ -3668,49 +4282,84 @@ const UNLISTED_RUN_MS: i64 = 60_000;
 
 impl RoutineRun {
     fn from_server(run: ScheduleRun) -> Self {
-        let at = chrono::DateTime::from_timestamp_millis(run.started_at_ms)
-            .map(|at| {
-                at.with_timezone(&chrono::Local)
-                    .format("%b %d at %I:%M %p")
-                    .to_string()
-                    .replace(" 0", " ")
-            })
-            .unwrap_or_default();
+        let skipped = run.is_skipped();
+        let started_at_ms = run.started_at_ms.or(run.at).unwrap_or_default();
+        let outcome = match run.run_id {
+            Some(run_id) if !skipped => RunOutcome::Ran {
+                run_id,
+                status: run.status.unwrap_or(ScheduleRunStatus::Other),
+            },
+            // "Skipped" alone is the server's own word for a skip it has no sentence for
+            // (`skip_reason` in opengrok-server's `crates/opengrok-server/src/autonomy/mod.rs`).
+            _ => RunOutcome::Skipped {
+                reason: run
+                    .reason
+                    .map(|reason| reason.trim().to_string())
+                    .filter(|reason| !reason.is_empty())
+                    .unwrap_or_else(|| "Skipped".to_string()),
+            },
+        };
         Self {
-            run_id: run.run_id,
-            at,
-            started_at_ms: run.started_at_ms,
+            at: history_time(started_at_ms),
+            started_at_ms,
             cause: run.cause,
-            status: run.status,
+            by: run.by.map(|by| by.name),
+            outcome,
         }
     }
 
     /// The run a Test run just started, before the history has it.
     fn just_started(run_id: String) -> Self {
-        Self::from_server(ScheduleRun {
-            run_id,
+        let started_at_ms = chrono::Utc::now().timestamp_millis();
+        Self {
+            at: history_time(started_at_ms),
+            started_at_ms,
             cause: RunCause::Manual,
-            status: ScheduleRunStatus::Running,
-            started_at_ms: chrono::Utc::now().timestamp_millis(),
-            ended_at_ms: None,
-        })
+            by: None,
+            outcome: RunOutcome::Ran {
+                run_id,
+                status: ScheduleRunStatus::Running,
+            },
+        }
     }
 
-    /// Still going, or parked on a card: a later look can say how it ended.
+    /// The run its line opens, or `None` on a skipped firing, which started none.
+    pub fn run_id(&self) -> Option<&str> {
+        match &self.outcome {
+            RunOutcome::Ran { run_id, .. } => Some(run_id),
+            RunOutcome::Skipped { .. } => None,
+        }
+    }
+
+    /// Still going, or parked on a card: a later look can say how it ended. A skip is settled.
     pub fn unsettled(&self) -> bool {
         matches!(
-            self.status,
-            ScheduleRunStatus::Running | ScheduleRunStatus::Waiting
+            self.outcome,
+            RunOutcome::Ran {
+                status: ScheduleRunStatus::Running | ScheduleRunStatus::Waiting,
+                ..
+            }
         )
     }
 
-    /// What set it off, in the words the editor uses for it.
-    pub fn cause_label(&self) -> &'static str {
+    /// What set it off, in the words the editor uses for it: a Bot's run says which Bot ran it, by
+    /// the name the server gave, and any other cause says nothing of any Bot, whatever else a line
+    /// carries.
+    pub fn cause_label(&self) -> String {
         match self.cause {
-            RunCause::Manual => "Test run",
-            RunCause::Webhook => "Webhook",
-            RunCause::Clock => "Schedule",
-            RunCause::Other => "Run",
+            RunCause::Manual => "Test run".to_string(),
+            RunCause::Webhook => "Webhook".to_string(),
+            RunCause::Clock => "Schedule".to_string(),
+            RunCause::Bot => match self
+                .by
+                .as_deref()
+                .map(str::trim)
+                .filter(|by| !by.is_empty())
+            {
+                Some(name) => format!("Run by {name}"),
+                None => "Run by a Bot".to_string(),
+            },
+            RunCause::Other => "Run".to_string(),
         }
     }
 }
@@ -4108,9 +4757,6 @@ pub enum AppSettingsTab {
     Logins,
     /// The services the person has signed in to for their Bots, and the ones on offer (#2).
     Connections,
-    /// Where the account's replies are paid from: the server's paid keys, or the person's own
-    /// subscription through opencodex.
-    ReplySource,
     Skills,
 }
 
@@ -4373,6 +5019,12 @@ pub struct AppState {
     /// The files on the draft, as (name, `uploading` / `ready` / `failed`), published by the
     /// composer for a driver like its chips.
     pub composer_files: Vec<(String, &'static str)>,
+    /// Whether the transcript keeps its newest row in view, as the transcript publishes it.
+    ///
+    /// The list lives in the transcript's own view and nothing outside that view can read it.
+    /// A driver is handed this state and nothing else, and this is what lets it scroll up and
+    /// see that the transcript let go of the newest row, and stayed let go.
+    pub transcript_following: bool,
     /// Files a driver asked the composer to attach, by path: the OS picker is not something a
     /// driver can work, so it hands the composer the paths it would have picked.
     pub attach_requests: Vec<std::path::PathBuf>,
@@ -4485,7 +5137,36 @@ pub struct AppState {
     /// edit's answer, or a refused edit put back), so the editor's fields follow it. Per routine
     /// because an answer for one must leave another's half-typed fields alone.
     routine_resyncs: HashMap<String, u64>,
-    pub model_picker_open: bool,
+    /// What this server has shown it cannot do with a routine. Forgotten with the client, when
+    /// the app is pointed at a server again (`set_config`).
+    pub routine_routes_missing: RoutineRoutesMissing,
+    /// Per routine, the edit a server that cannot change a routine refused: what the person
+    /// typed, kept on screen beside the server's values the fields went back to, so it is not
+    /// lost to a refusal it had no part in.
+    pub routine_unsaved: HashMap<String, ScheduleEdit>,
+    /// The routine Delete is asking about, while its question is over the window.
+    pub routine_delete_prompt: Option<String>,
+    /// The open routine's panel shows its Run history and nothing else, in place of its fields.
+    /// Per routine opened: the next one to open shows its fields again.
+    pub routine_history_open: bool,
+    /// The wake being picked for the open routine, while the wake editor is open.
+    pub routine_wake_editor: Option<WakeEditor>,
+    /// How many times the wake editor has opened: each opening's own number.
+    wake_opens: u64,
+    /// A run of a routine to bring into view in the routine's thread once the thread has it:
+    /// the thread's id and the run's. Set by a line of the Run history; let go once shown, or
+    /// once the person is in another thread.
+    pub reveal_run: Option<(String, String)>,
+    /// The Bot's model picker's popover, under the Model card in the Bot's settings, the one
+    /// place a Bot's model is picked (`components::model_picker`).
+    pub model_picker: PickerView,
+    /// Default for new Bots' picker's popover, under its card on Settings → General.
+    pub new_bots_picker: PickerView,
+    /// The Relay-off fallback's picker's popover, under its card on Settings → General.
+    pub plan_fallback_picker: PickerView,
+    /// The server's words for the last change the picker made that did not go through, with the
+    /// Bot it was for. The popover says it under its controls until the next change is sent.
+    pub model_pick_note: Option<(String, String)>,
     pub avatar_editor_open: bool,
     pub hiring: bool,
     pub pinned_coworker_ids: HashSet<String>,
@@ -4539,6 +5220,10 @@ pub struct AppState {
     pending_save: HashMap<String, PendingSave>,
     /// A "Use saved login" press on a card, keyed by card key, until the form settles.
     pub saved_login_use: HashMap<String, SavedLoginUse>,
+    /// The login whose name was sent from the name page of a two-step sign-in, by thread and
+    /// site, so the password page after it offers that login first. A row id, never a secret;
+    /// in memory only, and a sign-out forgets it.
+    name_page_picks: HashMap<(String, String), String>,
     /// Ids of the saved logins whose password is in this Mac's keychain. The others are on
     /// the server only and are fetched, after Touch ID, the first time they are used here.
     pub site_logins_on_this_mac: HashSet<String>,
@@ -4568,12 +5253,32 @@ pub struct AppState {
     pub approval_decisions: HashMap<String, ApprovalDecision>,
     pub local_exec_machine_id: Option<String>,
     local_exec_cancel: Option<Arc<AtomicBool>>,
+    /// This Mac's credential as local-exec holds it, while local-exec runs: the relay opens its
+    /// stream and answers with it, and follows it when local-exec enrols this Mac again.
+    local_exec_enrolment: Option<Enrolment>,
+    /// Why local-exec stopped by itself, since it last started: this Mac runs no command for the
+    /// server until it starts again, at the next sign-in. Settings → Computer says so under This
+    /// Mac.
+    pub local_exec_stopped: Option<LocalExecStopped>,
     pub expanded_shell_output: HashSet<String>,
-    /// The step rows, groups of steps and Thought rows the person has opened, by the keys
-    /// `components::steps` gives them. Not saved: every one of them is shut when a thread is
+    /// The step rows, groups of steps, Thought rows and Timing rows the person has opened, by the
+    /// keys `components::steps` gives them. Not saved: every one of them is shut when a thread is
     /// opened again, which is how a reply is meant to be read.
     pub expanded_steps: HashSet<String>,
     pub computers: Vec<ConnectedComputer>,
+    /// Numbers the reads of [`Self::computers`], so an answer that is not the newest, or that lands
+    /// after a sign-out, is dropped. A relay switch the server answers counts one too: a read begun
+    /// before it cannot put back the row the answer replaced.
+    computers_generation: u64,
+    /// The relay switches of the person's computers that are with the server, by machine id: one
+    /// to a computer at a time, drawn where the click asked to take it until the server answers
+    /// (see [`Self::set_computer_relay`]).
+    computer_relay_switches: HashMap<String, ComputerRelaySwitch>,
+    /// Counts the relay switches sent, for the token each is settled by.
+    computer_relay_switch_count: u64,
+    /// What each computer's card says about its last relay switch that did not go as asked, by
+    /// machine id: a refusal in the server's words stays until the next switch of that card.
+    computer_relay_notes: HashMap<String, ChangeNote>,
     /// This Mac's standing rules, as Settings → Computer last read them. See
     /// [`Self::this_mac_rules`] for when they are drawn.
     pub local_rules: Option<LocalRules>,
@@ -4613,27 +5318,49 @@ pub struct AppState {
     /// Connect it was asked for. The service's name cannot tell that ask from another for the
     /// same service, or from one an account that has since signed out made.
     connect_asks: u64,
-    /// Settings → Reply source: where the server keeps this account's replies paid from, and
-    /// the page's unsaved picks. The composer's chip defaults from it.
+    /// Where the server keeps this account's replies paid from, and the unsaved changes to this
+    /// computer's half of the relay on its card in Settings → Computer. A Bot that has picked no
+    /// door of its own follows the kind the server keeps, which nothing here switches.
     pub reply_source: ReplySourceSettings,
-    /// Numbers the reads and Saves of the reply source, so an answer that is not the newest, or
-    /// that lands after a sign-out, is dropped.
+    /// Numbers the reads of the reply source, so an answer that is not the newest, or that lands
+    /// after a sign-out, is dropped.
     reply_source_generation: u64,
-    /// The door the person picked on the composer's chip where it is not the account's own. The
-    /// chip shows it, and every turn names what the chip shows, until they change it back, a
-    /// Save makes it the account's own, or they sign out; and it does not outlive the app,
-    /// because only this memory keeps it. The server keeps the account's door, and that is what
-    /// a relaunch starts from.
-    turn_source_pick: Option<InferenceKind>,
-    /// The composer is dictating: its chip is not drawn meanwhile, and a turn names the
-    /// account's own door rather than the chip's.
-    pub(crate) composer_dictating: bool,
     /// Numbers the reads of `/models`, so only the newest answer lands
     /// ([`Self::begin_models_read`]).
     models_generation: u64,
-    /// Settings → Reply source was on screen when Settings last changed what it shows, so its
-    /// arrival and its leaving are each told once ([`Self::settle_reply_source_page`]).
-    reply_source_page_shown: bool,
+    /// Settings → Computer was on screen when Settings last changed what it shows, so its arrival
+    /// and its leaving are each told once ([`Self::settle_computer_page`]).
+    computer_page_shown: bool,
+    /// The same of Settings → General, whose Default models read the setting and the models as
+    /// it arrives ([`Self::settle_default_models_page`]).
+    default_models_page_shown: bool,
+    /// The time zone a `PUT /account` is out with, or that the server refused: it is not sent
+    /// again until this computer's zone moves off it ([`Self::begin_time_zone`]).
+    time_zone_sent: Option<String>,
+    /// The sign-in the time-zone watch is for: a new one starts it again, a sign-out ends it, and
+    /// an answer from another lands on nothing.
+    time_zone_epoch: u64,
+    /// The relay: this computer's opencodex and the running relay's word on itself
+    /// (hexuria/nativechat #156, opengrok-server #292).
+    pub relay_mac: RelayMac,
+    /// The relay, while it runs, or once it has stopped and says why: for good after another
+    /// stream of this computer took over, and until this Mac enrols again after the server turned
+    /// its token away; and waiting for this computer's own row to read on while the server has its
+    /// relay switched off. Dropping it stops it, with every call it was answering: signed out, or
+    /// the app quitting.
+    relay_worker: Option<RelayHandle>,
+    /// A start of the relay reading its key, by its number, so a second is not begun meanwhile.
+    relay_starting: Option<u64>,
+    /// Numbers the relay's starts, so a start, or a report from a relay stopped since, is
+    /// dropped.
+    relay_generation: u64,
+    /// Where the key for this Mac's opencodex is kept: the Keychain, once the app is configured,
+    /// and memory before that and in tests.
+    relay_keys: Arc<dyn RelayKeyStore>,
+    /// Replies whose run ended because the person's plan could not answer (a `RUN_ERROR`'s
+    /// `code`: the relay's, or `plan_unavailable`), by the reply's message id: the thread's last
+    /// one offers the turn again on the server's keys ([`Self::send_on_server`]).
+    plan_failures: HashMap<String, RunErrorCode>,
     /// Everything the open Bot could be offered and which of it it may be, as its Tools card's
     /// switches show it (opengrok-server#268): the Bot's id and the answer, like
     /// [`Self::coworker_tools`]. Drawn through [`Self::ceiling_card`].
@@ -4654,11 +5381,6 @@ pub struct AppState {
     ceiling_switches: u64,
     /// What the Tools card says about the last switch that did not go as asked.
     ceiling_note: Option<CeilingNote>,
-    /// The effort picked in the open bot's settings and not saved yet, with the bot it was picked
-    /// for. The pane's words live in its own fields; a pick lives here so that a driver can make
-    /// one from the menu's choices the way a person does. Save sends it when it differs from what
-    /// the server keeps ([`Self::effort_to_save`]).
-    effort_pick: Option<(String, String)>,
     /// A driver pressed the bot settings' Save. The button is the pane's, and so are the fields
     /// it sends, so the pane takes this and saves as the button would.
     agent_save_requested: bool,
@@ -4702,6 +5424,16 @@ pub struct AppState {
     pub last_box_shot: Option<ScreenshotSpec>,
     /// Runs while the Computer pane is open; dropped when it closes.
     computer_poll: Option<Task<()>>,
+    /// A status request is out. The poll ticks every two seconds whatever the server's pace,
+    /// and a slow server (seconds per answer while a box is busy) would otherwise have one
+    /// more request piled on it each tick, each slowing the rest. So one at a time, and a
+    /// refresh asked for meanwhile (after a Reset, say) is sent once the answer lands, so
+    /// it never takes an answer that predates it.
+    computer_refresh_in_flight: bool,
+    computer_refresh_again: bool,
+    /// The same for the screen tile; a tick that finds one out just skips, as the next
+    /// tick fetches a newer picture anyway.
+    screen_refresh_in_flight: bool,
     /// One screen window per coworker: Open brings the existing one forward rather than
     /// stacking another.
     #[cfg(target_os = "macos")]
@@ -4718,6 +5450,10 @@ pub struct AppState {
     /// The coworker whose absent computer we already asked the server to (re)provision, so a
     /// status of `absent` heals once per visit rather than on every poll.
     computer_heal_requested: Option<String>,
+    /// The bots whose computer the server has been asked for (`POST /coworkers/{id}/computer`)
+    /// and has not answered about yet. Get a computer waits on its bot's, as two asks at once
+    /// could each make a box.
+    computer_asks: HashSet<String>,
     /// What the main slot shows: the chat, or the Recipes page.
     pub page: MainPage,
     /// The pictures of one turn, opened full window from a tile in the transcript.
@@ -5097,6 +5833,8 @@ impl AppState {
             active_recipe: None,
             active_skill: None,
             composer_files: Vec::new(),
+            // A thread opens at its newest row.
+            transcript_following: true,
             attach_requests: Vec::new(),
             detach_requests: Vec::new(),
             composer_chips: Vec::new(),
@@ -5152,7 +5890,19 @@ impl AppState {
             routine_runs_asked: HashMap::new(),
             routine_latest_edit: HashMap::new(),
             routine_resyncs: HashMap::new(),
-            model_picker_open: false,
+            routine_routes_missing: RoutineRoutesMissing::default(),
+            routine_unsaved: HashMap::new(),
+            routine_history_open: false,
+            routine_wake_editor: None,
+            wake_opens: 0,
+            routine_delete_prompt: None,
+            reveal_run: None,
+            model_picker: PickerView::default(),
+            new_bots_picker: PickerView::default(),
+            plan_fallback_picker: PickerView::default(),
+            time_zone_sent: None,
+            time_zone_epoch: 0,
+            model_pick_note: None,
             avatar_editor_open: false,
             hiring: false,
             pinned_coworker_ids: HashSet::new(),
@@ -5179,6 +5929,7 @@ impl AppState {
             site_login_vault: None,
             pending_save: HashMap::new(),
             saved_login_use: HashMap::new(),
+            name_page_picks: HashMap::new(),
             site_logins_on_this_mac: HashSet::new(),
             site_logins_with_code: HashSet::new(),
             user_form_list_open: HashSet::new(),
@@ -5192,9 +5943,15 @@ impl AppState {
             approval_decisions: HashMap::new(),
             local_exec_machine_id: None,
             local_exec_cancel: None,
+            local_exec_enrolment: None,
+            local_exec_stopped: None,
             expanded_shell_output: HashSet::new(),
             expanded_steps: HashSet::new(),
             computers: Vec::new(),
+            computers_generation: 0,
+            computer_relay_switches: HashMap::new(),
+            computer_relay_switch_count: 0,
+            computer_relay_notes: HashMap::new(),
             local_rules: None,
             local_rules_epoch: 0,
             coworker_computer: None,
@@ -5210,17 +5967,21 @@ impl AppState {
             connect_asks: 0,
             reply_source: ReplySourceSettings::default(),
             reply_source_generation: 0,
-            turn_source_pick: None,
-            composer_dictating: false,
             models_generation: 0,
-            reply_source_page_shown: false,
+            computer_page_shown: false,
+            default_models_page_shown: false,
+            relay_mac: RelayMac::default(),
+            relay_worker: None,
+            relay_starting: None,
+            relay_generation: 0,
+            relay_keys: Arc::new(crate::relay_key::MemoryKeyStore::default()),
+            plan_failures: HashMap::new(),
             coworker_ceiling: None,
             ceiling_generation: 0,
             ceiling_reading: None,
             ceiling_switch: None,
             ceiling_switches: 0,
             ceiling_note: None,
-            effort_pick: None,
             agent_save_requested: false,
             coworker_skills: None,
             skills_generation: 0,
@@ -5238,8 +5999,12 @@ impl AppState {
             computer_confirm: None,
             computer_action_error: None,
             computer_heal_requested: None,
+            computer_asks: HashSet::new(),
             computer_endpoint_missing: false,
             computer_poll: None,
+            computer_refresh_in_flight: false,
+            computer_refresh_again: false,
+            screen_refresh_in_flight: false,
             page: MainPage::Chat,
             lightbox: None,
             recipes: Vec::new(),
@@ -5286,6 +6051,10 @@ impl AppState {
     }
 
     pub fn set_config(&mut self, config: Config, cx: &mut Context<Self>) {
+        // What a server could not do with a routine is that server's: a new client may be a
+        // newer one.
+        self.routine_routes_missing = RoutineRoutesMissing::default();
+        self.routine_unsaved.clear();
         match OpenGrokClient::new(&config.opengrok_base_url) {
             Ok(client) => {
                 let client =
@@ -5300,6 +6069,7 @@ impl AppState {
         }
         self.config = Some(config);
         self.ensure_site_login_vault(cx);
+        self.open_relay_mac(cx);
         cx.notify();
     }
 
@@ -5338,6 +6108,7 @@ impl AppState {
                         state.auth_status = AuthStatus::SignedIn;
                         state.auth_error = None;
                         state.note_server_answered(cx);
+                        state.watch_time_zone(cx);
                         state.start_local_exec(cx);
                         state.refresh_coworkers(cx);
                         state.sync_server_threads(cx);
@@ -5369,6 +6140,116 @@ impl AppState {
 
     pub fn is_signed_in(&self) -> bool {
         self.auth_status == AuthStatus::SignedIn && self.account.is_some()
+    }
+
+    /// Keep this computer's time zone on the account, for the routines that default to it
+    /// (opengrok-server #322, on main since c0bb6ae: `PUT /account` `{timeZone}`):
+    /// now, as somebody has just signed in, and then whenever the system's zone has moved, looked
+    /// at every [`TIME_ZONE_CHECK`] until they sign out.
+    fn watch_time_zone(&mut self, cx: &mut Context<Self>) {
+        self.time_zone_epoch += 1;
+        self.time_zone_sent = None;
+        let epoch = self.time_zone_epoch;
+        self.keep_time_zone(cx);
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(TIME_ZONE_CHECK).await;
+                let watching = this.update(cx, |state, cx| {
+                    let watching = state.time_zone_epoch == epoch;
+                    if watching {
+                        state.keep_time_zone(cx);
+                    }
+                    watching
+                });
+                if !matches!(watching, Ok(true)) {
+                    return;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// Send this computer's time zone to the account if it is not the one the account keeps.
+    fn keep_time_zone(&mut self, cx: &mut Context<Self>) {
+        let Some(send) = self.begin_time_zone(system_time_zone()) else {
+            return;
+        };
+        let TimeZoneSend {
+            client,
+            epoch,
+            zone,
+        } = send;
+        cx.spawn(async move |this, cx| {
+            let answer = client.set_time_zone(&zone).await;
+            let _ = this.update(cx, |state, cx| {
+                if state.settle_time_zone(epoch, &zone, answer) {
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Begin keeping `system`, this computer's zone, on the account: only where the account's
+    /// read carries `timeZone`, a server that keeps one, and the zone differs from the one it
+    /// keeps; and not again while that zone is out, or after the server refused it, until this
+    /// computer's zone moves off it.
+    fn begin_time_zone(&mut self, system: Option<String>) -> Option<TimeZoneSend> {
+        let client = self.opengrok.clone()?;
+        if !self.is_signed_in() {
+            return None;
+        }
+        let kept = self.account.as_ref()?.time_zone.clone()?;
+        let zone = system
+            .map(|zone| zone.trim().to_string())
+            .filter(|zone| !zone.is_empty())?;
+        if kept.as_deref() == Some(zone.as_str()) {
+            self.time_zone_sent = None;
+            return None;
+        }
+        if self.time_zone_sent.as_deref() == Some(zone.as_str()) {
+            return None;
+        }
+        self.time_zone_sent = Some(zone.clone());
+        Some(TimeZoneSend {
+            client,
+            epoch: self.time_zone_epoch,
+            zone,
+        })
+    }
+
+    /// The server's answer to this computer's time zone, `false` when it is not this sign-in's.
+    /// Kept, the account is what the server answers with. Not answered, the zone is sent again
+    /// at the next look. Refused (a zone the server's database does not know), it is not sent
+    /// again until this computer's zone moves off it, and the refusal goes to stderr, there being
+    /// no page that asked.
+    fn settle_time_zone(
+        &mut self,
+        epoch: u64,
+        zone: &str,
+        answer: Result<Account, OpenGrokError>,
+    ) -> bool {
+        if epoch != self.time_zone_epoch || self.time_zone_sent.as_deref() != Some(zone) {
+            return false;
+        }
+        match answer {
+            Ok(account) => {
+                self.time_zone_sent = None;
+                if self.account.as_ref().map(|kept| &kept.id) == Some(&account.id) {
+                    self.account = Some(account);
+                }
+            }
+            Err(error) if error.unreachable().is_some() || error.status.is_none() => {
+                self.time_zone_sent = None;
+            }
+            Err(error) => {
+                eprintln!(
+                    "NativeChat: the server did not keep this computer's time zone {zone}: {}",
+                    error.message
+                );
+            }
+        }
+        true
     }
 
     /// The working line under the open thread, which is that thread's own or nothing.
@@ -6203,6 +7084,7 @@ impl AppState {
                         state.site_login_notice = None;
                         state.reload_site_logins(cx);
                         state.note_server_answered(cx);
+                        state.watch_time_zone(cx);
                         state.start_local_exec(cx);
                         state.refresh_coworkers(cx);
                         state.sync_server_threads(cx);
@@ -6247,6 +7129,7 @@ impl AppState {
         self.account = None;
         self.auth_status = AuthStatus::SignedOut;
         self.saved_login_use.clear();
+        self.name_page_picks.clear();
         self.pending_save.clear();
         self.auth_error = None;
         // A person who has just signed out is not somebody who needs telling they are signed
@@ -6267,6 +7150,11 @@ impl AppState {
         self.stop_local_exec();
         self.approval_decisions.clear();
         self.computers.clear();
+        // The computers were this account's, and so is any read of them, or relay switch of one,
+        // still out: an answer that lands after this finds nothing waiting for it.
+        self.computers_generation += 1;
+        self.computer_relay_switches.clear();
+        self.computer_relay_notes.clear();
         // This Mac's rules were this account's, and so is any read of them still out.
         self.local_rules = None;
         self.local_rules_epoch += 1;
@@ -6277,13 +7165,25 @@ impl AppState {
         self.connections_generation += 1;
         self.connectors_generation += 1;
         self.connect_asks += 1;
-        // So was the reply source, and whatever read or Save of it is still out; and the pick on
-        // the composer's chip was theirs to make.
+        // So was the reply source, its default for new Bots, and whatever read or change of it
+        // is still out.
         self.reply_source = ReplySourceSettings::default();
-        self.reply_source_page_shown = false;
+        self.computer_page_shown = false;
+        self.default_models_page_shown = false;
         self.reply_source_generation += 1;
-        self.turn_source_pick = None;
-        self.composer_dictating = false;
+        // The time-zone watch was for them, and so is a PUT of it still out.
+        self.time_zone_epoch += 1;
+        self.time_zone_sent = None;
+        // The pickers were open on one of their Bots and on their default for new Bots, and what
+        // the Bot's last said was about theirs.
+        self.model_picker = PickerView::default();
+        self.new_bots_picker = PickerView::default();
+        self.plan_fallback_picker = PickerView::default();
+        self.model_pick_note = None;
+        // The relay answered for them, and stops with every call it was answering; its switch is
+        // their computer's row, and is read again for whoever signs in next.
+        self.stop_relay();
+        self.plan_failures.clear();
         // And any list of models still being asked for was asked as them, and the plan's models
         // listed were their plan's: the gateway's routes are the deployment's and stay.
         self.models_generation += 1;
@@ -6349,8 +7249,9 @@ impl AppState {
         })
         .detach();
         self.refresh_models(cx);
-        // The composer's chip defaults from the account's reply source, so it is read with the
-        // roster: at sign-in, and when the server comes back.
+        // Every Bot that has picked no door of its own follows the account's reply source, and
+        // the picker names that door's model, so it is read with the roster: at sign-in, and
+        // when the server comes back.
         self.read_reply_source(cx);
     }
 
@@ -6370,7 +7271,7 @@ impl AppState {
 
     /// Number a read of `/models`, the reconnect loop's probe among them. Every read begun
     /// before it is overtaken, and its answer is dropped when it comes: several are asked in a
-    /// row (sign-in, Settings → Reply source, a Save's answer, a Bot's settings) and they need
+    /// row (sign-in, Settings → General, a Save's answer, a Bot's settings) and they need
     /// not answer in that order, and an older list landing last would put back models the
     /// newer one no longer offers.
     fn begin_models_read(&mut self) -> Option<(OpenGrokClient, u64)> {
@@ -6379,7 +7280,8 @@ impl AppState {
         Some((client, self.models_generation))
     }
 
-    /// What a `/models` answer means — for the Model field, and for whether the gateway is there.
+    /// What a `/models` answer means — for the model picker, and for whether the gateway is
+    /// there.
     ///
     /// This is also the reconnect loop's probe, which is why it answers whether everything is
     /// reachable now: one request settles both questions, and its success *is* the refill. An
@@ -6491,8 +7393,8 @@ impl AppState {
     ///
     /// Reached only on the transition, so the refill below happens once rather than on every
     /// request that succeeds. The roster is what a spell out of reach may have emptied, and
-    /// asking for it asks for the catalogue too — so the Model field fills again without anybody
-    /// going and looking at it.
+    /// asking for it asks for the catalogue too — so the model picker's list fills again without
+    /// anybody going and looking at it.
     fn came_back(&mut self, cx: &mut Context<Self>) {
         self.reconnecting = false;
         self.reconnect_epoch += 1;
@@ -6526,7 +7428,7 @@ impl AppState {
     /// The probe is `/models`: it is the one request that answers both questions at once — a
     /// failure at the socket is the server, a `200` carrying the gateway's reason is the gateway,
     /// and a list of models is everything working — and its success is itself the refill the
-    /// Model field needs. A refusal (a `401`, a `500`) also ends the loop, because a server that
+    /// model picker's list needs. A refusal (a `401`, a `500`) also ends the loop, because a server that
     /// refuses is a server that is being reached; what it refused is not this loop's business.
     fn start_reconnect(&mut self, cx: &mut Context<Self>) {
         if self.reconnecting {
@@ -6641,7 +7543,7 @@ impl AppState {
             self.computer_poll = None;
         }
         if pane == RightPane::Settings {
-            // Looking at the Model field asks again. The catalogue is fetched once at startup
+            // Looking at the Model card asks again. The catalogue is fetched once at startup
             // and one failed fetch used to be the whole of it for the life of the process; the
             // reconnect loop refills it unvisited now, and this is the other half — somebody
             // who opens the pane to see why it is empty gets a fresh answer for opening it.
@@ -7345,8 +8247,9 @@ impl AppState {
     }
 
     /// Ask the server where the account's replies are paid from: on sign-in, with the roster,
-    /// because the composer's chip defaults from it; and whenever Settings → Reply source comes
-    /// on screen, for its health line. What was read stays on the page while it is asked again.
+    /// because every Bot that has picked no door follows it; and whenever Settings → Computer
+    /// comes on screen, for what the server keeps of the relay. What was read stays on the page
+    /// while it is asked again.
     pub fn read_reply_source(&mut self, cx: &mut Context<Self>) {
         let Some((client, generation)) = self.begin_reply_source_read() else {
             return;
@@ -7355,6 +8258,9 @@ impl AppState {
             let read = client.inference_source().await;
             let _ = this.update(cx, |state, cx| {
                 if state.settle_reply_source_read(generation, read) {
+                    // Whether the server knows the relay is in what it said, and so is whether
+                    // the relay runs.
+                    state.ensure_relay(cx);
                     cx.notify();
                 }
             });
@@ -7363,17 +8269,16 @@ impl AppState {
     }
 
     /// Begin a read of the reply source: every read begun before it is overtaken, and dropped
-    /// when it answers. None while a Save is out, whose answer is the newest word there will be,
-    /// and none with nobody signed in to ask for.
+    /// when it answers. None while a change is out, whose answer is the newest word there will
+    /// be, and none with nobody signed in to ask for.
     fn begin_reply_source_read(&mut self) -> Option<(OpenGrokClient, u64)> {
         let client = self.opengrok.clone()?;
-        if !self.is_signed_in() || self.reply_source.saving.is_some() {
+        if !self.is_signed_in() || self.reply_source.changing.is_some() {
             return None;
         }
         if self.reply_source.kept_source().is_none() {
             self.reply_source.kept = Some(ReplySourceRead::Loading);
         }
-        self.reply_source.server_on_this_mac = client.is_on_this_machine();
         self.reply_source_generation += 1;
         self.reply_source.reading = Some(self.reply_source_generation);
         Some((client, self.reply_source_generation))
@@ -7394,10 +8299,14 @@ impl AppState {
         match read {
             Ok(source) => {
                 settings.kept = Some(ReplySourceRead::Read(source));
-                // What the server says now answers a Save nobody knew the fate of, and a read
-                // that failed. A refusal is about the Save, and stays until the next one.
-                if !matches!(settings.note, Some(ReplySourceNote::Refused(_))) {
+                // What the server says now answers a read that failed, and a change nobody heard
+                // back from. What the Keychain said is about this computer, and stays until the
+                // next Save; a refusal is about its change, and stays until the next.
+                if matches!(settings.note, Some(ReplySourceNote::ReadFailed(_))) {
                     settings.note = None;
+                }
+                if matches!(settings.change_note, Some((_, ChangeNote::Unknown))) {
+                    settings.change_note = None;
                 }
             }
             // A bare 404 is a server from before the route; the server's own 404 is not that.
@@ -7415,33 +8324,89 @@ impl AppState {
                 }
             }
         }
-        self.settle_turn_source_pick();
         true
     }
 
-    /// Settings → Reply source's Save: the door and what changed, in one `PUT`. Every control is
-    /// dead until the server answers, and what it answers is what the page shows after. A
-    /// refusal leaves the kept setting as it was and the picks where they were, with the
-    /// server's words under Save.
+    /// Save, on this computer's card in Settings → Computer: what the card keeps on this computer,
+    /// opencodex's address and its key for the relay, kept at once ([`Self::keep_changes_here`]).
+    /// It sends the server nothing: nothing on the card is the server's to keep.
     pub fn save_reply_source(&mut self, cx: &mut Context<Self>) {
-        let Some(save) = self.begin_reply_source_save() else {
+        let Some(here) = self.begin_reply_source_save() else {
             return;
         };
-        let ReplySourceSave {
+        self.keep_changes_here(here, cx);
+        cx.notify();
+    }
+
+    /// Begin a Save, for the caller to keep: `None` while there is nothing to save or something
+    /// in its way. A key typed on the page goes with it and leaves the page for good.
+    fn begin_reply_source_save(&mut self) -> Option<RelayChangesHere> {
+        if !self.reply_source.can_save() {
+            return None;
+        }
+        self.reply_source.note = None;
+        Some(self.reply_source.take_changes_here())
+    }
+
+    /// Begin a change of the account's setting sent the server at once, for the caller to send: the
+    /// `PUT` `update` makes of the kind the server keeps, which goes back as it is, since the
+    /// server takes no `PUT` without one. `None` with nobody signed in, before the setting is
+    /// read, and while another change is out: one at a time. A read out now is overtaken, and its
+    /// answer dropped when it comes: this change's answer is the newest word there will be.
+    fn begin_account_change(
+        &mut self,
+        about: AccountChange,
+        update: impl FnOnce(InferenceKind) -> InferenceSourceUpdate,
+    ) -> Option<AccountChangeSend> {
+        let client = self.opengrok.clone()?;
+        if !self.is_signed_in() || self.reply_source.changing.is_some() {
+            return None;
+        }
+        let kind = self.reply_source.kept_source()?.kind;
+        self.reply_source_generation += 1;
+        let generation = self.reply_source_generation;
+        let settings = &mut self.reply_source;
+        settings.changing = Some((generation, about));
+        settings.reading = None;
+        // A new change is a new answer to wait for, and what was said of the last one of its
+        // kind goes with it.
+        if settings
+            .change_note
+            .as_ref()
+            .is_some_and(|(was, _)| *was == about)
+        {
+            settings.change_note = None;
+        }
+        Some(AccountChangeSend {
             client,
-            sent,
+            generation,
+            about,
+            update: update(kind),
+        })
+    }
+
+    /// Send a change that has begun, and put its answer on the page.
+    fn send_account_change(&mut self, send: AccountChangeSend, cx: &mut Context<Self>) {
+        let AccountChangeSend {
+            client,
+            generation,
+            about,
             update,
-        } = save;
+        } = send;
         cx.spawn(async move |this, cx| {
             let answer = client.set_inference_source(&update).await;
-            // The key, if one went, goes no further than this request.
-            drop(update);
             let _ = this.update(cx, |state, cx| {
-                match state.settle_reply_source_save(sent, answer) {
-                    None | Some(AfterReplySourceSave::Done) => {}
-                    Some(AfterReplySourceSave::ReadModels) => state.refresh_models(cx),
-                    Some(AfterReplySourceSave::ReadAgain) => state.read_reply_source(cx),
+                match state.settle_account_change(generation, about, answer) {
+                    None | Some(AfterChange::Done) => {}
+                    Some(AfterChange::ReadModels) => state.refresh_models(cx),
+                    Some(AfterChange::ReadAgain) => state.read_reply_source(cx),
                 }
+                // The relay switch moved while this one was out: what it says goes now, and its
+                // answer, the newest word there will be, overtakes a read begun above.
+                if let Some(send) = state.begin_owed_relay_change() {
+                    state.send_account_change(send, cx);
+                }
+                state.ensure_relay(cx);
                 cx.notify();
             });
         })
@@ -7449,364 +8414,583 @@ impl AppState {
         cx.notify();
     }
 
-    /// Begin a Save, for the caller to send: `None` while there is nothing to save, something in
-    /// its way, or anything with the server. A key typed on the page goes with it and leaves the
-    /// page for good.
-    fn begin_reply_source_save(&mut self) -> Option<ReplySourceSave> {
-        let plan_models = self.plan_models_listed();
-        if !self.reply_source.can_save(plan_models) {
-            return None;
-        }
-        let client = self.opengrok.clone()?;
-        let held = self
-            .reply_source
-            .holds_gateway(plan_models)
-            .then_some(InferenceKind::LocalProxy);
-        let update = self.reply_source.take_update(plan_models)?;
-        let key_sent = matches!(update.api_key, Some(Some(_)));
-        self.reply_source.note = None;
-        self.reply_source_generation += 1;
-        self.reply_source.saving = Some(self.reply_source_generation);
-        Some(ReplySourceSave {
-            client,
-            sent: SentSave {
-                generation: self.reply_source_generation,
-                key_sent,
-                held,
-            },
-            update,
-        })
-    }
-
-    /// Put a Save's answer on the page, and say what to ask next. `None` when the answer is not
-    /// the Save's that is out (the person signed out since) and nothing was touched.
-    fn settle_reply_source_save(
+    /// Put a change's answer on the page, and say what to ask next. `None` when the answer is not
+    /// the change's that is out (the person signed out since) and nothing was touched. Kept, the
+    /// answer is the account's setting as the server now keeps it; refused, nothing was kept, and
+    /// the server's words are said where the change was asked; unanswered, nobody knows, and the
+    /// setting is read again to find out.
+    fn settle_account_change(
         &mut self,
-        sent: SentSave,
+        generation: u64,
+        about: AccountChange,
         answer: Result<InferenceSource, OpenGrokError>,
-    ) -> Option<AfterReplySourceSave> {
+    ) -> Option<AfterChange> {
         let settings = &mut self.reply_source;
-        if settings.saving != Some(sent.generation) {
+        if settings.changing != Some((generation, about)) {
             return None;
         }
-        settings.saving = None;
-        let after = match answer {
+        settings.changing = None;
+        Some(match answer {
             Ok(kept) => {
-                settings.forget_picks();
-                settings.retype_key = false;
-                // The address is kept and the door held on the server's keys: My subscription
-                // stays picked, for a model to be picked from the list the server now makes.
-                if let Some(kind) = sent.held.filter(|held| *held != kept.kind) {
-                    settings.kind_pick = Some(kind);
-                }
                 settings.kept = Some(ReplySourceRead::Read(kept));
-                AfterReplySourceSave::ReadModels
+                // What the server keeps now answers a change nobody heard back from, as a read's
+                // answer does: one the relay switch sent after it overtook that read.
+                if matches!(settings.change_note, Some((_, ChangeNote::Unknown))) {
+                    settings.change_note = None;
+                }
+                match about {
+                    AccountChange::NewBots | AccountChange::PlanFallback => AfterChange::Done,
+                    // The pickers' Subscription group is the account's way's models.
+                    AccountChange::Relay => AfterChange::ReadModels,
+                }
             }
+            // A bare 404 is a server from before the route; the server's own 404 is not that.
             Err(error) if error.is_not_found() && !error.written_by_opengrok() => {
                 settings.forget_picks();
+                settings.note = None;
                 settings.kept = Some(ReplySourceRead::NotOnServer);
-                AfterReplySourceSave::Done
+                AfterChange::Done
             }
             // No answer at all, or one that could not be read: the server may have kept it, and
             // only asking again can say.
             Err(error) if error.unreachable().is_some() || error.status.is_none() => {
-                settings.note = Some(ReplySourceNote::Unknown);
-                settings.retype_key |= sent.key_sent;
-                AfterReplySourceSave::ReadAgain
+                settings.change_note = Some((about, ChangeNote::Unknown));
+                AfterChange::ReadAgain
             }
             Err(error) => {
-                settings.note = Some(ReplySourceNote::Refused(reply_source_refusal(&error)));
-                settings.retype_key |= sent.key_sent;
-                AfterReplySourceSave::Done
+                settings.change_note =
+                    Some((about, ChangeNote::Refused(account_change_refusal(&error))));
+                AfterChange::Done
             }
-        };
-        self.settle_turn_source_pick();
-        Some(after)
+        })
     }
 
-    /// Settings → Reply source's radio. It waits for Save like everything on the page. My
-    /// subscription is offered only where the server runs on this Mac.
-    pub fn pick_reply_source_kind(&mut self, kind: InferenceKind, cx: &mut Context<Self>) {
-        if self.note_reply_source_kind(kind) {
-            cx.notify();
-        }
-    }
-
-    fn note_reply_source_kind(&mut self, kind: InferenceKind) -> bool {
+    /// Begin pointing the account's way to the plan at the relay, which a computer's relay switch
+    /// going on asks, for the caller to send: one `PUT /account/inference-source` of
+    /// `{kind, via: "mac"}` with the kind the server keeps (opengrok-server #292: `apply` in
+    /// `crates/opengrok-harness/src/local_proxy.rs`, which keeps `via` as the account's way
+    /// whatever the kind), `mac` being the word every server with the relay reads, whatever this
+    /// app calls it. `machine_id` is the computer whose switch asked, which says what became of it.
+    ///
+    /// Still needed with each computer's own switch (opengrok-server #342 (main 2136ffc): `resolve`
+    /// in `crates/opengrok-core/src/inference.rs` and `route` in
+    /// `crates/opengrok-harness/src/local_proxy.rs`): the relay answers only the turns that ask
+    /// through it (`via: "mac"`), and a Bot on the plan that names no way of its own asks by the
+    /// account's, which is the server's own machine (`loopback`) until somebody says otherwise. A
+    /// computer switched on while the account still asked the server's own machine would answer
+    /// none of them. So it goes once, when the account's way is not the relay already, and the
+    /// way is the account's, not a computer's: any computer's switch going on asks it, and none
+    /// going off moves it (`via: "mac"` with no computer on is the server's "Relay off", which
+    /// answers on the Relay-off fallback). It never carries `relayEnabled`: that is each
+    /// computer's own switch now and the account's is read from them, so a `PUT` of it would
+    /// switch every one of the person's computers.
+    ///
+    /// Nothing before the setting is read (the server takes no `PUT` without the kind it keeps),
+    /// from a server that does not know the relay, or when the way is the relay's already. One
+    /// change of the account's at a time: while another is with the server this sends nothing, and
+    /// it goes once that one is answered ([`Self::begin_owed_relay_change`]). What was said of the
+    /// last such change was said of a switch that has moved since, and goes.
+    fn begin_relay_change(&mut self, machine_id: &str) -> Option<AccountChangeSend> {
         let settings = &mut self.reply_source;
-        let editable = match kind {
-            InferenceKind::Gateway => settings.can_edit(),
-            InferenceKind::LocalProxy => settings.plan_editable(),
-        };
-        if !editable {
-            return false;
+        settings.relay_change_owed = false;
+        settings.relay_change_for = Some(machine_id.to_string());
+        if settings
+            .change_note
+            .as_ref()
+            .is_some_and(|(about, _)| *about == AccountChange::Relay)
+        {
+            settings.change_note = None;
         }
-        let kept = settings.kept_source().map(|source| source.kind);
-        settings.kind_pick = (Some(kind) != kept).then_some(kind);
-        true
+        let kept = settings.kept_source()?;
+        if !kept.knows_relay() || kept.default_via() == Some(Via::Mac) {
+            return None;
+        }
+        if settings.changing.is_some() {
+            settings.relay_change_owed = true;
+            return None;
+        }
+        self.begin_account_change(AccountChange::Relay, |kind| InferenceSourceUpdate {
+            kind,
+            via: Some(Via::Mac),
+            new_bot_default: None,
+            plan_fallback: None,
+        })
     }
 
-    /// The proxy URL as the field holds it now. Emptied, it is the address taken away.
-    pub fn set_reply_source_url(&mut self, url: String, cx: &mut Context<Self>) {
-        if self.note_reply_source_url(url) {
-            cx.notify();
+    /// The account's way to the relay, when a computer's switch went on while the change just
+    /// answered was out ([`Self::begin_relay_change`]).
+    fn begin_owed_relay_change(&mut self) -> Option<AccountChangeSend> {
+        if !self.reply_source.relay_change_owed {
+            return None;
         }
+        let machine_id = self.reply_source.relay_change_for.clone()?;
+        self.begin_relay_change(&machine_id)
     }
 
-    /// Only while the plan's half of the page takes a change, as the radio and the picker: a
-    /// field drawn read-only (a Save out, the setting not read, the server on another machine)
-    /// leaves the address as it was, whatever reaches it.
-    fn note_reply_source_url(&mut self, url: String) -> bool {
-        let settings = &mut self.reply_source;
-        if !settings.plan_editable() || settings.shown_url() == url {
-            return false;
-        }
-        settings.url_draft = Some(url);
-        true
-    }
-
-    /// A model picked from the models of the person's plan.
-    pub fn pick_reply_source_model(&mut self, model: String, cx: &mut Context<Self>) {
-        if self.note_reply_source_model(Some(model)) {
-            cx.notify();
-        }
-    }
-
-    /// No model: the one the server keeps is taken away with the next Save.
-    pub fn clear_reply_source_model(&mut self, cx: &mut Context<Self>) {
-        if self.note_reply_source_model(None) {
-            cx.notify();
-        }
-    }
-
-    fn note_reply_source_model(&mut self, model: Option<String>) -> bool {
-        let settings = &mut self.reply_source;
-        if !settings.plan_editable() {
-            return false;
-        }
-        let kept = settings
-            .kept_source()
-            .and_then(|source| source.local_model.clone());
-        settings.model_pick = (model != kept).then_some(model);
-        true
-    }
-
-    /// A key for the proxy as the field holds it now; a blank field is no key, and leaves the
-    /// one the server has alone. A key typed takes back a Remove key, and is the key the page
-    /// asked for again.
-    pub fn set_reply_source_key(&mut self, typed: &str, cx: &mut Context<Self>) {
-        if self.note_reply_source_key(typed) {
-            cx.notify();
-        }
-    }
-
-    fn note_reply_source_key(&mut self, typed: &str) -> bool {
-        let settings = &mut self.reply_source;
-        if !settings.plan_editable() {
-            return false;
-        }
-        let key = ProxyKey::new(typed);
-        if key.is_some() {
-            settings.remove_key = false;
-            settings.retype_key = false;
-        }
-        if settings.key_draft == key {
-            return false;
-        }
-        settings.key_draft = key;
-        true
-    }
-
-    /// Remove key, and Keep key to take it back: the next Save asks the server to forget the key
-    /// it holds. Offered only while the server holds one.
-    pub fn toggle_remove_reply_source_key(&mut self, cx: &mut Context<Self>) {
-        if self.note_remove_reply_source_key() {
-            cx.notify();
-        }
-    }
-
-    fn note_remove_reply_source_key(&mut self) -> bool {
-        let settings = &mut self.reply_source;
-        let holds_key = settings
-            .kept_source()
-            .is_some_and(|source| source.has_api_key);
-        if !settings.plan_editable() || !holds_key {
-            return false;
-        }
-        settings.remove_key = !settings.remove_key;
-        if settings.remove_key {
-            settings.key_draft = None;
-        }
-        true
-    }
-
-    /// Settings has changed what it shows. Reply source coming on screen reads the setting, for
-    /// the health line and in case it changed on another Mac, and the models, for the picker;
-    /// leaving it drops a key typed there and not saved ([`Self::settle_reply_source_page`]).
+    /// Settings has changed what it shows. Computer coming on screen reads the setting, for what
+    /// the server keeps of the relay and in case it changed on another computer; leaving it drops
+    /// a key typed on this computer's card and not saved ([`Self::settle_computer_page`]). General
+    /// coming on screen reads the setting and the models, which a computer relaying lists for
+    /// every picker's Subscription group, for Default models' pickers, and leaving it shuts their
+    /// popovers ([`Self::settle_default_models_page`]).
     fn reply_source_page_moved(&mut self, cx: &mut Context<Self>) {
-        if self.settle_reply_source_page() {
+        let computer = self.settle_computer_page();
+        let general = self.settle_default_models_page();
+        if computer || general {
             self.read_reply_source(cx);
+        }
+        if general {
             self.refresh_models(cx);
         }
     }
 
-    /// Whether Settings → Reply source has just come on screen. Off screen, a key typed there and
-    /// not saved is dropped, and the page asks for it again when it is back: nothing keeps a key
-    /// the person walked away from, in memory or anywhere else.
-    fn settle_reply_source_page(&mut self) -> bool {
-        let shown = self.reply_source_on_screen();
-        let arrived = shown && !self.reply_source_page_shown;
-        self.reply_source_page_shown = shown;
-        if !shown && self.reply_source.key_draft.take().is_some() {
-            self.reply_source.retype_key = true;
+    /// Whether Settings → General, whose first section is Default models, has just come on
+    /// screen. Off screen, the popovers of its pickers go with the page they hang from.
+    fn settle_default_models_page(&mut self) -> bool {
+        let shown = self.default_models_on_screen();
+        let arrived = shown && !self.default_models_page_shown;
+        self.default_models_page_shown = shown;
+        if !shown {
+            self.new_bots_picker = PickerView::default();
+            self.plan_fallback_picker = PickerView::default();
         }
         arrived
     }
 
-    /// The server lists models of the person's plan to pick from.
-    fn plan_models_listed(&self) -> bool {
-        !self.subscription_models().is_empty()
-    }
-
-    /// Save would send something ([`ReplySourceSettings::can_save`]).
-    pub fn reply_source_can_save(&self) -> bool {
-        self.reply_source.can_save(self.plan_models_listed())
-    }
-
-    /// The line beside Save about what it will or will not do ([`ReplySourceSettings::hint`]).
-    pub fn reply_source_hint(&self) -> Option<&'static str> {
-        self.reply_source.hint(self.plan_models_listed())
-    }
-
-    /// Whether opencodex answers the server, for the page's health line: no address kept is its
-    /// own answer; otherwise `/models`' word on it (`localProxy.healthy`) when that gave one,
-    /// being what filled the picker, and the setting's `healthy` when it did not. `None` before
-    /// the setting is read.
-    pub fn proxy_health(&self) -> Option<ProxyHealth> {
-        let kept = self.reply_source.kept_source()?;
-        if kept.base_url.is_none() {
-            return Some(ProxyHealth::NoAddress);
+    /// Whether Settings → Computer has just come on screen. Off screen, a key for this computer's
+    /// opencodex typed on its card and not saved is dropped, and the card asks for it again when
+    /// it is back: nothing keeps a key the person walked away from, in memory or anywhere else.
+    fn settle_computer_page(&mut self) -> bool {
+        let shown = self.computer_page_on_screen();
+        let arrived = shown && !self.computer_page_shown;
+        self.computer_page_shown = shown;
+        if !shown && self.reply_source.relay_key_draft.take().is_some() {
+            self.reply_source.relay_retype_key = true;
         }
-        let healthy = self
-            .model_catalogue
-            .local_proxy
-            .map_or(kept.healthy, |proxy| proxy.healthy);
-        Some(if healthy {
-            ProxyHealth::Running
-        } else {
-            ProxyHealth::NotRunning
-        })
+        arrived
     }
 
-    /// The models the page offers for the person's plan: what `GET /models` lists as served
-    /// through opencodex, in its order, and only those the server's allowlist lets a
-    /// subscription answer with ([`crate::opengrok::is_subscription_model`]).
-    pub fn subscription_models(&self) -> Vec<String> {
+    /// Save would keep something ([`ReplySourceSettings::can_save`]).
+    pub fn reply_source_can_save(&self) -> bool {
+        self.reply_source.can_save()
+    }
+
+    /// The line beside Save: what it waits for before it will keep what this computer's card holds
+    /// ([`ReplySourceSettings::blocker`]).
+    pub fn reply_source_hint(&self) -> Option<&'static str> {
+        self.reply_source.blocker()
+    }
+
+    /// The models of the person's plan for a way to it: what `GET /models` lists as served
+    /// through opencodex there, in its order, and only those the server's allowlist lets a
+    /// subscription answer with ([`crate::opengrok::is_subscription_model`]). The picker's
+    /// Subscription group offers the account's way's.
+    fn plan_models(&self, via: Via) -> Vec<String> {
         self.model_catalogue
             .models
             .iter()
-            .filter(|entry| entry.source() == Some(InferenceKind::LocalProxy))
+            .filter(|entry| entry.plan_via() == Some(via))
             .filter(|entry| crate::opengrok::is_subscription_model(&entry.id))
             .map(|entry| entry.id.clone())
             .collect()
     }
 
-    /// The chip the account's setting makes for, drawn or not: `None` before the setting is read,
-    /// on a server without reply sources, and while the person has no plan set up to switch to
-    /// (the account is on the server's keys, with no model of theirs kept).
-    fn turn_source_chip(&self) -> Option<TurnSourceChip> {
-        let kept = self.reply_source.kept_source()?;
-        if kept.kind == InferenceKind::Gateway && kept.local_model.is_none() {
-            return None;
-        }
-        let kind = self.turn_source_pick.unwrap_or(kept.kind);
-        Some(TurnSourceChip {
-            kind,
-            picked: kind != kept.kind,
-            local_model: kept.local_model.clone(),
-        })
-    }
-
-    /// The composer's chip as drawn: [`Self::turn_source_chip`], except while the composer is
-    /// dictating, when the chip gives its place to the dictation's buttons and a turn names the
-    /// account's own door ([`Self::turn_source_for_send`]). `None` where no chip is drawn.
-    pub fn composer_turn_source(&self) -> Option<TurnSourceChip> {
-        self.turn_source_chip().filter(|_| !self.composer_dictating)
-    }
-
-    /// Replies go through the person's own plan: the account's door is it, or the composer's
-    /// chip is on it. A Bot's own model is not what answers then, the plan's model picked in
-    /// Settings → Reply source is, and the Bot's Model field says so.
+    /// Replies from the open Bot go through the person's own plan: its door is the plan, its own
+    /// or the account's that it follows. The server meters no such turn, and the Bot's Usage card
+    /// says so.
     pub fn replies_on_plan(&self) -> bool {
-        let plan = Some(InferenceKind::LocalProxy);
-        self.reply_source.kept_source().map(|kept| kept.kind) == plan
-            || self.turn_source_chip().map(|chip| chip.kind) == plan
+        self.model_pick()
+            .is_some_and(|pick| pick.door == Some(InferenceKind::LocalProxy))
     }
 
-    /// The door a turn sent now names in `forwardedProps.inferenceSource`: the one the chip
-    /// shows, the account's own included. The chip starts at the account's door as last read,
-    /// and that may have moved on another Mac since; naming it anyway is what makes the turn go
-    /// where the chip says.
+    /// The door a turn sent now names in `forwardedProps.inferenceSource`: the open Bot's own,
+    /// and on the person's plan the account's way to it, named only to a server that knows the
+    /// relay, as the account's own door is ([`InferenceSource::door`]). A Bot that follows the
+    /// account's door, a server that keeps none per Bot, and a door this app cannot name all
+    /// send nothing, and the server goes by what it keeps.
     ///
-    /// While the composer dictates, the chip gives its place to the dictation's buttons and the
-    /// turn names the account's own door, as Settings → Reply source shows it: a pick on a chip
-    /// the person cannot see does not steer the turn, and naming nothing would leave it to the
-    /// server's copy of the setting, which may have moved since it was read here. Where there is
-    /// no chip to hide (the setting not read, a server without reply sources, no plan set up to
-    /// switch to), nothing, dictating or not, and the account's setting decides on the server,
-    /// where it is kept.
-    fn turn_source_for_send(&self) -> Option<InferenceKind> {
-        let chip = self.turn_source_chip()?;
-        if self.composer_dictating {
-            return self.reply_source.kept_source().map(|kept| kept.kind);
+    /// The server would go by the Bot's door anyway. Naming it on the turn is what lets a message
+    /// held while the Bot is busy keep the door it was typed under, wherever the Bot is moved
+    /// before it drains.
+    fn turn_source_for_send(&self) -> Option<TurnSource> {
+        let id = self.active_coworker_id.as_deref()?;
+        let bot = self.coworkers.iter().find(|bot| bot.id == id)?;
+        match bot.source {
+            CoworkerSource::Kind(InferenceKind::Gateway) => Some(TurnSource::GATEWAY),
+            CoworkerSource::Kind(InferenceKind::LocalProxy) => {
+                let via = self
+                    .reply_source
+                    .kept_source()
+                    .and_then(|kept| kept.default_via().filter(|_| kept.knows_relay()));
+                Some(TurnSource::plan(via))
+            }
+            _ => None,
         }
-        Some(chip.kind)
     }
 
     /// The door a turn names: a held send's is the one it was held with when the message was
-    /// sent, whatever the chip shows by the time it drains; any other turn's is the one a turn
-    /// sent now names ([`Self::turn_source_for_send`]).
-    fn turn_inference_source(&self, drained: Option<&QueuedSend>) -> Option<InferenceKind> {
+    /// sent, wherever the Bot is by the time it drains; any other turn's is the one a turn sent
+    /// now names ([`Self::turn_source_for_send`]).
+    fn turn_inference_source(&self, drained: Option<&QueuedSend>) -> Option<TurnSource> {
         match drained {
             Some(held) => held.inference_source,
             None => self.turn_source_for_send(),
         }
     }
 
-    /// The composer is dictating, or has stopped. The chip is not drawn meanwhile, so it is not
-    /// in a driver's tree either, and a turn sent meanwhile names the account's own door.
-    pub fn set_composer_dictating(&mut self, dictating: bool, cx: &mut Context<Self>) {
-        if self.composer_dictating != dictating {
-            self.composer_dictating = dictating;
-            cx.notify();
+    /// The door a turn names as it leaves. One sent again on the server's keys (`on_server`,
+    /// [`Self::send_on_server`]) names them, whatever the Bot's door and the account's, and the
+    /// server lets a turn's own pick win over both for that turn (`local_proxy::route` in
+    /// opengrok-server's `crates/opengrok-harness/src/local_proxy.rs`, server main d6f640e (#307,
+    /// after #304), pin bf99845). Any other turn names [`Self::turn_inference_source`]'s. The
+    /// model picker on the Bot's card picks the Bot's model and door, and never one turn's, so
+    /// this is the one way a single turn goes through another door than the Bot's.
+    fn turn_door(&self, drained: Option<&QueuedSend>, on_server: bool) -> Option<TurnSource> {
+        if on_server {
+            Some(TurnSource::GATEWAY)
+        } else {
+            self.turn_inference_source(drained)
         }
     }
 
-    /// A click on the composer's chip: the person's next turns go through the other door until
-    /// it is clicked again. The pick is not sent anywhere until a turn carries it.
-    pub fn toggle_turn_source(&mut self, cx: &mut Context<Self>) {
-        if self.flip_turn_source() {
-            cx.notify();
+    // ---- The relay: this computer answers for the plan (hexuria/nativechat #156, #292) ---------
+
+    /// Answer with this Mac's own half, as this Mac keeps it: the Keychain for opencodex's key,
+    /// asked only whether it holds one, and the address from the prefs. Whether the relay is on is
+    /// not this Mac's to keep: it is this computer's own switch on the server, which the relay is
+    /// told of on its stream. The relay stops when the app quits, with every call it was
+    /// answering.
+    fn open_relay_mac(&mut self, cx: &mut Context<Self>) {
+        self.relay_keys = crate::relay_key::open_store();
+        self.relay_mac.has_key = self.relay_keys.holds_key();
+        if let Some(config) = &self.config {
+            self.relay_mac.address = crate::prefs::load_relay(&config.data_dir).address;
+        }
+        cx.on_app_quit(|state, _| {
+            state.stop_relay();
+            async {}
+        })
+        .detach();
+    }
+
+    /// This Mac is enrolled with the server, so it has the machine token the relay opens its
+    /// stream with, and a row of its own among the person's computers.
+    pub fn relay_enrolled(&self) -> bool {
+        self.local_exec_machine_id.is_some()
+    }
+
+    /// The relay should be running: somebody is signed in, this Mac is enrolled, and the server
+    /// knows the relay. Not whether this computer's switch is on: the server says so on the stream
+    /// (`disabled`, or a refusal of the stream with `relay_disabled`), and a relay it has switched
+    /// off waits for its own row to read on again without opening the stream ([`RelayHandle`]).
+    /// Nor whether opencodex answers: the relay that runs asks it before it opens its stream, and
+    /// says so where it does not ([`RelayStatus::OpencodexSilent`]), so that a computer with no
+    /// opencodex does not offer to relay, though the server starts every computer's relay on.
+    fn relay_wanted(&self) -> bool {
+        self.is_signed_in() && self.relay_enrolled() && self.reply_source.knows_relay()
+    }
+
+    /// Start the relay where it should run and does not, and stop it where it runs and should
+    /// not. One that stopped is left as it is. After another stream of this computer took over,
+    /// only this computer's switch turned off and on starts it
+    /// ([`Self::relay_switched_on_here`]); after the server turned its token away, so does
+    /// local-exec enrolling this Mac again, which the relay follows by itself ([`Enrolment`]).
+    fn ensure_relay(&mut self, cx: &mut Context<Self>) {
+        if !self.relay_wanted() {
+            if self.relay_worker.is_some() || self.relay_starting.is_some() {
+                self.stop_relay();
+                cx.notify();
+            }
+            return;
+        }
+        if self.relay_worker.is_none() && self.relay_starting.is_none() {
+            self.begin_relay(cx);
         }
     }
 
-    pub(crate) fn flip_turn_source(&mut self) -> bool {
-        let Some(chip) = self.composer_turn_source() else {
-            return false;
+    /// This computer's relay switch has just been switched on here. A relay the server switched off
+    /// is waiting for its row to read on, and is told to look at it now. One that stopped for good
+    /// (another stream of this computer took over, or the server turned its token away) is made
+    /// again, which is how turning it off and on takes the relay back; and where there is none,
+    /// one starts if one should.
+    fn relay_switched_on_here(&mut self, cx: &mut Context<Self>) {
+        match &self.relay_worker {
+            Some(worker) if !self.relay_halted() => worker.wake(),
+            _ => {
+                self.stop_relay();
+                self.ensure_relay(cx);
+            }
+        }
+    }
+
+    /// The relay has stopped for good, by its own word: another stream of this computer took over,
+    /// or the server turned its token away. A relay waiting to be switched on is not.
+    fn relay_halted(&self) -> bool {
+        self.relay_mac
+            .report
+            .as_ref()
+            .is_some_and(|report| report.halted)
+    }
+
+    /// Start the relay: its key is read from the Keychain off the main thread, since the
+    /// Keychain may ask the person first, and then it opens the stream on the tokio runtime.
+    fn begin_relay(&mut self, cx: &mut Context<Self>) {
+        let Some(client) = self.opengrok.clone() else {
+            return;
         };
-        let next = chip.kind.other();
-        let account = self.reply_source.kept_source().map(|kept| kept.kind);
-        self.turn_source_pick = (Some(next) != account).then_some(next);
+        // What would keep it from starting is said where the relay's status is, rather than a
+        // switch that is on and a line that only says it is not connected.
+        let Some(enrolment) = self
+            .local_exec_enrolment
+            .clone()
+            .filter(|enrolment| enrolment.borrow().is_some())
+        else {
+            self.relay_mac.report = Some(relay_cannot_start(RELAY_NO_CREDENTIAL));
+            return;
+        };
+        let Some(address) = self.relay_address() else {
+            self.relay_mac.report = Some(relay_cannot_start(RELAY_ADDRESS_UNREADABLE));
+            return;
+        };
+        self.relay_generation += 1;
+        let generation = self.relay_generation;
+        self.relay_starting = Some(generation);
+        self.relay_mac.report = Some(RelayReport {
+            status: RelayStatus::Connecting,
+            ..RelayReport::default()
+        });
+        let store = self.relay_keys.clone();
+        cx.spawn(async move |this, cx| {
+            let key = cx
+                .background_executor()
+                .spawn(async move { store.read() })
+                .await;
+            let _ = this.update(cx, |state, cx| {
+                if state.relay_starting != Some(generation) || !state.relay_wanted() {
+                    return;
+                }
+                state.relay_starting = None;
+                let key = key.unwrap_or_else(|error| {
+                    // Said without the key, which was never read.
+                    eprintln!("NativeChat relay: the key for opencodex could not be read: {error}");
+                    None
+                });
+                let handle = start_relay(
+                    client,
+                    enrolment,
+                    RelayTarget {
+                        address,
+                        key: key.map(Arc::new),
+                    },
+                    RelayTimings::default(),
+                );
+                let reports = handle.reports();
+                state.relay_worker = Some(handle);
+                state.follow_relay(generation, reports, cx);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Carry the relay's word on itself into the window as it changes, until it is stopped.
+    fn follow_relay(
+        &mut self,
+        generation: u64,
+        mut reports: tokio::sync::watch::Receiver<RelayReport>,
+        cx: &mut Context<Self>,
+    ) {
+        cx.spawn(async move |this, cx| {
+            loop {
+                let report = reports.borrow_and_update().clone();
+                let following = this
+                    .update(cx, |state, cx| {
+                        state.take_relay_report(generation, report, cx)
+                    })
+                    .unwrap_or(false);
+                if !following || reports.changed().await.is_err() {
+                    return;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// A report from the relay, `false` once it is not this relay's to give. Where the relay
+    /// stands is the server's word too: when this Mac starts answering, or another stream of it
+    /// takes over, the setting is read again, and while General with its Default models is on
+    /// screen the models, which a Mac answering lists. And this computer's row says whether it
+    /// relays now and whether its switch is on, which moves with the relay: it started or stopped
+    /// answering, or the server switched it off from another computer and told it so.
+    fn take_relay_report(
+        &mut self,
+        generation: u64,
+        report: RelayReport,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.relay_generation != generation {
+            return false;
+        }
+        let before = self
+            .relay_mac
+            .report
+            .as_ref()
+            .map(|report| report.status.clone());
+        let turned = matches!(
+            report.status,
+            RelayStatus::Answering | RelayStatus::Replaced
+        ) && before.as_ref() != Some(&report.status);
+        let row_moved = relay_moved_the_row(before.as_ref(), &report.status);
+        self.relay_mac.report = Some(report);
+        if turned {
+            self.read_reply_source(cx);
+            if self.default_models_on_screen() {
+                self.refresh_models(cx);
+            }
+        }
+        if row_moved {
+            self.refresh_computers(cx);
+        }
+        cx.notify();
         true
     }
 
-    /// After the account's setting changes: a pick on the chip that is now the account's own
-    /// door is no pick, and there is none while the setting makes for no chip. A chip that is
-    /// only out of sight while the composer dictates keeps its pick.
-    fn settle_turn_source_pick(&mut self) {
-        let account = self.reply_source.kept_source().map(|kept| kept.kind);
-        if self.turn_source_chip().is_none() || self.turn_source_pick == account {
-            self.turn_source_pick = None;
+    /// Stop the relay, and every call it was answering.
+    fn stop_relay(&mut self) {
+        self.relay_generation += 1;
+        self.relay_worker = None;
+        self.relay_starting = None;
+        self.relay_mac.report = None;
+    }
+
+    /// Where the relay calls opencodex: the address saved on this Mac, or its default.
+    fn relay_address(&self) -> Option<crate::opengrok::OpencodexAddress> {
+        crate::opengrok::OpencodexAddress::parse(&self.relay_mac.shown_address()).ok()
+    }
+
+    /// This Mac's opencodex address as the field holds it now; it waits for Save. The one kept
+    /// here typed back is no change.
+    pub fn set_relay_address(&mut self, typed: String, cx: &mut Context<Self>) {
+        if self.note_relay_address(typed) {
+            cx.notify();
+        }
+    }
+
+    fn note_relay_address(&mut self, typed: String) -> bool {
+        if !self.reply_source.relay_editable() {
+            return false;
+        }
+        let kept = self.relay_mac.shown_address();
+        let draft = (typed.trim() != kept).then_some(typed);
+        if self.reply_source.relay_address_draft == draft {
+            return false;
+        }
+        self.reply_source.relay_address_draft = draft;
+        true
+    }
+
+    /// A key for this Mac's opencodex as the field holds it now; a blank field is no key, and
+    /// leaves the one kept alone. A key typed takes back a Remove key.
+    pub fn set_relay_key(&mut self, typed: &str, cx: &mut Context<Self>) {
+        if self.note_relay_key(typed) {
+            cx.notify();
+        }
+    }
+
+    fn note_relay_key(&mut self, typed: &str) -> bool {
+        let settings = &mut self.reply_source;
+        if !settings.relay_editable() {
+            return false;
+        }
+        let key = RelayKey::new(typed);
+        if key.is_some() {
+            settings.relay_remove_key = false;
+            settings.relay_retype_key = false;
+        }
+        if settings.relay_key_draft == key {
+            return false;
+        }
+        settings.relay_key_draft = key;
+        true
+    }
+
+    /// Remove key for this Mac's opencodex, and Keep key to take it back: Save takes it out of
+    /// the Keychain. Offered only while the Keychain holds one.
+    pub fn toggle_remove_relay_key(&mut self, cx: &mut Context<Self>) {
+        if self.note_remove_relay_key() {
+            cx.notify();
+        }
+    }
+
+    fn note_remove_relay_key(&mut self) -> bool {
+        if !self.reply_source.relay_editable() || !self.relay_mac.has_key {
+            return false;
+        }
+        let settings = &mut self.reply_source;
+        settings.relay_remove_key = !settings.relay_remove_key;
+        if settings.relay_remove_key {
+            settings.relay_key_draft = None;
+        }
+        true
+    }
+
+    /// What a Save keeps on this computer: opencodex's address in the prefs, at once, and its key
+    /// in the Keychain, off the main thread, since the Keychain may ask the person first. A relay
+    /// that runs calls opencodex at the new address, and with the new key, from its next call on.
+    fn keep_changes_here(&mut self, here: RelayChangesHere, cx: &mut Context<Self>) {
+        if let Some(address) = here.address {
+            self.relay_mac.address = address;
+            if let Some(config) = &self.config {
+                let mut prefs = crate::prefs::load_relay(&config.data_dir);
+                prefs.address = self.relay_mac.address.clone();
+                crate::prefs::save_relay(&config.data_dir, &prefs);
+            }
+            if let (Some(worker), Some(address)) = (&self.relay_worker, self.relay_address()) {
+                worker.readdress(address);
+            }
+            // A relay that could not start for an address it could not read can start now.
+            self.ensure_relay(cx);
+        }
+        let Some(key) = here.key else {
+            return;
+        };
+        let store = self.relay_keys.clone();
+        cx.spawn(async move |this, cx| {
+            let kept = cx
+                .background_executor()
+                .spawn(async move {
+                    match key {
+                        Some(key) => store.keep(&key).map(|()| Some(key)),
+                        None => store.forget().map(|()| None),
+                    }
+                })
+                .await;
+            let _ = this.update(cx, |state, cx| {
+                state.settle_key_kept(kept);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// The Keychain's answer to a key kept or forgotten: the page says whether one is kept, and
+    /// the relay, if it runs, asks with it from its next call on. A Keychain that refused says so
+    /// under Save, in its words.
+    fn settle_key_kept(&mut self, kept: Result<Option<RelayKey>, String>) {
+        match kept {
+            Ok(key) => {
+                self.relay_mac.has_key = key.is_some();
+                self.reply_source.relay_retype_key = false;
+                if let Some(worker) = &self.relay_worker {
+                    worker.rekey(key.map(Arc::new));
+                }
+            }
+            Err(why) => {
+                self.reply_source.note = Some(ReplySourceNote::KeyNotKept(format!(
+                    "This computer's secure storage did not keep the change to opencodex's key: \
+                     {why}"
+                )));
+            }
         }
     }
 
@@ -8211,28 +9395,38 @@ impl AppState {
         if reads.models {
             self.refresh_models(cx);
         }
+        if reads.computers {
+            self.refresh_computers(cx);
+        }
     }
 
     /// What coming back to the window asks the server for again.
     fn reads_on_activation(&mut self, now: Instant) -> ActivationReads {
         ActivationReads {
             connections: self.rereads_connections_on_activation(now),
-            // The account's door, whenever somebody is signed in. The composer's chip starts at
-            // it and every turn names what the chip shows, so a door changed on another Mac
-            // meanwhile would send the next turn somewhere the person no longer asked for. It
-            // is also Settings → Reply source's health line, which changes outside the app: the
-            // person starts opencodex in a terminal and comes back to see it running.
+            // The account's door, whenever somebody is signed in. Every Bot that has picked no
+            // door follows it, and its picker names that door's model, so a door changed on
+            // another Mac meanwhile would have the picker name a model that does not answer.
             reply_source: self.is_signed_in(),
-            // And while that page is on screen, the plan's models with it, as arriving on the
-            // page reads them: opencodex that has just been started lists them for the first
-            // time, and the picker should not wait for the page to be left and come back to.
-            models: self.is_signed_in() && self.reply_source_on_screen(),
+            // And while General with its Default models is on screen, the plan's models with it,
+            // as arriving on the page reads them: opencodex that has just been started lists
+            // them for the first time, and the pickers should not wait for the page to be left
+            // and come back to.
+            models: self.is_signed_in() && self.default_models_on_screen(),
+            // And the person's computers while Settings is open on Computer: a relay switch
+            // moved from another computer meanwhile is on their cards.
+            computers: self.is_signed_in() && self.computer_page_on_screen(),
         }
     }
 
-    /// Settings is open on Reply source.
-    fn reply_source_on_screen(&self) -> bool {
-        self.is_app_settings_open && self.app_settings_tab == AppSettingsTab::ReplySource
+    /// Settings is open on Computer, whose cards hold each computer's relay switch.
+    fn computer_page_on_screen(&self) -> bool {
+        self.is_app_settings_open && self.app_settings_tab == AppSettingsTab::Computer
+    }
+
+    /// Settings is open on General, whose first section is Default models.
+    fn default_models_on_screen(&self) -> bool {
+        self.is_app_settings_open && self.app_settings_tab == AppSettingsTab::General
     }
 
     /// Whether coming back to the window asks for the person's connections again: a sign-in is
@@ -8244,58 +9438,6 @@ impl AppState {
             && self.app_settings_tab == AppSettingsTab::Connections)
             || self.right_pane == RightPane::Settings;
         waiting || showing
-    }
-
-    /// The open bot's Effort control: `None` with no bot open.
-    pub fn effort_control(&self) -> Option<EffortControl> {
-        let id = self.active_coworker_id.as_deref()?;
-        let coworker = self.coworkers.iter().find(|c| c.id == id)?;
-        let pick = self
-            .effort_pick
-            .as_ref()
-            .filter(|(bot, _)| bot == id)
-            .map(|(_, word)| word.clone());
-        Some(EffortControl {
-            kept: coworker.effort.clone(),
-            shown: pick.unwrap_or_else(|| coworker.effort().to_string()),
-        })
-    }
-
-    /// Pick an effort for the open bot, as a choice in its settings' menu does. It waits for
-    /// Save like everything else the pane holds, and picking the word the server already keeps
-    /// takes a pick back.
-    pub fn pick_effort(&mut self, word: String, cx: &mut Context<Self>) {
-        self.note_effort_pick(word);
-        cx.notify();
-    }
-
-    fn note_effort_pick(&mut self, word: String) {
-        let (Some(id), Some(control)) = (self.active_coworker_id.clone(), self.effort_control())
-        else {
-            return;
-        };
-        self.effort_pick = (word != control.kept_word()).then_some((id, word));
-    }
-
-    /// The effort Save sends: the pick, when it differs from what the server keeps. Otherwise the
-    /// key stays off the patch, and the stored effort is left alone.
-    pub fn effort_to_save(&self) -> Option<String> {
-        self.effort_control()
-            .filter(EffortControl::unsaved)
-            .map(|control| control.shown)
-    }
-
-    /// A patch carrying the pick was stored, so the control goes back to showing the roster, which
-    /// now holds the word the server answered with: the pick, or whatever a server that dropped it
-    /// kept instead. A pick made while the patch was out is a newer one, and stays.
-    fn settle_effort_pick(&mut self, coworker_id: &str, sent: &str) {
-        if self
-            .effort_pick
-            .as_ref()
-            .is_some_and(|(bot, word)| bot == coworker_id && word == sent)
-        {
-            self.effort_pick = None;
-        }
     }
 
     /// A driver pressing the bot settings' Save, which the pane takes and answers as the button.
@@ -8315,7 +9457,7 @@ impl AppState {
         }
         self.set_right_pane(RightPane::Closed, cx);
         self.computer_view = ComputerView::Overview;
-        self.model_picker_open = false;
+        self.model_picker = PickerView::default();
         self.avatar_editor_open = false;
         self.record_nav();
         cx.notify();
@@ -8356,7 +9498,8 @@ impl AppState {
         }
         self.set_right_pane(RightPane::Computer, cx);
         self.computer_view = ComputerView::Overview;
-        self.model_picker_open = false;
+        // The Model card goes with the Bot's settings, and its popover with it.
+        self.model_picker = PickerView::default();
         self.avatar_editor_open = false;
         self.record_nav();
         cx.notify();
@@ -8385,6 +9528,24 @@ impl AppState {
         }));
     }
 
+    /// Whether a status request may go out now. One is out already: this one is kept as
+    /// "again" and goes when that answer lands.
+    fn begin_computer_refresh(&mut self) -> bool {
+        if self.computer_refresh_in_flight {
+            self.computer_refresh_again = true;
+            return false;
+        }
+        self.computer_refresh_in_flight = true;
+        true
+    }
+
+    /// The status request's answer landed. True when another was asked for meanwhile, to
+    /// send now.
+    fn settle_computer_refresh(&mut self) -> bool {
+        self.computer_refresh_in_flight = false;
+        std::mem::take(&mut self.computer_refresh_again)
+    }
+
     pub fn refresh_coworker_computer(&mut self, cx: &mut Context<Self>) {
         let Some(client) = self.opengrok.clone() else {
             return;
@@ -8397,9 +9558,15 @@ impl AppState {
         if self.computer_endpoint_missing {
             return;
         }
+        if !self.begin_computer_refresh() {
+            return;
+        }
         cx.spawn(async move |this, cx| {
             let result = client.coworker_computer(&coworker_id).await;
             let _ = this.update(cx, |state, cx| {
+                if state.settle_computer_refresh() {
+                    state.refresh_coworker_computer(cx);
+                }
                 // A late answer for a bot the person has since left is stale.
                 if state.active_coworker_id.as_deref() != Some(coworker_id.as_str()) {
                     return;
@@ -8408,8 +9575,9 @@ impl AppState {
                     Ok(mut status) => {
                         state.hold_pending_egress_policy(&coworker_id, &mut status);
                         // A bot with no computer gets one: ask once per visit, and let the
-                        // next poll pick up the answer. A recorded error is the server saying
-                        // it cannot, so that is left alone.
+                        // next poll pick up the answer. Asked even when the server has recorded
+                        // why it could not give one, as that reason can be an earlier attempt's;
+                        // the answer carries this attempt's, and Get a computer asks again.
                         let absent = status.state == "absent" && !status.updating();
                         if state.coworker_computer.as_ref() != Some(&status) {
                             state.coworker_computer = Some(status);
@@ -8463,9 +9631,14 @@ impl AppState {
             }
             return;
         }
+        if self.screen_refresh_in_flight {
+            return;
+        }
+        self.screen_refresh_in_flight = true;
         cx.spawn(async move |this, cx| {
             let result = client.coworker_screen(&coworker_id).await;
             let _ = this.update(cx, |state, cx| {
+                state.screen_refresh_in_flight = false;
                 if state.active_coworker_id.as_deref() != Some(coworker_id.as_str()) {
                     return;
                 }
@@ -8497,7 +9670,7 @@ impl AppState {
     }
 
     /// Ask the server to (re)provision the active coworker's computer, and take the answer as
-    /// the current status.
+    /// the current status. Once at a time per bot: see [`Self::asking_for_computer`].
     pub fn ensure_coworker_computer(&mut self, cx: &mut Context<Self>) {
         let Some(client) = self.opengrok.clone() else {
             return;
@@ -8505,9 +9678,15 @@ impl AppState {
         let Some(coworker_id) = self.active_coworker_id.clone() else {
             return;
         };
+        if !self.computer_asks.insert(coworker_id.clone()) {
+            return;
+        }
+        cx.notify();
         cx.spawn(async move |this, cx| {
             let result = client.ensure_coworker_computer(&coworker_id).await;
             let _ = this.update(cx, |state, cx| {
+                state.computer_asks.remove(&coworker_id);
+                cx.notify();
                 if state.active_coworker_id.as_deref() != Some(coworker_id.as_str()) {
                     return;
                 }
@@ -8525,6 +9704,14 @@ impl AppState {
             });
         })
         .detach();
+    }
+
+    /// The open bot's computer has been asked for and the server has not answered yet, so Get a
+    /// computer waits: a second ask while the first is making a box could make another.
+    pub fn asking_for_computer(&self) -> bool {
+        self.active_coworker_id
+            .as_ref()
+            .is_some_and(|id| self.computer_asks.contains(id))
     }
 
     /// Ask before acting on the active bot's computer: the dialog over the app.
@@ -10290,6 +11477,7 @@ impl AppState {
                             triggers: Vec::new(),
                             runs: Vec::new(),
                             saved: None,
+                            tz: None,
                         },
                     );
                 id
@@ -10298,8 +11486,258 @@ impl AppState {
         self.set_right_pane(RightPane::Computer, cx);
         self.load_routine_runs(&coworker_id, &id, cx);
         self.computer_view = ComputerView::Editor { id: Some(id) };
+        self.routine_history_open = false;
+        self.routine_wake_editor = None;
         self.record_nav();
         cx.notify();
+    }
+
+    /// Whether + can add a wake to a routine: only while it has none, since the server keeps one
+    /// per routine (see [`ONE_WAKE_PER_ROUTINE`]; opengrok-server#315 will lift this).
+    pub fn can_add_wake(routine: &AgentRoutine) -> bool {
+        routine.triggers.is_empty()
+    }
+
+    /// Whether 🗑 can take a wake off a routine: never its only one ([`LAST_WAKE_STAYS`]), and
+    /// with one per routine on the server, that is every one there is.
+    pub fn can_remove_wake(routine: &AgentRoutine) -> bool {
+        routine.triggers.len() > 1
+    }
+
+    /// ✎ on one of a routine's wakes, or + on a routine with none: the wake editor, on the wake's
+    /// own tab and values, or on 9:00 AM every day for a new one.
+    pub fn open_wake_editor(
+        &mut self,
+        routine_id: &str,
+        index: Option<usize>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(coworker_id) = self.active_coworker_id.clone() else {
+            return;
+        };
+        let account = self.account_time_zone();
+        let Some(row) = self.routine_mut(&coworker_id, routine_id) else {
+            return;
+        };
+        let kind = row.triggers.first().map(|trigger| match trigger {
+            RoutineTrigger::Webhook { .. } => ScheduleKind::Webhook,
+            _ => ScheduleKind::Cron,
+        });
+        let spec = match index.and_then(|at| row.triggers.get(at)) {
+            Some(RoutineTrigger::Schedule { spec, .. }) => spec.clone(),
+            _ => ScheduleSpec::advanced_daily(9, 0),
+        };
+        let zone = RoutineZone::of(row, account.as_deref(), system_time_zone().as_deref());
+        let mut editor = WakeEditor::new(routine_id.to_string(), index, kind, spec, zone);
+        self.wake_opens += 1;
+        editor.opened = self.wake_opens;
+        self.routine_wake_editor = Some(editor);
+        self.routine_history_open = false;
+        cx.notify();
+    }
+
+    /// Cancel, in the wake editor: nothing picked reaches the routine.
+    pub fn close_wake_editor(&mut self, cx: &mut Context<Self>) {
+        if self.routine_wake_editor.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// A tab of the wake editor: the same schedule as far as it goes, drawn by that tab. A tab
+    /// the routine's kind rules out is dead, and asked for anyway changes nothing.
+    pub fn pick_wake_tab(&mut self, tab: WakeTab, cx: &mut Context<Self>) {
+        let Some(editor) = self.routine_wake_editor.as_mut() else {
+            return;
+        };
+        if !editor.tab_open(tab) || editor.tab == tab {
+            return;
+        }
+        editor.tab = tab;
+        if tab != WakeTab::Webhook {
+            editor.spec = editor.spec.on_tab(tab);
+            editor.write_boxes();
+        }
+        cx.notify();
+    }
+
+    /// One of the editor's typed boxes, as typed (`from_box`), or set from outside it, which is
+    /// then written back into the box.
+    pub fn set_wake_box(
+        &mut self,
+        which: WakeBox,
+        text: String,
+        from_box: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(editor) = self.routine_wake_editor.as_mut() else {
+            return;
+        };
+        match which {
+            WakeBox::Every => {
+                // Not a number is no interval, which the editor then says, rather than an older
+                // number the box no longer shows.
+                editor.spec.every = text.trim().parse().unwrap_or(0);
+                editor.every = text;
+            }
+            WakeBox::Hour => {
+                editor.hour = text;
+                editor.read_time();
+            }
+            WakeBox::Minute => {
+                editor.minute = text;
+                editor.read_time();
+            }
+            WakeBox::Cron => editor.spec.expr = text,
+        }
+        if !from_box {
+            editor.resync += 1;
+        }
+        cx.notify();
+    }
+
+    /// ▲ or ▼ beside the Every number, the hour or the minute: one more or one less, the hour
+    /// round the clock through noon and midnight, and the minute by five.
+    pub fn step_wake_box(&mut self, which: WakeBox, up: bool, cx: &mut Context<Self>) {
+        let Some(editor) = self.routine_wake_editor.as_mut() else {
+            return;
+        };
+        match which {
+            WakeBox::Every => {
+                let every = editor.spec.every;
+                editor.spec.every = if up {
+                    every + 1
+                } else {
+                    every.saturating_sub(1).max(1)
+                };
+            }
+            WakeBox::Hour | WakeBox::Minute => {
+                let (hour, minute) = editor.spec.times.first().copied().unwrap_or((9, 0));
+                editor.spec.times = vec![match (which, up) {
+                    (WakeBox::Hour, true) => ((hour + 1) % 24, minute),
+                    (WakeBox::Hour, false) => ((hour + 23) % 24, minute),
+                    (_, true) => (hour, (minute / 5 * 5 + 5) % 60),
+                    (_, false) => (
+                        hour,
+                        if minute % 5 == 0 {
+                            (minute + 55) % 60
+                        } else {
+                            minute / 5 * 5
+                        },
+                    ),
+                }];
+            }
+            WakeBox::Cron => return,
+        }
+        editor.write_boxes();
+        cx.notify();
+    }
+
+    /// AM or PM, for the time typed.
+    pub fn set_wake_pm(&mut self, pm: bool, cx: &mut Context<Self>) {
+        let Some(editor) = self.routine_wake_editor.as_mut() else {
+            return;
+        };
+        editor.pm = pm;
+        editor.read_time();
+        cx.notify();
+    }
+
+    /// The Every tab's unit.
+    pub fn set_wake_unit(&mut self, unit: ScheduleUnit, cx: &mut Context<Self>) {
+        if let Some(editor) = self.routine_wake_editor.as_mut() {
+            editor.spec.unit = unit;
+            cx.notify();
+        }
+    }
+
+    /// A day of the week's chip, on the Weekly tab: in or out (0 is Sunday).
+    pub fn toggle_wake_weekday(&mut self, day: u8, cx: &mut Context<Self>) {
+        if let Some(editor) = self.routine_wake_editor.as_mut() {
+            toggle(&mut editor.spec.weekdays, day);
+            cx.notify();
+        }
+    }
+
+    /// A date in the Monthly tab's grid: in or out.
+    pub fn toggle_wake_date(&mut self, date: u8, cx: &mut Context<Self>) {
+        if let Some(editor) = self.routine_wake_editor.as_mut() {
+            toggle(&mut editor.spec.month_days, date);
+            cx.notify();
+        }
+    }
+
+    /// A month's chip: in or out. None in is every month.
+    pub fn toggle_wake_month(&mut self, month: u8, cx: &mut Context<Self>) {
+        if let Some(editor) = self.routine_wake_editor.as_mut() {
+            toggle(&mut editor.spec.months, month);
+            cx.notify();
+        }
+    }
+
+    /// Save, in the wake editor. The fields typed for the routine go on it first, since a
+    /// routine's first wake is what makes it on the server, with its name and instruction
+    /// (`add_routine_trigger`); a change to the wake it has goes as one edit with whatever else
+    /// changed (`save_routine_fields`). A pick that is not one line the server takes leaves the
+    /// editor open, saying why.
+    pub fn save_wake(
+        &mut self,
+        name: String,
+        instruction: String,
+        cx: &mut Context<Self>,
+    ) -> WakeSaved {
+        let (Some(editor), Some(coworker_id)) = (
+            self.routine_wake_editor.clone(),
+            self.active_coworker_id.clone(),
+        ) else {
+            return WakeSaved::Nothing;
+        };
+        let picked = match editor.picked() {
+            Ok(picked) => picked,
+            Err(not_cron) => {
+                self.say_routine_trouble(not_cron.sentence().to_string(), cx);
+                return WakeSaved::Nothing;
+            }
+        };
+        let Some(first) = self
+            .routine_mut(&coworker_id, &editor.routine_id)
+            .map(|row| row.triggers.is_empty())
+        else {
+            return WakeSaved::Nothing;
+        };
+        self.routine_wake_editor = None;
+        if first {
+            if let Some(row) = self.routine_mut(&coworker_id, &editor.routine_id) {
+                row.name = name;
+                row.instruction = instruction;
+            }
+            self.add_routine_trigger(&coworker_id, &editor.routine_id, picked, cx);
+            return WakeSaved::Created;
+        }
+        if let (NewTrigger::Schedule(spec), Some(at)) = (picked, editor.index)
+            && let Some(RoutineTrigger::Schedule { spec: wake, .. }) = self
+                .routine_mut(&coworker_id, &editor.routine_id)
+                .and_then(|row| row.triggers.get_mut(at))
+        {
+            *wake = spec;
+            self.save_routine_fields(&coworker_id, &editor.routine_id, name, instruction, cx);
+            return WakeSaved::Changed;
+        }
+        cx.notify();
+        WakeSaved::Closed
+    }
+
+    /// The history icon in a routine's header: its Run history in place of its fields, or its
+    /// fields again.
+    pub fn toggle_routine_history(&mut self, cx: &mut Context<Self>) {
+        self.routine_history_open = !self.routine_history_open;
+        cx.notify();
+    }
+
+    /// A line of a routine's Run history: the routine's thread, with that run brought into view
+    /// once the thread has it (`ChatView`), which a thread rebuilt from the server may not yet.
+    pub fn open_routine_run(&mut self, routine_id: &str, run_id: &str, cx: &mut Context<Self>) {
+        self.reveal_run = Some((routine_id.to_string(), run_id.to_string()));
+        self.open_routine_thread(routine_id, cx);
     }
 
     pub fn back_to_computer(&mut self, cx: &mut Context<Self>) {
@@ -10326,6 +11764,24 @@ impl AppState {
         cx.notify();
     }
 
+    /// The zone `routine`'s times are in, and whether it is this computer's ([`RoutineZone::of`]).
+    pub fn routine_zone(&self, routine: &AgentRoutine) -> RoutineZone {
+        RoutineZone::of(
+            routine,
+            self.account_time_zone().as_deref(),
+            system_time_zone().as_deref(),
+        )
+    }
+
+    /// The zone the account keeps for its routines, as last read: none from a server that keeps
+    /// none, or while none is set.
+    fn account_time_zone(&self) -> Option<String> {
+        self.account
+            .as_ref()
+            .and_then(|account| account.time_zone.clone())
+            .flatten()
+    }
+
     pub fn coworker_routines(&self, coworker_id: &str) -> &[AgentRoutine] {
         self.routines
             .get(coworker_id)
@@ -10346,66 +11802,144 @@ impl AppState {
         instruction: String,
         cx: &mut Context<Self>,
     ) {
-        let Some(row) = self.routine_mut(coworker_id, routine_id) else {
-            return;
-        };
-        row.name = name;
-        row.instruction = instruction;
-        let edit = routine_edit(row);
+        let begun = self.begin_routine_edit(coworker_id, routine_id, name, instruction);
         cx.notify();
-        if edit.is_empty() {
-            return;
-        }
-        let Some(client) = self.opengrok.clone() else {
+        let Some((client, this_edit, edit)) = begun else {
             return;
         };
         let coworker_id = coworker_id.to_string();
         let routine_id = routine_id.to_string();
-        self.routine_seq += 1;
-        let this_edit = self.routine_seq;
-        self.routine_latest_edit
-            .insert(routine_id.clone(), this_edit);
-        // A Test run already waiting keeps waiting, now on this edit.
-        let entry = self
-            .routine_edits
-            .entry(routine_id.clone())
-            .or_insert((this_edit, false));
-        entry.0 = this_edit;
         cx.spawn(async move |this, cx| {
             let result = client.edit_schedule(&routine_id, &edit).await;
             let _ = this.update(cx, |state, cx| {
-                // An earlier edit's answer, with a later one still out: the later one says what
-                // the routine is, and settles the wait.
-                if state
-                    .routine_edits
-                    .get(&routine_id)
-                    .map(|(latest, _)| *latest)
-                    != Some(this_edit)
+                match state.settle_routine_edit(&coworker_id, &routine_id, this_edit, edit, result)
                 {
-                    return;
-                }
-                let run_waiting = state
-                    .routine_edits
-                    .remove(&routine_id)
-                    .is_some_and(|(_, waiting)| waiting);
-                match result {
-                    Ok(row) => {
-                        state.put_server_routine(&coworker_id, row);
-                        if run_waiting {
-                            state.run_routine_now(&coworker_id, &routine_id, cx);
-                        }
+                    AfterRoutineEdit::RunNow => {
+                        state.run_routine_now(&coworker_id, &routine_id, cx)
                     }
-                    // A Test run waiting on a refused edit is not started: it would run the
-                    // routine the person just tried to change.
-                    Err(error) => {
-                        state.computer_action_error = Some(error.message);
-                        state.restore_routine(&coworker_id, &routine_id, cx);
+                    AfterRoutineEdit::ReadBack => {
+                        state.restore_routine(&coworker_id, &routine_id, cx)
                     }
+                    AfterRoutineEdit::Nothing => {}
                 }
                 cx.notify();
             });
         })
         .detach();
+    }
+
+    /// The part of [`Self::save_routine_fields`] that needs no window: the fields go onto the
+    /// routine, and what differs from the server's copy is the edit to send, numbered so a late
+    /// answer can be told from the latest. Nothing to send for a routine nobody changed, for a
+    /// draft, or with no server; and nothing to a server that has said it cannot change a
+    /// routine, where the edit is refused here, as the server refused the last.
+    fn begin_routine_edit(
+        &mut self,
+        coworker_id: &str,
+        routine_id: &str,
+        name: String,
+        instruction: String,
+    ) -> Option<(OpenGrokClient, u64, ScheduleEdit)> {
+        let row = self.routine_mut(coworker_id, routine_id)?;
+        row.name = name;
+        row.instruction = instruction;
+        let edit = routine_edit(row);
+        if edit.is_empty() {
+            return None;
+        }
+        if self.routine_routes_missing.edit {
+            self.refuse_routine_edit(coworker_id, routine_id, edit);
+            return None;
+        }
+        let client = self.opengrok.clone()?;
+        self.routine_seq += 1;
+        let this_edit = self.routine_seq;
+        self.routine_latest_edit
+            .insert(routine_id.to_string(), this_edit);
+        // A Test run already waiting keeps waiting, now on this edit.
+        let entry = self
+            .routine_edits
+            .entry(routine_id.to_string())
+            .or_insert((this_edit, false));
+        entry.0 = this_edit;
+        Some((client, this_edit, edit))
+    }
+
+    /// What an edit's answer means for the routine, and what has to follow it.
+    fn settle_routine_edit(
+        &mut self,
+        coworker_id: &str,
+        routine_id: &str,
+        this_edit: u64,
+        edit: ScheduleEdit,
+        result: Result<ScheduleRow, OpenGrokError>,
+    ) -> AfterRoutineEdit {
+        // An earlier edit's answer, with a later one still out: the later one says what the
+        // routine is, and settles the wait.
+        if self
+            .routine_edits
+            .get(routine_id)
+            .map(|(latest, _)| *latest)
+            != Some(this_edit)
+        {
+            return AfterRoutineEdit::Nothing;
+        }
+        let run_waiting = self
+            .routine_edits
+            .remove(routine_id)
+            .is_some_and(|(_, waiting)| waiting);
+        match result {
+            Ok(row) => {
+                self.put_server_routine(coworker_id, row);
+                if run_waiting {
+                    AfterRoutineEdit::RunNow
+                } else {
+                    AfterRoutineEdit::Nothing
+                }
+            }
+            // A server from before routines could be changed. Nothing was kept, and nothing will
+            // be on this server, so it is not asked again; what was typed stays on screen.
+            Err(error) if error.route_missing() => {
+                self.routine_routes_missing.edit = true;
+                self.refuse_routine_edit(coworker_id, routine_id, edit);
+                AfterRoutineEdit::Nothing
+            }
+            // A Test run waiting on a refused edit is not started: it would run the routine the
+            // person just tried to change.
+            Err(error) => {
+                self.computer_action_error = Some(routine_trouble(&error));
+                AfterRoutineEdit::ReadBack
+            }
+        }
+    }
+
+    /// An edit a server that cannot change a routine will not keep. What the person typed is
+    /// kept, to show beside the routine; the line says why; and the routine goes back to the
+    /// server's copy as it last answered it, which nothing has changed, since nothing reached it.
+    fn refuse_routine_edit(&mut self, coworker_id: &str, routine_id: &str, edit: ScheduleEdit) {
+        self.routine_unsaved.insert(routine_id.to_string(), edit);
+        self.computer_action_error = Some(ROUTINE_EDIT_UNAVAILABLE.to_string());
+        let Some(row) = self.routine_mut(coworker_id, routine_id) else {
+            return;
+        };
+        let Some(saved) = row.saved.clone() else {
+            return;
+        };
+        row.name = saved.name.unwrap_or_default();
+        row.instruction = saved.prompt.unwrap_or_default();
+        if let Some(cron) = saved.cron.as_deref() {
+            for trigger in &mut row.triggers {
+                if let RoutineTrigger::Schedule { spec, .. } = trigger {
+                    *spec = ScheduleSpec::from_server_cron(cron);
+                }
+            }
+        }
+        // The editor's fields follow the routine back, so they stop showing the refused words
+        // as if they were saved.
+        *self
+            .routine_resyncs
+            .entry(routine_id.to_string())
+            .or_default() += 1;
     }
 
     /// The server's copy of one routine, written over the one on screen and into the editor's
@@ -10457,9 +11991,9 @@ impl AppState {
                         let refused = state.computer_action_error.take().unwrap_or_default();
                         state.computer_action_error = Some(
                             format!(
-                                "{refused} The saved routine could not be read back ({}), so \
-                                 what is shown may not be what is saved.",
-                                error.message
+                                "{refused} The saved routine could not be read back, so what is \
+                                 shown may not be what is saved: {}",
+                                routine_trouble(&error)
                             )
                             .trim()
                             .to_string(),
@@ -10500,41 +12034,74 @@ impl AppState {
         routine_id: &str,
         cx: &mut Context<Self>,
     ) {
-        let on_the_server = self
-            .routine_mut(coworker_id, routine_id)
-            .is_some_and(|row| row.saved.is_some());
-        let Some(client) = self.opengrok.clone().filter(|_| on_the_server) else {
+        let Some((client, this_read)) = self.begin_routine_runs_read(coworker_id, routine_id)
+        else {
             return;
         };
         let coworker_id = coworker_id.to_string();
         let routine_id = routine_id.to_string();
-        self.routine_seq += 1;
-        let this_read = self.routine_seq;
-        self.routine_runs_asked
-            .insert(routine_id.clone(), this_read);
         cx.spawn(async move |this, cx| {
             let result = client.schedule_runs(&routine_id).await;
             let _ = this.update(cx, |state, cx| {
-                // A page asked for before the latest one is older news than it.
-                if state.routine_runs_asked.get(&routine_id) != Some(&this_read) {
-                    return;
+                if state.settle_routine_runs(&coworker_id, &routine_id, this_read, result) {
+                    cx.notify();
                 }
-                match result {
-                    Ok(runs) => {
-                        if let Some(row) = state.routine_mut(&coworker_id, &routine_id) {
-                            row.runs = with_unlisted_runs(
-                                &row.runs,
-                                runs.into_iter().map(RoutineRun::from_server).collect(),
-                                chrono::Utc::now().timestamp_millis(),
-                            );
-                        }
-                    }
-                    Err(error) => state.computer_action_error = Some(error.message),
-                }
-                cx.notify();
             });
         })
         .detach();
+    }
+
+    /// The part of [`Self::load_routine_runs`] that needs no window: the read to make, numbered
+    /// so an older page landing last can be told from the latest. Nothing for a draft, with no
+    /// server, or on a server that has said it cannot list a routine's runs.
+    fn begin_routine_runs_read(
+        &mut self,
+        coworker_id: &str,
+        routine_id: &str,
+    ) -> Option<(OpenGrokClient, u64)> {
+        let on_the_server = self
+            .routine_mut(coworker_id, routine_id)
+            .is_some_and(|row| row.saved.is_some());
+        if !on_the_server || self.routine_routes_missing.runs {
+            return None;
+        }
+        let client = self.opengrok.clone()?;
+        self.routine_seq += 1;
+        let this_read = self.routine_seq;
+        self.routine_runs_asked
+            .insert(routine_id.to_string(), this_read);
+        Some((client, this_read))
+    }
+
+    /// A read of a routine's history landing, and whether it changed what is on screen.
+    fn settle_routine_runs(
+        &mut self,
+        coworker_id: &str,
+        routine_id: &str,
+        this_read: u64,
+        result: Result<Vec<crate::opengrok::ScheduleRun>, OpenGrokError>,
+    ) -> bool {
+        // A page asked for before the latest one is older news than it.
+        if self.routine_runs_asked.get(routine_id) != Some(&this_read) {
+            return false;
+        }
+        match result {
+            Ok(runs) => {
+                if let Some(row) = self.routine_mut(coworker_id, routine_id) {
+                    row.runs = with_unlisted_runs(
+                        &row.runs,
+                        runs.into_iter().map(RoutineRun::from_server).collect(),
+                        chrono::Utc::now().timestamp_millis(),
+                    );
+                }
+            }
+            // A server from before routines kept a history. That is said once, in the history,
+            // in place of "No runs yet", which would claim what nobody knows; not as a red line
+            // over the editor about a read the person never asked for.
+            Err(error) if error.route_missing() => self.routine_routes_missing.runs = true,
+            Err(error) => self.computer_action_error = Some(routine_trouble(&error)),
+        }
+        true
     }
 
     pub fn routine_mut(
@@ -10631,7 +12198,7 @@ impl AppState {
                         ));
                         state.routines.insert(coworker_id, routines);
                     }
-                    Err(error) => state.computer_action_error = Some(error.message),
+                    Err(error) => state.computer_action_error = Some(routine_trouble(&error)),
                 }
                 cx.notify();
             });
@@ -10681,7 +12248,7 @@ impl AppState {
             let _ = this.update(cx, |state, cx| {
                 match result {
                     Ok(row) => state.settle_new_routine(&coworker_id, draft_id.as_deref(), row),
-                    Err(error) => state.computer_action_error = Some(error.message),
+                    Err(error) => state.computer_action_error = Some(routine_trouble(&error)),
                 }
                 cx.notify();
             });
@@ -10731,7 +12298,7 @@ impl AppState {
                             routine.triggers = vec![trigger_from_schedule(&row)];
                         }
                     }
-                    Err(error) => state.computer_action_error = Some(error.message),
+                    Err(error) => state.computer_action_error = Some(routine_trouble(&error)),
                 }
                 cx.notify();
             });
@@ -10746,72 +12313,139 @@ impl AppState {
         cx.notify();
     }
 
-    /// Change when a routine runs, on screen.
-    ///
-    /// On screen only, for the same reason the name and the prompt are: `/schedules` has no
-    /// route to change a schedule once it is made. What this does do is say so the moment a
-    /// combination stops being one cron line — two times of day with different minutes past
-    /// the hour, a week with no day picked — because that is a thing the person is building
-    /// right now and can still put right.
-    pub fn update_schedule_spec(
-        &mut self,
-        coworker_id: &str,
-        routine_id: &str,
-        trigger_id: &str,
-        spec: ScheduleSpec,
-        cx: &mut Context<Self>,
-    ) {
-        let trouble = spec.to_cron().err();
-        if let Some(row) = self.routine_mut(coworker_id, routine_id)
-            && let Some(RoutineTrigger::Schedule { spec: current, .. }) =
-                row.triggers.iter_mut().find(|t| t.id() == trigger_id)
-        {
-            *current = spec;
-        }
-        self.computer_action_error = trouble.map(|not_cron| not_cron.sentence().to_string());
-        cx.notify();
-    }
-
     /// Test run: the server starts the routine's prompt now, in the routine's thread, and the
     /// history is read again so the run it started is the top line. The line is the server's,
     /// not this app's note that a button was pressed; while it is going, the Computer pane's
     /// poll keeps reading it until it says how it ended.
     pub fn run_routine_now(&mut self, coworker_id: &str, routine_id: &str, cx: &mut Context<Self>) {
-        let on_the_server = self
-            .routine_mut(coworker_id, routine_id)
-            .is_some_and(|row| row.saved.is_some());
-        let Some(client) = self.opengrok.clone() else {
+        let begun = self.begin_routine_run(coworker_id, routine_id);
+        cx.notify();
+        let Some(client) = begun else {
             return;
         };
-        if !on_the_server {
-            self.computer_action_error =
-                Some("Choose when this routine runs first, then test it.".to_string());
-            cx.notify();
-            return;
-        }
-        if let Some((_, run_waiting)) = self.routine_edits.get_mut(routine_id) {
-            *run_waiting = true;
-            return;
-        }
         let coworker_id = coworker_id.to_string();
         let routine_id = routine_id.to_string();
         cx.spawn(async move |this, cx| {
             let result = client.run_schedule_now(&routine_id).await;
             let _ = this.update(cx, |state, cx| {
-                match result {
-                    Ok(run_id) => {
-                        state.computer_action_error = None;
-                        if let Some(row) = state.routine_mut(&coworker_id, &routine_id) {
-                            row.runs.insert(0, RoutineRun::just_started(run_id));
-                        }
-                        state.load_routine_runs(&coworker_id, &routine_id, cx);
-                    }
-                    Err(error) => state.computer_action_error = Some(error.message),
+                if state.settle_routine_run(&coworker_id, &routine_id, result) {
+                    state.load_routine_runs(&coworker_id, &routine_id, cx);
                 }
                 cx.notify();
             });
         })
         .detach();
+    }
+
+    /// The part of [`Self::run_routine_now`] that needs no window: the client to start the run
+    /// with, or nothing when there is no run to start now. A routine the server does not have
+    /// yet says to choose when it runs first; one with an edit still out waits for that edit's
+    /// answer (`settle_routine_edit`); and on a server that has said it cannot run a routine on
+    /// demand, where Test run is dead, a run asked for anyway is refused here in the same words.
+    fn begin_routine_run(&mut self, coworker_id: &str, routine_id: &str) -> Option<OpenGrokClient> {
+        let on_the_server = self
+            .routine_mut(coworker_id, routine_id)
+            .is_some_and(|row| row.saved.is_some());
+        let client = self.opengrok.clone()?;
+        if !on_the_server {
+            self.computer_action_error =
+                Some("Choose when this routine runs first, then test it.".to_string());
+            return None;
+        }
+        if self.routine_routes_missing.run_now {
+            self.computer_action_error = Some(ROUTINE_RUN_UNAVAILABLE.to_string());
+            return None;
+        }
+        if let Some((_, run_waiting)) = self.routine_edits.get_mut(routine_id) {
+            *run_waiting = true;
+            return None;
+        }
+        Some(client)
+    }
+
+    /// A Test run's answer landing, and whether the history is to be read again for the run it
+    /// started, or for the skip the server kept in its place.
+    fn settle_routine_run(
+        &mut self,
+        coworker_id: &str,
+        routine_id: &str,
+        result: Result<String, OpenGrokError>,
+    ) -> bool {
+        match result {
+            Ok(run_id) => {
+                self.computer_action_error = None;
+                if let Some(row) = self.routine_mut(coworker_id, routine_id) {
+                    row.runs.insert(0, RoutineRun::just_started(run_id));
+                }
+                true
+            }
+            // A server from before routines could be run on demand. It says so, and Test run
+            // goes dead, rather than a press that does nothing being offered again.
+            Err(error) if error.route_missing() => {
+                self.routine_routes_missing.run_now = true;
+                self.computer_action_error = Some(ROUTINE_RUN_UNAVAILABLE.to_string());
+                false
+            }
+            // The Bot answers on its person's own plan, and the plan could not answer now: no run
+            // started, and the server kept the firing in the history as skipped (opengrok-server
+            // #316). Its sentence is what the person is told, and the history is read again for
+            // the line it kept, with nothing shown as running in the meantime.
+            Err(error) if error.is_skipped_firing() => {
+                self.computer_action_error = Some(routine_trouble(&error));
+                true
+            }
+            Err(error) => {
+                self.computer_action_error = Some(routine_trouble(&error));
+                false
+            }
+        }
+    }
+
+    /// Delete, pressed on a routine: a question over the whole window first, because a routine
+    /// deleted stops running for good.
+    pub fn ask_delete_routine(&mut self, routine_id: &str, cx: &mut Context<Self>) {
+        self.routine_delete_prompt = Some(routine_id.to_string());
+        cx.notify();
+    }
+
+    /// Cancel, Escape, or a press beside the question: nothing is deleted.
+    pub fn cancel_routine_delete(&mut self, cx: &mut Context<Self>) {
+        if self.routine_delete_prompt.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// The question's Delete.
+    pub fn confirm_routine_delete(&mut self, cx: &mut Context<Self>) {
+        let (Some(routine_id), Some(coworker_id)) = (
+            self.routine_delete_prompt.take(),
+            self.active_coworker_id.clone(),
+        ) else {
+            return;
+        };
+        self.delete_routine(&coworker_id, &routine_id, cx);
+    }
+
+    /// What Delete asks: the routine by its name, and what deleting it does. Nothing while it is
+    /// not asking, or about a routine gone from the open bot's meanwhile.
+    pub fn routine_delete_question(&self) -> Option<(String, &'static str)> {
+        let routine_id = self.routine_delete_prompt.as_deref()?;
+        let routine = self
+            .coworker_routines(self.active_coworker_id.as_deref()?)
+            .iter()
+            .find(|row| row.id == routine_id)?;
+        let name = match routine.name.trim() {
+            "" => "Untitled routine",
+            name => name,
+        };
+        Some((
+            format!("Delete \"{name}\"?"),
+            if routine.saved.is_some() {
+                ROUTINE_DELETE_KEEPS
+            } else {
+                DRAFT_DELETE_KEEPS
+            },
+        ))
     }
 
     /// Drop the routine here and on the server.
@@ -10826,6 +12460,7 @@ impl AppState {
         if let Some(rows) = self.routines.get_mut(coworker_id) {
             rows.retain(|row| row.id != routine_id);
         }
+        self.routine_unsaved.remove(routine_id);
         self.computer_view = ComputerView::Overview;
         cx.notify();
         // A draft nobody finished is nobody's but this app's.
@@ -10840,7 +12475,7 @@ impl AppState {
             let result = client.delete_schedule(&routine_id).await;
             let _ = this.update(cx, |state, cx| {
                 if let Err(error) = result {
-                    state.computer_action_error = Some(error.message);
+                    state.computer_action_error = Some(routine_trouble(&error));
                     state.load_routines(cx);
                 }
                 cx.notify();
@@ -10889,7 +12524,7 @@ impl AppState {
                     if let Some(row) = state.routine_mut(&coworker_id, &routine_id) {
                         row.active = !active;
                     }
-                    state.computer_action_error = Some(error.message);
+                    state.computer_action_error = Some(routine_trouble(&error));
                 }
                 cx.notify();
             });
@@ -10898,10 +12533,10 @@ impl AppState {
     }
 
     pub fn dismiss_popovers(&mut self, cx: &mut Context<Self>) {
-        if !self.model_picker_open && !self.avatar_editor_open && self.emoji_picker.is_none() {
+        if !self.model_picker.open && !self.avatar_editor_open && self.emoji_picker.is_none() {
             return;
         }
-        self.model_picker_open = false;
+        self.model_picker = PickerView::default();
         self.avatar_editor_open = false;
         self.emoji_picker = None;
         self.hidden_bots_open = false;
@@ -11006,6 +12641,13 @@ impl AppState {
     pub fn request_attach(&mut self, path: std::path::PathBuf, cx: &mut Context<Self>) {
         self.attach_requests.push(path);
         cx.notify();
+    }
+
+    /// Say whether the transcript follows its newest row, for a driver: the list is the
+    /// transcript's own. Nothing on screen reads this, so it notifies nobody, and a scroll
+    /// gesture does not redraw the whole window.
+    pub fn set_transcript_following(&mut self, following: bool) {
+        self.transcript_following = following;
     }
 
     /// Say which chips the draft holds, for a driver: the field is the composer's own.
@@ -11215,24 +12857,15 @@ impl AppState {
         cx.notify();
     }
 
-    pub fn set_model_picker_open(&mut self, open: bool, cx: &mut Context<Self>) {
-        if self.model_picker_open == open && (!open || !self.avatar_editor_open) {
-            return;
-        }
-        self.model_picker_open = open;
-        if open {
-            self.avatar_editor_open = false;
-        }
-        cx.notify();
-    }
-
     pub fn set_avatar_editor_open(&mut self, open: bool, cx: &mut Context<Self>) {
-        if self.avatar_editor_open == open && (!open || !self.model_picker_open) {
+        if self.avatar_editor_open == open && (!open || !self.model_picker.open) {
             return;
         }
         self.avatar_editor_open = open;
+        // The avatar editor and the Model card's popover share the settings pane, and one opens
+        // over the other.
         if open {
-            self.model_picker_open = false;
+            self.model_picker = PickerView::default();
         }
         cx.notify();
     }
@@ -11293,14 +12926,11 @@ impl AppState {
                 }
                 match result.as_ref() {
                     Ok(_) => {
-                        if let Some(sent) = patch.effort.as_deref() {
-                            state.settle_effort_pick(&id, sent);
-                        }
                         state.auth_error = None;
                         state.note_server_answered(cx);
                     }
-                    // A refused pick stays on the control, as refused words stay in the fields,
-                    // with the server's sentence under them.
+                    // Refused words stay in the fields, with the server's sentence under them;
+                    // the roster has gone back to what the server keeps.
                     Err(error) => state.note_failure(error, cx),
                 }
                 cx.notify();
@@ -11312,6 +12942,454 @@ impl AppState {
             }
         })
         .detach();
+    }
+
+    // ---- The model picker: a Bot's, and Default for new Bots' -----------------------------------
+
+    /// The open Bot's picker, as its card draws it and a driver reads it: `None` with no Bot
+    /// open.
+    pub fn model_pick(&self) -> Option<ModelPick> {
+        let id = self.active_coworker_id.as_deref()?;
+        let bot = self.coworkers.iter().find(|bot| bot.id == id)?;
+        Some(crate::opengrok::bot_pick(
+            bot,
+            self.reply_source.kept_source(),
+            &self.model_catalogue,
+            |via| self.plan_models(via),
+        ))
+    }
+
+    /// Default for new Bots' picker, as its card on Settings → General draws it: `None` while the
+    /// server keeps no default for new Bots, when the card is dead and opens nothing.
+    pub fn new_bots_pick(&self) -> Option<ModelPick> {
+        let DefaultForNewBots::Kept(default) = self.default_for_new_bots() else {
+            return None;
+        };
+        Some(crate::opengrok::new_bots_pick(
+            default.as_ref(),
+            self.reply_source.kept_source(),
+            &self.model_catalogue,
+            |via| self.plan_models(via),
+        ))
+    }
+
+    /// A picker as its card draws it.
+    pub fn picker_pick(&self, which: PickerFor) -> Option<ModelPick> {
+        match which {
+            PickerFor::Bot => self.model_pick(),
+            PickerFor::NewBots => self.new_bots_pick(),
+            PickerFor::PlanFallback => self.plan_fallback_pick(),
+        }
+    }
+
+    /// Where a picker's popover is: open or shut, its list or its controls, its search and its
+    /// window.
+    pub fn picker_view(&self, which: PickerFor) -> &PickerView {
+        match which {
+            PickerFor::Bot => &self.model_picker,
+            PickerFor::NewBots => &self.new_bots_picker,
+            PickerFor::PlanFallback => &self.plan_fallback_picker,
+        }
+    }
+
+    fn picker_view_mut(&mut self, which: PickerFor) -> &mut PickerView {
+        match which {
+            PickerFor::Bot => &mut self.model_picker,
+            PickerFor::NewBots => &mut self.new_bots_picker,
+            PickerFor::PlanFallback => &mut self.plan_fallback_picker,
+        }
+    }
+
+    /// Default for new Bots, as the account's setting last read says it: kept by a server whose
+    /// read carries `newBotDefault`, `null` or not (opengrok-server #322, on main c0bb6ae), and
+    /// not kept by one whose read carries no such key, or before the setting is read.
+    pub fn default_for_new_bots(&self) -> DefaultForNewBots {
+        match self
+            .reply_source
+            .kept_source()
+            .and_then(|kept| kept.new_bot_default.as_ref())
+        {
+            Some(default) => DefaultForNewBots::Kept(default.clone()),
+            None => DefaultForNewBots::NotOnServer,
+        }
+    }
+
+    /// The Relay-off fallback, as the account's setting last read says it: kept by a server whose
+    /// read carries `planFallback`, `null` or not (opengrok-server #332 (PR #338 at 66b9f7b),
+    /// which sends it on every read), and not kept by one whose read carries no such key, or
+    /// before the setting is read.
+    pub fn relay_off_fallback(&self) -> RelayOffFallback {
+        match self
+            .reply_source
+            .kept_source()
+            .and_then(|kept| kept.plan_fallback.as_ref())
+        {
+            Some(fallback) => RelayOffFallback::Kept(fallback.clone()),
+            None => RelayOffFallback::NotOnServer,
+        }
+    }
+
+    /// The Relay-off fallback's picker, as its card on Settings → General draws it: the Gateway
+    /// group alone ([`crate::opengrok::plan_fallback_pick`]). `None` while the server keeps no
+    /// such fallback, when the card is dead and opens nothing.
+    pub fn plan_fallback_pick(&self) -> Option<ModelPick> {
+        let RelayOffFallback::Kept(fallback) = self.relay_off_fallback() else {
+            return None;
+        };
+        Some(crate::opengrok::plan_fallback_pick(
+            fallback.as_ref(),
+            &self.model_catalogue,
+        ))
+    }
+
+    /// The server keeps a door per Bot: some row of the roster carries `source` (opengrok-server
+    /// main d6f640e (#307, after #304), pin bf99845, which writes it on every row). Settings →
+    /// Relay is then the place a Bot's Subscription model answers through, and says so.
+    pub fn server_keeps_bot_doors(&self) -> bool {
+        self.coworkers
+            .iter()
+            .any(|bot| bot.source != CoworkerSource::NotKept)
+    }
+
+    /// Open a picker's popover under its card, or shut it. Opening the Bot's shuts the avatar
+    /// editor, which shares the settings pane with the card; and a popover opens on its controls,
+    /// not on the list it was last left at.
+    pub fn set_picker_open(&mut self, which: PickerFor, open: bool, cx: &mut Context<Self>) {
+        if self.picker_view(which).open == open {
+            return;
+        }
+        self.picker_view_mut(which).open = open;
+        self.picker_view_mut(which).effort_note = None;
+        self.shut_picker_list(which);
+        if open && which == PickerFor::Bot {
+            self.avatar_editor_open = false;
+        }
+        cx.notify();
+    }
+
+    /// A click on a card.
+    pub fn toggle_picker(&mut self, which: PickerFor, cx: &mut Context<Self>) {
+        let open = !self.picker_view(which).open;
+        self.set_picker_open(which, open, cx);
+    }
+
+    /// The model's name in a popover opens its list; the list's heading goes back.
+    pub fn toggle_picker_list(&mut self, which: PickerFor, cx: &mut Context<Self>) {
+        if self.note_picker_list_toggled(which) {
+            cx.notify();
+        }
+    }
+
+    /// [`Self::toggle_picker_list`] without the repaint: `false` while the popover is shut. The
+    /// list opens with nothing typed in its search box and the model that answers in view,
+    /// wherever it was left.
+    fn note_picker_list_toggled(&mut self, which: PickerFor) -> bool {
+        if !self.picker_view(which).open {
+            return false;
+        }
+        if self.picker_view(which).list_open {
+            self.shut_picker_list(which);
+        } else {
+            let start = self
+                .picker_pick(which)
+                .map_or(0, |pick| pick.opening_window_start());
+            let view = self.picker_view_mut(which);
+            view.list_open = true;
+            view.search.clear();
+            view.list_start = start;
+        }
+        true
+    }
+
+    /// A list goes back to the controls, and what was typed in its search box and how far it was
+    /// scrolled go with it.
+    fn shut_picker_list(&mut self, which: PickerFor) {
+        let view = self.picker_view_mut(which);
+        view.list_open = false;
+        view.search.clear();
+        view.list_start = 0;
+    }
+
+    /// What a list's search box holds now. The list shows only the models it leaves, from the
+    /// top.
+    pub fn set_picker_search(&mut self, which: PickerFor, query: String, cx: &mut Context<Self>) {
+        if self.note_picker_search(which, query) {
+            cx.notify();
+        }
+    }
+
+    /// Only while the list shows, as the box is only there then: a field put back to empty as the
+    /// list shuts is no search.
+    fn note_picker_search(&mut self, which: PickerFor, query: String) -> bool {
+        let view = self.picker_view_mut(which);
+        if !view.list_open || view.search == query {
+            return false;
+        }
+        view.search = query;
+        view.list_start = 0;
+        true
+    }
+
+    /// The wheel moved a list's window by `rows` models, toward the end above zero. It stops at
+    /// either end of what the search leaves.
+    pub fn scroll_picker_list(&mut self, which: PickerFor, rows: isize, cx: &mut Context<Self>) {
+        if self.note_picker_list_scroll(which, rows) {
+            cx.notify();
+        }
+    }
+
+    fn note_picker_list_scroll(&mut self, which: PickerFor, rows: isize) -> bool {
+        if !self.picker_view(which).list_open {
+            return false;
+        }
+        let Some(pick) = self.picker_pick(which) else {
+            return false;
+        };
+        let view = self.picker_view_mut(which);
+        let last = crate::opengrok::last_window_start(crate::opengrok::row_count(
+            &pick.search(&view.search),
+        ));
+        let start = view
+            .list_start
+            .min(last)
+            .saturating_add_signed(rows)
+            .min(last);
+        let moved = start != view.list_start;
+        view.list_start = start;
+        moved
+    }
+
+    /// A row of a list picked: the Bot, or the default for new Bots, goes onto its model at once,
+    /// with its door, and the popover goes back to its controls, where that model's effort and ⚡
+    /// are. The pick never changes the effort by itself: it stays where the model lists it, and
+    /// where it does not it goes back to `inherit`, so the slider shows the model's own level,
+    /// and the popover says so in a line ([`ModelPick::pick_patch`]).
+    pub fn pick_model(
+        &mut self,
+        which: PickerFor,
+        source: InferenceKind,
+        base_id: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let pick = self.picker_pick(which);
+        let patch = pick
+            .as_ref()
+            .and_then(|pick| pick.pick_patch(source, base_id).ok().flatten());
+        let line = patch
+            .as_ref()
+            .and_then(|_| pick.as_ref()?.pick_effort_note(source, base_id));
+        self.shut_picker_list(which);
+        match patch {
+            Some(patch) => {
+                self.save_picker_change(which, patch, cx);
+                self.picker_view_mut(which).effort_note = line.map(|line| EffortNote {
+                    base_id: base_id.to_string(),
+                    line,
+                });
+            }
+            None => cx.notify(),
+        }
+    }
+
+    /// ⚡ switched: the pin moves to the model's fast twin, or back.
+    pub fn set_model_fast(&mut self, which: PickerFor, on: bool, cx: &mut Context<Self>) {
+        if let Some(patch) = self
+            .picker_pick(which)
+            .and_then(|pick| pick.fast_patch(on).ok().flatten())
+        {
+            self.save_picker_change(which, patch, cx);
+        }
+    }
+
+    /// A stop of the slider, by the server's word for it: one of the levels the model lists.
+    pub fn pick_model_effort(&mut self, which: PickerFor, word: &str, cx: &mut Context<Self>) {
+        if let Some(patch) = self
+            .picker_pick(which)
+            .and_then(|pick| pick.effort_patch(word).ok().flatten())
+        {
+            self.save_picker_change(which, patch, cx);
+        }
+    }
+
+    /// The thumb let go at the `stop`th stop of the slider, counting from the lowest level the
+    /// model lists: that level's word is the pick. A stop past the levels the model has is none.
+    pub fn pick_model_effort_level(
+        &mut self,
+        which: PickerFor,
+        stop: usize,
+        cx: &mut Context<Self>,
+    ) {
+        let word = self
+            .picker_pick(which)
+            .and_then(|pick| pick.levels().get(stop).map(|level| level.value.clone()));
+        if let Some(word) = word {
+            self.pick_model_effort(which, &word, cx);
+        }
+    }
+
+    /// ↺: the effort back to `inherit`, so the slider shows the model's own level, and ⚡ off, the
+    /// model left where it is.
+    pub fn reset_model_pick(&mut self, which: PickerFor, cx: &mut Context<Self>) {
+        if let Some(patch) = self.picker_pick(which).and_then(|pick| pick.reset_patch()) {
+            self.save_picker_change(which, patch, cx);
+        }
+    }
+
+    /// Send a change a picker made, at once: a Bot's as a patch of the Bot
+    /// ([`Self::save_model_pick`]), and Default for new Bots' as the whole default it makes, kept
+    /// on the account ([`Self::begin_new_bots_change`]).
+    fn save_picker_change(
+        &mut self,
+        which: PickerFor,
+        patch: CoworkerPatch,
+        cx: &mut Context<Self>,
+    ) {
+        // What was said of the last pick was said of what it left; this change leaves something
+        // else.
+        self.picker_view_mut(which).effort_note = None;
+        let send = match which {
+            PickerFor::Bot => return self.save_model_pick(patch, cx),
+            PickerFor::NewBots => self.begin_new_bots_pick(&patch),
+            PickerFor::PlanFallback => self.begin_plan_fallback_pick(&patch),
+        };
+        if let Some(send) = send {
+            self.send_account_change(send, cx);
+        }
+    }
+
+    /// Begin what a change Default for new Bots' picker made sends: the whole default `patch`
+    /// makes of the kept one ([`ModelPick::new_bots_default`]). `None` where it makes none, or
+    /// no change can begin.
+    fn begin_new_bots_pick(&mut self, patch: &CoworkerPatch) -> Option<AccountChangeSend> {
+        let default = self.new_bots_pick()?.new_bots_default(patch)?;
+        self.begin_new_bots_change(Some(default))
+    }
+
+    /// Send a change the Bot's picker made, at once, as a pick from the old model list always
+    /// was: the roster takes it before the server answers so the card follows the click, and a
+    /// refusal puts the roster back ([`Self::patch_active_agent_then`]) and is said in the popover
+    /// in the server's words, as well as on the settings pane's red line.
+    fn save_model_pick(&mut self, patch: CoworkerPatch, cx: &mut Context<Self>) {
+        let Some(bot) = self.active_coworker_id.clone() else {
+            return;
+        };
+        self.model_pick_note = None;
+        let this = cx.entity().downgrade();
+        self.patch_active_agent_then(
+            patch,
+            Some(Box::new(move |error, cx| {
+                let Some(error) = error else {
+                    return;
+                };
+                let _ = this.update(cx, |state, cx| {
+                    state.model_pick_note = Some((bot, error));
+                    cx.notify();
+                });
+            })),
+            cx,
+        );
+    }
+
+    /// None, Default for new Bots' first row: the default the server keeps goes, and a new Bot is
+    /// left to the server's own.
+    pub fn clear_new_bots_default(&mut self, cx: &mut Context<Self>) {
+        self.shut_picker_list(PickerFor::NewBots);
+        match self.begin_new_bots_none() {
+            Some(send) => self.send_account_change(send, cx),
+            None => cx.notify(),
+        }
+    }
+
+    /// Begin None: `None` while none is kept, which is nothing to send, as well as where no
+    /// change can begin.
+    fn begin_new_bots_none(&mut self) -> Option<AccountChangeSend> {
+        if !matches!(
+            self.default_for_new_bots(),
+            DefaultForNewBots::Kept(Some(_))
+        ) {
+            return None;
+        }
+        self.begin_new_bots_change(None)
+    }
+
+    /// Begin keeping Default for new Bots on the account at once, whole, with the kind the server
+    /// keeps sent back as it is: `PUT /account/inference-source` `{kind, newBotDefault}`
+    /// (opengrok-server #322, on main c0bb6ae: `apply` in
+    /// `crates/opengrok-harness/src/local_proxy.rs`, which replaces the default whole, and clears
+    /// it on `null`). The card shows what the server answers; a refusal is said in its words.
+    fn begin_new_bots_change(
+        &mut self,
+        default: Option<NewBotDefault>,
+    ) -> Option<AccountChangeSend> {
+        self.begin_account_change(AccountChange::NewBots, |kind| InferenceSourceUpdate {
+            kind,
+            via: None,
+            new_bot_default: Some(default),
+            plan_fallback: None,
+        })
+    }
+
+    /// Begin what a change the Relay-off fallback's picker made sends: the whole fallback `patch`
+    /// makes of the kept one ([`ModelPick::plan_fallback`]). `None` where it makes none, or no
+    /// change can begin.
+    fn begin_plan_fallback_pick(&mut self, patch: &CoworkerPatch) -> Option<AccountChangeSend> {
+        let fallback = self.plan_fallback_pick()?.plan_fallback(patch)?;
+        self.begin_plan_fallback_change(Some(fallback))
+    }
+
+    /// None, the Relay-off fallback's first row: the fallback the server keeps goes.
+    pub fn clear_plan_fallback(&mut self, cx: &mut Context<Self>) {
+        self.shut_picker_list(PickerFor::PlanFallback);
+        match self.begin_plan_fallback_none() {
+            Some(send) => self.send_account_change(send, cx),
+            None => cx.notify(),
+        }
+    }
+
+    /// Begin None: `None` while none is kept, which is nothing to send, as well as where no
+    /// change can begin.
+    fn begin_plan_fallback_none(&mut self) -> Option<AccountChangeSend> {
+        if !matches!(self.relay_off_fallback(), RelayOffFallback::Kept(Some(_))) {
+            return None;
+        }
+        self.begin_plan_fallback_change(None)
+    }
+
+    /// Begin keeping the Relay-off fallback on the account at once, whole, with the kind the
+    /// server keeps sent back as it is: `PUT /account/inference-source` `{kind, planFallback}`
+    /// (opengrok-server #332 (PR #338 at 66b9f7b): `PlanFallback::named`), whole, or `null` to
+    /// take it away. The card shows what the server answers; a refusal is said in its words.
+    fn begin_plan_fallback_change(
+        &mut self,
+        fallback: Option<PlanFallback>,
+    ) -> Option<AccountChangeSend> {
+        self.begin_account_change(AccountChange::PlanFallback, |kind| InferenceSourceUpdate {
+            kind,
+            via: None,
+            new_bot_default: None,
+            plan_fallback: Some(fallback),
+        })
+    }
+
+    /// What a picker's popover says about its last change that did not go through: the open
+    /// Bot's, in the server's words, and Default for new Bots', in the server's words or that
+    /// nobody knows whether it was kept.
+    pub fn picker_note(&self, which: PickerFor) -> Option<&str> {
+        match which {
+            PickerFor::Bot => {
+                let (bot, said) = self.model_pick_note.as_ref()?;
+                (self.active_coworker_id.as_deref() == Some(bot.as_str())).then_some(said.as_str())
+            }
+            PickerFor::NewBots => self.reply_source.change_note(AccountChange::NewBots),
+            PickerFor::PlanFallback => self.reply_source.change_note(AccountChange::PlanFallback),
+        }
+    }
+
+    /// A picker takes no change now: Default for new Bots' and the Relay-off fallback's while a
+    /// change of the account's is with the server, one at a time, since each sends its setting
+    /// whole and two crossing on the wire could land in either order. A Bot's never waits.
+    pub fn picker_busy(&self, which: PickerFor) -> bool {
+        which != PickerFor::Bot && self.reply_source.changing.is_some()
     }
 
     /// A patch that never left the app. The settings pane paints the reason, and whoever is
@@ -11685,11 +13763,6 @@ impl AppState {
         let Some(coworker) = self.coworkers.iter().find(|c| c.id == id).cloned() else {
             return;
         };
-        // An effort picked and not saved goes with the switch, as the words typed into the
-        // settings' fields do: those fill afresh with the next bot's own.
-        if self.active_coworker_id.as_deref() != Some(id.as_str()) {
-            self.effort_pick = None;
-        }
         self.active_coworker_id = Some(id.clone());
         // A bot chosen is a chat: the main slot leaves whatever page it was on.
         self.page = MainPage::Chat;
@@ -11840,6 +13913,26 @@ impl AppState {
             self.select_conversation(bot, cx);
             self.record_nav();
         }
+    }
+
+    /// A press of the Bot chip, the pill at the top of the chat that names the open Bot.
+    ///
+    /// In one of the Bot's routines' threads it goes back to the Bot's own chat. That thread is
+    /// not a row of the sidebar, and the chip is the one thing on screen that names the Bot it
+    /// belongs to, so it is the way home. Anywhere else it opens and shuts the Bot's settings, as
+    /// it always has.
+    pub fn press_bot_chip(&mut self, cx: &mut Context<Self>) {
+        if self.bot_chip_goes_home() {
+            self.back_to_bot_chat(cx);
+        } else {
+            self.toggle_agent_settings(cx);
+        }
+    }
+
+    /// Whether the Bot chip goes back to the Bot's own chat rather than opening its settings:
+    /// while the open thread is one of its routines'.
+    pub fn bot_chip_goes_home(&self) -> bool {
+        self.active_thread_origin().is_some()
     }
 
     /// The routine the open thread belongs to, when it is one of the bot's routines' threads.
@@ -12493,6 +14586,7 @@ impl AppState {
                 return;
             };
             let grafted_id = graft_reply(&mut conversation.messages, &reply);
+            self.note_plan_failure(&grafted_id, reply.plan_failure);
             let message_id = grafted_id.clone();
             if reply.live {
                 // Whatever stopped watching this run, the run did not stop. Registering it makes
@@ -12738,7 +14832,7 @@ impl AppState {
         cx: &mut Context<Self>,
     ) {
         let (plain, parts, source) = replayed_run(&replay.events, &replay.status);
-        let parts = self.graft_user_forms(parts);
+        let mut parts = self.graft_user_forms(parts);
         let plain = replayed_ending(
             &replay.events,
             &replay.status,
@@ -12751,6 +14845,8 @@ impl AppState {
             streaming_message_mut(&mut self.conversations, conversation_id, &turn.message_id)
         {
             message.content = plain.clone();
+            // What the stream timed before the thread was left keeps its times.
+            keep_call_times(&message.parts, &mut parts);
             message.parts = parts.clone();
             if wear_replayed_source(message, source.clone()) {
                 badge = source.map(|source| ReplayedBadge {
@@ -12763,6 +14859,7 @@ impl AppState {
         // A row this turn already has takes the badge now; one written later takes it from the
         // bubble.
         self.persist_replayed_badges(conversation_id, badge.into_iter().collect(), cx);
+        self.note_plan_failure(&turn.message_id, plan_failure_of(&replay.events));
         if let Some(shot) = parts.iter().rev().find_map(|part| match part {
             ChatPart::Screenshot(spec) => Some(spec.clone()),
             _ => None,
@@ -13037,6 +15134,7 @@ impl AppState {
         &mut self,
         conversation_id: String,
         content: String,
+        retry_of: Option<String>,
         cx: &mut Context<Self>,
     ) {
         let recipe = self.active_recipe.as_ref().map(ActiveRecipe::turn);
@@ -13045,7 +15143,17 @@ impl AppState {
         // sent, and what the composer is holding now belongs to the message still being
         // written. Taking it here sent somebody's skill on a turn they never attached it to
         // and left the chip standing over a draft with nothing behind it.
-        self.send_opengrok_turn_with(conversation_id, content, recipe, None, None, None, cx);
+        self.send_opengrok_turn_with(
+            conversation_id,
+            content,
+            recipe,
+            None,
+            None,
+            None,
+            retry_of,
+            false,
+            cx,
+        );
     }
 
     /// The messages a turn posts.
@@ -13114,45 +15222,15 @@ impl AppState {
         history
     }
 
-    /// `recipe` and `skill` are what the message was typed with. `stop_first` is a run this turn
-    /// replaces: it is stopped on the wire before the turn is posted. `drained` is the hold this
-    /// turn is firing, when it came off `queued_sends`.
-    #[allow(clippy::too_many_arguments)]
-    fn send_opengrok_turn_with(
-        &mut self,
-        conversation_id: String,
-        _content: String,
-        recipe: Option<TurnRecipe>,
-        skill: Option<String>,
-        stop_first: Option<String>,
-        drained: Option<QueuedSend>,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(client) = self.opengrok.clone() else {
-            self.auth_error = Some("OpenGrok is not configured".to_string());
-            cx.notify();
-            return;
-        };
-        // The other door into this is "Try again" on a turn that did not go out, which reaches
-        // here without passing `send_message`'s guard — and it is exactly the button somebody
-        // presses while the session is gone. A turn is a turn: it does not leave while the app
-        // knows it has nothing to sign it with.
-        if !self.can_send_turn() {
-            self.note_signed_out(cx);
-            return;
-        }
-        let coworker_id = self.active_coworker_id.clone();
-        let history = self.turn_history(&conversation_id, drained.as_ref());
-        let pending_id = drained.as_ref().and_then(|held| held.pending_id.clone());
-        let queued_message_id = drained.as_ref().map(|held| held.message_id.clone());
-        // The door the chip shows as the turn leaves, or for a held send the one it showed when
-        // the message was sent: see `turn_inference_source`.
-        let turn_source = self.turn_inference_source(drained.as_ref());
-
-        // Both ids are minted here, before anything is sent. The run id because the server files
-        // every frame under it and this is the app's only handle on the run once the stream is
-        // gone; the message id because the run has to be able to find the bubble it is filling
-        // in by name, whatever else happens to the thread meanwhile.
+    /// The bubble a turn's reply is written into, and the turn made its thread's live one, before
+    /// anything is sent: the run's id and the bubble's.
+    ///
+    /// Both ids are minted here. The run id because the server files every frame under it and
+    /// this is the app's only handle on the run once the stream is gone; the message id because
+    /// the run has to be able to find the bubble it is filling in by name, whatever else happens
+    /// to the thread meanwhile. The bubble names its run from the start: it is how the thread
+    /// accounts for the run, and the run a retry of this reply names ([`Self::begin_retry`]).
+    fn open_turn(&mut self, conversation_id: &str) -> (String, String) {
         let run_id = uuid::Uuid::now_v7().to_string();
         let reply_id = uuid::Uuid::now_v7().to_string();
         if let Some(conversation) = self
@@ -13178,13 +15256,57 @@ impl AppState {
             });
         }
         self.live_turns.insert(
-            conversation_id.clone(),
+            conversation_id.to_string(),
             LiveTurn {
                 run_id: run_id.clone(),
                 message_id: reply_id.clone(),
                 persisting: false,
             },
         );
+        (run_id, reply_id)
+    }
+
+    /// `recipe` and `skill` are what the message was typed with. `stop_first` is a run this turn
+    /// replaces: it is stopped on the wire before the turn is posted. `drained` is the hold this
+    /// turn is firing, when it came off `queued_sends`. `retry_of` is the run of the failed reply
+    /// this turn sends again, Try again's or Send on Server's ([`Self::begin_retry`]).
+    /// `on_server` sends it on the server's paid keys whatever the Bot's door: the turn the
+    /// person's plan could not answer, sent again.
+    #[allow(clippy::too_many_arguments)]
+    fn send_opengrok_turn_with(
+        &mut self,
+        conversation_id: String,
+        _content: String,
+        recipe: Option<TurnRecipe>,
+        skill: Option<String>,
+        stop_first: Option<String>,
+        drained: Option<QueuedSend>,
+        retry_of: Option<String>,
+        on_server: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(client) = self.opengrok.clone() else {
+            self.auth_error = Some("OpenGrok is not configured".to_string());
+            cx.notify();
+            return;
+        };
+        // The other door into this is "Try again" on a turn that did not go out, which reaches
+        // here without passing `send_message`'s guard — and it is exactly the button somebody
+        // presses while the session is gone. A turn is a turn: it does not leave while the app
+        // knows it has nothing to sign it with.
+        if !self.can_send_turn() {
+            self.note_signed_out(cx);
+            return;
+        }
+        let coworker_id = self.active_coworker_id.clone();
+        let history = self.turn_history(&conversation_id, drained.as_ref());
+        let pending_id = drained.as_ref().and_then(|held| held.pending_id.clone());
+        let queued_message_id = drained.as_ref().map(|held| held.message_id.clone());
+        // The Bot's door as the turn leaves, or for a held send the one it had when the message
+        // was sent, or the server's keys for a turn sent again on them: see `turn_door`.
+        let turn_source = self.turn_door(drained.as_ref(), on_server);
+
+        let (run_id, reply_id) = self.open_turn(&conversation_id);
         if let Some(id) = self.active_coworker_id.clone() {
             self.touch_coworker_activity(&id);
         }
@@ -13234,8 +15356,9 @@ impl AppState {
                             recipe.as_ref(),
                             skill.as_deref(),
                             pending_id.as_deref(),
+                            retry_of.as_deref(),
                             turn_source,
-                            |event| {
+                            |event, arrived_at| {
                                 match tracker.tick(event) {
                                     ActivityTick::Keep => {}
                                     tick => {
@@ -13259,7 +15382,9 @@ impl AppState {
                                         });
                                     }
                                 }
-                                assembler.push_event(event);
+                                // When each frame came is how a call's row knows how long its
+                                // answer took: nothing on the wire says.
+                                assembler.push_event_at(event, Some(arrived_at));
                                 let timing = TurnTiming::from_event(event);
                                 let source = source_news(&assembler, &mut told_source);
                                 let (plain, parts) = assembler.snapshot();
@@ -13398,32 +15523,28 @@ impl AppState {
                     cx.notify();
                     return;
                 }
+                // The server holds the send this turn fired for the person's Mac, and started no
+                // run: it goes back on the queue waiting for the Mac, and the drain goes on to the
+                // sends behind it.
+                if let Err(error) = &result
+                    && error.is_held_for_mac()
+                {
+                    state.put_back_held_for_mac(&conversation_id, &reply_id, drained.clone());
+                    state.release_live_turn(&conversation_id, &run_id);
+                    state.finish_responding(Some(&conversation_id), false);
+                    if let Some(custom) = error.pending_custom() {
+                        state.apply_pending_event(&custom, queued_message_id.as_deref(), cx);
+                    }
+                    state.drain_queued_send(&conversation_id, cx);
+                    cx.notify();
+                    return;
+                }
                 if let Err(error) = &result
                     && (error.is_already_consumed() || error.is_not_pending())
                 {
-                    // Another machine already fired or canceled this hold. The empty
-                    // assistant row this turn minted is not an answer.
-                    if let Some(conversation) = state
-                        .conversations
-                        .iter_mut()
-                        .find(|conversation| conversation.id == conversation_id)
+                    let queued = queued_message_id.as_deref();
+                    if state.drop_refused_turn(&conversation_id, &reply_id, &run_id, queued, error)
                     {
-                        conversation
-                            .messages
-                            .retain(|message| message.id != reply_id);
-                        if error.is_not_pending()
-                            && let Some(user_id) = queued_message_id.as_deref()
-                            && let Some(message) = conversation
-                                .messages
-                                .iter_mut()
-                                .find(|message| message.id == user_id)
-                        {
-                            message.hidden = true;
-                        }
-                    }
-                    state.release_live_turn(&conversation_id, &run_id);
-                    state.finish_responding(Some(&conversation_id), false);
-                    if error.is_already_consumed() {
                         state.reconcile_thread(&conversation_id, cx);
                     }
                     state.drain_queued_send(&conversation_id, cx);
@@ -13476,6 +15597,14 @@ impl AppState {
                     }
                 }
                 let parked = waiting_approval || waiting_user_form;
+                // A turn the person's plan could not answer says why, and offers itself again on
+                // the server's keys.
+                let plan_failure = result
+                    .as_ref()
+                    .err()
+                    .and_then(OpenGrokError::code)
+                    .and_then(RunErrorCode::from_code);
+                state.note_plan_failure(&reply_id, plan_failure);
                 let reply = (!parked)
                     .then(|| {
                         state
@@ -13600,22 +15729,103 @@ impl AppState {
     ///
     /// The person's message is still in the thread and is not sent again; the failed row goes,
     /// and the turn is run from the thread as it stands, which is where `send_opengrok_turn`
-    /// reads its history from anyway.
+    /// reads its history from anyway. The failed row's run goes with the turn as the one it
+    /// retries ([`Self::begin_retry`]).
     pub fn retry_turn(&mut self, cx: &mut Context<Self>) {
-        let Some(message_id) = self.retryable_turn() else {
+        let Some(retry) = self.begin_retry(false) else {
             return;
         };
-        let Some(conversation_id) = self.active_conversation_id.clone() else {
-            return;
-        };
-        if let Some(conversation) = self
+        self.send_opengrok_turn(retry.conversation_id, String::new(), retry.of, cx);
+    }
+
+    /// Take the open thread's failed last reply out, to send its turn again: Try again's, or
+    /// Send on Server's (`on_server`). None when the thread's last turn is not one to send again.
+    ///
+    /// The reply's run goes with the retry, named to the server as the run it retries
+    /// (`retryOf`: opengrok-server #300, server main 06db932 (#309, after #308), pin b6ca457).
+    /// The person's message may have been a queued send, which the server keeps as consumed by
+    /// the run that fired it, and the same bubble posted again saying nothing of that run is the
+    /// send firing a second time: it was refused `already-consumed`, and the retry never ran.
+    /// Named, and the run over, the server hands the send to the retry's run, whose own reply is
+    /// minted naming it ([`Self::open_turn`]), so a retry of that reply names the run the send is
+    /// with by then. A retry fires no queued send: it carries no drained hold, and so no
+    /// `pendingId`, beside which the server would not read `retryOf` at all.
+    fn begin_retry(&mut self, on_server: bool) -> Option<Retry> {
+        let message_id = if on_server {
+            self.plan_failed_turn()
+        } else {
+            self.retryable_turn()
+        }?;
+        let conversation_id = self.active_conversation_id.clone()?;
+        let conversation = self
             .conversations
             .iter_mut()
-            .find(|c| c.id == conversation_id)
-        {
-            conversation.messages.retain(|m| m.id != message_id);
+            .find(|c| c.id == conversation_id)?;
+        let of = conversation
+            .messages
+            .iter()
+            .find(|m| m.id == message_id)
+            .and_then(|m| m.run_id.clone());
+        conversation.messages.retain(|m| m.id != message_id);
+        if on_server {
+            self.plan_failures.remove(&message_id);
         }
-        self.send_opengrok_turn(conversation_id, String::new(), cx);
+        Some(Retry {
+            conversation_id,
+            of,
+        })
+    }
+
+    /// Keep, or let go, why the person's plan could not answer a reply's run.
+    fn note_plan_failure(&mut self, message_id: &str, failure: Option<RunErrorCode>) {
+        match failure {
+            Some(code) => {
+                self.plan_failures.insert(message_id.to_string(), code);
+            }
+            None => {
+                self.plan_failures.remove(message_id);
+            }
+        }
+    }
+
+    /// The row of the open thread's last turn when the person's plan could not answer it, if its
+    /// last turn is one: their Mac could not (`relay_offline`, `relay_timeout`, `relay_failed`),
+    /// or their own setting left the plan nothing to answer with (`plan_unavailable`). Only the
+    /// last, as with Try again: an older one has messages after it, and sending it again would
+    /// answer the newest message rather than the one that went unanswered.
+    pub fn plan_failed_turn(&self) -> Option<String> {
+        if self.is_turn_in_flight() || self.session.is_expired() {
+            return None;
+        }
+        let conversation = self
+            .conversations
+            .iter()
+            .find(|c| Some(&c.id) == self.active_conversation_id.as_ref())?;
+        let last = conversation.messages.iter().rev().find(|m| !m.hidden)?;
+        (!last.is_me && self.plan_failures.contains_key(&last.id)).then(|| last.id.clone())
+    }
+
+    /// Send this reply on Server instead: the turn the person's plan could not answer, again, on
+    /// the server's paid keys, this once ([`Self::turn_door`]). The failed row goes and the turn
+    /// runs from the thread as it stands, as Try again's does, naming the failed row's run as the
+    /// one it retries ([`Self::begin_retry`]); the person's message is not sent twice, and the
+    /// Bot's door is left where it was, for the turns after this one.
+    pub fn send_on_server(&mut self, cx: &mut Context<Self>) {
+        let Some(retry) = self.begin_retry(true) else {
+            return;
+        };
+        let recipe = self.active_recipe.as_ref().map(ActiveRecipe::turn);
+        self.send_opengrok_turn_with(
+            retry.conversation_id,
+            String::new(),
+            recipe,
+            None,
+            None,
+            None,
+            retry.of,
+            true,
+            cx,
+        );
     }
 
     /// Stop the turn the open thread has in flight.
@@ -14039,6 +16249,9 @@ impl AppState {
         cx.spawn(async move |this, cx| {
             let mut last_len = 0usize;
             let mut last_status = String::new();
+            // When each call's end and answer first came back, so the calls this poll saw
+            // happen can say how long they took.
+            let mut arrivals = FrameArrivals::default();
             for _ in 0..400 {
                 if registered {
                     let settled = this
@@ -14056,6 +16269,7 @@ impl AppState {
                 }
                 match client.replay_run(&run_id).await {
                     Ok(replay) => {
+                        arrivals.note(&replay.events, Instant::now());
                         // The status counts as news of its own: the frame that ends a run is
                         // often one the last poll already saw, and a run that stopped holding
                         // its text back has words to show for it even when nothing new arrived.
@@ -14063,7 +16277,7 @@ impl AppState {
                             last_len = replay.events.len();
                             last_status = replay.status.clone();
                             let (plain, parts, source) =
-                                replayed_run(&replay.events, &replay.status);
+                                reply_from_followed(&replay.events, &replay.status, &arrivals);
                             let status = replay.status.clone();
                             // A resumed turn that only ran tools says what it did, so the
                             // thread keeps a memory of the run the person allowed.
@@ -14086,7 +16300,7 @@ impl AppState {
                                     + Duration::from_millis(replay.started_at_ms as u64)
                             });
                             let _ = this.update(cx, |state, cx| {
-                                let parts = state.graft_user_forms(parts.clone());
+                                let mut parts = state.graft_user_forms(parts.clone());
                                 // The bubble this run has been filling in all along, by the name
                                 // it was given when the turn started — the resumed half of a turn
                                 // belongs to the same row as the half before the card. Only when
@@ -14116,6 +16330,9 @@ impl AppState {
                                     let last = &mut conversation.messages[at];
                                     painted = Some(last.id.clone());
                                     last.content = plain.clone();
+                                    // The half before a card was timed live, and the server's
+                                    // frames cannot give those times back.
+                                    keep_call_times(&last.parts, &mut parts);
                                     last.parts = parts.clone();
                                     if let Some(timing) = TurnTiming::from_events(&replay.events) {
                                         apply_timing(last, timing);
@@ -14156,6 +16373,14 @@ impl AppState {
                                         id,
                                         badge.into_iter().collect(),
                                         cx,
+                                    );
+                                }
+                                // A run the person's plan could not answer offers itself again on
+                                // the server's keys, followed as it is watched live.
+                                if let Some(painted) = painted.as_deref() {
+                                    state.note_plan_failure(
+                                        painted,
+                                        plan_failure_of(&replay.events),
                                     );
                                 }
                                 match status.as_str() {
@@ -14480,22 +16705,97 @@ impl AppState {
         self.stop_local_exec();
         let cancel = Arc::new(AtomicBool::new(false));
         self.local_exec_cancel = Some(cancel.clone());
+        // Each credential local-exec enrols this Mac with, for the relay to follow: a relay the
+        // server turned the old token away from starts again with the new one. This app follows
+        // it too, for the id it knows this Mac by ([`Self::follow_enrolment`]).
+        let (enrolled, enrolment) = tokio::sync::watch::channel(None);
+        self.local_exec_enrolment = Some(enrolment.clone());
+        self.follow_enrolment(enrolment.clone(), cx);
         cx.spawn(async move |this, cx| {
             match enrol_this_machine(&client, &config.data_dir).await {
-                Ok(machine_id) => {
-                    let _ = this.update(cx, |state, cx| {
-                        state.local_exec_machine_id = Some(machine_id);
-                        state.refresh_computers(cx);
-                        cx.notify();
-                    });
+                // What follows the enrolment takes it from here: this Mac's id, its computers,
+                // and the relay, which opens its stream with the credential held here.
+                Ok(machine) => {
+                    enrolled.send_replace(Some(machine));
                 }
                 Err(error) => {
                     eprintln!("NativeChat local-exec: {error}");
                 }
             }
-            serve_local_exec(client, config.data_dir, cancel).await;
+            let stopped = serve_local_exec(client, config.data_dir, cancel, enrolled).await;
+            let _ = this.update(cx, |state, cx| {
+                state.note_local_exec_stopped(&enrolment, stopped, cx);
+            });
         })
         .detach();
+    }
+
+    /// Why the local-exec that `enrolment` is the credential of stopped by itself, kept for
+    /// Settings → Computer to say. Nothing for one stopped by signing out, or no longer the one
+    /// running: signed out and in again since, it is not this Mac's local-exec any more.
+    fn note_local_exec_stopped(
+        &mut self,
+        enrolment: &Enrolment,
+        stopped: Option<LocalExecStopped>,
+        cx: &mut Context<Self>,
+    ) {
+        let current = self
+            .local_exec_enrolment
+            .as_ref()
+            .is_some_and(|held| held.same_channel(enrolment));
+        if current && stopped.is_some() {
+            self.local_exec_stopped = stopped;
+            cx.notify();
+        }
+    }
+
+    /// Follow local-exec's enrolment for as long as it is the one local-exec runs with: this
+    /// Mac's id, the computers read with it, and the relay, which a Mac enrolled for the first
+    /// time may start. Local-exec enrols this Mac again when the server turns its token away,
+    /// always as this Mac's own machine, and the relay follows the new credential by itself. The
+    /// id here follows whatever machine the credential names: one left behind would read the
+    /// relay the server says this Mac's machine holds as another Mac's, under this Mac's own name,
+    /// and keep a card's rule for a machine this Mac is not.
+    fn follow_enrolment(&mut self, mut enrolment: Enrolment, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            while enrolment.changed().await.is_ok() {
+                let following = this
+                    .update(cx, |state, cx| {
+                        let moved = state.note_enrolment(&enrolment);
+                        if moved == Some(true) {
+                            state.refresh_computers(cx);
+                            // Enrolled: the relay can start.
+                            state.ensure_relay(cx);
+                            cx.notify();
+                        }
+                        moved.is_some()
+                    })
+                    .unwrap_or(false);
+                if !following {
+                    return;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// This Mac's id, from the credential local-exec holds now: `None` once `enrolment` is not the
+    /// one local-exec runs with (stopped, or started again since), and otherwise whether the id
+    /// moved, as it does at the first enrolment.
+    fn note_enrolment(&mut self, enrolment: &Enrolment) -> Option<bool> {
+        let held = self
+            .local_exec_enrolment
+            .as_ref()
+            .filter(|held| held.same_channel(enrolment))?;
+        let newest = held
+            .borrow()
+            .as_ref()
+            .map(|machine| machine.machine_id().to_string());
+        if newest.is_none() || newest == self.local_exec_machine_id {
+            return Some(false);
+        }
+        self.local_exec_machine_id = newest;
+        Some(true)
     }
 
     fn stop_local_exec(&mut self) {
@@ -14504,6 +16804,8 @@ impl AppState {
         }
         self.local_exec_cancel = None;
         self.local_exec_machine_id = None;
+        self.local_exec_enrolment = None;
+        self.local_exec_stopped = None;
     }
 
     pub fn toggle_shell_output(&mut self, call_id: String, cx: &mut Context<Self>) {
@@ -14513,7 +16815,7 @@ impl AppState {
         cx.notify();
     }
 
-    /// Open or shut step rows, groups of steps and Thought rows, by their keys.
+    /// Open or shut step rows, groups of steps, Thought rows and Timing rows, by their keys.
     pub fn set_steps_open(&mut self, keys: &[String], open: bool, cx: &mut Context<Self>) {
         self.mark_steps_open(keys, open);
         cx.notify();
@@ -15310,8 +17612,10 @@ impl AppState {
         .detach();
     }
 
-    /// The rows a card can take: the vault has loaded, the card has a target (a login, a
-    /// code, a passkey), and the row is of that kind for the card's site.
+    /// The rows a card can take: the vault has loaded, the card has a target (a login, a page
+    /// of a two-step sign-in, a code, a passkey), and the row is of that kind for the card's
+    /// site. On the password page of a two-step sign-in, the login picked on the name page
+    /// before it, in the same thread, comes first.
     pub fn saved_logins_for_form(
         &self,
         spec: &crate::opengrok::UserFormSpec,
@@ -15325,11 +17629,15 @@ impl AppState {
         let Some(origin) = login_origin(spec) else {
             return Vec::new();
         };
-        self.site_logins
+        let mut rows: Vec<SiteLoginRecord> = self
+            .site_logins
             .iter()
             .filter(|row| login_matches_request(&row.origin, &row.username, &origin, None))
             .filter(|row| match &target {
-                CardTarget::Login(_) => row.kind == crate::site_login::KIND_PASSWORD,
+                // Either page of a two-step sign-in takes half of a password login.
+                CardTarget::Login(_)
+                | CardTarget::Username { .. }
+                | CardTarget::Password { .. } => row.kind == crate::site_login::KIND_PASSWORD,
                 // A code can sit beside a password or on a row of its own; either way the
                 // seed has to be on this Mac (or the row on the server) to be offered.
                 // Only a row that really carries a code: its seed is on this Mac, or the
@@ -15347,14 +17655,62 @@ impl AppState {
                 CardTarget::Passkey { register: true } => false,
             })
             .cloned()
-            .collect()
+            .collect();
+        // The password page does not ask who is signing in: the name page before it did. The
+        // login picked there leads, so the person does not have to remember which account
+        // they chose a moment ago; the others stay listed for a name typed by hand.
+        if matches!(target, CardTarget::Password { .. })
+            && let Some(picked) = self.name_page_pick(spec.card_key(), &origin)
+        {
+            rows.sort_by_key(|row| row.id != picked);
+        }
+        rows
+    }
+
+    /// The login picked on the name page of a two-step sign-in to `origin`, in the thread this
+    /// card is in.
+    fn name_page_pick(&self, card_key: &str, origin: &str) -> Option<String> {
+        if self.name_page_picks.is_empty() {
+            return None;
+        }
+        let (_, _, thread, _) = self.user_form_context(card_key)?;
+        self.name_page_picks
+            .get(&(thread, origin.to_string()))
+            .cloned()
+    }
+
+    /// What a name page leaves for the password page after it: the login whose name it sent,
+    /// or, for a name typed by hand, nothing, so an earlier pick in the thread is not offered
+    /// first for a name that is not its own. Any other card leaves nothing.
+    fn remember_name_page_pick(&mut self, card_key: &str, login_id: Option<String>) {
+        let Some(spec) = self.user_form_mut_ref(card_key) else {
+            return;
+        };
+        if !matches!(card_target(spec), Some(CardTarget::Username { .. })) {
+            return;
+        }
+        let Some(origin) = login_origin(spec) else {
+            return;
+        };
+        let Some((_, _, thread, _)) = self.user_form_context(card_key) else {
+            return;
+        };
+        match login_id {
+            Some(login_id) => {
+                self.name_page_picks.insert((thread, origin), login_id);
+            }
+            None => {
+                self.name_page_picks.remove(&(thread, origin));
+            }
+        }
     }
 
     /// A pick from the card's list: Touch ID first, then what the row holds is fetched for
     /// the card — the password from this Mac's keychain (or once from the server), the code
     /// seed the same way, nothing at all for a passkey (its key stays on the server, in the
-    /// box's browser) — and held for the press of the button. The name goes into its field;
-    /// a secret is never painted and never put in an input, and the Bot never sees it.
+    /// box's browser) or for the name page of a two-step sign-in (it takes the name alone) —
+    /// and held for the press of the button. The name goes into its field, where the card has
+    /// one; a secret is never painted and never put in an input, and the Bot never sees it.
     pub fn pick_saved_login(&mut self, card_key: String, login_id: String, cx: &mut Context<Self>) {
         let Some(spec) = self.user_form_mut(&card_key).map(|spec| spec.clone()) else {
             return;
@@ -15390,19 +17746,20 @@ impl AppState {
                 username: username.clone(),
             },
         );
-        if let CardTarget::Login(fields) = &target {
+        if let Some(name_id) = target.name_field() {
             // The name shows in its field at once (the driver reads it from here; the view
             // sets its input too).
             self.user_form_typed
                 .entry(card_key.clone())
                 .or_default()
-                .insert(fields.username_id.clone(), username.clone());
+                .insert(name_id.to_string(), username.clone());
         }
         cx.notify();
         let client = self.opengrok.clone();
         let wants = match &target {
-            CardTarget::Login(_) => HeldSecret::Password,
+            CardTarget::Login(_) | CardTarget::Password { .. } => HeldSecret::Password,
             CardTarget::Code { .. } => HeldSecret::CodeSeed,
+            CardTarget::Username { .. } => HeldSecret::Name,
             CardTarget::Passkey { .. } => HeldSecret::None,
         };
         cx.spawn(async move |this, cx| {
@@ -15418,7 +17775,7 @@ impl AppState {
                             crate::site_login::touch_id::TouchIdOutcome::Verified => Ok(match wants {
                                 HeldSecret::Password => vault.secret_for_fill(&row_id),
                                 HeldSecret::CodeSeed => vault.code_for(&row_id),
-                                HeldSecret::None => Ok(Some(String::new())),
+                                HeldSecret::Name | HeldSecret::None => Ok(Some(String::new())),
                             }),
                             other => Err(other),
                         }
@@ -15461,7 +17818,7 @@ impl AppState {
                             Ok(Ok(match wants {
                                 HeldSecret::Password => secrets.password,
                                 HeldSecret::CodeSeed => secrets.otpauth,
-                                HeldSecret::None => Some(String::new()),
+                                HeldSecret::Name | HeldSecret::None => Some(String::new()),
                             }))
                         }
                         Err(error) => Ok(Err(crate::site_login::StoreError::Secret(format!(
@@ -15508,6 +17865,11 @@ impl AppState {
                                     "The code seed for {username} is not readable. Import it \
                                      again, or type the code."
                                 ),
+                            })
+                        } else if wants == HeldSecret::Name {
+                            Some(SavedLoginUse::NameReady {
+                                login_id: row.id.clone(),
+                                username: username.clone(),
                             })
                         } else {
                             Some(SavedLoginUse::Ready {
@@ -15626,10 +17988,11 @@ impl AppState {
         cx.notify();
     }
 
-    /// A submit with a held secret: for a login the name and the password ride along; for a
-    /// code the digits are minted now, from the held seed; for a passkey nothing is added,
-    /// the row's id is enough. The submit is marked as a saved login for the server's
-    /// own-computer rule.
+    /// A submit with a held secret: for a login the name and the password ride along; for
+    /// the two pages of a two-step sign-in, the name alone on the first and the password alone
+    /// on the second; for a code the digits are minted now, from the held seed; for a passkey
+    /// nothing is added, the row's id is enough. The submit is marked as a saved login for the
+    /// server's own-computer rule.
     /// `false` when the card must not be sent: a held code seed this Mac cannot read is
     /// said so on the card instead of sending an empty field to the box.
     fn fold_held_saved_login(&mut self, card_key: &str, values: &mut UserFormValues) -> bool {
@@ -15647,10 +18010,14 @@ impl AppState {
                         username,
                         password,
                     } => Some((login_id.clone(), username.clone(), password.clone())),
+                    SavedLoginUse::NameReady { login_id, username } => {
+                        Some((login_id.clone(), username.clone(), String::new()))
+                    }
                     _ => None,
                 })
         else {
             // Nothing is held: an ordinary typed submit.
+            self.remember_name_page_pick(card_key, None);
             return true;
         };
         let Some(target) = self
@@ -15665,6 +18032,13 @@ impl AppState {
                 // is the name that goes with the picked password.
                 values.by_id.insert(fields.username_id, username.clone());
                 values.by_id.insert(fields.password_id, secret);
+            }
+            CardTarget::Username { username_id } => {
+                values.by_id.insert(username_id, username.clone());
+                self.remember_name_page_pick(card_key, Some(login_id.clone()));
+            }
+            CardTarget::Password { password_id } => {
+                values.by_id.insert(password_id, secret);
             }
             CardTarget::Code { code_id } => {
                 let Ok(totp) = crate::site_login::totp::parse(&secret) else {
@@ -16096,8 +18470,9 @@ impl AppState {
     }
 
     /// The cursor is in the field the accounts belong to, so the list comes up. Only that
-    /// field: the password field is not where an account is chosen, and a card that has
-    /// just arrived shows nothing until the person asks.
+    /// field: the password field is not where an account is chosen, except on the password
+    /// page of a two-step sign-in, which has no other; and a card that has just arrived shows
+    /// nothing until the person asks.
     pub fn open_saved_login_list(
         &mut self,
         card_key: String,
@@ -16110,11 +18485,7 @@ impl AppState {
         let belongs = self
             .user_form_mut_ref(&card_key)
             .and_then(card_target)
-            .is_some_and(|target| match target {
-                CardTarget::Login(fields) => fields.username_id == field_id,
-                CardTarget::Code { code_id } => code_id == field_id,
-                CardTarget::Passkey { .. } => false,
-            });
+            .is_some_and(|target| target.list_field() == Some(field_id));
         if belongs {
             self.user_form_list_open.insert(card_key);
             cx.notify();
@@ -16892,6 +19263,8 @@ impl AppState {
             skill,
             stop_first,
             None,
+            None,
+            false,
             cx,
         );
     }
@@ -16952,6 +19325,8 @@ impl AppState {
             next.skill.clone(),
             None,
             Some(next),
+            None,
+            false,
             cx,
         );
     }
@@ -17011,6 +19386,25 @@ impl AppState {
         cx.notify();
     }
 
+    /// Right-click changes the remembered size without changing visibility.
+    pub fn toggle_sidebar_size(&mut self, cx: &mut Context<Self>) {
+        self.sidebar_collapsed = !self.sidebar_collapsed;
+        self.auto_collapsed = false;
+        // An explicit mouse choice is remembered even while the sidebar floats.
+        self.sidebar_responsive.preferred = self.sidebar_collapsed;
+        cx.notify();
+    }
+
+    /// Close the topmost temporary pane. The caller establishes that the window is narrow.
+    pub fn dismiss_floating_chrome(&mut self, cx: &mut Context<Self>) {
+        if self.right_pane != RightPane::Closed {
+            self.close_right_pane(cx);
+        } else {
+            self.sidebar_hidden = true;
+            cx.notify();
+        }
+    }
+
     pub fn toggle_mini_sidebar(&mut self, cx: &mut Context<Self>) {
         if self.sidebar_hidden {
             self.sidebar_hidden = false;
@@ -17050,6 +19444,12 @@ impl AppState {
     }
 
     pub fn apply_responsive_sidebar(&mut self, width: f32, cx: &mut Context<Self>) {
+        if self.sidebar_hidden {
+            // Hidden is a deliberate choice, not a size for the breakpoint to rewrite.
+            self.sidebar_responsive.was_narrow = crate::chrome::is_narrow_viewport(width);
+            self.sidebar_responsive.preferred = self.sidebar_collapsed;
+            return;
+        }
         let result = collapse_for_width(self.sidebar_responsive, width, self.sidebar_collapsed);
         self.sidebar_responsive = result.next;
         if let Some(apply) = result.apply
@@ -17117,6 +19517,27 @@ impl AppState {
             .values()
             .flatten()
             .any(|queued| queued.message_id == message_id)
+    }
+
+    /// A held send the server holds until a Mac holds the relay again: its queue line says
+    /// "Waiting for your Mac".
+    pub fn is_send_waiting_for_mac(&self, message_id: &str) -> bool {
+        self.queued_sends
+            .values()
+            .flatten()
+            .any(|queued| queued.message_id == message_id && queued.waits_for_mac)
+    }
+
+    /// The open thread's held sends the server holds for the person's Mac, by bubble id.
+    pub fn sends_waiting_for_mac(&self) -> Vec<String> {
+        self.active_conversation_id
+            .as_deref()
+            .and_then(|id| self.queued_sends.get(id))
+            .into_iter()
+            .flatten()
+            .filter(|queued| queued.waits_for_mac)
+            .map(|queued| queued.message_id.clone())
+            .collect()
     }
 
     fn bubble_hidden(&self, conversation_id: &str, message_id: &str) -> bool {
@@ -17208,19 +19629,27 @@ impl AppState {
     ///
     /// A hold whose bubble is hidden is dropped, not returned: hidden means the person took it
     /// back, and a hidden hold never posts, whichever path hid it.
+    ///
+    /// A send the server holds for the person's Mac is passed over, and keeps its place: the
+    /// server sends it itself, oldest first, once a Mac opens the relay and any turn in flight on
+    /// its thread has ended (`drain_held` in opengrok-server's `agui/pending.rs`, server main
+    /// cad36fd (#303, after #298), pin 47a5d6b), and fired from here it would only be held again.
+    /// The send behind it waits for the coworker alone, as its line says, and goes.
     fn pop_queued_send(&mut self, conversation_id: &str) -> Option<QueuedSend> {
         loop {
-            let front = self.queued_sends.get(conversation_id)?.front()?;
-            if self.pending_inflight.contains(&front.message_id)
-                || front.stale == StaleRefusal::Parked
-                || front.unsynced
+            let queue = self.queued_sends.get(conversation_id)?;
+            let at = queue.iter().position(|queued| !queued.waits_for_mac)?;
+            let first = &queue[at];
+            if self.pending_inflight.contains(&first.message_id)
+                || first.stale == StaleRefusal::Parked
+                || first.unsynced
             {
                 return None;
             }
             let next = self
                 .queued_sends
                 .get_mut(conversation_id)
-                .and_then(VecDeque::pop_front)?;
+                .and_then(|queue| queue.remove(at))?;
             if self
                 .queued_sends
                 .get(conversation_id)
@@ -17246,9 +19675,10 @@ impl AppState {
     }
 
     fn queued_send_ready_to_drain(&self, conversation_id: &str) -> bool {
+        // Only a send this app may post: one the server holds for the Mac is the server's to send.
         self.queued_sends
             .get(conversation_id)
-            .is_some_and(|queue| !queue.is_empty())
+            .is_some_and(|queue| queue.iter().any(|queued| !queued.waits_for_mac))
             && self.active_conversation_id.as_deref() == Some(conversation_id)
             && self.busy_state(conversation_id) == Busy::Idle
     }
@@ -18014,6 +20444,86 @@ impl AppState {
         fold
     }
 
+    /// A turn the queue refused before any run began, as the queue's 409: `already-consumed`
+    /// or `not-pending`. The reply bubble the turn minted is no answer and goes, and the thread is
+    /// let go. A hold canceled elsewhere (`not-pending`) takes its message out of sight with it.
+    ///
+    /// Answers whether the thread is read again from the server, which `already-consumed` is:
+    /// another machine fired the send, or the run a retry named is still going or no longer the
+    /// one holding the send, and either way the server has a run this thread is missing.
+    fn drop_refused_turn(
+        &mut self,
+        conversation_id: &str,
+        reply_id: &str,
+        run_id: &str,
+        queued_message_id: Option<&str>,
+        error: &OpenGrokError,
+    ) -> bool {
+        if let Some(conversation) = self
+            .conversations
+            .iter_mut()
+            .find(|conversation| conversation.id == conversation_id)
+        {
+            conversation
+                .messages
+                .retain(|message| message.id != reply_id);
+            if error.is_not_pending()
+                && let Some(user_id) = queued_message_id
+                && let Some(message) = conversation
+                    .messages
+                    .iter_mut()
+                    .find(|message| message.id == user_id)
+            {
+                message.hidden = true;
+            }
+        }
+        self.release_live_turn(conversation_id, run_id);
+        self.finish_responding(Some(conversation_id), false);
+        error.is_already_consumed()
+    }
+
+    /// A fired hold the server answered 202: it holds the send for the person's Mac and started
+    /// no run. The reply bubble the turn minted is no answer, and the hold goes back on the
+    /// queue, now waiting for the Mac, ahead of the sends that do not, which is where the drain
+    /// took it from while the waiting ones ahead of it stay put. The queue's CUSTOM, applied
+    /// after, brings the row as it stands. A snapshot that raced the answer and queued the row
+    /// again already put it back.
+    fn put_back_held_for_mac(
+        &mut self,
+        conversation_id: &str,
+        reply_id: &str,
+        held: Option<QueuedSend>,
+    ) {
+        if let Some(conversation) = self
+            .conversations
+            .iter_mut()
+            .find(|conversation| conversation.id == conversation_id)
+        {
+            conversation
+                .messages
+                .retain(|message| message.id != reply_id);
+        }
+        let Some(mut held) = held else {
+            return;
+        };
+        held.waits_for_mac = true;
+        let queue = self
+            .queued_sends
+            .entry(conversation_id.to_string())
+            .or_default();
+        if queue
+            .iter()
+            .any(|queued| queued.message_id == held.message_id)
+        {
+            return;
+        }
+        let at = queue
+            .iter()
+            .position(|queued| !queued.waits_for_mac)
+            .unwrap_or(queue.len());
+        queue.insert(at, held);
+    }
+
     /// A drained hold OpenGrok refused as stale. `edited`: the row is still queued, so the hold
     /// goes back to the front as the server has it; the CUSTOM, applied after, puts the words on
     /// the bubble. `drained`: another turn spent the row and the hold stays off. The refused
@@ -18042,6 +20552,7 @@ impl AppState {
         held.recipe = recipe_from_pending(row);
         held.skill = row.skill_id.clone().filter(|id| !id.is_empty());
         held.inference_source = row.inference_source().or(held.inference_source);
+        held.waits_for_mac = row.waits_for_mac();
         if !row.id.is_empty() {
             held.pending_id = Some(row.id.clone());
         }
@@ -18143,6 +20654,10 @@ impl AppState {
                     && let Some(held) = self.hold_mut(&bubble_id)
                 {
                     held.inference_source = Some(door);
+                }
+                // Whether the server holds it for the person's Mac is the row's word as it stands.
+                if let Some(held) = self.hold_mut(&bubble_id) {
+                    held.waits_for_mac = item.waits_for_mac();
                 }
                 if self.apply_queued_edit(&bubble_id, item.content.clone()) {
                     if let Some(queued) = self
@@ -18250,6 +20765,7 @@ impl AppState {
             existing.skill = hold.skill;
             existing.reply = hold.reply;
             existing.inference_source = hold.inference_source.or(existing.inference_source);
+            existing.waits_for_mac = hold.waits_for_mac;
             if hold.pending_id.is_some() {
                 existing.pending_id = hold.pending_id;
             }
@@ -18439,25 +20955,203 @@ impl AppState {
         // Settings → Computer reads them again too: opening the page, landing on it by back
         // or forward, and this Mac enrolling while it is open.
         self.refresh_local_rules(cx);
-        let this_id = self.local_exec_machine_id.clone();
+        // This computer is the one its stored machine id names, which is known from the start,
+        // before enrolling has answered ([`Self::this_mac_id`]).
+        let this_id = self.this_mac_id();
+        self.computers_generation += 1;
+        let generation = self.computers_generation;
         cx.spawn(async move |this, cx| {
-            let Ok(mut computers) = client.list_computers().await else {
+            let Ok(computers) = client.list_computers().await else {
                 return;
             };
-            for computer in &mut computers {
-                computer.this_machine = this_id.as_ref() == Some(&computer.machine_id);
-                if computer.this_machine {
-                    computer.online = true;
-                }
-            }
-            computers = collapse_computer_roster(computers);
-            computers.sort_by_key(|computer| !computer.this_machine);
+            let computers = settle_roster(computers, this_id.as_deref());
             let _ = this.update(cx, |state, cx| {
-                state.computers = computers;
+                if state.take_computers(generation, computers) {
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Put a read of the roster on screen, unless something newer has begun since or the person has
+    /// signed out. `false` when it was dropped and nothing was touched. What the server says now
+    /// answers a relay switch nobody heard back from, and a note about a computer the server no
+    /// longer lists is about nothing.
+    fn take_computers(&mut self, generation: u64, computers: Vec<ConnectedComputer>) -> bool {
+        if self.computers_generation != generation {
+            return false;
+        }
+        self.computers = computers;
+        let listed = |id: &str| self.computers.iter().any(|c| c.machine_id == id);
+        let mut notes = std::mem::take(&mut self.computer_relay_notes);
+        notes.retain(|id, note| listed(id) && !matches!(note, ChangeNote::Unknown));
+        self.computer_relay_notes = notes;
+        true
+    }
+
+    /// One computer's relay switch, from its card: `PATCH /local-exec/daemon/{machine_id}
+    /// {relayEnabled}`, the computer's own, whichever computer this is (a switch can be moved
+    /// from any of the person's computers, and the server tells the one it moves). The card draws
+    /// the switch where the click asked to take it while the server is asked, and the server's
+    /// answer is the computer's row from then on: a refusal leaves the row as it was, so the switch
+    /// goes back, with the server's words under it ([`Self::computer_relay_note`]).
+    ///
+    /// Switched on, this computer's relay looks at its row at once, and the account's way to the
+    /// plan is pointed at the relay if it is not that already ([`Self::begin_relay_change`]).
+    /// Switched off, the account keeps its way, and a computer relaying is told by the server.
+    pub fn set_computer_relay(&mut self, machine_id: String, on: bool, cx: &mut Context<Self>) {
+        let Some(send) = self.begin_computer_relay(&machine_id, on) else {
+            return;
+        };
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let answer = send
+                .client
+                .switch_computer_relay(&send.machine_id, send.on)
+                .await;
+            let _ = this.update(cx, |state, cx| {
+                match state.settle_computer_relay(&send.machine_id, send.token, answer) {
+                    AfterComputerRelay::Dropped | AfterComputerRelay::Refused => {}
+                    AfterComputerRelay::ReadAgain => state.refresh_computers(cx),
+                    AfterComputerRelay::Kept { on } => {
+                        state.after_computer_relay_kept(&send.machine_id, on, cx)
+                    }
+                }
                 cx.notify();
             });
         })
         .detach();
+    }
+
+    /// Begin one computer's relay switch, for the caller to send. `None` with nobody signed in, for
+    /// a computer the roster does not list, and while that computer's last switch is still with
+    /// the server: one at a time to a card. What was said of the card's last switch was said of one
+    /// that has moved since, and goes.
+    fn begin_computer_relay(&mut self, machine_id: &str, on: bool) -> Option<ComputerRelaySend> {
+        let client = self.opengrok.clone()?;
+        if !self.is_signed_in()
+            || self.computer_relay_switches.contains_key(machine_id)
+            || !self.computers.iter().any(|c| c.machine_id == machine_id)
+        {
+            return None;
+        }
+        self.computer_relay_switch_count += 1;
+        let token = self.computer_relay_switch_count;
+        self.computer_relay_switches
+            .insert(machine_id.to_string(), ComputerRelaySwitch { on, token });
+        self.computer_relay_notes.remove(machine_id);
+        let settings = &mut self.reply_source;
+        if settings.relay_change_for.as_deref() == Some(machine_id) {
+            settings.relay_change_for = None;
+            if matches!(settings.change_note, Some((AccountChange::Relay, _))) {
+                settings.change_note = None;
+            }
+        }
+        Some(ComputerRelaySend {
+            client,
+            machine_id: machine_id.to_string(),
+            on,
+            token,
+        })
+    }
+
+    /// Put the server's answer to a computer's relay switch on its card, unless it is not the
+    /// switch that is out any more (the person signed out meanwhile, and its answer lands on
+    /// nothing). Kept, the answer is the computer's row from now on, and any read of the roster
+    /// begun before it is dropped. Refused, nothing was kept: the row is as it was, so the switch is
+    /// drawn back, and the server's words go under it. A computer the server does not know, or one
+    /// it says is revoked, is a roster gone out of date, and is read again; and so is a switch
+    /// nobody heard the answer to, which may or may not have been kept.
+    fn settle_computer_relay(
+        &mut self,
+        machine_id: &str,
+        token: u64,
+        answer: Result<DaemonMachine, OpenGrokError>,
+    ) -> AfterComputerRelay {
+        let out = self.computer_relay_switches.get(machine_id);
+        if out.map(|switch| switch.token) != Some(token) {
+            return AfterComputerRelay::Dropped;
+        }
+        self.computer_relay_switches.remove(machine_id);
+        match answer {
+            Ok(row) => {
+                self.computers_generation += 1;
+                if let Some(computer) = self
+                    .computers
+                    .iter_mut()
+                    .find(|computer| computer.machine_id == machine_id)
+                {
+                    computer.relay_enabled = row.relay_enabled;
+                    computer.relaying = row.relaying;
+                    computer.online = computer.this_machine || row.connected;
+                }
+                AfterComputerRelay::Kept {
+                    on: row.relay_enabled,
+                }
+            }
+            // A server before the per-computer switch has no such route: a `405`, or a `404` with
+            // nothing in it. Its own `404` says what is missing, and is about the computer.
+            Err(error) if error.route_missing() => {
+                self.computer_relay_notes.insert(
+                    machine_id.to_string(),
+                    ChangeNote::Refused(COMPUTER_RELAY_NOT_ON_SERVER.to_string()),
+                );
+                AfterComputerRelay::Refused
+            }
+            // No answer at all, or one that could not be read: the server may have kept it, and
+            // only asking again can say.
+            Err(error) if error.unreachable().is_some() || error.status.is_none() => {
+                self.computer_relay_notes
+                    .insert(machine_id.to_string(), ChangeNote::Unknown);
+                AfterComputerRelay::ReadAgain
+            }
+            Err(error) => {
+                self.computer_relay_notes.insert(
+                    machine_id.to_string(),
+                    ChangeNote::Refused(account_change_refusal(&error)),
+                );
+                if matches!(error.status, Some(404 | 409)) {
+                    AfterComputerRelay::ReadAgain
+                } else {
+                    AfterComputerRelay::Refused
+                }
+            }
+        }
+    }
+
+    /// What follows a computer's relay switch the server kept, now that its row says `on`. Off
+    /// moves nothing here: the server tells a computer relaying that it is off, and the account
+    /// keeps its way. On, this computer's relay looks at its row at once if the switch was this
+    /// computer's own, and the account's way is pointed at the relay if it is not that already.
+    fn after_computer_relay_kept(&mut self, machine_id: &str, on: bool, cx: &mut Context<Self>) {
+        if !on {
+            return;
+        }
+        if self.this_mac_id().as_deref() == Some(machine_id) {
+            self.relay_switched_on_here(cx);
+        }
+        if let Some(send) = self.begin_relay_change(machine_id) {
+            self.send_account_change(send, cx);
+        }
+    }
+
+    /// The relay switch of this computer's card that is with the server, and where the click asked
+    /// to take it.
+    pub fn computer_relay_switch(&self, machine_id: &str) -> Option<&ComputerRelaySwitch> {
+        self.computer_relay_switches.get(machine_id)
+    }
+
+    /// What a computer's card says under its relay switch about the last thing that did not go as
+    /// asked: the server's words for a refusal of the switch, or of the account's way to the relay
+    /// that the switch going on sent; or that nobody knows whether a switch was kept.
+    pub fn computer_relay_note(&self, machine_id: &str) -> Option<&str> {
+        if let Some(note) = self.computer_relay_notes.get(machine_id) {
+            return Some(note.line());
+        }
+        (self.reply_source.relay_change_for.as_deref() == Some(machine_id))
+            .then(|| self.reply_source.change_note(AccountChange::Relay))
+            .flatten()
     }
 
     /// This Mac's standing rules where Settings → Computer draws them: under the roster's row
@@ -19233,6 +21927,9 @@ fn apply_patch(coworker: &mut Coworker, patch: &CoworkerPatch) {
     if let Some(effort) = patch.effort.as_ref() {
         coworker.effort = Some(effort.clone());
     }
+    if let Some(kind) = patch.source {
+        coworker.source = CoworkerSource::Kind(kind);
+    }
 }
 
 /// The roster's copy of a coworker once the server has answered, for the fields the patch
@@ -19296,6 +21993,11 @@ fn settle_patch(
     if patch.effort.is_some() {
         coworker.effort = echo.map_or_else(|| before.effort.clone(), |c| c.effort.clone());
     }
+    // The door too: the echo's, which is the server's word on it even where it is not the one
+    // sent, and what the roster held before where the patch was refused.
+    if patch.source.is_some() {
+        coworker.source = echo.map_or_else(|| before.source.clone(), |c| c.source.clone());
+    }
 }
 
 /// A field a coworker always has, after the server has answered. An answer that left the field
@@ -19320,6 +22022,9 @@ fn settled_option(echo: Option<String>, cleared: bool, before: Option<String>) -
 enum HeldSecret {
     Password,
     CodeSeed,
+    /// Nothing: the name page of a two-step sign-in takes the name alone, so no password is
+    /// read out of the keychain for it.
+    Name,
     None,
 }
 
@@ -19784,6 +22489,75 @@ fn skill_bundle(found: Vec<(String, Vec<u8>)>) -> Result<(String, Vec<SkillFile>
 
 #[cfg(test)]
 mod tests {
+    #[gpui_kit::test]
+    fn sidebar_click_restores_last_size_and_hidden_stays_hidden(cx: &mut gpui_kit::TestAppContext) {
+        use gpui_kit::AppContext as _;
+        let app = cx.new(|_| super::AppState::new());
+        app.update(cx, |state, cx| {
+            for collapsed in [false, true] {
+                state.set_sidebar_collapsed(collapsed, false, cx);
+                state.sidebar_hidden = false;
+                state.toggle_sidebar(cx);
+                for width in [720., 1200., 899., 900., 600., 1400.] {
+                    state.apply_responsive_sidebar(width, cx);
+                    assert!(state.sidebar_hidden);
+                    assert_eq!(state.sidebar_collapsed, collapsed);
+                }
+                state.toggle_sidebar(cx);
+                assert!(!state.sidebar_hidden);
+                assert_eq!(state.sidebar_collapsed, collapsed);
+            }
+        });
+    }
+
+    #[gpui_kit::test]
+    fn floating_dismissal_hides_sidebar_and_remembers_size(cx: &mut gpui_kit::TestAppContext) {
+        use gpui_kit::AppContext as _;
+        let app = cx.new(|_| super::AppState::new());
+        app.update(cx, |state, cx| {
+            for collapsed in [false, true] {
+                state.set_sidebar_collapsed(collapsed, false, cx);
+                state.sidebar_hidden = false;
+                state.dismiss_floating_chrome(cx);
+                state.dismiss_floating_chrome(cx);
+                assert!(state.sidebar_hidden);
+                assert_eq!(state.sidebar_collapsed, collapsed);
+                state.toggle_sidebar(cx);
+                assert!(!state.sidebar_hidden);
+                assert_eq!(state.sidebar_collapsed, collapsed);
+            }
+        });
+    }
+
+    #[gpui_kit::test]
+    fn sidebar_size_click_preserves_visibility_and_remembers_choice(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        use gpui_kit::AppContext as _;
+        let app = cx.new(|_| super::AppState::new());
+        app.update(cx, |state, cx| {
+            for narrow in [false, true] {
+                for hidden in [false, true] {
+                    for collapsed in [false, true] {
+                        state.sidebar_hidden = hidden;
+                        state.sidebar_collapsed = collapsed;
+                        state.sidebar_responsive.was_narrow = narrow;
+                        state.sidebar_responsive.preferred = collapsed;
+                        state.toggle_sidebar_size(cx);
+                        assert_eq!(state.sidebar_hidden, hidden);
+                        assert_eq!(state.sidebar_collapsed, !collapsed);
+                        assert_eq!(state.sidebar_responsive.preferred, !collapsed);
+                        assert!(!state.auto_collapsed);
+                        state.toggle_sidebar_size(cx);
+                        assert_eq!(state.sidebar_hidden, hidden);
+                        assert_eq!(state.sidebar_collapsed, collapsed);
+                        assert_eq!(state.sidebar_responsive.preferred, collapsed);
+                    }
+                }
+            }
+        });
+    }
+
     /// Whether `chmod 000` stops this process at all.
     ///
     /// It stops everybody but root, so on a root CI container the two refusals below have
@@ -20424,13 +23198,23 @@ mod tests {
     /// showing the words it was chosen by rather than a line to decipher.
     #[test]
     fn a_cron_row_is_a_routine_with_the_picker_back_on_it() {
-        let routine = super::routine_from_schedule(
-            serde_json::from_value(serde_json::json!({
-                "id": "sch_1", "coworkerId": "cw_1", "kind": "cron", "cron": "0 9 * * 1,2,3,4,5",
-                "prompt": "Read the inbox", "name": "Morning post", "active": true
-            }))
-            .unwrap(),
+        let row = |cron: &str| {
+            super::routine_from_schedule(
+                serde_json::from_value(serde_json::json!({
+                    "id": "sch_1", "coworkerId": "cw_1", "kind": "cron", "cron": cron,
+                    "prompt": "Read the inbox", "name": "Morning post", "active": true
+                }))
+                .unwrap(),
+            )
+        };
+        // A six-field line the server kept with numbers reads the way the server runs it, the
+        // `cron` crate's way, Sunday as 1, as every line from before #331 is kept: the editor's
+        // old "Weekdays", `1,2,3,4,5`, runs Sunday to Thursday, and says so.
+        assert_eq!(
+            row("0 0 9 * * 1,2,3,4,5").triggers[0].label(),
+            "Sun to Thu at 9:00 AM"
         );
+        let routine = row("0 0 9 * * MON-FRI");
         assert_eq!(routine.id, "sch_1");
         assert_eq!(routine.name, "Morning post");
         assert_eq!(routine.instruction, "Read the inbox");
@@ -20528,10 +23312,11 @@ mod tests {
         );
     }
 
-    /// The server keeps a line in six fields (`0 0 9 * * 1`). Read the way the server shows it,
-    /// it is the picker's own Every week on Monday at 9:00: the editor opens on the picker and
-    /// not a line to decipher, switching the mode control keeps Monday at nine, and the picker
-    /// choosing that same schedule is no edit at all.
+    /// The server keeps a line in six fields (`0 0 9 * * 1`). Read the way the server shows it
+    /// and runs it, it is the Weekly tab's Sunday at 9:00, since a six-field line's numbers are
+    /// the `cron` crate's, Sunday as 1:
+    /// the editor opens on the tab and not a line to decipher, and the tab writing that same day
+    /// by name is no edit at all.
     #[test]
     fn the_servers_six_field_line_is_the_pickers_own_schedule() {
         let mut routine = super::routine_from_schedule(
@@ -20544,27 +23329,47 @@ mod tests {
         let super::RoutineTrigger::Schedule { spec, .. } = &mut routine.triggers[0] else {
             panic!("a cron row is a schedule trigger");
         };
-        assert_ne!(spec.mode, super::ScheduleUiMode::Custom, "{spec:?}");
-        assert_eq!(spec.to_cron().ok().as_deref(), Some("0 9 * * 1"));
-        *spec = super::ScheduleSpec::from_cron("0 9 * * 1");
+        assert_eq!(spec.tab(), super::WakeTab::Weekly, "{spec:?}");
+        assert_eq!(spec.to_cron().ok().as_deref(), Some("0 9 * * SUN"));
+        *spec = super::ScheduleSpec::from_cron("0 9 * * SUN");
         assert!(
             super::routine_edit(&routine).is_empty(),
-            "the picker's Monday at nine is the server's Monday at nine"
+            "the tab's Sunday at nine is the server's Sunday at nine"
         );
         assert_eq!(
-            super::ScheduleSpec::from_server_cron("@every 90m")
-                .to_cron()
-                .ok(),
-            super::ScheduleSpec::from_cron("@every 90m").to_cron().ok(),
+            super::ScheduleSpec::from_server_cron("@daily"),
+            super::ScheduleSpec::from_cron("@daily"),
             "a line with no seconds field is read as it is"
         );
+    }
+
+    /// A line of a routine's history that is a run, as `GET /schedules/{id}/runs` lists one.
+    fn history_run(
+        run_id: &str,
+        cause: crate::opengrok::RunCause,
+        status: crate::opengrok::ScheduleRunStatus,
+        started_at_ms: i64,
+        ended_at_ms: Option<i64>,
+    ) -> crate::opengrok::ScheduleRun {
+        crate::opengrok::ScheduleRun {
+            run_id: Some(run_id.into()),
+            cause,
+            status: Some(status),
+            started_at_ms: Some(started_at_ms),
+            ended_at_ms,
+            state: None,
+            at: None,
+            skipped: None,
+            reason: None,
+            by: None,
+        }
     }
 
     /// A roster refresh re-lists the routines while one is open, and the history already read
     /// for it stays: the listing has none in it.
     #[test]
     fn a_relist_keeps_the_history_already_read() {
-        use crate::opengrok::{RunCause, ScheduleRun, ScheduleRunStatus};
+        use crate::opengrok::{RunCause, ScheduleRunStatus};
         let row = || -> crate::opengrok::ScheduleRow {
             serde_json::from_value(serde_json::json!({
                 "id": "sch_1", "coworkerId": "cw_1", "kind": "cron", "cron": "0 0 9 * * 1",
@@ -20573,13 +23378,13 @@ mod tests {
             .unwrap()
         };
         let mut shown = super::routine_from_schedule(row());
-        shown.runs = vec![super::RoutineRun::from_server(ScheduleRun {
-            run_id: "run_1".into(),
-            cause: RunCause::Manual,
-            status: ScheduleRunStatus::Ok,
-            started_at_ms: 1_000,
-            ended_at_ms: Some(2_000),
-        })];
+        shown.runs = vec![super::RoutineRun::from_server(history_run(
+            "run_1",
+            RunCause::Manual,
+            ScheduleRunStatus::Ok,
+            1_000,
+            Some(2_000),
+        ))];
         let relisted = super::relisted(Some(std::slice::from_ref(&shown)), vec![row()]);
         assert_eq!(relisted[0].runs, shown.runs);
         assert!(super::relisted(None, vec![row()])[0].runs.is_empty());
@@ -20590,19 +23395,21 @@ mod tests {
     /// lists is dropped after a minute rather than running for good.
     #[test]
     fn a_test_run_is_shown_before_the_history_lists_it() {
-        use crate::opengrok::{RunCause, ScheduleRun, ScheduleRunStatus};
+        use crate::opengrok::{RunCause, ScheduleRunStatus};
         let started = super::RoutineRun::just_started("run_new".into());
         let now = started.started_at_ms;
-        let old = super::RoutineRun::from_server(ScheduleRun {
-            run_id: "run_old".into(),
-            cause: RunCause::Clock,
-            status: ScheduleRunStatus::Ok,
-            started_at_ms: now - 86_400_000,
-            ended_at_ms: Some(now - 86_000_000),
-        });
+        let old = super::RoutineRun::from_server(history_run(
+            "run_old",
+            RunCause::Clock,
+            ScheduleRunStatus::Ok,
+            now - 86_400_000,
+            Some(now - 86_000_000),
+        ));
         let shown = vec![started.clone(), old.clone()];
         let ids = |runs: &[super::RoutineRun]| -> Vec<String> {
-            runs.iter().map(|run| run.run_id.clone()).collect()
+            runs.iter()
+                .filter_map(|run| run.run_id().map(str::to_string))
+                .collect()
         };
 
         let behind = super::with_unlisted_runs(&shown, vec![old.clone()], now + 50);
@@ -20614,14 +23421,13 @@ mod tests {
         assert!(behind[0].unsettled(), "and still read again");
 
         let mut listed = started.clone();
-        listed.status = ScheduleRunStatus::Ok;
+        listed.outcome = super::RunOutcome::Ran {
+            run_id: "run_new".into(),
+            status: ScheduleRunStatus::Ok,
+        };
         let caught_up = super::with_unlisted_runs(&shown, vec![listed, old.clone()], now + 50);
         assert_eq!(ids(&caught_up), ["run_new", "run_old"]);
-        assert_eq!(
-            caught_up[0].status,
-            ScheduleRunStatus::Ok,
-            "the history's own line wins"
-        );
+        assert!(!caught_up[0].unsettled(), "the history's own line wins");
 
         let never = super::with_unlisted_runs(&shown, vec![old], now + super::UNLISTED_RUN_MS);
         assert_eq!(
@@ -20636,13 +23442,7 @@ mod tests {
     #[test]
     fn a_history_line_names_its_cause_and_knows_when_it_is_settled() {
         let line = |cause, status| {
-            super::RoutineRun::from_server(crate::opengrok::ScheduleRun {
-                run_id: "run_1".into(),
-                cause,
-                status,
-                started_at_ms: 1_000,
-                ended_at_ms: None,
-            })
+            super::RoutineRun::from_server(history_run("run_1", cause, status, 1_000, None))
         };
         use crate::opengrok::{RunCause, ScheduleRunStatus};
         assert_eq!(
@@ -20663,18 +23463,214 @@ mod tests {
         assert!(!line(RunCause::Manual, ScheduleRunStatus::Ok).at.is_empty());
     }
 
-    /// A line the pickers cannot draw is still a routine: it lists, it pauses, it deletes, and
-    /// the line is shown as the server wrote it.
+    /// A routine run a Bot started (opengrok-server #337, built in #342: its history's lines carry
+    /// `cause: "bot"` and `by: {coworkerId, name}`, the Bot as it was called then) says which Bot
+    /// ran it, on its line of the Run history: the recording's own lines, a run the Bot started
+    /// beside the person's own Test run, and the two firings a Bot's press set off that the plan
+    /// could not answer, each "Run by Luna" with what became of it under or beside. A line whose
+    /// `by` is null, or that has none (a server from before it), says what it always said, and
+    /// nothing of any Bot; one that names a Bot with no name says "a Bot".
+    #[test]
+    fn a_run_a_bot_started_says_which_bot_ran_it() {
+        let lines = |fixture: &str| -> Vec<super::RoutineRun> {
+            serde_json::from_value::<Vec<crate::opengrok::ScheduleRun>>(recorded_body(fixture))
+                .expect("a history")
+                .into_iter()
+                .map(super::RoutineRun::from_server)
+                .collect()
+        };
+        let ran = lines(include_str!(
+            "../fixtures/wire/rest/GET__schedules__id__runs/200-a_bot_runs_a_routine_by_its_id_and_its_history_names_the_bot.json"
+        ));
+        assert_eq!(
+            ran.iter().map(|run| run.cause_label()).collect::<Vec<_>>(),
+            ["Run by Luna", "Test run"],
+            "the Bot's run, and the person's own, whose `by` is null"
+        );
+        assert!(ran.iter().all(|run| run.run_id().is_some()));
+
+        let skipped = lines(include_str!(
+            "../fixtures/wire/rest/GET__schedules__id__runs/200-a_plan_bots_routine_run_by_a_bot_keeps_its_plans_rules.json"
+        ));
+        assert_eq!(
+            skipped
+                .iter()
+                .map(|run| (run.cause_label().to_string(), run.outcome.clone()))
+                .collect::<Vec<_>>(),
+            [
+                (
+                    "Run by Luna".to_string(),
+                    super::RunOutcome::Skipped {
+                        reason: "Skipped: your plan's proxy didn't answer".into()
+                    }
+                ),
+                (
+                    "Run by Luna".to_string(),
+                    super::RunOutcome::Skipped {
+                        reason: "Skipped: your computer was off, so your plan couldn't answer"
+                            .into()
+                    }
+                ),
+            ]
+        );
+
+        // By null, or no `by` at all: nothing of any Bot, whatever set the run off.
+        let line = |cause: &str, by: Option<serde_json::Value>| {
+            let mut line = serde_json::json!({
+                "runId": "run_1", "cause": cause, "status": "ok",
+                "startedAtMs": 1_000, "endedAtMs": 2_000
+            });
+            if let Some(by) = by {
+                line["by"] = by;
+            }
+            let line: crate::opengrok::ScheduleRun =
+                serde_json::from_value(line).expect("a history line");
+            super::RoutineRun::from_server(line).cause_label()
+        };
+        for (cause, said) in [
+            ("manual", "Test run"),
+            ("webhook", "Webhook"),
+            ("clock", "Schedule"),
+        ] {
+            for by in [None, Some(serde_json::Value::Null)] {
+                let shown = line(cause, by);
+                assert_eq!(shown, said);
+                assert!(!shown.contains("Run by"), "{shown}");
+            }
+        }
+        let a_bot = serde_json::json!({"coworkerId": "cw_2", "name": "  "});
+        assert_eq!(line("bot", Some(a_bot)), "Run by a Bot");
+        assert_eq!(line("bot", None), "Run by a Bot");
+    }
+
+    /// The zone a routine's times are in (opengrok-server #316): its own, as its row says it;
+    /// UTC on one from a server before zones, which read every line in UTC; and on a draft, the
+    /// one the server will give it, since this app names none: the account's, else UTC. It is
+    /// named beside the times only where it is not this computer's.
+    #[test]
+    fn a_routines_zone_is_its_own_or_the_one_the_server_will_give_it() {
+        let row = |tz: Option<&str>| {
+            let mut row = serde_json::json!({
+                "id": "sch_1", "coworkerId": "cw_1", "kind": "cron", "cron": "0 0 9 * * MON-FRI",
+                "prompt": "post the standup", "active": true
+            });
+            if let Some(tz) = tz {
+                row["tz"] = tz.into();
+            }
+            super::routine_from_schedule(serde_json::from_value(row).expect("a row"))
+        };
+        let zone = super::RoutineZone::of;
+        let manila = row(Some("Asia/Manila"));
+        assert_eq!(
+            zone(&manila, Some("Europe/London"), Some("Asia/Manila")),
+            super::RoutineZone {
+                name: "Asia/Manila".into(),
+                here: true
+            },
+            "its own, which is this computer's"
+        );
+        assert_eq!(
+            zone(&manila, None, Some("Europe/London")).note(),
+            Some("Asia/Manila")
+        );
+        assert_eq!(
+            zone(&manila, None, None).note(),
+            Some("Asia/Manila"),
+            "a computer that cannot say its zone"
+        );
+        assert_eq!(
+            zone(&row(None), Some("Asia/Manila"), Some("Asia/Manila")).note(),
+            Some("UTC"),
+            "a server before zones read it in UTC"
+        );
+        let mut draft = manila.clone();
+        draft.saved = None;
+        draft.tz = None;
+        assert_eq!(
+            zone(&draft, Some("Asia/Manila"), Some("Asia/Manila")).note(),
+            None,
+            "the account's, which is this computer's"
+        );
+        assert_eq!(
+            zone(&draft, None, Some("Asia/Manila")).note(),
+            Some("UTC"),
+            "an account that keeps none: UTC"
+        );
+        assert_eq!(
+            zone(&draft, Some(" "), Some("UTC")).note(),
+            None,
+            "a blank zone is none, and UTC here is here"
+        );
+    }
+
+    /// The wake editor says when its pick next runs where it can read the line in the routine's
+    /// zone: this computer's own, or UTC. In any other it leaves the next run unsaid, and still
+    /// holds the line to the server's parser, which no zone changes. A draft's editor reads the
+    /// line in the zone the server will give it, the account's.
+    #[gpui_kit::test]
+    fn the_wake_editor_reads_the_line_in_the_routines_zone(cx: &mut gpui_kit::TestAppContext) {
+        use super::{RoutineZone, WakeTab};
+        use gpui_kit::AppContext as _;
+        let status = |zone: &str, here: bool, line: &str| {
+            let mut editor = super::WakeEditor::new(
+                "sch_1".into(),
+                Some(0),
+                Some(super::ScheduleKind::Cron),
+                super::ScheduleSpec::custom(line),
+                RoutineZone {
+                    name: zone.into(),
+                    here,
+                },
+            );
+            editor.tab = WakeTab::Cron;
+            editor.status(chrono::Utc::now())
+        };
+        assert!(status("Asia/Manila", true, "0 9 * * *").next.is_some());
+        assert!(status("UTC", false, "0 9 * * *").next.is_some());
+        let away = status("Europe/London", false, "0 9 * * *");
+        assert!(away.next.is_none() && away.can_save(), "{away:?}");
+        let never = status("Europe/London", false, "0 9 31 2 *");
+        assert!(!never.can_save(), "the 31st of February, anywhere");
+
+        let app = cx.new(|_| {
+            let mut state = with_routines();
+            state.account = Some(account_in(Some("Asia/Manila")));
+            state
+        });
+        app.update(cx, |state, cx| {
+            state.open_wake_editor("draft-1", None, cx);
+            assert_eq!(
+                state.routine_wake_editor.as_ref().unwrap().zone.name,
+                "Asia/Manila",
+                "a draft is made in the account's zone"
+            );
+            state.open_wake_editor("sch_1", Some(0), cx);
+            assert_eq!(
+                state.routine_wake_editor.as_ref().unwrap().zone.name,
+                "UTC",
+                "a routine from a server before zones"
+            );
+        });
+    }
+
+    /// A line the tabs cannot draw is still a routine: it lists, it pauses, it deletes, and it
+    /// is said in words where it can be and shown as the server wrote it where it cannot.
     #[test]
     fn a_line_with_no_picker_for_it_is_still_a_routine() {
-        let routine = super::routine_from_schedule(
-            serde_json::from_value(serde_json::json!({
-                "id": "sch_3", "coworkerId": "cw_1", "kind": "cron", "cron": "@every 90m",
-                "prompt": "Sweep", "active": true
-            }))
-            .unwrap(),
+        let routine = |cron: &str| {
+            super::routine_from_schedule(
+                serde_json::from_value(serde_json::json!({
+                    "id": "sch_3", "coworkerId": "cw_1", "kind": "cron", "cron": cron,
+                    "prompt": "Sweep", "active": true
+                }))
+                .unwrap(),
+            )
+        };
+        assert_eq!(
+            routine("0 0 9,17 * * MON-FRI").triggers[0].label(),
+            "At 9:00 AM and 5:00 PM, on weekdays"
         );
-        assert_eq!(routine.triggers[0].label(), "@every 90m");
+        assert_eq!(routine("@daily").triggers[0].label(), "@daily");
     }
 
     #[test]
@@ -21376,6 +24372,254 @@ mod tests {
         }
     }
 
+    /// A row of Settings → Logins, as the vault lists it.
+    fn saved_login(
+        id: &str,
+        origin: &str,
+        username: &str,
+        kind: &str,
+    ) -> crate::site_login::SiteLoginRecord {
+        crate::site_login::SiteLoginRecord {
+            id: id.into(),
+            origin: origin.into(),
+            username: username.into(),
+            label: String::new(),
+            kind: kind.into(),
+            notes: String::new(),
+            last_used_at_ms: None,
+            created_at: "2026-09-30T10:00:00+00:00".into(),
+            updated_at: "2026-09-30T10:00:00+00:00".into(),
+        }
+    }
+
+    /// A card the Bot raised on Google's sign-in page, with the fields given.
+    fn google_card(entry_id: &str, fields: serde_json::Value) -> crate::opengrok::UserFormSpec {
+        crate::opengrok::UserFormSpec::parse(
+            &json!({
+                "entryId": entry_id,
+                "formRequest": {
+                    "title": "Google sign-in",
+                    "domain": "accounts.google.com",
+                    "liveHost": "accounts.google.com",
+                    "fields": fields
+                }
+            }),
+            None,
+        )
+        .expect("form")
+    }
+
+    /// The ids of the saved logins a card offers, in the order it lists them.
+    fn offered(state: &AppState, spec: &crate::opengrok::UserFormSpec) -> Vec<String> {
+        state
+            .saved_logins_for_form(spec)
+            .into_iter()
+            .map(|row| row.id)
+            .collect()
+    }
+
+    /// The owner's report: Google asked for the email alone, the Bot raised a card with one
+    /// "Email or phone" field, and the card offered nothing, although a login for google.com
+    /// was saved. A card had to hold a name and a password to take a login, and neither page of
+    /// a two-step sign-in holds both. Each page now offers the site's password logins, found
+    /// from accounts.google.com under the google.com they were saved as; another site's logins
+    /// and a passkey are not offered, and a sign-up still takes nothing.
+    #[test]
+    fn both_pages_of_a_two_step_sign_in_offer_the_sites_saved_logins() {
+        let mut state = AppState::new();
+        state.site_logins = vec![
+            saved_login("sl_fb", "facebook.com", "ada@example.com", "password"),
+            saved_login("sl_ada", "google.com", "ada@example.com", "password"),
+            saved_login("sl_key", "google.com", "ada@example.com", "passkey"),
+        ];
+        state.site_logins_ready = true;
+        let email = google_card(
+            "e_email",
+            json!([{"id": "email", "label": "Email or phone", "type": "email", "required": true}]),
+        );
+        assert_eq!(offered(&state, &email), ["sl_ada"]);
+        let password = google_card(
+            "e_password",
+            json!([{"id": "password", "label": "Enter your password", "type": "password", "required": true}]),
+        );
+        assert_eq!(offered(&state, &password), ["sl_ada"]);
+        let sign_up = google_card(
+            "e_sign_up",
+            json!([
+                {"id": "email", "label": "Email", "type": "email", "required": true},
+                {"id": "password", "label": "Password", "type": "password", "required": true},
+                {"id": "confirm", "label": "Confirm password", "type": "password", "required": true}
+            ]),
+        );
+        assert!(offered(&state, &sign_up).is_empty());
+    }
+
+    /// The password page does not ask who is signing in; the name page before it did. Once a
+    /// saved login's name has gone into the name page, the password page in the same thread
+    /// offers that login first, so the person is not left to remember which account they chose.
+    /// Another thread's sign-in to the same site is its own, and a name typed by hand on a later
+    /// name page is not the earlier pick's, so that pick stops leading. Each page is sent its
+    /// half of the login and nothing else.
+    #[test]
+    fn the_password_page_offers_first_the_login_picked_on_the_name_page() {
+        let mut state = AppState::new();
+        state.site_logins = vec![
+            saved_login("sl_ada", "google.com", "ada@example.com", "password"),
+            saved_login("sl_bea", "google.com", "bea@example.com", "password"),
+        ];
+        state.site_logins_ready = true;
+        let email_field =
+            json!([{"id": "email", "label": "Email or phone", "type": "email", "required": true}]);
+        let password_field = json!([
+            {"id": "password", "label": "Enter your password", "type": "password", "required": true}
+        ]);
+        let email = google_card("e_email", email_field.clone());
+        let password = google_card("e_password", password_field.clone());
+        let elsewhere = google_card("e_elsewhere", password_field);
+        let mut sign_in = message("m1", false, "");
+        sign_in.parts = vec![
+            ChatPart::UserForm(email),
+            ChatPart::UserForm(password.clone()),
+        ];
+        let mut other = message("m2", false, "");
+        other.parts = vec![ChatPart::UserForm(elsewhere.clone())];
+        state.conversations.push(thread("cw_1", vec![sign_in]));
+        state.conversations.push(thread("cw_2", vec![other]));
+        assert_eq!(
+            offered(&state, &password),
+            ["sl_ada", "sl_bea"],
+            "nothing picked yet: the vault's own order"
+        );
+
+        // Touch ID passed for bea on the name page; Continue sends her name, and only it.
+        state.saved_login_use.insert(
+            "e_email".into(),
+            crate::site_login::SavedLoginUse::NameReady {
+                login_id: "sl_bea".into(),
+                username: "bea@example.com".into(),
+            },
+        );
+        let mut sent = crate::opengrok::UserFormValues::default();
+        assert!(state.fold_held_saved_login("e_email", &mut sent));
+        assert_eq!(
+            sent.by_id,
+            std::collections::HashMap::from([("email".to_string(), "bea@example.com".to_string())])
+        );
+        assert_eq!(
+            state
+                .saved_login_use
+                .get("e_email")
+                .and_then(crate::site_login::SavedLoginUse::filling_id),
+            Some("sl_bea"),
+            "sent as a saved login, which keeps it off a shared computer and stamps its use"
+        );
+        assert_eq!(offered(&state, &password), ["sl_bea", "sl_ada"]);
+        assert_eq!(
+            offered(&state, &elsewhere),
+            ["sl_ada", "sl_bea"],
+            "another thread's sign-in"
+        );
+
+        // Her password, picked on the password page, is sent alone.
+        state.saved_login_use.insert(
+            "e_password".into(),
+            crate::site_login::SavedLoginUse::Ready {
+                login_id: "sl_bea".into(),
+                username: "bea@example.com".into(),
+                password: "s3cret-pass".into(),
+            },
+        );
+        let mut sent = crate::opengrok::UserFormValues::default();
+        assert!(state.fold_held_saved_login("e_password", &mut sent));
+        assert_eq!(
+            sent.by_id,
+            std::collections::HashMap::from([("password".to_string(), "s3cret-pass".to_string())])
+        );
+
+        // Signing in again later, with a name typed by hand: bea no longer leads.
+        let mut again = message("m3", false, "");
+        again.parts = vec![ChatPart::UserForm(google_card("e_email_2", email_field))];
+        state.conversations[0].messages.push(again);
+        let mut typed = crate::opengrok::UserFormValues::default();
+        typed.by_id.insert("email".into(), "ada@example.com".into());
+        assert!(state.fold_held_saved_login("e_email_2", &mut typed));
+        assert_eq!(offered(&state, &password), ["sl_ada", "sl_bea"]);
+    }
+
+    /// A driver finds each page's saved logins where a person does, by the ids the one-page
+    /// login card uses: a `user-form-use-saved-{card}-{login}` row per login on the name page
+    /// and on the password page, the password page's in the order the card lists them. A
+    /// click on one is a pick of that login on that card.
+    #[cfg(feature = "agent")]
+    #[test]
+    fn a_driver_picks_a_saved_login_on_either_page_of_a_two_step_sign_in() {
+        use crate::agent::{Command, NativeChatHost};
+        use gpui_agent::prelude::{AgentHost, Op};
+        let mut state = AppState::new();
+        state.auth_status = super::AuthStatus::SignedIn;
+        state.account = serde_json::from_value(json!({
+            "id": "acct_1",
+            "email": "ada@example.com"
+        }))
+        .ok();
+        state.coworkers.push(bob());
+        state.site_logins = vec![
+            saved_login("sl_ada", "google.com", "ada@example.com", "password"),
+            saved_login("sl_bea", "google.com", "bea@example.com", "password"),
+        ];
+        state.site_logins_ready = true;
+        let mut sign_in = message("m1", false, "");
+        sign_in.parts = vec![
+            ChatPart::UserForm(google_card(
+                "e_email",
+                json!([{"id": "email", "label": "Email or phone", "type": "email", "required": true}]),
+            )),
+            ChatPart::UserForm(google_card(
+                "e_password",
+                json!([{"id": "password", "label": "Enter your password", "type": "password", "required": true}]),
+            )),
+        ];
+        state.conversations.push(thread("cw_1", vec![sign_in]));
+        state.active_conversation_id = Some("cw_1".into());
+        state
+            .name_page_picks
+            .insert(("cw_1".into(), "google.com".into()), "sl_bea".into());
+        let mut host = NativeChatHost::from_app(&state);
+        let tree = host.snapshot();
+        let rows = |card: &str| -> Vec<String> {
+            tree.find(&format!("user-form-{card}"))
+                .map(|node| {
+                    node.children
+                        .iter()
+                        .map(|child| child.id.clone())
+                        .filter(|id| id.starts_with("user-form-use-saved-"))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        assert_eq!(
+            rows("e_email"),
+            [
+                "user-form-use-saved-e_email-sl_ada",
+                "user-form-use-saved-e_email-sl_bea"
+            ]
+        );
+        assert_eq!(
+            rows("e_password"),
+            [
+                "user-form-use-saved-e_password-sl_bea",
+                "user-form-use-saved-e_password-sl_ada"
+            ]
+        );
+        host.dispatch(&Op::click("user-form-use-saved-e_password-sl_bea"))
+            .unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::UserFormUseSaved { card_key, login_id })
+                if card_key == "e_password" && login_id == "sl_bea"
+        ));
+    }
+
     #[test]
     fn saved_parts_drop_user_form_cards_and_keep_no_password() {
         let spec = crate::opengrok::UserFormSpec::parse(
@@ -21596,7 +24840,7 @@ mod tests {
                     "step {} {} {} {:?} {:?}",
                     step.call_id, step.tool, step.arguments, step.result, step.ok
                 ),
-                ChatPart::Reasoning(thought) => format!("thought {thought}"),
+                ChatPart::Reasoning(thought) => format!("thought {}", thought.text),
             })
             .collect()
     }
@@ -22042,6 +25286,8 @@ mod tests {
         let resumed = ReplySource {
             kind: InferenceKind::LocalProxy,
             model: Some("gpt-5-codex".into()),
+            via: None,
+            fallback_for: None,
         };
         let target = super::followed_bubble(&live_turns, Some("cw_1"), "run_old");
         assert_eq!(target, None, "the live turn is another run's");
@@ -22777,7 +26023,7 @@ mod tests {
 
     // The patch reconciliation, apart from the app: what the roster holds for a coworker once
     // the server has answered.
-    use super::{Coworker, CoworkerPatch, EffortControl, apply_patch, settle_patch};
+    use super::{Coworker, CoworkerPatch, CoworkerSource, apply_patch, settle_patch};
 
     fn bob() -> Coworker {
         Coworker {
@@ -22793,6 +26039,7 @@ mod tests {
             box_id: None,
             effort: Some("high".to_string()),
             visibility: Some("private".to_string()),
+            source: CoworkerSource::NotKept,
         }
     }
 
@@ -22881,6 +26128,7 @@ mod tests {
             box_id: None,
             effort: None,
             visibility: None,
+            source: CoworkerSource::NotKept,
         };
         settle_patch(&mut roster, &patch, Some(&echo), &before);
         assert_eq!(roster.model, "xai/grok-4.7@sub");
@@ -22946,68 +26194,47 @@ mod tests {
         assert_eq!(roster, before);
     }
 
-    /// Save carries the effort only when the pick differs from what the server keeps. Picking
-    /// the kept word takes the pick back, a pick is the bot's it was made for and no other's, and
-    /// a stored pick hands the control back to the roster unless a newer one was made meanwhile.
+    /// A change in the model picker is the roster's the moment it is made, door, model and
+    /// effort together, so both of the picker's places follow the click at once; the server's
+    /// echo then has the last word on each, and a refusal puts all three back.
     #[test]
-    fn save_carries_the_effort_only_when_the_pick_changed_it() {
-        let mut state = AppState::new();
-        state.coworkers = vec![
-            bob(),
-            Coworker {
-                id: "cw_2".to_string(),
-                ..bob()
-            },
-        ];
-        state.active_coworker_id = Some("cw_1".to_string());
-        let untouched = state.effort_control().unwrap();
-        assert_eq!(untouched.shown, "high");
-        assert!(!untouched.unsaved());
-        assert_eq!(state.effort_to_save(), None, "nothing picked, nothing sent");
-
-        state.note_effort_pick("max".to_string());
-        let picked = state.effort_control().unwrap();
-        assert_eq!((picked.kept_word(), picked.shown.as_str()), ("high", "max"));
-        assert!(picked.unsaved());
-        assert_eq!(state.effort_to_save().as_deref(), Some("max"));
-
-        state.note_effort_pick("high".to_string());
-        assert_eq!(state.effort_to_save(), None, "the kept word is no change");
-
-        state.note_effort_pick("low".to_string());
-        state.active_coworker_id = Some("cw_2".to_string());
-        assert_eq!(state.effort_control().unwrap().shown, "high");
-        assert_eq!(state.effort_to_save(), None);
-        state.active_coworker_id = Some("cw_1".to_string());
-
-        state.settle_effort_pick("cw_1", "max");
+    fn a_pick_is_the_rosters_at_once_and_the_servers_word_settles_it() {
+        let before = bob();
+        let patch = CoworkerPatch {
+            source: Some(InferenceKind::LocalProxy),
+            model: Some("gpt-6-luna--fast".to_string()),
+            effort: Some("max".to_string()),
+            ..Default::default()
+        };
+        let mut roster = before.clone();
+        apply_patch(&mut roster, &patch);
         assert_eq!(
-            state.effort_to_save().as_deref(),
-            Some("low"),
-            "a pick made while the patch was out is a newer one"
+            (
+                &roster.source,
+                roster.model.as_str(),
+                roster.effort.as_deref()
+            ),
+            (
+                &CoworkerSource::Kind(InferenceKind::LocalProxy),
+                "gpt-6-luna--fast",
+                Some("max")
+            )
         );
-        state.settle_effort_pick("cw_1", "low");
-        assert_eq!(state.effort_to_save(), None);
-    }
-
-    /// A server from before opengrok-server#271 keeps no effort. The control shows what that
-    /// server's turns run with, which is inherit, and Save has nothing to send.
-    #[test]
-    fn a_server_that_keeps_no_effort_shows_inherit() {
-        let mut state = AppState::new();
-        state.coworkers = vec![Coworker {
-            effort: None,
-            ..bob()
-        }];
-        state.active_coworker_id = Some("cw_1".to_string());
+        let echo = Coworker {
+            source: CoworkerSource::AccountDefault,
+            model: "gpt-6-luna--fast".to_string(),
+            effort: Some("max".to_string()),
+            ..before.clone()
+        };
+        let mut kept = roster.clone();
+        settle_patch(&mut kept, &patch, Some(&echo), &before);
         assert_eq!(
-            state.effort_control(),
-            Some(EffortControl {
-                kept: None,
-                shown: "inherit".to_string(),
-            })
+            kept.source,
+            CoworkerSource::AccountDefault,
+            "the server's word on the door, even where it is not the one sent"
         );
-        assert_eq!(state.effort_to_save(), None);
+        settle_patch(&mut roster, &patch, None, &before);
+        assert_eq!(roster, before, "refused: all three go back");
     }
 
     // ---- A turn survives looking away -------------------------------------------------------
@@ -23378,6 +26605,8 @@ mod tests {
                 arguments: "{\"command\":\"du -sh /srv/archive\"}".into(),
                 result: Some("4.0G\t/srv/archive".into()),
                 ok: Some(true),
+                // Timed as it happened: nothing can time it again once the turn is over.
+                took_ms: Some(1234),
             }),
             ChatPart::Step(crate::opengrok::StepSpec {
                 call_id: "c2".into(),
@@ -23385,6 +26614,7 @@ mod tests {
                 arguments: "{\"path\":\"/srv/archive/INDEX\"}".into(),
                 result: None,
                 ok: None,
+                took_ms: None,
             }),
             ChatPart::Text("The archive is four gigabytes.".into()),
         ];
@@ -23425,6 +26655,7 @@ mod tests {
                 arguments: "{\"command\":\"ls\"}".into(),
                 result: Some("a.txt".into()),
                 ok: Some(true),
+                took_ms: None,
             }),
             ChatPart::Text("After.".into()),
         ];
@@ -23621,13 +26852,13 @@ mod tests {
         match raw.as_slice() {
             [ChatPart::Step(step), ChatPart::Reasoning(thought)] => {
                 assert_eq!(step.arguments, "{\"recipe\":\"Gmail login\"}");
-                assert!(thought.len() < "思".repeat(3_500).len());
+                assert!(thought.text.len() < "思".repeat(3_500).len());
                 assert_eq!(
-                    &crate::opengrok::capped(thought),
-                    thought,
+                    &crate::opengrok::capped(&thought.text),
+                    &thought.text,
                     "read back already kept to the cap"
                 );
-                assert!(thought.ends_with('…'));
+                assert!(thought.text.ends_with('…'));
             }
             other => panic!("expected a step and a thought, got {other:?}"),
         }
@@ -23701,6 +26932,7 @@ mod tests {
             arguments: "{\"command\":\"du -sh /srv/archive\"}".into(),
             result: Some("4.0G\t/srv/archive".into()),
             ok: Some(true),
+            took_ms: None,
         })];
         let (content, saved) = reply_to_keep("", &parts).expect("the step is worth keeping");
         let db = test_db().await;
@@ -23849,6 +27081,7 @@ mod tests {
             finished_at: Some(SystemTime::UNIX_EPOCH + Duration::from_millis(8_000)),
             run_timing: None,
             reply_source: None,
+            plan_failure: None,
         };
 
         let id = graft_reply(&mut messages, &reply);
@@ -24217,6 +27450,855 @@ mod tests {
         assert_eq!(agent_id, "cw_1", "and it is the bot's card to answer");
     }
 
+    /// The history icon swaps a routine's fields for its runs and back, and the next routine to
+    /// open, or the same one opened again, opens on its fields.
+    #[gpui_kit::test]
+    fn a_routines_history_is_shown_until_another_routine_opens(cx: &mut gpui_kit::TestAppContext) {
+        use gpui_kit::AppContext as _;
+        let app = cx.new(|_| with_routines());
+        app.update(cx, |state, cx| {
+            state.open_routine_editor(Some("sch_1".into()), cx);
+            assert!(!state.routine_history_open, "fields first");
+            state.toggle_routine_history(cx);
+            assert!(state.routine_history_open);
+            state.open_routine_editor(Some("draft-1".into()), cx);
+            assert!(
+                !state.routine_history_open,
+                "another routine opens on its fields"
+            );
+            state.toggle_routine_history(cx);
+            state.open_routine_editor(Some("draft-1".into()), cx);
+            assert!(
+                !state.routine_history_open,
+                "and so does this one, opened again"
+            );
+        });
+    }
+
+    /// Delete asks before it deletes: the question names the routine and says what deleting it
+    /// does, which is not the same for a draft that never reached the server. Cancel leaves the
+    /// routine; Delete takes it off the list.
+    #[gpui_kit::test]
+    fn delete_asks_before_it_deletes(cx: &mut gpui_kit::TestAppContext) {
+        use gpui_kit::AppContext as _;
+        let app = cx.new(|_| with_routines());
+        app.update(cx, |state, cx| {
+            assert_eq!(state.routine_delete_question(), None);
+            state.ask_delete_routine("sch_1", cx);
+            assert_eq!(
+                state.routine_delete_question(),
+                Some((
+                    "Delete \"Weekly\"?".to_string(),
+                    super::ROUTINE_DELETE_KEEPS
+                ))
+            );
+            state.cancel_routine_delete(cx);
+            assert_eq!(state.routine_delete_question(), None);
+            assert_eq!(state.coworker_routines("cw_1").len(), 2, "nothing deleted");
+
+            state.ask_delete_routine("draft-1", cx);
+            assert_eq!(
+                state.routine_delete_question().map(|(_, what)| what),
+                Some(super::DRAFT_DELETE_KEEPS)
+            );
+            state.confirm_routine_delete(cx);
+            assert_eq!(state.routine_delete_prompt, None);
+            assert!(
+                state
+                    .coworker_routines("cw_1")
+                    .iter()
+                    .all(|row| row.id != "draft-1")
+            );
+        });
+    }
+
+    /// A line of the Run history opens the routine's thread and asks for that run to be brought
+    /// into view there.
+    #[gpui_kit::test]
+    fn a_run_line_opens_the_thread_at_that_run(cx: &mut gpui_kit::TestAppContext) {
+        use gpui_kit::AppContext as _;
+        let app = cx.new(|_| with_routines());
+        app.update(cx, |state, cx| {
+            state.open_routine_run("sch_1", "run_01a", cx);
+            assert_eq!(state.active_conversation_id.as_deref(), Some("sch_1"));
+            assert_eq!(
+                state.reveal_run,
+                Some(("sch_1".to_string(), "run_01a".to_string()))
+            );
+        });
+    }
+
+    // ---- When to run: the wakes, and the wake editor ----------------------------------------
+
+    /// The open bot with one saved routine (Sundays at nine, by the server's numbering), one
+    /// draft with no wake yet, and one webhook routine.
+    fn with_wakes() -> AppState {
+        let mut state = with_routines();
+        let rows = state.routines.get_mut("cw_1").expect("the bot's routines");
+        if let Some(draft) = rows.iter_mut().find(|row| row.id == "draft-1") {
+            draft.triggers.clear();
+            draft.name.clear();
+            draft.instruction.clear();
+        }
+        rows.push(super::routine_from_schedule(
+            serde_json::from_value(serde_json::json!({
+                "id": "sch_hook", "coworkerId": "cw_1", "kind": "webhook", "cron": null,
+                "prompt": "Deal with it", "name": "Hook", "active": true,
+                "webhook": { "url": "u", "key": "k", "header": "h" }
+            }))
+            .unwrap(),
+        ));
+        state.computer_view = super::ComputerView::Editor {
+            id: Some("sch_1".into()),
+        };
+        state
+    }
+
+    /// The server keeps one wake per routine: + adds the first and is dead once there is one,
+    /// and 🗑 never takes a routine's only wake, which is what deleting the routine is for.
+    #[test]
+    fn a_routine_has_one_wake_and_keeps_it() {
+        let state = with_wakes();
+        let routine = |id: &str| {
+            state
+                .coworker_routines("cw_1")
+                .iter()
+                .find(|row| row.id == id)
+                .cloned()
+                .unwrap()
+        };
+        assert!(
+            AppState::can_add_wake(&routine("draft-1")),
+            "a draft gets its first"
+        );
+        assert!(
+            !AppState::can_add_wake(&routine("sch_1")),
+            "one per routine"
+        );
+        assert!(!AppState::can_add_wake(&routine("sch_hook")));
+        assert!(
+            !AppState::can_remove_wake(&routine("sch_1")),
+            "its only wake stays"
+        );
+        assert!(!AppState::can_remove_wake(&routine("sch_hook")));
+    }
+
+    /// Each tab of the wake editor writes the line the server takes for what it shows, and says
+    /// it in words under it: the editor opens on the routine's own wake, every pick changes only
+    /// the editor, and Save puts it on the routine.
+    #[gpui_kit::test]
+    fn each_tab_writes_its_line_and_says_what_was_picked(cx: &mut gpui_kit::TestAppContext) {
+        use super::{WakeBox, WakeSaved, WakeTab};
+        use gpui_kit::AppContext as _;
+        let app = cx.new(|_| with_wakes());
+        app.update(cx, |state, cx| {
+            let line = |state: &AppState| match state.routine_wake_editor.as_ref().unwrap().picked()
+            {
+                Ok(super::NewTrigger::Schedule(spec)) => spec.to_cron().unwrap(),
+                other => panic!("not a schedule: {other:?}"),
+            };
+            let summary = |state: &AppState| state.routine_wake_editor.as_ref().unwrap().summary();
+
+            state.open_wake_editor("sch_1", Some(0), cx);
+            let editor = state.routine_wake_editor.as_ref().unwrap();
+            assert_eq!(
+                editor.tab,
+                WakeTab::Weekly,
+                "the server's `0 0 9 * * 1` is Sundays"
+            );
+            assert_eq!(
+                (editor.hour.as_str(), editor.minute.as_str(), editor.pm),
+                ("9", "00", false)
+            );
+            assert_eq!(line(state), "0 9 * * SUN");
+
+            // Every
+            state.pick_wake_tab(WakeTab::Every, cx);
+            state.set_wake_box(WakeBox::Every, "15".into(), true, cx);
+            state.set_wake_unit(super::ScheduleUnit::Minutes, cx);
+            assert_eq!(line(state), "*/15 * * * *");
+            assert_eq!(summary(state), "Every 15 minutes");
+            state.step_wake_box(WakeBox::Every, false, cx);
+            assert_eq!(state.routine_wake_editor.as_ref().unwrap().every, "14");
+            state.set_wake_unit(super::ScheduleUnit::Hours, cx);
+            state.set_wake_box(WakeBox::Every, "6".into(), true, cx);
+            assert_eq!(line(state), "0 */6 * * *");
+            assert_eq!(summary(state), "Every 6 hours");
+
+            // Daily, typed and stepped
+            state.pick_wake_tab(WakeTab::Daily, cx);
+            state.set_wake_box(WakeBox::Hour, "7".into(), true, cx);
+            state.set_wake_box(WakeBox::Minute, "30".into(), true, cx);
+            state.set_wake_pm(true, cx);
+            assert_eq!(line(state), "30 19 * * *");
+            assert_eq!(summary(state), "Every day at 7:30 PM");
+            state.step_wake_box(WakeBox::Hour, true, cx);
+            state.step_wake_box(WakeBox::Minute, true, cx);
+            let editor = state.routine_wake_editor.as_ref().unwrap();
+            assert_eq!((editor.hour.as_str(), editor.minute.as_str()), ("8", "35"));
+            assert_eq!(line(state), "35 20 * * *");
+
+            // Weekly keeps the day it had, and takes months.
+            state.pick_wake_tab(WakeTab::Weekly, cx);
+            assert_eq!(line(state), "35 20 * * SUN", "the day carries over");
+            state.toggle_wake_weekday(6, cx);
+            assert_eq!(line(state), "35 20 * * SUN,SAT");
+            assert_eq!(summary(state), "Weekends at 8:35 PM");
+            state.toggle_wake_weekday(0, cx);
+            state.toggle_wake_month(1, cx);
+            state.toggle_wake_month(3, cx);
+            assert_eq!(line(state), "35 20 * 1,3 SAT");
+            assert_eq!(summary(state), "Every Saturday at 8:35 PM, in Jan and Mar");
+
+            // Monthly
+            state.pick_wake_tab(WakeTab::Monthly, cx);
+            state.toggle_wake_date(15, cx);
+            assert_eq!(line(state), "35 20 1,15 1,3 *");
+            assert_eq!(
+                summary(state),
+                "Monthly on the 1st and 15th at 8:35 PM, in Jan and Mar"
+            );
+
+            // Cron: five fields, said in words, with the server's next run or its refusal.
+            state.pick_wake_tab(WakeTab::Cron, cx);
+            assert_eq!(
+                line(state),
+                "35 20 1,15 1,3 *",
+                "it starts from the line it was"
+            );
+            state.set_wake_box(WakeBox::Cron, "0 9 * * MON-FRI".into(), true, cx);
+            assert_eq!(summary(state), "Weekdays at 9:00 AM");
+            let now = chrono::Utc::now();
+            let status = state.routine_wake_editor.as_ref().unwrap().status(now);
+            assert!(status.can_save() && status.next.is_some(), "{status:?}");
+            state.set_wake_box(WakeBox::Cron, "0 9 * * 1-5".into(), true, cx);
+            let status = state.routine_wake_editor.as_ref().unwrap().status(now);
+            assert!(status.numbered_weekdays, "the note says how they count");
+            assert_eq!(
+                status.summary, "Weekdays at 9:00 AM",
+                "standard cron's 1-5 (#331)"
+            );
+            assert!(status.can_save() && status.next.is_some(), "{status:?}");
+            for refused in ["0 9 * * 8", "@every 1h", "0 9 * *"] {
+                state.set_wake_box(WakeBox::Cron, refused.into(), true, cx);
+                let status = state.routine_wake_editor.as_ref().unwrap().status(now);
+                assert!(!status.can_save(), "{refused}: {status:?}");
+            }
+
+            // A routine that is a schedule cannot become a webhook.
+            state.pick_wake_tab(WakeTab::Webhook, cx);
+            assert_eq!(
+                state.routine_wake_editor.as_ref().unwrap().tab,
+                WakeTab::Cron
+            );
+
+            // Save puts it on the routine.
+            state.set_wake_box(WakeBox::Cron, "0 9 * * MON-FRI".into(), true, cx);
+            assert_eq!(
+                state.save_wake("Weekly".into(), "write the weekly report".into(), cx),
+                WakeSaved::Changed
+            );
+            assert!(state.routine_wake_editor.is_none());
+            let row = state.routine_mut("cw_1", "sch_1").unwrap();
+            assert_eq!(row.triggers[0].label(), "Weekdays at 9:00 AM");
+        });
+    }
+
+    /// A box that is not a time is no time, which the editor says, rather than an older time the
+    /// box no longer shows; Save waits for one. Cancel leaves the routine as it was.
+    #[gpui_kit::test]
+    fn a_box_that_is_not_a_time_is_said_and_cancel_changes_nothing(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        use super::{WakeBox, WakeSaved, WakeTab};
+        use gpui_kit::AppContext as _;
+        let app = cx.new(|_| with_wakes());
+        app.update(cx, |state, cx| {
+            state.open_wake_editor("sch_1", Some(0), cx);
+            state.pick_wake_tab(WakeTab::Daily, cx);
+            state.set_wake_box(WakeBox::Hour, "13".into(), true, cx);
+            let status = state
+                .routine_wake_editor
+                .as_ref()
+                .unwrap()
+                .status(chrono::Utc::now());
+            assert!(
+                status
+                    .error
+                    .as_deref()
+                    .is_some_and(|why| why.contains("time of day")),
+                "{status:?}"
+            );
+            assert_eq!(
+                state.save_wake("Weekly".into(), "write the weekly report".into(), cx),
+                WakeSaved::Nothing
+            );
+            assert!(
+                state.routine_wake_editor.is_some(),
+                "still open, saying why"
+            );
+
+            state.close_wake_editor(cx);
+            assert_eq!(
+                state.routine_mut("cw_1", "sch_1").unwrap().triggers[0].label(),
+                "Every Sunday at 9:00 AM",
+                "nothing picked reached the routine"
+            );
+        });
+    }
+
+    /// A webhook routine's ✎ shows the webhook, and stays one; a draft's + may be either, and
+    /// Save on a draft makes the routine, with the name and instruction typed for it.
+    #[gpui_kit::test]
+    fn a_webhook_stays_one_and_a_drafts_first_wake_makes_it(cx: &mut gpui_kit::TestAppContext) {
+        use super::{WakeSaved, WakeTab};
+        use gpui_kit::AppContext as _;
+        let app = cx.new(|_| with_wakes());
+        app.update(cx, |state, cx| {
+            state.open_wake_editor("sch_hook", Some(0), cx);
+            let editor = state.routine_wake_editor.as_ref().unwrap();
+            assert_eq!(editor.tab, WakeTab::Webhook);
+            assert!(!editor.tab_open(WakeTab::Daily));
+            assert_eq!(editor.summary(), "When a webhook fires");
+            assert_eq!(
+                state.save_wake("Hook".into(), "Deal with it".into(), cx),
+                WakeSaved::Closed
+            );
+
+            state.open_wake_editor("draft-1", None, cx);
+            let editor = state.routine_wake_editor.as_ref().unwrap();
+            assert!(WakeTab::ALL.into_iter().all(|tab| editor.tab_open(tab)));
+            assert_eq!(
+                editor.tab,
+                WakeTab::Daily,
+                "a new wake starts at 9:00 AM daily"
+            );
+            assert_eq!(
+                state.save_wake("Morning".into(), "say hello".into(), cx),
+                WakeSaved::Created
+            );
+            let draft = state.routine_mut("cw_1", "draft-1").unwrap();
+            assert_eq!(
+                (draft.name.as_str(), draft.instruction.as_str()),
+                ("Morning", "say hello"),
+                "what was typed goes to the server with it"
+            );
+        });
+    }
+
+    /// A slow server is asked for the computer's status one request at a time: ticks that come
+    /// while one is out add nothing, and a refresh asked for meanwhile goes once, after the
+    /// answer, so it never takes an answer that predates it. Without this the two-second poll
+    /// piled five requests on a server taking eleven seconds each, slowing them all.
+    #[test]
+    fn the_computers_status_is_asked_one_request_at_a_time() {
+        let mut state = AppState::default();
+        assert!(state.begin_computer_refresh(), "the first goes");
+        assert!(
+            !state.begin_computer_refresh(),
+            "a tick while it is out waits"
+        );
+        assert!(!state.begin_computer_refresh(), "and so does the next");
+        assert!(
+            state.settle_computer_refresh(),
+            "the answer lands, and one more goes for what was asked meanwhile"
+        );
+        assert!(state.begin_computer_refresh(), "that one goes");
+        assert!(
+            !state.settle_computer_refresh(),
+            "nothing was asked while it was out, so nothing follows it"
+        );
+        assert!(
+            state.begin_computer_refresh(),
+            "and the next tick goes again"
+        );
+    }
+
+    // ---- A routine on a server that cannot do everything with one -------------------------
+
+    /// The open bot and its routines, talking to `server`.
+    fn routines_on(server: &wiremock::MockServer) -> AppState {
+        let mut state = with_routines();
+        state.opengrok = Some(OpenGrokClient::new(&server.uri()).expect("a URL that parses"));
+        state
+    }
+
+    /// `server` answers `method path` with `answer`, and nothing else.
+    async fn answers(
+        method: &str,
+        route: &str,
+        answer: wiremock::ResponseTemplate,
+    ) -> wiremock::MockServer {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method(method))
+            .and(wiremock::matchers::path(route))
+            .respond_with(answer)
+            .mount(&server)
+            .await;
+        server
+    }
+
+    /// A server from before routines kept a history answers `GET /schedules/{id}/runs` with an
+    /// empty 404. The history says it cannot show the runs, in place of "No runs yet", and there
+    /// is no red line over the editor about a read nobody asked for; nor is it asked again.
+    #[tokio::test]
+    async fn a_server_without_a_routines_history_says_so_in_the_history() {
+        let server = answers(
+            "GET",
+            "/schedules/sch_1/runs",
+            wiremock::ResponseTemplate::new(404),
+        )
+        .await;
+        let mut state = routines_on(&server);
+        let (client, read) = state
+            .begin_routine_runs_read("cw_1", "sch_1")
+            .expect("a routine the server has");
+        let result = client.schedule_runs("sch_1").await;
+        assert!(state.settle_routine_runs("cw_1", "sch_1", read, result));
+        assert!(state.routine_routes_missing.runs);
+        assert_eq!(state.computer_action_error, None, "not \"request failed\"");
+        assert!(
+            state.begin_routine_runs_read("cw_1", "sch_1").is_none(),
+            "a server that has said it cannot is not asked again"
+        );
+    }
+
+    /// A server from before routines could be changed answers `PATCH /schedules/{id}` with a
+    /// 405. What the person typed stays on screen to read, the line says why, the routine goes
+    /// back to the server's own values (which the fields follow), and from then on an edit is
+    /// refused here the same way rather than sent again.
+    #[tokio::test]
+    async fn a_server_that_cannot_change_a_routine_keeps_what_was_typed_and_puts_its_own_back() {
+        let server = answers(
+            "PATCH",
+            "/schedules/sch_1",
+            wiremock::ResponseTemplate::new(405),
+        )
+        .await;
+        let mut state = routines_on(&server);
+        // Every minute, where the server has Sundays at nine, and a new name.
+        if let Some(super::RoutineTrigger::Schedule { spec, .. }) = state
+            .routine_mut("cw_1", "sch_1")
+            .and_then(|row| row.triggers.first_mut())
+        {
+            *spec = super::ScheduleSpec::interval(1, super::ScheduleUnit::Minutes);
+        }
+        let (client, number, edit) = state
+            .begin_routine_edit(
+                "cw_1",
+                "sch_1",
+                "Daily".into(),
+                "write the weekly report".into(),
+            )
+            .expect("an edit to send");
+        assert_eq!(edit.cron.as_deref(), Some("* * * * *"));
+        let result = client.edit_schedule("sch_1", &edit).await;
+        assert_eq!(
+            state.settle_routine_edit("cw_1", "sch_1", number, edit.clone(), result),
+            super::AfterRoutineEdit::Nothing,
+            "nothing to read back: the server has what it had"
+        );
+
+        assert!(state.routine_routes_missing.edit);
+        assert_eq!(
+            state.computer_action_error.as_deref(),
+            Some(super::ROUTINE_EDIT_UNAVAILABLE)
+        );
+        assert_eq!(state.routine_unsaved.get("sch_1"), Some(&edit));
+        assert_eq!(
+            super::unsaved_lines(&edit),
+            [
+                ("Name", "Daily".to_string()),
+                ("When", "Every 1 minute".to_string())
+            ]
+        );
+        let row = state.routine_mut("cw_1", "sch_1").expect("the routine");
+        assert_eq!(row.name, "Weekly", "the server's name is back");
+        assert!(
+            super::routine_edit(row).is_empty(),
+            "and so is its schedule: nothing differs from what it has"
+        );
+        assert_eq!(
+            state.routine_resync("sch_1"),
+            1,
+            "the fields follow it back"
+        );
+        assert_eq!(
+            super::routine_notes(state.routine_routes_missing, true),
+            [("cant-change", super::ROUTINE_EDIT_UNAVAILABLE)]
+        );
+        assert!(
+            super::routine_notes(state.routine_routes_missing, false).is_empty(),
+            "a draft is made by a route every server has"
+        );
+
+        state.computer_action_error = None;
+        assert!(
+            state
+                .begin_routine_edit(
+                    "cw_1",
+                    "sch_1",
+                    "Again".into(),
+                    "write the weekly report".into()
+                )
+                .is_none(),
+            "not sent again"
+        );
+        assert_eq!(
+            state.computer_action_error.as_deref(),
+            Some(super::ROUTINE_EDIT_UNAVAILABLE)
+        );
+        assert_eq!(
+            state
+                .routine_unsaved
+                .get("sch_1")
+                .and_then(|edit| edit.name.as_deref()),
+            Some("Again")
+        );
+        assert_eq!(state.routine_mut("cw_1", "sch_1").unwrap().name, "Weekly");
+        let mut sent = server
+            .received_requests()
+            .await
+            .expect("the recorder is on");
+        sent.retain(|request| request.method.as_str() == "PATCH");
+        assert_eq!(sent.len(), 1, "one PATCH, the first");
+    }
+
+    /// A server from before routines could be run on demand answers `POST /schedules/{id}/run`
+    /// with an empty 404. Test run says so and goes dead, and a run asked for after that is
+    /// refused here in the same words rather than sent.
+    #[tokio::test]
+    async fn a_server_that_cannot_run_a_routine_on_demand_says_so_and_test_run_goes_dead() {
+        let server = answers(
+            "POST",
+            "/schedules/sch_1/run",
+            wiremock::ResponseTemplate::new(404),
+        )
+        .await;
+        let mut state = routines_on(&server);
+        let client = state
+            .begin_routine_run("cw_1", "sch_1")
+            .expect("a run to start");
+        let result = client.run_schedule_now("sch_1").await;
+        assert!(
+            !state.settle_routine_run("cw_1", "sch_1", result),
+            "no run started, so no history to read"
+        );
+        assert!(state.routine_routes_missing.run_now);
+        assert_eq!(
+            state.computer_action_error.as_deref(),
+            Some(super::ROUTINE_RUN_UNAVAILABLE)
+        );
+        assert!(
+            super::routine_notes(state.routine_routes_missing, false)
+                .contains(&("cant-run", super::ROUTINE_RUN_UNAVAILABLE))
+        );
+
+        state.computer_action_error = None;
+        assert!(state.begin_routine_run("cw_1", "sch_1").is_none());
+        assert_eq!(
+            state.computer_action_error.as_deref(),
+            Some(super::ROUTINE_RUN_UNAVAILABLE)
+        );
+    }
+
+    /// Any other refusal is said in the server's words, and one with no words in it as what the
+    /// server answered: never the client's stand-in, "request failed". Neither marks a route as
+    /// missing, so nothing goes dead over a routine that is gone or a server having a bad moment.
+    #[tokio::test]
+    async fn a_routine_refusal_is_the_servers_words_and_never_a_bare_request_failed() {
+        let gone = answers(
+            "POST",
+            "/schedules/sch_1/run",
+            wiremock::ResponseTemplate::new(404).set_body_string("no such schedule"),
+        )
+        .await;
+        let mut state = routines_on(&gone);
+        let client = state.begin_routine_run("cw_1", "sch_1").expect("a run");
+        let result = client.run_schedule_now("sch_1").await;
+        assert!(!state.settle_routine_run("cw_1", "sch_1", result));
+        assert_eq!(
+            state.computer_action_error.as_deref(),
+            Some("No such schedule")
+        );
+        assert!(!state.routine_routes_missing.run_now);
+
+        let silent = answers(
+            "GET",
+            "/schedules/sch_1/runs",
+            wiremock::ResponseTemplate::new(500),
+        )
+        .await;
+        let mut state = routines_on(&silent);
+        let (client, read) = state
+            .begin_routine_runs_read("cw_1", "sch_1")
+            .expect("a read");
+        let result = client.schedule_runs("sch_1").await;
+        assert!(state.settle_routine_runs("cw_1", "sch_1", read, result));
+        assert_eq!(
+            state.computer_action_error.as_deref(),
+            Some("The server answered 500 without saying why.")
+        );
+        assert!(!state.routine_routes_missing.runs);
+
+        // Nobody answered at all.
+        let mut state = with_routines();
+        state.opengrok = Some(OpenGrokClient::new("http://127.0.0.1:9").expect("a URL"));
+        let (client, read) = state
+            .begin_routine_runs_read("cw_1", "sch_1")
+            .expect("a read");
+        let result = client.schedule_runs("sch_1").await;
+        assert!(state.settle_routine_runs("cw_1", "sch_1", read, result));
+        assert_eq!(
+            state.computer_action_error.as_deref(),
+            Some("Could not reach the server.")
+        );
+    }
+
+    /// A firing the server skipped (opengrok-server #316: the Bot answers on its person's own
+    /// plan, and no computer held the relay) is a line of the history with no run: it says the
+    /// server's sentence, opens nothing, and is settled, so nothing reads it again.
+    #[test]
+    fn a_skipped_line_says_why_and_has_no_run_to_open() {
+        let said = "Skipped: your computer was off, so your plan couldn't answer";
+        let line: crate::opengrok::ScheduleRun = serde_json::from_value(serde_json::json!({
+            "runId": null, "cause": "clock", "status": null, "startedAtMs": null,
+            "endedAtMs": null, "at": 1_790_000_000_000i64, "state": "skipped",
+            "skipped": "relay_offline", "reason": said
+        }))
+        .expect("a skipped line");
+        let run = super::RoutineRun::from_server(line);
+        assert_eq!(
+            run.outcome,
+            super::RunOutcome::Skipped {
+                reason: said.into()
+            }
+        );
+        assert_eq!(run.run_id(), None, "nothing to open");
+        assert!(!run.unsettled(), "a skip is settled");
+        assert_eq!(run.cause_label(), "Schedule");
+        assert_eq!(
+            run.started_at_ms, 1_790_000_000_000,
+            "its time is when it was due"
+        );
+        assert!(!run.at.is_empty());
+    }
+
+    /// Run it now on a Bot whose own plan cannot answer (opengrok-server #316, #334, on main
+    /// 8e7387f: no computer holds the person's relay) is the server's 409 with the skip's code. Its
+    /// sentence goes on the routine's red line, nothing is shown as running, and the history is
+    /// read again for the line the server kept, which says the same and opens nothing.
+    #[tokio::test]
+    async fn run_now_while_the_plan_cannot_answer_says_why_and_reads_the_skip_back() {
+        let said = "Skipped: your computer was off, so your plan couldn't answer";
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/schedules/sch_1/run"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(409)
+                    .set_body_json(serde_json::json!({ "error": said, "code": "relay_offline" })),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/schedules/sch_1/runs"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!([{
+                    "runId": null, "cause": "manual", "status": null, "startedAtMs": null,
+                    "endedAtMs": null, "at": 1_790_000_000_000i64, "state": "skipped",
+                    "skipped": "relay_offline", "reason": said
+                }])),
+            )
+            .mount(&server)
+            .await;
+        let mut state = routines_on(&server);
+        let client = state
+            .begin_routine_run("cw_1", "sch_1")
+            .expect("a run to ask for");
+        let result = client.run_schedule_now("sch_1").await;
+        assert!(
+            state.settle_routine_run("cw_1", "sch_1", result),
+            "the history is read again for the skip"
+        );
+        assert_eq!(state.computer_action_error.as_deref(), Some(said));
+        assert!(
+            state.routine_mut("cw_1", "sch_1").unwrap().runs.is_empty(),
+            "no run started, so none is shown running"
+        );
+
+        let (client, read) = state
+            .begin_routine_runs_read("cw_1", "sch_1")
+            .expect("a read");
+        let result = client.schedule_runs("sch_1").await;
+        assert!(state.settle_routine_runs("cw_1", "sch_1", read, result));
+        assert_eq!(
+            state.computer_action_error.as_deref(),
+            Some(said),
+            "the read raises nothing of its own"
+        );
+        let runs = &state.routine_mut("cw_1", "sch_1").unwrap().runs;
+        assert_eq!(runs.len(), 1);
+        assert_eq!(
+            runs[0].outcome,
+            super::RunOutcome::Skipped {
+                reason: said.into()
+            }
+        );
+        assert_eq!(runs[0].cause_label(), "Test run");
+        assert_eq!(runs[0].run_id(), None);
+    }
+
+    /// The history the server recorded for a routine of a Bot on its person's plan, run now and
+    /// then due while they switched the relay off and set no fallback (opengrok-server #332 (PR
+    /// #338 at 66b9f7b)): two skipped lines, `skipped: "relay_disabled"` with the server's reason.
+    fn relay_off_history() -> serde_json::Value {
+        recorded_body(include_str!(
+            "../fixtures/wire/rest/GET__schedules__id__runs/200-a_plan_bots_routine_is_skipped_while_the_relay_is_off_with_no_fallback.json"
+        ))
+    }
+
+    /// A routine of a Bot on its person's plan, run now and then due while they switched the
+    /// relay off with no fallback, is skipped each time (opengrok-server #332 (PR #338 at
+    /// 66b9f7b), as recorded: Run it now is the 409 with `relay_disabled` beside the skip's
+    /// sentence, and the history keeps a line for each, `skipped: "relay_disabled"` with its
+    /// `reason`). Run it now says the server's sentence and reads the history again, and each
+    /// skipped line, Test run's and the schedule's, says the server's reason and opens nothing.
+    #[tokio::test]
+    async fn a_routine_skipped_while_the_relay_is_off_says_the_servers_reason() {
+        let said = "Skipped: Relay is off for your plan";
+        let refused = recorded_body(include_str!(
+            "../fixtures/wire/rest/POST__schedules__id__run/409-a_plan_bots_routine_is_skipped_while_the_relay_is_off_with_no_fallback.json"
+        ));
+        assert_eq!(
+            refused,
+            serde_json::json!({ "error": said, "code": "relay_disabled" })
+        );
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/schedules/sch_1/run"))
+            .respond_with(wiremock::ResponseTemplate::new(409).set_body_json(refused))
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/schedules/sch_1/runs"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(relay_off_history()))
+            .mount(&server)
+            .await;
+        let mut state = routines_on(&server);
+        let client = state
+            .begin_routine_run("cw_1", "sch_1")
+            .expect("a run to ask for");
+        let result = client.run_schedule_now("sch_1").await;
+        assert!(
+            state.settle_routine_run("cw_1", "sch_1", result),
+            "the history is read again for the skip"
+        );
+        assert_eq!(state.computer_action_error.as_deref(), Some(said));
+
+        let (client, read) = state
+            .begin_routine_runs_read("cw_1", "sch_1")
+            .expect("a read");
+        let result = client.schedule_runs("sch_1").await;
+        assert!(state.settle_routine_runs("cw_1", "sch_1", read, result));
+        let runs = &state.routine_mut("cw_1", "sch_1").unwrap().runs;
+        let mut causes: Vec<String> = runs.iter().map(|run| run.cause_label()).collect();
+        causes.sort_unstable();
+        assert_eq!(causes, ["Schedule", "Test run"]);
+        for run in runs {
+            assert_eq!(
+                run.outcome,
+                super::RunOutcome::Skipped {
+                    reason: said.into()
+                }
+            );
+            assert_eq!(run.run_id(), None, "nothing to open");
+        }
+    }
+
+    /// On a driver's tree, each line of that history is `routine-{id}-skipped-{atMs}`, by when it
+    /// was due as the server recorded it, valued with the server's reason and in state `skipped`.
+    #[cfg(feature = "agent")]
+    #[test]
+    fn a_routine_skipped_while_the_relay_is_off_is_on_a_drivers_tree_in_the_servers_words() {
+        use crate::agent::{NativeChatHost, ids};
+        use gpui_agent::prelude::AgentHost;
+        let lines: Vec<crate::opengrok::ScheduleRun> =
+            serde_json::from_value(relay_off_history()).expect("the recorded history");
+        let due: Vec<i64> = lines.iter().filter_map(|line| line.at).collect();
+        assert_eq!(due.len(), 2);
+        let mut state = with_routines();
+        state.account = Some(
+            serde_json::from_value(serde_json::json!({ "id": "acc_1", "email": "a@example.com" }))
+                .expect("an account"),
+        );
+        state.auth_status = super::AuthStatus::SignedIn;
+        state.right_pane = super::RightPane::Computer;
+        state.routine_mut("cw_1", "sch_1").unwrap().runs = lines
+            .into_iter()
+            .map(super::RoutineRun::from_server)
+            .collect();
+        let tree = NativeChatHost::from_app(&state).snapshot();
+        for at_ms in due {
+            let line = tree
+                .find(&ids::routine_skipped("sch_1", at_ms))
+                .expect("the skipped line");
+            assert_eq!(
+                line.value.as_deref(),
+                Some("Skipped: Relay is off for your plan")
+            );
+            assert!(line.states.iter().any(|state| state == "skipped"));
+        }
+    }
+
+    /// An edit the server takes is what the routine reads as from then on: its answer, in the
+    /// server's six-field form, is the picker's every minute again, nothing is left to send, and a
+    /// listing read later (the editor opened again from another Bot) says the same.
+    #[tokio::test]
+    async fn an_edit_the_server_takes_is_what_the_routine_reads_as_when_opened_again() {
+        let saved = serde_json::json!({
+            "id": "sch_1", "coworkerId": "cw_1", "kind": "cron", "cron": "0 * * * * *",
+            "prompt": "write the weekly report", "name": "Weekly", "active": true
+        });
+        let server = answers(
+            "PATCH",
+            "/schedules/sch_1",
+            wiremock::ResponseTemplate::new(200).set_body_json(saved.clone()),
+        )
+        .await;
+        let mut state = routines_on(&server);
+        if let Some(super::RoutineTrigger::Schedule { spec, .. }) = state
+            .routine_mut("cw_1", "sch_1")
+            .and_then(|row| row.triggers.first_mut())
+        {
+            *spec = super::ScheduleSpec::interval(1, super::ScheduleUnit::Minutes);
+        }
+        let (client, number, edit) = state
+            .begin_routine_edit(
+                "cw_1",
+                "sch_1",
+                "Weekly".into(),
+                "write the weekly report".into(),
+            )
+            .expect("an edit to send");
+        let result = client.edit_schedule("sch_1", &edit).await;
+        assert_eq!(
+            state.settle_routine_edit("cw_1", "sch_1", number, edit, result),
+            super::AfterRoutineEdit::Nothing
+        );
+        let label = |routine: &super::AgentRoutine| routine.triggers[0].label();
+        let row = state.routine_mut("cw_1", "sch_1").expect("the routine");
+        assert_eq!(label(row), "Every 1 minute");
+        assert!(super::routine_edit(row).is_empty(), "nothing left to send");
+        assert_eq!(state.computer_action_error, None);
+        assert!(state.routine_unsaved.is_empty());
+
+        let listed = super::relisted(
+            state.routines.get("cw_1").map(Vec::as_slice),
+            vec![serde_json::from_value(saved).unwrap()],
+        );
+        assert_eq!(label(&listed[0]), "Every 1 minute");
+    }
+
     // ---- Stopping a turn --------------------------------------------------------------------
 
     /// A thread with a turn in flight in it, the way `send_opengrok_turn` leaves one: the row the
@@ -24534,6 +28616,135 @@ mod tests {
             .iter()
             .find(|message| message.id == id)
             .expect("the bubble")
+    }
+
+    /// A frame of the running turn, landed the way `send_opengrok_turn_with`'s stream lands it:
+    /// folded into the turn's assembler, then written into the row the turn was started with,
+    /// found by its name, unless the turn has been settled or replaced since.
+    fn stream_into(state: &mut AppState, assembler: &mut TurnAssembler, frame: serde_json::Value) {
+        let LiveTurn {
+            run_id, message_id, ..
+        } = in_flight();
+        assembler.push_event(&frame);
+        let (plain, parts) = assembler.snapshot();
+        if !state.turn_is_unsettled("cw_1", &run_id) {
+            return;
+        }
+        if let Some(message) = streaming_message_mut(&mut state.conversations, "cw_1", &message_id)
+        {
+            message.content = plain;
+            message.parts = parts;
+        }
+    }
+
+    /// A message sent while the turn runs, held the way `SendPlan::Queue` holds it: its bubble
+    /// goes on the end of the thread, and its hold into the queue.
+    fn hold_a_send(state: &mut AppState, id: &str, words: &str) {
+        assert!(state.would_queue(false), "a send now waits for the turn");
+        state.conversations[0]
+            .messages
+            .push(message(id, true, words));
+        state.enqueue_hold(
+            "cw_1".to_string(),
+            super::held_message(id.to_string(), words.to_string(), None, None, None, None),
+        );
+    }
+
+    /// The bug the person reported: a message sent while a reply was streaming was held, as it
+    /// should be, and from that moment the reply stood still on screen with "is working" still
+    /// lit, until the run ended and the whole of it landed at once. The thread had every word
+    /// all along; what stopped was the transcript looking at the row they went into, because that
+    /// row was no longer the last one. Taking the held message back to the composer and sending
+    /// it again, or cancelling it, leaves a bubble under the reply too, shown or hidden, and the
+    /// reply has to keep coming through each of those as well.
+    #[test]
+    fn a_reply_goes_on_streaming_while_a_message_is_held_under_it() {
+        use crate::components::chat::ShownFeed;
+        let mut state = mid_turn(at(message("m_live", false, ""), 20));
+        let mut assembler = TurnAssembler::default();
+        let mut screen = ShownFeed::of(&state);
+        let words = |delta: &str| json!({ "type": "TEXT_MESSAGE_CONTENT", "messageId": "msg_1", "delta": delta });
+        let reply_on_screen = |screen: &ShownFeed| -> String {
+            screen
+                .words()
+                .into_iter()
+                .filter(|(id, _, _)| id == "m_live")
+                .map(|(_, said, _)| said)
+                .collect()
+        };
+        for frame in [
+            json!({ "type": "RUN_STARTED", "threadId": "cw_1", "runId": "run_1" }),
+            json!({ "type": "TEXT_MESSAGE_START", "messageId": "msg_1", "role": "assistant" }),
+            words("The draft, humanized: "),
+        ] {
+            stream_into(&mut state, &mut assembler, frame);
+            screen.observe(&state);
+        }
+        assert_eq!(reply_on_screen(&screen), "The draft, humanized: ");
+
+        // Sent mid-stream, it waits for the turn, under the reply it arrived during.
+        hold_a_send(&mut state, "m_held", "make it shorter");
+        screen.observe(&state);
+        let row = |id: &str, said: &str, queued: bool| (id.to_string(), said.to_string(), queued);
+        assert_eq!(
+            screen.words(),
+            [
+                row("m_ask", "open youtube", false),
+                row("m_live", "The draft, humanized: ", false),
+                row("m_held", "make it shorter", true),
+            ],
+            "the held bubble sits under the reply and says it is queued"
+        );
+
+        stream_into(&mut state, &mut assembler, words("first line"));
+        screen.observe(&state);
+        assert_eq!(
+            bubble(&state, "m_live").content,
+            "The draft, humanized: first line",
+            "the thread has the words"
+        );
+        assert_eq!(
+            reply_on_screen(&screen),
+            "The draft, humanized: first line",
+            "and the screen shows them while the run is still going"
+        );
+
+        // Edit: the hold goes back to the composer and its bubble is hidden where it stood. Sent
+        // again, the words are a new bubble on the end, in the hold's old place in the queue.
+        let refill = state
+            .take_hold_for_edit("m_held", "")
+            .expect("the hold comes off");
+        state.hide_message_in_memory("m_held");
+        hold_a_send(&mut state, "m_again", &format!("{} please", refill.content));
+        screen.observe(&state);
+        stream_into(&mut state, &mut assembler, words(", second line"));
+        screen.observe(&state);
+        assert_eq!(
+            reply_on_screen(&screen),
+            "The draft, humanized: first line, second line",
+            "an edited send is held under the reply as well, and the reply keeps coming"
+        );
+        assert_eq!(
+            screen.words().last(),
+            Some(&row("m_again", "make it shorter please", true))
+        );
+
+        // Cancel: the hold comes off and its bubble is hidden, still the last thing in the
+        // thread, and the reply goes on arriving above it.
+        state.hide_message_in_memory("m_again");
+        assert!(!state.is_send_queued("m_again"));
+        screen.observe(&state);
+        stream_into(&mut state, &mut assembler, words(", third line"));
+        screen.observe(&state);
+        assert_eq!(
+            reply_on_screen(&screen),
+            "The draft, humanized: first line, second line, third line",
+            "a cancelled send leaves the reply streaming"
+        );
+        assert!(
+            state.is_active_bot_responding(),
+            "all of it before the run ended"
+        );
     }
 
     /// Cancel and Delete both go through `delete_message`: the hold comes off in the same call
@@ -26240,6 +30451,8 @@ mod tests {
             mode: LocalExecMode::Ask,
             this_machine: false,
             online: true,
+            relay_enabled: true,
+            relaying: false,
         };
         state.computers = vec![other.clone()];
         assert_eq!(state.this_mac_id(), None);
@@ -26546,6 +30759,8 @@ mod tests {
             mode: LocalExecMode::Ask,
             this_machine: false,
             online: true,
+            relay_enabled: true,
+            relaying: false,
         };
         state.computers = vec![not_this_mac.clone()];
         assert!(state.this_mac_rules().is_none());
@@ -26593,6 +30808,8 @@ mod tests {
             mode: LocalExecMode::Ask,
             this_machine: true,
             online: true,
+            relay_enabled: true,
+            relaying: false,
         }];
         state.local_rules = Some(LocalRules::listed(
             "mac_here".into(),
@@ -27416,6 +31633,8 @@ mod tests {
                 .map(|id| ModelEntry {
                     id: (*id).to_string(),
                     source: None,
+                    via: None,
+                    ..Default::default()
                 })
                 .collect(),
             note: note.map(str::to_string),
@@ -27434,6 +31653,8 @@ mod tests {
         let entry = |id: &&str, source: &str| ModelEntry {
             id: (*id).to_string(),
             source: Some(source.to_string()),
+            via: None,
+            ..Default::default()
         };
         ModelCatalogue {
             models: gateway
@@ -27442,7 +31663,10 @@ mod tests {
                 .chain(plan.iter().map(|id| entry(id, "local_proxy")))
                 .collect(),
             note: note.map(str::to_string),
-            local_proxy: proxy_healthy.map(|healthy| crate::opengrok::LocalProxyStatus { healthy }),
+            local_proxy: proxy_healthy.map(|healthy| crate::opengrok::LocalProxyStatus {
+                healthy,
+                relay_connected: false,
+            }),
         }
     }
 
@@ -27501,7 +31725,10 @@ mod tests {
         );
         assert_eq!(
             held.local_proxy,
-            Some(crate::opengrok::LocalProxyStatus { healthy: false }),
+            Some(crate::opengrok::LocalProxyStatus {
+                healthy: false,
+                relay_connected: false,
+            }),
             "and says it is down"
         );
 
@@ -27517,6 +31744,143 @@ mod tests {
         apply_catalogue(&mut held, both_doors(&["oag/cheap"], &[], None, None));
         assert_eq!(model_ids(&held), ["oag/cheap"]);
         assert_eq!(held.local_proxy, None);
+    }
+
+    /// The plan's models come two ways with the Mac relay, and each list is kept by the same rule,
+    /// apart: no Mac holding the relay leaves the Mac's models in its picker while the server's
+    /// own opencodex answers fresh, and opencodex down on the server's machine says nothing of
+    /// the Mac's. Each way's list holds only that way's models, held to the allowlist: each is
+    /// the pickers' Subscription group while the account's way to the plan is that way.
+    #[test]
+    fn the_macs_models_are_kept_apart_from_the_servers_machines() {
+        let listed = |here: &[&str], mac: &[&str], healthy: bool, relay: bool| {
+            let entry = |id: &&str, via: &str| ModelEntry {
+                id: (*id).to_string(),
+                source: Some("local_proxy".into()),
+                via: Some(via.into()),
+                ..Default::default()
+            };
+            ModelCatalogue {
+                models: here
+                    .iter()
+                    .map(|id| entry(id, "loopback"))
+                    .chain(mac.iter().map(|id| entry(id, "mac")))
+                    .collect(),
+                note: None,
+                local_proxy: Some(crate::opengrok::LocalProxyStatus {
+                    healthy,
+                    relay_connected: relay,
+                }),
+            }
+        };
+        let mut state = AppState::new();
+        apply_catalogue(
+            &mut state.model_catalogue,
+            listed(&["gpt-5-codex"], &["grok-4", "claude-opus"], true, true),
+        );
+        assert_eq!(
+            state.plan_models(crate::opengrok::Via::Loopback),
+            ["gpt-5-codex"]
+        );
+        assert_eq!(
+            state.plan_models(crate::opengrok::Via::Mac),
+            ["grok-4"],
+            "the allowlist holds for the Mac too"
+        );
+
+        // No Mac holds the relay: its models stay, while the server's machine's come back fresh.
+        apply_catalogue(
+            &mut state.model_catalogue,
+            listed(&["gpt-5-codex", "o3"], &[], true, false),
+        );
+        assert_eq!(
+            state.plan_models(crate::opengrok::Via::Loopback),
+            ["gpt-5-codex", "o3"]
+        );
+        assert_eq!(state.plan_models(crate::opengrok::Via::Mac), ["grok-4"]);
+
+        // opencodex down on the server's machine: its models stay, and the Mac's are the Mac's.
+        apply_catalogue(
+            &mut state.model_catalogue,
+            listed(&[], &["gpt-5.5"], false, true),
+        );
+        assert_eq!(
+            state.plan_models(crate::opengrok::Via::Loopback),
+            ["gpt-5-codex", "o3"]
+        );
+        assert_eq!(state.plan_models(crate::opengrok::Via::Mac), ["gpt-5.5"]);
+
+        // A Mac answering that lists nothing: that is the answer.
+        apply_catalogue(&mut state.model_catalogue, listed(&[], &[], false, true));
+        assert!(state.plan_models(crate::opengrok::Via::Mac).is_empty());
+    }
+
+    /// A Bot on the person's plan names the account's way to it on every turn: through the
+    /// person's Mac where that is the account's way, on the server's own machine where that is,
+    /// named with its way to a server that knows the relay, and as the bare word to one from
+    /// before it, the only word that one reads. A Bot on the server's keys names them whatever
+    /// the account's way, and a Bot that follows the account's door names nothing.
+    #[test]
+    fn a_bot_on_the_plan_names_the_accounts_way_to_it() {
+        use crate::opengrok::{RelayRead, Via};
+        let relayed = |via: &str| InferenceSource {
+            via: Some(via.into()),
+            relay: Some(RelayRead {
+                connected: true,
+                machine_id: Some("mac_1".into()),
+                machine_label: Some("NativeChat on studio".into()),
+                local_model: Some("grok-4".into()),
+            }),
+            ..kept(InferenceKind::Gateway, Some("gpt-5-codex"))
+        };
+        let on = |source: serde_json::Value| {
+            let mut state = signed_in_state();
+            state.coworkers = vec![
+                serde_json::from_value(json!({
+                    "id": "cw_1", "name": "Ada", "model": "gpt-5-codex", "source": source
+                }))
+                .expect("a row"),
+            ];
+            state.active_coworker_id = Some("cw_1".into());
+            state
+        };
+        let mut state = on(json!("local_proxy"));
+        read_as(&mut state, relayed("mac"));
+        assert_eq!(
+            serde_json::to_value(state.turn_inference_source(None)).unwrap(),
+            json!({"kind": "local_proxy", "via": "mac"})
+        );
+        read_as(&mut state, relayed("loopback"));
+        assert_eq!(
+            state.turn_inference_source(None),
+            Some(TurnSource::plan(Some(Via::Loopback)))
+        );
+        // A server from before the relay: the bare word, the only one it reads.
+        read_as(
+            &mut state,
+            kept(InferenceKind::Gateway, Some("gpt-5-codex")),
+        );
+        assert_eq!(
+            serde_json::to_value(state.turn_inference_source(None)).unwrap(),
+            json!("local_proxy")
+        );
+        // The account's setting not read yet: the plan, by the server's own way to it.
+        let state = on(json!("local_proxy"));
+        assert_eq!(
+            state.turn_inference_source(None),
+            Some(TurnSource::plan(None))
+        );
+
+        let mut state = on(json!("gateway"));
+        read_as(&mut state, relayed("mac"));
+        assert_eq!(state.turn_inference_source(None), Some(TurnSource::GATEWAY));
+        let mut state = on(serde_json::Value::Null);
+        read_as(&mut state, relayed("mac"));
+        assert_eq!(
+            state.turn_inference_source(None),
+            None,
+            "the account's door, left to the server"
+        );
     }
 
     /// Only the newest read of `/models` lands. Several are asked in a row and need not answer
@@ -31733,11 +36097,8 @@ mod tests {
 
     // ---- Reply source: the server's paid keys, or the person's own plan ------------------------
 
-    use super::{
-        ActivationReads, AfterReplySourceSave, REPLY_SOURCE_NOT_ON_SERVER,
-        REPLY_SOURCE_SAVE_UNKNOWN, ReplySourceNote, ReplySourceRead, TurnSourceChip,
-    };
-    use crate::opengrok::{InferenceKind, InferenceSource, ReplySource};
+    use super::{ActivationReads, REPLY_SOURCE_NOT_ON_SERVER, ReplySourceNote, ReplySourceRead};
+    use crate::opengrok::{InferenceKind, InferenceSource, ReplySource, TurnSource};
 
     /// Somebody signed in, with a client that is never asked: every answer here is handed in.
     fn signed_in_state() -> AppState {
@@ -31758,6 +36119,11 @@ mod tests {
             local_model: local_model.map(str::to_string),
             healthy: true,
             has_api_key: false,
+            via: None,
+            relay: None,
+            new_bot_default: None,
+            relay_enabled: None,
+            plan_fallback: None,
         }
     }
 
@@ -31767,116 +36133,62 @@ mod tests {
         assert!(state.settle_reply_source_read(generation, Ok(source)));
     }
 
-    fn chip(state: &AppState) -> Option<(InferenceKind, bool)> {
-        state
-            .composer_turn_source()
-            .map(|chip| (chip.kind, chip.picked))
+    /// A Bot with Ada's row and the door given, open.
+    fn with_bot(state: &mut AppState, source: serde_json::Value) {
+        state.coworkers = vec![
+            serde_json::from_value(json!({
+                "id": "cw_1", "name": "Ada", "model": "gpt-5-codex", "source": source
+            }))
+            .expect("a row"),
+        ];
+        state.active_coworker_id = Some("cw_1".into());
     }
 
-    /// The composer's chip starts where the account's setting is, and a turn sent from there
-    /// names that door: the chip shows where the turn goes, and the turn goes there even if the
-    /// setting has moved on another Mac since it was read. A click picks the other door for the
-    /// next turns and it sticks, named by each, until clicked back; and it is gone with a sign
-    /// out, which is also what a relaunch starts from, since nothing but this memory keeps it.
-    /// With no chip to draw a turn names nothing, and the account's setting decides; with the
-    /// chip hidden while the composer dictates, it names the account's own door.
+    /// A turn names the open Bot's own door, whatever the account's is. A Bot that follows the
+    /// account's door, a server that keeps no door per Bot, and a door this app cannot name
+    /// name none, and the server goes by what it keeps. Moving the Bot moves its next turn with
+    /// it, and a sign-out forgets it all.
     #[test]
-    fn a_turn_names_the_door_the_composer_chip_shows() {
+    fn a_turn_names_the_bots_own_door() {
         let mut state = signed_in_state();
-        assert_eq!(chip(&state), None, "nothing read, no chip");
-        assert_eq!(state.turn_inference_source(None), None);
+        assert_eq!(state.turn_inference_source(None), None, "no Bot open");
+        with_bot(&mut state, json!("gateway"));
         read_as(
             &mut state,
             kept(InferenceKind::LocalProxy, Some("gpt-5-codex")),
         );
         assert_eq!(
-            state.composer_turn_source(),
-            Some(TurnSourceChip {
-                kind: InferenceKind::LocalProxy,
-                picked: false,
-                local_model: Some("gpt-5-codex".into()),
-            }),
-            "the account's own door"
+            state.turn_inference_source(None),
+            Some(TurnSource::GATEWAY),
+            "the Bot's own door, not the account's"
         );
+        state.coworkers[0].source = CoworkerSource::Kind(InferenceKind::LocalProxy);
         assert_eq!(
             state.turn_inference_source(None),
-            Some(InferenceKind::LocalProxy),
-            "the account's door, as the chip shows it, goes with the turn"
+            Some(TurnSource::plan(None))
         );
-
-        assert!(state.flip_turn_source());
-        assert_eq!(chip(&state), Some((InferenceKind::Gateway, true)));
-        assert_eq!(
-            state.turn_inference_source(None),
-            Some(InferenceKind::Gateway),
-            "the pick goes with the turn"
-        );
-        assert_eq!(
-            state.turn_inference_source(None),
-            Some(InferenceKind::Gateway),
-            "and with the one after it: it sticks"
-        );
-        assert!(state.flip_turn_source());
-        assert_eq!(chip(&state), Some((InferenceKind::LocalProxy, false)));
-        assert_eq!(
-            state.turn_inference_source(None),
-            Some(InferenceKind::LocalProxy),
-            "clicked back: the account's door again"
-        );
-
-        // An account on the server's keys with a plan set up: the chip starts on Server.
-        let mut state = signed_in_state();
-        read_as(&mut state, kept(InferenceKind::Gateway, Some("grok-4")));
-        assert_eq!(chip(&state), Some((InferenceKind::Gateway, false)));
-        assert_eq!(
-            state.turn_inference_source(None),
-            Some(InferenceKind::Gateway)
-        );
-        assert!(state.flip_turn_source());
-        assert_eq!(
-            state.turn_inference_source(None),
-            Some(InferenceKind::LocalProxy)
-        );
-        // A read that finds the account moved to the person's plan on another Mac: the pick is
-        // the account's own door now, and no pick at all.
-        read_as(&mut state, kept(InferenceKind::LocalProxy, Some("grok-4")));
-        assert_eq!(chip(&state), Some((InferenceKind::LocalProxy, false)));
-        assert_eq!(
-            state.turn_inference_source(None),
-            Some(InferenceKind::LocalProxy)
-        );
-
-        // While the composer dictates the chip is not drawn, and a turn names the account's own
-        // door rather than the pick nobody can see; the pick is still there when the chip comes
-        // back.
-        assert!(state.flip_turn_source());
-        state.composer_dictating = true;
-        assert_eq!(chip(&state), None);
-        assert_eq!(
-            state.turn_inference_source(None),
-            Some(InferenceKind::LocalProxy)
-        );
-        assert!(!state.flip_turn_source(), "no chip to click");
-        read_as(&mut state, kept(InferenceKind::LocalProxy, Some("grok-4")));
-        state.composer_dictating = false;
-        assert_eq!(chip(&state), Some((InferenceKind::Gateway, true)));
-
-        // Signing out forgets the pick with the setting.
+        for (none, why) in [
+            (
+                CoworkerSource::AccountDefault,
+                "it follows the account's door",
+            ),
+            (CoworkerSource::NotKept, "the server keeps no door per Bot"),
+            (
+                CoworkerSource::Unknown("byok".into()),
+                "a door this app cannot name",
+            ),
+        ] {
+            state.coworkers[0].source = none;
+            assert_eq!(state.turn_inference_source(None), None, "{why}");
+        }
+        state.coworkers[0].source = CoworkerSource::Kind(InferenceKind::Gateway);
         state.forget_account();
-        assert_eq!(chip(&state), None);
-        assert_eq!(state.turn_inference_source(None), None);
-
-        // No plan set up to switch to: no chip, and nothing a turn could carry.
-        let mut state = signed_in_state();
-        read_as(&mut state, kept(InferenceKind::Gateway, None));
-        assert_eq!(chip(&state), None);
-        assert!(!state.flip_turn_source());
-        assert_eq!(state.turn_inference_source(None), None);
+        assert_eq!(state.turn_inference_source(None), None, "signed out");
     }
 
     /// Coming back to the window reads the account's door again whenever somebody is signed
-    /// in: the chip starts at it and every turn names what the chip shows, so a door changed on
-    /// another Mac meanwhile is read before the next turn goes.
+    /// in: every Bot that has picked no door follows it, and the picker names its model, so a
+    /// door changed on another Mac meanwhile is read before the picker is next looked at.
     #[test]
     fn coming_back_to_the_window_reads_the_accounts_door_again() {
         let mut state = AppState::new();
@@ -31892,12 +36204,12 @@ mod tests {
                 reply_source: true,
                 ..ActivationReads::default()
             },
-            "with Settings shut, and with no Reply source on screen"
+            "with Settings shut, and with no page of it on screen"
         );
-        // Settings → Reply source on screen: the plan's models with it, since opencodex may have
-        // just been started in a terminal and listed them for the first time.
+        // Settings → General on screen: the plan's models with it, since opencodex may have just
+        // been started in a terminal and listed them for the first time.
         state.is_app_settings_open = true;
-        state.app_settings_tab = AppSettingsTab::ReplySource;
+        state.app_settings_tab = AppSettingsTab::General;
         assert_eq!(
             state.reads_on_activation(Instant::now()),
             ActivationReads {
@@ -31906,24 +36218,52 @@ mod tests {
                 ..ActivationReads::default()
             }
         );
+        // Settings → Computer on screen: the computers, whose relay switches another computer may
+        // have moved meanwhile, and no models, which that page does not show.
+        state.app_settings_tab = AppSettingsTab::Computer;
+        assert_eq!(
+            state.reads_on_activation(Instant::now()),
+            ActivationReads {
+                reply_source: true,
+                computers: true,
+                ..ActivationReads::default()
+            }
+        );
         state.app_settings_tab = AppSettingsTab::Logins;
-        assert!(!state.reads_on_activation(Instant::now()).models);
+        assert_eq!(
+            state.reads_on_activation(Instant::now()),
+            ActivationReads {
+                reply_source: true,
+                ..ActivationReads::default()
+            }
+        );
+        state.forget_account();
+        state.app_settings_tab = AppSettingsTab::Computer;
+        state.is_app_settings_open = true;
+        assert_eq!(
+            state.reads_on_activation(Instant::now()),
+            ActivationReads::default(),
+            "nobody signed in, nothing to ask"
+        );
     }
 
-    /// A message sent while a turn runs is held with the door the chip showed when it was sent,
-    /// and its turn names that door when it drains, whatever the chip shows by then; the row
-    /// the server keeps for it names it too. One held while the composer dictated keeps the
-    /// account's own door, which is what a turn sent then names. One held while there was no
-    /// chip to draw names none, even if a chip is drawn by the time it goes.
+    /// A message sent while a turn runs is held with the Bot's door as it was sent, and its turn
+    /// names that door when it drains, wherever the Bot has been moved by then; the row the
+    /// server keeps for it names it too. One held while the Bot followed the account's door
+    /// names none, even if the Bot has a door of its own by the time it goes.
     #[test]
     fn a_held_send_keeps_the_door_it_was_sent_under() {
         let mut state = signed_in_state();
+        with_bot(&mut state, json!("local_proxy"));
         read_as(
             &mut state,
-            kept(InferenceKind::LocalProxy, Some("gpt-5-codex")),
+            kept(InferenceKind::Gateway, Some("gpt-5-codex")),
         );
         let hold = state.hold_for_send("m_1".into(), "later".into(), None, None, None);
-        assert_eq!(hold.inference_source, Some(InferenceKind::LocalProxy));
+        assert_eq!(
+            hold.inference_source,
+            Some(InferenceKind::LocalProxy.into())
+        );
         assert_eq!(
             serde_json::to_value(super::pending_write_for(&hold)).unwrap()["inferenceSource"],
             "local_proxy",
@@ -31931,40 +36271,22 @@ mod tests {
         );
         state.enqueue_hold("cw_1".into(), hold);
 
-        // The chip is clicked to Server before the thread goes idle.
-        assert!(state.flip_turn_source());
+        // The Bot is moved to the server's keys before the thread goes idle.
+        state.coworkers[0].source = CoworkerSource::Kind(InferenceKind::Gateway);
         assert_eq!(
             state.turn_inference_source(None),
-            Some(InferenceKind::Gateway)
+            Some(InferenceKind::Gateway.into())
         );
         let drained = state.pop_queued_send("cw_1").expect("the hold drains");
         assert_eq!(
             state.turn_inference_source(Some(&drained)),
-            Some(InferenceKind::LocalProxy),
-            "sent under My plan, it goes through My plan"
+            Some(InferenceKind::LocalProxy.into()),
+            "sent on the plan, it goes on the plan"
         );
 
-        // Held while the composer dictated, with the chip picked to Server out of sight: the
-        // account's own door, now and when it drains, once the chip is back on its pick.
-        state.composer_dictating = true;
-        let dictated = state.hold_for_send("m_2".into(), "and this".into(), None, None, None);
-        assert_eq!(dictated.inference_source, Some(InferenceKind::LocalProxy));
-        assert_eq!(
-            serde_json::to_value(super::pending_write_for(&dictated)).unwrap()["inferenceSource"],
-            "local_proxy"
-        );
-        state.composer_dictating = false;
-        assert_eq!(chip(&state), Some((InferenceKind::Gateway, true)));
-        state.enqueue_hold("cw_1".into(), dictated);
-        let drained = state.pop_queued_send("cw_1").expect("the hold drains");
-        assert_eq!(
-            state.turn_inference_source(Some(&drained)),
-            Some(InferenceKind::LocalProxy)
-        );
-
-        // Held before the setting was read: no chip, no door, now or when it drains.
-        let mut state = signed_in_state();
-        let quiet = state.hold_for_send("m_3".into(), "early".into(), None, None, None);
+        // Held while the Bot followed the account's door: no door, now or when it drains.
+        state.coworkers[0].source = CoworkerSource::AccountDefault;
+        let quiet = state.hold_for_send("m_2".into(), "early".into(), None, None, None);
         assert_eq!(quiet.inference_source, None);
         assert!(
             serde_json::to_value(super::pending_write_for(&quiet))
@@ -31972,63 +36294,10 @@ mod tests {
                 .get("inferenceSource")
                 .is_none()
         );
-        read_as(
-            &mut state,
-            kept(InferenceKind::LocalProxy, Some("gpt-5-codex")),
-        );
+        state.coworkers[0].source = CoworkerSource::Kind(InferenceKind::LocalProxy);
         state.enqueue_hold("cw_1".into(), quiet);
         let drained = state.pop_queued_send("cw_1").expect("the hold drains");
         assert_eq!(state.turn_inference_source(Some(&drained)), None);
-    }
-
-    /// A turn sent while the composer dictates, its chip given over to the dictation's buttons,
-    /// names the account's own door as Settings shows it, and not a pick on the chip nobody can
-    /// see: an account on the person's plan with Server picked goes through the plan, and one on
-    /// the server's keys with My plan picked goes through the keys. It names nothing where no
-    /// door is known (the setting not read, or a server without reply sources) and where there
-    /// is no chip to hide, as a turn typed then would.
-    #[test]
-    fn a_turn_sent_while_dictating_names_the_accounts_own_door() {
-        let mut state = signed_in_state();
-        state.composer_dictating = true;
-        assert_eq!(state.turn_inference_source(None), None, "nothing read");
-        state.reply_source.kept = Some(ReplySourceRead::NotOnServer);
-        assert_eq!(
-            state.turn_inference_source(None),
-            None,
-            "a server without reply sources"
-        );
-        read_as(&mut state, kept(InferenceKind::Gateway, None));
-        assert_eq!(
-            state.turn_inference_source(None),
-            None,
-            "no plan to switch to, so no chip to hide"
-        );
-        state.composer_dictating = false;
-        assert_eq!(state.turn_inference_source(None), None, "as when typed");
-
-        for (account, pick) in [
-            (InferenceKind::LocalProxy, InferenceKind::Gateway),
-            (InferenceKind::Gateway, InferenceKind::LocalProxy),
-        ] {
-            let mut state = signed_in_state();
-            read_as(&mut state, kept(account, Some("gpt-5-codex")));
-            assert!(state.flip_turn_source());
-            assert_eq!(state.turn_inference_source(None), Some(pick), "typed");
-            state.composer_dictating = true;
-            assert_eq!(chip(&state), None);
-            assert_eq!(
-                state.turn_inference_source(None),
-                Some(account),
-                "dictated: the account's door, not the hidden pick"
-            );
-            state.composer_dictating = false;
-            assert_eq!(
-                state.turn_inference_source(None),
-                Some(pick),
-                "the pick again"
-            );
-        }
     }
 
     /// An edit of a held send carries the door it was held with, so the row the server drains
@@ -32041,7 +36310,14 @@ mod tests {
         for (id, door) in [("m_1", Some(InferenceKind::LocalProxy)), ("m_2", None)] {
             state.enqueue_hold(
                 "cw_1".into(),
-                super::held_message(id.into(), "later".into(), None, None, None, door),
+                super::held_message(
+                    id.into(),
+                    "later".into(),
+                    None,
+                    None,
+                    None,
+                    door.map(Into::into),
+                ),
             );
         }
         assert_eq!(
@@ -32075,11 +36351,11 @@ mod tests {
                 .and_then(|held| held.inference_source)
         };
         state.apply_pending_custom(&edited_elsewhere(Some("gateway")), None);
-        assert_eq!(door_of(&state), Some(InferenceKind::Gateway));
+        assert_eq!(door_of(&state), Some(InferenceKind::Gateway.into()));
         state.apply_pending_custom(&edited_elsewhere(None), None);
         assert_eq!(
             door_of(&state),
-            Some(InferenceKind::Gateway),
+            Some(InferenceKind::Gateway.into()),
             "none named, none changed"
         );
     }
@@ -32119,7 +36395,7 @@ mod tests {
             None,
             None,
             None,
-            Some(InferenceKind::LocalProxy),
+            Some(InferenceKind::LocalProxy.into()),
         );
         here.pending_id = Some("pum_here".into());
         here.posted = true;
@@ -32133,7 +36409,7 @@ mod tests {
                 row("pum_there", "m_there", Some("gateway")),
             ],
         );
-        let doors: Vec<(String, Option<InferenceKind>)> = state
+        let doors: Vec<(String, Option<TurnSource>)> = state
             .queued_sends
             .get("cw_1")
             .unwrap()
@@ -32143,8 +36419,8 @@ mod tests {
         assert_eq!(
             doors,
             vec![
-                ("m_here".to_string(), Some(InferenceKind::LocalProxy)),
-                ("m_there".to_string(), Some(InferenceKind::Gateway)),
+                ("m_here".to_string(), Some(InferenceKind::LocalProxy.into())),
+                ("m_there".to_string(), Some(InferenceKind::Gateway.into())),
             ]
         );
 
@@ -32161,7 +36437,7 @@ mod tests {
         let front = state.queued_sends.get("cw_1").unwrap().front().unwrap();
         assert_eq!(
             (front.message_id.as_str(), front.inference_source),
-            ("m_here", Some(InferenceKind::LocalProxy))
+            ("m_here", Some(InferenceKind::LocalProxy.into()))
         );
         let held = state.pop_queued_send("cw_1").expect("m_here drains again");
         let edited = PendingCustom {
@@ -32170,13 +36446,921 @@ mod tests {
         };
         state.put_back_stale_hold("cw_1", "m_reply", held, &edited);
         let front = state.queued_sends.get("cw_1").unwrap().front().unwrap();
-        assert_eq!(front.inference_source, Some(InferenceKind::Gateway));
+        assert_eq!(front.inference_source, Some(InferenceKind::Gateway.into()));
+    }
+
+    /// A turn the person's Mac could not answer offers itself again on the server's keys, as the
+    /// thread's last turn and only then: live, by the run error's code, and read back, by the
+    /// code on the journal's `RUN_ERROR`. A failure of any other kind, a later message, a turn in
+    /// flight, and a sign-out all take the offer away.
+    #[test]
+    fn a_turn_the_mac_could_not_answer_is_offered_again_on_the_servers_keys() {
+        use crate::opengrok::RunErrorCode;
+        let mut state = signed_in_state();
+        state.conversations.push(Conversation {
+            id: "cw_1".into(),
+            title: "Ada".into(),
+            created_at: String::new(),
+            updated_at: String::new(),
+            messages: vec![
+                message("m_ask", true, "summarise it"),
+                message(
+                    "m_failed",
+                    false,
+                    &format!("{RUN_ERROR_PREFIX}Your Mac isn't connected."),
+                ),
+            ],
+            unread_count: 0,
+            origin: None,
+        });
+        state.active_conversation_id = Some("cw_1".into());
+        assert_eq!(state.plan_failed_turn(), None, "a failure of another kind");
+        state.note_plan_failure("m_failed", Some(RunErrorCode::RelayOffline));
+        assert_eq!(state.plan_failed_turn().as_deref(), Some("m_failed"));
+        state.live_turns.insert(
+            "cw_1".into(),
+            LiveTurn {
+                run_id: "run_2".into(),
+                message_id: "m_next".into(),
+                persisting: false,
+            },
+        );
+        assert_eq!(state.plan_failed_turn(), None, "a turn in flight");
+        state.live_turns.clear();
+        state.conversations[0]
+            .messages
+            .push(message("m_more", true, "and another thing"));
+        assert_eq!(state.plan_failed_turn(), None, "not the last turn any more");
+        state.conversations[0].messages.pop();
+        state.note_plan_failure("m_failed", None);
+        assert_eq!(
+            state.plan_failed_turn(),
+            None,
+            "a later word without the code"
+        );
+        state.note_plan_failure("m_failed", Some(RunErrorCode::RelayTimeout));
+        state.forget_account();
+        assert_eq!(state.plan_failed_turn(), None, "signed out");
+
+        // Read back: the journal's RUN_ERROR carries the code, and a reply recovered from it
+        // brings it.
+        let events = vec![
+            json!({"type": "RUN_STARTED", "runId": "run_1", "threadId": "cw_1"}),
+            json!({"type": "CUSTOM", "name": "opengrok.inferenceSource",
+                "value": {"kind": "local_proxy", "via": "mac", "model": "grok-4"}}),
+            json!({"type": "RUN_ERROR", "message": "Your Mac didn't answer in time.",
+                "code": "relay_timeout"}),
+        ];
+        assert_eq!(
+            super::plan_failure_of(&events),
+            Some(RunErrorCode::RelayTimeout)
+        );
+        assert_eq!(
+            super::plan_failure_of(&[json!({"type": "RUN_ERROR", "message": "refused"})]),
+            None
+        );
+        let run: ThreadRun = serde_json::from_value(json!({
+            "runId": "run_1", "status": "failed", "startedAtMs": 1_000,
+            "failure": "Your Mac didn't answer in time.", "events": events
+        }))
+        .expect("a run");
+        let recovered = super::missing_replies(&[message("m_ask", true, "summarise it")], &[run]);
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].plan_failure, Some(RunErrorCode::RelayTimeout));
+        assert!(recovered[0].content.starts_with(RUN_ERROR_PREFIX));
+    }
+
+    /// A Mac already carrying all the calls the server lets one Mac carry at once (16) is refused
+    /// a turn in words and no code (`ModelError::Proxy` in opengrok-server's relay broker, PR
+    /// #298): the reply shows the server's sentence alone, and nothing offers the turn again on
+    /// the server's keys, live or read back. The Mac frees up on its own as its calls finish.
+    #[test]
+    fn a_mac_carrying_all_it_may_shows_its_sentence_with_nothing_to_send_on_server() {
+        let said = "Your Mac is already carrying 16 calls, so this one was not sent; try again \
+                    when one finishes.";
+        let mut state = signed_in_state();
+        state.conversations.push(Conversation {
+            id: "cw_1".into(),
+            title: "Ada".into(),
+            created_at: String::new(),
+            updated_at: String::new(),
+            messages: vec![
+                message("m_ask", true, "summarise it"),
+                message("m_busy", false, &format!("{RUN_ERROR_PREFIX}{said}")),
+            ],
+            unread_count: 0,
+            origin: None,
+        });
+        state.active_conversation_id = Some("cw_1".into());
+        // Live: the turn's error names no code, so what the ending notes is no relay failure.
+        state.note_plan_failure("m_busy", None);
+        assert_eq!(state.plan_failed_turn(), None);
+
+        // Read back: the journal's RUN_ERROR, after the run said it went through the Mac, has
+        // no code either, and the reply recovered from it is the sentence and nothing to offer.
+        let events = vec![
+            json!({"type": "RUN_STARTED", "runId": "run_1", "threadId": "cw_1"}),
+            json!({"type": "CUSTOM", "name": "opengrok.inferenceSource",
+                "value": {"kind": "local_proxy", "via": "mac", "model": "gpt-5.5"}}),
+            json!({"type": "RUN_ERROR", "message": said}),
+        ];
+        assert_eq!(super::plan_failure_of(&events), None);
+        let run: ThreadRun = serde_json::from_value(json!({
+            "runId": "run_1", "status": "failed", "startedAtMs": 1_000,
+            "failure": said, "events": events
+        }))
+        .expect("a run");
+        let recovered = super::missing_replies(&[message("m_ask", true, "summarise it")], &[run]);
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].plan_failure, None);
+        assert_eq!(recovered[0].content, format!("{RUN_ERROR_PREFIX}{said}"));
+    }
+
+    /// The thread `cw_1`, open, whose last turn the server refused with `said`.
+    fn refused_turn(state: &mut AppState, said: &str) {
+        state.conversations.push(Conversation {
+            id: "cw_1".into(),
+            title: "Ada".into(),
+            created_at: String::new(),
+            updated_at: String::new(),
+            messages: vec![
+                message("m_ask", true, "summarise it"),
+                message("m_failed", false, &format!("{RUN_ERROR_PREFIX}{said}")),
+            ],
+            unread_count: 0,
+            origin: None,
+        });
+        state.active_conversation_id = Some("cw_1".into());
+    }
+
+    /// A turn the person's own setting left their plan nothing to answer with ends
+    /// `plan_unavailable` beside the server's sentence (opengrok-server main d6f640e (#307, after
+    /// #304), pin bf99845): a teammate with no proxy on a shared Bot on the plan, or a proxy turn
+    /// with no address or no model stored. As the thread's last turn it offers itself again on the
+    /// server's keys, as a relay's failure does: live, by the run error's code, and read back, by
+    /// the code on the journal's `RUN_ERROR`. Sent that way it names the gateway for that turn,
+    /// whatever the Bot's own door or the account's, which the turns after it go by again.
+    #[test]
+    fn a_turn_the_plan_was_unavailable_for_is_offered_again_on_the_servers_keys() {
+        use crate::opengrok::RunErrorCode;
+        let said = "You chose your own subscription, but no proxy address is set; set one in your \
+                    inference source (like http://127.0.0.1:8080), or switch this turn to the \
+                    gateway.";
+        let mut state = signed_in_state();
+        with_bot(&mut state, json!("local_proxy"));
+        refused_turn(&mut state, said);
+        assert_eq!(state.plan_failed_turn(), None, "no code noted yet");
+        state.note_plan_failure("m_failed", RunErrorCode::from_code("plan_unavailable"));
+        assert_eq!(state.plan_failed_turn().as_deref(), Some("m_failed"));
+
+        // Sent on Server, the turn names the gateway, where the Bot's own turns name its plan;
+        // and so for a Bot that follows the account onto the plan, whose turns name nothing.
+        assert_eq!(
+            serde_json::to_value(state.turn_door(None, true)).unwrap(),
+            json!("gateway")
+        );
+        assert_eq!(state.turn_door(None, false), Some(TurnSource::plan(None)));
+        with_bot(&mut state, serde_json::Value::Null);
+        read_as(
+            &mut state,
+            kept(InferenceKind::LocalProxy, Some("gpt-5-codex")),
+        );
+        assert_eq!(state.turn_door(None, true), Some(TurnSource::GATEWAY));
+        assert_eq!(state.turn_door(None, false), None);
+
+        // Read back: the journal's RUN_ERROR carries the code, and a reply recovered from it
+        // brings it.
+        let events = vec![
+            json!({"type": "RUN_STARTED", "runId": "run_1", "threadId": "cw_1"}),
+            json!({"type": "RUN_ERROR", "message": said, "code": "plan_unavailable"}),
+        ];
+        assert_eq!(
+            super::plan_failure_of(&events),
+            Some(RunErrorCode::PlanUnavailable)
+        );
+        let run: ThreadRun = serde_json::from_value(json!({
+            "runId": "run_1", "status": "failed", "startedAtMs": 1_000,
+            "failure": said, "events": events
+        }))
+        .expect("a run");
+        let recovered = super::missing_replies(&[message("m_ask", true, "summarise it")], &[run]);
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(
+            recovered[0].plan_failure,
+            Some(RunErrorCode::PlanUnavailable)
+        );
+        assert_eq!(recovered[0].content, format!("{RUN_ERROR_PREFIX}{said}"));
+    }
+
+    /// A reply source the server could not read refuses the turn in words and no code (`route` in
+    /// opengrok-server's `crates/opengrok-harness/src/local_proxy.rs`, server main d6f640e (#307,
+    /// after #304), pin bf99845, whose recording holds no such turn): there is nothing of the
+    /// person's to change, and the sentence says to try again in a moment. The reply shows the
+    /// sentence alone, live and read back, and nothing offers the turn on the server's keys.
+    #[test]
+    fn a_reply_source_that_could_not_be_read_offers_nothing_on_server() {
+        let said = "Your reply source could not be read, so the turn was not sent; try again in a \
+                    moment.";
+        let mut state = signed_in_state();
+        with_bot(&mut state, json!("local_proxy"));
+        refused_turn(&mut state, said);
+        state.note_plan_failure("m_failed", None);
+        assert_eq!(state.plan_failed_turn(), None);
+
+        let events = vec![
+            json!({"type": "RUN_STARTED", "runId": "run_1", "threadId": "cw_1"}),
+            json!({"type": "RUN_ERROR", "message": said}),
+        ];
+        assert_eq!(super::plan_failure_of(&events), None);
+        let run: ThreadRun = serde_json::from_value(json!({
+            "runId": "run_1", "status": "failed", "startedAtMs": 1_000,
+            "failure": said, "events": events
+        }))
+        .expect("a run");
+        let recovered = super::missing_replies(&[message("m_ask", true, "summarise it")], &[run]);
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].plan_failure, None);
+        assert_eq!(recovered[0].content, format!("{RUN_ERROR_PREFIX}{said}"));
+    }
+
+    /// On a driver's tree: a turn the person's plan was unavailable for is offered on Server as
+    /// `run-error-send-on-server`, a click that sends it there; a run error with no code has no
+    /// such node, and the click is refused.
+    #[cfg(feature = "agent")]
+    #[test]
+    fn a_driver_is_offered_send_on_server_for_plan_unavailable_and_not_without_a_code() {
+        use crate::agent::{Command, NativeChatHost, ids};
+        use crate::opengrok::RunErrorCode;
+        use gpui_agent::prelude::{AgentHost, Op};
+        let mut state = signed_in_state();
+        with_bot(&mut state, json!("local_proxy"));
+        refused_turn(
+            &mut state,
+            "Choose a model for your own subscription first: your inference source names none, \
+             so the turn was not sent. Pick one your proxy serves, or switch this turn to the \
+             gateway.",
+        );
+        let offer = |state: &AppState| {
+            NativeChatHost::from_app(state)
+                .snapshot()
+                .find(ids::RUN_ERROR_SEND_ON_SERVER)
+                .map(|node| node.name.clone())
+        };
+        state.note_plan_failure("m_failed", RunErrorCode::from_code("plan_unavailable"));
+        assert_eq!(
+            offer(&state).as_deref(),
+            Some("Send this reply on Server instead")
+        );
+        let mut host = NativeChatHost::from_app(&state);
+        host.dispatch(&Op::click(ids::RUN_ERROR_SEND_ON_SERVER))
+            .unwrap();
+        assert!(matches!(host.take_command(), Some(Command::SendOnServer)));
+
+        state.note_plan_failure("m_failed", None);
+        assert_eq!(offer(&state), None);
+        let refused = NativeChatHost::from_app(&state)
+            .dispatch(&Op::click(ids::RUN_ERROR_SEND_ON_SERVER))
+            .unwrap_err();
+        assert!(refused.contains("person's plan"), "{refused}");
+    }
+
+    /// A turn by the person's Mac while they switched the relay off and set no fallback, and a
+    /// carry-on of one the Mac started before it went off, are refused `plan_unavailable` in the
+    /// server's words (opengrok-server #332 (PR #338 at 66b9f7b): `RELAY_OFF`, the door's refusal
+    /// in `crates/opengrok-harness/src/local_proxy.rs`), never moved to the fallback mid-run. As
+    /// the thread's last turn it is offered again on the server's keys, live by the run error's
+    /// code and read back by the code on the journal's `RUN_ERROR`; it ran, so Try again, which is
+    /// for a turn that never left, is not offered.
+    #[test]
+    fn a_turn_refused_because_the_relay_is_off_is_offered_on_server() {
+        use crate::opengrok::RunErrorCode;
+        let said = "Relay is off for your plan, so the turn was not sent. Turn Relay on, or choose \
+                    a Server model to answer while it is off, or switch this turn to the gateway.";
+        let mut state = signed_in_state();
+        with_bot(&mut state, json!("local_proxy"));
+        refused_turn(&mut state, said);
+        state.note_plan_failure("m_failed", RunErrorCode::from_code("plan_unavailable"));
+        assert_eq!(state.plan_failed_turn().as_deref(), Some("m_failed"));
+        assert_eq!(state.retryable_turn(), None);
+
+        let events = vec![
+            json!({"type": "RUN_STARTED", "runId": "run_1", "threadId": "cw_1"}),
+            json!({"type": "CUSTOM", "name": "opengrok.inferenceSource",
+                "value": {"kind": "local_proxy", "via": "mac", "model": "gpt-5.5"}}),
+            json!({"type": "RUN_ERROR", "message": said, "code": "plan_unavailable"}),
+        ];
+        let run: ThreadRun = serde_json::from_value(json!({
+            "runId": "run_1", "status": "failed", "startedAtMs": 1_000,
+            "failure": said, "events": events
+        }))
+        .expect("a run");
+        let recovered = super::missing_replies(&[message("m_ask", true, "summarise it")], &[run]);
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(
+            recovered[0].plan_failure,
+            Some(RunErrorCode::PlanUnavailable)
+        );
+        assert_eq!(recovered[0].content, format!("{RUN_ERROR_PREFIX}{said}"));
+    }
+
+    /// A Bot's reply to another Bot that the server skipped because the person switched the relay
+    /// off and set no fallback has no history row (opengrok-server #332 (PR #338 at 66b9f7b):
+    /// `refused` in `crates/opengrok-server/src/pairs.rs`): its run starts and fails at once in
+    /// the two Bots' pair thread, its `RUN_ERROR` naming `relay_disabled` beside the server's
+    /// words. Read back, or ending live, it is a failed reply in those words, and it offers
+    /// nothing: not Send this reply on Server, which no such code offers, and not Try again, which
+    /// is for a turn that never left. That thread is read-only (a person's words there are refused
+    /// 403 `read-only-thread`), so there is nothing of theirs to send again.
+    #[test]
+    fn a_bots_reply_skipped_while_the_relay_is_off_says_why_and_offers_nothing() {
+        use crate::opengrok::RunErrorCode;
+        let said = "Skipped: Relay is off for your plan";
+        let events = vec![
+            json!({"type": "RUN_STARTED", "runId": "run_1", "threadId": "pair-cw_1-cw_2"}),
+            json!({"type": "RUN_ERROR", "message": said, "code": "relay_disabled"}),
+        ];
+        assert_eq!(super::plan_failure_of(&events), None);
+        assert_eq!(RunErrorCode::from_code("relay_disabled"), None, "live, too");
+        let run: ThreadRun = serde_json::from_value(json!({
+            "runId": "run_1", "status": "failed", "startedAtMs": 1_000,
+            "failure": said, "events": events
+        }))
+        .expect("a run");
+        let recovered = super::missing_replies(&[message("m_ask", true, "the report?")], &[run]);
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].plan_failure, None);
+        assert_eq!(recovered[0].content, format!("{RUN_ERROR_PREFIX}{said}"));
+
+        let mut state = signed_in_state();
+        refused_turn(&mut state, said);
+        state.note_plan_failure("m_failed", recovered[0].plan_failure);
+        assert_eq!(state.plan_failed_turn(), None);
+        assert_eq!(state.retryable_turn(), None);
+    }
+
+    /// On a driver's tree, the same reply has neither `retry-turn` nor `run-error-send-on-server`
+    /// beside it, and a click on either is refused.
+    #[cfg(feature = "agent")]
+    #[test]
+    fn a_driver_is_offered_nothing_for_a_bots_reply_skipped_while_the_relay_is_off() {
+        use crate::agent::{NativeChatHost, ids};
+        use crate::opengrok::RunErrorCode;
+        use gpui_agent::prelude::{AgentHost, Op};
+        let mut state = signed_in_state();
+        refused_turn(&mut state, "Skipped: Relay is off for your plan");
+        state.note_plan_failure("m_failed", RunErrorCode::from_code("relay_disabled"));
+        let mut host = NativeChatHost::from_app(&state);
+        let tree = host.snapshot();
+        assert!(tree.find(ids::RUN_ERROR_SEND_ON_SERVER).is_none());
+        assert!(tree.find("retry-turn").is_none());
+        for control in [ids::RUN_ERROR_SEND_ON_SERVER, "retry-turn"] {
+            assert!(host.dispatch(&Op::click(control)).is_err(), "{control}");
+        }
+    }
+
+    /// A teammate on a shared Bot its owner put on the person's plan, with no plan of their own
+    /// set up, is refused the turn in the server's words: the plan is always the person's who
+    /// drives the turn, and the turn is never sent on the server's keys, nor to the owner's plan
+    /// (opengrok-server main d6f640e (#307, after #304), pin bf99845).
+    /// The recorded replay reads back as a run that failed, the server's sentence under the plan's
+    /// badge, and its `RUN_ERROR` names `plan_unavailable` beside the sentence: what is missing is
+    /// the teammate's own to set, so the reply offers the turn again on the server's keys, which
+    /// the turn's own pick takes it to whatever the Bot's door.
+    #[test]
+    fn a_teammate_refused_a_shared_bots_plan_reads_back_as_the_servers_sentence() {
+        use crate::opengrok::RunErrorCode;
+        let recorded: serde_json::Value = serde_json::from_str(include_str!(
+            "../fixtures/wire/rest/GET__ag-ui_threads__thread_id_/200-a_teammate_with_no_proxy_is_refused_in_words_on_a_shared_coworkers_own_plan.json"
+        ))
+        .expect("the recording");
+        let replay: super::ThreadReplay =
+            serde_json::from_value(recorded["body"].clone()).expect("the replay");
+        let said = replay.runs[0]
+            .failure
+            .clone()
+            .expect("the run says why it failed");
+        let ended = replay.runs[0].events.last().expect("the run's frames");
+        assert_eq!(
+            (
+                ended["type"].as_str(),
+                ended["message"].as_str(),
+                ended["code"].as_str()
+            ),
+            (
+                Some("RUN_ERROR"),
+                Some(said.as_str()),
+                Some("plan_unavailable")
+            ),
+            "a run error in the server's words, with the code beside them"
+        );
+        let recovered = super::missing_replies(&[message("m1", true, "hi")], &replay.runs);
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].content, format!("{RUN_ERROR_PREFIX}{said}"));
+        assert_eq!(
+            recovered[0].plan_failure,
+            Some(RunErrorCode::PlanUnavailable),
+            "the teammate's own gap, so the turn can be sent on Server"
+        );
+        let badge = recovered[0]
+            .reply_source
+            .as_ref()
+            .expect("the run said which door it asked");
+        assert_eq!(
+            (badge.kind, badge.model.as_deref()),
+            (InferenceKind::LocalProxy, Some("gpt-6-luna"))
+        );
+    }
+
+    // ---- A retry of a queued message's reply (`retryOf`, opengrok-server #300) ------------------
+
+    use super::Retry;
+
+    /// The queued message every retry here sends again, as the server's recording words it.
+    const QUEUED_BUBBLE: &str = "bubble-queued";
+    const QUEUED_WORDS: &str = "summarise the report I sent this morning";
+
+    /// The open thread `cw_1`: a message that was queued, and the reply of `run_queued`, the run
+    /// that fired it, which ended in `ending`.
+    fn a_queued_messages_reply(ending: &str) -> AppState {
+        let mut state = signed_in_state();
+        state.conversations.push(thread(
+            "cw_1",
+            vec![
+                at(message(QUEUED_BUBBLE, true, QUEUED_WORDS), 10),
+                from_run("m_failed", ending, "run_queued", 20),
+            ],
+        ));
+        state.active_conversation_id = Some("cw_1".into());
+        state
+    }
+
+    /// A client signed in to `server` by its own login, with a token nothing refreshes while a
+    /// test runs (it expires in 2100): a turn does not go out without one.
+    async fn client_signed_in_to(server: &wiremock::MockServer) -> OpenGrokClient {
+        use base64::Engine as _;
+        let part = |json: &str| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json);
+        let token = format!(
+            "{}.{}.not-a-signature",
+            part(r#"{"alg":"HS256","typ":"JWT"}"#),
+            part(r#"{"exp":4102444800}"#)
+        );
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/auth/login"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .append_header("set-cookie", format!("og_access={token}; Path=/"))
+                    .set_body_json(json!({})),
+            )
+            .mount(server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).expect("a URL");
+        client
+            .login("ada@example.com", "pw")
+            .await
+            .expect("signed in");
+        client
+    }
+
+    /// The server's answer to a turn whose `forwardedProps` hold `props`: a run, its stream
+    /// `frames`.
+    async fn runs_for(
+        server: &wiremock::MockServer,
+        props: serde_json::Value,
+        frames: &[serde_json::Value],
+    ) -> wiremock::MockGuard {
+        let stream: String = frames
+            .iter()
+            .map(|frame| format!("data: {frame}\n\n"))
+            .collect();
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/ag-ui"))
+            .and(wiremock::matchers::body_partial_json(
+                json!({ "forwardedProps": props }),
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(stream),
+            )
+            .mount_as_scoped(server)
+            .await
+    }
+
+    /// The server's answer to every other turn: the queue's 409 as its recording `name` under
+    /// `POST /ag-ui` has it, `already-consumed`, naming the run that holds the send.
+    async fn refused_otherwise(server: &wiremock::MockServer, name: &str) {
+        let recorded = format!(
+            "{}/fixtures/wire/rest/POST__ag-ui/{name}",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let recorded: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&recorded).expect("the recording"))
+                .expect("JSON");
+        assert_eq!(recorded["body"]["error"], "already-consumed", "{name}");
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/ag-ui"))
+            .respond_with(wiremock::ResponseTemplate::new(409).set_body_json(&recorded["body"]))
+            .with_priority(10)
+            .mount(server)
+            .await;
+    }
+
+    /// A run that starts and finishes.
+    fn finished() -> Vec<serde_json::Value> {
+        vec![
+            json!({"type": "RUN_STARTED", "threadId": "cw_1", "runId": "r"}),
+            json!({"type": "RUN_FINISHED", "threadId": "cw_1", "runId": "r"}),
+        ]
+    }
+
+    /// `retry` up to the wire, as `send_opengrok_turn_with` takes it there: the thread as it
+    /// stands, the door `turn_door` names, the reply bubble opened under a new run, and the turn
+    /// posted under that run naming the run it retries. A retry fires no held send, so it names
+    /// no queued one. The run, the bubble, and what the turn came to.
+    async fn retry_on_the_wire(
+        state: &mut AppState,
+        client: &OpenGrokClient,
+        retry: &Retry,
+        on_server: bool,
+    ) -> (String, String, Result<String, OpenGrokError>) {
+        let history = state.turn_history(&retry.conversation_id, None);
+        let door = state.turn_door(None, on_server);
+        let (run, reply) = state.open_turn(&retry.conversation_id);
+        let result = client
+            .run_turn(
+                "cw_1",
+                &retry.conversation_id,
+                &run,
+                &history,
+                None,
+                None,
+                None,
+                retry.of.as_deref(),
+                door,
+                |_, _| {},
+            )
+            .await;
+        (run, reply, result)
+    }
+
+    /// The bodies of the turns `server` was sent, in order.
+    async fn turns_sent(server: &wiremock::MockServer) -> Vec<serde_json::Value> {
+        server
+            .received_requests()
+            .await
+            .expect("the recorder is on")
+            .iter()
+            .filter(|request| request.url.path() == "/ag-ui")
+            .map(|request| serde_json::from_slice(&request.body).expect("a JSON body"))
+            .collect()
+    }
+
+    /// Try again on the reply of a message that was queued names the reply's run as the one it
+    /// retries, and no queued send: the server keeps the send as that run's, and the bubble sent
+    /// again naming nothing was the send firing twice, refused `already-consumed` and never run.
+    /// Named, the turn runs (opengrok-server main 06db932 (#309, after #308), pin b6ca457).
+    #[tokio::test]
+    async fn try_again_on_a_queued_messages_reply_names_its_run_and_runs() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_signed_in_to(&server).await;
+        let _retried = runs_for(&server, json!({"retryOf": "run_queued"}), &finished()).await;
+        refused_otherwise(
+            &server,
+            "409-a_retry_that_names_no_run_is_still_already_consumed.json",
+        )
+        .await;
+        let mut state = a_queued_messages_reply(TURN_UNREACHED_NOTE);
+
+        let retry = state.begin_retry(false).expect("Try again is offered");
+        assert_eq!(retry.of.as_deref(), Some("run_queued"));
+        assert_eq!(
+            ids(&state.conversations[0].messages),
+            [QUEUED_BUBBLE],
+            "the failed reply goes"
+        );
+        let (_, _, result) = retry_on_the_wire(&mut state, &client, &retry, false).await;
+        result.expect("the retry runs, where it was refused already-consumed");
+
+        let sent = turns_sent(&server).await;
+        assert_eq!(sent.len(), 1);
+        assert_eq!(
+            sent[0]["forwardedProps"],
+            json!({ "coworkerId": "cw_1", "retryOf": "run_queued" }),
+            "the run it retries, and no pendingId"
+        );
+        let said = sent[0]["messages"].as_array().expect("the thread");
+        assert_eq!(
+            said.last().map(|message| &message["id"]),
+            Some(&json!(QUEUED_BUBBLE)),
+            "the queued message is the turn's last, as the server finds the send by it"
+        );
+    }
+
+    /// Send this reply on Server names the failed reply's run as Try again does, and the gateway
+    /// for this turn: the server runs a retry where the retry names, over where the send was
+    /// queued to ask (opengrok-server main 06db932 (#309, after #308), pin b6ca457).
+    #[tokio::test]
+    async fn send_on_server_names_the_failed_run_and_the_gateway() {
+        use crate::opengrok::RunErrorCode;
+        let said = "You chose your own subscription, but no proxy address is set; set one in \
+                    your inference source (like http://127.0.0.1:1447), or switch this turn to \
+                    the gateway.";
+        let server = wiremock::MockServer::start().await;
+        let client = client_signed_in_to(&server).await;
+        let on_server = json!({"retryOf": "run_queued", "inferenceSource": "gateway"});
+        let _retried = runs_for(&server, on_server, &finished()).await;
+        refused_otherwise(
+            &server,
+            "409-a_retry_that_names_no_run_is_still_already_consumed.json",
+        )
+        .await;
+        let mut state = a_queued_messages_reply(&format!("{RUN_ERROR_PREFIX}{said}"));
+        with_bot(&mut state, json!("local_proxy"));
+        state.note_plan_failure("m_failed", RunErrorCode::from_code("plan_unavailable"));
+        assert_eq!(
+            state.begin_retry(false),
+            None,
+            "not a turn that did not go through"
+        );
+
+        let retry = state.begin_retry(true).expect("Send on Server is offered");
+        assert_eq!(retry.of.as_deref(), Some("run_queued"));
+        assert_eq!(state.plan_failed_turn(), None, "offered once");
+        let (_, _, result) = retry_on_the_wire(&mut state, &client, &retry, true).await;
+        result.expect("the retry runs on the server's keys");
+
+        let sent = turns_sent(&server).await;
+        assert_eq!(
+            sent[0]["forwardedProps"],
+            json!({
+                "coworkerId": "cw_1",
+                "retryOf": "run_queued",
+                "inferenceSource": "gateway"
+            })
+        );
+    }
+
+    /// A retry's reply is opened under the retry's run, which the server moves the queued send
+    /// to, so Try again on that reply names that run, not the first one: naming the first again
+    /// is the 409 the second of two retries of one reply gets.
+    #[tokio::test]
+    async fn a_second_retry_names_the_run_of_the_first() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_signed_in_to(&server).await;
+        let unreachable = [
+            json!({"type": "RUN_STARTED", "threadId": "cw_1", "runId": "r"}),
+            json!({"type": "RUN_ERROR", "message": "the model gateway is unreachable"}),
+        ];
+        let first_run = runs_for(&server, json!({"retryOf": "run_queued"}), &unreachable).await;
+        refused_otherwise(
+            &server,
+            "409-two_retries_of_one_reply_run_once_and_the_retry_can_be_retried.json",
+        )
+        .await;
+        let mut state = a_queued_messages_reply(TURN_UNREACHED_NOTE);
+
+        let first = state.begin_retry(false).expect("Try again is offered");
+        let (run, reply, result) = retry_on_the_wire(&mut state, &client, &first, false).await;
+        let error = result.expect_err("the gateway was out of reach");
+        assert!(error.unreachable().is_some(), "{error:?}");
+        assert_eq!(
+            bubble(&state, &reply).run_id.as_deref(),
+            Some(run.as_str()),
+            "the retry's reply carries the retry's run"
+        );
+        // The ending the turn paints for that: a turn that did not go through, offered again.
+        if let Some(message) = state.conversations[0]
+            .messages
+            .iter_mut()
+            .find(|message| message.id == reply)
+        {
+            message.content = TURN_UNREACHED_NOTE.to_string();
+        }
+        state.release_live_turn("cw_1", &run);
+        drop(first_run);
+
+        let _second_run = runs_for(&server, json!({"retryOf": run}), &finished()).await;
+        let second = state
+            .begin_retry(false)
+            .expect("Try again on the retry's reply");
+        assert_eq!(second.of.as_deref(), Some(run.as_str()));
+        let (_, _, result) = retry_on_the_wire(&mut state, &client, &second, false).await;
+        result.expect("the second retry runs");
+        let named: Vec<serde_json::Value> = turns_sent(&server)
+            .await
+            .iter()
+            .map(|turn| turn["forwardedProps"]["retryOf"].clone())
+            .collect();
+        assert_eq!(named, [json!("run_queued"), json!(run)]);
+    }
+
+    /// A retry the server refuses `already-consumed` (the run it names still going, or no longer
+    /// the one holding the send) is the queue's refusal as any send's is: the bubble the retry
+    /// minted goes, the message stays in sight, and the thread is read again from the server,
+    /// which has a run this thread is missing.
+    #[tokio::test]
+    async fn a_retry_refused_already_consumed_reads_the_thread_again() {
+        let server = wiremock::MockServer::start().await;
+        let client = client_signed_in_to(&server).await;
+        let refused = format!(
+            "{}/fixtures/wire/rest/POST__ag-ui/\
+             409-a_retry_of_a_reply_still_running_is_already_consumed.json",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let refused: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&refused).expect("the recording"))
+                .expect("JSON");
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/ag-ui"))
+            .and(wiremock::matchers::body_partial_json(
+                json!({"forwardedProps": {"retryOf": "run_queued"}}),
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(409).set_body_json(&refused["body"]))
+            .mount(&server)
+            .await;
+        let mut state = a_queued_messages_reply(TURN_UNREACHED_NOTE);
+
+        let retry = state.begin_retry(false).expect("Try again is offered");
+        let (run, reply, result) = retry_on_the_wire(&mut state, &client, &retry, false).await;
+        let error = result.expect_err("refused");
+        assert!(error.is_already_consumed(), "{error:?}");
+        assert!(
+            state.drop_refused_turn("cw_1", &reply, &run, None, &error),
+            "the thread is read again from the server"
+        );
+        assert_eq!(ids(&state.conversations[0].messages), [QUEUED_BUBBLE]);
+        assert!(!bubble(&state, QUEUED_BUBBLE).hidden);
+        assert!(state.live_turns.is_empty(), "the thread is let go");
+    }
+
+    /// A held message the server holds for the person's Mac says so, by its row's word as it
+    /// stands: a snapshot that no longer holds it for the Mac takes the line away, and a message
+    /// held here is not held for the Mac until the server says so.
+    #[test]
+    fn a_held_message_says_it_waits_for_the_mac_while_the_server_holds_it_so() {
+        use crate::opengrok::PendingUserMessage;
+        let row = |held_for: Option<&str>| -> PendingUserMessage {
+            let mut row = json!({
+                "id": "pum_1", "threadId": "cw_1", "content": "later",
+                "clientMessageId": "m_1", "status": "pending",
+                "inferenceSource": {"kind": "local_proxy", "via": "mac"}
+            });
+            if let Some(held_for) = held_for {
+                row["heldFor"] = json!(held_for);
+            }
+            serde_json::from_value(row).expect("a row")
+        };
+        let mut state = signed_in_state();
+        state.conversations.push(Conversation {
+            id: "cw_1".into(),
+            title: "Ada".into(),
+            created_at: String::new(),
+            updated_at: String::new(),
+            messages: vec![message("m_1", true, "later")],
+            unread_count: 0,
+            origin: None,
+        });
+        state.active_conversation_id = Some("cw_1".into());
+        let hold = state.hold_for_send("m_2".into(), "and this".into(), None, None, None);
+        assert!(!hold.waits_for_mac);
+        state.fold_pending_snapshot("cw_1", &[row(Some("relay_offline"))]);
+        assert!(state.is_send_waiting_for_mac("m_1"));
+        assert_eq!(state.sends_waiting_for_mac(), ["m_1"]);
+        assert_eq!(
+            state.queued_sends["cw_1"][0].inference_source,
+            Some(TurnSource::plan(Some(crate::opengrok::Via::Mac)))
+        );
+        state.fold_pending_snapshot("cw_1", &[row(None)]);
+        assert!(!state.is_send_waiting_for_mac("m_1"));
+        assert!(state.is_send_queued("m_1"));
+    }
+
+    /// A held message the server holds for the person's Mac is the server's to send, oldest
+    /// first, when a Mac opens the relay: going idle passes over it, and it keeps its place and
+    /// its line, while the message behind it, which waits only for the coworker, goes. With
+    /// nothing else held there is nothing to post, and once the server no longer holds it, it
+    /// goes like any other.
+    #[test]
+    fn a_message_held_for_the_mac_is_left_for_the_server_to_send() {
+        use crate::opengrok::PendingUserMessage;
+        let row =
+            |id: &str, bubble: &str, door: serde_json::Value, held: bool| -> PendingUserMessage {
+                let mut row = json!({
+                    "v": 1, "id": id, "threadId": "cw_1", "content": bubble,
+                    "clientMessageId": bubble, "status": "pending",
+                    "createdAtMs": 30, "updatedAtMs": 30, "inferenceSource": door
+                });
+                if held {
+                    row["heldFor"] = json!("relay_offline");
+                }
+                serde_json::from_value(row).expect("a row")
+            };
+        let by_mac = || json!({"kind": "local_proxy", "via": "mac"});
+        let mut state = mid_turn(at(message("m_live", false, ""), 20));
+        state.conversations[0]
+            .messages
+            .push(at(message("m_mac", true, "m_mac"), 30));
+        state.conversations[0]
+            .messages
+            .push(at(message("m_next", true, "m_next"), 40));
+        state.fold_pending_snapshot(
+            "cw_1",
+            &[
+                row("pum_1", "m_mac", by_mac(), true),
+                row("pum_2", "m_next", json!("gateway"), false),
+            ],
+        );
+        go_idle(&mut state);
+        assert!(state.queued_send_ready_to_drain("cw_1"));
+        assert_eq!(
+            state.pop_queued_send("cw_1").map(|next| next.message_id),
+            Some("m_next".to_string()),
+            "the message behind the Mac's goes"
+        );
+        assert!(
+            state.is_send_waiting_for_mac("m_mac"),
+            "the Mac's keeps its place and its line"
+        );
+        assert!(
+            !state.queued_send_ready_to_drain("cw_1"),
+            "nothing held is this app's to post"
+        );
+        assert!(state.pop_queued_send("cw_1").is_none());
+
+        // A Mac opened the relay: the server no longer holds it, and it goes as any held one does.
+        state.fold_pending_snapshot("cw_1", &[row("pum_1", "m_mac", by_mac(), false)]);
+        assert_eq!(
+            state.pop_queued_send("cw_1").map(|next| next.message_id),
+            Some("m_mac".to_string())
+        );
+    }
+
+    /// A held message this Mac did not yet know the server holds for the person's Mac is fired,
+    /// and answered 202: no run started. The reply bubble the turn minted goes, the message goes
+    /// back ahead of the one behind it, now waiting for the Mac, and the drain goes on to the one
+    /// behind it. A snapshot that queued it again before the answer landed is not doubled.
+    #[test]
+    fn a_fire_the_server_holds_for_the_mac_goes_back_waiting_for_it() {
+        let mut state = holding("m_mac", "by my Mac");
+        state.conversations[0]
+            .messages
+            .push(at(message("m_next", true, "then this"), 40));
+        let queue = state.queued_sends.get_mut("cw_1").unwrap();
+        queue[0].pending_id = Some("pum_1".into());
+        queue.push_back(super::held_message(
+            "m_next".to_string(),
+            "then this".to_string(),
+            None,
+            None,
+            None,
+            None,
+        ));
+        go_idle(&mut state);
+        let fired = state.pop_queued_send("cw_1").expect("drains");
+        assert_eq!(fired.message_id, "m_mac");
+        state.conversations[0]
+            .messages
+            .push(at(message("r_1", false, ""), 50));
+        let held = pending_custom(
+            "edited",
+            Some(json!({
+                "id": "pum_1", "content": "by my Mac", "clientMessageId": "m_mac",
+                "status": "pending", "inferenceSource": {"kind": "local_proxy", "via": "mac"},
+                "heldFor": "relay_offline"
+            })),
+        );
+
+        state.put_back_held_for_mac("cw_1", "r_1", Some(fired.clone()));
+        state.apply_pending_custom(&held, Some("m_mac"));
+        assert!(
+            state.conversations[0]
+                .messages
+                .iter()
+                .all(|message| message.id != "r_1"),
+            "a turn that never started leaves no reply bubble"
+        );
+        assert!(state.is_send_waiting_for_mac("m_mac"));
+        let order: Vec<&str> = state.queued_sends["cw_1"]
+            .iter()
+            .map(|queued| queued.message_id.as_str())
+            .collect();
+        assert_eq!(order, ["m_mac", "m_next"], "back in its place");
+
+        state.put_back_held_for_mac("cw_1", "r_1", Some(fired));
+        assert_eq!(state.queued_send_count(), 2, "not doubled");
+        assert_eq!(
+            state.pop_queued_send("cw_1").map(|next| next.message_id),
+            Some("m_next".to_string()),
+            "the drain goes on to the one behind it"
+        );
+        assert!(state.pop_queued_send("cw_1").is_none());
+        assert!(state.is_send_waiting_for_mac("m_mac"));
     }
 
     /// A server from before reply sources answers the read with a bare 404: the page says it
-    /// cannot switch, every control is dead, and the composer has no chip, since a door the
-    /// server does not read would be a switch that changes nothing. The server's own 404 is not
-    /// that: it is said as a failed read.
+    /// cannot switch and every control is dead, since a door the server does not read would be a
+    /// switch that changes nothing. The server's own 404 is not that: it is said as a failed
+    /// read.
     #[test]
     fn a_server_without_reply_sources_offers_no_switch_anywhere() {
         let mut state = signed_in_state();
@@ -32184,12 +37368,12 @@ mod tests {
         assert!(state.settle_reply_source_read(generation, Err(OpenGrokError::status(404, ""))));
         assert_eq!(state.reply_source.kept, Some(ReplySourceRead::NotOnServer));
         assert_eq!(
-            crate::components::reply_source::unavailable_line(&state.reply_source),
+            crate::components::computers::unavailable_line(&state.reply_source),
             Some(REPLY_SOURCE_NOT_ON_SERVER)
         );
         assert!(!state.reply_source.can_edit());
-        assert!(!state.note_reply_source_kind(InferenceKind::LocalProxy));
-        assert_eq!(chip(&state), None);
+        assert!(!state.note_relay_address("http://127.0.0.1:9090".into()));
+        assert_eq!(state.turn_inference_source(None), None);
         assert!(state.begin_reply_source_save().is_none());
 
         let mut state = signed_in_state();
@@ -32204,288 +37388,2579 @@ mod tests {
         ));
     }
 
-    /// The server lists `ids` as the person's plan's models, opencodex answering.
-    fn with_plan_models(state: &mut AppState, ids: &[&str]) {
+    /// The open Bot's picker is its row read with the account's door as last read and the lists
+    /// `/models` gave: the plan's models through the account's way, held to the allowlist, and the
+    /// gateway's routes less the seats; and nothing of the plan for a Bot on a server that keeps
+    /// no door per Bot, where the account's plan model answers.
+    #[test]
+    fn the_open_bots_picker_is_its_row_the_accounts_door_and_the_lists() {
+        use crate::opengrok::{
+            CoworkerSource, FAST_ACCOUNT_PLAN, GATEWAY_GROUP, SUBSCRIPTION_GROUP,
+        };
+        let mut state = signed_in_state();
+        assert!(state.model_pick().is_none(), "no Bot open");
+        state.coworkers = vec![
+            serde_json::from_value(json!({
+                "id": "cw_1", "name": "Ada", "model": "gpt-6-luna--fast",
+                "effort": "high", "source": "local_proxy"
+            }))
+            .expect("a row"),
+        ];
+        state.active_coworker_id = Some("cw_1".into());
+        read_as(
+            &mut state,
+            kept(InferenceKind::LocalProxy, Some("gpt-5-codex")),
+        );
+        let entry = |id: &str, source: &str| ModelEntry {
+            id: id.into(),
+            source: Some(source.into()),
+            via: None,
+            ..Default::default()
+        };
+        // GPT-6 Luna lists the levels of effort a model of opencodex's does.
+        let levels =
+            ["low", "medium", "high", "xhigh", "max"].map(|word| crate::opengrok::EffortLevel {
+                value: word.into(),
+                label: format!("{}{} Effort", word[..1].to_uppercase(), &word[1..]),
+            });
+        let luna = |id: &str| ModelEntry {
+            efforts: Some(levels.to_vec()),
+            own_effort: Some("medium".into()),
+            ..entry(id, "local_proxy")
+        };
         state.model_catalogue = ModelCatalogue {
-            models: ids
+            models: vec![
+                entry("oag/cheap", "gateway"),
+                entry("xai/grok-4.6@sub", "gateway"),
+                luna("gpt-6-luna"),
+                luna("gpt-6-luna--fast"),
+                entry("claude-opus", "local_proxy"),
+            ],
+            note: None,
+            local_proxy: Some(crate::opengrok::LocalProxyStatus {
+                healthy: true,
+                relay_connected: false,
+            }),
+        };
+        let pick = state.model_pick().expect("a Bot is open");
+        assert_eq!(pick.summary(), "GPT-6 Luna · High ⚡");
+        let groups: Vec<(&str, Vec<&str>)> = pick
+            .groups
+            .iter()
+            .map(|group| {
+                (
+                    group.title(),
+                    group.rows.iter().map(|row| row.base_id.as_str()).collect(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            groups,
+            vec![
+                (SUBSCRIPTION_GROUP, vec!["gpt-6-luna"]),
+                (GATEWAY_GROUP, vec!["oag/cheap"]),
+            ]
+        );
+        assert_eq!(pick.fast_blocked, None);
+
+        // The same Bot on a server that keeps no door per Bot: no plan rows for it, and the
+        // account's plan model is what answers.
+        state.coworkers[0].source = CoworkerSource::NotKept;
+        let pick = state.model_pick().expect("a Bot is open");
+        assert_eq!(
+            pick.summary(),
+            "GPT-5 Codex",
+            "no row of the list answers, so there are no levels to name"
+        );
+        assert_eq!(
+            pick.groups
+                .iter()
+                .map(|group| group.title())
+                .collect::<Vec<_>>(),
+            [GATEWAY_GROUP]
+        );
+        assert_eq!(pick.fast_blocked, Some(FAST_ACCOUNT_PLAN));
+        assert!(pick.account_plan.is_some());
+    }
+
+    /// The list opens with nothing typed and the model that answers in view, however far down
+    /// it is; a search starts it from the top; the wheel moves it a model at a time and stops at
+    /// either end of what the search leaves; and shutting the list forgets the search and where it
+    /// was. None of it moves while the popover or the list is shut.
+    #[test]
+    fn the_model_list_opens_on_the_model_that_answers_and_a_search_starts_from_the_top() {
+        use super::PickerFor;
+        use crate::opengrok::{ListLine, list_window};
+        let mut state = signed_in_state();
+        let routes: Vec<String> = (0..9).map(|at| format!("oag/route-{at}")).collect();
+        state.coworkers = vec![
+            serde_json::from_value(json!({
+                "id": "cw_1", "name": "Ada", "model": "oag/route-7", "effort": "low",
+                "source": "gateway"
+            }))
+            .expect("a row"),
+        ];
+        state.active_coworker_id = Some("cw_1".into());
+        state.model_catalogue = ModelCatalogue {
+            models: routes
                 .iter()
                 .map(|id| ModelEntry {
-                    id: (*id).to_string(),
-                    source: Some("local_proxy".into()),
+                    id: id.clone(),
+                    source: Some("gateway".into()),
+                    via: None,
+                    ..Default::default()
                 })
                 .collect(),
             note: None,
-            local_proxy: Some(crate::opengrok::LocalProxyStatus { healthy: true }),
+            local_proxy: None,
         };
-    }
-
-    /// What a Save would send now, as JSON, without sending it.
-    fn save_body(state: &mut AppState) -> Option<serde_json::Value> {
-        let save = state.begin_reply_source_save()?;
-        let body = serde_json::to_value(&save.update).unwrap();
-        state.reply_source.saving = None;
-        Some(body)
-    }
-
-    /// A Save sends the door and what the page changed, the typed key with it, once: the key
-    /// leaves the app with that Save, whatever becomes of it. While it is out nothing on the page
-    /// takes a change and no read begins. The server's answer is what shows after, the picks gone
-    /// into it, and the models are read again for the setting the server now keeps; a later
-    /// Save sends only what changed since.
-    #[test]
-    fn a_save_puts_what_changed_once_and_its_answer_is_what_shows() {
-        let mut state = signed_in_state();
-        with_plan_models(&mut state, &["gpt-5-codex", "grok-4"]);
-        read_as(&mut state, kept(InferenceKind::Gateway, None));
         assert!(
-            !state.reply_source_can_save(),
-            "nothing picked, nothing to save"
+            !state.note_picker_list_toggled(PickerFor::Bot),
+            "the popover is shut"
         );
-        // A read with the server takes picks, and Save waits for what it brings.
-        let (_, reading) = state.begin_reply_source_read().unwrap();
-        assert!(state.note_reply_source_kind(InferenceKind::LocalProxy));
-        assert!(state.note_reply_source_model(Some("gpt-5-codex".into())));
-        assert!(state.reply_source.is_unsaved() && !state.reply_source_can_save());
-        assert!(state.begin_reply_source_save().is_none());
-        assert!(state.settle_reply_source_read(reading, Ok(kept(InferenceKind::Gateway, None))));
-        assert!(
-            state.reply_source_can_save(),
-            "the picks waited on top of the read"
-        );
-        state.reply_source.url_draft = Some("http://127.0.0.1:18080".into());
-        assert!(state.note_reply_source_key("sk-proxy-1"));
-        assert!(state.reply_source.is_unsaved());
-
-        let save = state.begin_reply_source_save().expect("a Save begins");
-        assert_eq!(
-            serde_json::to_value(&save.update).unwrap(),
-            json!({
-                "kind": "local_proxy",
-                "baseUrl": "http://127.0.0.1:18080",
-                "localModel": "gpt-5-codex",
-                "apiKey": "sk-proxy-1"
+        assert!(!state.note_picker_search(PickerFor::Bot, "route".into()));
+        state.model_picker.open = true;
+        assert!(state.note_picker_list_toggled(PickerFor::Bot));
+        assert!(state.model_picker.list_open);
+        assert_eq!(state.model_picker.search, "");
+        let pick = state.model_pick().expect("a Bot is open");
+        let in_view = |state: &AppState| -> Vec<String> {
+            list_window(
+                &pick.search(&state.model_picker.search),
+                state.model_picker.list_start,
+            )
+            .into_iter()
+            .filter_map(|line| match line {
+                ListLine::Row(row) => Some(row.base_id.clone()),
+                ListLine::Heading(_) => None,
             })
-        );
-        assert!(save.sent.key_sent);
-        assert_eq!(
-            state.reply_source.key_draft, None,
-            "sent once, kept nowhere"
-        );
-        assert!(!state.reply_source.can_edit(), "every control is dead");
-        assert!(!state.note_reply_source_kind(InferenceKind::Gateway));
+            .collect()
+        };
         assert!(
-            state.begin_reply_source_read().is_none(),
-            "no read overtakes it"
-        );
-        assert!(
-            state.begin_reply_source_save().is_none(),
-            "one Save at a time"
+            in_view(&state).contains(&"oag/route-7".to_string()),
+            "{:?}",
+            in_view(&state)
         );
 
-        let answer = InferenceSource {
-            kind: InferenceKind::LocalProxy,
-            base_url: Some("http://127.0.0.1:18080".into()),
-            local_model: Some("gpt-5-codex".into()),
-            healthy: false,
-            has_api_key: true,
-        };
-        assert_eq!(
-            state.settle_reply_source_save(save.sent, Ok(answer.clone())),
-            Some(AfterReplySourceSave::ReadModels)
+        // The wheel: a model at a time, and no further than the last five.
+        state.model_picker.list_start = 0;
+        assert!(state.note_picker_list_scroll(PickerFor::Bot, 3));
+        assert_eq!(state.model_picker.list_start, 3);
+        assert!(state.note_picker_list_scroll(PickerFor::Bot, 10));
+        assert_eq!(state.model_picker.list_start, 4, "the last whole window");
+        assert!(
+            !state.note_picker_list_scroll(PickerFor::Bot, 1),
+            "at the end already"
         );
-        assert_eq!(state.reply_source.kept_source(), Some(&answer));
+        assert!(state.note_picker_list_scroll(PickerFor::Bot, -10));
+        assert_eq!(state.model_picker.list_start, 0);
+
+        // A search starts from the top of what it leaves.
+        state.model_picker.list_start = 4;
+        assert!(state.note_picker_search(PickerFor::Bot, "ROUTE-1".into()));
+        assert_eq!(state.model_picker.list_start, 0);
+        assert_eq!(in_view(&state), ["oag/route-1"]);
+        assert!(
+            !state.note_picker_list_scroll(PickerFor::Bot, 1),
+            "nothing more to show"
+        );
+
+        // Shut, the list forgets the search and the window; it opens afresh.
+        assert!(state.note_picker_list_toggled(PickerFor::Bot));
+        assert!(!state.model_picker.list_open);
         assert_eq!(
             (
-                state.reply_source.kind_pick,
-                state.reply_source.url_draft.clone(),
-                state.reply_source.model_pick.clone(),
+                state.model_picker.search.as_str(),
+                state.model_picker.list_start
             ),
-            (None, None, None),
-            "the picks are what the server keeps now"
+            ("", 0)
         );
-        assert!(!state.reply_source.is_unsaved());
-        assert_eq!(state.reply_source.shown_url(), "http://127.0.0.1:18080");
-        assert!(state.reply_source.can_edit());
-
-        // Only the model changes next: the address the server keeps is left out, and kept.
-        assert!(state.note_reply_source_model(Some("grok-4".into())));
-        assert_eq!(
-            save_body(&mut state),
-            Some(json!({"kind": "local_proxy", "localModel": "grok-4"}))
-        );
+        assert!(!state.note_picker_list_scroll(PickerFor::Bot, 1));
     }
 
-    /// A first Save never leaves the person's plan without what a turn on it needs. A new
-    /// account's page shows the default address as unsaved, since the server keeps none and
-    /// lists none of the plan's models without one, and says no address is kept rather than
-    /// that opencodex is down. My subscription picked while the server lists no model saves the
-    /// address with the door held on the server's keys, and stays picked; once models are
-    /// listed Save waits for one to be picked, and then sends the door with it. An emptied
-    /// address is refused the same way.
-    #[test]
-    fn a_first_save_never_leaves_the_plan_without_what_a_turn_needs() {
-        use super::{
-            REPLY_SOURCE_HOLDS_GATEWAY, REPLY_SOURCE_NEEDS_ADDRESS, REPLY_SOURCE_PICK_MODEL,
-        };
-        let unset = InferenceSource {
-            kind: InferenceKind::Gateway,
-            base_url: None,
-            local_model: None,
-            healthy: false,
-            has_api_key: false,
-        };
-        let mut state = signed_in_state();
-        read_as(&mut state, unset.clone());
-        assert_eq!(state.proxy_health(), Some(super::ProxyHealth::NoAddress));
-        assert!(
-            state.reply_source.is_unsaved(),
-            "the default address is not the server's yet"
-        );
-        assert_eq!(
-            save_body(&mut state),
-            Some(json!({"kind": "gateway", "baseUrl": "http://127.0.0.1:8080"}))
-        );
+    // ---- The relay: this computer's half, on its card in Settings → Computer ---------------------
 
-        // My subscription, with no model of the plan listed yet.
-        assert!(state.note_reply_source_kind(InferenceKind::LocalProxy));
-        assert_eq!(state.reply_source_hint(), Some(REPLY_SOURCE_HOLDS_GATEWAY));
-        let save = state
-            .begin_reply_source_save()
-            .expect("the address is saved");
-        assert_eq!(
-            serde_json::to_value(&save.update).unwrap(),
-            json!({"kind": "gateway", "baseUrl": "http://127.0.0.1:8080"}),
-            "never the plan without a model"
-        );
-        let kept_address = InferenceSource {
-            base_url: Some("http://127.0.0.1:8080".into()),
-            healthy: true,
-            ..unset.clone()
-        };
-        state.settle_reply_source_save(save.sent, Ok(kept_address.clone()));
-        assert_eq!(
-            state.reply_source.shown_kind(),
-            Some(InferenceKind::LocalProxy),
-            "My subscription stays picked, for a model"
-        );
-        assert!(
-            !state.reply_source_can_save(),
-            "nothing more to send until a model is listed and picked"
-        );
-        assert_eq!(state.reply_source_hint(), Some(REPLY_SOURCE_HOLDS_GATEWAY));
-
-        // The server lists the plan's models now: a model first.
-        with_plan_models(&mut state, &["gpt-5-codex"]);
-        assert_eq!(state.reply_source_hint(), Some(REPLY_SOURCE_PICK_MODEL));
-        assert!(!state.reply_source_can_save());
-        assert!(state.begin_reply_source_save().is_none());
-        assert!(state.note_reply_source_model(Some("gpt-5-codex".into())));
-        assert_eq!(state.reply_source_hint(), None);
-        assert_eq!(
-            save_body(&mut state),
-            Some(json!({"kind": "local_proxy", "localModel": "gpt-5-codex"}))
-        );
-
-        // An address emptied under My subscription is refused here too.
-        state.reply_source.url_draft = Some("  ".into());
-        assert_eq!(state.reply_source_hint(), Some(REPLY_SOURCE_NEEDS_ADDRESS));
-        assert!(state.begin_reply_source_save().is_none());
+    /// A read from a server that knows the relay: the account's door and way, and the relay's
+    /// model, with no computer holding it.
+    fn relay_kept(kind: InferenceKind, via: &str, relay_model: Option<&str>) -> InferenceSource {
+        InferenceSource {
+            via: Some(via.into()),
+            relay: Some(crate::opengrok::RelayRead {
+                connected: false,
+                machine_id: None,
+                machine_label: None,
+                local_model: relay_model.map(str::to_string),
+            }),
+            ..kept(kind, Some("gpt-5-codex"))
+        }
     }
 
-    /// My subscription is offered only where the app's server runs on this Mac: the server calls
-    /// opencodex on its own machine. Elsewhere the plan's half of the page takes no change and
-    /// asks nothing of the server, the default address is not counted as unsaved, and the
-    /// account can still be moved to the server's keys.
+    /// The page sets up nothing of the plan on the server's own machine and picks no model for
+    /// the relay, whatever the server keeps of either: an account on the plan on the server's
+    /// machine, with an address, a key and a model kept there and a model kept for the relay,
+    /// leaves the page with nothing unsaved and nothing for Save, which never needed a model from
+    /// a computer relaying. A Save of what is the page's, this computer's half, sends the server
+    /// nothing at all.
     #[test]
-    fn the_plan_is_set_up_only_where_the_server_runs_on_this_mac() {
-        let mut state = signed_in_state();
-        state.opengrok = Some(OpenGrokClient::new("https://opengrok.example.com").unwrap());
-        read_as(
-            &mut state,
-            InferenceSource {
-                base_url: None,
-                ..kept(InferenceKind::LocalProxy, Some("gpt-5-codex"))
-            },
-        );
-        assert!(!state.reply_source.server_on_this_mac);
-        assert!(!state.reply_source.plan_editable());
-        assert!(!state.reply_source.is_unsaved(), "no address to count");
-        assert!(!state.note_reply_source_model(Some("grok-4".into())));
-        assert!(!state.note_reply_source_key("sk-proxy-1"));
-        assert!(!state.note_remove_reply_source_key());
-        assert!(state.note_reply_source_kind(InferenceKind::Gateway));
-        assert_eq!(save_body(&mut state), Some(json!({"kind": "gateway"})));
-        assert!(
-            !state.note_reply_source_kind(InferenceKind::LocalProxy),
-            "not offered from here"
-        );
-
-        let mut state = signed_in_state();
-        read_as(&mut state, kept(InferenceKind::Gateway, None));
-        assert!(
-            state.reply_source.server_on_this_mac,
-            "127.0.0.1 is this Mac"
-        );
-    }
-
-    /// A field emptied on the page is cleared on the server, as `null`: the address, the model
-    /// (No model), and the key (Remove key, offered while the server holds one). Typing a key
-    /// takes a Remove key back, and Keep key does too.
-    #[test]
-    fn an_emptied_field_is_cleared_and_remove_key_forgets_the_key() {
+    fn the_page_has_nothing_of_the_servers_machine_and_no_relay_model_to_save() {
         let mut state = signed_in_state();
         read_as(
             &mut state,
             InferenceSource {
                 has_api_key: true,
-                ..kept(InferenceKind::Gateway, Some("gpt-5-codex"))
+                ..relay_kept(InferenceKind::LocalProxy, "mac", Some("grok-4"))
             },
         );
-        state.reply_source.url_draft = Some(String::new());
-        assert!(state.note_reply_source_model(None));
-        assert_eq!(state.reply_source.shown_model(), None);
-        assert!(state.note_remove_reply_source_key());
+        assert!(state.reply_source.on_mac());
+        assert!(!state.reply_source.is_unsaved(), "nothing of the server's");
+        assert!(!state.reply_source_can_save());
+        assert_eq!(state.reply_source_hint(), None, "Save waits for no model");
+        assert!(state.begin_reply_source_save().is_none());
+        assert!(state.note_relay_address("http://127.0.0.1:9090".into()));
+        let here = state.begin_reply_source_save().expect("a Save begins");
         assert_eq!(
-            save_body(&mut state),
-            Some(json!({"kind": "gateway", "baseUrl": null, "localModel": null, "apiKey": null}))
+            here.address,
+            Some(Some("http://127.0.0.1:9090".to_string())),
+            "kept on this computer, and nothing is with the server"
         );
-        assert!(state.note_reply_source_key("sk-new"));
-        assert!(
-            !state.reply_source.remove_key,
-            "a typed key replaces instead"
-        );
-        assert!(state.note_remove_reply_source_key());
-        assert_eq!(
-            state.reply_source.key_draft, None,
-            "and Remove key drops it"
-        );
-        assert!(state.note_remove_reply_source_key(), "Keep key");
-        assert!(!state.reply_source.remove_key);
+        assert_eq!(state.reply_source.reading, None);
+    }
 
+    /// opencodex's address and key for the relay are this computer's: Save keeps them here and
+    /// sends the server neither. An address that is not this computer is refused before Save, an
+    /// emptied one goes back to the default, and a key typed and left behind with the page is
+    /// dropped and asked for again.
+    #[test]
+    fn this_computers_address_and_key_are_kept_here_and_never_sent() {
+        use super::RELAY_ADDRESS_NOT_HERE;
         let mut state = signed_in_state();
-        read_as(&mut state, kept(InferenceKind::Gateway, None));
+        read_as(
+            &mut state,
+            relay_kept(InferenceKind::Gateway, "loopback", None),
+        );
+        assert!(!state.note_relay_address(crate::opengrok::DEFAULT_PROXY_URL.into()));
+        assert!(state.note_relay_address("http://192.168.1.5:8080".into()));
+        assert_eq!(state.reply_source_hint(), Some(RELAY_ADDRESS_NOT_HERE));
+        assert!(!state.reply_source_can_save());
+        assert!(state.note_relay_address("http://127.0.0.1:9090/".into()));
+        assert!(state.note_relay_key("  opencodex-test-key  "));
+        let printed = format!("{:?}", state.reply_source);
+        assert!(!printed.contains("opencodex-test-key"), "{printed}");
+        assert!(state.reply_source.without_key().relay_key_draft.is_none());
+        assert!(state.reply_source_can_save());
+        let here = state.begin_reply_source_save().expect("a Save begins");
+        assert_eq!(
+            here.address,
+            Some(Some("http://127.0.0.1:9090".to_string()))
+        );
+        assert_eq!(
+            here.key,
+            Some(crate::opengrok::RelayKey::new("opencodex-test-key"))
+        );
+        assert!(!state.reply_source.is_unsaved(), "the page has let them go");
+
+        // The Keychain's answer: kept, or refused in its words.
+        state.settle_key_kept(Ok(crate::opengrok::RelayKey::new("opencodex-test-key")));
+        assert!(state.relay_mac.has_key);
+        state.settle_key_kept(Err("user interaction is not allowed".into()));
+        assert!(matches!(
+            state.reply_source.note,
+            Some(super::ReplySourceNote::KeyNotKept(ref why)) if why.contains("not allowed")
+        ));
+        state.settle_key_kept(Ok(None));
+        assert!(!state.relay_mac.has_key);
+
+        // Remove key only while one is kept; a key typed takes it back.
+        assert!(!state.note_remove_relay_key());
+        state.relay_mac.has_key = true;
+        assert!(state.note_remove_relay_key());
+        assert!(!state.reply_source.relay_key_editable());
+        let here = state.begin_reply_source_save().unwrap();
+        assert_eq!(here.key, Some(None), "Save forgets it");
+
+        // An emptied address goes back to the default.
+        state.relay_mac.address = Some("http://127.0.0.1:9090".into());
+        assert!(state.note_relay_address(String::new()));
+        let here = state.begin_reply_source_save().unwrap();
+        assert_eq!(here.address, Some(None));
+
+        // A key typed and left behind with the page is dropped, and asked for again.
+        state.is_app_settings_open = true;
+        state.app_settings_tab = AppSettingsTab::Computer;
+        assert!(state.settle_computer_page());
+        assert!(state.note_relay_key("opencodex-test-key"));
+        state.app_settings_tab = AppSettingsTab::Logins;
+        assert!(!state.settle_computer_page());
+        assert!(state.reply_source.relay_key_draft.is_none());
+        assert!(state.reply_source.relay_retype_key);
+        assert!(state.note_relay_key("opencodex-test-key"));
+        assert!(!state.reply_source.relay_retype_key);
+    }
+
+    // ---- Default for new Bots: the account's, kept at once (opengrok-server #322) ---------------
+
+    /// A read from a server that keeps a default for new Bots, as given, `None` being `null`.
+    fn with_new_bots(default: Option<crate::opengrok::NewBotDefault>) -> InferenceSource {
+        InferenceSource {
+            new_bot_default: Some(default),
+            ..relay_kept(InferenceKind::Gateway, "loopback", None)
+        }
+    }
+
+    fn luna(effort: &str) -> crate::opengrok::NewBotDefault {
+        crate::opengrok::NewBotDefault {
+            source: InferenceKind::LocalProxy,
+            model: "gpt-6-luna".into(),
+            effort: effort.into(),
+        }
+    }
+
+    /// The setting as the server answers it, as JSON, with `newBotDefault` as given.
+    fn answered_with(default: serde_json::Value) -> serde_json::Value {
+        json!({
+            "kind": "gateway", "via": "loopback", "baseUrl": null, "localModel": null,
+            "healthy": false, "hasApiKey": false,
+            "relay": {"connected": false, "machineId": null, "machineLabel": null,
+                      "localModel": null},
+            "newBotDefault": default
+        })
+    }
+
+    /// The bodies of the `PUT`s of the account's setting `server` was sent, in order.
+    async fn puts_sent(server: &wiremock::MockServer) -> Vec<serde_json::Value> {
+        server
+            .received_requests()
+            .await
+            .expect("the recorder is on")
+            .iter()
+            .filter(|request| {
+                request.method.as_str() == "PUT"
+                    && request.url.path() == "/account/inference-source"
+            })
+            .map(|request| serde_json::from_slice(&request.body).expect("a JSON body"))
+            .collect()
+    }
+
+    /// Default for new Bots is live only where the server's read carries its key, `null` or not
+    /// (opengrok-server #322, on main c0bb6ae): before the setting is read,
+    /// and from a server whose read has no such key, it is not on the server, it has no picker,
+    /// and nothing of it can be sent. Signing out forgets it with the setting.
+    #[test]
+    fn the_default_for_new_bots_is_live_only_where_the_read_carries_its_key() {
+        use super::{DefaultForNewBots, PickerFor};
+        let mut state = signed_in_state();
+        assert_eq!(
+            state.default_for_new_bots(),
+            DefaultForNewBots::NotOnServer,
+            "not read"
+        );
+        read_as(
+            &mut state,
+            relay_kept(InferenceKind::Gateway, "loopback", None),
+        );
+        assert_eq!(
+            state.default_for_new_bots(),
+            DefaultForNewBots::NotOnServer,
+            "no key on the read"
+        );
+        assert!(state.picker_pick(PickerFor::NewBots).is_none());
+        assert!(state.begin_new_bots_none().is_none());
+
+        read_as(&mut state, with_new_bots(None));
+        assert_eq!(state.default_for_new_bots(), DefaultForNewBots::Kept(None));
+        let pick = state.picker_pick(PickerFor::NewBots).expect("live");
+        assert_eq!(pick.summary(), "None");
         assert!(
-            !state.note_remove_reply_source_key(),
-            "no key held, nothing to remove"
+            state.begin_new_bots_none().is_none(),
+            "none kept: nothing to send"
+        );
+
+        read_as(&mut state, with_new_bots(Some(luna("high"))));
+        assert_eq!(
+            state.default_for_new_bots(),
+            DefaultForNewBots::Kept(Some(luna("high")))
+        );
+        assert_eq!(
+            state.new_bots_pick().map(|pick| pick.summary()),
+            Some("GPT-6 Luna".to_string()),
+            "no list of models read yet, so no levels to name"
+        );
+        state.model_catalogue = crate::opengrok::model_fixtures::levelled_catalogue();
+        assert_eq!(
+            state.new_bots_pick().map(|pick| pick.summary()),
+            Some("GPT-6 Luna · High".to_string())
+        );
+        state.forget_account();
+        assert_eq!(state.default_for_new_bots(), DefaultForNewBots::NotOnServer);
+    }
+
+    /// A pick in Default for new Bots' list is kept on the account at once, whole: one `PUT` of
+    /// the kind the server keeps and `newBotDefault`, the row's door and model with the Default
+    /// effort, and nothing of the plan on the server's own machine or a model of the relay's.
+    /// While it is out the picker takes no other change and no read begins, and a read already
+    /// out is overtaken; what the server answers is what the card shows after.
+    #[tokio::test]
+    async fn a_pick_for_new_bots_puts_the_whole_default_at_once() {
+        use super::{AfterChange, DefaultForNewBots, PickerFor};
+        let server = wiremock::MockServer::start().await;
+        let picked = json!({"source": "local_proxy", "model": "gpt-6-luna", "effort": "inherit"});
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .and(wiremock::matchers::path("/account/inference-source"))
+            .and(wiremock::matchers::body_json(
+                json!({"kind": "gateway", "newBotDefault": picked}),
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(answered_with(picked.clone())),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut state = signed_in_state();
+        state.opengrok = Some(client_signed_in_to(&server).await);
+        read_as(&mut state, with_new_bots(None));
+        state.model_catalogue = ModelCatalogue {
+            models: vec![ModelEntry {
+                id: "gpt-6-luna".into(),
+                source: Some("local_proxy".into()),
+                via: None,
+                ..Default::default()
+            }],
+            note: None,
+            local_proxy: None,
+        };
+        let (_, reading) = state.begin_reply_source_read().expect("a read begins");
+        let patch = state
+            .new_bots_pick()
+            .and_then(|pick| {
+                pick.pick_patch(InferenceKind::LocalProxy, "gpt-6-luna")
+                    .ok()
+                    .flatten()
+            })
+            .expect("a row of the list");
+        let send = state.begin_new_bots_pick(&patch).expect("a change begins");
+        assert!(state.picker_busy(PickerFor::NewBots));
+        assert!(state.begin_new_bots_pick(&patch).is_none(), "one at a time");
+        assert!(
+            state.begin_reply_source_read().is_none(),
+            "no read overtakes it"
+        );
+        assert!(
+            !state.settle_reply_source_read(reading, Ok(with_new_bots(None))),
+            "the read already out is overtaken"
+        );
+
+        let answer = send.client.set_inference_source(&send.update).await;
+        assert_eq!(
+            state.settle_account_change(send.generation, send.about, answer),
+            Some(AfterChange::Done)
+        );
+        assert_eq!(
+            state.default_for_new_bots(),
+            DefaultForNewBots::Kept(Some(luna("inherit")))
+        );
+        assert!(!state.picker_busy(PickerFor::NewBots));
+        assert_eq!(state.picker_note(PickerFor::NewBots), None);
+        assert_eq!(
+            puts_sent(&server).await,
+            [json!({"kind": "gateway", "newBotDefault": picked})]
         );
     }
 
-    /// The URL and key fields take typing only while the page draws them editable, as the radio
-    /// and the picker take a click only then: before the setting is read, while a Save is out,
-    /// and where the server is not on this Mac, what reaches them changes no draft. The key field
-    /// is read-only while Remove key waits for Save too; the URL is not.
+    /// A pick the server refuses is said under the picker in the server's own words, its 400
+    /// `{error}` as #322 words it, and nothing changes: the card still shows what the server
+    /// keeps, and the picker takes the next pick. A read that lands meanwhile leaves the words;
+    /// the next change of the default takes them away.
+    #[tokio::test]
+    async fn a_refused_pick_for_new_bots_shows_the_servers_words() {
+        use super::{AfterChange, DefaultForNewBots, PickerFor};
+        let said = "newBotDefault.model: \"xai/grok-4.6@sub\" is not a model this server knows to \
+                    be OpenAI's or xAI's, and only theirs (gpt-*, o1*, o3*, o4*, codex*, grok-*) \
+                    may use your own subscription";
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .and(wiremock::matchers::path("/account/inference-source"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(400).set_body_json(json!({"error": said})),
+            )
+            .mount(&server)
+            .await;
+        let mut state = signed_in_state();
+        state.opengrok = Some(client_signed_in_to(&server).await);
+        read_as(&mut state, with_new_bots(None));
+        let send = state
+            .begin_new_bots_change(Some(luna("high")))
+            .expect("a change begins");
+        let answer = send.client.set_inference_source(&send.update).await;
+        assert_eq!(
+            state.settle_account_change(send.generation, send.about, answer),
+            Some(AfterChange::Done)
+        );
+        assert_eq!(state.picker_note(PickerFor::NewBots), Some(said));
+        assert_eq!(
+            state.picker_note(PickerFor::Bot),
+            None,
+            "said only where it was asked"
+        );
+        assert_eq!(
+            state.default_for_new_bots(),
+            DefaultForNewBots::Kept(None),
+            "nothing was kept, and nothing claims it was"
+        );
+        assert!(!state.picker_busy(PickerFor::NewBots));
+        read_as(&mut state, with_new_bots(None));
+        assert_eq!(state.picker_note(PickerFor::NewBots), Some(said));
+        assert!(state.begin_new_bots_change(Some(luna("low"))).is_some());
+        assert_eq!(state.picker_note(PickerFor::NewBots), None, "a new change");
+    }
+
+    /// A runtime that nothing drives: a request begun while it is entered never answers, and
+    /// never fails, which is what a test wants of a change it only means to see begin.
+    fn undriven_runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime")
+    }
+
+    /// An effort the model does not list is refused with a 400 whose words name the levels it
+    /// does list (opengrok-server #342 (main 2136ffc): `effort_refused` in
+    /// `crates/opengrok-server/src/inference.rs`, which `save` there asks of `newBotDefault` on
+    /// its own source and of `planFallback` on the gateway), and nothing is kept. Default for new
+    /// Bots' and the Relay-off fallback's pickers each say the words as they are, under their
+    /// controls, where they asked; the Bot's is
+    /// [`a_bots_refused_effort_is_said_in_its_popover_through_the_real_refusal`].
+    #[tokio::test]
+    async fn a_refused_effort_shows_the_servers_words_in_default_for_new_bots_and_the_fallback() {
+        use super::{AfterChange, DefaultForNewBots, PickerFor, RelayOffFallback};
+        let defaults =
+            "newBotDefault.effort: gpt-6-luna takes low, medium, high, xhigh or max, not \"none\"";
+        let fallbacks =
+            "planFallback.effort: openai/gpt-6-luna takes low, medium or high, not \"max\"";
+        let server = wiremock::MockServer::start().await;
+        for (key, said, effort) in [
+            ("newBotDefault", defaults, "none"),
+            ("planFallback", fallbacks, "max"),
+        ] {
+            wiremock::Mock::given(wiremock::matchers::method("PUT"))
+                .and(wiremock::matchers::path("/account/inference-source"))
+                .and(wiremock::matchers::body_partial_json(json!({
+                    (key): {"effort": effort}
+                })))
+                .respond_with(
+                    wiremock::ResponseTemplate::new(400).set_body_json(json!({"error": said})),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+        }
+        let mut state = signed_in_state();
+        state.opengrok = Some(client_signed_in_to(&server).await);
+        with_bot(&mut state, json!("local_proxy"));
+        read_as(
+            &mut state,
+            InferenceSource {
+                new_bot_default: Some(Some(luna("high"))),
+                plan_fallback: Some(Some(cheap("high"))),
+                ..relay_kept(InferenceKind::Gateway, "loopback", None)
+            },
+        );
+
+        // Default for new Bots': its own words, kept nowhere, and said where it asked.
+        let send = state
+            .begin_new_bots_change(Some(luna("none")))
+            .expect("a change begins");
+        let answer = send.client.set_inference_source(&send.update).await;
+        assert_eq!(
+            state.settle_account_change(send.generation, send.about, answer),
+            Some(AfterChange::Done)
+        );
+        assert_eq!(state.picker_note(PickerFor::NewBots), Some(defaults));
+        assert_eq!(
+            state.picker_note(PickerFor::Bot),
+            None,
+            "said only where it was asked"
+        );
+        assert_eq!(
+            state.default_for_new_bots(),
+            DefaultForNewBots::Kept(Some(luna("high"))),
+            "nothing was kept"
+        );
+
+        // The Relay-off fallback's.
+        let send = state
+            .begin_plan_fallback_change(Some(crate::opengrok::PlanFallback {
+                model: "openai/gpt-6-luna".into(),
+                effort: "max".into(),
+            }))
+            .expect("a change begins");
+        let answer = send.client.set_inference_source(&send.update).await;
+        assert_eq!(
+            state.settle_account_change(send.generation, send.about, answer),
+            Some(AfterChange::Done)
+        );
+        assert_eq!(state.picker_note(PickerFor::PlanFallback), Some(fallbacks));
+        assert_eq!(
+            state.relay_off_fallback(),
+            RelayOffFallback::Kept(Some(cheap("high")))
+        );
+        assert_eq!(
+            state.picker_note(PickerFor::NewBots),
+            None,
+            "the account's one slot holds the last refusal, and says it where it was asked"
+        );
+    }
+
+    /// The Bot's picker offers a level the server then refuses, as when the list the picker was
+    /// shown is not the one the server holds: the PATCH goes out, the server answers 400 in its
+    /// words, and the popover says them, as the settings pane's red line does, with the roster put
+    /// back on what the server keeps. It goes through the road a real refusal takes, over a real
+    /// answer: the callback `save_model_pick` hands the request is what puts the words in the
+    /// popover, so the test fails without it.
+    #[gpui_kit::test]
+    fn a_bots_refused_effort_is_said_in_its_popover_through_the_real_refusal(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        use super::PickerFor;
+        use gpui_kit::AppContext as _;
+        let said = "effort: gpt-6-luna takes low, medium, high, xhigh or max, not \"none\"";
+        // The answer comes back on this runtime's own threads, so it is driven, and the test
+        // waits for the answer in real time, which the scheduler is told it may.
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("a runtime");
+        let _enter = runtime.enter();
+        cx.executor().allow_parking();
+        let server = runtime.block_on(wiremock::MockServer::start());
+        runtime.block_on(
+            wiremock::Mock::given(wiremock::matchers::method("PATCH"))
+                .and(wiremock::matchers::path("/coworkers/cw_1"))
+                .and(wiremock::matchers::body_json(json!({"effort": "none"})))
+                .respond_with(
+                    wiremock::ResponseTemplate::new(400).set_body_json(json!({"error": said})),
+                )
+                .expect(1)
+                .mount(&server),
+        );
+        let mut state = signed_in_state();
+        state.opengrok = Some(runtime.block_on(client_signed_in_to(&server)));
+        read_as(
+            &mut state,
+            relay_kept(InferenceKind::Gateway, "loopback", None),
+        );
+        with_bot(&mut state, json!("local_proxy"));
+        state.coworkers[0].model = "gpt-6-luna".into();
+        state.coworkers[0].effort = Some("high".into());
+        // The picker lists `none` among GPT-6 Luna's levels, and the server, asked again, does not.
+        let levels = ["none", "low", "medium", "high", "xhigh", "max"]
+            .map(|word| json!({"value": word, "label": format!("{word} effort")}));
+        state.model_catalogue = serde_json::from_value(json!({
+            "models": [{
+                "id": "gpt-6-luna", "source": "local_proxy", "ownEffort": "medium",
+                "efforts": levels
+            }],
+            "note": null
+        }))
+        .expect("a list");
+        let app = cx.new(|_| state);
+        app.update(cx, |state, cx| {
+            state.set_picker_open(PickerFor::Bot, true, cx);
+            // None is the first of the six stops.
+            state.pick_model_effort_level(PickerFor::Bot, 0, cx);
+            assert_eq!(
+                state.coworkers[0].effort.as_deref(),
+                Some("none"),
+                "the roster takes the pick at once"
+            );
+        });
+        // The answer lands on the executor from another thread, so it is waited for.
+        let mut waited = 0;
+        while app.read_with(cx, |state, _| state.auth_error.is_none()) {
+            assert!(waited < 2000, "the server never answered");
+            cx.run_until_parked();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            waited += 1;
+        }
+        app.read_with(cx, |state, _| {
+            assert_eq!(
+                state.picker_note(PickerFor::Bot),
+                Some(said),
+                "said in the popover, in the server's words"
+            );
+            assert_eq!(
+                state.auth_error.as_deref(),
+                Some(said),
+                "and on the pane's red line"
+            );
+            assert_eq!(
+                state.coworkers[0].effort.as_deref(),
+                Some("high"),
+                "the roster is put back on what the server keeps"
+            );
+        });
+        cx.run_until_parked();
+    }
+
+    /// A pick that puts the effort back on the model's own level says so under the slider, for
+    /// that model, until the next change is sent or the popover opens or shuts; the pick of a
+    /// model that lists the effort says nothing, and the Bot's roster takes the pick, effort and
+    /// all, at once. Ultra is Sol's alone: GPT-6 Luna stops at max.
+    #[gpui_kit::test]
+    fn a_pick_that_puts_the_effort_back_says_so_until_the_next_change(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        use super::PickerFor;
+        use gpui_kit::AppContext as _;
+        let runtime = undriven_runtime();
+        let _enter = runtime.enter();
+        let levels = |ids: &[&str]| -> Vec<serde_json::Value> {
+            let words: &[&str] = if ids.iter().any(|id| id.contains("sol")) {
+                &["low", "medium", "high", "xhigh", "max", "ultra"]
+            } else {
+                &["low", "medium", "high", "xhigh", "max"]
+            };
+            words
+                .iter()
+                .map(|word| {
+                    let name = format!("{}{}", word[..1].to_uppercase(), &word[1..]);
+                    json!({"value": word, "label": format!("{name} Effort")})
+                })
+                .collect()
+        };
+        let mut state = signed_in_state();
+        read_as(
+            &mut state,
+            relay_kept(InferenceKind::Gateway, "loopback", None),
+        );
+        with_bot(&mut state, json!("local_proxy"));
+        state.coworkers[0].model = "gpt-5.6-sol".into();
+        state.coworkers[0].effort = Some("ultra".into());
+        state.model_catalogue = serde_json::from_value(json!({
+            "models": [
+                {"id": "gpt-6-luna", "source": "local_proxy", "ownEffort": "medium",
+                 "efforts": levels(&["gpt-6-luna"])},
+                {"id": "gpt-5.6-sol", "source": "local_proxy", "ownEffort": "high",
+                 "efforts": levels(&["gpt-5.6-sol"])}
+            ],
+            "note": null
+        }))
+        .expect("a list");
+        let app = cx.new(|_| state);
+        app.update(cx, |state, cx| {
+            state.set_picker_open(PickerFor::Bot, true, cx);
+            state.toggle_picker_list(PickerFor::Bot, cx);
+            state.pick_model(PickerFor::Bot, InferenceKind::LocalProxy, "gpt-6-luna", cx);
+            // The roster took the pick at once: the model, and the effort back to `inherit`,
+            // which the slider shows as the model's own level.
+            assert_eq!(state.coworkers[0].model, "gpt-6-luna");
+            assert_eq!(state.coworkers[0].effort.as_deref(), Some("inherit"));
+            let pick = state.model_pick().expect("a Bot is open");
+            assert_eq!(pick.effort_name().as_deref(), Some("Medium"));
+            assert_eq!(
+                state.model_picker.effort_note_for(&pick),
+                Some("GPT-6 Luna has no Ultra, so it's on Medium, its own level.")
+            );
+            assert!(!state.model_picker.list_open, "back to the controls");
+
+            // Moving the slider is a change of its own, and the line is about the last pick.
+            state.pick_model_effort_level(PickerFor::Bot, 2, cx);
+            assert_eq!(state.coworkers[0].effort.as_deref(), Some("high"));
+            assert_eq!(state.model_picker.effort_note, None);
+
+            // A stop past the levels the model lists is none, and sends nothing.
+            state.pick_model_effort_level(PickerFor::Bot, 5, cx);
+            assert_eq!(state.coworkers[0].effort.as_deref(), Some("high"));
+
+            // Sol lists high: the pick keeps it, and nothing is said.
+            state.toggle_picker_list(PickerFor::Bot, cx);
+            state.pick_model(PickerFor::Bot, InferenceKind::LocalProxy, "gpt-5.6-sol", cx);
+            assert_eq!(state.coworkers[0].model, "gpt-5.6-sol");
+            assert_eq!(state.coworkers[0].effort.as_deref(), Some("high"));
+            assert_eq!(state.model_picker.effort_note, None);
+
+            // The line goes as the popover shuts, and is not about another model.
+            state.pick_model_effort_level(PickerFor::Bot, 5, cx);
+            assert_eq!(state.coworkers[0].effort.as_deref(), Some("ultra"));
+            state.toggle_picker_list(PickerFor::Bot, cx);
+            state.pick_model(PickerFor::Bot, InferenceKind::LocalProxy, "gpt-6-luna", cx);
+            assert!(state.model_picker.effort_note.is_some());
+            let pick = state.model_pick().expect("a Bot is open");
+            assert!(state.model_picker.effort_note_for(&pick).is_some());
+            state.coworkers[0].model = "gpt-5.6-sol".into();
+            let pick = state.model_pick().expect("a Bot is open");
+            assert_eq!(
+                state.model_picker.effort_note_for(&pick),
+                None,
+                "a line about a model that is not the one on the card"
+            );
+            state.coworkers[0].model = "gpt-6-luna".into();
+            state.set_picker_open(PickerFor::Bot, false, cx);
+            assert_eq!(state.model_picker.effort_note, None);
+        });
+        // Whatever the last change began is polled while the runtime is entered, and stays out.
+        cx.run_until_parked();
+    }
+
+    /// None takes the kept default away: one `PUT` of the kind the server keeps and
+    /// `newBotDefault: null`, which leaves a new Bot to the server's own default.
+    #[tokio::test]
+    async fn none_sends_null_and_takes_the_default_for_new_bots_away() {
+        use super::{AfterChange, DefaultForNewBots};
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .and(wiremock::matchers::path("/account/inference-source"))
+            .and(wiremock::matchers::body_json(
+                json!({"kind": "gateway", "newBotDefault": null}),
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(answered_with(serde_json::Value::Null)),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut state = signed_in_state();
+        state.opengrok = Some(client_signed_in_to(&server).await);
+        read_as(&mut state, with_new_bots(Some(luna("high"))));
+        let send = state.begin_new_bots_none().expect("a default to take away");
+        let answer = send.client.set_inference_source(&send.update).await;
+        assert_eq!(
+            state.settle_account_change(send.generation, send.about, answer),
+            Some(AfterChange::Done)
+        );
+        assert_eq!(state.default_for_new_bots(), DefaultForNewBots::Kept(None));
+        assert_eq!(
+            puts_sent(&server).await,
+            [json!({"kind": "gateway", "newBotDefault": null})]
+        );
+    }
+
+    /// A change nobody heard back from says so where it was asked, not as trouble, and the
+    /// setting is read again, whose answer clears it; a change the person signed out from lands
+    /// on nothing when it answers.
+    #[test]
+    fn a_change_nobody_heard_back_from_is_read_again() {
+        use super::{ACCOUNT_CHANGE_UNKNOWN, AfterChange, PickerFor};
+        let mut state = signed_in_state();
+        read_as(&mut state, with_new_bots(None));
+        let send = state
+            .begin_new_bots_change(Some(luna("high")))
+            .expect("a change begins");
+        assert_eq!(
+            state.settle_account_change(
+                send.generation,
+                send.about,
+                Err(OpenGrokError::message("error sending request"))
+            ),
+            Some(AfterChange::ReadAgain)
+        );
+        assert_eq!(
+            state.picker_note(PickerFor::NewBots),
+            Some(ACCOUNT_CHANGE_UNKNOWN)
+        );
+        read_as(&mut state, with_new_bots(Some(luna("high"))));
+        assert_eq!(
+            state.picker_note(PickerFor::NewBots),
+            None,
+            "the read answers it"
+        );
+
+        let send = state.begin_new_bots_none().expect("a change begins");
+        state.forget_account();
+        assert_eq!(
+            state.settle_account_change(send.generation, send.about, Ok(with_new_bots(None))),
+            None
+        );
+        assert_eq!(state.reply_source.kept, None);
+    }
+
+    // ---- The Relay-off fallback: the account's, kept at once (opengrok-server #332) ----------
+
+    /// A read from a server that keeps a Relay-off fallback, as given, `None` being `null`.
+    fn with_plan_fallback(fallback: Option<crate::opengrok::PlanFallback>) -> InferenceSource {
+        InferenceSource {
+            plan_fallback: Some(fallback),
+            ..relay_kept(InferenceKind::LocalProxy, "mac", None)
+        }
+    }
+
+    fn cheap(effort: &str) -> crate::opengrok::PlanFallback {
+        crate::opengrok::PlanFallback {
+            model: "oag/cheap".into(),
+            effort: effort.into(),
+        }
+    }
+
+    /// The setting as the server answers it, as JSON, with `planFallback` as given.
+    fn answered_with_fallback(fallback: serde_json::Value) -> serde_json::Value {
+        json!({
+            "kind": "local_proxy", "via": "mac", "baseUrl": null, "localModel": null,
+            "healthy": false, "hasApiKey": false,
+            "relay": {"connected": false, "machineId": null, "machineLabel": null,
+                      "localModel": null},
+            "planFallback": fallback
+        })
+    }
+
+    /// One gateway route and one model of the person's plan, as `GET /models` lists them.
+    fn a_route_and_a_plan_model() -> ModelCatalogue {
+        ModelCatalogue {
+            models: vec![
+                ModelEntry {
+                    id: "oag/cheap".into(),
+                    source: Some("gateway".into()),
+                    via: None,
+                    ..Default::default()
+                },
+                ModelEntry {
+                    id: "gpt-6-luna".into(),
+                    source: Some("local_proxy".into()),
+                    via: None,
+                    ..Default::default()
+                },
+            ],
+            note: None,
+            local_proxy: None,
+        }
+    }
+
+    /// The Relay-off fallback is live only where the server's read carries its key, `null` or not
+    /// (opengrok-server #332 (PR #338 at 66b9f7b)): before the setting is read, and from a server
+    /// whose read has no such key, it is not on the server, it has no picker, and nothing of it
+    /// can be sent. Signing out forgets it with the setting.
+    #[test]
+    fn the_relay_off_fallback_is_live_only_where_the_read_carries_its_key() {
+        use super::{PickerFor, RelayOffFallback};
+        let mut state = signed_in_state();
+        assert_eq!(
+            state.relay_off_fallback(),
+            RelayOffFallback::NotOnServer,
+            "not read"
+        );
+        read_as(
+            &mut state,
+            relay_kept(InferenceKind::LocalProxy, "mac", None),
+        );
+        assert_eq!(
+            state.relay_off_fallback(),
+            RelayOffFallback::NotOnServer,
+            "no key on the read"
+        );
+        assert!(state.picker_pick(PickerFor::PlanFallback).is_none());
+        assert!(state.begin_plan_fallback_none().is_none());
+
+        read_as(&mut state, with_plan_fallback(None));
+        assert_eq!(state.relay_off_fallback(), RelayOffFallback::Kept(None));
+        let pick = state.picker_pick(PickerFor::PlanFallback).expect("live");
+        assert_eq!(pick.summary(), "None");
+        assert!(
+            state.begin_plan_fallback_none().is_none(),
+            "none kept: nothing to send"
+        );
+
+        read_as(&mut state, with_plan_fallback(Some(cheap("low"))));
+        assert_eq!(
+            state.relay_off_fallback(),
+            RelayOffFallback::Kept(Some(cheap("low")))
+        );
+        state.forget_account();
+        assert_eq!(state.relay_off_fallback(), RelayOffFallback::NotOnServer);
+    }
+
+    /// The Relay-off fallback's list is the Gateway group alone: over the same models, where
+    /// Default for new Bots offers the person's plan too, the fallback offers the server's keys
+    /// and nothing else.
+    #[test]
+    fn the_relay_off_fallbacks_list_holds_gateway_rows_only() {
+        let mut state = signed_in_state();
+        read_as(
+            &mut state,
+            InferenceSource {
+                new_bot_default: Some(None),
+                plan_fallback: Some(None),
+                ..relay_kept(InferenceKind::LocalProxy, "loopback", None)
+            },
+        );
+        state.model_catalogue = a_route_and_a_plan_model();
+        let doors = |pick: crate::opengrok::ModelPick| {
+            pick.rows()
+                .map(|row| (row.source, row.base_id.clone()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            doors(state.new_bots_pick().expect("live")),
+            [
+                (InferenceKind::LocalProxy, "gpt-6-luna".to_string()),
+                (InferenceKind::Gateway, "oag/cheap".to_string())
+            ]
+        );
+        assert_eq!(
+            doors(state.plan_fallback_pick().expect("live")),
+            [(InferenceKind::Gateway, "oag/cheap".to_string())]
+        );
+    }
+
+    /// A pick in the Relay-off fallback's list is kept on the account at once, whole: one `PUT`
+    /// of the kind the server keeps and `planFallback`, the row's model with the effort `inherit`,
+    /// and nothing else. While it is out no other change of the account's is taken, the
+    /// fallback's or the default for new Bots'; what the server answers is what the card shows
+    /// after. A refusal is said under the fallback's picker in the server's words, and nowhere
+    /// else.
+    #[tokio::test]
+    async fn a_pick_for_the_relay_off_fallback_puts_it_whole_at_once() {
+        use super::{AccountChange, AfterChange, PickerFor, RelayOffFallback};
+        let server = wiremock::MockServer::start().await;
+        let picked = json!({"model": "oag/cheap", "effort": "inherit"});
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .and(wiremock::matchers::path("/account/inference-source"))
+            .and(wiremock::matchers::body_json(
+                json!({"kind": "local_proxy", "planFallback": picked}),
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(answered_with_fallback(picked.clone())),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut state = signed_in_state();
+        state.opengrok = Some(client_signed_in_to(&server).await);
+        read_as(&mut state, with_plan_fallback(None));
+        state.model_catalogue = a_route_and_a_plan_model();
+        let patch = state
+            .plan_fallback_pick()
+            .and_then(|pick| {
+                pick.pick_patch(InferenceKind::Gateway, "oag/cheap")
+                    .ok()
+                    .flatten()
+            })
+            .expect("a row of the list");
+        let send = state
+            .begin_plan_fallback_pick(&patch)
+            .expect("a change begins");
+        assert!(state.picker_busy(PickerFor::PlanFallback));
+        assert!(state.picker_busy(PickerFor::NewBots), "one at a time");
+        assert!(state.begin_plan_fallback_pick(&patch).is_none());
+        let answer = send.client.set_inference_source(&send.update).await;
+        assert_eq!(
+            state.settle_account_change(send.generation, send.about, answer),
+            Some(AfterChange::Done)
+        );
+        assert_eq!(
+            state.relay_off_fallback(),
+            RelayOffFallback::Kept(Some(cheap("inherit")))
+        );
+        assert!(!state.picker_busy(PickerFor::PlanFallback));
+        assert_eq!(
+            puts_sent(&server).await,
+            [json!({"kind": "local_proxy", "planFallback": picked})]
+        );
+
+        // The server's words for an effort that is not a Bot's (opengrok-server #332 (PR #338 at
+        // 66b9f7b): `PlanFallback::named`), which keep none of the body.
+        let said = "planFallback.effort must be one of inherit, none, low, medium, high, xhigh, \
+                    max, ultra";
+        let send = state
+            .begin_plan_fallback_change(Some(cheap("loud")))
+            .expect("a change begins");
+        assert_eq!(
+            state.settle_account_change(
+                send.generation,
+                send.about,
+                Err(OpenGrokError::from_opengrok(400, said))
+            ),
+            Some(AfterChange::Done)
+        );
+        assert_eq!(state.picker_note(PickerFor::PlanFallback), Some(said));
+        assert_eq!(state.picker_note(PickerFor::NewBots), None);
+        assert_eq!(
+            state.reply_source.change_note(AccountChange::PlanFallback),
+            Some(said)
+        );
+        assert_eq!(
+            state.relay_off_fallback(),
+            RelayOffFallback::Kept(Some(cheap("inherit"))),
+            "nothing refused is kept"
+        );
+    }
+
+    /// None takes the kept fallback away: one `PUT` of the kind the server keeps and
+    /// `planFallback: null`.
+    #[tokio::test]
+    async fn none_sends_null_and_takes_the_relay_off_fallback_away() {
+        use super::{AfterChange, RelayOffFallback};
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .and(wiremock::matchers::path("/account/inference-source"))
+            .and(wiremock::matchers::body_json(
+                json!({"kind": "local_proxy", "planFallback": null}),
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(answered_with_fallback(serde_json::Value::Null)),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut state = signed_in_state();
+        state.opengrok = Some(client_signed_in_to(&server).await);
+        read_as(&mut state, with_plan_fallback(Some(cheap("low"))));
+        let send = state
+            .begin_plan_fallback_none()
+            .expect("a fallback to take away");
+        let answer = send.client.set_inference_source(&send.update).await;
+        assert_eq!(
+            state.settle_account_change(send.generation, send.about, answer),
+            Some(AfterChange::Done)
+        );
+        assert_eq!(state.relay_off_fallback(), RelayOffFallback::Kept(None));
+        assert_eq!(
+            puts_sent(&server).await,
+            [json!({"kind": "local_proxy", "planFallback": null})]
+        );
+    }
+
+    // ---- A computer's relay switch: each card's own, and the account's way pointed at the relay --
+
+    /// The account's setting as a server that knows the relay answers it: on the plan, its way
+    /// `via`, nobody's computer holding the relay, and `relayEnabled` as given, `None` being a
+    /// server that sends no such key, as every server before opengrok-server #332 (PR #338 at
+    /// 66b9f7b) does. From a server with per-computer switches (opengrok-server #342 (main
+    /// 2136ffc)) it is derived, and only ever read.
+    fn relay_answer(via: &str, relay_enabled: Option<bool>) -> serde_json::Value {
+        let mut body = json!({
+            "kind": "local_proxy", "via": via, "baseUrl": "http://127.0.0.1:8080",
+            "localModel": "gpt-5-codex", "healthy": true, "hasApiKey": false,
+            "relay": {"connected": false, "machineId": null, "machineLabel": null,
+                      "localModel": null}
+        });
+        if let Some(enabled) = relay_enabled {
+            body["relayEnabled"] = json!(enabled);
+        }
+        body
+    }
+
+    /// One of the person's computers as the roster holds it.
+    fn computer(
+        machine_id: &str,
+        this_machine: bool,
+        relay_enabled: bool,
+        relaying: bool,
+        online: bool,
+    ) -> ConnectedComputer {
+        ConnectedComputer {
+            machine_id: machine_id.into(),
+            label: format!("NativeChat on {machine_id}"),
+            mode: LocalExecMode::Ask,
+            this_machine,
+            online,
+            relay_enabled,
+            relaying,
+        }
+    }
+
+    /// A computer's row as `GET /local-exec/daemon` lists it and `PATCH` answers it (opengrok-server
+    /// #342 (main 2136ffc): `row` in `crates/opengrok-server/src/local_exec.rs`).
+    fn daemon_row(machine_id: &str, relay_enabled: bool, relaying: bool) -> serde_json::Value {
+        json!({"machineId": machine_id, "label": format!("NativeChat on {machine_id}"),
+               "enrolledAtMs": 1_790_000_000_000_i64, "revoked": false, "connected": true,
+               "relayEnabled": relay_enabled, "relaying": relaying})
+    }
+
+    /// `PATCH /local-exec/daemon/{machine_id}` `{relayEnabled: on}` is answered with the row.
+    async fn mount_switch(server: &wiremock::MockServer, machine_id: &str, on: bool) {
+        wiremock::Mock::given(wiremock::matchers::method("PATCH"))
+            .and(wiremock::matchers::path(format!(
+                "/local-exec/daemon/{machine_id}"
+            )))
+            .and(wiremock::matchers::body_json(json!({ "relayEnabled": on })))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(daemon_row(
+                    machine_id,
+                    on,
+                    on && machine_id == "mac_1",
+                )),
+            )
+            .mount(server)
+            .await;
+    }
+
+    /// Somebody signed in to `server` on an enrolled computer, `mac_1`, with its relay on and
+    /// another, `mac_2`, off and not reached by the server; the account's way to the plan `via`, as
+    /// a read of [`relay_answer`] brings it, from a server that derives `relayEnabled`.
+    async fn ready_to_switch(server: &wiremock::MockServer, via: &str) -> AppState {
+        let mut state = signed_in_state();
+        state.opengrok = Some(client_signed_in_to(server).await);
+        state.local_exec_machine_id = Some("mac_1".into());
+        state.computers = vec![
+            computer("mac_1", true, true, true, true),
+            computer("mac_2", false, false, false, false),
+        ];
+        read_as(
+            &mut state,
+            serde_json::from_value(relay_answer(via, Some(true))).expect("a setting"),
+        );
+        state
+    }
+
+    /// The `PATCH`es of a computer's switch `server` was sent, as (machine id, body), in order.
+    async fn patches_sent(server: &wiremock::MockServer) -> Vec<(String, serde_json::Value)> {
+        server
+            .received_requests()
+            .await
+            .expect("the recorder is on")
+            .iter()
+            .filter(|request| request.method.as_str() == "PATCH")
+            .filter_map(|request| {
+                let id = request.url.path().strip_prefix("/local-exec/daemon/")?;
+                let body = serde_json::from_slice(&request.body).expect("a JSON body");
+                Some((id.to_string(), body))
+            })
+            .collect()
+    }
+
+    /// One computer's card as the window draws it.
+    fn card_of(state: &AppState, machine_id: &str) -> crate::components::computers::ComputerCard {
+        crate::components::computers::cards(state)
+            .into_iter()
+            .find(|card| card.machine_id == machine_id)
+            .expect("a card for the computer")
+    }
+
+    /// Send the switch of `machine_id`'s card to `on` against the real client, and settle it.
+    async fn switch_card(
+        state: &mut AppState,
+        machine_id: &str,
+        on: bool,
+    ) -> super::AfterComputerRelay {
+        let send = state
+            .begin_computer_relay(machine_id, on)
+            .expect("a switch begins");
+        let answer = send
+            .client
+            .switch_computer_relay(&send.machine_id, send.on)
+            .await;
+        state.settle_computer_relay(machine_id, send.token, answer)
+    }
+
+    /// A computer's card switch is its own: one `PATCH` of `{relayEnabled}` to that computer's id,
+    /// from this window whichever computer it is. The card draws the switch where the click asked to
+    /// take it while the server is asked, and takes no second click meanwhile, and another card's
+    /// switch is free; the server's answer is the row from then on. Turning one on points the
+    /// account's way at the relay in the same press, once: one `PUT` of `{kind, via: "mac"}` with
+    /// nothing else in it, and the models are read again for the pickers' Subscription group. The
+    /// next switch finds the way already the relay's and sends none, and turning one off moves no
+    /// way. (opengrok-server #342 (main 2136ffc): `resolve` and `route` read `via`, and
+    /// `via: "mac"` with no computer on is "Relay off".)
+    #[tokio::test]
+    async fn a_computers_switch_is_its_own_patch_and_on_points_the_account_at_the_relay_once() {
+        use super::{AfterChange, AfterComputerRelay};
+        let server = wiremock::MockServer::start().await;
+        for (id, on) in [("mac_2", true), ("mac_2", false), ("mac_1", false)] {
+            mount_switch(&server, id, on).await;
+        }
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .and(wiremock::matchers::path("/account/inference-source"))
+            .and(wiremock::matchers::body_json(
+                json!({"kind": "local_proxy", "via": "mac"}),
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(relay_answer("mac", Some(true))),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut state = ready_to_switch(&server, "loopback").await;
+        assert!(!state.reply_source.on_mac());
+        assert!(!card_of(&state, "mac_2").relay_on);
+
+        // On: drawn where the click asked while with the server, one at a time to a card.
+        let send = state
+            .begin_computer_relay("mac_2", true)
+            .expect("a switch begins");
+        let card = card_of(&state, "mac_2");
+        assert!(card.relay_on && card.switching, "{card:?}");
+        assert!(state.begin_computer_relay("mac_2", false).is_none());
+        assert!(
+            !card_of(&state, "mac_1").switching,
+            "another card's is free"
+        );
+        let answer = send
+            .client
+            .switch_computer_relay(&send.machine_id, send.on)
+            .await;
+        assert_eq!(
+            state.settle_computer_relay("mac_2", send.token, answer),
+            AfterComputerRelay::Kept { on: true }
+        );
+        let card = card_of(&state, "mac_2");
+        assert!(card.relay_on && !card.switching, "the row is the answer");
+
+        // The account's way follows, once.
+        let change = state
+            .begin_relay_change("mac_2")
+            .expect("the account still asks the server's own machine");
+        assert_eq!(
+            serde_json::to_value(&change.update).unwrap(),
+            json!({"kind": "local_proxy", "via": "mac"})
+        );
+        let answer = change.client.set_inference_source(&change.update).await;
+        assert_eq!(
+            state.settle_account_change(change.generation, change.about, answer),
+            Some(AfterChange::ReadModels)
+        );
+        assert!(state.reply_source.on_mac(), "as the server answered");
+
+        // Off moves no way, and on again finds the way the relay's already.
+        assert_eq!(
+            switch_card(&mut state, "mac_2", false).await,
+            AfterComputerRelay::Kept { on: false }
+        );
+        assert!(!card_of(&state, "mac_2").relay_on);
+        assert_eq!(
+            switch_card(&mut state, "mac_2", true).await,
+            AfterComputerRelay::Kept { on: true }
+        );
+        assert!(
+            state.begin_relay_change("mac_2").is_none(),
+            "already the account's way"
+        );
+        assert_eq!(
+            patches_sent(&server).await,
+            [
+                ("mac_2".to_string(), json!({"relayEnabled": true})),
+                ("mac_2".to_string(), json!({"relayEnabled": false})),
+                ("mac_2".to_string(), json!({"relayEnabled": true})),
+            ]
+        );
+        assert_eq!(
+            puts_sent(&server).await,
+            [json!({"kind": "local_proxy", "via": "mac"})]
+        );
+    }
+
+    /// The account's own `relayEnabled` is derived from the computers' switches now, and a `PUT` of
+    /// it would switch every one of them: it is read and never sent, whatever a switch does. A
+    /// server that sends it on every read (true while any computer is on, false with none) is
+    /// answered switches on and off of each card, with the way pointed at the relay or not, and no
+    /// `PUT` it was sent names `relayEnabled` anywhere; nor does any other change the app makes of
+    /// the account's setting.
+    #[tokio::test]
+    async fn no_put_of_the_account_ever_carries_relay_enabled() {
+        let server = wiremock::MockServer::start().await;
+        for (id, on) in [
+            ("mac_1", true),
+            ("mac_1", false),
+            ("mac_2", true),
+            ("mac_2", false),
+        ] {
+            mount_switch(&server, id, on).await;
+        }
+        for relay_enabled in [true, false] {
+            wiremock::Mock::given(wiremock::matchers::method("PUT"))
+                .and(wiremock::matchers::path("/account/inference-source"))
+                .respond_with(
+                    wiremock::ResponseTemplate::new(200)
+                        .set_body_json(relay_answer("mac", Some(relay_enabled))),
+                )
+                .mount(&server)
+                .await;
+        }
+        for via in ["loopback", "mac"] {
+            let mut state = ready_to_switch(&server, via).await;
+            for (machine, on) in [
+                ("mac_2", true),
+                ("mac_1", false),
+                ("mac_2", false),
+                ("mac_1", true),
+            ] {
+                switch_card(&mut state, machine, on).await;
+                if on && let Some(change) = state.begin_relay_change(machine) {
+                    let answer = change.client.set_inference_source(&change.update).await;
+                    state.settle_account_change(change.generation, change.about, answer);
+                }
+            }
+            // The other changes of the account's setting that go at once.
+            if let Some(pick) = state.begin_new_bots_change(None) {
+                let answer = pick.client.set_inference_source(&pick.update).await;
+                state.settle_account_change(pick.generation, pick.about, answer);
+            }
+        }
+        let sent = puts_sent(&server).await;
+        assert!(!sent.is_empty(), "something was asked of the account");
+        for body in &sent {
+            assert!(!body.to_string().contains("relayEnabled"), "{body}");
+        }
+    }
+
+    /// A refused switch goes back, and the server's words are under that card's switch, in the
+    /// server's own sentence beside its code: another account's computer and one nobody enrolled
+    /// are the same 404 `not_found`, a revoked one 409 `revoked`, and a body that is not a true or
+    /// false 400 `bad_request` (opengrok-server #342 (main 2136ffc): `switch_relay` in
+    /// `crates/opengrok-server/src/local_exec.rs`). The card was
+    /// drawn where the click asked while the server was asked, and is drawn from the row, which
+    /// nothing refused changed, from then on. A computer the server does not know, or says is
+    /// revoked, is a roster gone out of date, and is read again; no other card says anything, and
+    /// the next switch of this one takes the words away.
+    #[tokio::test]
+    async fn a_refused_switch_shows_the_servers_words_under_its_card_and_goes_back() {
+        use super::AfterComputerRelay;
+        for (status, words, code, after) in [
+            (
+                404,
+                "no computer of yours has that id",
+                "not_found",
+                AfterComputerRelay::ReadAgain,
+            ),
+            (
+                409,
+                "this computer was revoked; enrol it again to use it",
+                "revoked",
+                AfterComputerRelay::ReadAgain,
+            ),
+            (
+                400,
+                "relayEnabled must be true or false",
+                "bad_request",
+                AfterComputerRelay::Refused,
+            ),
+        ] {
+            let server = wiremock::MockServer::start().await;
+            wiremock::Mock::given(wiremock::matchers::method("PATCH"))
+                .and(wiremock::matchers::path("/local-exec/daemon/mac_2"))
+                .respond_with(
+                    wiremock::ResponseTemplate::new(status)
+                        .set_body_json(json!({"error": words, "code": code})),
+                )
+                .mount(&server)
+                .await;
+            let mut state = ready_to_switch(&server, "mac").await;
+            let send = state
+                .begin_computer_relay("mac_2", true)
+                .expect("a switch begins");
+            assert!(
+                card_of(&state, "mac_2").relay_on,
+                "drawn where it was asked"
+            );
+            let answer = send
+                .client
+                .switch_computer_relay(&send.machine_id, send.on)
+                .await;
+            assert_eq!(
+                state.settle_computer_relay("mac_2", send.token, answer),
+                after,
+                "{status}"
+            );
+            let card = card_of(&state, "mac_2");
+            assert_eq!(
+                (card.relay_on, card.switching, card.note.as_deref()),
+                (false, false, Some(words)),
+                "{status}: back, with the server's words under it"
+            );
+            assert_eq!(state.computer_relay_note("mac_1"), None);
+            assert!(card_of(&state, "mac_1").note.is_none());
+            assert!(
+                puts_sent(&server).await.is_empty(),
+                "{status}: nothing of the account's"
+            );
+
+            state
+                .begin_computer_relay("mac_2", true)
+                .expect("the card takes another click");
+            assert_eq!(
+                state.computer_relay_note("mac_2"),
+                None,
+                "the next switch takes the words away"
+            );
+        }
+    }
+
+    /// A switch nobody heard the answer to may or may not have been kept: the card says so, and the
+    /// roster is read again to find out, whose answer takes the doubt away. One the server has no
+    /// route for (a server from before the per-computer switch, which answers `PATCH` with a bare
+    /// 405 or an empty 404) says so in this app's words, nothing is read again, and the switch goes
+    /// back; the server's own 404, which says what is missing, is about the computer and not that.
+    #[tokio::test]
+    async fn a_switch_nobody_heard_back_is_checked_again_and_a_server_without_it_says_so() {
+        use super::{ACCOUNT_CHANGE_UNKNOWN, AfterComputerRelay, COMPUTER_RELAY_NOT_ON_SERVER};
+        let server = wiremock::MockServer::start().await;
+        let mut state = ready_to_switch(&server, "mac").await;
+        let send = state
+            .begin_computer_relay("mac_2", true)
+            .expect("a switch begins");
+        assert_eq!(
+            state.settle_computer_relay(
+                "mac_2",
+                send.token,
+                Err(OpenGrokError::message("error sending request"))
+            ),
+            AfterComputerRelay::ReadAgain
+        );
+        assert_eq!(
+            state.computer_relay_note("mac_2"),
+            Some(ACCOUNT_CHANGE_UNKNOWN)
+        );
+        assert!(
+            !card_of(&state, "mac_2").relay_on,
+            "back until the server says"
+        );
+        // The read of the roster that follows answers it.
+        state.computers_generation += 1;
+        let generation = state.computers_generation;
+        let listed = vec![
+            computer("mac_1", true, true, true, true),
+            computer("mac_2", false, true, false, true),
+        ];
+        assert!(state.take_computers(generation, listed));
+        assert_eq!(state.computer_relay_note("mac_2"), None);
+        assert!(card_of(&state, "mac_2").relay_on, "it was kept after all");
+
+        // A server before the switch.
+        for status in [405, 404] {
+            let server = wiremock::MockServer::start().await;
+            wiremock::Mock::given(wiremock::matchers::method("PATCH"))
+                .respond_with(wiremock::ResponseTemplate::new(status))
+                .mount(&server)
+                .await;
+            let mut state = ready_to_switch(&server, "mac").await;
+            assert_eq!(
+                switch_card(&mut state, "mac_2", true).await,
+                AfterComputerRelay::Refused,
+                "{status}"
+            );
+            assert_eq!(
+                state.computer_relay_note("mac_2"),
+                Some(COMPUTER_RELAY_NOT_ON_SERVER),
+                "{status}"
+            );
+            assert!(!card_of(&state, "mac_2").relay_on, "{status}: back");
+        }
+    }
+
+    /// A switch is settled by its own token and by nothing else: one the person signed out from is
+    /// forgotten with the session, and its answer, whenever it comes, lands on nothing. A read of
+    /// the roster begun before a switch was answered is dropped when it lands, so it cannot put
+    /// back the row the answer replaced.
+    #[tokio::test]
+    async fn a_switchs_answer_lands_only_on_its_own_switch_and_a_stale_roster_is_dropped() {
+        use super::AfterComputerRelay;
+        let server = wiremock::MockServer::start().await;
+        mount_switch(&server, "mac_2", true).await;
+        let mut state = ready_to_switch(&server, "mac").await;
+        let send = state
+            .begin_computer_relay("mac_2", true)
+            .expect("a switch begins");
+        let elsewhere = send
+            .client
+            .switch_computer_relay(&send.machine_id, send.on)
+            .await;
+        let answer = send
+            .client
+            .switch_computer_relay(&send.machine_id, send.on)
+            .await;
+        assert_eq!(
+            state.settle_computer_relay("mac_2", send.token + 1, elsewhere),
+            AfterComputerRelay::Dropped,
+            "not this switch's token"
+        );
+        assert!(card_of(&state, "mac_2").switching, "still with the server");
+        // A roster read begun before the answer.
+        let stale = state.computers_generation;
+        assert_eq!(
+            state.settle_computer_relay("mac_2", send.token, answer),
+            AfterComputerRelay::Kept { on: true }
+        );
+        assert!(
+            !state.take_computers(stale, vec![computer("mac_2", false, false, false, false)]),
+            "begun before the answer"
+        );
+        assert!(card_of(&state, "mac_2").relay_on, "the answer's row stays");
+
+        let send = state
+            .begin_computer_relay("mac_2", false)
+            .expect("a switch begins");
+        state.forget_account();
+        assert_eq!(
+            state.settle_computer_relay(
+                "mac_2",
+                send.token,
+                Ok(serde_json::from_value(daemon_row("mac_2", false, false)).unwrap())
+            ),
+            AfterComputerRelay::Dropped,
+            "signed out since"
+        );
+        assert!(state.computers.is_empty());
+        assert!(
+            state.begin_computer_relay("mac_2", true).is_none(),
+            "nobody is signed in"
+        );
+    }
+
+    /// Pointing the account's way at the relay is one change of the account's at a time. A card's
+    /// switch going on while a pick for new Bots is with the server owes it: nothing is sent, the
+    /// pick's answer comes first, and then it goes once, as `{kind, via: "mac"}`. It is asked for
+    /// the computer whose switch owed it, whose card says what became of it. Nothing before the
+    /// setting is read, from a server that does not know the relay, or when the way is the relay's.
+    #[test]
+    fn the_accounts_way_goes_once_the_change_in_flight_is_answered_and_only_where_it_is_wanted() {
+        use super::{AccountChange, AfterChange};
+        let mut state = signed_in_state();
+        state.computers = vec![computer("mac_2", false, true, false, true)];
+        assert!(
+            state.begin_relay_change("mac_2").is_none(),
+            "the setting is not read"
+        );
+        read_as(&mut state, with_new_bots(None));
+        let pick = state
+            .begin_new_bots_change(Some(luna("high")))
+            .expect("a pick goes out");
+        assert!(state.begin_relay_change("mac_2").is_none(), "one at a time");
+        assert!(state.reply_source.relay_change_owed);
+        assert!(state.begin_owed_relay_change().is_none(), "the pick is out");
+        assert_eq!(
+            state.settle_account_change(
+                pick.generation,
+                pick.about,
+                Ok(with_new_bots(Some(luna("high"))))
+            ),
+            Some(AfterChange::Done)
+        );
+        let send = state.begin_owed_relay_change().expect("its turn now");
+        assert_eq!(
+            serde_json::to_value(&send.update).unwrap(),
+            json!({"kind": "gateway", "via": "mac"})
+        );
+        assert!(state.begin_owed_relay_change().is_none(), "sent once");
+        // Refused, the server's words are under the card of the computer that asked.
+        let said = "via \"helper\" is not built yet (#293); use \"loopback\" or \"mac\"";
+        assert_eq!(
+            state.settle_account_change(
+                send.generation,
+                send.about,
+                Err(OpenGrokError::from_opengrok(400, said))
+            ),
+            Some(AfterChange::Done)
+        );
+        assert_eq!(state.computer_relay_note("mac_2"), Some(said));
+        assert_eq!(state.computer_relay_note("mac_1"), None);
+        assert_eq!(state.reply_source.change_note(AccountChange::NewBots), None);
+        state
+            .computers
+            .push(computer("mac_1", true, true, true, true));
+        assert_eq!(state.computer_relay_note("mac_1"), None, "another card's");
+
+        // A server that does not know the relay is sent nothing.
+        read_as(&mut state, kept(InferenceKind::Gateway, None));
+        assert!(state.begin_relay_change("mac_2").is_none());
+        // And one whose way is the relay's already.
+        read_as(&mut state, relay_kept(InferenceKind::Gateway, "mac", None));
+        assert!(state.begin_relay_change("mac_2").is_none());
+    }
+
+    /// The relay switch against the server as it recorded the setting (opengrok-server #332 (PR
+    /// #338 at 66b9f7b)): from its read with the relay on, this computer the account's way and a
+    /// fallback kept, a card's switch goes off and on and the account's setting is not touched: no
+    /// `PUT`, the way and the fallback as they were. From the same read with the way the server's
+    /// own machine, turning one on sends the one `PUT` that points it at the relay, and the
+    /// server's recorded answer to choosing the relay is what the app holds after.
+    #[tokio::test]
+    async fn a_switch_leaves_the_recorded_setting_alone_and_points_the_way_once_where_it_is_not() {
+        use super::{AfterChange, AfterComputerRelay, RelayOffFallback};
+        let read = recorded_body(include_str!(
+            "../fixtures/wire/rest/GET__account_inference-source/200-the_relay_switch_moves_no_way_and_a_fallback_is_kept_until_cleared.json"
+        ));
+        let chosen = recorded_body(include_str!(
+            "../fixtures/wire/rest/PUT__account_inference-source/200-a_person_chooses_their_mac_and_reads_the_relay_back.json"
+        ));
+        let server = wiremock::MockServer::start().await;
+        for (id, on) in [("mac_2", true), ("mac_2", false)] {
+            mount_switch(&server, id, on).await;
+        }
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .and(wiremock::matchers::path("/account/inference-source"))
+            .and(wiremock::matchers::body_json(
+                json!({"kind": "local_proxy", "via": "mac"}),
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(chosen))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut state = ready_to_switch(&server, "mac").await;
+        read_as(
+            &mut state,
+            serde_json::from_value(read.clone()).expect("the recorded setting"),
+        );
+        let fallback = state.relay_off_fallback();
+        assert!(
+            matches!(&fallback, RelayOffFallback::Kept(Some(_))),
+            "{fallback:?}"
+        );
+        assert!(state.reply_source.on_mac());
+        for on in [true, false, true] {
+            assert_eq!(
+                switch_card(&mut state, "mac_2", on).await,
+                AfterComputerRelay::Kept { on }
+            );
+            assert!(
+                state.begin_relay_change("mac_2").is_none(),
+                "the way is the relay's"
+            );
+        }
+        assert!(
+            puts_sent(&server).await.is_empty(),
+            "nothing of the account's"
+        );
+        assert_eq!(
+            state.relay_off_fallback(),
+            fallback,
+            "the fallback as it was"
+        );
+
+        // The way the server's own machine: on points it, once.
+        let mut loopback = read;
+        loopback["via"] = json!("loopback");
+        read_as(
+            &mut state,
+            serde_json::from_value(loopback).expect("the recorded setting, the other way"),
+        );
+        assert!(!state.reply_source.on_mac());
+        let change = state
+            .begin_relay_change("mac_2")
+            .expect("the way is the server's own machine");
+        let answer = change.client.set_inference_source(&change.update).await;
+        assert_eq!(
+            state.settle_account_change(change.generation, change.about, answer),
+            Some(AfterChange::ReadModels)
+        );
+        assert!(state.reply_source.on_mac(), "as the server recorded it");
+        assert_eq!(
+            puts_sent(&server).await,
+            [json!({"kind": "local_proxy", "via": "mac"})]
+        );
+    }
+
+    /// The body of a fixture of the server's recording, vendored in `fixtures/wire/`.
+    fn recorded_body(fixture: &str) -> serde_json::Value {
+        let recorded: serde_json::Value = serde_json::from_str(fixture).expect("the recording");
+        recorded["body"].clone()
+    }
+
+    // ---- The account's time zone: this computer's, for its routines (opengrok-server PR #322) ---
+
+    /// The account as `GET /account` and `PUT /account` answer it, with `timeZone` as given.
+    fn account_in(zone: Option<&str>) -> crate::opengrok::Account {
+        serde_json::from_value(json!({
+            "id": "acc_1", "email": "ada@example.com", "isAdmin": false, "timeZone": zone
+        }))
+        .expect("an account")
+    }
+
+    /// This computer's zone is sent only where the account's read carries `timeZone` and the zone
+    /// differs from the one kept there: not to a server that keeps none, not when they are the
+    /// same, not while the same zone is out, and not again after the server refused it, until
+    /// this computer's zone moves. An answer kept is the account after; one nobody heard is sent
+    /// again at the next look; and an answer after a sign-out lands on nothing.
+    #[test]
+    fn the_time_zone_is_sent_only_where_it_differs() {
+        let mut state = signed_in_state();
+        let zone = |name: &str| Some(name.to_string());
+        assert!(
+            state.begin_time_zone(zone("Asia/Manila")).is_none(),
+            "a server that keeps none"
+        );
+        state.account = Some(account_in(Some("Asia/Manila")));
+        assert!(
+            state.begin_time_zone(zone("Asia/Manila")).is_none(),
+            "the same zone"
+        );
+        assert!(
+            state.begin_time_zone(None).is_none(),
+            "the system cannot say"
+        );
+        let send = state
+            .begin_time_zone(zone(" Europe/London "))
+            .expect("a zone that differs");
+        assert_eq!(send.zone, "Europe/London");
+        assert!(
+            state.begin_time_zone(zone("Europe/London")).is_none(),
+            "out already"
+        );
+
+        let said = "\"Europe/London\" is not an IANA time zone this server knows; send one like \
+                    \"Europe/London\"";
+        assert!(state.settle_time_zone(
+            send.epoch,
+            &send.zone,
+            Err(OpenGrokError::from_opengrok(422, said))
+        ));
+        assert!(
+            state.begin_time_zone(zone("Europe/London")).is_none(),
+            "refused: not sent again"
+        );
+        let moved = state
+            .begin_time_zone(zone("Asia/Tokyo"))
+            .expect("the zone moved");
+        assert!(state.settle_time_zone(
+            moved.epoch,
+            &moved.zone,
+            Err(OpenGrokError::message("error sending request"))
+        ));
+        let again = state
+            .begin_time_zone(zone("Asia/Tokyo"))
+            .expect("not heard: sent again at the next look");
+        assert!(state.settle_time_zone(
+            again.epoch,
+            &again.zone,
+            Ok(account_in(Some("Asia/Tokyo")))
+        ));
+        assert_eq!(
+            state
+                .account
+                .as_ref()
+                .and_then(|account| account.time_zone.clone()),
+            Some(zone("Asia/Tokyo"))
+        );
+        assert!(
+            state.begin_time_zone(zone("Asia/Tokyo")).is_none(),
+            "kept: the same now"
+        );
+
+        state.account = Some(account_in(None));
+        let first = state
+            .begin_time_zone(zone("Asia/Tokyo"))
+            .expect("none kept yet: any zone differs");
+        state.forget_account();
+        assert!(!state.settle_time_zone(
+            first.epoch,
+            &first.zone,
+            Ok(account_in(Some("Asia/Tokyo")))
+        ));
+        assert_eq!(state.account, None);
+    }
+
+    /// A zone that differs from the one the server keeps goes in one `PUT /account` of
+    /// `{timeZone}` alone, and the account the server answers with is the app's after, so the same
+    /// zone is not sent again.
+    #[tokio::test]
+    async fn a_zone_that_differs_is_put_once_with_nothing_else() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .and(wiremock::matchers::path("/account"))
+            .and(wiremock::matchers::body_json(
+                json!({"timeZone": "Asia/Manila"}),
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
+                "id": "acc_1", "email": "ada@example.com", "firstName": "Ada",
+                "lastName": "", "avatarUrl": null, "orgId": null, "verified": true,
+                "enabled": true, "timeZone": "Asia/Manila", "isAdmin": false
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut state = signed_in_state();
+        state.opengrok = Some(client_signed_in_to(&server).await);
+        state.account = Some(account_in(Some("Europe/London")));
+        assert!(
+            state
+                .begin_time_zone(Some("Europe/London".into()))
+                .is_none()
+        );
+        let send = state
+            .begin_time_zone(Some("Asia/Manila".into()))
+            .expect("a zone that differs");
+        let answer = send.client.set_time_zone(&send.zone).await;
+        assert!(state.settle_time_zone(send.epoch, &send.zone, answer));
+        assert_eq!(
+            state
+                .account
+                .as_ref()
+                .and_then(|account| account.time_zone.clone()),
+            Some(Some("Asia/Manila".to_string()))
+        );
+        assert!(state.begin_time_zone(Some("Asia/Manila".into())).is_none());
+        let puts: Vec<serde_json::Value> = server
+            .received_requests()
+            .await
+            .expect("the recorder is on")
+            .iter()
+            .filter(|request| request.method.as_str() == "PUT" && request.url.path() == "/account")
+            .map(|request| serde_json::from_slice(&request.body).expect("a JSON body"))
+            .collect();
+        assert_eq!(puts, [json!({"timeZone": "Asia/Manila"})]);
+    }
+
+    /// Where this computer's relay found no opencodex is said on this computer's card alone, and
+    /// only while its relay is on: another computer's card is not this computer's to say it of, and
+    /// a computer whose switch is off is not asked to do anything about opencodex, so each reads as
+    /// it did, "On, but asleep" included. A relay that is answering again takes the words back.
+    #[test]
+    fn only_this_computers_card_with_its_relay_on_says_opencodex_is_silent() {
+        use crate::components::computers::{RelayState, cards};
+        use crate::opengrok::{RelayReport, RelayStatus};
+        let mut state = signed_in_state();
+        read_as(
+            &mut state,
+            relay_kept(InferenceKind::Gateway, "loopback", None),
+        );
+        state.local_exec_machine_id = Some("mac_1".into());
+        state.computers = vec![
+            computer("mac_1", true, true, false, true),
+            computer("mac_2", false, true, false, false),
+            computer("mac_3", false, false, false, true),
+        ];
+        let silent = "http://127.0.0.1:8080";
+        let report = |status: RelayStatus| {
+            Some(RelayReport {
+                status,
+                halted: false,
+            })
+        };
+        let words = |state: &AppState| {
+            cards(state)
+                .iter()
+                .map(|card| card.status_words())
+                .collect::<Vec<_>>()
+        };
+        state.relay_mac.report = report(RelayStatus::OpencodexSilent(silent.into()));
+        assert_eq!(
+            words(&state),
+            [
+                format!("Not relaying: opencodex isn't answering on this computer ({silent})"),
+                "On, but asleep: it can't answer right now".to_string(),
+                "Not relaying".to_string(),
+            ]
+        );
+        assert_eq!(
+            cards(&state)[0].detail,
+            None,
+            "the status line says it, and nothing is said twice"
+        );
+        state.computers[0].relay_enabled = false;
+        assert_eq!(
+            words(&state)[0],
+            "Not relaying",
+            "its switch is off, and nothing is asked of opencodex"
+        );
+        state.computers[0].relay_enabled = true;
+        state.relay_mac.report = report(RelayStatus::Answering);
+        assert_eq!(cards(&state)[0].state, RelayState::Relaying);
+        state.relay_mac.report = report(RelayStatus::Connecting);
+        assert_eq!(words(&state)[0], "Not relaying");
+    }
+
+    /// An address on this Mac that nothing answers on: a port bound, read, and let go.
+    fn nothing_answers() -> String {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("a port")
+            .local_addr()
+            .expect("an address")
+            .port();
+        format!("http://127.0.0.1:{port}")
+    }
+
+    /// A window signed in on an enrolled computer, `mac_1`, against a server that knows the relay,
+    /// as the relay finds it: `server` makes this Mac the relay on each stream it is asked for, and
+    /// answers the setting and the roster as the window asks for them once the relay answers.
+    /// `saved` is the address kept on this computer, and `default_address` where opencodex is looked
+    /// for while none is, which a test points at its own opencodex, so that none asks the real
+    /// 8080. The sender is the enrolment's: the window keeps what it holds as long as it is.
+    fn a_window_that_could_relay(
+        runtime: &tokio::runtime::Runtime,
+        server: &wiremock::MockServer,
+        saved: Option<&str>,
+        default_address: Option<&str>,
+    ) -> (
+        AppState,
+        tokio::sync::watch::Sender<Option<crate::opengrok::MachineCredential>>,
+    ) {
+        use wiremock::matchers::{method, path};
+        runtime.block_on(async {
+            wiremock::Mock::given(method("GET"))
+                .and(path("/inference-relay/requests"))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_raw(
+                    "data: {\"type\":\"ready\",\"machineId\":\"mac_1\"}\n\n",
+                    "text/event-stream",
+                ))
+                .mount(server)
+                .await;
+            wiremock::Mock::given(method("GET"))
+                .and(path("/account/inference-source"))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(recorded_body(
+                    include_str!(
+                        "../fixtures/wire/rest/GET__account_inference-source/200-a_turn_skips_a_computer_switched_off_while_another_serves.json"
+                    ),
+                )))
+                .mount(server)
+                .await;
+            wiremock::Mock::given(method("GET"))
+                .and(path("/local-exec/daemon"))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
+                    "machines": [{
+                        "machineId": "mac_1", "label": "NativeChat on mac_1",
+                        "enrolledAtMs": 1_790_000_000_000_i64, "revoked": false,
+                        "connected": true, "relayEnabled": true, "relaying": false
+                    }]
+                })))
+                .mount(server)
+                .await;
+        });
+        let (enrolled, enrolment) = tokio::sync::watch::channel(Some(
+            crate::opengrok::MachineCredential::new("mac_1", "tok_1"),
+        ));
+        let mut state = signed_in_state();
+        state.opengrok = Some(OpenGrokClient::new(&server.uri()).expect("a URL"));
+        read_as(
+            &mut state,
+            relay_kept(InferenceKind::Gateway, "loopback", None),
+        );
+        state.local_exec_enrolment = Some(enrolment);
+        state.local_exec_machine_id = Some("mac_1".into());
+        state.computers = vec![computer("mac_1", true, true, false, true)];
+        state.relay_mac.address = saved.map(str::to_string);
+        state.relay_mac.default_address = default_address.map(str::to_string);
+        (state, enrolled)
+    }
+
+    /// An opencodex that answers a look at its model list, `GET /v1/models`, as the relay takes one
+    /// before it offers to relay, and only with `key` where it is given.
+    fn an_opencodex_that_answers(
+        runtime: &tokio::runtime::Runtime,
+        key: Option<&str>,
+    ) -> wiremock::MockServer {
+        use wiremock::matchers::{header, method, path};
+        let opencodex = runtime.block_on(wiremock::MockServer::start());
+        let mock = wiremock::Mock::given(method("GET")).and(path("/v1/models"));
+        let mock = match key {
+            Some(key) => mock.and(header("authorization", format!("Bearer {key}").as_str())),
+            None => mock,
+        };
+        runtime.block_on(
+            mock.respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(json!({"data": []})),
+            )
+            .mount(&opencodex),
+        );
+        opencodex
+    }
+
+    /// How many times `server` was asked for `at`.
+    fn asked_for(
+        runtime: &tokio::runtime::Runtime,
+        server: &wiremock::MockServer,
+        at: &str,
+    ) -> usize {
+        runtime
+            .block_on(server.received_requests())
+            .expect("the recorder is on")
+            .iter()
+            .filter(|request| request.url.path() == at)
+            .count()
+    }
+
+    /// Wait, in real time, for what another thread does: the relay's words land on the executor
+    /// from the runtime's own.
+    fn wait_for(
+        cx: &mut gpui_kit::TestAppContext,
+        what: &str,
+        mut done: impl FnMut(&mut gpui_kit::TestAppContext) -> bool,
+    ) {
+        let mut waited = 0;
+        while !done(cx) {
+            assert!(waited < 2000, "{what}");
+            cx.run_until_parked();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            waited += 1;
+        }
+    }
+
+    /// A runtime the relay's own tasks run on, entered, for a test of the road the window takes to
+    /// start it: its answers land from this runtime's threads, so the test waits for them in real
+    /// time, which the scheduler is told it may.
+    fn a_runtime_for_the_relay(cx: &mut gpui_kit::TestAppContext) -> tokio::runtime::Runtime {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("a runtime");
+        cx.executor().allow_parking();
+        runtime
+    }
+
+    /// Nobody saved an address on this computer, and opencodex answers where it listens by default:
+    /// the relay is offered as it always was. The window asks opencodex there before it opens the
+    /// stream, so a computer that has opencodex at its default address needs to be told nothing, and
+    /// the field shows that address, as it always did. (The default is a mock's here: no test asks
+    /// the real 8080.)
+    #[gpui_kit::test]
+    fn a_computer_with_no_saved_address_relays_when_opencodex_answers_at_the_default(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        use gpui_kit::AppContext as _;
+        let runtime = a_runtime_for_the_relay(cx);
+        let _enter = runtime.enter();
+        let server = runtime.block_on(wiremock::MockServer::start());
+        let opencodex = an_opencodex_that_answers(&runtime, None);
+        let (state, _enrolled) =
+            a_window_that_could_relay(&runtime, &server, None, Some(&opencodex.uri()));
+        let app = cx.new(|_| state);
+        app.update(cx, |state, cx| {
+            assert_eq!(state.relay_mac.address, None, "nothing saved");
+            assert_eq!(
+                state.relay_mac.shown_address(),
+                opencodex.uri(),
+                "the field shows where opencodex is looked for"
+            );
+            state.ensure_relay(cx);
+        });
+        wait_for(cx, "the stream was opened", |_| {
+            asked_for(&runtime, &server, "/inference-relay/requests") >= 1
+        });
+        assert!(
+            asked_for(&runtime, &opencodex, "/v1/models") >= 1,
+            "opencodex was asked at the default address before the stream was opened"
+        );
+        app.update(cx, |state, _| state.stop_relay());
+        cx.run_until_parked();
+    }
+
+    /// Nobody saved an address and nothing answers where opencodex listens by default: the relay
+    /// is not offered, so the server's plan turns are not sent here to fail, and this computer's
+    /// card says why, with the address it asked: "Not relaying: opencodex isn't answering on this
+    /// computer (http://127.0.0.1:8080)", in the status line the driver reads as `opencodex-silent`.
+    #[gpui_kit::test]
+    fn a_computer_whose_opencodex_does_not_answer_is_not_offered_and_its_card_says_why(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        use crate::components::computers::{RelayState, cards};
+        use crate::opengrok::RelayStatus;
+        use gpui_kit::AppContext as _;
+        let runtime = a_runtime_for_the_relay(cx);
+        let _enter = runtime.enter();
+        let server = runtime.block_on(wiremock::MockServer::start());
+        let silent = nothing_answers();
+        let (state, _enrolled) = a_window_that_could_relay(&runtime, &server, None, Some(&silent));
+        let app = cx.new(|_| state);
+        app.update(cx, |state, cx| state.ensure_relay(cx));
+        wait_for(cx, "the relay says opencodex is silent", |cx| {
+            app.read_with(cx, |state, _| {
+                matches!(
+                    state.relay_mac.report.as_ref().map(|report| &report.status),
+                    Some(RelayStatus::OpencodexSilent(_))
+                )
+            })
+        });
+        // It only waits: a stream would have been asked for by now.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        cx.run_until_parked();
+        assert_eq!(
+            asked_for(&runtime, &server, "/inference-relay/requests"),
+            0,
+            "no stream is opened"
+        );
+        app.read_with(cx, |state, _| {
+            let card = &cards(state)[0];
+            assert_eq!(
+                card.status_words(),
+                format!("Not relaying: opencodex isn't answering on this computer ({silent})")
+            );
+            assert_eq!(
+                (card.state, card.state.word(), card.tried.as_deref()),
+                (
+                    RelayState::OpencodexSilent,
+                    "opencodex-silent",
+                    Some(silent.as_str())
+                )
+            );
+            assert_eq!(
+                state.relay_mac.shown_address(),
+                silent,
+                "the address it tried"
+            );
+            assert!(
+                !state
+                    .relay_mac
+                    .report
+                    .as_ref()
+                    .is_some_and(|report| report.halted),
+                "it waits to be answered, it is not done"
+            );
+        });
+        app.update(cx, |state, _| state.stop_relay());
+        cx.run_until_parked();
+    }
+
+    /// A saved address that answers is relayed for, and is the one asked, not where opencodex
+    /// listens by default (which here is nothing); the look carries the key kept for it, as every
+    /// call does, and an opencodex that wants one answers only with it.
+    #[gpui_kit::test]
+    fn a_saved_address_that_answers_is_relayed_for_and_asked_with_its_key(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        use gpui_kit::AppContext as _;
+        let runtime = a_runtime_for_the_relay(cx);
+        let _enter = runtime.enter();
+        let server = runtime.block_on(wiremock::MockServer::start());
+        let opencodex = an_opencodex_that_answers(&runtime, Some("opencodex-test-key"));
+        let (state, _enrolled) = a_window_that_could_relay(
+            &runtime,
+            &server,
+            Some(&opencodex.uri()),
+            Some(&nothing_answers()),
+        );
+        state
+            .relay_keys
+            .keep(&crate::opengrok::RelayKey::new("opencodex-test-key").expect("a key"))
+            .expect("kept");
+        let app = cx.new(|_| state);
+        app.update(cx, |state, cx| state.ensure_relay(cx));
+        wait_for(cx, "the stream was opened", |_| {
+            asked_for(&runtime, &server, "/inference-relay/requests") >= 1
+        });
+        assert!(
+            asked_for(&runtime, &opencodex, "/v1/models") >= 1,
+            "the saved address was asked, with its key, before the stream was opened"
+        );
+        app.update(cx, |state, _| state.stop_relay());
+        cx.run_until_parked();
+    }
+
+    /// The relay runs for somebody signed in, on an enrolled computer, against a server that knows
+    /// the relay, and for no other reason: not a switch of this computer's own, which is the
+    /// server's to say on the stream (`disabled`, or a refusal with `relay_disabled`) and which the
+    /// relay waits on for itself. Not before the setting is read, not before this Mac is enrolled,
+    /// and not from a server that does not know the relay; signing out stops it, and forgets what
+    /// it said.
+    #[test]
+    fn the_relay_runs_for_an_enrolled_mac_signed_in_on_a_server_that_knows_it() {
+        let mut state = signed_in_state();
+        assert!(!state.relay_wanted(), "the setting not read");
+        read_as(
+            &mut state,
+            relay_kept(InferenceKind::Gateway, "loopback", None),
+        );
+        assert!(!state.relay_wanted(), "not enrolled");
+        state.local_exec_machine_id = Some("mac_1".into());
+        assert!(state.relay_wanted());
+
+        // A server that no longer knows the relay: it would not run.
+        read_as(&mut state, kept(InferenceKind::Gateway, None));
+        assert!(!state.relay_wanted());
+        read_as(
+            &mut state,
+            relay_kept(InferenceKind::Gateway, "loopback", None),
+        );
+        assert!(state.relay_wanted());
+
+        state.relay_mac.report = Some(crate::opengrok::RelayReport::default());
+        state.forget_account();
+        assert_eq!(state.relay_mac.report, None);
+        assert!(!state.relay_wanted());
+    }
+
+    /// Where a computer's relay stands is on its card, from its switch, whether the server holds
+    /// its relay stream and whether the server can reach it: relaying only while it is on and the
+    /// stream is up; off is not relaying whatever else is so; on and not relaying is asleep exactly
+    /// when the server cannot reach it, and not relaying while the computer is awake. This
+    /// computer's own relay says what it does at once, and the app is open on it, so it is never
+    /// asleep.
+    #[test]
+    fn a_card_says_where_its_computers_relay_stands() {
+        use crate::components::computers::{RelayState, relay_state};
+        use crate::opengrok::{RelayReport, RelayStatus};
+        for (on, relaying, online, expected) in [
+            (true, true, true, RelayState::Relaying),
+            (true, true, false, RelayState::Relaying),
+            (true, false, false, RelayState::OnButAsleep),
+            (true, false, true, RelayState::NotRelaying),
+            (false, false, true, RelayState::NotRelaying),
+            (false, false, false, RelayState::NotRelaying),
+            (false, true, true, RelayState::NotRelaying),
+        ] {
+            assert_eq!(
+                relay_state(on, relaying, online),
+                expected,
+                "on {on}, relaying {relaying}, online {online}"
+            );
+        }
+
+        let mut state = signed_in_state();
+        state.local_exec_machine_id = Some("mac_1".into());
+        state.computers = vec![
+            computer("mac_1", true, true, false, true),
+            computer("mac_2", false, true, false, false),
+            computer("mac_3", false, false, false, true),
+        ];
+        let states = |state: &AppState| {
+            crate::components::computers::cards(state)
+                .iter()
+                .map(|card| (card.machine_id.clone(), card.state, card.online))
+                .collect::<Vec<_>>()
+        };
+        let report = |status: RelayStatus| {
+            Some(RelayReport {
+                status,
+                halted: false,
+            })
+        };
+        // This computer's relay is not up yet: not relaying, and awake. Another computer's is on
+        // and nobody can reach it: asleep. A third is off.
+        assert_eq!(
+            states(&state),
+            [
+                ("mac_1".to_string(), RelayState::NotRelaying, true),
+                ("mac_2".to_string(), RelayState::OnButAsleep, false),
+                ("mac_3".to_string(), RelayState::NotRelaying, true),
+            ]
+        );
+        // This computer's relay says it answers, before the server's row does.
+        state.relay_mac.report = report(RelayStatus::Answering);
+        assert_eq!(states(&state)[0].1, RelayState::Relaying);
+        // And it is no word about another computer's card.
+        assert_eq!(states(&state)[1].1, RelayState::OnButAsleep);
+        assert_eq!(
+            crate::components::computers::cards(&state)[1].detail,
+            None,
+            "this computer's relay's words are on this computer's card"
+        );
+
+        // Why this computer's relay is not relaying, in its own words, while its switch is on.
+        let detail = |state: &AppState| {
+            crate::components::computers::cards(state)[0]
+                .detail
+                .clone()
+                .map(|detail| (detail.words, detail.trouble))
+        };
+        state.relay_mac.report = report(RelayStatus::Connecting);
+        assert_eq!(detail(&state), Some(("Connecting…".to_string(), false)));
+        state.relay_mac.report = report(RelayStatus::Error("gone quiet".into()));
+        assert_eq!(detail(&state), Some(("gone quiet".to_string(), true)));
+        state.relay_mac.report = report(RelayStatus::Replaced);
+        let taken = detail(&state).expect("how to take it back");
+        assert!(taken.0.contains("Turn this off and on"), "{taken:?}");
+        state.relay_mac.report = report(RelayStatus::Off);
+        assert_eq!(
+            detail(&state),
+            None,
+            "switched off by the server: nothing is wrong"
+        );
+        // Switched off here, nothing is said of a relay that is not meant to run.
+        state.relay_mac.report = report(RelayStatus::Error("gone quiet".into()));
+        state.computers[0].relay_enabled = false;
+        assert_eq!(detail(&state), None);
+    }
+
+    /// The relay's word on itself moving the server's row for this computer, which is when the
+    /// roster is read again: it started or stopped answering, or the server switched it off (from
+    /// another computer, say) and told it so. Opening the stream, failing and trying again, and
+    /// the other computer taking over are not.
+    #[test]
+    fn a_report_that_moves_this_computers_row_asks_for_the_roster_again() {
+        use super::relay_moved_the_row;
+        use crate::opengrok::RelayStatus::{Answering, Connecting, Error, Off, Replaced};
+        let err = || Error("gone quiet".into());
+        for (before, now, moved) in [
+            (Some(Connecting), Answering, true),
+            (Some(Answering), Connecting, true),
+            (Some(Answering), Off, true),
+            (Some(Answering), err(), true),
+            (Some(Connecting), Off, true),
+            (None, Off, true),
+            (Some(Off), Off, false),
+            (Some(Off), Connecting, false),
+            (Some(Connecting), err(), false),
+            (Some(err()), Connecting, false),
+            (Some(Connecting), Replaced, false),
+            (Some(Answering), Answering, false),
+        ] {
+            assert_eq!(
+                relay_moved_the_row(before.as_ref(), &now),
+                moved,
+                "{before:?} to {now:?}"
+            );
+        }
+    }
+
+    /// This computer is the one its stored machine id names, from the start, before enrolling has
+    /// answered: the roster marks it, always online since the app is open on it, and puts it first;
+    /// any other computer is not it, and a stale enrolment under the same name collapses into the
+    /// live one. Without a stored id, and with none enrolled, no computer is this one.
+    #[test]
+    fn this_computer_is_the_one_its_stored_machine_id_names() {
+        use super::settle_roster;
+        let dir = std::env::temp_dir().join(format!(
+            "nativechat-this-computer-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut state = signed_in_state();
+        assert_eq!(state.this_mac_id(), None, "nothing enrolled or stored");
+        state.config = Some(crate::config::Config {
+            database_url: String::new(),
+            data_dir: dir.clone(),
+            opengrok_base_url: "http://127.0.0.1:9".into(),
+        });
+        assert_eq!(state.this_mac_id(), None, "no stored id yet");
+        std::fs::write(
+            dir.join("local-exec-daemon.json"),
+            r#"{"machine_id":"mac_2","token":"tok","label":"NativeChat on studio"}"#,
+        )
+        .unwrap();
+        assert_eq!(state.this_mac_id().as_deref(), Some("mac_2"));
+
+        let listed = vec![
+            computer("mac_1", false, true, true, true),
+            computer("mac_2", false, true, false, false),
+        ];
+        let roster = settle_roster(listed.clone(), state.this_mac_id().as_deref());
+        let ids: Vec<(&str, bool, bool)> = roster
+            .iter()
+            .map(|c| (c.machine_id.as_str(), c.this_machine, c.online))
+            .collect();
+        assert_eq!(
+            ids,
+            [("mac_2", true, true), ("mac_1", false, true)],
+            "this computer first, and online"
+        );
+        let nobody = settle_roster(listed, None);
+        assert!(nobody.iter().all(|computer| !computer.this_machine));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The id this app knows this Mac by follows the newest enrolment, whatever machine it names,
+    /// as the relay does, so the card that says this computer's relay is this Mac's own, and not
+    /// another computer's under this Mac's own name. The same credential again moves nothing, and
+    /// nor does the enrolment of a local-exec that is no longer the one running.
+    #[test]
+    fn this_macs_id_follows_its_newest_enrolment() {
+        use crate::opengrok::{MachineCredential, RelayReport, RelayStatus};
+        let mut state = signed_in_state();
+        let (enrolled, enrolment) = tokio::sync::watch::channel(None);
+        state.local_exec_enrolment = Some(enrolment.clone());
+        assert_eq!(state.note_enrolment(&enrolment), Some(false), "none yet");
+        assert!(!state.relay_enrolled());
+        enrolled.send_replace(Some(MachineCredential::new("mac_1", "tok_1")));
+        assert_eq!(state.note_enrolment(&enrolment), Some(true));
+        assert_eq!(state.local_exec_machine_id.as_deref(), Some("mac_1"));
+        assert!(state.relay_enrolled());
+        assert_eq!(
+            state.note_enrolment(&enrolment),
+            Some(false),
+            "the same machine again"
+        );
+
+        // A credential naming another machine: the relay opens its stream again with it, and
+        // the roster marks that computer as this one, with this Mac's own relay's word on it.
+        enrolled.send_replace(Some(MachineCredential::new("mac_2", "tok_2")));
+        state.relay_mac.report = Some(RelayReport {
+            status: RelayStatus::Connecting,
+            halted: false,
+        });
+        assert_eq!(state.note_enrolment(&enrolment), Some(true));
+        assert_eq!(state.local_exec_machine_id.as_deref(), Some("mac_2"));
+        state.computers = super::settle_roster(
+            vec![
+                computer("mac_1", false, true, false, true),
+                computer("mac_2", false, true, false, true),
+            ],
+            state.this_mac_id().as_deref(),
+        );
+        let cards = crate::components::computers::cards(&state);
+        let said: Vec<(&str, bool, bool)> = cards
+            .iter()
+            .map(|card| {
+                (
+                    card.machine_id.as_str(),
+                    card.this_computer,
+                    card.detail.is_some(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            said,
+            [("mac_2", true, true), ("mac_1", false, false)],
+            "this Mac's own relay, not another computer's"
+        );
+
+        // A local-exec that is no longer the one running: signed out and in again since.
+        let (stale, old) = tokio::sync::watch::channel(None);
+        stale.send_replace(Some(MachineCredential::new("mac_0", "tok_0")));
+        assert_eq!(state.note_enrolment(&old), None);
+        assert_eq!(state.local_exec_machine_id.as_deref(), Some("mac_2"));
+        state.stop_local_exec();
+        assert_eq!(state.note_enrolment(&enrolment), None, "stopped");
+        assert_eq!(state.local_exec_machine_id, None);
+    }
+
+    /// Why this Mac's local-exec stopped by itself is kept for Settings → Computer to say. A stop
+    /// it was told to make says nothing, nor does one from a local-exec that is no longer the one
+    /// running (signed out and in again since), and signing out forgets it.
+    #[gpui_kit::test]
+    fn why_local_exec_stopped_is_kept_until_it_starts_again(cx: &mut gpui_kit::TestAppContext) {
+        use crate::opengrok::LocalExecStopped;
+        use gpui_kit::AppContext as _;
+        let app = cx.new(|_| signed_in_state());
+        app.update(cx, |state, cx| {
+            let (_enrolled, enrolment) = tokio::sync::watch::channel(None);
+            state.local_exec_enrolment = Some(enrolment.clone());
+            let (_stale, old) = tokio::sync::watch::channel(None);
+            state.note_local_exec_stopped(&old, Some(LocalExecStopped::TurnedAwayAgain), cx);
+            assert_eq!(
+                state.local_exec_stopped, None,
+                "not this Mac's local-exec any more"
+            );
+            state.note_local_exec_stopped(&enrolment, None, cx);
+            assert_eq!(state.local_exec_stopped, None, "told to stop");
+
+            state.note_local_exec_stopped(&enrolment, Some(LocalExecStopped::TurnedAwayAgain), cx);
+            assert_eq!(
+                state.local_exec_stopped,
+                Some(LocalExecStopped::TurnedAwayAgain)
+            );
+            state.stop_local_exec();
+            assert_eq!(state.local_exec_stopped, None, "signed out");
+        });
+    }
+
+    /// The page no longer switches where the account's replies go, and nothing on it moves the
+    /// account's kind or sends one: a Bot that follows the account (`source: null`) still goes the
+    /// account's way, as the server keeps it. Its picker names the account's door, and its turns
+    /// name none, for the server to go by what it keeps.
+    #[test]
+    fn a_bot_that_follows_the_account_goes_its_way() {
+        for kind in InferenceKind::ALL {
+            let mut state = signed_in_state();
+            with_bot(&mut state, serde_json::Value::Null);
+            read_as(&mut state, kept(kind, Some("gpt-5-codex")));
+            let pick = state.model_pick().expect("a Bot is open");
+            assert_eq!(pick.door, Some(kind), "the Bot follows the account's door");
+            assert_eq!(
+                state.turn_inference_source(None),
+                None,
+                "and names none of its own"
+            );
+        }
+    }
+
+    /// The relay's fields take typing only while the page draws them editable, as Remove key
+    /// takes a click only then: before the setting is read, and from a server without the relay,
+    /// what reaches them changes no draft. The key field is read-only while Remove key waits for
+    /// Save too; the address is not.
     #[test]
     fn a_field_drawn_read_only_takes_no_typing() {
         let typed = |state: &mut AppState| {
             (
-                state.note_reply_source_url("http://127.0.0.1:9090".into()),
-                state.note_reply_source_key("sk-proxy-1"),
+                state.note_relay_address("http://127.0.0.1:9090".into()),
+                state.note_relay_key("opencodex-test-key"),
             )
         };
         let drafts = |state: &AppState| {
             (
-                state.reply_source.url_draft.clone(),
-                state.reply_source.key_draft.is_some(),
+                state.reply_source.relay_address_draft.clone(),
+                state.reply_source.relay_key_draft.is_some(),
             )
         };
 
@@ -32493,193 +39968,114 @@ mod tests {
         assert_eq!(typed(&mut state), (false, false), "not read yet");
         assert_eq!(drafts(&state), (None, false));
 
+        read_as(&mut state, kept(InferenceKind::Gateway, None));
+        assert_eq!(typed(&mut state), (false, false), "no relay on the server");
+        assert_eq!(drafts(&state), (None, false));
+
         read_as(
             &mut state,
-            InferenceSource {
-                has_api_key: true,
-                ..kept(InferenceKind::Gateway, None)
-            },
+            relay_kept(InferenceKind::Gateway, "loopback", None),
         );
-        assert!(state.note_reply_source_url("http://127.0.0.1:8081".into()));
-        assert!(state.note_reply_source_key("sk-proxy-0"));
-        assert!(state.begin_reply_source_save().is_some());
-        assert_eq!(typed(&mut state), (false, false), "a Save is out");
-        assert_eq!(
-            drafts(&state),
-            (Some("http://127.0.0.1:8081".into()), false),
-            "the address waits on the Save as it was, and its key went with it"
-        );
-        state.reply_source.saving = None;
-
-        assert!(state.note_remove_reply_source_key());
-        assert!(state.reply_source.plan_editable() && !state.reply_source.key_editable());
+        state.relay_mac.has_key = true;
+        assert!(state.note_remove_relay_key());
         assert!(
-            state.note_reply_source_url("http://127.0.0.1:9090".into()),
+            state.reply_source.relay_editable() && !state.reply_source.relay_key_editable(),
+            "the key field is drawn read-only while Remove key waits for Save"
+        );
+        assert!(
+            state.note_relay_address("http://127.0.0.1:9090".into()),
             "Remove key leaves the address alone"
         );
-
-        let mut state = signed_in_state();
-        state.opengrok = Some(OpenGrokClient::new("https://opengrok.example.com").unwrap());
-        read_as(&mut state, kept(InferenceKind::Gateway, None));
-        assert_eq!(typed(&mut state), (false, false), "the server is elsewhere");
-        assert_eq!(drafts(&state), (None, false));
+        assert_eq!(
+            drafts(&state),
+            (Some("http://127.0.0.1:9090".into()), false)
+        );
     }
 
-    /// Settings → Reply source coming on screen is told once, which is when the setting and the
-    /// models are read; and a key typed there and not saved does not outlive the page: leaving
-    /// the tab, or Settings, drops it, and the page asks for it again when it is back. Signing
-    /// out drops it with everything else, and the gpui-agent tree never holds it.
+    /// Settings → Computer coming on screen is told once, which is when the setting is read; and a
+    /// key typed on this computer's card and not saved does not outlive the page: leaving the tab,
+    /// or Settings, drops it, and the card asks for it again when it is back. Signing out drops it
+    /// with everything else, and the gpui-agent tree never holds it.
     #[test]
     fn the_page_reads_when_it_arrives_and_a_key_left_on_it_is_dropped() {
-        use super::REPLY_SOURCE_RETYPE_KEY;
         let mut state = signed_in_state();
-        read_as(&mut state, kept(InferenceKind::Gateway, None));
-        assert!(!state.settle_reply_source_page(), "Settings is shut");
-        state.is_app_settings_open = true;
-        state.app_settings_tab = AppSettingsTab::ReplySource;
-        assert!(state.settle_reply_source_page(), "arrived: read");
-        assert!(
-            !state.settle_reply_source_page(),
-            "still there: no read again"
-        );
-        assert!(state.note_reply_source_key("sk-proxy-1"));
-        assert!(state.reply_source.without_key().key_draft.is_none());
-
-        state.app_settings_tab = AppSettingsTab::Logins;
-        assert!(!state.settle_reply_source_page());
-        assert_eq!(state.reply_source.key_draft, None, "gone with the tab");
-        assert!(state.reply_source.retype_key);
-        assert_eq!(
-            crate::components::reply_source::error_line(&state.reply_source).as_deref(),
-            Some(REPLY_SOURCE_RETYPE_KEY)
-        );
-
-        state.app_settings_tab = AppSettingsTab::ReplySource;
-        assert!(state.settle_reply_source_page(), "back: read again");
-        assert!(state.note_reply_source_key("sk-proxy-1"));
-        assert!(!state.reply_source.retype_key, "typed again");
-        state.is_app_settings_open = false;
-        assert!(!state.settle_reply_source_page());
-        assert_eq!(state.reply_source.key_draft, None, "gone with Settings");
-
-        state.is_app_settings_open = true;
-        assert!(state.settle_reply_source_page());
-        assert!(state.note_reply_source_key("sk-proxy-1"));
-        state.forget_account();
-        assert_eq!(state.reply_source.key_draft, None, "gone with the account");
-    }
-
-    /// A URL that is not loopback is refused with the server's sentence, which the page shows as
-    /// written; the setting stays what the server keeps, the picks stay to be fixed, and Save is
-    /// live again. A key typed for that Save is gone, and the page says to type it again rather
-    /// than drop it without a word. A Save nobody heard back from reads the setting again, and
-    /// the read's answer clears the line that said nobody knew; a refusal's line stays until the
-    /// next Save.
-    #[test]
-    fn a_refused_save_shows_the_servers_words_and_keeps_the_picks() {
-        use super::REPLY_SOURCE_RETYPE_KEY;
-        use crate::components::reply_source::error_line;
-        let said = "baseUrl must be a literal loopback address such as http://127.0.0.1:8080";
-        let mut state = signed_in_state();
-        read_as(&mut state, kept(InferenceKind::Gateway, None));
-        state.reply_source.url_draft = Some("http://my-mac.example.com:8080".into());
-        assert!(state.note_reply_source_key("sk-proxy-1"));
-        let save = state.begin_reply_source_save().unwrap();
-        assert_eq!(
-            state.settle_reply_source_save(save.sent, Err(OpenGrokError::from_opengrok(400, said))),
-            Some(AfterReplySourceSave::Done)
-        );
-        assert_eq!(
-            state.reply_source.note,
-            Some(ReplySourceNote::Refused(said.to_string()))
-        );
-        assert_eq!(state.reply_source.note.as_ref().unwrap().line(), said);
-        assert_eq!(state.reply_source.key_draft, None, "the key went with it");
-        assert_eq!(
-            error_line(&state.reply_source),
-            Some(format!("{said} {REPLY_SOURCE_RETYPE_KEY}"))
-        );
-        assert_eq!(
-            state
-                .reply_source
-                .kept_source()
-                .unwrap()
-                .base_url
-                .as_deref(),
-            Some("http://127.0.0.1:8080"),
-            "nothing was kept, and nothing claims it was"
-        );
-        assert_eq!(
-            state.reply_source.shown_url(),
-            "http://my-mac.example.com:8080",
-            "the URL stays where the person can fix it"
-        );
-        assert!(state.reply_source_can_save());
-        // A read that lands meanwhile (the window came back to the front) leaves the refusal.
-        read_as(&mut state, kept(InferenceKind::Gateway, None));
-        assert_eq!(
-            state.reply_source.note,
-            Some(ReplySourceNote::Refused(said.to_string()))
-        );
-
-        // No answer at all: nobody knows, and the setting is read again to find out. The key
-        // typed again went with it, and is asked for again too.
-        state.reply_source.url_draft = Some("http://127.0.0.1:9090".into());
-        assert!(state.note_reply_source_key("sk-proxy-1"));
-        assert!(!state.reply_source.retype_key);
-        let save = state.begin_reply_source_save().unwrap();
-        assert_eq!(state.reply_source.note, None, "a new Save, a new line");
-        assert_eq!(
-            state.settle_reply_source_save(
-                save.sent,
-                Err(OpenGrokError::message("error sending request"))
-            ),
-            Some(AfterReplySourceSave::ReadAgain)
-        );
-        assert_eq!(
-            state.reply_source.note.as_ref().map(ReplySourceNote::line),
-            Some(REPLY_SOURCE_SAVE_UNKNOWN)
-        );
-        assert!(state.reply_source.retype_key);
-        read_as(&mut state, kept(InferenceKind::Gateway, None));
-        assert_eq!(state.reply_source.note, None);
-        assert_eq!(
-            error_line(&state.reply_source).as_deref(),
-            Some(REPLY_SOURCE_RETYPE_KEY),
-            "the key is still asked for after the read"
-        );
-        // A Save the server keeps is the end of it.
-        let save = state.begin_reply_source_save().unwrap();
-        state.settle_reply_source_save(save.sent, Ok(kept(InferenceKind::Gateway, None)));
-        assert_eq!(error_line(&state.reply_source), None);
-    }
-
-    /// The health line: no address kept is said as such, not as opencodex being down; with one,
-    /// `/models`' word on the proxy is preferred when it gave one, being what filled the picker,
-    /// and the setting's own `healthy` otherwise.
-    #[test]
-    fn the_health_line_prefers_the_model_lists_word_on_the_proxy() {
-        use super::ProxyHealth;
-        let mut state = signed_in_state();
-        assert_eq!(state.proxy_health(), None, "nothing read");
-        read_as(&mut state, kept(InferenceKind::LocalProxy, Some("m")));
-        assert_eq!(state.proxy_health(), Some(ProxyHealth::Running));
-        state.model_catalogue.local_proxy =
-            Some(crate::opengrok::LocalProxyStatus { healthy: false });
-        assert_eq!(state.proxy_health(), Some(ProxyHealth::NotRunning));
         read_as(
             &mut state,
-            InferenceSource {
-                base_url: None,
-                ..kept(InferenceKind::Gateway, None)
-            },
+            relay_kept(InferenceKind::Gateway, "loopback", None),
         );
-        assert_eq!(state.proxy_health(), Some(ProxyHealth::NoAddress));
+        assert!(!state.settle_computer_page(), "Settings is shut");
+        state.is_app_settings_open = true;
+        state.app_settings_tab = AppSettingsTab::Computer;
+        assert!(state.settle_computer_page(), "arrived: read");
+        assert!(!state.settle_computer_page(), "still there: no read again");
+        assert!(state.note_relay_key("opencodex-test-key"));
+        assert!(state.reply_source.without_key().relay_key_draft.is_none());
+
+        state.app_settings_tab = AppSettingsTab::Logins;
+        assert!(!state.settle_computer_page());
+        assert_eq!(
+            state.reply_source.relay_key_draft, None,
+            "gone with the tab"
+        );
+        assert!(state.reply_source.relay_retype_key);
+
+        state.app_settings_tab = AppSettingsTab::Computer;
+        assert!(state.settle_computer_page(), "back: read again");
+        assert!(state.note_relay_key("opencodex-test-key"));
+        assert!(!state.reply_source.relay_retype_key, "typed again");
+        state.is_app_settings_open = false;
+        assert!(!state.settle_computer_page());
+        assert_eq!(
+            state.reply_source.relay_key_draft, None,
+            "gone with Settings"
+        );
+
+        state.is_app_settings_open = true;
+        assert!(state.settle_computer_page());
+        assert!(state.note_relay_key("opencodex-test-key"));
+        state.forget_account();
+        assert_eq!(
+            state.reply_source.relay_key_draft, None,
+            "gone with the account"
+        );
+    }
+
+    /// Settings → General coming on screen is told once, which is when the setting and the
+    /// models are read for its Default models; while it is on screen, coming back to the window
+    /// reads the models again. Leaving it shuts Default for new Bots' popover, which hangs from
+    /// it; Settings → Computer coming on screen does not.
+    #[test]
+    fn the_general_page_reads_when_it_arrives_and_shuts_its_pickers_when_it_goes() {
+        use super::PickerView;
+        let mut state = signed_in_state();
+        assert!(!state.settle_default_models_page(), "Settings is shut");
+        state.is_app_settings_open = true;
+        state.app_settings_tab = AppSettingsTab::General;
+        assert!(state.settle_default_models_page(), "arrived: read");
+        assert!(!state.settle_default_models_page(), "still there");
+        assert!(state.reads_on_activation(Instant::now()).models);
+        state.new_bots_picker.open = true;
+        assert!(!state.settle_computer_page(), "Computer is not on screen");
+        assert!(state.new_bots_picker.open, "and has no say in it");
+
+        state.app_settings_tab = AppSettingsTab::Computer;
+        assert!(!state.settle_default_models_page());
+        assert_eq!(
+            state.new_bots_picker,
+            PickerView::default(),
+            "shut with the page"
+        );
+        state.app_settings_tab = AppSettingsTab::General;
+        assert!(state.settle_default_models_page(), "back: read again");
+        state.is_app_settings_open = false;
+        assert!(!state.settle_default_models_page());
+        assert!(!state.reads_on_activation(Instant::now()).models);
     }
 
     /// Only the newest read of the setting lands: an older one answered late, or one that lands
-    /// after the person signed out, is dropped, as is a Save's answer after a sign out. A read
-    /// that fails with the setting already on the page leaves it there and says so.
+    /// after the person signed out, is dropped. A read that fails with the setting already on the
+    /// page leaves it there and says so, and the next read that lands clears what it said; what
+    /// the Keychain said is about this computer, and stays.
     #[test]
     fn a_late_answer_about_the_reply_source_lands_on_nothing() {
         let mut state = signed_in_state();
@@ -32711,26 +40107,33 @@ mod tests {
             state.reply_source.note,
             Some(ReplySourceNote::ReadFailed(_))
         ));
+        read_as(&mut state, kept(InferenceKind::LocalProxy, Some("m")));
+        assert_eq!(state.reply_source.note, None, "the read answers it");
 
-        state.note_reply_source_kind(InferenceKind::Gateway);
-        let save = state.begin_reply_source_save().unwrap();
+        state.settle_key_kept(Err("user interaction is not allowed".into()));
+        read_as(&mut state, kept(InferenceKind::LocalProxy, Some("m")));
+        assert!(matches!(
+            state.reply_source.note,
+            Some(ReplySourceNote::KeyNotKept(_))
+        ));
+
+        let (_, late) = state.begin_reply_source_read().unwrap();
         state.forget_account();
-        assert_eq!(
-            state.settle_reply_source_save(save.sent, Ok(kept(InferenceKind::Gateway, None))),
-            None
-        );
+        assert!(!state.settle_reply_source_read(late, Ok(kept(InferenceKind::Gateway, None))));
         assert_eq!(state.reply_source.kept, None);
     }
 
-    /// The page offers the models `GET /models` lists as the person's plan's, in its order, and
-    /// never one the server would refuse for a subscription: Claude, or an id it does not know
-    /// to be OpenAI's or xAI's. The gateway's are the Bot's.
+    /// The picker's Subscription group offers the models `GET /models` lists as the person's
+    /// plan's, in its order, and never one the server would refuse for a subscription: Claude, or
+    /// an id it does not know to be OpenAI's or xAI's. The gateway's are the Gateway group's.
     #[test]
-    fn the_page_offers_only_the_plans_models() {
+    fn the_subscription_group_offers_only_the_plans_models() {
         let mut state = AppState::new();
         let entry = |id: &str, source: Option<&str>| ModelEntry {
             id: id.into(),
             source: source.map(str::to_string),
+            via: None,
+            ..Default::default()
         };
         state.model_catalogue = ModelCatalogue {
             models: vec![
@@ -32745,7 +40148,10 @@ mod tests {
             note: None,
             local_proxy: None,
         };
-        assert_eq!(state.subscription_models(), vec!["gpt-5-codex", "grok-4"]);
+        assert_eq!(
+            state.plan_models(crate::opengrok::Via::Loopback),
+            vec!["gpt-5-codex", "grok-4"]
+        );
     }
 
     /// Which door a reply came through is read off the run's own frame by the same assembler a
@@ -32766,6 +40172,8 @@ mod tests {
         let badge = ReplySource {
             kind: InferenceKind::LocalProxy,
             model: Some("gpt-5-codex".into()),
+            via: None,
+            fallback_for: None,
         };
         let (plain, _, source) = super::replayed_run(&events, "finished");
         assert_eq!((plain.as_str(), source.as_ref()), ("Done.", Some(&badge)));
@@ -32802,6 +40210,8 @@ mod tests {
         reply.reply_source = Some(ReplySource {
             kind: InferenceKind::Gateway,
             model: Some("oag/cheap".into()),
+            via: None,
+            fallback_for: None,
         });
         keep_reply(
             &db,
@@ -32866,6 +40276,8 @@ mod tests {
         let badge = ReplySource {
             kind: InferenceKind::LocalProxy,
             model: Some("gpt-5-codex".into()),
+            via: None,
+            fallback_for: None,
         };
         let frames = [
             json!({"type": "RUN_STARTED", "runId": "run_1", "threadId": "cw_1"}),
@@ -32957,10 +40369,14 @@ mod tests {
         let plan = ReplySource {
             kind: InferenceKind::LocalProxy,
             model: Some("gpt-5-codex".into()),
+            via: None,
+            fallback_for: None,
         };
         let paid = ReplySource {
             kind: InferenceKind::Gateway,
             model: Some("oag/cheap".into()),
+            via: None,
+            fallback_for: None,
         };
         // As a replay opens a run: the person's own message first, then the frame that says
         // which door the run went through.
@@ -33056,6 +40472,8 @@ mod tests {
         reply.reply_source = Some(ReplySource {
             kind: InferenceKind::LocalProxy,
             model: Some("gpt-5-codex".into()),
+            via: None,
+            fallback_for: None,
         });
         let write = |run: &'static str, stamp: SaveStamp| {
             let db = db.clone();
@@ -33088,6 +40506,8 @@ mod tests {
         let gateway = ReplySource {
             kind: InferenceKind::Gateway,
             model: Some("oag/cheap".into()),
+            via: None,
+            fallback_for: None,
         };
         let mut known = reply.save_stamp();
         known.source_json = Some(gateway.to_json());
@@ -33104,6 +40524,8 @@ mod tests {
         let plan = ReplySource {
             kind: InferenceKind::LocalProxy,
             model: Some("gpt-5-codex".into()),
+            via: None,
+            fallback_for: None,
         };
         let journal = |run: &str, source: Option<serde_json::Value>| {
             let mut events = vec![json!({"type": "RUN_STARTED", "runId": run, "threadId": "cw_1"})];

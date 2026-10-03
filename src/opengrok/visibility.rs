@@ -1,9 +1,13 @@
 //! OpenGrok #139 `TOOL_CALL_RESULT.image.visibility`.
 //!
-//! NativeChat persists `transcript` | `failure` | `end`. `agent` is the live
-//! Computer pane (and `GET /coworkers/{id}/screen`). Missing on old frames
-//! is treated as untagged: pin failure immediately and the last shot at
-//! turn-end, the heuristic used before the server tagged every frame.
+//! NativeChat persists `transcript` | `failure` | `end`. `agent` is a step's
+//! own shot, which stays off the feed. `GET /coworkers/{id}/screen` is
+//! `transcript`, an explicit look at the screen (opengrok-server #342 (main
+//! 2136ffc): `computer_screen` in `crates/opengrok-server/src/agui/routes.rs`,
+//! recorded in `fixtures/wire/rest/GET__coworkers__coworker_id__screen/`).
+//! Missing on old frames is treated as untagged: pin failure immediately and
+//! the last shot at turn-end, the heuristic used before the server tagged
+//! every frame.
 
 /// OpenGrok #139 `TOOL_CALL_RESULT.image.visibility`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

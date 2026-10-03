@@ -1,20 +1,49 @@
-//! What the routine editor's schedule is, and the one cron line it comes down to.
+//! What a routine's schedule is, the one cron line it comes down to, and what a line means in
+//! words.
 //!
-//! The picker in the editor was written for a person: "Every hour", "Weekdays", a time of day,
-//! a list of dates. The server takes one cron line. This module is where the two meet, and it
-//! is deliberately a plain module with no GPUI in it — the interesting part is arithmetic about
+//! The wake editor is written for a person: every 30 minutes, weekdays at nine, the 1st of the
+//! month. The server takes one cron line. This module is where the two meet, and it is
+//! deliberately a plain module with no GPUI in it — the interesting part is arithmetic about
 //! when a thing fires, and arithmetic is worth being able to test without a window.
 //!
 //! Standalone, too: `rustc --edition 2024 --test src/cron_spec.rs` builds and runs the tests at
 //! the bottom without the rest of the app. Nothing here may reach for `crate::`.
 //!
+//! # How the server reads a line
+//!
+//! opengrok-server puts a seconds field of `0` in front of a five-field line and hands it to the
+//! `cron` crate, 0.17 (opengrok-core `schedule.rs`, `normalized_cron`). That is not quite the cron
+//! most people know, and what this module writes and reads follows the server, because the
+//! server is what runs it:
+//!
+//! * Times are the routine's own zone's. The server reads a routine's line in the IANA zone it
+//!   keeps for it (opengrok-server #316: `tz`, the account's `timeZone` for one this app makes,
+//!   UTC for one stored before zones), so `0 9 * * *` in Asia/Manila runs at 9:00 there. The
+//!   words here name no zone: the editor names the routine's beside them where it is not this
+//!   computer's, and says when the next run lands in the person's own time.
+//! * A five-field line's days of the week count as standard cron counts them: 0 and 7 are
+//!   Sunday and 1 is Monday, so `1-5` is Monday to Friday. The server names them so before the
+//!   `cron` crate, which counts Sunday as 1, reads them (opengrok-server #331, on main 5567f91:
+//!   `normalized_cron` and `named_weekdays` in opengrok-core `schedule.rs`), and so does this
+//!   module ([`standard_days_named`]). A six-field line the server kept, every line from before
+//!   #331 among them, counts them the crate's way, and is read back so
+//!   ([`ScheduleSpec::from_server_cron`]). The lines written here name their days (`MON-FRI`),
+//!   which every counting reads alike.
+//! * A day of the month and a day of the week given together must both hold: `0 9 1 * MON` is a
+//!   1st that falls on a Monday, where the usual cron runs on either.
+//! * A step counts from the start of its field: `*/45` minutes is :00 and :45 of each hour, and
+//!   `*/10` days of the month is the 1st, 11th, 21st and 31st.
+//! * Five fields, or one of `@hourly`, `@daily`, `@weekly`, `@monthly` and `@yearly`. Not
+//!   `@every`, and not `L` for the last day of the month. The editor's Cron tab takes five fields.
+//!
 //! The translation is not total in either direction, and that is the point:
 //!
-//! * [`ScheduleSpec::to_cron`] says no to combinations that are not one line — two times of day
-//!   with different minutes past the hour, a weekly schedule with no day picked — with a
-//!   sentence to show the person instead of a schedule that would never fire.
-//! * [`ScheduleSpec::from_cron`] reads back the shapes the editor can draw and leaves everything
-//!   else as `Custom`, where the line is shown as written rather than approximated.
+//! * [`ScheduleSpec::to_cron`] says no to a schedule that is not one line the server takes — a
+//!   weekly schedule with no day picked, a line that is not five fields — with a sentence to show
+//!   the person instead of a schedule that would never fire.
+//! * [`ScheduleSpec::from_cron`] reads back the shapes the editor's tabs draw and leaves the rest
+//!   to the Cron tab, where the line is shown as written rather than approximated, with what it
+//!   means in words beside it ([`describe_cron`]).
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ScheduleUiMode {
@@ -37,6 +66,74 @@ pub enum ScheduleDayKind {
     DaysOfMonth,
 }
 
+/// The wake editor's tabs: one for each shape of schedule it draws, and the webhook, which is no
+/// schedule at all but is the other way a routine can be set off.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WakeTab {
+    Every,
+    Daily,
+    Weekly,
+    Monthly,
+    Webhook,
+    Cron,
+}
+
+impl WakeTab {
+    pub const ALL: [Self; 6] = [
+        Self::Every,
+        Self::Daily,
+        Self::Weekly,
+        Self::Monthly,
+        Self::Webhook,
+        Self::Cron,
+    ];
+
+    /// The tab's name on screen.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Every => "Every",
+            Self::Daily => "Daily",
+            Self::Weekly => "Weekly",
+            Self::Monthly => "Monthly",
+            Self::Webhook => "Webhook",
+            Self::Cron => "Cron",
+        }
+    }
+
+    /// The tab's word in ids: `routine-wake-tab-{word}`.
+    pub fn word(self) -> &'static str {
+        match self {
+            Self::Every => "every",
+            Self::Daily => "daily",
+            Self::Weekly => "weekly",
+            Self::Monthly => "monthly",
+            Self::Webhook => "webhook",
+            Self::Cron => "cron",
+        }
+    }
+}
+
+/// The days of the week, Sunday first, as the weekly tab's chips and the summaries name them.
+/// A schedule keeps its days by their place here: 0 is Sunday and 6 Saturday.
+pub const WEEKDAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+const WEEKDAYS_IN_FULL: [&str; 7] = [
+    "Sunday",
+    "Monday",
+    "Tuesday",
+    "Wednesday",
+    "Thursday",
+    "Friday",
+    "Saturday",
+];
+/// The same days as a written line names them.
+const CRON_WEEKDAYS: [&str; 7] = ["SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"];
+
+/// The months, as the month chips and the summaries name them. A schedule keeps its months as
+/// cron does, January as 1.
+pub const MONTHS: [&str; 12] = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ScheduleSpec {
     pub mode: ScheduleUiMode,
@@ -45,8 +142,11 @@ pub struct ScheduleSpec {
     pub expr: String,
     pub months: Vec<u8>,
     pub day_kind: ScheduleDayKind,
+    /// Days of the week, 0 for Sunday to 6 for Saturday ([`WEEKDAYS`]).
     pub weekdays: Vec<u8>,
     pub month_days: Vec<u8>,
+    /// The time of day, as (hour, minute) on a 24-hour clock. The tabs draw one; a line read
+    /// back with more is the Cron tab's.
     pub times: Vec<(u8, u8)>,
 }
 
@@ -108,21 +208,71 @@ impl ScheduleSpec {
         }
     }
 
+    /// The tab that draws this schedule.
+    pub fn tab(&self) -> WakeTab {
+        match (self.mode, self.day_kind) {
+            (ScheduleUiMode::Interval, _) => WakeTab::Every,
+            (ScheduleUiMode::Custom, _) => WakeTab::Cron,
+            // The tabs draw one time of day; more is a line for the Cron tab.
+            (ScheduleUiMode::Advanced, _) if self.times.len() != 1 => WakeTab::Cron,
+            (ScheduleUiMode::Advanced, ScheduleDayKind::EveryDay) => WakeTab::Daily,
+            (ScheduleUiMode::Advanced, ScheduleDayKind::Weekdays) => WakeTab::Weekly,
+            (ScheduleUiMode::Advanced, ScheduleDayKind::DaysOfMonth) => WakeTab::Monthly,
+        }
+    }
+
+    /// The same schedule as far as it goes, drawn by another tab: the time of day and the months
+    /// carry over, a tab with days of its own starts from Monday to Friday or from the 1st, and
+    /// the Cron tab starts from the line the schedule was, so it can be written further.
+    pub fn on_tab(&self, tab: WakeTab) -> Self {
+        let mut next = self.clone();
+        let time = self.times.first().copied().unwrap_or((9, 0));
+        match tab {
+            WakeTab::Every => {
+                if self.mode != ScheduleUiMode::Interval {
+                    next.every = 1;
+                    next.unit = ScheduleUnit::Hours;
+                }
+                next.mode = ScheduleUiMode::Interval;
+            }
+            WakeTab::Daily | WakeTab::Weekly | WakeTab::Monthly => {
+                next.mode = ScheduleUiMode::Advanced;
+                next.times = vec![time];
+                next.day_kind = match tab {
+                    WakeTab::Daily => ScheduleDayKind::EveryDay,
+                    WakeTab::Weekly => ScheduleDayKind::Weekdays,
+                    _ => ScheduleDayKind::DaysOfMonth,
+                };
+                if tab == WakeTab::Weekly && next.weekdays.is_empty() {
+                    next.weekdays = vec![1, 2, 3, 4, 5];
+                }
+                if tab == WakeTab::Monthly && next.month_days.is_empty() {
+                    next.month_days = vec![1];
+                }
+            }
+            WakeTab::Cron => {
+                if self.mode != ScheduleUiMode::Custom {
+                    next.expr = self.to_cron().unwrap_or_default();
+                }
+                next.mode = ScheduleUiMode::Custom;
+            }
+            // A webhook is not a schedule; the editor keeps the schedule as it was under it.
+            WakeTab::Webhook => {}
+        }
+        next
+    }
+
+    /// The schedule in plain words, as the list of when a routine runs says it and as the editor
+    /// says what was picked: "Weekdays at 9:00 AM, in Jan and Mar".
     pub fn label(&self) -> String {
         match self.mode {
-            ScheduleUiMode::Interval => match (self.every, self.unit) {
-                (1, ScheduleUnit::Minutes) => "Every minute".into(),
-                (n, ScheduleUnit::Minutes) => format!("Every {n} minutes"),
-                (1, ScheduleUnit::Hours) => "Every hour".into(),
-                (n, ScheduleUnit::Hours) => format!("Every {n} hours"),
-                (1, ScheduleUnit::Days) => "Every day".into(),
-                (n, ScheduleUnit::Days) => format!("Every {n} days"),
-            },
+            ScheduleUiMode::Interval => interval_label(self.every, self.unit),
             ScheduleUiMode::Custom => {
-                if self.expr.trim().is_empty() {
-                    "Custom schedule".into()
+                let line = self.expr.trim();
+                if line.is_empty() {
+                    "No cron line yet".into()
                 } else {
-                    self.expr.clone()
+                    describe_cron(line).unwrap_or_else(|| line.to_string())
                 }
             }
             ScheduleUiMode::Advanced => advanced_label(self),
@@ -130,17 +280,26 @@ impl ScheduleSpec {
     }
 }
 
-fn format_clock(hour: u8, minute: u8) -> String {
-    let (h12, am) = if hour == 0 {
-        (12, true)
-    } else if hour < 12 {
-        (hour, true)
-    } else if hour == 12 {
-        (12, false)
-    } else {
-        (hour - 12, false)
-    };
+/// "9:00 AM": a time of day as the summaries say it.
+pub fn format_clock(hour: u8, minute: u8) -> String {
+    let (h12, am) = twelve_hour(hour);
     format!("{}:{:02} {}", h12, minute, if am { "AM" } else { "PM" })
+}
+
+/// "9 AM": an hour on its own.
+fn format_hour(hour: u8) -> String {
+    let (h12, am) = twelve_hour(hour);
+    format!("{} {}", h12, if am { "AM" } else { "PM" })
+}
+
+/// An hour of a 24-hour clock on a 12-hour one, and whether it is before noon.
+pub fn twelve_hour(hour: u8) -> (u8, bool) {
+    match hour {
+        0 => (12, true),
+        1..=11 => (hour, true),
+        12 => (12, false),
+        _ => (hour - 12, false),
+    }
 }
 
 fn ordinal(n: u8) -> String {
@@ -157,34 +316,143 @@ fn ordinal(n: u8) -> String {
     format!("{n}{suffix}")
 }
 
-fn advanced_label(spec: &ScheduleSpec) -> String {
-    let time = spec
-        .times
-        .first()
-        .map(|(h, m)| format_clock(*h, *m))
-        .unwrap_or_else(|| "9:00 AM".into());
-    match spec.day_kind {
-        ScheduleDayKind::EveryDay => format!("Every day at {time}"),
-        ScheduleDayKind::Weekdays if spec.weekdays == [1, 2, 3, 4, 5] => {
-            format!("Weekdays at {time}")
-        }
-        ScheduleDayKind::Weekdays if spec.weekdays.len() == 1 => {
-            format!("Every week at {time}")
-        }
-        ScheduleDayKind::DaysOfMonth if spec.month_days == [1] => {
-            format!("Monthly on the 1st at {time}")
-        }
-        ScheduleDayKind::DaysOfMonth => {
-            let days = spec
-                .month_days
-                .iter()
-                .map(|d| ordinal(*d))
-                .collect::<Vec<_>>()
-                .join(", ");
-            format!("Monthly on the {days} at {time}")
-        }
-        _ => format!("Scheduled at {time}"),
+/// "a", "a and b", "a, b and c".
+fn join_and(items: &[String]) -> String {
+    match items {
+        [] => String::new(),
+        [one] => one.clone(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
     }
+}
+
+/// The runs of consecutive numbers in a sorted list, as (first, last).
+fn runs(sorted: &[u8]) -> Vec<(u8, u8)> {
+    let mut runs: Vec<(u8, u8)> = Vec::new();
+    for &n in sorted {
+        match runs.last_mut() {
+            Some((_, last)) if n == *last + 1 => *last = n,
+            _ => runs.push((n, n)),
+        }
+    }
+    runs
+}
+
+/// Numbers named the way a summary names them: a run of three or more as "a to b", the rest
+/// one by one, all joined with "and".
+fn named_runs(numbers: &[u8], name: impl Fn(u8) -> String) -> String {
+    let mut sorted = numbers.to_vec();
+    sorted.sort_unstable();
+    sorted.dedup();
+    let mut parts = Vec::new();
+    for (first, last) in runs(&sorted) {
+        if last >= first + 2 {
+            parts.push(format!("{} to {}", name(first), name(last)));
+        } else {
+            for n in first..=last {
+                parts.push(name(n));
+            }
+        }
+    }
+    join_and(&parts)
+}
+
+fn month_name(month: u8) -> String {
+    MONTHS
+        .get(usize::from(month.max(1)) - 1)
+        .map_or_else(|| month.to_string(), |name| name.to_string())
+}
+
+fn weekday_name(day: u8) -> String {
+    WEEKDAYS
+        .get(usize::from(day))
+        .map_or_else(|| day.to_string(), |name| name.to_string())
+}
+
+/// ", in Jan and Mar": the months a schedule is kept to, or nothing for every month.
+fn months_suffix(months: &[u8]) -> String {
+    let mut sorted = months.to_vec();
+    sorted.sort_unstable();
+    sorted.dedup();
+    if sorted.is_empty() || sorted.len() == 12 {
+        return String::new();
+    }
+    format!(", in {}", named_runs(&sorted, month_name))
+}
+
+/// The days of the week a schedule runs on, as the start of its summary.
+fn weekday_phrase(days: &[u8]) -> String {
+    let mut sorted = days.to_vec();
+    sorted.sort_unstable();
+    sorted.dedup();
+    match sorted.as_slice() {
+        [] => "No day of the week".into(),
+        [1, 2, 3, 4, 5] => "Weekdays".into(),
+        [0, 6] => "Weekends".into(),
+        [0, 1, 2, 3, 4, 5, 6] => "Every day".into(),
+        [one] => format!("Every {}", WEEKDAYS_IN_FULL[usize::from(*one).min(6)]),
+        many => named_runs(many, weekday_name),
+    }
+}
+
+/// `Every N minutes/hours/days`, in words that are true of the line it becomes. A step that does
+/// not divide its field starts again at the field's start: every 45 minutes is :00 and :45 of
+/// each hour, and saying "every 45 minutes" alone would promise a run at 1:30 there is not.
+fn interval_label(every: u32, unit: ScheduleUnit) -> String {
+    let noun = |one: &str, many: &str| if every == 1 { one } else { many }.to_string();
+    match unit {
+        ScheduleUnit::Minutes => {
+            let base = format!("Every {every} {}", noun("minute", "minutes"));
+            if every == 0 || every > 59 || 60 % every == 0 {
+                base
+            } else {
+                format!("{base}, starting again at :00 each hour")
+            }
+        }
+        ScheduleUnit::Hours => {
+            let base = format!("Every {every} {}", noun("hour", "hours"));
+            if every == 0 || every > 23 || 24 % every == 0 {
+                base
+            } else {
+                format!("{base}, starting again at 12 AM each day")
+            }
+        }
+        ScheduleUnit::Days => {
+            let base = format!("Every {every} {} at 12:00 AM", noun("day", "days"));
+            if every <= 1 {
+                base
+            } else {
+                format!("{base}, starting again on the 1st of each month")
+            }
+        }
+    }
+}
+
+fn advanced_label(spec: &ScheduleSpec) -> String {
+    let times: Vec<String> = spec
+        .times
+        .iter()
+        .map(|(hour, minute)| format_clock(*hour, *minute))
+        .collect();
+    let time = if times.is_empty() {
+        "no time of day".to_string()
+    } else {
+        join_and(&times)
+    };
+    let days = match spec.day_kind {
+        ScheduleDayKind::EveryDay => format!("Every day at {time}"),
+        ScheduleDayKind::Weekdays => format!("{} at {time}", weekday_phrase(&spec.weekdays)),
+        ScheduleDayKind::DaysOfMonth => {
+            if spec.month_days.is_empty() {
+                format!("Monthly on no date at {time}")
+            } else {
+                format!(
+                    "Monthly on the {} at {time}",
+                    named_runs(&spec.month_days, ordinal)
+                )
+            }
+        }
+    };
+    format!("{days}{}", months_suffix(&spec.months))
 }
 
 /// Why a schedule the editor can draw is not a cron line the server can take.
@@ -219,46 +487,78 @@ impl ScheduleSpec {
     pub fn to_cron(&self) -> Result<String, ScheduleNotCron> {
         match self.mode {
             ScheduleUiMode::Interval => interval_cron(self.every, self.unit),
-            ScheduleUiMode::Custom => {
-                let line = self.expr.trim();
-                if line.is_empty() {
-                    Err(ScheduleNotCron::new(
-                        "A custom schedule with nothing written in it is not a schedule: type a \
-                         cron line, like `0 9 * * 1-5`.",
-                    ))
-                } else {
-                    // Whatever was typed, as typed. `@every 1h` is a line this server takes and
-                    // no cron parser here would recognise, and guessing at it would be the app
-                    // overruling somebody who knows what they meant. The server is the judge,
-                    // and its refusal is a sentence the app already knows how to show.
-                    Ok(line.to_string())
-                }
-            }
+            ScheduleUiMode::Custom => five_fields(&self.expr),
             ScheduleUiMode::Advanced => advanced_cron(self),
         }
     }
 
     /// The editor's schedule for a line the server sent back.
     ///
-    /// Only the shapes the pickers can draw are read back; anything else is `Custom`, which
-    /// shows the line as written. That is the honest reading — an approximation would let
+    /// Only the shapes the tabs draw are read back; anything else is `Custom`, the Cron tab,
+    /// which shows the line as written. That is the honest reading — an approximation would let
     /// somebody save the editor's idea of their line over their own.
     pub fn from_cron(line: &str) -> Self {
         parse_cron(line).unwrap_or_else(|| Self::custom(line.trim()))
     }
 
     /// A line as opengrok-server keeps it: six fields, a seconds field of `0` first
-    /// (`0 0 9 * * 1`). Read the way the server shows it (`display_cron` in opengrok-core
-    /// `schedule.rs`), with that `0` dropped, so a Monday-at-nine routine opens as Every week
-    /// on Monday at 9:00 and not as a line to decipher, and saving it unchanged sends nothing.
+    /// (`0 0 9 * * MON`). Read the way the server shows it (`display_cron` in opengrok-core
+    /// `schedule.rs`), with that `0` dropped, so a routine opens on the tab that drew it and
+    /// saving it unchanged sends nothing.
+    ///
+    /// Its numbered days of the week, if it has any, are the `cron` crate's, Sunday as 1: the
+    /// server names a five-field line's days as it stores it since #331, and keeps every line
+    /// from before, numbers and all, as it was (`display_cron` keeps one six fields for that
+    /// reason). They are named first, the crate's way ([`crate_days_named`]), so `0 0 9 * * 1`
+    /// reads as `0 9 * * SUN`, since a five-field line's numbers count the standard way.
     pub fn from_server_cron(line: &str) -> Self {
         let fields: Vec<&str> = line.split_whitespace().collect();
-        if fields.len() == 6 && fields[0] == "0" {
-            Self::from_cron(&fields[1..].join(" "))
-        } else {
-            Self::from_cron(line)
+        match fields[..] {
+            ["0", minute, hour, day_of_month, month, days] => match crate_days_named(days) {
+                Some(days) => {
+                    Self::from_cron(&format!("{minute} {hour} {day_of_month} {month} {days}"))
+                }
+                None => Self::custom(line.trim()),
+            },
+            _ => Self::from_cron(line),
         }
     }
+}
+
+/// The words opengrok-server refuses a line in when it wakes more often than once a minute, a 6-
+/// or 7-field line whose seconds are not `0` (#315's floor, refused since #316: `FLOOR` in
+/// `crates/opengrok-server/src/autonomy/desk.rs`, found by `under_a_minute` in opengrok-core
+/// `schedule.rs`), word for word. The Cron tab says them before Save, as the server would after.
+pub const UNDER_A_MINUTE: &str =
+    "a routine can wake at most once a minute: use 5 fields, like */5 * * * *.";
+
+/// The Cron tab's line, as typed, when it is five fields: minute, hour, day of the month, month
+/// and day of the week. The server is the judge of what is in them; what this refuses is a line
+/// that is not one of its own shape at all, `@every` among them, which the server refuses too.
+fn five_fields(line: &str) -> Result<String, ScheduleNotCron> {
+    let fields: Vec<&str> = line.split_whitespace().collect();
+    match fields.len() {
+        0 => Err(ScheduleNotCron::new(
+            "A cron line with nothing written in it is not a schedule: type one, like \
+             `0 9 * * MON-FRI`.",
+        )),
+        5 => Ok(fields.join(" ")),
+        // A seconds field that is not `0` wakes more often than once a minute, which the server
+        // refuses in its own words: they are said here, begun with a capital as the editor's are.
+        6 | 7 if fields[0] != "0" => Err(ScheduleNotCron::new(capitalized(UNDER_A_MINUTE))),
+        _ => Err(ScheduleNotCron::new(
+            "A cron line here has five fields: minute, hour, day of the month, month and day of \
+             the week, like `0 9 * * MON-FRI`.",
+        )),
+    }
+}
+
+/// A sentence begun with a capital.
+fn capitalized(sentence: &str) -> String {
+    let mut chars = sentence.chars();
+    chars.next().map_or_else(String::new, |first| {
+        first.to_uppercase().chain(chars).collect()
+    })
 }
 
 /// `Every N minutes/hours/days` as a cron line.
@@ -279,7 +579,7 @@ fn interval_cron(every: u32, unit: ScheduleUnit) -> Result<String, ScheduleNotCr
     if every > ceiling {
         return Err(ScheduleNotCron::new(format!(
             "Every {every} {noun} is longer than a cron line can step; the most is {ceiling}. \
-             Choose a larger unit, or write the line under Custom."
+             Choose a larger unit, or write the line on the Cron tab."
         )));
     }
     if every == 1 {
@@ -305,7 +605,7 @@ fn advanced_cron(spec: &ScheduleSpec) -> Result<String, ScheduleNotCron> {
                     "A schedule with no day of the week picked never runs: choose at least one.",
                 ));
             }
-            ("*".to_string(), number_list(&spec.weekdays))
+            ("*".to_string(), weekday_field(&spec.weekdays))
         }
         ScheduleDayKind::DaysOfMonth => {
             if spec.month_days.is_empty() {
@@ -326,6 +626,28 @@ fn advanced_cron(spec: &ScheduleSpec) -> Result<String, ScheduleNotCron> {
         "{minute} {} {day_of_month} {months} {day_of_week}",
         number_list(&hours)
     ))
+}
+
+/// Days of the week as a written line names them: `MON-FRI`, `MON,WED,FRI`. Names and not
+/// numbers: a name is the same day to every counting, standard cron's, which the server reads a
+/// five-field line's numbers by since #331, and the `cron` crate's, Sunday as 1, which a server
+/// from before it read them by.
+fn weekday_field(days: &[u8]) -> String {
+    let mut sorted: Vec<u8> = days.iter().copied().filter(|day| *day < 7).collect();
+    sorted.sort_unstable();
+    sorted.dedup();
+    runs(&sorted)
+        .into_iter()
+        .flat_map(|(first, last)| {
+            let name = |day: u8| CRON_WEEKDAYS[usize::from(day)];
+            if last >= first + 2 {
+                vec![format!("{}-{}", name(first), name(last))]
+            } else {
+                (first..=last).map(|day| name(day).to_string()).collect()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 /// The times, when they are one minute past the hour and a set of hours; `None` when they are
@@ -373,58 +695,273 @@ fn number_list(numbers: &[u8]) -> String {
         .join(",")
 }
 
-/// One field of a cron line, in the three shapes this module can read.
+/// One field of a cron line, read the way the server reads it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum CronField {
-    /// `*`: every one of them.
+    /// `*` (or `?`, for the two day fields): every one.
     Any,
-    /// `*/n`: every nth.
+    /// `*/n`: every nth, counted from the start of the field.
     Every(u32),
-    /// `3` or `1,2,3`: these ones.
+    /// The ones named, sorted: numbers, names, ranges, and lists of them. Days of the week are
+    /// kept the schedule's way, 0 for Sunday.
     List(Vec<u8>),
 }
 
-/// One field read, or `None` for a shape this module has no picker for — a range (`1-5`), a
-/// name (`MON`), a stepped list. Those lines stay `Custom` and are shown as written.
-fn read_field(raw: &str, ceiling: u8) -> Option<CronField> {
-    if raw == "*" {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Field {
+    Minute,
+    Hour,
+    DayOfMonth,
+    Month,
+    DayOfWeek,
+}
+
+impl Field {
+    /// The numbers the field takes, the `cron` crate's way: days of the week are 1 (Sunday) to 7.
+    /// Only names, `*` and steps reach the day of the week here: a line's numbered days are named
+    /// before it is read ([`standard_days_named`]).
+    fn bounds(self) -> (u8, u8) {
+        match self {
+            Self::Minute => (0, 59),
+            Self::Hour => (0, 23),
+            Self::DayOfMonth => (1, 31),
+            Self::Month => (1, 12),
+            Self::DayOfWeek => (1, 7),
+        }
+    }
+
+    /// A name in the field, as the server takes it: three letters or the whole word, in any
+    /// case. Days of the week by the crate's numbers.
+    fn named(self, word: &str) -> Option<u8> {
+        let word = word.to_ascii_lowercase();
+        let find = |names: &[&str]| {
+            names.iter().position(|name| {
+                let name = name.to_ascii_lowercase();
+                word == name[..3] || word == name
+            })
+        };
+        match self {
+            Self::Month => find(&[
+                "january",
+                "february",
+                "march",
+                "april",
+                "may",
+                "june",
+                "july",
+                "august",
+                "september",
+                "october",
+                "november",
+                "december",
+            ])
+            .map(|at| at as u8 + 1),
+            // "tues" and "thurs" are the server's too.
+            Self::DayOfWeek => match word.as_str() {
+                "tues" => Some(3),
+                "thurs" => Some(5),
+                _ => find(&WEEKDAYS_IN_FULL).map(|at| at as u8 + 1),
+            },
+            _ => None,
+        }
+    }
+
+    fn number(self, raw: &str) -> Option<u8> {
+        let (low, high) = self.bounds();
+        let number = match raw.parse::<u8>() {
+            Ok(number) => number,
+            Err(_) => self.named(raw)?,
+        };
+        (low..=high).contains(&number).then_some(number)
+    }
+}
+
+/// One field read, or `None` for one the server would refuse or this module cannot follow.
+fn read_field(raw: &str, field: Field) -> Option<CronField> {
+    let any_day = matches!(field, Field::DayOfMonth | Field::DayOfWeek);
+    if raw == "*" || (raw == "?" && any_day) {
         return Some(CronField::Any);
     }
+    let (low, high) = field.bounds();
     if let Some(step) = raw.strip_prefix("*/") {
         let step: u32 = step.parse().ok()?;
-        // The same ceiling `interval_cron` writes to. `*/90` in a field that counts to 59 is not
-        // "every 90 minutes": read as an interval, the editor would show a schedule it then
-        // refuses to save. Left `Custom`, it is shown and saved as written.
-        return (1..=u32::from(ceiling))
+        if step == 0 {
+            return None;
+        }
+        // A stepped month or day of the week is a list of them; a stepped minute, hour or date
+        // is an interval, kept while it fits the field (`*/90` minutes does not, and is read as
+        // the Cron tab's line, not as an interval the editor would then refuse to save).
+        if matches!(field, Field::Month | Field::DayOfWeek) {
+            let numbers = (u32::from(low)..=u32::from(high))
+                .step_by(step as usize)
+                .map(|n| n as u8)
+                .collect::<Vec<_>>();
+            return Some(CronField::List(server_days(field, numbers)));
+        }
+        let ceiling = match field {
+            Field::Minute => 59,
+            Field::Hour => 23,
+            _ => 31,
+        };
+        return (1..=ceiling)
             .contains(&step)
             .then_some(CronField::Every(step));
     }
     let mut numbers = Vec::new();
     for part in raw.split(',') {
-        let number: u8 = part.parse().ok()?;
-        if number > ceiling {
+        let (range, step) = match part.split_once('/') {
+            Some((range, step)) => (range, Some(step.parse::<usize>().ok().filter(|s| *s > 0)?)),
+            None => (part, None),
+        };
+        let (first, last) = match range.split_once('-') {
+            Some((first, last)) => (field.number(first)?, field.number(last)?),
+            None => {
+                let only = field.number(range)?;
+                (only, if step.is_some() { high } else { only })
+            }
+        };
+        if first > last {
             return None;
         }
-        numbers.push(number);
+        numbers.extend((first..=last).step_by(step.unwrap_or(1)));
     }
-    (!numbers.is_empty()).then_some(CronField::List(numbers))
+    numbers.sort_unstable();
+    numbers.dedup();
+    (!numbers.is_empty()).then(|| CronField::List(server_days(field, numbers)))
 }
 
-fn parse_cron(line: &str) -> Option<ScheduleSpec> {
+/// Days of the week from the crate's numbers (1 for Sunday) to the schedule's (0 for Sunday);
+/// any other field as it is.
+fn server_days(field: Field, numbers: Vec<u8>) -> Vec<u8> {
+    if field == Field::DayOfWeek {
+        numbers.into_iter().map(|day| day - 1).collect()
+    } else {
+        numbers
+    }
+}
+
+/// The five fields of a line, each read, or `None` for a line that is not five readable fields.
+/// Its numbered days of the week count the standard way, as the server reads them since #331.
+fn read_line(line: &str) -> Option<[CronField; 5]> {
     let fields: Vec<&str> = line.split_whitespace().collect();
     let [minute, hour, day_of_month, month, day_of_week] = fields[..] else {
         return None;
     };
-    let minute = read_field(minute, 59)?;
-    let hour = read_field(hour, 23)?;
-    // Cron counts Sunday as both 0 and 7.
-    let day_of_week = read_field(day_of_week, 7)?;
-    let day_of_month = read_field(day_of_month, 31)?;
-    let month = read_field(month, 12)?;
+    let day_of_week = standard_days_named(day_of_week).ok()?;
+    Some([
+        read_field(minute, Field::Minute)?,
+        read_field(hour, Field::Hour)?,
+        read_field(day_of_month, Field::DayOfMonth)?,
+        read_field(month, Field::Month)?,
+        read_field(&day_of_week, Field::DayOfWeek)?,
+    ])
+}
+
+/// The `cron` crate's names for the days of the week, by standard cron's numbers: 0 and 7 are
+/// both Sunday (`WEEKDAYS` in opengrok-core `schedule.rs`).
+const STANDARD_DAYS: [&str; 8] = ["SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"];
+
+/// Why the server refuses a numbered day of the week, after the item itself, word for word
+/// (`NOT_A_DAY` in opengrok-core `schedule.rs`, #331): "8 is not a day of the week: …".
+pub const NOT_A_DAY: &str = "is not a day of the week: a day is 0 to 7, where 0 and 7 are both \
+                             Sunday, or SUN to SAT, and a range runs forward and steps by 1 to 7";
+
+/// Whether a day-of-week item counts its days by number: a digit before any step. Only those
+/// mean different days to standard cron and to the `cron` crate; `*`, `?`, a name and their
+/// steps mean the same days to both (`numbers_a_day` in opengrok-core `schedule.rs`).
+fn numbers_a_day(item: &str) -> bool {
+    let base = item.split_once('/').map_or(item, |(base, _)| base);
+    base.bytes().any(|b| b.is_ascii_digit())
+}
+
+/// A five-field line's day of the week with its numbered items named the way the server names
+/// them before the `cron` crate reads them (opengrok-server #331, on main 5567f91:
+/// `named_weekdays` in opengrok-core `schedule.rs`, transcribed): standard cron's numbers, 0 and
+/// 7 Sunday and 1 Monday, item by item so a list keeps its shape. `1-5` is `MON-FRI`, `1-5/2` is
+/// `MON-FRI/2`, a lone number with a step runs to 7 (`1/2` is Mon, Wed, Fri and Sun), and since
+/// the crate takes no range that wraps, `5-7` is `FRI-SAT,SUN`. Names, `*` and `?` pass as they
+/// are. `Err` is the server's sentence for an item it refuses: a number past 7, a range that runs
+/// backward, a step outside 1 to 7, or a digit beside a name.
+pub fn standard_days_named(field: &str) -> Result<String, String> {
+    let mut named = Vec::new();
+    for item in field.split(',') {
+        if !numbers_a_day(item) {
+            named.push(item.to_string());
+            continue;
+        }
+        let base = item.split_once('/').map_or(item, |(base, _)| base);
+        let step = item.split_once('/').map(|(_, step)| step);
+        let refused = || format!("{item} {NOT_A_DAY}");
+        let number = |text: &str| match text.parse::<usize>() {
+            Ok(n) if n <= 7 && text.bytes().all(|b| b.is_ascii_digit()) => Ok(n),
+            _ => Err(refused()),
+        };
+        let (first, last) = match base.split_once('-') {
+            Some((first, last)) => (number(first)?, number(last)?),
+            None => {
+                let day = number(base)?;
+                (day, if step.is_some() { 7 } else { day })
+            }
+        };
+        let every = step.map_or(Ok(1), number)?;
+        if first > last || every == 0 {
+            return Err(refused());
+        }
+        let sunday = last == 7 && (1..7).contains(&first) && (7 - first) % every == 0;
+        let last = if first < 7 { last.min(6) } else { last };
+        let step = step.map_or(String::new(), |step| format!("/{step}"));
+        named.push(if first == last {
+            STANDARD_DAYS[first].to_string()
+        } else {
+            format!("{}-{}{step}", STANDARD_DAYS[first], STANDARD_DAYS[last])
+        });
+        if sunday {
+            named.push("SUN".to_string());
+        }
+    }
+    Ok(named.join(","))
+}
+
+/// A day-of-week field in the `cron` crate's own numbers, 1 for Sunday to 7 for Saturday, as a
+/// six-field line the server kept counts them, named item by item, so the five-field reader,
+/// which counts numbers the standard way, reads the same days: `1-5` is `SUN-THU`, and a lone day
+/// with a step runs to the end of the crate's week (`2/2` is `MON-SAT/2`). `None` for an item
+/// that is no day of the crate's.
+fn crate_days_named(field: &str) -> Option<String> {
+    let name = |text: &str| -> Option<&str> {
+        let day: usize = text.parse().ok()?;
+        let digits = text.bytes().all(|b| b.is_ascii_digit());
+        (digits && (1..=7).contains(&day)).then(|| CRON_WEEKDAYS[day - 1])
+    };
+    let items = field.split(',').map(|item| {
+        if !numbers_a_day(item) {
+            return Some(item.to_string());
+        }
+        let (base, step) = match item.split_once('/') {
+            Some((base, step)) => (base, Some(step)),
+            None => (item, None),
+        };
+        let range = match base.split_once('-') {
+            Some((first, last)) => format!("{}-{}", name(first)?, name(last)?),
+            None if step.is_some() => format!("{}-SAT", name(base)?),
+            None => name(base)?.to_string(),
+        };
+        Some(match step {
+            Some(step) => format!("{range}/{step}"),
+            None => range,
+        })
+    });
+    items
+        .collect::<Option<Vec<_>>>()
+        .map(|items| items.join(","))
+}
+
+fn parse_cron(line: &str) -> Option<ScheduleSpec> {
+    let [minute, hour, day_of_month, month, day_of_week] = read_line(line)?;
     let every_day = day_of_month == CronField::Any && day_of_week == CronField::Any;
 
     // The interval readings first: a `*` or a `*/n` where a time of day would be is the shape
-    // the Interval picker draws, and reading those back as "Advanced, at midnight" would turn
+    // the Every tab draws, and reading those back as a time of day at midnight would turn
     // "every two days" into a daily schedule the moment somebody saved it.
     if every_day && month == CronField::Any {
         match (&minute, &hour) {
@@ -453,16 +990,15 @@ fn parse_cron(line: &str) -> Option<ScheduleSpec> {
         return Some(ScheduleSpec::interval(*step, ScheduleUnit::Days));
     }
 
-    // Everything else the editor can draw is Advanced: a literal time of day, on days that are
-    // named rather than stepped.
+    // Everything else the tabs draw is one time of day, on days that are named rather than
+    // stepped. Two times of day are the Cron tab's: the tabs draw one.
     let (CronField::List(minutes), CronField::List(hours)) = (&minute, &hour) else {
         return None;
     };
-    let &[minute] = minutes.as_slice() else {
+    let (&[minute], &[hour]) = (minutes.as_slice(), hours.as_slice()) else {
         return None;
     };
-    let mut spec = ScheduleSpec::advanced_daily(*hours.first()?, minute);
-    spec.times = hours.iter().map(|hour| (*hour, minute)).collect();
+    let mut spec = ScheduleSpec::advanced_daily(hour, minute);
     spec.months = match month {
         CronField::Any => Vec::new(),
         CronField::List(months) => months,
@@ -470,6 +1006,9 @@ fn parse_cron(line: &str) -> Option<ScheduleSpec> {
     };
     match (day_of_month, day_of_week) {
         (CronField::Any, CronField::Any) => spec.day_kind = ScheduleDayKind::EveryDay,
+        (CronField::Any, CronField::List(days)) if days.len() == 7 => {
+            spec.day_kind = ScheduleDayKind::EveryDay;
+        }
         (CronField::Any, CronField::List(days)) => {
             spec.day_kind = ScheduleDayKind::Weekdays;
             spec.weekdays = days;
@@ -478,119 +1017,500 @@ fn parse_cron(line: &str) -> Option<ScheduleSpec> {
             spec.day_kind = ScheduleDayKind::DaysOfMonth;
             spec.month_days = days;
         }
-        // Cron reads a line with both a date and a weekday as "either", which is not a thing
-        // the pickers can say and not a thing anybody means. The line stays as written.
+        // The server runs a line with both a date and a weekday only when both hold, which no
+        // tab draws. The line stays as written, and its words say so.
         _ => return None,
     }
     Some(spec)
+}
+
+/// Whether a line gives its days of the week by number: the Cron tab says beside it how they
+/// count, standard cron's way since opengrok-server #331, since a person may count them another.
+pub fn numbered_weekdays(line: &str) -> bool {
+    line.split_whitespace()
+        .nth(4)
+        .is_some_and(|days| days.chars().any(|c| c.is_ascii_digit()))
+}
+
+/// What a five-field line means in words, read the way the server reads it: the schedule's own
+/// words where one of the editor's tabs draws it, and otherwise field by field ("Every 15 minutes
+/// from 9:00 AM to 5:45 PM, on weekdays"). `None` for a line that is not five fields the server
+/// would take.
+pub fn describe_cron(line: &str) -> Option<String> {
+    let line = line.trim();
+    if let Some(spec) = parse_cron(line) {
+        return Some(spec.label());
+    }
+    let [minute, hour, day_of_month, month, day_of_week] = read_line(line)?;
+    let mut parts = vec![time_phrase(&minute, &hour)];
+    if let Some(days) = day_phrase(&day_of_month, &day_of_week) {
+        parts.push(days);
+    }
+    if let CronField::List(months) = &month
+        && months.len() < 12
+    {
+        parts.push(format!("in {}", named_runs(months, month_name)));
+    }
+    let words = parts.join(", ");
+    let mut chars = words.chars();
+    Some(chars.next().map_or_else(String::new, |first| {
+        first.to_uppercase().chain(chars).collect()
+    }))
+}
+
+/// When in the day a line fires.
+fn time_phrase(minute: &CronField, hour: &CronField) -> String {
+    let minutes_of = |field: &CronField| match field {
+        CronField::Any => (0..60).collect::<Vec<u8>>(),
+        CronField::Every(step) => (0..60).step_by(*step as usize).collect(),
+        CronField::List(minutes) => minutes.clone(),
+    };
+    let minute_marks = |minutes: &[u8]| {
+        join_and(
+            &minutes
+                .iter()
+                .map(|m| format!(":{m:02}"))
+                .collect::<Vec<_>>(),
+        )
+    };
+    let how_often = match minute {
+        CronField::Any => Some("every minute".to_string()),
+        CronField::Every(step) => Some(if 60 % step == 0 {
+            format!("every {step} minutes")
+        } else {
+            format!("every {step} minutes starting again at :00 each hour")
+        }),
+        CronField::List(_) => None,
+    };
+    match hour {
+        CronField::Any => how_often
+            .unwrap_or_else(|| format!("at {} past every hour", minute_marks(&minutes_of(minute)))),
+        CronField::Every(step) => {
+            let hours = format!("every {step} hours from 12 AM");
+            match how_often {
+                Some(often) => format!("{often}, in {hours}"),
+                None => format!("at {} past {hours}", minute_marks(&minutes_of(minute))),
+            }
+        }
+        CronField::List(hours) => {
+            let minutes = minutes_of(minute);
+            if let (Some(often), [(first, last)]) = (&how_often, runs(hours).as_slice()) {
+                let (Some(&start), Some(&end)) = (minutes.first(), minutes.last()) else {
+                    return String::new();
+                };
+                return format!(
+                    "{often} from {} to {}",
+                    format_clock(*first, start),
+                    format_clock(*last, end)
+                );
+            }
+            if how_often.is_none() && minutes.len() == 1 && hours.len() <= 6 {
+                let times: Vec<String> = hours
+                    .iter()
+                    .map(|hour| format_clock(*hour, minutes[0]))
+                    .collect();
+                return format!("at {}", join_and(&times));
+            }
+            let hours = named_runs(hours, format_hour);
+            match how_often {
+                Some(often) => format!("{often} in the hours of {hours}"),
+                None => format!("at {} past {hours}", minute_marks(&minutes)),
+            }
+        }
+    }
+}
+
+/// Which days a line fires on.
+fn day_phrase(day_of_month: &CronField, day_of_week: &CronField) -> Option<String> {
+    let dates = match day_of_month {
+        CronField::Any => None,
+        CronField::Every(step) => Some(format!(
+            "every {step} days starting again on the 1st of each month"
+        )),
+        CronField::List(days) => Some(format!("on the {}", named_runs(days, ordinal))),
+    };
+    let weekdays = match day_of_week {
+        CronField::List(days) if days.len() < 7 => Some(days.as_slice()),
+        _ => None,
+    };
+    Some(match (dates, weekdays) {
+        (None, None) => "every day".to_string(),
+        (Some(dates), None) => dates,
+        (None, Some(days)) => match weekday_phrase(days).as_str() {
+            "Weekdays" => "on weekdays".to_string(),
+            "Weekends" => "on weekends".to_string(),
+            phrase => match phrase.strip_prefix("Every ") {
+                Some(day) => format!("on {day}s"),
+                None => format!("on {phrase}"),
+            },
+        },
+        // Both must hold, on this server: a date that is also one of these days.
+        (Some(dates), Some(days)) => format!("{dates}, when it is {}", a_weekday(days)),
+    })
+}
+
+/// "a Monday", "a weekday", "a Mon, Wed or Fri": one day of those given, as a date can be.
+fn a_weekday(days: &[u8]) -> String {
+    match weekday_phrase(days).as_str() {
+        "Weekdays" => "a weekday".to_string(),
+        "Weekends" => "a Saturday or Sunday".to_string(),
+        phrase => match phrase.strip_prefix("Every ") {
+            Some(day) => format!("a {day}"),
+            None => {
+                let names: Vec<String> = days.iter().map(|day| weekday_name(*day)).collect();
+                match names.as_slice() {
+                    [rest @ .., last] if !rest.is_empty() => {
+                        format!("a {} or {last}", rest.join(", "))
+                    }
+                    _ => format!("a {phrase}"),
+                }
+            }
+        },
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// The seven things the "On a schedule" menu offers, as the lines the server will keep.
+    /// The line each tab writes for what it shows, which is the line the server keeps and runs.
+    /// Days of the week are named, months and dates are numbers, and a time is minute then hour.
     #[test]
-    fn every_preset_is_one_cron_line() {
-        let cron = |preset: &str| ScheduleSpec::from_preset(preset).to_cron().unwrap();
-        assert_eq!(cron("Every hour"), "0 * * * *");
-        assert_eq!(cron("Every day"), "0 9 * * *");
-        assert_eq!(cron("Weekdays"), "0 9 * * 1,2,3,4,5");
-        assert_eq!(cron("Every week"), "0 9 * * 1");
-        assert_eq!(cron("Every month"), "0 8 1 * *");
-        assert_eq!(cron("Interval"), "*/30 * * * *");
-        assert_eq!(cron("Advanced..."), "0 9 * * *");
+    fn every_tab_writes_a_line_the_server_takes() {
+        let cron = |spec: ScheduleSpec| spec.to_cron().unwrap();
+        // Every
+        assert_eq!(
+            cron(ScheduleSpec::interval(1, ScheduleUnit::Minutes)),
+            "* * * * *"
+        );
+        assert_eq!(
+            cron(ScheduleSpec::interval(15, ScheduleUnit::Minutes)),
+            "*/15 * * * *"
+        );
+        assert_eq!(
+            cron(ScheduleSpec::interval(1, ScheduleUnit::Hours)),
+            "0 * * * *"
+        );
+        assert_eq!(
+            cron(ScheduleSpec::interval(6, ScheduleUnit::Hours)),
+            "0 */6 * * *"
+        );
+        assert_eq!(
+            cron(ScheduleSpec::interval(1, ScheduleUnit::Days)),
+            "0 0 * * *"
+        );
+        assert_eq!(
+            cron(ScheduleSpec::interval(2, ScheduleUnit::Days)),
+            "0 0 */2 * *"
+        );
+        // Daily
+        let mut daily = ScheduleSpec::advanced_daily(9, 30);
+        assert_eq!(cron(daily.clone()), "30 9 * * *");
+        daily.months = vec![3, 1];
+        assert_eq!(cron(daily), "30 9 * 1,3 *");
+        // Weekly
+        let weekly = |days: &[u8]| {
+            let mut spec = ScheduleSpec::advanced_daily(9, 0).on_tab(WakeTab::Weekly);
+            spec.weekdays = days.to_vec();
+            cron(spec)
+        };
+        assert_eq!(weekly(&[1, 2, 3, 4, 5]), "0 9 * * MON-FRI");
+        assert_eq!(weekly(&[1, 3, 5]), "0 9 * * MON,WED,FRI");
+        assert_eq!(weekly(&[0, 6]), "0 9 * * SUN,SAT");
+        assert_eq!(weekly(&[0, 1, 2, 4]), "0 9 * * SUN-TUE,THU");
+        // Monthly
+        let mut monthly = ScheduleSpec::advanced_daily(8, 0).on_tab(WakeTab::Monthly);
+        monthly.month_days = vec![15, 1];
+        assert_eq!(cron(monthly), "0 8 1,15 * *");
+        // Cron
+        assert_eq!(
+            cron(ScheduleSpec::custom("  0  9 * *   MON-FRI ")),
+            "0 9 * * MON-FRI"
+        );
     }
 
-    /// Every preset survives the round trip unchanged, which is what lets the editor open a
-    /// routine the server sent and show the same words the person chose it by.
+    /// A weekly schedule names its days, which every counting reads alike. A five-field line's
+    /// numbered days count as standard cron counts them, as the server reads them since #331 (on
+    /// main 5567f91): 0 and 7 are Sunday and 1 is Monday, so `1-5` is weekdays. Read the old way,
+    /// the `cron` crate's, Sunday as 1, `1-5` was Sunday to Thursday and 0 was no day at all.
     #[test]
-    fn a_preset_read_back_off_the_wire_is_the_preset_again() {
-        for preset in [
-            "Every hour",
-            "Every day",
-            "Weekdays",
-            "Every week",
-            "Every month",
-            "Interval",
-        ] {
-            let spec = ScheduleSpec::from_preset(preset);
-            let line = spec.to_cron().unwrap();
+    fn a_numbered_day_of_the_week_counts_as_standard_cron_counts_it() {
+        let label = |line: &str| ScheduleSpec::from_cron(line).label();
+        assert_eq!(label("0 9 * * MON-FRI"), "Weekdays at 9:00 AM");
+        assert_eq!(label("0 9 * * mon,tue,wed,thu,fri"), "Weekdays at 9:00 AM");
+        assert_eq!(label("0 9 * * 1-5"), "Weekdays at 9:00 AM", "1 is Monday");
+        assert_eq!(label("0 9 * * 1,2,3,4,5"), "Weekdays at 9:00 AM");
+        assert_eq!(label("0 9 * * 1"), "Every Monday at 9:00 AM");
+        assert_eq!(label("0 9 * * 0"), "Every Sunday at 9:00 AM", "0 is Sunday");
+        assert_eq!(label("0 9 * * 7"), "Every Sunday at 9:00 AM", "and so is 7");
+        assert_eq!(label("0 9 * * 6,0"), "Weekends at 9:00 AM");
+        assert_eq!(label("0 9 * * 0-6"), "Every day at 9:00 AM");
+        assert_eq!(label("0 9 * * 1-7"), "Every day at 9:00 AM");
+        assert_eq!(
+            label("0 9 * * 1/2"),
+            "Sun, Mon, Wed and Fri at 9:00 AM",
+            "a lone day with a step runs to 7, which is Sunday"
+        );
+        assert_eq!(label("0 9 * * SAT,SUN"), "Weekends at 9:00 AM");
+        assert_eq!(
+            ScheduleSpec::from_cron("0 9 * * 1-5").to_cron().as_deref(),
+            Ok("0 9 * * MON-FRI"),
+            "and written back by name"
+        );
+        for refused in ["0 9 * * 8", "0 9 * * 5-1", "0 9 * * 1-5/0", "0 9 * * MON-5"] {
             assert_eq!(
-                ScheduleSpec::from_cron(&line),
-                spec,
-                "{preset} came back as something else off `{line}`"
+                ScheduleSpec::from_cron(refused).tab(),
+                WakeTab::Cron,
+                "{refused}: the server refuses it, so no tab draws it"
             );
-            assert_ne!(
-                ScheduleSpec::from_cron(&line).mode,
-                ScheduleUiMode::Custom,
-                "{preset} fell through to the raw line"
-            );
+            assert_eq!(describe_cron(refused), None, "{refused}");
+        }
+        assert!(numbered_weekdays("0 9 * * 1-5"));
+        assert!(!numbered_weekdays("0 9 * * MON-FRI"));
+        assert!(!numbered_weekdays("0 9 1 * *"));
+    }
+
+    /// The server's own naming of a numbered day of the week (#331: `named_weekdays` in
+    /// opengrok-core `schedule.rs`), item by item, and its refusals in its words.
+    #[test]
+    fn numbered_days_are_named_as_the_server_names_them() {
+        let named = |field: &str| standard_days_named(field).unwrap();
+        assert_eq!(named("1-5"), "MON-FRI");
+        assert_eq!(named("1,3,5"), "MON,WED,FRI");
+        assert_eq!(named("1-5/2"), "MON-FRI/2");
+        assert_eq!(named("5-7"), "FRI-SAT,SUN");
+        assert_eq!(named("1/2"), "MON-SAT/2,SUN");
+        assert_eq!(named("0"), "SUN");
+        assert_eq!(named("7"), "SUN");
+        assert_eq!(named("0-7"), "SUN-SAT");
+        assert_eq!(
+            named("*/2"),
+            "*/2",
+            "a step of every day is the same to both"
+        );
+        assert_eq!(named("MON-FRI,SUN"), "MON-FRI,SUN");
+        assert_eq!(
+            standard_days_named("8"),
+            Err(format!("8 {NOT_A_DAY}")),
+            "the server's words"
+        );
+        for refused in ["5-1", "1-5/0", "1/8", "MON-5", "1-x"] {
+            assert!(standard_days_named(refused).is_err(), "{refused}");
         }
     }
 
+    /// A six-field line the server kept counts its numbered days the `cron` crate's way, Sunday
+    /// as 1, as every line from before #331 does: read back, it is those days, by name, while a
+    /// five-field line's numbers count the standard way. A line it names is read as it was.
     #[test]
-    fn an_interval_steps_the_field_it_fits_in() {
-        let cron = |every, unit| ScheduleSpec::interval(every, unit).to_cron().unwrap();
-        assert_eq!(cron(1, ScheduleUnit::Minutes), "* * * * *");
-        assert_eq!(cron(5, ScheduleUnit::Minutes), "*/5 * * * *");
-        assert_eq!(cron(1, ScheduleUnit::Hours), "0 * * * *");
-        assert_eq!(cron(6, ScheduleUnit::Hours), "0 */6 * * *");
-        assert_eq!(cron(1, ScheduleUnit::Days), "0 0 * * *");
-        assert_eq!(cron(2, ScheduleUnit::Days), "0 0 */2 * *");
+    fn a_six_field_line_from_the_server_counts_its_days_the_crates_way() {
+        let read = ScheduleSpec::from_server_cron;
+        assert_eq!(read("0 0 9 * * 1").label(), "Every Sunday at 9:00 AM");
+        assert_eq!(read("0 0 9 * * 2-6").label(), "Weekdays at 9:00 AM");
+        assert_eq!(
+            read("0 0 9 * * 1-5").to_cron().as_deref(),
+            Ok("0 9 * * SUN-THU")
+        );
+        assert_eq!(read("0 0 9 * * MON-FRI").label(), "Weekdays at 9:00 AM");
+        assert_eq!(read("0 0 9 * * 2/2").label(), "Mon, Wed and Fri at 9:00 AM");
+        assert_eq!(
+            ScheduleSpec::from_cron("0 9 * * 1").label(),
+            "Every Monday at 9:00 AM",
+            "five fields count the standard way"
+        );
+        assert_eq!(
+            read("0 0 9 * * 0"),
+            ScheduleSpec::custom("0 0 9 * * 0"),
+            "no day of the crate's: the line as the server keeps it"
+        );
     }
 
-    /// Every interval the editor can write reads back as a schedule that saves the same line, for
-    /// every step the pickers allow and a few past them. (Every 1 day reads back as "every day
-    /// at 00:00": the same schedule, drawn by the other picker.)
+    /// What each tab says under the editor, and in the list of when a routine runs: what was
+    /// picked, in words, the months by name and never "Selected months", and the time on the
+    /// routine's own clock, whose zone the words do not name: the editor names it beside them
+    /// where it is not this computer's.
     #[test]
-    fn every_interval_the_editor_writes_reads_back_the_same() {
-        for (unit, ceiling) in [
-            (ScheduleUnit::Minutes, 59),
-            (ScheduleUnit::Hours, 23),
-            (ScheduleUnit::Days, 31),
+    fn a_summary_says_exactly_what_was_picked() {
+        let mut spec = ScheduleSpec::advanced_daily(9, 0).on_tab(WakeTab::Weekly);
+        spec.months = vec![1, 3];
+        assert_eq!(spec.label(), "Weekdays at 9:00 AM, in Jan and Mar");
+        spec.months = vec![3, 4, 5, 6, 12];
+        assert_eq!(spec.label(), "Weekdays at 9:00 AM, in Mar to Jun and Dec");
+        spec.months = (1..=12).collect();
+        assert_eq!(
+            spec.label(),
+            "Weekdays at 9:00 AM",
+            "every month is no month named"
+        );
+        spec.weekdays = vec![1, 3, 5];
+        spec.times = vec![(14, 15)];
+        assert_eq!(spec.label(), "Mon, Wed and Fri at 2:15 PM");
+        spec.weekdays = vec![2];
+        assert_eq!(spec.label(), "Every Tuesday at 2:15 PM");
+
+        let mut monthly = ScheduleSpec::advanced_daily(8, 0).on_tab(WakeTab::Monthly);
+        monthly.month_days = vec![1, 15];
+        assert_eq!(monthly.label(), "Monthly on the 1st and 15th at 8:00 AM");
+        monthly.month_days = vec![1, 2, 3, 22];
+        assert_eq!(
+            monthly.label(),
+            "Monthly on the 1st to 3rd and 22nd at 8:00 AM"
+        );
+
+        assert_eq!(
+            ScheduleSpec::advanced_daily(0, 5).label(),
+            "Every day at 12:05 AM"
+        );
+        let every = |n, unit| ScheduleSpec::interval(n, unit).label();
+        assert_eq!(every(1, ScheduleUnit::Hours), "Every 1 hour");
+        assert_eq!(every(30, ScheduleUnit::Minutes), "Every 30 minutes");
+        assert_eq!(every(1, ScheduleUnit::Minutes), "Every 1 minute");
+        assert_eq!(every(1, ScheduleUnit::Days), "Every 1 day at 12:00 AM");
+    }
+
+    /// A step that does not divide its field starts again at the field's start, on the server
+    /// as in any cron: the words say so, rather than promise runs that never come.
+    #[test]
+    fn an_uneven_step_says_it_starts_again() {
+        let every = |n, unit| ScheduleSpec::interval(n, unit).label();
+        assert_eq!(
+            every(45, ScheduleUnit::Minutes),
+            "Every 45 minutes, starting again at :00 each hour"
+        );
+        assert_eq!(
+            every(5, ScheduleUnit::Hours),
+            "Every 5 hours, starting again at 12 AM each day"
+        );
+        assert_eq!(every(8, ScheduleUnit::Hours), "Every 8 hours");
+        assert_eq!(
+            every(2, ScheduleUnit::Days),
+            "Every 2 days at 12:00 AM, starting again on the 1st of each month"
+        );
+    }
+
+    /// The Cron tab takes five fields, as written, and nothing else: not `@every`, which the
+    /// server refuses, and not the `@daily` kind, which it takes but the tab does not offer.
+    /// A line that wakes more often than once a minute, a 6- or 7-field one whose seconds are
+    /// not `0`, is refused in the server's own words (opengrok-server #316); one whose seconds are
+    /// `0` is still not five fields, and is refused as that.
+    #[test]
+    fn a_line_under_a_minute_is_refused_in_the_servers_words() {
+        let refused = |line: &str| {
+            ScheduleSpec::custom(line)
+                .to_cron()
+                .unwrap_err()
+                .sentence()
+                .to_string()
+        };
+        let floor = "A routine can wake at most once a minute: use 5 fields, like */5 * * * *.";
+        assert_eq!(refused("*/30 * * * * *"), floor);
+        assert_eq!(refused("* * * * * * *"), floor);
+        assert_eq!(refused("15 0 9 * * MON"), floor, "a second past the minute");
+        assert!(
+            refused("0 */5 * * * *").starts_with("A cron line here has five fields"),
+            "on the minute, but not five fields"
+        );
+        assert_eq!(
+            ScheduleSpec::custom("*/5 * * * *").to_cron().as_deref(),
+            Ok("*/5 * * * *"),
+            "the line the server's words suggest"
+        );
+    }
+
+    #[test]
+    fn the_cron_tab_takes_five_fields_and_nothing_else() {
+        assert_eq!(
+            ScheduleSpec::custom("0 9 * * MON-FRI").to_cron().unwrap(),
+            "0 9 * * MON-FRI"
+        );
+        for line in ["@every 1h", "@daily", "0 9 * *", "0 0 9 * * 1", "   "] {
+            assert!(ScheduleSpec::custom(line).to_cron().is_err(), "{line:?}");
+        }
+        assert!(
+            ScheduleSpec::custom("@every 1h")
+                .to_cron()
+                .unwrap_err()
+                .sentence()
+                .contains("five fields")
+        );
+    }
+
+    /// Every schedule a tab draws comes back off its own line on the same tab, the same, which is
+    /// what lets the editor open a routine the server sent on the tab and words it was chosen by.
+    #[test]
+    fn every_tab_reads_its_own_line_back() {
+        let mut weekly = ScheduleSpec::advanced_daily(7, 45).on_tab(WakeTab::Weekly);
+        weekly.weekdays = vec![0, 2, 4];
+        weekly.months = vec![6, 7, 8];
+        let mut monthly = ScheduleSpec::advanced_daily(23, 0).on_tab(WakeTab::Monthly);
+        monthly.month_days = vec![1, 10, 31];
+        for spec in [
+            ScheduleSpec::interval(10, ScheduleUnit::Minutes),
+            ScheduleSpec::interval(3, ScheduleUnit::Hours),
+            ScheduleSpec::interval(2, ScheduleUnit::Days),
+            ScheduleSpec::advanced_daily(9, 0),
+            weekly,
+            monthly,
+            ScheduleSpec::from_preset("Weekdays"),
+            ScheduleSpec::from_preset("Every week"),
+            ScheduleSpec::from_preset("Every month"),
         ] {
-            for every in 0..=ceiling + 10 {
-                let spec = ScheduleSpec::interval(every, unit);
-                match spec.to_cron() {
-                    Ok(line) => {
-                        assert!((1..=ceiling).contains(&every), "{every} {unit:?} -> {line}");
-                        let again = ScheduleSpec::from_cron(&line).to_cron();
-                        assert_eq!(again.as_deref(), Ok(line.as_str()), "{every} {unit:?}");
-                    }
-                    Err(_) => assert!(every == 0 || every > ceiling, "{every} {unit:?} refused"),
-                }
-            }
+            let line = spec.to_cron().unwrap();
+            let back = ScheduleSpec::from_cron(&line);
+            assert_eq!(back, spec, "`{line}` came back as something else");
+            assert_eq!(back.tab(), spec.tab(), "`{line}`");
         }
     }
 
-    /// Whatever step the server sends back, the editor can save it again: a step its field can
-    /// hold is an interval, and one it cannot (`*/90` minutes, `*/48` hours) is shown and kept
-    /// as written rather than read as an interval the editor would then refuse.
+    /// A tab switched to keeps what it can: the time and the months carry over, the weekly tab
+    /// starts on Monday to Friday and the monthly on the 1st, and the Cron tab on the line the
+    /// schedule was.
     #[test]
-    fn every_stepped_line_from_the_server_saves_again() {
-        for step in 1..=200u32 {
-            for (line, ceiling) in [
-                (format!("*/{step} * * * *"), 59),
-                (format!("0 */{step} * * *"), 23),
-                (format!("0 0 */{step} * *"), 31),
-            ] {
-                let read = ScheduleSpec::from_cron(&line);
-                let saved = read.to_cron().unwrap_or_else(|e| {
-                    panic!("{line} read back as a schedule that will not save: {e}")
-                });
-                if step > ceiling {
-                    assert_eq!(read.mode, ScheduleUiMode::Custom, "{line}");
-                    assert_eq!(saved, line);
-                } else if step > 1 {
-                    assert_eq!(saved, line);
-                }
-            }
-        }
+    fn a_tab_switched_to_keeps_the_time_and_the_months() {
+        let mut daily = ScheduleSpec::advanced_daily(18, 30);
+        daily.months = vec![12];
+        let weekly = daily.on_tab(WakeTab::Weekly);
+        assert_eq!(weekly.tab(), WakeTab::Weekly);
+        assert_eq!(weekly.label(), "Weekdays at 6:30 PM, in Dec");
+        let monthly = weekly.on_tab(WakeTab::Monthly);
+        assert_eq!(monthly.label(), "Monthly on the 1st at 6:30 PM, in Dec");
+        let cron = monthly.on_tab(WakeTab::Cron);
+        assert_eq!(cron.tab(), WakeTab::Cron);
+        assert_eq!(cron.expr, "30 18 1 12 *");
+        let every = cron.on_tab(WakeTab::Every);
+        assert_eq!(every.label(), "Every 1 hour");
+        assert_eq!(
+            every.on_tab(WakeTab::Daily).label(),
+            "Every day at 6:30 PM, in Dec"
+        );
     }
 
-    /// Cron steps inside one field, so an interval that overflows its field is not a schedule
-    /// at all — `*/90` in a field that counts to 59 fires never.
+    /// A line no tab draws is described field by field, the server's way.
+    #[test]
+    fn a_line_no_tab_draws_is_said_in_words_the_servers_way() {
+        let words = |line: &str| describe_cron(line).unwrap();
+        assert_eq!(words("0 9,17 * * *"), "At 9:00 AM and 5:00 PM, every day");
+        assert_eq!(
+            words("*/15 9-17 * * MON-FRI"),
+            "Every 15 minutes from 9:00 AM to 5:45 PM, on weekdays"
+        );
+        assert_eq!(
+            words("0 9 1 * MON"),
+            "At 9:00 AM, on the 1st, when it is a Monday"
+        );
+        assert_eq!(
+            words("0 9 1,15 * MON-FRI"),
+            "At 9:00 AM, on the 1st and 15th, when it is a weekday"
+        );
+        assert_eq!(words("30 * * * *"), "At :30 past every hour, every day");
+        assert_eq!(
+            words("0 12 * JAN-MAR SAT"),
+            "Every Saturday at 12:00 PM, in Jan to Mar"
+        );
+        assert_eq!(describe_cron("0 9 * * 8"), None, "the server refuses day 8");
+        assert_eq!(describe_cron("@daily"), None, "not five fields");
+    }
+
     #[test]
     fn an_interval_longer_than_its_field_is_refused_with_a_sentence() {
         let error = ScheduleSpec::interval(90, ScheduleUnit::Minutes)
@@ -614,13 +1534,65 @@ mod tests {
         );
     }
 
+    /// Every interval the Every tab can write reads back as a schedule that saves the same line,
+    /// for every step it allows and a few past them. (Every 1 day reads back as every day at
+    /// 12:00 AM: the same schedule, drawn by the Daily tab.)
+    #[test]
+    fn every_interval_the_editor_writes_reads_back_the_same() {
+        for (unit, ceiling) in [
+            (ScheduleUnit::Minutes, 59),
+            (ScheduleUnit::Hours, 23),
+            (ScheduleUnit::Days, 31),
+        ] {
+            for every in 0..=ceiling + 10 {
+                let spec = ScheduleSpec::interval(every, unit);
+                match spec.to_cron() {
+                    Ok(line) => {
+                        assert!((1..=ceiling).contains(&every), "{every} {unit:?} -> {line}");
+                        let again = ScheduleSpec::from_cron(&line).to_cron();
+                        assert_eq!(again.as_deref(), Ok(line.as_str()), "{every} {unit:?}");
+                    }
+                    Err(_) => assert!(every == 0 || every > ceiling, "{every} {unit:?} refused"),
+                }
+            }
+        }
+    }
+
+    /// Whatever step the server sends back, the editor can save it again: a step its field can
+    /// hold is an interval, and one it cannot (`*/90` minutes, `*/48` hours) is the Cron tab's
+    /// line, kept as written rather than read as an interval the editor would then refuse.
+    #[test]
+    fn every_stepped_line_from_the_server_saves_again() {
+        for step in 1..=200u32 {
+            for (line, ceiling) in [
+                (format!("*/{step} * * * *"), 59),
+                (format!("0 */{step} * * *"), 23),
+                (format!("0 0 */{step} * *"), 31),
+            ] {
+                let read = ScheduleSpec::from_cron(&line);
+                let saved = read.to_cron().unwrap_or_else(|e| {
+                    panic!("{line} read back as a schedule that will not save: {e}")
+                });
+                if step > ceiling {
+                    assert_eq!(read.mode, ScheduleUiMode::Custom, "{line}");
+                    assert_eq!(saved, line);
+                } else if step > 1 {
+                    assert_eq!(saved, line);
+                }
+            }
+        }
+    }
+
     /// Two times of day are one line while they share the minute, and two routines when they
-    /// do not: cron has one minute field for the whole line.
+    /// do not: cron has one minute field for the whole line. Read back, two times are the Cron
+    /// tab's, which says both.
     #[test]
     fn two_times_of_day_are_one_line_only_when_the_minute_agrees() {
         let mut spec = ScheduleSpec::advanced_daily(9, 0);
         spec.times = vec![(9, 0), (17, 0)];
         assert_eq!(spec.to_cron().unwrap(), "0 9,17 * * *");
+        assert_eq!(spec.tab(), WakeTab::Cron);
+        assert_eq!(ScheduleSpec::from_cron("0 9,17 * * *").tab(), WakeTab::Cron);
 
         spec.times = vec![(9, 0), (17, 30)];
         let error = spec.to_cron().unwrap_err();
@@ -653,41 +1625,18 @@ mod tests {
         assert!(spec.to_cron().unwrap_err().sentence().contains("date"));
     }
 
+    /// A line with a shape the tabs cannot draw is kept, not approximated: two times, a date and
+    /// a weekday together, steps the tabs do not offer, and lines that are not five fields.
     #[test]
-    fn months_narrow_the_line_and_read_back() {
-        let mut spec = ScheduleSpec::advanced_daily(8, 30);
-        spec.day_kind = ScheduleDayKind::DaysOfMonth;
-        spec.month_days = vec![1, 15];
-        spec.months = vec![3, 6, 9, 12];
-        let line = spec.to_cron().unwrap();
-        assert_eq!(line, "30 8 1,15 3,6,9,12 *");
-        assert_eq!(ScheduleSpec::from_cron(&line), spec);
-    }
-
-    /// Whatever was typed under Custom goes as typed. `@every 1h` is a line this server takes
-    /// and no cron parser here would recognise; the app is not the judge of it.
-    #[test]
-    fn a_custom_line_goes_as_written_and_comes_back_as_written() {
-        let spec = ScheduleSpec::custom("  @every 1h  ");
-        assert_eq!(spec.to_cron().unwrap(), "@every 1h");
-        assert_eq!(
-            ScheduleSpec::from_cron("@every 1h"),
-            ScheduleSpec::custom("@every 1h")
-        );
-        assert!(ScheduleSpec::custom("   ").to_cron().is_err());
-    }
-
-    /// A line with a shape the pickers cannot draw is kept, not approximated: ranges, names,
-    /// and the one cron reads as "either the date or the weekday".
-    #[test]
-    fn a_line_the_pickers_cannot_draw_stays_the_line() {
+    fn a_line_the_tabs_cannot_draw_stays_the_line() {
         for line in [
-            "0 9 * * 1-5",
-            "0 9 * * MON",
-            "0 9 1 * 1",
+            "0 9,17 * * MON-FRI",
+            "0 9 1 * MON",
+            "*/15 9-17 * * *",
             "0 9 * *",
             "",
             "0 9 * * * *",
+            "@daily",
         ] {
             let spec = ScheduleSpec::from_cron(line);
             assert_eq!(spec.mode, ScheduleUiMode::Custom, "{line}");
@@ -695,8 +1644,8 @@ mod tests {
         }
     }
 
-    /// An hourly line with an offset is not the Interval picker's `every hour`, which fires on
-    /// the hour: reading it back as one would move somebody's schedule by half an hour.
+    /// An hourly line with an offset is not the Every tab's `every hour`, which fires on the
+    /// hour: reading it back as one would move somebody's schedule by half an hour.
     #[test]
     fn an_offset_hour_is_not_the_hourly_interval() {
         assert_eq!(
@@ -710,15 +1659,19 @@ mod tests {
     }
 
     /// The label under the trigger row is what the person reads, and it comes off the spec the
-    /// line was read back into.
+    /// line was read back into, or off the line itself where no tab draws it.
     #[test]
     fn a_line_read_back_is_labelled_the_way_it_was_chosen() {
         let label = |line: &str| ScheduleSpec::from_cron(line).label();
-        assert_eq!(label("0 * * * *"), "Every hour");
+        assert_eq!(label("0 * * * *"), "Every 1 hour");
         assert_eq!(label("*/30 * * * *"), "Every 30 minutes");
         assert_eq!(label("0 9 * * *"), "Every day at 9:00 AM");
-        assert_eq!(label("0 9 * * 1,2,3,4,5"), "Weekdays at 9:00 AM");
         assert_eq!(label("0 8 1 * *"), "Monthly on the 1st at 8:00 AM");
-        assert_eq!(label("@every 1h"), "@every 1h");
+        assert_eq!(label("0 9,17 * * *"), "At 9:00 AM and 5:00 PM, every day");
+        assert_eq!(
+            label("@daily"),
+            "@daily",
+            "a line with no words for it is itself"
+        );
     }
 }

@@ -19,6 +19,12 @@ pub struct Account {
     pub enabled: bool,
     #[serde(default)]
     pub is_admin: Option<bool>,
+    /// The IANA zone the person's routines default to, from a server that keeps one, which
+    /// sends the key on every read, `null` until set (opengrok-server #322, on main since
+    /// c0bb6ae: `account_json` in `crates/opengrok-server/src/account_api.rs`, #316).
+    /// `None` is the key left out: a server before it, which is never sent one.
+    #[serde(default, deserialize_with = "super::inference::keyed")]
+    pub time_zone: Option<Option<String>>,
 }
 
 impl Account {
@@ -68,11 +74,12 @@ pub struct Coworker {
     pub hidden_from_sidebar: bool,
     #[serde(default, alias = "boxId", alias = "box_id")]
     pub box_id: Option<String>,
-    /// How hard it thinks before it answers: one of [`EFFORT_WORDS`], or a word this app has not
-    /// heard of, kept as the server sent it so the settings never show a value the server does
-    /// not hold. Missing is a server from before opengrok-server#271, which keeps no effort and
-    /// sends none on a turn: that reads as `inherit` ([`Self::effort`]), and nothing offers to
-    /// change what that server has nowhere to keep.
+    /// How hard it thinks before it answers, in the server's word: `inherit`, `none`, or a level
+    /// of its model's ([`ModelEntry::efforts`]), kept as the server sent it so the settings never
+    /// show a value the server does not hold. Missing is a server from before
+    /// opengrok-server#271, which keeps no effort and sends none on a turn: that reads as
+    /// `inherit` ([`Self::effort`]), and nothing offers to change what that server has nowhere to
+    /// keep.
     #[serde(default)]
     pub effort: Option<String>,
     /// Who may use this bot: `private`, its owner alone, or `org`, shared with the owner's
@@ -81,16 +88,65 @@ pub struct Coworker {
     /// app reads it through [`Self::is_shared`].
     #[serde(default)]
     pub visibility: Option<String>,
+    /// Which door the Bot's replies go through ([`CoworkerSource`]), read from `source`, which
+    /// may be missing, `null` or a word, and each of the three says something different.
+    #[serde(default, deserialize_with = "coworker_source")]
+    pub source: CoworkerSource,
 }
 
-/// How hard a coworker thinks before it answers, in the server's words and in its order.
-/// Transcribed from opengrok-server#271, the shape agreed with the server before it landed:
-/// every roster row carries one of these under `effort`, and `PATCH /coworkers/{id}` takes one.
-/// `inherit` is a coworker with none set, whose turns send the gateway no effort, so the model's
-/// route decides; any other word goes to the gateway as the turn's `reasoning_effort`, taken when
-/// the run starts. Some models ignore it, and the server cannot know which.
-pub const EFFORT_WORDS: [&str; 7] = ["inherit", "none", "low", "medium", "high", "xhigh", "max"];
+/// Which door a Bot's replies go through, as its row says it: `"source": "gateway" |
+/// "local_proxy" | null`, and `PATCH /coworkers/{id}` takes the same word (opengrok-server
+/// main d6f640e (#307, after #304), pin bf99845: `coworker_row` in
+/// `crates/opengrok-server/src/agui/routes.rs`). A server with per-Bot doors writes the key, a
+/// word or `null` and never left out, on every row it answers with: the roster's
+/// (`GET /coworkers`), a hire's (`POST /coworkers`) and a PATCH's. It mounts no
+/// `GET /coworkers/{id}`, so those three are where a Bot's door is read. `null` is a Bot that
+/// follows the account's setting, Settings → Reply source, and on the person's plan it answers
+/// with the account's plan model whatever it is pinned to: only a Bot whose own door is
+/// `local_proxy` is answered there with its pin. A server from before it writes no key at all,
+/// and every Bot there goes where the account's setting says, answering on the person's plan with
+/// the account's plan model whatever the Bot is pinned to. The two are told apart here because
+/// the picker offers a Bot its own plan model only where the server would keep one.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum CoworkerSource {
+    /// The row carries no `source`: a server from before per-Bot doors.
+    #[default]
+    NotKept,
+    /// `null`: the account's own door.
+    AccountDefault,
+    /// The Bot's own door.
+    Kind(super::InferenceKind),
+    /// A word this app has not heard of, kept as the server sent it: a door this app cannot name
+    /// is not claimed to be either of the two it can, and the server goes by its own word.
+    Unknown(String),
+}
 
+/// `source` as a row brings it. The key is there (the field's default covers a row without it),
+/// so `null` is the account's door; anything but a known word is kept as sent rather than failing
+/// the roster, as one row's `effort` never does.
+fn coworker_source<'de, D>(deserializer: D) -> Result<CoworkerSource, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(
+        match Option::<serde_json::Value>::deserialize(deserializer)? {
+            None => CoworkerSource::AccountDefault,
+            Some(serde_json::Value::String(word)) => super::InferenceKind::from_word(&word)
+                .map_or(CoworkerSource::Unknown(word), CoworkerSource::Kind),
+            Some(other) => CoworkerSource::Unknown(other.to_string()),
+        },
+    )
+}
+
+/// How hard a coworker thinks before it answers is a word of the server's: every roster row
+/// carries one under `effort`, and `PATCH /coworkers/{id}` takes one (opengrok-server#271, the
+/// shape agreed with the server before it landed). `inherit` is a coworker with none set, whose
+/// turns send the gateway no effort, so the model's route decides; any other word goes to the
+/// gateway as the turn's `reasoning_effort`, taken when the run starts. Some models ignore it,
+/// and the server cannot know which. What a model takes is its own to say: `GET /models` lists
+/// each model's levels ([`ModelEntry::efforts`]), `ultra` among them for a model that has one,
+/// and the picker offers those and no others, so this app keeps no list of the words itself.
+///
 /// The effort of a coworker with none set, and of every coworker on a server that keeps none.
 pub const EFFORT_INHERIT: &str = "inherit";
 
@@ -109,7 +165,7 @@ impl Coworker {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CoworkerPatch {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -129,13 +185,32 @@ pub struct CoworkerPatch {
     // client keeps that setting on the machine, and NativeChat has nowhere to keep it yet.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hidden_from_sidebar: Option<bool>,
-    /// One of [`EFFORT_WORDS`], sent only when the person changed it: absent leaves the stored
-    /// effort alone, and `inherit` clears it (opengrok-server#271, which reads `null` the same
-    /// way). The server refuses a word it does not know with a 400 and changes nothing, and
-    /// refuses it on a coworker shared with the caller with a 403, as it does every change there
-    /// but the sidebar flag.
+    /// A level of the model's ([`ModelEntry::efforts`]) or `inherit`, sent only when the person
+    /// changed it: absent leaves the stored effort alone, and `inherit` clears it
+    /// (opengrok-server#271, which reads `null` the same way). The server refuses a word it does
+    /// not know with a 400 and changes nothing (`effort must be one of inherit, none, low,
+    /// medium, high, xhigh, max, ultra`), and so it does a level the model does not list, in
+    /// words that name the ones it does (`effort: gpt-6-luna takes low, medium, high, xhigh or
+    /// max, not "none"`), and `ultra` where no listing of the model names it (`effort: no
+    /// listing of xai/grok-4.6 names "ultra", and it is taken only where one does`):
+    /// opengrok-server #342 (main 2136ffc), `effort_refused` in
+    /// `crates/opengrok-server/src/inference.rs`, which `repin_coworker` in
+    /// `crates/opengrok-server/src/agui/routes.rs` asks. It refuses a word on a coworker shared
+    /// with the caller with a 403, as it does every change there but the sidebar flag.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
+    /// The Bot's own door, sent with the model the model picker put it on, and only to a server
+    /// whose rows carry `source` (opengrok-server main d6f640e (#307, after #304), pin bf99845:
+    /// `repin_coworker` in `crates/opengrok-server/src/agui/routes.rs`):
+    /// absent leaves the door alone. The server refuses with a 400 in its own words, `model: ` and
+    /// the sentence its subscription allowlist refuses the account's plan model with, a patch
+    /// whose whole body leaves the Bot on `local_proxy` with a model the allowlist does not take;
+    /// and a `source` that is neither of its two words (`source must be "gateway" or
+    /// "local_proxy"`), which this app never sends, sending only an
+    /// [`InferenceKind`](super::InferenceKind). Either way it writes nothing. A teammate's patch of
+    /// a shared Bot is refused with a 403, as every change there but the sidebar flag is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<super::InferenceKind>,
 }
 
 impl CoworkerPatch {
@@ -148,6 +223,7 @@ impl CoworkerPatch {
             && self.avatar_color.is_none()
             && self.hidden_from_sidebar.is_none()
             && self.effort.is_none()
+            && self.source.is_none()
     }
 }
 
@@ -178,7 +254,28 @@ pub struct ThreadListing {
     pub updated_at_ms: i64,
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+/// One level of effort a model takes, as `GET /models` lists it under `efforts`: the word the
+/// server keeps and a `PATCH /coworkers/{id}` takes (`low`, `medium`, `ultra`), and what the model
+/// calls it, which is a word of the source's own (opencodex says "Low Effort").
+///
+/// Transcribed from opengrok-server #342 (main 2136ffc): `Level` and `Levels::of` in
+/// `crates/opengrok-core/src/catalogue.rs`, which `Model::entry` there writes on every row
+/// `list_models` in `crates/opengrok-server/src/agui/routes.rs` lists. The server sends a `label`
+/// on every level, showing one that was missing or blank as the `value`, and drops an entry that
+/// has no `value`; this app reads a listing the same way, so one odd entry never takes the slider
+/// from a model. The recording holds the shape in `fixtures/wire/rest/GET__models/`, which
+/// `opengrok/conformance.rs` reads (`a_models_levels_are_read_as_the_server_recorded_them`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EffortLevel {
+    pub value: String,
+    pub label: String,
+}
+
+/// A model of `GET /models`. Its `efforts` and `ownEffort` are from opengrok-server #342 (main
+/// 2136ffc): `Model::entry` in `crates/opengrok-core/src/catalogue.rs` writes both on every row,
+/// the gateway's and the person's plan's alike, `null` where the source publishes none
+/// ([`EffortLevel`]).
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
 pub struct ModelEntry {
     pub id: String,
     /// Which door serves it, `gateway` or `local_proxy` (the inference-source contract agreed
@@ -189,6 +286,25 @@ pub struct ModelEntry {
     /// the word the server sent and read through [`Self::source`].
     #[serde(default)]
     pub source: Option<String>,
+    /// For one of the plan's models, which way the server reaches it: `loopback`, listed by
+    /// opencodex on the server's machine, or `mac`, listed by the opencodex of the Mac holding
+    /// the relay (opengrok-server #292: `listed` in `crates/opengrok-harness/src/local_proxy.rs`,
+    /// server main cad36fd (#303, after #298), pin 47a5d6b). Kept as the word
+    /// sent and read through [`Self::plan_via`].
+    #[serde(default)]
+    pub via: Option<String>,
+    /// The levels of effort the model takes, lowest first: `[{value, label}]`, or `null` when
+    /// the source the model comes from publishes none. The app never works them out for a model
+    /// that lists none: a slider drawn from a guess would offer a stop the server then refuses.
+    /// An entry with no `value` is no level, and one with no `label` is called by its value, as
+    /// the server reads a listing itself; a list with no level left is none.
+    #[serde(default, deserialize_with = "effort_levels_or_none")]
+    pub efforts: Option<Vec<EffortLevel>>,
+    /// The `value` of the level the model runs at when a Bot chooses none, `null` when the
+    /// source publishes none. Read through [`Self::own_level`], which holds it to the levels
+    /// listed.
+    #[serde(default, rename = "ownEffort", deserialize_with = "own_effort_or_none")]
+    pub own_effort: Option<String>,
 }
 
 impl ModelEntry {
@@ -202,11 +318,89 @@ impl ModelEntry {
         }
     }
 
-    /// One of the person's own plan's models, which Settings → Reply source offers and a Bot's
-    /// Model field does not.
+    /// One of the person's own plan's models, which Settings → Reply source offers, and a Bot's
+    /// model picker in its plan group where the server keeps a door per Bot.
     pub fn is_local_proxy(&self) -> bool {
         self.source() == Some(super::InferenceKind::LocalProxy)
     }
+
+    /// The way the server reaches one of the plan's models: `loopback` when the entry names none,
+    /// as a server before the relay lists only those, and `None` for the gateway's models and for
+    /// a way this app has not heard of, which neither of the plan's pickers offers.
+    pub fn plan_via(&self) -> Option<super::Via> {
+        if !self.is_local_proxy() {
+            return None;
+        }
+        match self.via.as_deref() {
+            None => Some(super::Via::Loopback),
+            Some(word) => super::Via::from_word(word),
+        }
+    }
+
+    /// The level the model runs at when a Bot chooses none: the one `ownEffort` names, as long
+    /// as the model lists it. A word that is not one of its levels is no level to light.
+    pub fn own_level(&self) -> Option<&EffortLevel> {
+        let own = self.own_effort.as_deref()?;
+        self.efforts
+            .as_ref()?
+            .iter()
+            .find(|level| level.value == own)
+    }
+}
+
+/// A key of a row that this app reads as far as it can, and as none beyond: whatever the row
+/// holds there that it cannot make anything of is no more than the key missing, and never fails
+/// the list of models.
+fn read_or_none<'de, D, T>(
+    deserializer: D,
+    read: fn(&serde_json::Value) -> Option<T>,
+) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<serde_json::Value>::deserialize(deserializer)?
+        .as_ref()
+        .and_then(read))
+}
+
+/// `efforts` as a row brings it ([`effort_levels`]).
+fn effort_levels_or_none<'de, D>(deserializer: D) -> Result<Option<Vec<EffortLevel>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    read_or_none(deserializer, effort_levels)
+}
+
+/// `ownEffort` as a row brings it: a word, or `null`; anything else is none.
+fn own_effort_or_none<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    read_or_none(deserializer, |raw| word(raw).map(str::to_string))
+}
+
+/// The levels `efforts` lists: `[{value, label}]` lowest first, as the server reads a listing
+/// itself (`Levels::of`): an entry with no `value` is no level, and one with no `label` is
+/// called by its value. A list with no level left is none.
+fn effort_levels(raw: &serde_json::Value) -> Option<Vec<EffortLevel>> {
+    let levels: Vec<EffortLevel> = raw
+        .as_array()?
+        .iter()
+        .filter_map(|row| {
+            let value = word(row.get("value")?)?;
+            let label = row.get("label").and_then(word).unwrap_or(value);
+            Some(EffortLevel {
+                value: value.to_string(),
+                label: label.to_string(),
+            })
+        })
+        .collect();
+    (!levels.is_empty()).then_some(levels)
+}
+
+/// A word: a string with something in it.
+fn word(raw: &serde_json::Value) -> Option<&str> {
+    raw.as_str().filter(|word| !word.trim().is_empty())
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -222,7 +416,7 @@ pub struct ModelCatalogue {
     /// `crates/opengrok-server/src/agui/routes.rs`, `listed` in
     /// `crates/opengrok-harness/src/local_proxy.rs`). A proxy that is down lists nothing, and
     /// this is how that reads apart from a plan with nothing to offer. One this app cannot read
-    /// is none: the list the Bot's Model field is drawn from never fails for it.
+    /// is none: the list a Bot's model picker is drawn from never fails for it.
     #[serde(
         default,
         rename = "localProxy",
@@ -236,6 +430,11 @@ pub struct ModelCatalogue {
 pub struct LocalProxyStatus {
     /// opencodex answered its `/healthz` when the server asked.
     pub healthy: bool,
+    /// A Mac holds the relay, so the models listed through it are its opencodex's word now
+    /// (opengrok-server #292: server main cad36fd (#303, after #298), pin 47a5d6b). False from a
+    /// server before the relay, which lists none that way.
+    #[serde(default, rename = "relayConnected")]
+    pub relay_connected: bool,
 }
 
 fn proxy_status_or_none<'de, D>(deserializer: D) -> Result<Option<LocalProxyStatus>, D::Error>
@@ -511,7 +710,8 @@ mod tests {
 
     /// Every key a coworker patch can carry is one the server's patch route reads
     /// (opengrok-server `agui/routes.rs`: name, model, role, visibility, hiddenFromSidebar, and
-    /// title/avatarShape/avatarColor; `effort` from opengrok-server#271). A key it reads nowhere
+    /// title/avatarShape/avatarColor; `effort` from opengrok-server#271; `source` from
+    /// opengrok-server main d6f640e (#307, after #304), pin bf99845). A key it reads nowhere
     /// is a setting that looks saved and is not, and a patch of only that is refused.
     #[test]
     fn a_coworker_patch_names_only_what_the_server_keeps() {
@@ -524,6 +724,7 @@ mod tests {
             avatar_color: Some("c".into()),
             hidden_from_sidebar: Some(true),
             effort: Some("high".into()),
+            source: Some(super::super::InferenceKind::LocalProxy),
         };
         let wire = serde_json::to_value(&full).unwrap();
         let mut keys: Vec<&str> = wire
@@ -541,13 +742,45 @@ mod tests {
             "model",
             "name",
             "role",
+            "source",
             "title",
             "visibility",
         ];
         for key in &keys {
             assert!(read.contains(key), "the server reads no {key:?}");
         }
-        assert_eq!(keys.len(), 8, "every field is on the wire: {keys:?}");
+        assert_eq!(keys.len(), 9, "every field is on the wire: {keys:?}");
+        assert_eq!(wire["source"], "local_proxy", "the door goes as its word");
+    }
+
+    /// A row's `source` says three different things by being missing, `null` or a word: a server
+    /// from before per-Bot doors, a Bot that follows the account's door, and the Bot's own door
+    /// (opengrok-server main d6f640e (#307, after #304), pin bf99845).
+    /// A word this app has not heard of is kept as sent, and no row's door ever fails the roster.
+    #[test]
+    fn a_rows_door_is_missing_null_or_its_word() {
+        use super::super::InferenceKind;
+        let roster: Vec<Coworker> = serde_json::from_value(serde_json::json!([
+            {"id": "cw_old", "name": "Old", "model": "oag/cheap"},
+            {"id": "cw_default", "name": "Default", "model": "oag/cheap", "source": null},
+            {"id": "cw_plan", "name": "Plan", "model": "gpt-6-luna", "source": "local_proxy"},
+            {"id": "cw_keys", "name": "Keys", "model": "oag/cheap", "source": "gateway"},
+            {"id": "cw_odd", "name": "Odd", "model": "oag/cheap", "source": "byok"},
+            {"id": "cw_worse", "name": "Worse", "model": "oag/cheap", "source": 7}
+        ]))
+        .expect("one row's door never fails the roster");
+        let doors: Vec<CoworkerSource> = roster.into_iter().map(|bot| bot.source).collect();
+        assert_eq!(
+            doors,
+            vec![
+                CoworkerSource::NotKept,
+                CoworkerSource::AccountDefault,
+                CoworkerSource::Kind(InferenceKind::LocalProxy),
+                CoworkerSource::Kind(InferenceKind::Gateway),
+                CoworkerSource::Unknown("byok".into()),
+                CoworkerSource::Unknown("7".into()),
+            ]
+        );
     }
 
     /// A roster from a server before opengrok-server#271 has no `effort` on its rows, and every
@@ -635,6 +868,207 @@ mod tests {
         );
     }
 
+    /// A model lists the levels of effort it takes, lowest first, and the one it runs at when a
+    /// Bot chooses none (opengrok-server #342 (main 2136ffc): `Levels::of` in
+    /// `crates/opengrok-core/src/catalogue.rs`). Both are `null` where the source publishes
+    /// nothing and then read as none, as when the keys are missing; the app never works a model's
+    /// levels out. A level with no label is called by its value, as the server calls it, and an
+    /// entry with no value is no level; an empty list, one with no level left, and an own level
+    /// the model does not list are none, and never fail the list.
+    #[test]
+    fn a_models_levels_of_effort_read_as_sent_and_as_none_where_there_are_none() {
+        let catalogue: ModelCatalogue = serde_json::from_value(serde_json::json!({
+            "models": [
+                {"id": "gpt-6-luna", "source": "local_proxy", "ownEffort": "medium", "efforts": [
+                    {"value": "low", "label": "Low Effort"},
+                    {"value": "medium", "label": "Medium Effort"},
+                    {"value": "max", "label": "Max Effort"}
+                ]},
+                {"id": "oag/cheap", "efforts": null, "ownEffort": null},
+                {"id": "oag/fast"},
+                {"id": "empty", "efforts": [], "ownEffort": "medium"},
+                {"id": "half", "efforts": [{"value": "low"}, {"value": "high", "label": "High"}]},
+                {"id": "unlabelled", "efforts": [{"value": "medium", "label": "  "}]},
+                {"id": "dropped", "efforts": [
+                    {"label": "Nameless"}, {"value": "max", "label": "Max Effort"}
+                ]},
+                {"id": "blank", "efforts": [{"value": "", "label": "Low"}]},
+                {"id": "odd", "efforts": "low", "ownEffort": 3},
+                {"id": "unlisted", "ownEffort": "ultra", "efforts": [
+                    {"value": "low", "label": "Low"}
+                ]}
+            ],
+            "note": null
+        }))
+        .expect("one entry's levels never fail the list");
+        let read = |id: &str| {
+            catalogue
+                .models
+                .iter()
+                .find(|entry| entry.id == id)
+                .unwrap_or_else(|| panic!("{id} is listed"))
+        };
+        let luna = read("gpt-6-luna");
+        assert_eq!(
+            luna.efforts.as_ref().map(|levels| levels
+                .iter()
+                .map(|l| (l.value.as_str(), l.label.as_str()))
+                .collect::<Vec<_>>()),
+            Some(vec![
+                ("low", "Low Effort"),
+                ("medium", "Medium Effort"),
+                ("max", "Max Effort")
+            ])
+        );
+        assert_eq!(luna.own_effort.as_deref(), Some("medium"));
+        assert_eq!(
+            luna.own_level().map(|level| level.value.as_str()),
+            Some("medium")
+        );
+        let called = |id: &str| -> Vec<(String, String)> {
+            read(id)
+                .efforts
+                .iter()
+                .flatten()
+                .map(|level| (level.value.clone(), level.label.clone()))
+                .collect()
+        };
+        let pair = |value: &str, label: &str| (value.to_string(), label.to_string());
+        assert_eq!(
+            called("half"),
+            [pair("low", "low"), pair("high", "High")],
+            "no label: the value"
+        );
+        assert_eq!(
+            called("unlabelled"),
+            [pair("medium", "medium")],
+            "a blank label too"
+        );
+        assert_eq!(
+            called("dropped"),
+            [pair("max", "Max Effort")],
+            "no value, no level"
+        );
+        for none in ["oag/cheap", "oag/fast", "empty", "blank", "odd"] {
+            let entry = read(none);
+            assert_eq!(entry.efforts, None, "{none}");
+            assert_eq!(entry.own_level(), None, "{none}");
+        }
+        assert_eq!(read("empty").own_effort.as_deref(), Some("medium"));
+        assert_eq!(read("odd").own_effort, None, "not a word");
+        let unlisted = read("unlisted");
+        assert_eq!(unlisted.own_effort.as_deref(), Some("ultra"));
+        assert_eq!(
+            unlisted.own_level(),
+            None,
+            "a level it does not list is none to light"
+        );
+    }
+
+    /// The listings opengrok-server's own tests record of `GET /models`, transcribed as they are
+    /// (opengrok-server #342 (main 2136ffc):
+    /// `crates/opengrok-server/tests/against_a_models_own_levels.rs`): the plan's gpt-6-sol with
+    /// six levels, up to `ultra`, and gpt-6-luna with five beside a model with none, and the
+    /// gateway's route with three beside one with none. Each row carries `points`, `source` and
+    /// `via` as before, and `efforts` and `ownEffort`, both `null` where the source publishes none.
+    #[test]
+    fn the_listings_the_server_branch_records_are_read_as_they_say() {
+        use crate::opengrok::{InferenceKind, Via};
+        let level = |word: &str| {
+            serde_json::json!({
+                "value": word,
+                "label": format!("{}{} Effort", word[..1].to_uppercase(), &word[1..])
+            })
+        };
+        let six = ["low", "medium", "high", "xhigh", "max", "ultra"].map(level);
+        let five = ["low", "medium", "high", "xhigh", "max"].map(level);
+        let three = ["low", "medium", "high"].map(level);
+        let plan: ModelCatalogue = serde_json::from_value(serde_json::json!({
+            "models": [
+                {"id": "gpt-6-sol", "points": null, "source": "local_proxy", "via": "loopback",
+                 "efforts": six, "ownEffort": "medium"},
+                {"id": "gpt-6-luna", "points": null, "source": "local_proxy", "via": "loopback",
+                 "efforts": five, "ownEffort": "medium"},
+                {"id": "xai/grok-4.6", "points": null, "source": "local_proxy",
+                 "via": "loopback", "efforts": null, "ownEffort": null}
+            ],
+            "note": null
+        }))
+        .expect("the plan's listing");
+        let gateway: ModelCatalogue = serde_json::from_value(serde_json::json!({
+            "models": [
+                {"id": "openai/gpt-6-luna", "points": null, "source": "gateway",
+                 "efforts": three, "ownEffort": "medium"},
+                {"id": "xai/grok-4.6", "points": null, "source": "gateway",
+                 "efforts": null, "ownEffort": null}
+            ],
+            "note": null
+        }))
+        .expect("the gateway's listing");
+        let called = |entry: &ModelEntry| -> Vec<(String, String)> {
+            entry
+                .efforts
+                .iter()
+                .flatten()
+                .map(|level| (level.value.clone(), level.label.clone()))
+                .collect()
+        };
+        let pair = |value: &str, label: &str| (value.to_string(), label.to_string());
+        let [sol, luna, grok] = &plan.models[..] else {
+            panic!("three models")
+        };
+        assert_eq!(
+            called(sol),
+            [
+                pair("low", "Low Effort"),
+                pair("medium", "Medium Effort"),
+                pair("high", "High Effort"),
+                pair("xhigh", "Xhigh Effort"),
+                pair("max", "Max Effort"),
+                pair("ultra", "Ultra Effort")
+            ]
+        );
+        assert_eq!(
+            called(luna),
+            [
+                pair("low", "Low Effort"),
+                pair("medium", "Medium Effort"),
+                pair("high", "High Effort"),
+                pair("xhigh", "Xhigh Effort"),
+                pair("max", "Max Effort")
+            ]
+        );
+        for plan_model in [sol, luna] {
+            assert_eq!(
+                plan_model.own_level().map(|level| level.value.as_str()),
+                Some("medium")
+            );
+        }
+        assert_eq!(
+            (sol.plan_via(), luna.plan_via(), grok.plan_via()),
+            (
+                Some(Via::Loopback),
+                Some(Via::Loopback),
+                Some(Via::Loopback)
+            )
+        );
+        assert_eq!((grok.efforts.as_ref(), grok.own_level()), (None, None));
+        let [luna, grok] = &gateway.models[..] else {
+            panic!("two models")
+        };
+        assert_eq!(
+            called(luna),
+            [
+                pair("low", "Low Effort"),
+                pair("medium", "Medium Effort"),
+                pair("high", "High Effort")
+            ]
+        );
+        assert_eq!(luna.own_effort.as_deref(), Some("medium"));
+        assert_eq!((grok.efforts.as_ref(), grok.own_level()), (None, None));
+        assert_eq!(luna.source(), Some(InferenceKind::Gateway));
+    }
+
     /// `localProxy` says whether opencodex answered as the server listed its models: read when
     /// there, none when the account keeps no proxy address, and none, not a failed list, when it
     /// is in a shape this app cannot read.
@@ -648,14 +1082,26 @@ mod tests {
             "note": null,
             "localProxy": {"healthy": true}
         }));
-        assert_eq!(up.local_proxy, Some(LocalProxyStatus { healthy: true }));
+        assert_eq!(
+            up.local_proxy,
+            Some(LocalProxyStatus {
+                healthy: true,
+                relay_connected: false,
+            })
+        );
         assert!(up.models[0].is_local_proxy());
         let down = read(serde_json::json!({
             "models": [{"id": "oag/cheap", "source": "gateway", "points": null}],
             "note": null,
             "localProxy": {"healthy": false}
         }));
-        assert_eq!(down.local_proxy, Some(LocalProxyStatus { healthy: false }));
+        assert_eq!(
+            down.local_proxy,
+            Some(LocalProxyStatus {
+                healthy: false,
+                relay_connected: false,
+            })
+        );
         assert!(!down.models[0].is_local_proxy());
         let none = read(serde_json::json!({"models": [], "note": null}));
         assert_eq!(none.local_proxy, None);
@@ -679,6 +1125,52 @@ mod tests {
             assert_eq!(odd.local_proxy, None);
             assert_eq!(odd.models.len(), 1);
         }
+    }
+
+    /// With the Mac relay each of the plan's models says which way the server reaches it, and
+    /// `localProxy` whether a Mac holds the relay (opengrok-server PR #298, whose recording the
+    /// ledger reads). A plan's model that names no way is the server's own machine's, as
+    /// every one a server before the relay lists; a way this app has not heard of is neither
+    /// picker's, and the gateway's models have none.
+    #[test]
+    fn a_plans_model_says_which_way_it_is_reached() {
+        use super::super::Via;
+        let catalogue: ModelCatalogue = serde_json::from_value(serde_json::json!({
+            "models": [
+                {"id": "oag/cheap", "source": "gateway", "points": null},
+                {"id": "gpt-5-codex", "source": "local_proxy", "via": "loopback"},
+                {"id": "grok-4", "source": "local_proxy", "via": "mac"},
+                {"id": "gpt-5", "source": "local_proxy"},
+                {"id": "odd", "source": "local_proxy", "via": "helper"},
+                {"id": "stray", "source": "gateway", "via": "mac"}
+            ],
+            "note": null,
+            "localProxy": {"healthy": false, "relayConnected": true}
+        }))
+        .expect("one entry's way never fails the list");
+        let ways: Vec<(&str, Option<Via>)> = catalogue
+            .models
+            .iter()
+            .map(|entry| (entry.id.as_str(), entry.plan_via()))
+            .collect();
+        assert_eq!(
+            ways,
+            vec![
+                ("oag/cheap", None),
+                ("gpt-5-codex", Some(Via::Loopback)),
+                ("grok-4", Some(Via::Mac)),
+                ("gpt-5", Some(Via::Loopback)),
+                ("odd", None),
+                ("stray", None),
+            ]
+        );
+        assert_eq!(
+            catalogue.local_proxy,
+            Some(LocalProxyStatus {
+                healthy: false,
+                relay_connected: true,
+            })
+        );
     }
 
     /// The field is new: a server that has never heard of it must still see the array it saw

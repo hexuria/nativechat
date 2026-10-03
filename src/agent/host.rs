@@ -3,9 +3,8 @@ use gpui_agent::{DispatchResult, virtual_unavailable};
 
 use crate::components::agent_settings::{
     CeilingCardLine, SHARED_BOT_READS_SKILLS, SWITCHED_OFF_IN_SETTINGS, ShownCeilingRow,
-    ShownSkillRow, SkillsCardLine, ceiling_card_lines, ceiling_line, effort_choices, effort_label,
-    offered_without_switches, shown_ceiling_rows, shown_skill_rows, skills_card_lines,
-    skills_summary, tools_summary,
+    ShownSkillRow, SkillsCardLine, ceiling_card_lines, ceiling_line, offered_without_switches,
+    shown_ceiling_rows, shown_skill_rows, skills_card_lines, skills_summary, tools_summary,
 };
 use crate::components::app_settings::{
     NO_LOCAL_RULES, not_in_effect_line, remove_label, rule_list_title,
@@ -15,7 +14,10 @@ use crate::components::chat_input::sources::{
     ParameterSource, SkillLibrary, SlashSource, ToolSource, ValueSource,
 };
 use crate::components::composer_panel::ComposerPanelRow;
+use crate::components::computers::{self, ComputerCard};
 use crate::components::connections::{self, ConnectOffer};
+use crate::components::default_models;
+use crate::components::model_picker;
 use crate::components::reply_source;
 use crate::components::skills::{
     NEVER_UPDATED, NOT_YET_RECORDING, NOT_YET_WITH_BOT, NOTHING_WRITTEN_YET, empty_line,
@@ -35,12 +37,13 @@ use crate::opengrok::{
 use crate::site_login::{SiteLoginRecord, grouped_logins, login_title};
 use crate::state::{
     ActiveRecipe, AfterRefusal, AppSettingsTab, AppState, BotSkills, CeilingCard, ConnectionList,
-    LocalRuleRow, LocalRules, RuleKind, SWITCH_IN_FLIGHT, SkillScope, SkillsCard, TaughtSkill,
-    ToolCeiling, ToolList, WRITING_A_LESSON,
+    LocalRuleRow, LocalRules, PickerFor, PickerView, RuleKind, SWITCH_IN_FLIGHT, SkillScope,
+    SkillsCard, TaughtSkill, ToolCeiling, ToolList, WRITING_A_LESSON,
 };
 
 pub mod ids {
-    use crate::components::{connections, reply_source};
+    use crate::components::{computers, connections, default_models, model_picker, reply_source};
+    use crate::opengrok::InferenceKind;
     use crate::state::RuleKind;
 
     pub const WINDOW: &str = "app-window";
@@ -74,6 +77,11 @@ pub mod ids {
     /// only while one is on the draft, so `assert --exists false` is "this message carries no
     /// skill". Its value is the id the turn will name, because two skills may share a name.
     pub const COMPOSER_SKILL: &str = "composer-skill";
+    /// The chat's transcript, a scroll node whose value says whether it keeps the newest row in
+    /// view: `following`, or `detached` once the person has scrolled back up the thread. A step
+    /// toward older messages, however small, makes it `detached`, and nothing but the person
+    /// makes it `following` again.
+    pub const TRANSCRIPT: &str = "transcript";
     pub const LIGHTBOX: &str = "lightbox";
     pub const PAGE_LOGIN: &str = "page-login";
     pub const LOGIN_EMAIL: &str = "login-email";
@@ -83,6 +91,13 @@ pub mod ids {
     pub const DIALOG_ACCOUNT: &str = "dialog-account";
     pub const DIALOG_VOICE: &str = "dialog-voice";
     pub const HEADER_SETTINGS: &str = "header-settings";
+    pub const HEADER_LEFT_SIDEBAR: &str = "header-left-sidebar";
+    pub const HEADER_RIGHT_SIDEBAR: &str = "header-right-sidebar";
+    pub const HEADER_MONITOR: &str = "header-monitor";
+    /// The chip at the top of the chat that names the open Bot. A press opens its settings, or,
+    /// in one of its routines' threads, goes back to the Bot's own chat: state `goes-home` says
+    /// which it will do.
+    pub const HEADER_COWORKER: &str = "header-coworker";
     /// The open recipe's Run, the outcome of the run it started (value `running`, `ok`,
     /// `failed` or `interrupted`), and its run history.
     pub const RECIPE_RUN: &str = "recipe-run";
@@ -90,9 +105,9 @@ pub mod ids {
     pub const RECIPE_HISTORY_RUNS: &str = "recipe-history-runs";
     pub const RECIPE_ERROR: &str = "recipe-error";
     /// On a routine's thread: which routine (label) and what fires it (value, `schedule` or
-    /// `webhook`), and the way back to the bot's own chat.
+    /// `webhook`), the line centred under the Bot chip. The way back to the bot's own chat is
+    /// the chip itself, `header-coworker`, which says `goes-home` there.
     pub const CHAT_ROUTINE_THREAD: &str = "chat-routine-thread";
-    pub const CHAT_ROUTINE_BACK: &str = "chat-routine-back";
     /// On a routine's thread: how many bubbles are labelled as its instruction (value).
     pub const CHAT_ROUTINE_INSTRUCTIONS: &str = "chat-routine-instructions";
     pub const AGENT_SETTINGS: &str = "agent-settings";
@@ -100,10 +115,108 @@ pub mod ids {
     /// The one control that opens a blank routine, whichever of its two shapes the Computer
     /// pane is drawing: the "Create routine" card when the bot has none, the `+` when it has.
     pub const ROUTINE_NEW: &str = "routine-new";
+    /// The open routine editor's red line: the last refusal, in the server's words, unless a
+    /// note of the routine's already says it. In the tree only while the editor shows one.
+    pub const ROUTINE_ERROR: &str = "routine-error";
+    /// The open routine's four header icons, in the tree while a routine is open in the
+    /// Computer pane: its Run history in place of its fields (state `selected` while shown, when
+    /// it reads "Back to the routine"), Open in thread, Run it now, and Delete. Each acts on the
+    /// open routine, and one that cannot is disabled with the reason as its value.
+    pub const ROUTINE_HISTORY_TOGGLE: &str = "routine-history-toggle";
+    pub const ROUTINE_OPEN_THREAD: &str = "routine-open-thread";
+    pub const ROUTINE_RUN_NOW: &str = "routine-run-now";
+    pub const ROUTINE_DELETE: &str = "routine-delete";
+    /// "When to run" on the open routine: + (dead, with the reason as its value, while the
+    /// routine has its one wake), and the wake editor's Save and Cancel.
+    pub const ROUTINE_WAKE_ADD: &str = "routine-wake-add";
+    pub const ROUTINE_WAKE_EDITOR: &str = "routine-wake-editor";
+    pub const ROUTINE_WAKE_SUMMARY: &str = "routine-wake-summary";
+    pub const ROUTINE_WAKE_NEXT: &str = "routine-wake-next";
+    pub const ROUTINE_WAKE_ERROR: &str = "routine-wake-error";
+    pub const ROUTINE_WAKE_CRON_NOTE: &str = "routine-wake-cron-note";
+    /// Under what the wake editor picked, the zone its times are in (label `<zone> time`, value
+    /// the IANA name), only where that is not this computer's zone.
+    pub const ROUTINE_WAKE_ZONE: &str = "routine-wake-zone";
+    pub const ROUTINE_WAKE_SAVE: &str = "routine-wake-save";
+    pub const ROUTINE_WAKE_CANCEL: &str = "routine-wake-cancel";
+    pub const ROUTINE_WAKE_AM: &str = "routine-wake-am";
+    pub const ROUTINE_WAKE_PM: &str = "routine-wake-pm";
+
+    /// One of the open routine's wakes (label = what sets it off, in words), and its ✎ and 🗑.
+    pub fn routine_wake(at: usize) -> String {
+        format!("routine-wake-{at}")
+    }
+
+    /// Under a schedule's wake, the zone its times are in (label = the IANA name), only where
+    /// that is not this computer's zone.
+    pub fn routine_wake_zone(at: usize) -> String {
+        format!("routine-wake-{at}-zone")
+    }
+
+    pub fn routine_wake_edit(at: usize) -> String {
+        format!("routine-wake-edit-{at}")
+    }
+
+    pub fn routine_wake_delete(at: usize) -> String {
+        format!("routine-wake-delete-{at}")
+    }
+
+    /// A tab of the wake editor, by its word: `every`, `daily`, `weekly`, `monthly`, `webhook`,
+    /// `cron`.
+    pub fn routine_wake_tab(tab: crate::state::WakeTab) -> String {
+        format!("routine-wake-tab-{}", tab.word())
+    }
+
+    /// One of the wake editor's typed boxes, and its ▲ and ▼.
+    pub fn routine_wake_box(which: crate::state::WakeBox) -> &'static str {
+        match which {
+            crate::state::WakeBox::Every => "routine-wake-every",
+            crate::state::WakeBox::Hour => "routine-wake-hour",
+            crate::state::WakeBox::Minute => "routine-wake-minute",
+            crate::state::WakeBox::Cron => "routine-wake-cron",
+        }
+    }
+
+    /// The Every tab's unit, by its word: `minutes`, `hours`, `days`.
+    pub fn routine_wake_unit(unit: crate::state::ScheduleUnit) -> &'static str {
+        match unit {
+            crate::state::ScheduleUnit::Minutes => "routine-wake-unit-minutes",
+            crate::state::ScheduleUnit::Hours => "routine-wake-unit-hours",
+            crate::state::ScheduleUnit::Days => "routine-wake-unit-days",
+        }
+    }
+
+    /// The Weekly tab's day chips (0 is Sunday), the Monthly tab's dates (1 to 31) and the month
+    /// chips (1 is January).
+    pub fn routine_wake_day(day: u8) -> String {
+        format!("routine-wake-day-{day}")
+    }
+
+    pub fn routine_wake_date(date: u8) -> String {
+        format!("routine-wake-date-{date}")
+    }
+
+    pub fn routine_wake_month(month: u8) -> String {
+        format!("routine-wake-month-{month}")
+    }
+
+    /// The question Delete asks over the whole window (label = `Delete "<name>"?`, value = what
+    /// deleting it does), and its two answers. In the tree only while it asks.
+    pub const ROUTINE_DELETE_PROMPT: &str = "routine-delete-prompt";
+    pub const ROUTINE_DELETE_CANCEL: &str = "routine-delete-cancel";
+    pub const ROUTINE_DELETE_CONFIRM: &str = "routine-delete-confirm";
+    /// Under `computer-status`, while the Computer pane says why the server could not give the
+    /// bot a computer: the server's words as the pane shows them, with its code as the value.
+    pub const COMPUTER_ERROR: &str = "computer-error";
+    /// Get a computer, beside that reason: asks the server again, and is dead while it is asked.
+    pub const COMPUTER_GET: &str = "computer-get";
     /// The newest coworker reply's steps (value = how many), in the tree only while it has
     /// any, and its Thought rows (value = how many), only while it has any.
     pub const REPLY_STEPS: &str = "reply-steps";
     pub const REPLY_REASONING: &str = "reply-reasoning";
+    /// The newest coworker reply's Timing row (value = what it says shut, `10s total`), in the
+    /// tree only while the feed draws one.
+    pub const REPLY_TIMING: &str = "reply-timing";
 
     /// One step of the newest reply, by the call it was.
     pub fn step(call_id: &str) -> String {
@@ -262,15 +375,46 @@ pub mod ids {
         format!("routine-{id}-rotate")
     }
 
-    /// Test run: the server starts the routine now. Only on a routine the server has.
+    /// The Active switch on the routine's editor: checked while the routine runs on its own,
+    /// labelled `Active`, or `Paused` while it does not. A click asks for the other way.
+    pub fn routine_active(id: &str) -> String {
+        format!("routine-{id}-active")
+    }
+
+    /// Test run: the server starts the routine now. Only on a routine the server has; dead on a
+    /// server that cannot run a routine on demand.
     pub fn routine_test(id: &str) -> String {
         format!("routine-{id}-test")
+    }
+
+    /// What the editor says its server cannot do with the routine, beside the controls it leaves
+    /// dead, by the line's word: `cant-change` (it cannot change a routine once it is made) and
+    /// `cant-run` (it cannot run one on demand). In the tree only while it is so.
+    pub fn routine_note(id: &str, word: &str) -> String {
+        format!("routine-{id}-{word}")
+    }
+
+    /// In the Run history's place, on a server that cannot list a routine's runs.
+    pub fn routine_runs_unavailable(id: &str) -> String {
+        format!("routine-{id}-runs-unavailable")
+    }
+
+    /// What the person typed that a server unable to change the routine did not keep.
+    pub fn routine_unsaved(id: &str) -> String {
+        format!("routine-{id}-unsaved")
     }
 
     /// One line of the routine's Run history, by the server's run id. Its label is what set
     /// the run off and its value where the run got to, in the history's own words.
     pub fn routine_run(id: &str, run_id: &str) -> String {
         format!("routine-{id}-run-{run_id}")
+    }
+
+    /// A line of the routine's Run history that is a firing the server skipped (opengrok-server
+    /// #316), by when it was due, in the server's milliseconds: it has no run id. Its label is
+    /// what set it off and its value the server's sentence for why. It opens nothing.
+    pub fn routine_skipped(id: &str, at_ms: i64) -> String {
+        format!("routine-{id}-skipped-{at_ms}")
     }
 
     /// Open the thread the routine runs in. Only on a routine the server has.
@@ -302,6 +446,10 @@ pub mod ids {
     /// could not be read only while they could not.
     pub const LOCAL_RULES_EMPTY: &str = "settings-local-rules-empty";
     pub const LOCAL_RULES_ERROR: &str = "settings-local-rules-error";
+
+    /// Why this Mac stopped running commands for the server by itself, on Settings → Computer
+    /// under This Mac. In the tree only while it has, until the next sign-in.
+    pub const LOCAL_EXEC_STOPPED: &str = "settings-local-exec-stopped";
 
     /// One of the two lists, `allow` or `deny`, with its count as the value. In the tree only
     /// while it has a rule on it, as on screen.
@@ -343,38 +491,89 @@ pub mod ids {
     pub const AGENT_CONNECTIONS: &str = connections::AGENT_CARD;
     pub const AGENT_CONNECTIONS_NOTE: &str = connections::AGENT_NOTE;
 
-    /// Settings → Reply source, and the section it holds once the setting has been read.
-    pub const SETTINGS_REPLY_SOURCE: &str = reply_source::SETTINGS_TAB;
-    pub const REPLY_SOURCE: &str = reply_source::SECTION;
-    pub const REPLY_SOURCE_KIND: &str = reply_source::KIND;
-    pub const REPLY_SOURCE_URL: &str = reply_source::URL;
-    pub const REPLY_SOURCE_MODEL: &str = reply_source::MODEL;
-    pub const REPLY_SOURCE_KEY: &str = reply_source::KEY;
-    pub const REPLY_SOURCE_HEALTH: &str = reply_source::HEALTH;
-    pub const REPLY_SOURCE_PROVIDERS: &str = reply_source::PROVIDERS;
-    pub const REPLY_SOURCE_SAVE: &str = reply_source::SAVE;
-    pub const REPLY_SOURCE_ERROR: &str = reply_source::ERROR;
-    pub const REPLY_SOURCE_UNAVAILABLE: &str = reply_source::UNAVAILABLE;
-    pub const REPLY_SOURCE_NO_MODEL: &str = reply_source::NO_MODEL;
-    pub const REPLY_SOURCE_MODELS_NOTE: &str = reply_source::MODELS_NOTE;
-    pub const REPLY_SOURCE_REMOVE_KEY: &str = reply_source::REMOVE_KEY;
-    pub const REPLY_SOURCE_ELSEWHERE: &str = reply_source::ELSEWHERE;
-    pub const REPLY_SOURCE_HINT: &str = reply_source::HINT;
-    /// The composer's chip: which door the next turns go through.
-    pub const COMPOSER_REPLY_SOURCE: &str = reply_source::COMPOSER_CHIP;
-    /// Under a Bot's Model field, while replies go through the person's own plan.
-    pub const AGENT_MODEL_PLAN: &str = reply_source::BOT_MODEL_PLAN;
-    /// In a Bot's Usage card, at the same times.
-    pub const AGENT_USAGE_PLAN: &str = reply_source::BOT_USAGE_PLAN;
+    /// Settings → General, and its first section, Default models, which holds Default for new
+    /// Bots.
+    pub const SETTINGS_GENERAL: &str = "settings-tab-general";
+    pub const DEFAULT_MODELS: &str = default_models::SECTION;
 
-    /// One of the radio's two choices, by the door's wire word.
-    pub fn reply_source_kind(kind: crate::opengrok::InferenceKind) -> String {
-        reply_source::kind_id(kind)
+    /// Settings → Computer's "Your computers": one card to each enrolled computer, by the server's
+    /// machine id: the card, its Relay your plan switch, where its relay stands, and what became of
+    /// a switch that did not go as asked.
+    pub fn computer_card(machine_id: &str) -> String {
+        computers::card_id(machine_id)
     }
 
-    /// One model of the person's plan, in the picker.
-    pub fn reply_source_model(model: &str) -> String {
-        reply_source::model_id(model)
+    pub fn computer_relay(machine_id: &str) -> String {
+        computers::relay_switch_id(machine_id)
+    }
+
+    pub fn computer_status(machine_id: &str) -> String {
+        computers::status_id(machine_id)
+    }
+
+    pub fn computer_error(machine_id: &str) -> String {
+        computers::error_id(machine_id)
+    }
+
+    /// What this computer's card alone holds of its relay: opencodex's address and key, Save, and
+    /// the lines about them, which were Settings → Relay's and keep their ids.
+    pub const REPLY_SOURCE_SAVE: &str = computers::SAVE;
+    pub const REPLY_SOURCE_ERROR: &str = computers::ERROR;
+    pub const REPLY_SOURCE_UNAVAILABLE: &str = computers::UNAVAILABLE;
+    pub const REPLY_SOURCE_HINT: &str = computers::HINT;
+    /// In a Bot's Usage card, while its replies go through the person's own plan.
+    pub const AGENT_USAGE_PLAN: &str = reply_source::BOT_USAGE_PLAN;
+
+    /// The Bot's model picker: the Model card in the Bot's settings, the one place a Bot's model
+    /// is picked. The parts of the popover it opens are `model_picker`'s own ids, all under
+    /// `agent-model-`.
+    pub const AGENT_MODEL_CARD: &str = model_picker::CARD;
+
+    /// One model in the popover's list, by its door's wire word and the id a pick of it pins.
+    pub fn model_row(source: InferenceKind, base_id: &str) -> String {
+        model_picker::row_id(source, base_id)
+    }
+    /// Under this computer's status line: why it is not relaying, in the relay's own words.
+    pub const RELAY_DETAIL: &str = computers::RELAY_DETAIL;
+    pub const RELAY_ADDR: &str = computers::RELAY_ADDR;
+    pub const RELAY_KEY: &str = computers::RELAY_KEY;
+    pub const RELAY_KEY_REMOVE: &str = computers::RELAY_KEY_REMOVE;
+    pub const RELAY_UNAVAILABLE: &str = computers::RELAY_UNAVAILABLE;
+    /// Default for new Bots, on Settings → General: the section, the line saying it is coming,
+    /// and the picker's card in it, which is dead until the server keeps such a default.
+    pub const NEW_BOTS: &str = default_models::NEW_BOTS;
+    pub const NEW_BOTS_UNAVAILABLE: &str = default_models::NEW_BOTS_UNAVAILABLE;
+    pub const NEW_BOTS_CARD: &str = default_models::NEW_BOTS_CARD;
+    /// Shuts Default for new Bots' popover, as `agent-model-dismiss` shuts the Bot's.
+    pub const NEW_BOTS_DISMISS: &str = "settings-new-bots-dismiss";
+    /// The Relay-off fallback, on Settings → General: the section, the line saying it is coming,
+    /// and the picker's card in it, which is dead until the server keeps such a fallback; and the
+    /// dismiss that shuts its popover.
+    pub const PLAN_FALLBACK: &str = default_models::PLAN_FALLBACK;
+    pub const PLAN_FALLBACK_UNAVAILABLE: &str = default_models::PLAN_FALLBACK_UNAVAILABLE;
+    pub const PLAN_FALLBACK_CARD: &str = default_models::PLAN_FALLBACK_CARD;
+    pub const PLAN_FALLBACK_DISMISS: &str = "settings-plan-fallback-dismiss";
+
+    /// One model in the Relay-off fallback's list, by the id a pick of it pins: a Gateway row,
+    /// the Bot's row's id under `settings-plan-fallback-`.
+    pub fn plan_fallback_row(base_id: &str) -> String {
+        model_picker::PLAN_FALLBACK_IDS.row_id(InferenceKind::Gateway, base_id)
+    }
+
+    /// One model in Default for new Bots' list, by its door's wire word and the id a pick of it
+    /// pins: the Bot's row's id under `settings-new-bots-`.
+    pub fn new_bots_row(source: InferenceKind, base_id: &str) -> String {
+        model_picker::NEW_BOTS_IDS.row_id(source, base_id)
+    }
+
+    /// Beside the line of a turn the person's plan could not answer: the turn again, on the
+    /// server's paid keys.
+    pub const RUN_ERROR_SEND_ON_SERVER: &str = crate::components::chat::SEND_ON_SERVER;
+
+    /// A held message the server holds until a Mac holds the relay again, by its bubble's id,
+    /// under `composer-queued`.
+    pub fn queued_waiting(message_id: &str) -> String {
+        format!("queued-waiting-{message_id}")
     }
 
     /// A reply's badge, by the reply's message id.
@@ -565,8 +764,35 @@ pub enum Command {
     ToggleTheme,
     ToggleAccount,
     ToggleAgentSettings,
+    /// The model picker's card: its popover opens, or shuts.
     ToggleModelPicker,
+    /// The popover opened, or shut.
     SetModelPicker(bool),
+    /// The model's name in the popover, which opens the list, or the list's heading back.
+    ToggleModelList,
+    /// What the list's search box holds, as typing it there would leave it.
+    SetModelSearch(String),
+    /// A model in the list, by its group and its id: the Bot goes onto it at once.
+    PickModel {
+        source: crate::opengrok::InferenceKind,
+        base_id: String,
+    },
+    /// ⚡, on or off, saved at once.
+    SetModelFast(bool),
+    /// A level of the effort slider, by the server's word, saved at once.
+    SetModelEffort(String),
+    /// ↺: the effort back to `inherit`, and ⚡ off.
+    ResetModelPick,
+    /// Default for new Bots' picker, on Settings → General: the same changes as the Bot's, each
+    /// kept on the account at once.
+    NewBots(PickerCommand),
+    /// None, in Default for new Bots' list: no default, which leaves a new Bot to the server's.
+    ClearNewBotsDefault,
+    /// The Relay-off fallback's picker, on Settings → General: the same changes, each kept on
+    /// the account at once.
+    PlanFallback(PickerCommand),
+    /// None, in the Relay-off fallback's list: no fallback.
+    ClearPlanFallback,
     ToggleAvatarEditor,
     SetAvatarEditor(bool),
     SetAvatarColor(String),
@@ -583,6 +809,9 @@ pub enum Command {
     RetryTurn,
     ToggleComputerPane,
     OpenCoworkerScreen,
+    /// Get a computer: ask the server again for the open bot's computer, after it said why it
+    /// could not give one.
+    GetComputer,
     /// Update / Reset the active bot's computer: open the confirm dialog, then answer it.
     OpenComputerConfirm(crate::state::ComputerAction),
     ConfirmComputerAction,
@@ -723,8 +952,6 @@ pub enum Command {
         name: String,
         enabled: bool,
     },
-    /// A choice in the bot settings' Effort menu. It waits for Save, as a person's pick does.
-    PickEffort(String),
     /// The bot settings' Save.
     SaveAgentSettings,
     ToggleAgentSkills,
@@ -788,10 +1015,45 @@ pub enum Command {
     RunRoutineNow {
         routine_id: String,
     },
+    /// The Active switch: pause the routine, or let it run on its own again.
+    SetRoutineActive {
+        routine_id: String,
+        active: bool,
+    },
     OpenRoutineThread {
         routine_id: String,
     },
-    BackToBotChat,
+    /// A line of a routine's Run history: its thread, at that run.
+    OpenRoutineRun {
+        routine_id: String,
+        run_id: String,
+    },
+    /// The open routine's history icon: its Run history in place of its fields, or back.
+    ToggleRoutineHistory,
+    /// ✎ on one of the open routine's wakes, or + on one with none.
+    OpenWakeEditor {
+        index: Option<usize>,
+    },
+    CloseWakeEditor,
+    PickWakeTab(crate::state::WakeTab),
+    /// A typed box of the wake editor, set the way a driver sets a field.
+    SetWakeBox {
+        which: crate::state::WakeBox,
+        text: String,
+    },
+    StepWakeBox {
+        which: crate::state::WakeBox,
+        up: bool,
+    },
+    SetWakePm(bool),
+    SetWakeUnit(crate::state::ScheduleUnit),
+    ToggleWakeDay(u8),
+    ToggleWakeDate(u8),
+    ToggleWakeMonth(u8),
+    /// The wake editor's Save, with the routine's name and instruction as they stand.
+    SaveWake,
+    /// The Bot chip, pressed: the Bot's settings, or its own chat from a routine's thread.
+    PressBotChip,
     /// Run the open recipe on this bot.
     RunOpenRecipe(String),
     SetComputerExecMode {
@@ -808,6 +1070,12 @@ pub enum Command {
     DeleteRoutine {
         routine_id: String,
     },
+    /// Delete, clicked: the question first, as a person's click asks it.
+    AskDeleteRoutine {
+        routine_id: String,
+    },
+    ConfirmRoutineDelete,
+    CancelRoutineDelete,
     /// Settings → Computer: take one of this Mac's standing rules off, named by its command.
     RemoveLocalRule {
         kind: RuleKind,
@@ -835,20 +1103,23 @@ pub enum Command {
         keys: Vec<String>,
         open: bool,
     },
-    /// Settings → Reply source: a choice of the radio, the proxy URL as the field would hold it,
-    /// a model of the person's plan and a key for the proxy, each waiting for Save as on the
-    /// page; and Save.
-    PickReplySourceKind(crate::opengrok::InferenceKind),
-    SetReplySourceUrl(String),
-    PickReplySourceModel(String),
-    /// No model: the kept one is taken away with the next Save.
-    ClearReplySourceModel,
-    SetReplySourceKey(RedactedSecret),
-    /// Remove key, or Keep key to take it back.
-    ToggleRemoveReplySourceKey,
+    /// Settings → Computer's Save, on this computer's card, which keeps this computer's half of the
+    /// relay.
     SaveReplySource,
-    /// The composer's chip: the next turns go through the other door.
-    ToggleTurnSource,
+    /// Send this reply on Server instead: the turn the person's plan could not answer, again, on
+    /// the server's paid keys.
+    SendOnServer,
+    /// A computer's Relay your plan switch, which acts at once: `PATCH /local-exec/daemon/{id}`
+    /// for that computer, and on also points the account's way at the relay once. And opencodex's
+    /// address and key on this computer, each waiting for Save as on its card.
+    SetComputerRelay {
+        machine_id: String,
+        on: bool,
+    },
+    SetRelayAddress(String),
+    SetRelayKey(RedactedSecret),
+    /// Remove key for this computer's opencodex, or Keep key to take it back.
+    ToggleRemoveRelayKey,
     Shutdown,
 }
 
@@ -861,11 +1132,20 @@ impl Command {
             Self::ToggleTheme => state.toggle_theme(cx),
             Self::ToggleAccount => state.toggle_account_settings(cx),
             Self::ToggleAgentSettings => state.toggle_agent_settings(cx),
-            Self::ToggleModelPicker => {
-                let open = !state.model_picker_open;
-                state.set_model_picker_open(open, cx);
+            Self::ToggleModelPicker => state.toggle_picker(PickerFor::Bot, cx),
+            Self::SetModelPicker(open) => state.set_picker_open(PickerFor::Bot, open, cx),
+            Self::ToggleModelList => state.toggle_picker_list(PickerFor::Bot, cx),
+            Self::SetModelSearch(query) => state.set_picker_search(PickerFor::Bot, query, cx),
+            Self::PickModel { source, base_id } => {
+                state.pick_model(PickerFor::Bot, source, &base_id, cx)
             }
-            Self::SetModelPicker(open) => state.set_model_picker_open(open, cx),
+            Self::SetModelFast(on) => state.set_model_fast(PickerFor::Bot, on, cx),
+            Self::SetModelEffort(word) => state.pick_model_effort(PickerFor::Bot, &word, cx),
+            Self::ResetModelPick => state.reset_model_pick(PickerFor::Bot, cx),
+            Self::NewBots(command) => command.apply(PickerFor::NewBots, state, cx),
+            Self::ClearNewBotsDefault => state.clear_new_bots_default(cx),
+            Self::PlanFallback(command) => command.apply(PickerFor::PlanFallback, state, cx),
+            Self::ClearPlanFallback => state.clear_plan_fallback(cx),
             Self::ToggleAvatarEditor => {
                 let open = !state.avatar_editor_open;
                 state.set_avatar_editor_open(open, cx);
@@ -890,6 +1170,7 @@ impl Command {
             Self::RetryTurn => state.retry_turn(cx),
             Self::ToggleComputerPane => state.toggle_computer_pane(cx),
             Self::OpenCoworkerScreen => state.open_coworker_screen(cx),
+            Self::GetComputer => state.ensure_coworker_computer(cx),
             Self::OpenComputerConfirm(action) => state.open_computer_confirm(action, cx),
             Self::ConfirmComputerAction => state.confirm_computer_action(cx),
             Self::CancelComputerConfirm => state.close_computer_confirm(cx),
@@ -981,7 +1262,6 @@ impl Command {
             Self::ToggleAgentTools => state.toggle_agent_tools(cx),
             Self::ToggleAgentUsage => state.toggle_agent_usage(cx),
             Self::SetCeilingTool { name, enabled } => state.switch_ceiling_tool(name, enabled, cx),
-            Self::PickEffort(word) => state.pick_effort(word, cx),
             Self::SaveAgentSettings => state.request_agent_save(cx),
             Self::ToggleAgentSkills => state.toggle_agent_skills(cx),
             Self::SetBotSkill { skill_id, attached } => {
@@ -1034,7 +1314,40 @@ impl Command {
                 }
             }
             Self::OpenRoutineThread { routine_id } => state.open_routine_thread(&routine_id, cx),
-            Self::BackToBotChat => state.back_to_bot_chat(cx),
+            Self::OpenRoutineRun { routine_id, run_id } => {
+                state.open_routine_run(&routine_id, &run_id, cx)
+            }
+            Self::ToggleRoutineHistory => state.toggle_routine_history(cx),
+            Self::OpenWakeEditor { index } => {
+                if let crate::state::ComputerView::Editor { id: Some(open) } =
+                    state.computer_view.clone()
+                {
+                    state.open_wake_editor(&open, index, cx);
+                }
+            }
+            Self::CloseWakeEditor => state.close_wake_editor(cx),
+            Self::PickWakeTab(tab) => state.pick_wake_tab(tab, cx),
+            Self::SetWakeBox { which, text } => state.set_wake_box(which, text, false, cx),
+            Self::StepWakeBox { which, up } => state.step_wake_box(which, up, cx),
+            Self::SetWakePm(pm) => state.set_wake_pm(pm, cx),
+            Self::SetWakeUnit(unit) => state.set_wake_unit(unit, cx),
+            Self::ToggleWakeDay(day) => state.toggle_wake_weekday(day, cx),
+            Self::ToggleWakeDate(date) => state.toggle_wake_date(date, cx),
+            Self::ToggleWakeMonth(month) => state.toggle_wake_month(month, cx),
+            Self::SaveWake => {
+                let fields = state.routine_wake_editor.as_ref().and_then(|editor| {
+                    let bot = state.active_coworker_id.as_deref()?;
+                    state
+                        .coworker_routines(bot)
+                        .iter()
+                        .find(|row| row.id == editor.routine_id)
+                        .map(|row| (row.name.clone(), row.instruction.clone()))
+                });
+                if let Some((name, instruction)) = fields {
+                    state.save_wake(name, instruction, cx);
+                }
+            }
+            Self::PressBotChip => state.press_bot_chip(cx),
             Self::RunOpenRecipe(coworker_id) => state.run_open_recipe(coworker_id, cx),
             Self::SetComputerExecMode { machine_id, mode } => {
                 state.set_computer_exec_mode(machine_id, mode, cx)
@@ -1042,6 +1355,11 @@ impl Command {
             Self::RunRoutineNow { routine_id } => {
                 if let Some(coworker_id) = state.active_coworker_id.clone() {
                     state.run_routine_now(&coworker_id, &routine_id, cx);
+                }
+            }
+            Self::SetRoutineActive { routine_id, active } => {
+                if let Some(coworker_id) = state.active_coworker_id.clone() {
+                    state.set_routine_active(&coworker_id, &routine_id, active, cx);
                 }
             }
             Self::EditRoutine {
@@ -1062,6 +1380,9 @@ impl Command {
                     state.delete_routine(&coworker_id, &routine_id, cx);
                 }
             }
+            Self::AskDeleteRoutine { routine_id } => state.ask_delete_routine(&routine_id, cx),
+            Self::ConfirmRoutineDelete => state.confirm_routine_delete(cx),
+            Self::CancelRoutineDelete => state.cancel_routine_delete(cx),
             Self::RemoveLocalRule { kind, pattern } => state.remove_local_rule(kind, pattern, cx),
             Self::RefreshConnections => state.refresh_connections(cx),
             Self::ConnectService(connector) => state.connect_service(connector, cx),
@@ -1073,15 +1394,74 @@ impl Command {
                 lent,
             } => state.set_connection_lent(connection_id, lent, cx),
             Self::SetStepsOpen { keys, open } => state.set_steps_open(&keys, open, cx),
-            Self::PickReplySourceKind(kind) => state.pick_reply_source_kind(kind, cx),
-            Self::SetReplySourceUrl(url) => state.set_reply_source_url(url, cx),
-            Self::PickReplySourceModel(model) => state.pick_reply_source_model(model, cx),
-            Self::ClearReplySourceModel => state.clear_reply_source_model(cx),
-            Self::ToggleRemoveReplySourceKey => state.toggle_remove_reply_source_key(cx),
-            Self::SetReplySourceKey(key) => state.set_reply_source_key(&key.0, cx),
             Self::SaveReplySource => state.save_reply_source(cx),
-            Self::ToggleTurnSource => state.toggle_turn_source(cx),
+            Self::SendOnServer => state.send_on_server(cx),
+            Self::SetComputerRelay { machine_id, on } => {
+                state.set_computer_relay(machine_id, on, cx)
+            }
+            Self::SetRelayAddress(address) => state.set_relay_address(address, cx),
+            Self::SetRelayKey(key) => state.set_relay_key(&key.0, cx),
+            Self::ToggleRemoveRelayKey => state.toggle_remove_relay_key(cx),
             Self::Shutdown => {}
+        }
+    }
+}
+
+/// One of a picker's changes, as a click on its popover makes it: the Bot's are sent as the
+/// commands above that it has always had, Default for new Bots' as [`Command::NewBots`], and the
+/// Relay-off fallback's as [`Command::PlanFallback`].
+#[derive(Debug, Clone)]
+pub enum PickerCommand {
+    /// The card: the popover opens, or shuts.
+    Toggle,
+    /// The popover opened, or shut.
+    SetOpen(bool),
+    /// The model's name in the popover, which opens the list, or the list's heading back.
+    ToggleList,
+    /// What the list's search box holds, as typing it there would leave it.
+    SetSearch(String),
+    /// A model in the list, by its group and its id.
+    Pick {
+        source: crate::opengrok::InferenceKind,
+        base_id: String,
+    },
+    /// ⚡, on or off.
+    SetFast(bool),
+    /// A level of the effort slider, by the server's word.
+    SetEffort(String),
+    /// ↺: the effort back to `inherit`, and ⚡ off.
+    Reset,
+}
+
+impl PickerCommand {
+    fn apply(self, which: PickerFor, state: &mut AppState, cx: &mut gpui_kit::Context<AppState>) {
+        match self {
+            Self::Toggle => state.toggle_picker(which, cx),
+            Self::SetOpen(open) => state.set_picker_open(which, open, cx),
+            Self::ToggleList => state.toggle_picker_list(which, cx),
+            Self::SetSearch(query) => state.set_picker_search(which, query, cx),
+            Self::Pick { source, base_id } => state.pick_model(which, source, &base_id, cx),
+            Self::SetFast(on) => state.set_model_fast(which, on, cx),
+            Self::SetEffort(word) => state.pick_model_effort(which, &word, cx),
+            Self::Reset => state.reset_model_pick(which, cx),
+        }
+    }
+
+    /// The command this change is sent as for `which` picker.
+    fn sent_to(self, which: PickerFor) -> Command {
+        match which {
+            PickerFor::NewBots => Command::NewBots(self),
+            PickerFor::PlanFallback => Command::PlanFallback(self),
+            PickerFor::Bot => match self {
+                Self::Toggle => Command::ToggleModelPicker,
+                Self::SetOpen(open) => Command::SetModelPicker(open),
+                Self::ToggleList => Command::ToggleModelList,
+                Self::SetSearch(query) => Command::SetModelSearch(query),
+                Self::Pick { source, base_id } => Command::PickModel { source, base_id },
+                Self::SetFast(on) => Command::SetModelFast(on),
+                Self::SetEffort(word) => Command::SetModelEffort(word),
+                Self::Reset => Command::ResetModelPick,
+            },
         }
     }
 }
@@ -1174,8 +1554,9 @@ fn not_editable(target: &str) -> String {
     format!(
         "`{target}` is not editable (composer, login-email, login-password, \
          user-form-field-*, settings-logins-search, settings-skills-search, \
-         settings-login-notes-*, settings-reply-source-url, settings-reply-source-key, or \"\" \
-         for whatever holds the caret)"
+         settings-login-notes-*, settings-relay-addr, settings-relay-key, agent-model-search, \
+         settings-new-bots-search, settings-plan-fallback-search, or \"\" for whatever holds the \
+         caret)"
     )
 }
 
@@ -1185,6 +1566,43 @@ fn not_editable(target: &str) -> String {
 enum LoginField {
     Email,
     Password,
+}
+
+/// Whether a target is one of the Bot's model picker's ids: the card, a part of its popover, or a
+/// heading or a row of its list.
+fn is_picker_part(target: &str) -> bool {
+    model_picker::BOT_IDS.holds(target)
+}
+
+/// The picker whose search box or slider a target is, if it is one.
+fn picker_field(
+    target: &str,
+    field: fn(&model_picker::PickerIds) -> &'static str,
+) -> Option<PickerFor> {
+    [PickerFor::Bot, PickerFor::NewBots, PickerFor::PlanFallback]
+        .into_iter()
+        .find(|which| field(model_picker::ids(*which)) == target)
+}
+
+/// The words a driver is refused in where a picker's slider is not on screen: no model is
+/// picked, or the model on the card lists no levels of effort.
+fn no_slider_refusal(pick: &crate::opengrok::ModelPick, target: &str) -> String {
+    let why = if pick.model.is_some() {
+        format!("{} lists no levels of effort", pick.model_label())
+    } else {
+        "no model is picked".to_string()
+    };
+    format!("`{target}` is not on screen: {why}, so there is no slider")
+}
+
+/// The levels the model on the card lists, by the server's words, low to high, as a refusal names
+/// them.
+fn levels_in_words(pick: &crate::opengrok::ModelPick) -> String {
+    pick.levels()
+        .iter()
+        .map(|level| level.value.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn login_field(target: &str) -> Option<LoginField> {
@@ -1443,8 +1861,49 @@ struct RoutineSnap {
     active: bool,
     webhook_url: Option<String>,
     webhook_key: Option<String>,
-    /// Run history, newest first: run id, what set it off, where it got to.
-    runs: Vec<(String, &'static str, &'static str)>,
+    /// Run history, newest first.
+    runs: Vec<RunLineSnap>,
+    /// What the editor says the server cannot do with this routine (`state::routine_notes`).
+    notes: Vec<(&'static str, &'static str)>,
+    /// The server cannot list this routine's runs, so the history says so in their place.
+    runs_unavailable: bool,
+    /// What the person typed that the server did not keep, line by line.
+    unsaved: Vec<(&'static str, String)>,
+    /// Its wakes, in order: what sets each off in words, and whether it is a webhook.
+    wakes: Vec<(String, bool)>,
+    /// The zone its times are in, where that is not this computer's
+    /// ([`crate::state::RoutineZone::note`]).
+    zone: Option<String>,
+}
+
+/// One line of a routine's Run history as the driver sees it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum RunLineSnap {
+    /// A run, by its id: what set it off, and where it got to.
+    Ran {
+        run_id: String,
+        cause: String,
+        status: &'static str,
+    },
+    /// A firing the server skipped, by when it was due: what set it off, and the server's
+    /// sentence for why.
+    Skipped {
+        at_ms: i64,
+        cause: String,
+        reason: String,
+    },
+}
+
+impl RoutineSnap {
+    /// Test run is dead: the server cannot run a routine on demand.
+    fn run_dead(&self) -> bool {
+        self.notes.iter().any(|(word, _)| *word == "cant-run")
+    }
+
+    /// The routine's fields are dead: the server cannot change it once it is made.
+    fn cant_change(&self) -> bool {
+        self.notes.iter().any(|(word, _)| *word == "cant-change")
+    }
 }
 
 /// The open recipe as the driver needs it: whether Run can be pressed and which bot it plays on,
@@ -1470,7 +1929,10 @@ struct RecipeDetailSnap {
 struct ReplyRunSnap {
     steps: Vec<StepSnap>,
     /// Each Thought row's key, and whether it is open.
-    thoughts: Vec<(String, bool)>,
+    thoughts: Vec<(String, bool, Option<String>)>,
+    /// Its Timing row, from the function that builds the feed's (`steps::timing_row`), while
+    /// the feed draws one.
+    timing: Option<crate::components::steps::RunRow>,
 }
 
 /// One step of that reply.
@@ -1483,16 +1945,29 @@ struct StepSnap {
     /// Its key in `AppState::expanded_steps`, and whether its row is open.
     key: String,
     open: bool,
+    /// How long the call took, as the end of its row says it (`StepSpec::took`), while the row
+    /// says it.
+    took: Option<String>,
 }
 
 impl ReplyRunSnap {
-    fn from_parts(
-        message_id: &str,
-        parts: &[ChatPart],
+    /// `show_timing` is Settings → Show turn timing, which puts each call's time on its row and
+    /// the Timing row under the reply.
+    fn from_message(
+        message: &crate::state::Message,
         open: &std::collections::HashSet<String>,
+        show_timing: bool,
     ) -> Self {
-        let mut run = Self::default();
-        for part in parts {
+        let message_id = message.id.as_str();
+        let mut run = Self {
+            timing: message
+                .run_timing
+                .as_ref()
+                .filter(|_| show_timing)
+                .and_then(|frame| crate::components::steps::timing_row(message_id, frame, open)),
+            ..Self::default()
+        };
+        for part in &message.parts {
             match part {
                 ChatPart::Step(step) => {
                     let key = crate::components::steps::step_key(message_id, &step.call_id);
@@ -1502,11 +1977,16 @@ impl ReplyRunSnap {
                         status: step.status(),
                         open: open.contains(&key),
                         key,
+                        took: show_timing.then(|| step.took()).flatten(),
                     });
                 }
-                ChatPart::Reasoning(_) => {
+                ChatPart::Reasoning(thought) => {
                     let key = crate::components::steps::thought_key(message_id, run.thoughts.len());
-                    run.thoughts.push((key.clone(), open.contains(&key)));
+                    run.thoughts.push((
+                        key.clone(),
+                        open.contains(&key),
+                        show_timing.then(|| thought.took()).flatten(),
+                    ));
                 }
                 _ => {}
             }
@@ -1739,29 +2219,6 @@ fn choice_node(choice: &ChoiceSnap) -> UiNode {
         choice_dismiss_id(&choice.message_id),
         "Dismiss",
     ))
-}
-
-/// `agent-effort` (a menu; value = the word it shows, state `unsaved` while that is a pick Save
-/// has not sent), with one `agent-effort-{word}` per choice it offers (label as the menu reads
-/// it, state `selected` on the one shown). All of it is disabled from a server that keeps no
-/// effort, where the menu is dead.
-fn agent_effort_node(effort: &crate::state::EffortControl) -> UiNode {
-    let live = effort.kept.is_some();
-    let mut menu = UiNode::new("agent-effort", "menu", "Effort")
-        .with_value(effort.shown.clone())
-        .with_enabled(live);
-    if effort.unsaved() {
-        menu.states.push("unsaved".into());
-    }
-    for word in effort_choices(effort.kept_word()) {
-        let mut choice =
-            UiNode::button(format!("agent-effort-{word}"), effort_label(&word)).with_enabled(live);
-        if word == effort.shown {
-            choice.states.push("selected".into());
-        }
-        menu = menu.with_child(choice);
-    }
-    menu
 }
 
 /// The open Bot's Tools card as its settings draw it: what the next turn is offered, and the
@@ -2001,7 +2458,8 @@ fn computer_handoff_node(handoff: &ComputerHandoffSnap) -> UiNode {
 ///
 /// A routine is one schedule, so the trigger says what kind it is and carries the one fact
 /// worth asserting on: the cron line the server keeps, or the URL it minted.
-fn routine_snap(routine: &crate::state::AgentRoutine) -> RoutineSnap {
+fn routine_snap(routine: &crate::state::AgentRoutine, state: &AppState) -> RoutineSnap {
+    let on_the_server = routine.saved.is_some();
     let mut snap = RoutineSnap {
         id: routine.id.clone(),
         name: if routine.name.trim().is_empty() {
@@ -2017,17 +2475,43 @@ fn routine_snap(routine: &crate::state::AgentRoutine) -> RoutineSnap {
         runs: routine
             .runs
             .iter()
-            .map(|run| {
-                let status = match run.status {
-                    crate::opengrok::ScheduleRunStatus::Running => "running",
-                    crate::opengrok::ScheduleRunStatus::Waiting => "waiting",
-                    crate::opengrok::ScheduleRunStatus::Ok => "ok",
-                    crate::opengrok::ScheduleRunStatus::Error => "error",
-                    crate::opengrok::ScheduleRunStatus::Other => "other",
-                };
-                (run.run_id.clone(), run.cause_label(), status)
+            .map(|run| match &run.outcome {
+                crate::state::RunOutcome::Ran { run_id, status } => RunLineSnap::Ran {
+                    run_id: run_id.clone(),
+                    cause: run.cause_label(),
+                    status: match status {
+                        crate::opengrok::ScheduleRunStatus::Running => "running",
+                        crate::opengrok::ScheduleRunStatus::Waiting => "waiting",
+                        crate::opengrok::ScheduleRunStatus::Ok => "ok",
+                        crate::opengrok::ScheduleRunStatus::Error => "error",
+                        crate::opengrok::ScheduleRunStatus::Other => "other",
+                    },
+                },
+                crate::state::RunOutcome::Skipped { reason } => RunLineSnap::Skipped {
+                    at_ms: run.started_at_ms,
+                    cause: run.cause_label(),
+                    reason: reason.clone(),
+                },
             })
             .collect(),
+        notes: crate::state::routine_notes(state.routine_routes_missing, on_the_server),
+        runs_unavailable: on_the_server && state.routine_routes_missing.runs,
+        unsaved: state
+            .routine_unsaved
+            .get(&routine.id)
+            .map(crate::state::unsaved_lines)
+            .unwrap_or_default(),
+        wakes: routine
+            .triggers
+            .iter()
+            .map(|trigger| {
+                (
+                    trigger.label(),
+                    matches!(trigger, crate::state::RoutineTrigger::Webhook { .. }),
+                )
+            })
+            .collect(),
+        zone: state.routine_zone(routine).note().map(str::to_string),
     };
     match routine.triggers.first() {
         Some(crate::state::RoutineTrigger::Schedule { spec, .. }) => {
@@ -2044,6 +2528,224 @@ fn routine_snap(routine: &crate::state::AgentRoutine) -> RoutineSnap {
     snap
 }
 
+/// The open routine's four header icons, as the panel draws them: each enabled while it can
+/// act, with the reason as the value of one that cannot.
+fn routine_header_nodes(routine: &RoutineSnap, history_open: bool) -> Vec<UiNode> {
+    let on_the_server = routine.kind != "draft";
+    let mut history = UiNode::button(
+        ids::ROUTINE_HISTORY_TOGGLE,
+        if history_open {
+            "Back to the routine"
+        } else {
+            "Run history"
+        },
+    );
+    if history_open {
+        history.states.push("selected".into());
+    }
+    let mut thread =
+        UiNode::button(ids::ROUTINE_OPEN_THREAD, "Open in thread").with_enabled(on_the_server);
+    if !on_the_server {
+        thread = thread.with_value("Choose when it runs first: its thread is on the server");
+    }
+    let mut run = UiNode::button(ids::ROUTINE_RUN_NOW, "Run it now")
+        .with_enabled(on_the_server && !routine.run_dead());
+    if routine.run_dead() {
+        run = run.with_value(crate::state::ROUTINE_RUN_UNAVAILABLE);
+    } else if !on_the_server {
+        run = run.with_value("Choose when it runs first, then run it");
+    }
+    vec![
+        history,
+        thread,
+        run,
+        UiNode::button(ids::ROUTINE_DELETE, "Delete"),
+    ]
+}
+
+/// "When to run" on the open routine: +, a node per wake with its ✎ and 🗑, and the wake editor
+/// while it is open, each enabled while a click would act and with the reason as the value of
+/// one that would not.
+fn routine_wake_nodes(
+    open: &RoutineSnap,
+    editor: Option<&(crate::state::WakeEditor, crate::state::WakeStatus)>,
+) -> Vec<UiNode> {
+    use crate::state::{LAST_WAKE_STAYS, ONE_WAKE_PER_ROUTINE, ROUTINE_EDIT_UNAVAILABLE};
+    let can_add = open.wakes.is_empty();
+    let mut add = UiNode::button(ids::ROUTINE_WAKE_ADD, "Add a schedule")
+        .with_enabled(can_add && editor.is_none());
+    if !can_add {
+        add = add.with_value(ONE_WAKE_PER_ROUTINE);
+    }
+    let mut nodes = vec![add];
+    for (at, (summary, webhook)) in open.wakes.iter().enumerate() {
+        let can_edit = *webhook || !open.cant_change();
+        let mut edit = UiNode::button(ids::routine_wake_edit(at), "Edit").with_enabled(can_edit);
+        if !can_edit {
+            edit = edit.with_value(ROUTINE_EDIT_UNAVAILABLE);
+        }
+        let mut wake = UiNode::status(ids::routine_wake(at), summary.clone())
+            .with_child(edit)
+            .with_child(
+                UiNode::button(ids::routine_wake_delete(at), "Delete")
+                    .with_enabled(false)
+                    .with_value(LAST_WAKE_STAYS),
+            );
+        if let Some(zone) = open.zone.as_ref().filter(|_| !*webhook) {
+            wake = wake.with_child(UiNode::status(ids::routine_wake_zone(at), zone.clone()));
+        }
+        nodes.push(wake);
+    }
+    if let Some((editor, status)) = editor {
+        nodes.push(wake_editor_node(editor, status));
+    }
+    nodes
+}
+
+/// The wake editor as the panel draws it: the tabs, what the open tab picks with, and under
+/// them what was picked, when it would next run or why it cannot be saved, and the two buttons.
+fn wake_editor_node(
+    editor: &crate::state::WakeEditor,
+    status: &crate::state::WakeStatus,
+) -> UiNode {
+    use crate::state::{WakeBox, WakeTab};
+    let mut node =
+        UiNode::dialog(ids::ROUTINE_WAKE_EDITOR, "When to run").with_value(editor.tab.word());
+    for tab in WakeTab::ALL {
+        let mut button = UiNode::button(ids::routine_wake_tab(tab), tab.label())
+            .with_enabled(editor.tab_open(tab));
+        if editor.tab == tab {
+            button.states.push("selected".into());
+        }
+        node = node.with_child(button);
+    }
+    let typed = |which: WakeBox, label: &str, value: &str| {
+        UiNode::textbox(ids::routine_wake_box(which), label).with_value(value)
+    };
+    let steppers = |which: WakeBox| {
+        [true, false].map(|up| {
+            UiNode::button(
+                format!(
+                    "{}-{}",
+                    ids::routine_wake_box(which),
+                    if up { "up" } else { "down" }
+                ),
+                if up { "Up" } else { "Down" },
+            )
+        })
+    };
+    let chip =
+        |id: String, label: String, on: bool| UiNode::new(id, "checkbox", label).with_checked(on);
+    let time_tab = matches!(
+        editor.tab,
+        WakeTab::Daily | WakeTab::Weekly | WakeTab::Monthly
+    );
+    match editor.tab {
+        WakeTab::Every => {
+            node = node.with_child(typed(WakeBox::Every, "Every", &editor.every));
+            for stepper in steppers(WakeBox::Every) {
+                node = node.with_child(stepper);
+            }
+            for unit in [
+                crate::state::ScheduleUnit::Minutes,
+                crate::state::ScheduleUnit::Hours,
+                crate::state::ScheduleUnit::Days,
+            ] {
+                let mut button = UiNode::button(ids::routine_wake_unit(unit), format!("{unit:?}"));
+                if editor.spec.unit == unit {
+                    button.states.push("selected".into());
+                }
+                node = node.with_child(button);
+            }
+        }
+        WakeTab::Weekly => {
+            for day in 0u8..7 {
+                node = node.with_child(chip(
+                    ids::routine_wake_day(day),
+                    crate::cron_spec::WEEKDAYS[usize::from(day)].to_string(),
+                    editor.spec.weekdays.contains(&day),
+                ));
+            }
+        }
+        WakeTab::Monthly => {
+            for date in 1u8..=31 {
+                node = node.with_child(chip(
+                    ids::routine_wake_date(date),
+                    date.to_string(),
+                    editor.spec.month_days.contains(&date),
+                ));
+            }
+        }
+        WakeTab::Cron => {
+            node = node.with_child(typed(WakeBox::Cron, "Cron line", &editor.spec.expr));
+            if status.numbered_weekdays {
+                node = node.with_child(UiNode::status(
+                    ids::ROUTINE_WAKE_CRON_NOTE,
+                    crate::state::NUMBERED_WEEKDAYS,
+                ));
+            }
+        }
+        WakeTab::Daily | WakeTab::Webhook => {}
+    }
+    if time_tab {
+        node = node.with_child(typed(WakeBox::Hour, "Hour", &editor.hour));
+        for stepper in steppers(WakeBox::Hour) {
+            node = node.with_child(stepper);
+        }
+        node = node.with_child(typed(WakeBox::Minute, "Minute", &editor.minute));
+        for stepper in steppers(WakeBox::Minute) {
+            node = node.with_child(stepper);
+        }
+        for (id, label, pm) in [
+            (ids::ROUTINE_WAKE_AM, "AM", false),
+            (ids::ROUTINE_WAKE_PM, "PM", true),
+        ] {
+            let mut button = UiNode::button(id, label);
+            if editor.pm == pm {
+                button.states.push("selected".into());
+            }
+            node = node.with_child(button);
+        }
+        for month in 1u8..=12 {
+            node = node.with_child(chip(
+                ids::routine_wake_month(month),
+                crate::cron_spec::MONTHS[usize::from(month) - 1].to_string(),
+                editor.spec.months.contains(&month),
+            ));
+        }
+    }
+    node = node.with_child(UiNode::status(
+        ids::ROUTINE_WAKE_SUMMARY,
+        status.summary.clone(),
+    ));
+    if let Some(zone) = editor
+        .zone
+        .note()
+        .filter(|_| editor.tab != WakeTab::Webhook)
+    {
+        node = node.with_child(
+            UiNode::status(
+                ids::ROUTINE_WAKE_ZONE,
+                crate::components::computer::zone_words(zone),
+            )
+            .with_value(zone),
+        );
+    }
+    if let Some(next) = &status.next {
+        node = node.with_child(UiNode::status(ids::ROUTINE_WAKE_NEXT, next.clone()));
+    }
+    if let Some(error) = &status.error {
+        node = node.with_child(UiNode::status(ids::ROUTINE_WAKE_ERROR, error.clone()));
+    }
+    let done = if editor.kind == Some(crate::opengrok::ScheduleKind::Webhook) {
+        "Done"
+    } else {
+        "Save"
+    };
+    node.with_child(UiNode::button(ids::ROUTINE_WAKE_SAVE, done).with_enabled(status.can_save()))
+        .with_child(UiNode::button(ids::ROUTINE_WAKE_CANCEL, "Cancel"))
+}
+
 /// The routine's row and everything reachable from it.
 ///
 /// The two triggers are here only while the routine has none, and the webhook's three only
@@ -2057,6 +2759,14 @@ fn routine_node(routine: &RoutineSnap) -> UiNode {
     if let Some(cron) = &routine.cron {
         node = node.with_value(cron.clone());
     }
+    node = node.with_child(
+        UiNode::new(
+            ids::routine_active(&routine.id),
+            "switch",
+            if routine.active { "Active" } else { "Paused" },
+        )
+        .with_checked(routine.active),
+    );
     if routine.kind == "draft" {
         node = node
             .with_child(UiNode::button(
@@ -2088,17 +2798,56 @@ fn routine_node(routine: &RoutineSnap) -> UiNode {
     }
     if routine.kind != "draft" {
         node = node
-            .with_child(UiNode::button(ids::routine_test(&routine.id), "Test run"))
+            .with_child(
+                UiNode::button(ids::routine_test(&routine.id), "Test run")
+                    .with_enabled(!routine.run_dead()),
+            )
             .with_child(UiNode::button(
                 ids::routine_thread(&routine.id),
                 "Open thread",
             ));
     }
-    for (run_id, cause, status) in &routine.runs {
+    for (word, words) in &routine.notes {
+        node = node.with_child(UiNode::status(ids::routine_note(&routine.id, word), *words));
+    }
+    if !routine.unsaved.is_empty() {
         node = node.with_child(
-            UiNode::status(ids::routine_run(&routine.id, run_id), *cause)
-                .with_value(status.to_string()),
+            UiNode::status(ids::routine_unsaved(&routine.id), "Not saved").with_value(
+                routine
+                    .unsaved
+                    .iter()
+                    .map(|(label, value)| format!("{label}: {value}"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            ),
         );
+    }
+    if routine.runs_unavailable {
+        node = node.with_child(UiNode::status(
+            ids::routine_runs_unavailable(&routine.id),
+            crate::state::ROUTINE_RUNS_UNAVAILABLE,
+        ));
+    }
+    for line in &routine.runs {
+        node = node.with_child(match line {
+            RunLineSnap::Ran {
+                run_id,
+                cause,
+                status,
+            } => UiNode::status(ids::routine_run(&routine.id, run_id), cause.clone())
+                .with_value(status.to_string()),
+            RunLineSnap::Skipped {
+                at_ms,
+                cause,
+                reason,
+            } => {
+                let mut skipped =
+                    UiNode::status(ids::routine_skipped(&routine.id, *at_ms), cause.clone())
+                        .with_value(reason.clone());
+                skipped.states.push("skipped".into());
+                skipped
+            }
+        });
     }
     node.with_child(UiNode::button(ids::routine_delete(&routine.id), "Delete"))
 }
@@ -2398,21 +3147,30 @@ fn invoke_arg_str(args: &serde_json::Value, keys: &[&str]) -> Option<String> {
     })
 }
 
-/// Settings → Reply source as the page draws it. The typed key is not copied here: the tree says
-/// only that one is waiting for Save, never what it is.
+/// The id Settings → Relay's tab had, which answers nothing now and says where the relay moved.
+const RETIRED_RELAY_TAB: &str = "settings-tab-reply-source";
+
+/// The state on a reply's badge while the door is the person's plan through their computer, so an
+/// assert need not match the words. A driver's word, kept as it was when the app said "Mac".
+const VIA_MAC: &str = "via-mac";
+
+/// This computer's card's opencodex fields as the card draws them, and General's two pickers'
+/// kept settings. The typed key is not copied here: the tree says only that one is waiting for
+/// Save, never what it is.
 #[derive(Default)]
 struct ReplySourceSnap {
-    /// The page's settings, with no key in them.
+    /// The setting and what the card has changed of it, with no key in them.
     settings: crate::state::ReplySourceSettings,
-    key_typed: bool,
     unsaved: bool,
     can_save: bool,
-    /// The models of the person's plan the picker offers.
-    models: Vec<String>,
-    /// What the health line says (`AppState::proxy_health`).
-    health: Option<crate::state::ProxyHealth>,
     /// The line beside Save (`AppState::reply_source_hint`).
     hint: Option<&'static str>,
+    /// This computer's opencodex address and key as the card draws them, without the typed key.
+    relay: RelaySnap,
+    /// Default for new Bots: whether the server keeps one, and what.
+    new_bots: crate::state::DefaultForNewBots,
+    /// The Relay-off fallback: whether the server keeps one, and what.
+    plan_fallback: crate::state::RelayOffFallback,
 }
 
 impl ReplySourceSnap {
@@ -2420,14 +3178,31 @@ impl ReplySourceSnap {
         let settings = &state.reply_source;
         Self {
             settings: settings.without_key(),
-            key_typed: settings.key_draft.is_some(),
             unsaved: settings.is_unsaved(),
             can_save: state.reply_source_can_save(),
-            models: state.subscription_models(),
-            health: state.proxy_health(),
             hint: state.reply_source_hint(),
+            relay: RelaySnap {
+                address: settings
+                    .relay_address_draft
+                    .clone()
+                    .unwrap_or_else(|| state.relay_mac.shown_address()),
+                has_key: state.relay_mac.has_key,
+                key_typed: settings.relay_key_draft.is_some(),
+            },
+            new_bots: state.default_for_new_bots(),
+            plan_fallback: state.relay_off_fallback(),
         }
     }
+}
+
+/// This computer's opencodex fields as its card draws them. The key is never here: the tree says
+/// only that the Keychain holds one, or that one waits for Save.
+#[derive(Default)]
+struct RelaySnap {
+    /// opencodex's address as the field shows it.
+    address: String,
+    has_key: bool,
+    key_typed: bool,
 }
 
 /// `Default` is the host with nothing in it — signed out, no sessions, no panel. Typing ops
@@ -2436,6 +3211,7 @@ impl ReplySourceSnap {
 #[derive(Default)]
 pub struct NativeChatHost {
     ready: bool,
+    sidebar_hidden: bool,
     theme_mode: String,
     sessions: Vec<SessionSnap>,
     account_open: bool,
@@ -2446,6 +3222,8 @@ pub struct NativeChatHost {
     login_email: String,
     login_password: String,
     last_assistant: String,
+    /// The transcript keeps its newest row in view, as the transcript published it.
+    transcript_following: bool,
     /// The steps and thoughts of that same reply.
     reply_run: ReplyRunSnap,
     /// The open thread's working line, which is that thread's own: it is kept per thread, like
@@ -2471,15 +3249,17 @@ pub struct NativeChatHost {
     agent_usage: Option<crate::state::UsageReport>,
     agent_usage_open: bool,
     agent_tools_open: bool,
-    /// The open bot's Effort menu, as its settings draw it.
-    agent_effort: Option<crate::state::EffortControl>,
-    model_picker_open: bool,
     avatar_editor_open: bool,
     approvals: Vec<ApprovalSnap>,
     computer_open: bool,
     /// The coworker's computer as the pane sees it: "<state>; screen: yes|no",
     /// "endpoint missing", or "unknown".
     computer_status: String,
+    /// Why the server could not give the open bot a computer, as the pane shows it in place of
+    /// "No computer yet", and the server's code for it.
+    computer_error: Option<(String, String)>,
+    /// Get a computer is with the server for the open bot.
+    computer_asking: bool,
     computer_update_label: String,
     computer_reset_label: String,
     /// The confirm dialog's question, when it is open.
@@ -2498,13 +3278,34 @@ pub struct NativeChatHost {
     signed_out: Option<String>,
     /// The open thread's last turn did not go through, and the feed is offering it again.
     can_retry_turn: bool,
-    /// How many routes the Model field can offer, and the server's note about why that is not
-    /// more — which is the sentence the person read under the field while the gateway was down.
-    model_count: usize,
-    model_note: Option<String>,
-    /// Replies go through the person's own plan, whose model answers rather than the Bot's pin:
-    /// the line under the Model field says so (`AppState::replies_on_plan`).
+    /// The open thread's last turn is one the person's plan could not answer, and the feed offers
+    /// it again on the server's keys.
+    can_send_on_server: bool,
+    /// The open thread's held messages the server holds for the person's Mac, by bubble id.
+    waiting_for_mac: Vec<String>,
+    /// The open Bot's replies go through the person's own plan, which the server meters none of:
+    /// the Usage card says so (`AppState::replies_on_plan`).
     replies_on_plan: bool,
+    /// The open Bot's model picker, as both of its places draw it (`AppState::model_pick`).
+    model_pick: Option<crate::opengrok::ModelPick>,
+    /// Its popover: open or shut, its list or its controls, its search and its window.
+    model_picker: PickerView,
+    /// The server's words for the picker's last change that did not go through.
+    picker_note: Option<String>,
+    /// Default for new Bots' picker, while the server keeps such a default
+    /// (`AppState::new_bots_pick`), its popover, what its last change that did not go as asked
+    /// came to, and whether a change is with the server.
+    new_bots_pick: Option<crate::opengrok::ModelPick>,
+    new_bots_picker: PickerView,
+    new_bots_note: Option<String>,
+    new_bots_busy: bool,
+    /// The same of the Relay-off fallback's picker (`AppState::plan_fallback_pick`).
+    plan_fallback_pick: Option<crate::opengrok::ModelPick>,
+    plan_fallback_picker: PickerView,
+    plan_fallback_note: Option<String>,
+    plan_fallback_busy: bool,
+    /// `GET /models`' word on why its list is not fuller, which the popover's list shows.
+    model_note: Option<String>,
     /// The Recipes page, when it fills the main slot: its rows, and the recipe open in it.
     recipes_open: bool,
     recipes_filter: &'static str,
@@ -2512,13 +3313,25 @@ pub struct NativeChatHost {
     recipe_open: Option<String>,
     /// The open recipe's Run and what it has run, when its detail has come back.
     recipe_detail: Option<RecipeDetailSnap>,
-    /// Settings → Computer's connected computers: id, name, mode, and whether it is this Mac.
-    computers: Vec<(String, String, crate::opengrok::LocalExecMode, bool)>,
+    /// Settings → Computer's cards, one to each enrolled computer, as the window draws them.
+    computers: Vec<ComputerCard>,
     /// The open bot's routines, as the Computer pane lists them.
     routines: Vec<RoutineSnap>,
+    /// The red line of the routine editor, while one is open and shows one.
+    routine_error: Option<String>,
+    /// The routine open in the Computer pane, by id.
+    routine_editor: Option<String>,
+    /// The open routine's panel shows its Run history in place of its fields.
+    routine_history_open: bool,
+    /// The question Delete is asking about a routine: its title and what deleting it does.
+    routine_delete_question: Option<(String, String)>,
+    /// The wake editor while it is open, and what it says under what is picked.
+    routine_wake_editor: Option<(crate::state::WakeEditor, crate::state::WakeStatus)>,
     /// The open thread's routine, when it is one of the bot's routines' threads: its name and
     /// the server's word for what fires it.
     routine_thread: Option<(String, String)>,
+    /// A press of the Bot chip goes back to the Bot's own chat (`AppState::bot_chip_goes_home`).
+    bot_chip_goes_home: bool,
     /// How many of the open routine thread's bubbles carry a routine's instruction caption.
     routine_instructions: usize,
     /// The composer's panel, when one is open: which list it is, and the rows in it.
@@ -2595,16 +3408,19 @@ pub struct NativeChatHost {
     /// This Mac's standing rules, where Settings → Computer draws them: see
     /// [`AppState::this_mac_rules`]. `None` where it draws none.
     local_rules: Option<LocalRules>,
+    /// Why local-exec stopped by itself, in the words Settings → Computer shows:
+    /// [`AppState::local_exec_stopped`].
+    local_exec_stopped: Option<String>,
     /// The person's connections and the services on offer, as Settings → Connections and the
     /// open bot's Connections card draw them (#2). Bot names come from `sessions`, which is the
     /// roster while signed in.
     connections: crate::state::AccountConnections,
     connections_tab: bool,
-    /// Settings → Reply source as the page draws it, without the typed key.
+    /// This computer's relay fields on Settings → Computer, and General's two kept settings, as
+    /// the window draws them, without the typed key.
     reply_source: ReplySourceSnap,
-    reply_source_tab: bool,
-    /// The composer's chip, while there is a choice of door to make.
-    turn_source: Option<crate::state::TurnSourceChip>,
+    /// Settings is on General, whose first section is Default models.
+    general_tab: bool,
     /// The badges on the open thread's replies, oldest first: (message id, source).
     reply_sources: Vec<(String, crate::opengrok::ReplySource)>,
     pending: Option<Command>,
@@ -2648,6 +3464,7 @@ impl NativeChatHost {
         Self {
             ready: true,
             theme_mode: state.theme_mode.clone(),
+            sidebar_hidden: state.sidebar_hidden,
             sessions,
             account_open: state.is_app_settings_open,
             voice_open: state.is_voice_mode_open,
@@ -2667,12 +3484,15 @@ impl NativeChatHost {
                 .and_then(|c| c.messages.iter().rev().find(|m| !m.is_me && !m.hidden))
                 .map(|m| m.content.clone())
                 .unwrap_or_default(),
+            transcript_following: state.transcript_following,
             reply_run: state
                 .conversations
                 .iter()
                 .find(|c| Some(&c.id) == state.active_conversation_id.as_ref())
                 .and_then(|c| c.messages.iter().rev().find(|m| !m.is_me && !m.hidden))
-                .map(|m| ReplyRunSnap::from_parts(&m.id, &m.parts, &state.expanded_steps))
+                .map(|m| {
+                    ReplyRunSnap::from_message(m, &state.expanded_steps, state.show_turn_timing)
+                })
                 .unwrap_or_default(),
             bot_status: state.visible_bot_status(),
             turn_in_flight: state.is_turn_in_flight(),
@@ -2693,8 +3513,6 @@ impl NativeChatHost {
                 .as_ref()
                 .filter(|(owner, _)| state.active_coworker_id.as_deref() == Some(owner.as_str()))
                 .map(|(_, report)| report.clone()),
-            agent_effort: state.effort_control(),
-            model_picker_open: state.model_picker_open,
             avatar_editor_open: state.avatar_editor_open,
             approvals: state
                 .open_approvals()
@@ -2755,15 +3573,23 @@ impl NativeChatHost {
                 .session_banner()
                 .map(|(title, detail)| format!("{title} — {detail}")),
             can_retry_turn: state.retryable_turn().is_some(),
-            // What the Bot's Model field offers: the gateway's routes, not the person's plan's.
-            model_count: state
-                .model_catalogue
-                .models
-                .iter()
-                .filter(|entry| entry.source() == Some(crate::opengrok::InferenceKind::Gateway))
-                .count(),
-            model_note: state.model_catalogue.note.clone(),
+            can_send_on_server: state.plan_failed_turn().is_some(),
+            waiting_for_mac: state.sends_waiting_for_mac(),
             replies_on_plan: state.replies_on_plan(),
+            model_pick: state.model_pick(),
+            model_picker: state.model_picker.clone(),
+            picker_note: state.picker_note(PickerFor::Bot).map(str::to_string),
+            new_bots_pick: state.new_bots_pick(),
+            new_bots_picker: state.new_bots_picker.clone(),
+            new_bots_note: state.picker_note(PickerFor::NewBots).map(str::to_string),
+            new_bots_busy: state.picker_busy(PickerFor::NewBots),
+            plan_fallback_pick: state.plan_fallback_pick(),
+            plan_fallback_picker: state.plan_fallback_picker.clone(),
+            plan_fallback_note: state
+                .picker_note(PickerFor::PlanFallback)
+                .map(str::to_string),
+            plan_fallback_busy: state.picker_busy(PickerFor::PlanFallback),
+            model_note: state.model_catalogue.note.clone(),
             computer_status: if state.computer_endpoint_missing {
                 "endpoint missing".to_string()
             } else {
@@ -2783,6 +3609,19 @@ impl NativeChatHost {
                     })
                     .unwrap_or_else(|| "unknown".to_string())
             },
+            // Read the way the pane reads it (`ComputerControls::from_state`), so the tree says
+            // what the pane says.
+            computer_error: state
+                .coworker_computer
+                .as_ref()
+                .and_then(crate::opengrok::CoworkerComputer::why_no_computer)
+                .map(|error| {
+                    (
+                        crate::components::computer::no_computer_line(error),
+                        error.code.clone(),
+                    )
+                }),
+            computer_asking: state.asking_for_computer(),
             recipes_open: state.page == crate::state::MainPage::Recipes,
             recipes_filter: state.recipes_filter.query(),
             recipes: state
@@ -2836,18 +3675,7 @@ impl NativeChatHost {
                         .collect(),
                 }
             }),
-            computers: state
-                .computers
-                .iter()
-                .map(|c| {
-                    (
-                        c.machine_id.clone(),
-                        c.label.clone(),
-                        c.mode,
-                        c.this_machine,
-                    )
-                })
-                .collect(),
+            computers: computers::cards(state),
             routine_instructions: state
                 .active_conversation_id
                 .as_ref()
@@ -2861,6 +3689,40 @@ impl NativeChatHost {
                         })
                         .count()
                 }),
+            bot_chip_goes_home: state.bot_chip_goes_home(),
+            routine_editor: match (&state.computer_view, state.right_pane) {
+                (
+                    crate::state::ComputerView::Editor { id: Some(open) },
+                    crate::state::RightPane::Computer,
+                ) => Some(open.clone()),
+                _ => None,
+            },
+            routine_history_open: state.routine_history_open,
+            routine_delete_question: state
+                .routine_delete_question()
+                .map(|(title, what)| (title, what.to_string())),
+            routine_wake_editor: state.routine_wake_editor.clone().map(|editor| {
+                let status = editor.status(chrono::Utc::now());
+                (editor, status)
+            }),
+            routine_error: match (&state.computer_view, state.right_pane) {
+                (
+                    crate::state::ComputerView::Editor { id: Some(open) },
+                    crate::state::RightPane::Computer,
+                ) => {
+                    let on_the_server = state.active_coworker_id.as_deref().is_some_and(|bot| {
+                        state
+                            .coworker_routines(bot)
+                            .iter()
+                            .any(|routine| &routine.id == open && routine.saved.is_some())
+                    });
+                    crate::state::routine_trouble_line(
+                        state.computer_action_error.as_deref(),
+                        &crate::state::routine_notes(state.routine_routes_missing, on_the_server),
+                    )
+                }
+                _ => None,
+            },
             routine_thread: state
                 .active_thread_origin()
                 .map(|origin| (origin.routine_name.clone(), origin.word.clone())),
@@ -2870,7 +3732,7 @@ impl NativeChatHost {
                 .map(|id| state.coworker_routines(id))
                 .unwrap_or_default()
                 .iter()
-                .map(routine_snap)
+                .map(|routine| routine_snap(routine, state))
                 .collect(),
             composer_panel: state.composer_panel,
             composer_chips: state.composer_chips.clone(),
@@ -3122,10 +3984,13 @@ impl NativeChatHost {
             .flatten(),
             network_policy_open: state.network_policy_open,
             local_rules: state.this_mac_rules().cloned(),
+            local_exec_stopped: state
+                .local_exec_stopped
+                .as_ref()
+                .map(crate::opengrok::LocalExecStopped::sentence),
             connections: state.connections.clone(),
             reply_source: ReplySourceSnap::from_state(state),
-            reply_source_tab: state.app_settings_tab == AppSettingsTab::ReplySource,
-            turn_source: state.composer_turn_source(),
+            general_tab: state.app_settings_tab == AppSettingsTab::General,
             reply_sources: crate::components::chat::reply_badges(state),
             connections_tab: state.app_settings_tab == AppSettingsTab::Connections,
             pending: None,
@@ -3180,6 +4045,15 @@ impl NativeChatHost {
                 ready: self.ready,
                 nodes: vec![
                     UiNode::window(ids::WINDOW, "NativeChat")
+                        .with_child(if self.sidebar_hidden {
+                            UiNode::button(ids::HEADER_LEFT_SIDEBAR, "Show sidebar")
+                        } else {
+                            self.sidebar_toggle_node()
+                        })
+                        .with_child(UiNode::button(
+                            ids::HEADER_RIGHT_SIDEBAR,
+                            "Toggle Bot details",
+                        ))
                         .with_child(UiNode::button(ids::NAV_NEW_CHAT, "New Bot"))
                         .with_child(empty),
                 ],
@@ -3211,7 +4085,7 @@ impl NativeChatHost {
 
         let sidebar =
             UiNode::navigation(ids::SIDEBAR, "Sidebar")
-                .with_child(UiNode::button(ids::NAV_TOGGLE, "Toggle sidebar"))
+                .with_child(self.sidebar_toggle_node())
                 .with_child(UiNode::button(ids::NAV_NEW_CHAT, "New Bot"))
                 .with_child(UiNode::button(ids::NAV_SEARCH, "Search"))
                 .with_child(UiNode::button(ids::NAV_LIBRARY, "Library"))
@@ -3241,7 +4115,33 @@ impl NativeChatHost {
                 } else {
                     self.last_assistant.chars().take(400).collect()
                 },
+            ))
+            .with_child(UiNode::scroll(ids::TRANSCRIPT, "Transcript").with_value(
+                if self.transcript_following {
+                    "following"
+                } else {
+                    "detached"
+                },
             ));
+        if self.signed_in {
+            if self.sidebar_hidden {
+                page = page.with_child(UiNode::button(ids::HEADER_LEFT_SIDEBAR, "Show sidebar"));
+            }
+            page = page.with_child(UiNode::button(
+                ids::HEADER_RIGHT_SIDEBAR,
+                "Toggle right sidebar",
+            ));
+            if self.sessions.iter().any(|session| session.active) {
+                page = page.with_child(UiNode::button(ids::HEADER_MONITOR, "Toggle computer pane"));
+            }
+            if let Some(bot) = self.sessions.iter().find(|session| session.active) {
+                let mut chip = UiNode::button(ids::HEADER_COWORKER, bot.title.clone());
+                if self.bot_chip_goes_home {
+                    chip.states.push("goes-home".into());
+                }
+                page = page.with_child(chip);
+            }
+        }
         if let Some(status) = &self.bot_status {
             page = page.with_child(UiNode::new("bot-status", "status", status.clone()));
         }
@@ -3254,29 +4154,23 @@ impl NativeChatHost {
         for node in self.reply_run_nodes() {
             page = page.with_child(node);
         }
-        // Which door the next turns go through, while there is a choice to make: label as the
-        // chip reads, value the door's wire word, state `picked` while it is the person's pick
-        // and not the account's own door.
-        if let Some(chip) = &self.turn_source {
-            let mut node = UiNode::button(
-                ids::COMPOSER_REPLY_SOURCE,
-                reply_source::chip_label(chip.kind),
-            )
-            .with_value(chip.kind.word());
-            if chip.picked {
-                node.states.push("picked".into());
-            }
-            page = page.with_child(node);
-        }
         // Each reply's badge, as the feed draws it: label as it reads, value the door's wire
-        // word, and under it the model the server named, which the badge shows on hover: words
-        // the window draws, so a node of their own rather than a state.
+        // word, state `via-mac` on a reply the person's Mac answered, and under it the model the
+        // server named, which the badge shows on hover: words the window draws, so a node of
+        // their own rather than a state.
         for (message_id, source) in &self.reply_sources {
             let mut node = UiNode::status(
                 ids::reply_badge(message_id),
-                reply_source::badge_label(source.kind),
+                reply_source::badge_words(source),
             )
             .with_value(source.kind.word());
+            if source.via == Some(crate::opengrok::Via::Mac) {
+                node.states.push(VIA_MAC.into());
+            }
+            // The server's keys answered a Bot on the person's plan because the relay is off.
+            if source.relay_off() {
+                node.states.push("relay-off".into());
+            }
             if let Some(model) = &source.model {
                 node = node.with_child(UiNode::status(
                     ids::reply_badge_model(message_id),
@@ -3293,24 +4187,25 @@ impl NativeChatHost {
                 )
                 .with_child(
                     UiNode::status(ids::CHAT_ROUTINE_THREAD, name.clone()).with_value(word.clone()),
-                )
-                .with_child(UiNode::button(
-                    ids::CHAT_ROUTINE_BACK,
-                    format!(
-                        "Back to {}",
-                        self.sessions
-                            .iter()
-                            .find(|session| session.active)
-                            .map_or("the bot", |session| session.title.as_str())
-                    ),
-                ));
+                );
         }
         if self.queued_sends > 0 {
-            page = page.with_child(UiNode::new(
-                ids::COMPOSER_QUEUED,
-                "status",
-                format!("{} queued", self.queued_sends),
-            ));
+            // Each held message the server holds for the person's Mac says so under it, as its
+            // bubble does.
+            let queued = self.waiting_for_mac.iter().fold(
+                UiNode::new(
+                    ids::COMPOSER_QUEUED,
+                    "status",
+                    format!("{} queued", self.queued_sends),
+                ),
+                |queued, message_id| {
+                    queued.with_child(UiNode::status(
+                        ids::queued_waiting(message_id),
+                        crate::components::message::WAITING_FOR_YOUR_MAC,
+                    ))
+                },
+            );
+            page = page.with_child(queued);
         }
         // What typing produces: the list `/` or `@` opened, the recipe that picking one put on
         // the draft, and the pictures a turn came back with. Each is in the tree only while it
@@ -3329,6 +4224,14 @@ impl NativeChatHost {
         }
         if let Some(lightbox) = self.lightbox_node() {
             page = page.with_child(lightbox);
+        }
+        if let Some((title, what)) = &self.routine_delete_question {
+            page = page.with_child(
+                UiNode::dialog(ids::ROUTINE_DELETE_PROMPT, title.clone())
+                    .with_value(what.clone())
+                    .with_child(UiNode::button(ids::ROUTINE_DELETE_CANCEL, "Cancel"))
+                    .with_child(UiNode::button(ids::ROUTINE_DELETE_CONFIRM, "Delete")),
+            );
         }
         for approval in &self.approvals {
             let id = format!("approval-{}", approval.call_id);
@@ -3368,13 +4271,25 @@ impl NativeChatHost {
         for offer in &self.save_logins {
             page = page.with_child(save_login_node(offer));
         }
+        let mut status = UiNode::new("computer-status", "status", self.computer_status.clone());
+        if let Some((line, code)) = &self.computer_error {
+            status = status.with_child(
+                UiNode::status(ids::COMPUTER_ERROR, line.clone()).with_value(code.clone()),
+            );
+        }
         let mut computer = UiNode::new("computer-pane", "dialog", "Computer")
             .with_visible(self.computer_open)
-            .with_child(UiNode::new(
-                "computer-status",
-                "status",
-                self.computer_status.clone(),
-            ))
+            .with_child(status);
+        if self.computer_error.is_some() {
+            computer = computer.with_child(
+                UiNode::button(
+                    ids::COMPUTER_GET,
+                    crate::components::computer::GET_A_COMPUTER,
+                )
+                .with_enabled(!self.computer_asking),
+            );
+        }
+        computer = computer
             .with_child(UiNode::button(
                 "computer-update",
                 self.computer_update_label.clone(),
@@ -3405,6 +4320,17 @@ impl NativeChatHost {
             );
         }
         computer = computer.with_child(UiNode::button(ids::ROUTINE_NEW, "Create routine"));
+        if let Some(line) = &self.routine_error {
+            computer = computer.with_child(UiNode::status(ids::ROUTINE_ERROR, line.clone()));
+        }
+        if let Some(open) = self.open_routine() {
+            for node in routine_header_nodes(open, self.routine_history_open) {
+                computer = computer.with_child(node);
+            }
+            for node in routine_wake_nodes(open, self.routine_wake_editor.as_ref()) {
+                computer = computer.with_child(node);
+            }
+        }
         for routine in &self.routines {
             computer = computer.with_child(routine_node(routine));
         }
@@ -3466,6 +4392,12 @@ impl NativeChatHost {
         if self.can_retry_turn {
             page = page.with_child(UiNode::button("retry-turn", "Try again"));
         }
+        if self.can_send_on_server {
+            page = page.with_child(UiNode::button(
+                ids::RUN_ERROR_SEND_ON_SERVER,
+                crate::components::chat::SEND_ON_SERVER_LABEL,
+            ));
+        }
         if let Some(question) = &self.computer_confirm {
             page = page.with_child(
                 UiNode::new("computer-confirm", "dialog", question.clone())
@@ -3480,18 +4412,10 @@ impl NativeChatHost {
             .with_child(
                 UiNode::new("avatar-editor", "dialog", "Avatar editor")
                     .with_visible(self.avatar_editor_open),
-            )
-            .with_child(UiNode::button("agent-model-field", "Model"))
-            .with_child(
-                UiNode::new("agent-model-list", "list", "Models")
-                    // How many routes the field can offer. The bug was this going to nothing and
-                    // staying there, so it is the number a driver watches — always in the tree,
-                    // because "none" is as much an answer as any other count.
-                    .with_value(self.model_count.to_string())
-                    .with_visible(self.model_picker_open),
             );
-        if let Some(effort) = &self.agent_effort {
-            settings = settings.with_child(agent_effort_node(effort));
+        // The Model card, the one place a Bot's model is picked: see `picker_node`.
+        if let Some(card) = self.picker_node(PickerFor::Bot) {
+            settings = settings.with_child(card);
         }
         if self.agent_tools.is_some() || self.agent_ceiling.is_some() {
             settings = settings.with_child(agent_tools_node(&ToolsCardSnap {
@@ -3537,24 +4461,13 @@ impl NativeChatHost {
         {
             settings = settings.with_child(self.agent_connections_node(&bot.id));
         }
-        if let Some(note) = &self.model_note {
-            // The server's word about why the list is not fuller, under the field, exactly where
-            // the person read it. In the tree only while there is one, so its absence is the
-            // assertion that the gateway answered.
-            settings = settings.with_child(UiNode::status("agent-model-note", note.clone()));
-        }
-        // While replies go through the person's own plan: under the Model field, whose pin does
-        // not answer then, and in the Usage card, which does not count them.
+        // While the Bot's replies go through the person's own plan: in the Usage card, which
+        // does not count them.
         if self.replies_on_plan {
-            settings = settings
-                .with_child(UiNode::status(
-                    ids::AGENT_MODEL_PLAN,
-                    reply_source::PLAN_MODEL_NOTE,
-                ))
-                .with_child(UiNode::status(
-                    ids::AGENT_USAGE_PLAN,
-                    reply_source::PLAN_USAGE_NOTE,
-                ));
+            settings = settings.with_child(UiNode::status(
+                ids::AGENT_USAGE_PLAN,
+                reply_source::PLAN_USAGE_NOTE,
+            ));
         }
         // The pane's red line over Save, where a refused Save says why in the server's words.
         if let Some(error) = &self.auth_error {
@@ -3568,18 +4481,23 @@ impl NativeChatHost {
             ready: self.ready,
             nodes: vec![
                 UiNode::window(ids::WINDOW, "NativeChat")
-                    .with_child(sidebar)
+                    .with_children(
+                        (!self.sidebar_hidden)
+                            .then_some(sidebar)
+                            .into_iter()
+                            .collect(),
+                    )
                     .with_child(page)
                     .with_child(self.recipes_node())
                     .with_child({
                         let mut settings = UiNode::dialog(ids::DIALOG_ACCOUNT, "Settings")
                             .with_visible(self.account_open)
                             .with_child(UiNode::button("app-settings-back", "← Back to app"))
+                            .with_child(UiNode::button(ids::SETTINGS_GENERAL, "General"))
                             .with_child(UiNode::button("settings-tab-computer", "Computer"))
                             .with_child(UiNode::button("settings-tab-updates", "Updates"))
                             .with_child(UiNode::button("settings-tab-logins", "Logins"))
                             .with_child(UiNode::button(ids::SETTINGS_CONNECTIONS, "Connections"))
-                            .with_child(UiNode::button(ids::SETTINGS_REPLY_SOURCE, "Reply source"))
                             .with_child(UiNode::button(ids::SETTINGS_SKILLS, "Skills"));
                         if self.logins_tab {
                             settings = self.logins_nodes(settings);
@@ -3591,10 +4509,9 @@ impl NativeChatHost {
                                 settings = settings.with_child(node);
                             }
                         }
-                        // The same for Reply source: its section is in the tree only while the
-                        // dialog is open on it.
-                        if self.account_open && self.reply_source_tab {
-                            settings = settings.with_child(self.reply_source_node());
+                        // The same for General's Default models.
+                        if self.account_open && self.general_tab {
+                            settings = settings.with_child(self.default_models_node());
                         }
                         if self.skills_tab {
                             settings = self.skills_nodes(settings);
@@ -3605,14 +4522,27 @@ impl NativeChatHost {
                                 self.computer_update_label.clone(),
                             ));
                         }
-                        // Each connected computer's local-exec mode, while Settings is open on
-                        // Computer: the choice a check of this Mac's Ask / Always / Never sets.
+                        // Why this Mac stopped running commands, over its computers as on the
+                        // page, then each computer's card, its relay switch and where its relay
+                        // stands, and its local-exec mode, while Settings is open on Computer:
+                        // the choice a check of this Mac's Ask / Always / Never sets.
                         if self.account_open && self.computer_tab {
-                            for (machine, label, mode, this_mac) in &self.computers {
-                                let mut menu =
-                                    UiNode::new(ids::computer_exec(machine), "menu", label.clone())
-                                        .with_value(mode.as_stored());
-                                if *this_mac {
+                            if let Some(why) = &self.local_exec_stopped {
+                                settings = settings.with_child(UiNode::status(
+                                    ids::LOCAL_EXEC_STOPPED,
+                                    why.clone(),
+                                ));
+                            }
+                            for card in &self.computers {
+                                settings = settings.with_child(self.computer_card_node(card));
+                                let (machine, mode) = (&card.machine_id, card.mode);
+                                let mut menu = UiNode::new(
+                                    ids::computer_exec(machine),
+                                    "menu",
+                                    card.label.clone(),
+                                )
+                                .with_value(mode.as_stored());
+                                if card.this_computer {
                                     menu.states.push("this-mac".into());
                                 }
                                 for choice in [
@@ -3624,7 +4554,7 @@ impl NativeChatHost {
                                         ids::computer_exec_mode(machine, choice),
                                         choice.label(),
                                     );
-                                    if choice == *mode {
+                                    if choice == mode {
                                         button.states.push("selected".into());
                                     }
                                     menu = menu.with_child(button);
@@ -3665,6 +4595,14 @@ impl NativeChatHost {
                         "Dismiss model picker",
                     ))
                     .with_child(UiNode::button(
+                        ids::NEW_BOTS_DISMISS,
+                        "Dismiss the default for new Bots' picker",
+                    ))
+                    .with_child(UiNode::button(
+                        ids::PLAN_FALLBACK_DISMISS,
+                        "Dismiss the Relay-off fallback's picker",
+                    ))
+                    .with_child(UiNode::button(
                         "avatar-editor-dismiss",
                         "Dismiss avatar editor",
                     )),
@@ -3676,6 +4614,9 @@ impl NativeChatHost {
     /// its Thought rows. Each is in the tree only while the reply has some, so `assert --exists
     /// false` is "this reply did nothing but talk". An open row has state `expanded`; for the
     /// Thought rows that is all of them open, which is what a click on `reply-reasoning` asks for.
+    /// A step whose row ends with how long the call took has that as a state, `took-1s`; its
+    /// value stays how it came out. The Timing row under the reply is `reply-timing`, with its
+    /// lines under it while it is open.
     fn reply_run_nodes(&self) -> Vec<UiNode> {
         let run = &self.reply_run;
         let mut nodes = Vec::new();
@@ -3693,6 +4634,9 @@ impl NativeChatHost {
                                 if step.open {
                                     node.states.push("expanded".into());
                                 }
+                                if let Some(took) = &step.took {
+                                    node.states.push(format!("took-{took}"));
+                                }
                                 node
                             })
                             .collect(),
@@ -3702,10 +4646,29 @@ impl NativeChatHost {
         if !run.thoughts.is_empty() {
             let mut node = UiNode::status(ids::REPLY_REASONING, "Thought")
                 .with_value(run.thoughts.len().to_string());
-            if run.thoughts.iter().all(|(_, open)| *open) {
+            if run.thoughts.iter().all(|(_, open, _)| *open) {
                 node.states.push("expanded".into());
             }
+            node = node.with_children(
+                run.thoughts
+                    .iter()
+                    .enumerate()
+                    .map(|(n, (_, open, took))| {
+                        let mut thought = UiNode::status(format!("reply-thought-{n}"), "Thinking");
+                        if *open {
+                            thought.states.push("expanded".into());
+                        }
+                        if let Some(took) = took {
+                            thought.states.push(format!("took-{took}"));
+                        }
+                        thought
+                    })
+                    .collect(),
+            );
             nodes.push(node);
+        }
+        if let Some(crate::components::steps::RunRow::Timing { total, .. }) = &run.timing {
+            nodes.push(UiNode::status(ids::REPLY_TIMING, "Timing").with_value(total.clone()));
         }
         nodes
     }
@@ -3713,16 +4676,24 @@ impl NativeChatHost {
     /// A click on one of the newest reply's steps opens it, or shuts it if it is open. What
     /// holds it opens with it: an open step keeps its "N steps" line open (see
     /// `components::steps`). A click on `reply-reasoning` opens every Thought row, or shuts
-    /// them all once they all are.
+    /// them all once they all are. The `reply-timing` footer is plain text and refuses clicks.
     fn reply_run_command(&self, target: &str) -> Option<Result<Command, String>> {
+        if target == ids::REPLY_TIMING {
+            return Some(match &self.reply_run.timing {
+                Some(_) => {
+                    Err("the newest reply's Timing row is its total and does not open".to_string())
+                }
+                None => Err("the newest reply has no Timing row".to_string()),
+            });
+        }
         if target == ids::REPLY_REASONING {
             let thoughts = &self.reply_run.thoughts;
             if thoughts.is_empty() {
                 return Some(Err("the newest reply has no Thought row".to_string()));
             }
             return Some(Ok(Command::SetStepsOpen {
-                keys: thoughts.iter().map(|(key, _)| key.clone()).collect(),
-                open: !thoughts.iter().all(|(_, open)| *open),
+                keys: thoughts.iter().map(|(key, _, _)| key.clone()).collect(),
+                open: !thoughts.iter().all(|(_, open, _)| *open),
             }));
         }
         let call_id = target.strip_prefix("step-")?;
@@ -4391,167 +5362,781 @@ impl NativeChatHost {
         })
     }
 
-    /// Settings → Reply source as the page draws it: `settings-reply-source` (value = the door
-    /// the server keeps; states `unsaved`, `saving`, `reading`) holding the radio, the line saying
-    /// the plan is set up only from the server's own Mac where this is not it, the proxy URL, the
-    /// model picker with No model and a choice per model of the person's plan, the line under
-    /// it, the key field (never its text) and Remove key, the health line, the note on Claude and
-    /// Gemini, the line under Save, the line beside it, and Save. Before the setting has been
-    /// read, on a server without reply sources, or when it could not be read, the section holds
-    /// only the line the page draws in place of the form (state `asking` while that is the
-    /// server being asked).
-    fn reply_source_node(&self) -> UiNode {
-        use crate::state::ProxyHealth;
-        let snap = &self.reply_source;
-        let settings = &snap.settings;
-        let mut section = UiNode::new(ids::REPLY_SOURCE, "group", "Reply source");
-        let Some(kept) = settings.kept_source() else {
-            let line = reply_source::unavailable_line(settings).unwrap_or(reply_source::ASKING);
-            if line == reply_source::ASKING {
-                section.states.push("asking".into());
-            }
-            return section.with_child(UiNode::status(ids::REPLY_SOURCE_UNAVAILABLE, line));
-        };
-        section = section.with_value(kept.kind.word());
-        for (on, state) in [
-            (snap.unsaved, "unsaved"),
-            (settings.saving.is_some(), "saving"),
-            (settings.reading.is_some(), "reading"),
-        ] {
-            if on {
-                section.states.push(state.into());
-            }
+    /// A picker's card and popover, what each picker has, and whether it takes a change now.
+    fn picker_snap(
+        &self,
+        which: PickerFor,
+    ) -> (
+        Option<&crate::opengrok::ModelPick>,
+        &PickerView,
+        Option<&String>,
+        bool,
+    ) {
+        match which {
+            PickerFor::Bot => (
+                self.model_pick.as_ref(),
+                &self.model_picker,
+                self.picker_note.as_ref(),
+                false,
+            ),
+            PickerFor::NewBots => (
+                self.new_bots_pick.as_ref(),
+                &self.new_bots_picker,
+                self.new_bots_note.as_ref(),
+                self.new_bots_busy,
+            ),
+            PickerFor::PlanFallback => (
+                self.plan_fallback_pick.as_ref(),
+                &self.plan_fallback_picker,
+                self.plan_fallback_note.as_ref(),
+                self.plan_fallback_busy,
+            ),
         }
-        let live = settings.can_edit();
-        let plan_live = settings.plan_editable();
-        let here = settings.server_on_this_mac;
-        let shown = settings.shown_kind().unwrap_or(kept.kind);
-        let mut radio = UiNode::new(ids::REPLY_SOURCE_KIND, "radiogroup", "Reply source")
-            .with_value(shown.word());
-        for kind in crate::opengrok::InferenceKind::ALL {
-            let enabled = match kind {
-                crate::opengrok::InferenceKind::Gateway => live,
-                crate::opengrok::InferenceKind::LocalProxy => plan_live,
-            };
-            radio = radio.with_child(
-                UiNode::new(
-                    ids::reply_source_kind(kind),
-                    "radio",
-                    reply_source::kind_label(kind),
-                )
-                .with_checked(kind == shown)
-                .with_enabled(enabled),
-            );
-        }
-        let shown_model = settings.shown_model();
-        let mut models = UiNode::new(
-            ids::REPLY_SOURCE_MODEL,
-            "menu",
-            shown_model.unwrap_or(reply_source::PICK_MODEL),
-        )
-        .with_value(shown_model.unwrap_or_default())
-        .with_enabled(plan_live && (!snap.models.is_empty() || shown_model.is_some()));
-        if snap.models.is_empty() {
-            models.states.push("empty".into());
-        }
-        if shown_model.is_some() {
-            models = models.with_child(
-                UiNode::button(ids::REPLY_SOURCE_NO_MODEL, reply_source::NO_MODEL_LABEL)
-                    .with_enabled(plan_live),
-            );
-        }
-        for model in &snap.models {
-            let mut choice = UiNode::button(ids::reply_source_model(model), model.clone())
-                .with_enabled(plan_live);
-            if shown_model == Some(model.as_str()) {
-                choice.states.push("selected".into());
-            }
-            models = models.with_child(choice);
-        }
-        // The window draws a key waiting for Save as masked dots in the field, a driver's too.
-        let mut key = UiNode::textbox(ids::REPLY_SOURCE_KEY, "Proxy key")
-            .with_enabled(settings.key_editable());
-        if kept.has_api_key {
-            key.states.push("set".into());
-        }
-        if snap.key_typed {
-            key.states.push("typed".into());
-        }
-        let health = snap.health.unwrap_or(ProxyHealth::NoAddress);
-        section = section.with_child(radio);
-        if !here {
-            section = section.with_child(UiNode::status(
-                ids::REPLY_SOURCE_ELSEWHERE,
-                reply_source::ELSEWHERE_LINE,
-            ));
-        }
-        section = section
-            .with_child(
-                UiNode::textbox(ids::REPLY_SOURCE_URL, "Proxy URL")
-                    .with_value(settings.shown_url())
-                    .with_enabled(plan_live),
-            )
-            .with_child(models);
-        if let Some(line) = reply_source::models_note(health, !snap.models.is_empty()) {
-            section = section.with_child(UiNode::status(ids::REPLY_SOURCE_MODELS_NOTE, line));
-        }
-        section = section.with_child(key);
-        if kept.has_api_key {
-            let mut remove = UiNode::button(
-                ids::REPLY_SOURCE_REMOVE_KEY,
-                if settings.remove_key {
-                    reply_source::KEEP_KEY_LABEL
-                } else {
-                    reply_source::REMOVE_KEY_LABEL
-                },
-            )
-            .with_enabled(plan_live);
-            if settings.remove_key {
-                remove.states.push("picked".into());
-            }
-            section = section.with_child(remove);
-        }
-        section = section
-            .with_child(
-                UiNode::status(ids::REPLY_SOURCE_HEALTH, {
-                    let (words, command) = reply_source::health_line(health, here);
-                    command
-                        .map_or_else(|| words.to_string(), |command| format!("{words} {command}"))
-                })
-                .with_value(reply_source::health_word(health)),
-            )
-            .with_child(UiNode::status(
-                ids::REPLY_SOURCE_PROVIDERS,
-                reply_source::PROVIDERS_NOTE,
-            ));
-        // The line under Save: state `trouble` while it is drawn in the danger colour, a refusal
-        // or a failed read; a Save being checked, and a key to type again, are drawn muted.
-        if let Some(line) = reply_source::error_line(settings) {
-            let mut error = UiNode::status(ids::REPLY_SOURCE_ERROR, line);
-            if reply_source::error_is_trouble(settings) {
-                error.states.push("trouble".into());
-            }
-            section = section.with_child(error);
-        }
-        if let Some(hint) = snap.hint {
-            section = section.with_child(UiNode::status(ids::REPLY_SOURCE_HINT, hint));
-        }
-        section.with_child(
-            UiNode::button(ids::REPLY_SOURCE_SAVE, reply_source::save_label(settings))
-                .with_enabled(snap.can_save),
-        )
     }
 
-    /// One of Settings → Reply source's controls, or the composer's chip, or `None` for a target
-    /// that is neither. The tab answers from anywhere in Settings, and not while Settings is
-    /// shut. Every control on the page is refused while the page is not on screen, before the
-    /// setting has been read, and while it is dead there: a Save with the server, for Save a read
-    /// too, and for the plan's controls a server that is not on this Mac. A model is refused
-    /// unless the picker offers it.
-    fn reply_source_command(&self, target: &str) -> Option<Result<Command, String>> {
-        if target == ids::SETTINGS_REPLY_SOURCE {
+    /// A model picker as the window draws it: the Bot's while a Bot is open, `agent-model-card`
+    /// in the Bot's settings, the one place a Bot's model is picked; and Default for new Bots'
+    /// while the server keeps one, `settings-new-bots-card`, with every part below under
+    /// `settings-new-bots-` for `agent-model-`. The card is a button named as the picker reads in
+    /// a line ("GPT-6 Luna · Medium ⚡") and valued by the model, with its door's wire word as a
+    /// state, `fast` while ⚡ is on, `expanded` while its popover is open, and `saving` while a
+    /// change is with the server. Under it the popover, `agent-model-pop`, visible while open,
+    /// holds while it shows its controls `agent-model-fast` (a switch, checked while on, dead
+    /// with why as its value), `agent-model-open-list` (named by the model) and
+    /// `agent-model-reset` (live while there is something to put back), then
+    /// `agent-model-effort`, a slider that is there only where the model lists levels of effort
+    /// (named by the level it is on, the model's own while the Bot chose none, and valued by that
+    /// level's own word, so a driver can write back what it reads; `Effort` and with no value
+    /// where no level is lit, a model that names none as its own and none chosen; dead with why
+    /// as its own words from a server that keeps no effort; `set_value` takes one of the model's
+    /// own levels by its word and refuses any other in words that name them), and
+    /// `agent-model-effort-note`, the line a pick left when it put the effort back on the
+    /// model's own level, while the model it is about is the one on the card; and while it shows
+    /// its
+    /// list, `agent-model-open-list` as the heading back (state `expanded`) and
+    /// `agent-model-search`, the search box (valued by what is typed). `agent-model-list` is
+    /// always there, valued by how many models the search leaves and visible while shown, and
+    /// holds while shown `settings-new-bots-none` (new Bots only: `None`, valued
+    /// `the server's default`, `selected` while none is set) and the window the list draws: at
+    /// most five models, an `agent-model-row-{source}-{id}` each (valued by its door's word,
+    /// `selected` on the one that answers, `fast` where it has a fast version), with an
+    /// `agent-model-group-{source}` heading ("Subscription", "Gateway") over each group's first
+    /// model in view; `agent-model-plan` where a server without per-Bot doors has the account's
+    /// plan model answer, `agent-model-no-match` where the search leaves nothing of a list that
+    /// has some, `agent-model-routines` where the Bot's own door is the person's plan, where its
+    /// routines run, and `agent-model-note`, the server's word on why the list is not
+    /// fuller. `agent-model-error`, while open: the server's words for the last change it refused,
+    /// or for new Bots that nobody knows whether it was kept.
+    fn picker_node(&self, which: PickerFor) -> Option<UiNode> {
+        use crate::opengrok::{ListLine, group_title, list_window, row_count};
+        use model_picker::{MODELS_TITLE, NO_MODEL_MATCHES, SEARCH_PLACEHOLDER};
+        let ids = model_picker::ids(which);
+        let (pick, view, note, busy) = self.picker_snap(which);
+        let pick = pick?;
+        let open = view.open;
+        let list_open = open && view.list_open;
+        let mut trigger = UiNode::button(ids.card, pick.summary())
+            .with_value(pick.model.clone().unwrap_or_default());
+        if let Some(door) = pick.door {
+            trigger.states.push(door.word().into());
+        }
+        if pick.is_fast() {
+            trigger.states.push("fast".into());
+        }
+        if open {
+            trigger.states.push("expanded".into());
+        }
+        if busy {
+            trigger.states.push("saving".into());
+        }
+        let mut pop = UiNode::dialog(ids.pop, "Model").with_visible(open);
+        if open && !list_open {
+            let mut fast = UiNode::new(ids.fast, "switch", model_picker::FAST_LABEL)
+                .with_checked(pick.is_fast())
+                .with_enabled(pick.fast_blocked.is_none() && !busy);
+            if let Some(why) = pick.fast_blocked {
+                fast = fast.with_value(why);
+            }
+            // The window's own order: ⚡, the model's name and ↺ in a row, then the slider under
+            // them, which is not there at all where the model lists no levels, and the line a
+            // pick may have left.
+            pop = pop
+                .with_child(fast)
+                .with_child(UiNode::button(ids.open_list, pick.model_label()))
+                .with_child(
+                    UiNode::button(ids.reset, model_picker::RESET_LABEL)
+                        .with_enabled(pick.can_reset() && !busy),
+                );
+            if pick.has_slider() {
+                // Valued by the word of the level it is lit on, the model's own where the Bot
+                // chose none, so what a driver reads is what it can write back; a slider with
+                // no level lit has no word to say.
+                let mut slider = UiNode::new(
+                    ids.effort,
+                    "slider",
+                    pick.effort_name()
+                        .unwrap_or_else(|| model_picker::EFFORT_LABEL.to_string()),
+                )
+                .with_enabled(pick.effort_dead.is_none() && !busy);
+                if let Some(level) = pick.lit_level() {
+                    slider = slider.with_value(level.value.clone());
+                }
+                pop = pop.with_child(slider);
+            }
+            if let Some(line) = view.effort_note_for(pick) {
+                pop = pop.with_child(UiNode::status(ids.effort_note, line));
+            }
+        }
+        // What the search leaves: the whole list while nothing is typed, which it always is while
+        // the list is shut.
+        let groups = pick.search(&view.search);
+        let mut list = UiNode::list(ids.list, MODELS_TITLE)
+            .with_value(row_count(&groups).to_string())
+            .with_visible(list_open);
+        if list_open {
+            let mut back = UiNode::button(ids.open_list, MODELS_TITLE);
+            back.states.push("expanded".into());
+            pop = pop.with_child(back).with_child(
+                UiNode::textbox(ids.search, SEARCH_PLACEHOLDER).with_value(view.search.clone()),
+            );
+            let none = ids
+                .none
+                .filter(|_| model_picker::none_shows(&view.search, ids.none_hint));
+            if let Some(id) = none {
+                let mut row = UiNode::listitem(id, crate::opengrok::NEW_BOTS_NONE)
+                    .with_value(ids.none_hint)
+                    .with_enabled(!busy);
+                if pick.model.is_none() {
+                    row.states.push("selected".into());
+                }
+                list = list.with_child(row);
+            }
+            let plan = pick.plan_line(&view.search);
+            if let Some(plan) = plan {
+                let model = plan.model.as_deref().map_or_else(
+                    || crate::opengrok::NO_MODEL.to_string(),
+                    crate::opengrok::base_label,
+                );
+                list = list.with_child(
+                    UiNode::status(ids.plan, model)
+                        .with_value(plan.model.clone().unwrap_or_default()),
+                );
+            }
+            for line in list_window(&groups, view.list_start) {
+                list = list.with_child(match line {
+                    ListLine::Heading(source) => {
+                        UiNode::new(ids.group_id(source), "heading", group_title(source))
+                    }
+                    ListLine::Row(row) => {
+                        let mut item = UiNode::listitem(
+                            ids.row_id(row.source, &row.base_id),
+                            row.label.clone(),
+                        )
+                        .with_value(row.source.word())
+                        .with_enabled(!busy);
+                        if pick.is_current(row) {
+                            item.states.push("selected".into());
+                        }
+                        if row.has_fast {
+                            item.states.push("fast".into());
+                        }
+                        item
+                    }
+                });
+            }
+            let offers_nothing = pick.groups.is_empty() && pick.account_plan.is_none();
+            if !offers_nothing && groups.is_empty() && plan.is_none() && none.is_none() {
+                list = list.with_child(UiNode::status(ids.no_match, NO_MODEL_MATCHES));
+            }
+            if let Some(line) = &pick.routines {
+                list = list.with_child(UiNode::status(ids.routines, line.clone()));
+            }
+            if let Some(note) = &self.model_note {
+                list = list.with_child(UiNode::status(ids.note, note.clone()));
+            }
+        }
+        pop = pop.with_child(list);
+        if open && let Some(note) = note {
+            pop = pop.with_child(UiNode::status(ids.error, note.clone()));
+        }
+        Some(trigger.with_child(pop))
+    }
+
+    /// One computer's card as the window draws it: `settings-computer-{id}` (named by the
+    /// computer's label; states `online` or `offline`, `this-computer` on the one the app is
+    /// running on, and `unsaved` on that one while a change to its opencodex fields waits for
+    /// Save) holding its Relay your plan switch, `settings-computer-{id}-relay` (checked while the
+    /// computer's relay is on, or where a click is taking it while the server is asked; disabled
+    /// then), where its relay stands, `settings-computer-{id}-status` (`Relaying`, `Not
+    /// relaying` or `On, but asleep: it can't answer right now`; value `relaying`,
+    /// `not-relaying` or `asleep`), and under the switch `settings-computer-{id}-error` while a
+    /// switch did not go as asked (the server's words, or that nobody knows whether it was kept).
+    /// The card of this computer alone also holds why its relay is not relaying,
+    /// `settings-relay-detail`, and what its relay needs of it ([`Self::opencodex_nodes`]).
+    fn computer_card_node(&self, card: &ComputerCard) -> UiNode {
+        let machine = &card.machine_id;
+        let mut node = UiNode::new(ids::computer_card(machine), "group", card.label.clone());
+        node.states
+            .push(if card.online { "online" } else { "offline" }.into());
+        if card.this_computer {
+            node.states.push("this-computer".into());
+            if self.reply_source.unsaved {
+                node.states.push("unsaved".into());
+            }
+        }
+        node = node
+            .with_child(
+                UiNode::new(
+                    ids::computer_relay(machine),
+                    "switch",
+                    computers::RELAY_LABEL,
+                )
+                .with_checked(card.relay_on)
+                .with_enabled(!card.switching),
+            )
+            .with_child(
+                UiNode::status(ids::computer_status(machine), card.status_words())
+                    .with_value(card.state.word()),
+            );
+        if let Some(note) = &card.note {
+            node = node.with_child(UiNode::status(ids::computer_error(machine), note.clone()));
+        }
+        if let Some(detail) = &card.detail {
+            let mut line = UiNode::status(ids::RELAY_DETAIL, detail.words.clone());
+            if detail.trouble {
+                line.states.push("trouble".into());
+            }
+            node = node.with_child(line);
+        }
+        if card.this_computer {
+            for child in self.opencodex_nodes() {
+                node = node.with_child(child);
+            }
+        }
+        node
+    }
+
+    /// This computer's opencodex address and key, and Save, as its card draws them: until the
+    /// setting has been read, on a server without reply sources, or when it could not be read,
+    /// only the line the card draws in place of them (`settings-reply-source-unavailable`, state
+    /// `asking` while that is the server being asked); from a server without the relay,
+    /// `settings-relay-unavailable` (that this server can't take replies from a computer yet) and
+    /// the line under Save; and from one with it, opencodex's address, the key field (never its
+    /// text: states `set` while the Keychain holds a key, `typed` while one waits for Save) with
+    /// Remove key, `settings-reply-source-error` (a read that failed, state `trouble`, or what
+    /// the Keychain said when it did not keep a key), `settings-reply-source-hint` (what Save
+    /// waits for) and Save. Nothing of the plan on the server's own machine is on it, nor a model
+    /// of the relay's own.
+    fn opencodex_nodes(&self) -> Vec<UiNode> {
+        let snap = &self.reply_source;
+        let settings = &snap.settings;
+        let relay = &snap.relay;
+        let Some(_) = settings.kept_source() else {
+            let line = computers::unavailable_line(settings).unwrap_or(computers::ASKING);
+            let mut node = UiNode::status(ids::REPLY_SOURCE_UNAVAILABLE, line);
+            if line == computers::ASKING {
+                node.states.push("asking".into());
+            }
+            return vec![node];
+        };
+        let mut nodes = Vec::new();
+        // The line under Save: state `trouble` while it is drawn in the danger colour, a failed
+        // read; what the Keychain said is drawn muted.
+        let error = computers::error_line(settings).map(|line| {
+            let mut error = UiNode::status(ids::REPLY_SOURCE_ERROR, line);
+            if computers::error_is_trouble(settings) {
+                error.states.push("trouble".into());
+            }
+            error
+        });
+        // From a server before the relay: the line saying so in the fields' place, and nothing
+        // to save.
+        if !settings.knows_relay() {
+            nodes.push(UiNode::status(
+                ids::RELAY_UNAVAILABLE,
+                computers::RELAY_NOT_ON_SERVER,
+            ));
+            nodes.extend(error);
+            return nodes;
+        }
+        nodes.push(
+            UiNode::textbox(ids::RELAY_ADDR, computers::RELAY_ADDR_LABEL)
+                .with_value(relay.address.clone())
+                .with_enabled(settings.relay_editable()),
+        );
+        // The window draws a key waiting for Save as masked dots in the field, a driver's too.
+        let mut key = UiNode::textbox(ids::RELAY_KEY, computers::RELAY_KEY_LABEL)
+            .with_enabled(settings.relay_key_editable());
+        if relay.has_key {
+            key.states.push("set".into());
+        }
+        if relay.key_typed {
+            key.states.push("typed".into());
+        }
+        // A key typed and left behind when the page was left: the window asks for it again.
+        if settings.relay_retype_key {
+            key.states.push("retype".into());
+        }
+        nodes.push(key);
+        if relay.has_key {
+            let mut remove = UiNode::button(
+                ids::RELAY_KEY_REMOVE,
+                if settings.relay_remove_key {
+                    computers::KEEP_KEY_LABEL
+                } else {
+                    computers::REMOVE_KEY_LABEL
+                },
+            )
+            .with_enabled(settings.relay_editable());
+            if settings.relay_remove_key {
+                remove.states.push("picked".into());
+            }
+            nodes.push(remove);
+        }
+        nodes.extend(error);
+        if let Some(hint) = snap.hint {
+            nodes.push(UiNode::status(ids::REPLY_SOURCE_HINT, hint));
+        }
+        nodes.push(
+            UiNode::button(ids::REPLY_SOURCE_SAVE, computers::SAVE_LABEL)
+                .with_enabled(snap.can_save),
+        );
+        nodes
+    }
+
+    /// Settings → General's first section as the page draws it: `settings-default-models`
+    /// (named `Default models`), holding Default for new Bots and the Relay-off fallback.
+    fn default_models_node(&self) -> UiNode {
+        UiNode::new(ids::DEFAULT_MODELS, "group", default_models::TITLE)
+            .with_child(self.new_bots_node())
+            .with_child(self.plan_fallback_node())
+    }
+
+    /// The Relay-off fallback as the page draws it: `settings-plan-fallback`, as Default for new
+    /// Bots is ([`Self::new_bots_node`]). While the server keeps no such fallback (state
+    /// `unavailable`) it holds `settings-plan-fallback-unavailable`, the line saying it is coming,
+    /// and `settings-plan-fallback-card`, disabled; while it keeps one, the live card and its
+    /// popover over the Gateway group alone, and while the popover is shut
+    /// `settings-plan-fallback-error`.
+    fn plan_fallback_node(&self) -> UiNode {
+        let mut section = UiNode::new(
+            ids::PLAN_FALLBACK,
+            "group",
+            default_models::PLAN_FALLBACK_TITLE,
+        );
+        match &self.reply_source.plan_fallback {
+            crate::state::RelayOffFallback::NotOnServer => {
+                section = section
+                    .with_child(UiNode::status(
+                        ids::PLAN_FALLBACK_UNAVAILABLE,
+                        default_models::PLAN_FALLBACK_COMING_SOON,
+                    ))
+                    .with_child(
+                        UiNode::button(ids::PLAN_FALLBACK_CARD, model_picker::dead_card_model())
+                            .with_enabled(false),
+                    );
+                section.states.push("unavailable".into());
+            }
+            crate::state::RelayOffFallback::Kept(_) => {
+                if let Some(card) = self.picker_node(PickerFor::PlanFallback) {
+                    section = section.with_child(card);
+                }
+                if !self.plan_fallback_picker.open
+                    && let Some(note) = &self.plan_fallback_note
+                {
+                    section = section.with_child(UiNode::status(
+                        model_picker::PLAN_FALLBACK_IDS.error,
+                        note.clone(),
+                    ));
+                }
+            }
+        }
+        section
+    }
+
+    /// Default for new Bots as the page draws it: `settings-new-bots`. While the server keeps no
+    /// default for new Bots (state `unavailable`) it holds `settings-new-bots-unavailable`, the
+    /// line saying it is coming, and `settings-new-bots-card`, the picker's card, named as it
+    /// reads in a line and disabled, as the window dims it. While the server keeps one it holds
+    /// the live card and its popover ([`Self::picker_node`]), and while the popover is shut,
+    /// `settings-new-bots-error`: what the last change that did not go as asked came to.
+    fn new_bots_node(&self) -> UiNode {
+        let section = UiNode::new(ids::NEW_BOTS, "group", default_models::NEW_BOTS_TITLE);
+        match &self.reply_source.new_bots {
+            crate::state::DefaultForNewBots::NotOnServer => {
+                let mut section = section
+                    .with_child(UiNode::status(
+                        ids::NEW_BOTS_UNAVAILABLE,
+                        default_models::NEW_BOTS_COMING_SOON,
+                    ))
+                    .with_child(
+                        UiNode::button(ids::NEW_BOTS_CARD, model_picker::dead_card_model())
+                            .with_enabled(false),
+                    );
+                section.states.push("unavailable".into());
+                section
+            }
+            crate::state::DefaultForNewBots::Kept(_) => {
+                let mut section = section;
+                if let Some(card) = self.picker_node(PickerFor::NewBots) {
+                    section = section.with_child(card);
+                }
+                if !self.new_bots_picker.open
+                    && let Some(note) = &self.new_bots_note
+                {
+                    section = section.with_child(UiNode::status(
+                        model_picker::NEW_BOTS_IDS.error,
+                        note.clone(),
+                    ));
+                }
+                section
+            }
+        }
+    }
+
+    /// One of the Bot's model picker's controls on its card, or `None` for a target that is none
+    /// of them ([`is_picker_part`]).
+    fn model_picker_command(&self, target: &str) -> Option<Result<Command, String>> {
+        is_picker_part(target).then(|| self.picker_control(PickerFor::Bot, target))
+    }
+
+    /// Why `which` picker cannot be worked at all now, or `None` while it can: no Bot open for
+    /// the Bot's; and for Default for new Bots', its page not on screen, or a server that keeps no
+    /// default for new Bots, where its card is dead.
+    fn picker_absent(&self, which: PickerFor, target: &str) -> Option<String> {
+        if which != PickerFor::Bot
+            && let Some(off) = self.off_the_general_page(target)
+        {
+            return Some(off);
+        }
+        if self.picker_snap(which).0.is_some() {
+            return None;
+        }
+        Some(match which {
+            PickerFor::Bot => format!("`{target}` is not on screen: no Bot is open"),
+            PickerFor::NewBots => {
+                format!(
+                    "`{target}` is dead: {}",
+                    default_models::NEW_BOTS_COMING_SOON
+                )
+            }
+            PickerFor::PlanFallback => {
+                format!(
+                    "`{target}` is dead: {}",
+                    default_models::PLAN_FALLBACK_COMING_SOON
+                )
+            }
+        })
+    }
+
+    /// A click on one of a picker's parts, refused while it is not on screen: the Bot's card
+    /// while the Bot's settings are shut, a part of the popover while it is shut, its controls
+    /// while it shows its list, and its list's parts while it does not. ⚡ where it is dead is
+    /// refused with why, and ↺ with nothing to put back; the slider and the search box are set
+    /// with `set_value`, not clicked. A model is picked only while it is in the list's window, as
+    /// a person can click only what is in view: one further down is out of view until the search
+    /// box finds it. Default for new Bots' controls are dead while a change is with the server.
+    fn picker_control(&self, which: PickerFor, target: &str) -> Result<Command, String> {
+        let ids = model_picker::ids(which);
+        if let Some(absent) = self.picker_absent(which, target) {
+            return Err(absent);
+        }
+        let (pick, view, _, busy) = self.picker_snap(which);
+        let Some(pick) = pick else {
+            return Err(format!("`{target}` is not on screen"));
+        };
+        if target == ids.card {
+            return if which == PickerFor::Bot && !self.agent_settings_open {
+                Err(format!(
+                    "`{target}` is in the Bot's settings, which are closed"
+                ))
+            } else {
+                Ok(PickerCommand::Toggle.sent_to(which))
+            };
+        }
+        if !view.open {
+            return Err(format!(
+                "`{target}` is in the model picker's popover, which is shut: open it with `{}`",
+                ids.card
+            ));
+        }
+        let list_open = view.list_open;
+        let open_list = ids.open_list;
+        let dead = || Err(format!("`{target}` is dead: a change is with the server"));
+        if target == ids.pop {
+            return Err(format!(
+                "`{target}` is the popover: click one of its controls"
+            ));
+        }
+        if target == open_list {
+            return Ok(PickerCommand::ToggleList.sent_to(which));
+        }
+        if [
+            ids.plan,
+            ids.note,
+            ids.routines,
+            ids.error,
+            ids.no_match,
+            ids.effort_note,
+        ]
+        .contains(&target)
+        {
+            return Err(format!("`{target}` is a line, not a control"));
+        }
+        if [ids.fast, ids.effort, ids.reset].contains(&target) && list_open {
+            return Err(format!(
+                "`{target}` is not on screen: the popover shows its list, and `{open_list}` goes \
+                 back"
+            ));
+        }
+        if target == ids.fast {
+            return match pick.fast_blocked {
+                Some(why) => Err(format!("`{target}` is dead: {why}")),
+                None if busy => dead(),
+                None => Ok(PickerCommand::SetFast(!pick.is_fast()).sent_to(which)),
+            };
+        }
+        if target == ids.effort {
+            return Err(if pick.has_slider() {
+                format!(
+                    "`{target}` is a slider: set_value it to one of {}",
+                    levels_in_words(pick)
+                )
+            } else {
+                no_slider_refusal(pick, target)
+            });
+        }
+        if target == ids.reset {
+            return if !pick.can_reset() {
+                Err(format!(
+                    "`{target}` has nothing to put back: the effort is the model's own, and ⚡ is \
+                     off or cannot be switched"
+                ))
+            } else if busy {
+                dead()
+            } else {
+                Ok(PickerCommand::Reset.sent_to(which))
+            };
+        }
+        if target == ids.list {
+            return Err(format!(
+                "`{target}` is the list: click one of its models, `{}{{source}}-{{id}}`",
+                ids.row
+            ));
+        }
+        if !list_open {
+            return Err(format!(
+                "`{target}` is not on screen: the popover shows its controls, and `{open_list}` \
+                 opens the list"
+            ));
+        }
+        if target == ids.search {
+            return Err(format!("`{target}` is a field: use set_value"));
+        }
+        let query = view.search.as_str();
+        let search = ids.search;
+        if ids.none == Some(target) {
+            return if !model_picker::none_shows(query, ids.none_hint) {
+                Err(format!(
+                    "`{target}` is not on screen: the search `{query}` in `{search}` leaves it out"
+                ))
+            } else if busy {
+                dead()
+            } else if which == PickerFor::PlanFallback {
+                Ok(Command::ClearPlanFallback)
+            } else {
+                Ok(Command::ClearNewBotsDefault)
+            };
+        }
+        if target.starts_with(ids.group) {
+            return Err(format!("`{target}` is a group's heading, not a model"));
+        }
+        use crate::opengrok::{LIST_ROWS, ListLine, list_window};
+        let rest = target.strip_prefix(ids.row).unwrap_or(target);
+        let found = crate::opengrok::InferenceKind::ALL
+            .into_iter()
+            .find_map(|source| {
+                let base_id = rest.strip_prefix(source.word())?.strip_prefix('-')?;
+                pick.row(source, base_id)
+            });
+        let Some(found) = found else {
+            let offered: Vec<String> = pick
+                .rows()
+                .map(|row| ids.row_id(row.source, &row.base_id))
+                .collect();
+            return Err(format!(
+                "no `{target}` in the list, which offers {}",
+                if offered.is_empty() {
+                    "nothing".to_string()
+                } else {
+                    offered.join(", ")
+                }
+            ));
+        };
+        if !found.matches(query) {
+            return Err(format!(
+                "`{target}` is not on screen: the search `{query}` in `{search}` leaves it out"
+            ));
+        }
+        let groups = pick.search(query);
+        let in_view = list_window(&groups, view.list_start)
+            .into_iter()
+            .any(|line| line == ListLine::Row(found));
+        if !in_view {
+            return Err(format!(
+                "`{target}` is out of view: the list shows {LIST_ROWS} models at a time, and \
+                 `{search}` finds the rest"
+            ));
+        }
+        if busy {
+            return dead();
+        }
+        Ok(PickerCommand::Pick {
+            source: found.source,
+            base_id: found.base_id.clone(),
+        }
+        .sent_to(which))
+    }
+
+    /// `set_value` on a list's search box, as typing it there would leave it: the list shows
+    /// only the models it leaves, from the top. Refused while the box is not on screen: the
+    /// popover shut, or showing its controls.
+    fn set_picker_search(
+        &mut self,
+        which: PickerFor,
+        target: &str,
+        value: &str,
+    ) -> Result<DispatchResult, String> {
+        if let Some(closed) = self.picker_search_closed(which, target) {
+            return Err(closed);
+        }
+        let view = match which {
+            PickerFor::Bot => &mut self.model_picker,
+            PickerFor::NewBots => &mut self.new_bots_picker,
+            PickerFor::PlanFallback => &mut self.plan_fallback_picker,
+        };
+        view.search = value.to_string();
+        view.list_start = 0;
+        self.pending = Some(PickerCommand::SetSearch(value.to_string()).sent_to(which));
+        Ok(DispatchResult::empty())
+    }
+
+    /// Why a list's search box takes no typing now, or `None` while it does.
+    fn picker_search_closed(&self, which: PickerFor, target: &str) -> Option<String> {
+        if let Some(absent) = self.picker_absent(which, target) {
+            return Some(absent);
+        }
+        let ids = model_picker::ids(which);
+        let view = self.picker_snap(which).1;
+        if !view.open {
+            return Some(format!(
+                "`{target}` is in the model picker's popover, which is shut: open it with `{}`",
+                ids.card
+            ));
+        }
+        if !view.list_open {
+            return Some(format!(
+                "`{target}` is not on screen: the popover shows its controls, and `{}` opens the \
+                 list",
+                ids.open_list
+            ));
+        }
+        None
+    }
+
+    /// `set_value` on a picker's slider: one of the model's own levels by the server's word,
+    /// saved at once, as letting go of the thumb there is. Refused off screen, as a click is,
+    /// where the model lists no levels and so the slider is not there, where it is dead (a server
+    /// that keeps no effort), while a change is with the server, and for a word that is none of
+    /// the model's levels, in words that name them (`inherit` is ↺'s).
+    fn set_picker_effort(
+        &mut self,
+        which: PickerFor,
+        target: &str,
+        value: &str,
+    ) -> Result<DispatchResult, String> {
+        if let Some(absent) = self.picker_absent(which, target) {
+            return Err(absent);
+        }
+        let ids = model_picker::ids(which);
+        let (pick, view, _, busy) = self.picker_snap(which);
+        let Some(pick) = pick else {
+            return Err(format!("`{target}` is not on screen"));
+        };
+        if !view.open {
+            return Err(format!(
+                "`{target}` is in the model picker's popover, which is shut: open it with `{}`",
+                ids.card
+            ));
+        }
+        if view.list_open {
+            return Err(format!(
+                "`{target}` is not on screen: the popover shows its list, and `{}` goes back",
+                ids.open_list
+            ));
+        }
+        if !pick.has_slider() {
+            return Err(no_slider_refusal(pick, target));
+        }
+        let word = value.trim();
+        pick.effort_patch(word)
+            .map_err(|why| format!("`{target}`: {why}"))?;
+        if busy {
+            return Err(format!("`{target}` is dead: a change is with the server"));
+        }
+        self.pending = Some(PickerCommand::SetEffort(word.to_string()).sent_to(which));
+        Ok(DispatchResult::empty())
+    }
+
+    /// One of a computer's card's controls on Settings → Computer, or `None` for a target that is
+    /// none of them: the Relay your plan switch of a computer on the roster, which acts at once and
+    /// asks for the other way from where it is drawn; the card and its lines, which are lines and
+    /// not controls; and this computer's opencodex fields, key and Save
+    /// ([`Self::opencodex_command`]). Each is refused while Settings is not open on Computer.
+    fn computer_card_command(&self, target: &str) -> Option<Result<Command, String>> {
+        if let Some(command) = self.opencodex_command(target) {
+            return Some(command);
+        }
+        let card = self.computers.iter().find(|card| {
+            let machine = &card.machine_id;
+            [
+                ids::computer_card(machine),
+                ids::computer_relay(machine),
+                ids::computer_status(machine),
+                ids::computer_error(machine),
+            ]
+            .iter()
+            .any(|id| id == target)
+        })?;
+        if let Some(off) = self.off_the_computer_page(target) {
+            return Some(Err(off));
+        }
+        if target != ids::computer_relay(&card.machine_id) {
+            return Some(Err(format!(
+                "`{target}` is a card or a line on it, not a control: its Relay your plan switch is \
+                 `{}`",
+                ids::computer_relay(&card.machine_id)
+            )));
+        }
+        Some(if card.switching {
+            Err(format!(
+                "`{target}` is dead: the switch is with the server, which has not answered"
+            ))
+        } else {
+            Ok(Command::SetComputerRelay {
+                machine_id: card.machine_id.clone(),
+                on: !card.relay_on,
+            })
+        })
+    }
+
+    /// One of Settings → General's Default models, or `None` for a target that is none of them.
+    /// The tab answers from anywhere in Settings, and not while Settings is shut; the section is
+    /// a line; Default for new Bots' parts are its own ([`Self::new_bots_control`]).
+    fn default_models_command(&self, target: &str) -> Option<Result<Command, String>> {
+        if target == ids::SETTINGS_GENERAL {
             return Some(if self.account_open {
-                Ok(Command::SetAppSettingsTab(AppSettingsTab::ReplySource))
+                Ok(Command::SetAppSettingsTab(AppSettingsTab::General))
             } else {
                 Err(format!(
                     "`{target}` is in Settings, which is shut: open it with `{}`",
@@ -4559,176 +6144,269 @@ impl NativeChatHost {
                 ))
             });
         }
-        if target == ids::COMPOSER_REPLY_SOURCE {
-            return Some(match self.turn_source {
-                Some(_) => Ok(Command::ToggleTurnSource),
-                None => Err(format!(
-                    "no `{target}` on screen: the server keeps no reply source, no plan of yours \
-                     is set up to switch to (Settings → Reply source), or the composer is \
-                     dictating"
-                )),
-            });
+        if target == ids::DEFAULT_MODELS {
+            return Some(Err(self.off_the_general_page(target).unwrap_or_else(
+                || format!("`{target}` is a section of the page, not a control"),
+            )));
         }
-        if !target.starts_with(ids::REPLY_SOURCE) {
-            return None;
+        if target.starts_with(ids::NEW_BOTS) {
+            return Some(self.new_bots_control(target));
         }
-        Some(self.reply_source_control(target))
+        if target.starts_with(ids::PLAN_FALLBACK) {
+            return Some(self.plan_fallback_control(target));
+        }
+        None
     }
 
-    fn reply_source_control(&self, target: &str) -> Result<Command, String> {
-        if !(self.account_open && self.reply_source_tab) {
+    /// The Relay-off fallback's parts, as Default for new Bots' are ([`Self::new_bots_control`]):
+    /// its popover's dismiss answers anywhere; the rest are refused off General; while the server
+    /// keeps no such fallback the card is dead and says why, and the rest are lines; while it
+    /// keeps one, the card and its popover are the Bot's ([`Self::picker_control`]).
+    fn plan_fallback_control(&self, target: &str) -> Result<Command, String> {
+        if target == ids::PLAN_FALLBACK_DISMISS {
+            return Ok(PickerCommand::SetOpen(false).sent_to(PickerFor::PlanFallback));
+        }
+        if let Some(off) = self.off_the_general_page(target) {
+            return Err(off);
+        }
+        let parts = &model_picker::PLAN_FALLBACK_IDS;
+        match &self.reply_source.plan_fallback {
+            crate::state::RelayOffFallback::NotOnServer => Err(if target == parts.card {
+                format!(
+                    "`{target}` is dead: {}",
+                    default_models::PLAN_FALLBACK_COMING_SOON
+                )
+            } else {
+                format!("`{target}` is a line on the page, not a control")
+            }),
+            crate::state::RelayOffFallback::Kept(_) => {
+                if target == parts.error || target == ids::PLAN_FALLBACK {
+                    Err(format!("`{target}` is a line on the page, not a control"))
+                } else if parts.holds(target) {
+                    self.picker_control(PickerFor::PlanFallback, target)
+                } else {
+                    Err(format!("no `{target}` on the page"))
+                }
+            }
+        }
+    }
+
+    /// Why a control of Settings → General is not on screen: Settings is not open on the page.
+    fn off_the_general_page(&self, target: &str) -> Option<String> {
+        (!(self.account_open && self.general_tab)).then(|| {
+            format!(
+                "`{target}` is on Settings → General, which is not what is on screen: open it \
+                 with `{}`",
+                ids::SETTINGS_GENERAL
+            )
+        })
+    }
+
+    /// Why a control of Settings → Computer is not on screen: Settings is not open on the page.
+    fn off_the_computer_page(&self, target: &str) -> Option<String> {
+        (!(self.account_open && self.computer_tab)).then(|| {
+            format!(
+                "`{target}` is on Settings → Computer, which is not what is on screen: open it \
+                 with `settings-tab-computer`"
+            )
+        })
+    }
+
+    /// Default for new Bots' parts. Its popover's dismiss answers anywhere, as the Bot's does;
+    /// the rest are refused off the page, as the page's are. While the server keeps no default
+    /// for new Bots, the card is dead and says why, since a pick in it would change nothing
+    /// there, and the rest are lines; while it keeps one, the card and its popover are the Bot's
+    /// ([`Self::picker_control`]).
+    fn new_bots_control(&self, target: &str) -> Result<Command, String> {
+        if target == ids::NEW_BOTS_DISMISS {
+            return Ok(PickerCommand::SetOpen(false).sent_to(PickerFor::NewBots));
+        }
+        if let Some(off) = self.off_the_general_page(target) {
+            return Err(off);
+        }
+        match &self.reply_source.new_bots {
+            crate::state::DefaultForNewBots::NotOnServer => Err(if target == ids::NEW_BOTS_CARD {
+                format!(
+                    "`{target}` is dead: {}",
+                    default_models::NEW_BOTS_COMING_SOON
+                )
+            } else {
+                format!("`{target}` is a line on the page, not a control")
+            }),
+            crate::state::DefaultForNewBots::Kept(_) => {
+                if target == model_picker::NEW_BOTS_IDS.error || target == ids::NEW_BOTS {
+                    Err(format!("`{target}` is a line on the page, not a control"))
+                } else if model_picker::NEW_BOTS_IDS.holds(target) {
+                    self.picker_control(PickerFor::NewBots, target)
+                } else {
+                    Err(format!("no `{target}` on the page"))
+                }
+            }
+        }
+    }
+
+    /// One of this computer's opencodex controls, or `None` for a target that is none of them:
+    /// the lines about them are lines, the address and the key are fields, Remove key only while
+    /// the Keychain holds one, and Save keeps this computer's half of the relay and is refused with
+    /// what it waits for. Refused off the page, while this computer is not on the roster (it has no
+    /// card), before the setting is read, and from a server without the relay, which draws none of
+    /// them. An id the card does not draw, the plan on the server's own machine's among them, is
+    /// no control of it either.
+    fn opencodex_command(&self, target: &str) -> Option<Result<Command, String>> {
+        let ours = [
+            ids::RELAY_DETAIL,
+            ids::RELAY_ADDR,
+            ids::RELAY_KEY,
+            ids::RELAY_KEY_REMOVE,
+            ids::RELAY_UNAVAILABLE,
+            ids::REPLY_SOURCE_SAVE,
+            ids::REPLY_SOURCE_ERROR,
+            ids::REPLY_SOURCE_HINT,
+            ids::REPLY_SOURCE_UNAVAILABLE,
+        ];
+        if ours.contains(&target) {
+            return Some(self.opencodex_control(target));
+        }
+        // Everything else of Settings → Relay is gone with the page: its tab, its section, its
+        // card, its switch and its lines, and the plan on the server's own machine that it no
+        // longer sets up. A driver that still asks for one is told where the relay is.
+        let retired = target == RETIRED_RELAY_TAB
+            || target.starts_with("settings-relay")
+            || target.starts_with("settings-reply-source");
+        retired.then(|| {
+            Err(format!(
+                "no `{target}` on screen: Settings → Relay is gone, and each computer has its own \
+                 Relay your plan switch on its card on Settings → Computer \
+                 (`settings-computer-{{id}}-relay`)"
+            ))
+        })
+    }
+
+    fn opencodex_control(&self, target: &str) -> Result<Command, String> {
+        if let Some(off) = self.off_the_computer_page(target) {
+            return Err(off);
+        }
+        if !self.computers.iter().any(|card| card.this_computer) {
             return Err(format!(
-                "`{target}` is on Settings → Reply source, which is not what is on screen: open \
-                 it with `{}`",
-                ids::SETTINGS_REPLY_SOURCE
+                "no `{target}` on screen: this computer is not among the computers listed yet"
             ));
         }
         let snap = &self.reply_source;
         let settings = &snap.settings;
-        let Some(kept) = settings.kept_source() else {
-            let line = reply_source::unavailable_line(settings).unwrap_or(reply_source::ASKING);
-            return Err(format!("no `{target}` on screen: {line}"));
-        };
-        let dead = || {
-            let why = if settings.saving.is_some() {
-                "a Save is with the server"
+        if settings.kept_source().is_none() {
+            let line = computers::unavailable_line(settings).unwrap_or(computers::ASKING);
+            return if target == ids::REPLY_SOURCE_UNAVAILABLE {
+                Err(format!("`{target}` is a line on the card, not a control"))
             } else {
-                "the setting is being read, and Save waits for what it brings"
+                Err(format!("no `{target}` on screen: {line}"))
             };
-            Err(format!("`{target}` is dead: {why}"))
-        };
-        // The plan's controls: dead while the page is, and where the server is not on this Mac.
-        let plan = |command: Command| {
-            if !settings.can_edit() {
-                dead()
-            } else if !settings.server_on_this_mac {
-                Err(format!(
-                    "`{target}` is dead: {}",
-                    reply_source::ELSEWHERE_LINE
-                ))
-            } else {
-                Ok(command)
-            }
-        };
-        if target == ids::REPLY_SOURCE_URL || target == ids::REPLY_SOURCE_KEY {
-            return Err(format!("`{target}` is a field: use set_value"));
         }
-        if target == ids::REPLY_SOURCE_MODEL {
-            return Err(format!(
-                "`{target}` is the menu: a pick is a click on its choice, `{}`, or `{}`",
-                ids::reply_source_model("{model}"),
-                ids::REPLY_SOURCE_NO_MODEL
-            ));
+        if !settings.knows_relay() {
+            return Err(
+                if target == ids::RELAY_UNAVAILABLE || target == ids::REPLY_SOURCE_ERROR {
+                    format!("`{target}` is a line on the card, not a control")
+                } else {
+                    format!(
+                        "no `{target}` on screen: {}",
+                        computers::RELAY_NOT_ON_SERVER
+                    )
+                },
+            );
+        }
+        if target == ids::RELAY_ADDR || target == ids::RELAY_KEY {
+            return Err(format!("`{target}` is a field: use set_value"));
         }
         if target == ids::REPLY_SOURCE_SAVE {
             return if snap.can_save {
                 Ok(Command::SaveReplySource)
-            } else if !settings.can_edit() || settings.reading.is_some() {
-                dead()
+            } else if settings.reading.is_some() {
+                Err(format!(
+                    "`{target}` is dead: the setting is being read, and Save waits for what it \
+                     brings"
+                ))
             } else if let Some(hint) = snap.hint.filter(|_| snap.unsaved) {
                 Err(format!("`{target}` is dead: {hint}"))
             } else {
                 Err(format!(
-                    "`{target}` is dead: nothing on the page differs from what the server keeps"
+                    "`{target}` is dead: nothing on the card differs from what this computer \
+                     keeps"
                 ))
             };
         }
-        if target == ids::REPLY_SOURCE_REMOVE_KEY {
-            return if kept.has_api_key {
-                plan(Command::ToggleRemoveReplySourceKey)
-            } else {
-                Err(format!("no `{target}` on screen: the server holds no key"))
-            };
-        }
-        if target == ids::REPLY_SOURCE_NO_MODEL {
-            return if settings.shown_model().is_some() {
-                plan(Command::ClearReplySourceModel)
+        if target == ids::RELAY_KEY_REMOVE {
+            return if snap.relay.has_key {
+                Ok(Command::ToggleRemoveRelayKey)
             } else {
                 Err(format!(
-                    "no `{target}` on screen: no model is shown to take away"
+                    "no `{target}` on screen: this computer's secure storage holds no key"
                 ))
             };
         }
-        if let Some(kind) = crate::opengrok::InferenceKind::ALL
-            .into_iter()
-            .find(|kind| target == ids::reply_source_kind(*kind))
-        {
-            return match kind {
-                crate::opengrok::InferenceKind::Gateway if settings.can_edit() => {
-                    Ok(Command::PickReplySourceKind(kind))
-                }
-                crate::opengrok::InferenceKind::Gateway => dead(),
-                crate::opengrok::InferenceKind::LocalProxy => {
-                    plan(Command::PickReplySourceKind(kind))
-                }
-            };
-        }
-        if let Some(model) = target.strip_prefix(&format!("{}-", ids::REPLY_SOURCE_MODEL)) {
-            return if !snap.models.iter().any(|offered| offered == model) {
-                Err(format!(
-                    "no `{target}` on screen: the picker offers no model `{model}`"
-                ))
-            } else {
-                plan(Command::PickReplySourceModel(model.to_string()))
-            };
-        }
-        Err(format!("`{target}` is a line on the page, not a control"))
+        Err(format!("`{target}` is a line on the card, not a control"))
     }
 
-    /// Why Settings → Reply source's URL or key field takes no typing now, or `None` while it
-    /// does: the page's own reasons for drawing it read-only, as the radio and the picker give
-    /// them for a click. Off the page, before the setting is read, while a Save is out, where
-    /// the server is not on this Mac, and the key while Remove key is picked. Every way a driver
-    /// types asks it first (`set_value`, `type`, `key`), so none of them reaches a draft the
-    /// window would not let a person change.
-    fn reply_source_field_closed(&self, target: &str) -> Option<String> {
-        if !(self.account_open && self.reply_source_tab) {
+    /// Why the relay's address or key field takes no typing now, or `None` while it does: the
+    /// page's own reasons for drawing it read-only. Off the page, before the setting is read,
+    /// from a server without the relay, and the key while Remove key is picked. Every way a
+    /// driver types asks it first (`set_value`, `type`, `key`), so none of them reaches a draft
+    /// the window would not let a person change.
+    fn relay_field_closed(&self, target: &str) -> Option<String> {
+        if let Some(off) = self.off_the_computer_page(target) {
+            return Some(off);
+        }
+        if !self.computers.iter().any(|card| card.this_computer) {
             return Some(format!(
-                "`{target}` is on Settings → Reply source, which is not what is on screen: open \
-                 it with `{}`",
-                ids::SETTINGS_REPLY_SOURCE
+                "no `{target}` on screen: this computer is not among the computers listed yet"
             ));
         }
         let settings = &self.reply_source.settings;
         if settings.kept_source().is_none() {
-            let line = reply_source::unavailable_line(settings).unwrap_or(reply_source::ASKING);
+            let line = computers::unavailable_line(settings).unwrap_or(computers::ASKING);
             return Some(format!("no `{target}` on screen: {line}"));
         }
-        if !settings.can_edit() {
-            return Some(format!("`{target}` is dead: a Save is with the server"));
-        }
-        if !settings.plan_editable() {
+        if !settings.knows_relay() {
             return Some(format!(
-                "`{target}` is dead: {}",
-                reply_source::ELSEWHERE_LINE
+                "no `{target}` on screen: {}",
+                computers::RELAY_NOT_ON_SERVER
             ));
         }
-        if target == ids::REPLY_SOURCE_KEY && !settings.key_editable() {
+        if target == ids::RELAY_KEY && !settings.relay_key_editable() {
             return Some(format!(
                 "`{target}` is dead: Remove key waits for Save; `{}`, now Keep key, takes it back",
-                ids::REPLY_SOURCE_REMOVE_KEY
+                ids::RELAY_KEY_REMOVE
             ));
         }
         None
     }
 
-    /// `set_value` on Settings → Reply source's URL or key field, as typing it there would; the
-    /// key goes to the page, which draws it masked, and never into a tree. Refused wherever the
-    /// page draws the field read-only ([`Self::reply_source_field_closed`]).
-    fn set_reply_source_field(
-        &mut self,
-        target: &str,
-        value: &str,
-    ) -> Result<DispatchResult, String> {
-        if let Some(closed) = self.reply_source_field_closed(target) {
+    /// `set_value` on the relay's address or key field, as typing it there would. The key goes
+    /// to the page, drawn masked, and never into a tree.
+    fn set_relay_field(&mut self, target: &str, value: &str) -> Result<DispatchResult, String> {
+        if let Some(closed) = self.relay_field_closed(target) {
             return Err(closed);
         }
-        self.pending = Some(if target == ids::REPLY_SOURCE_URL {
-            Command::SetReplySourceUrl(value.to_string())
+        self.pending = Some(if target == ids::RELAY_ADDR {
+            Command::SetRelayAddress(value.to_string())
         } else {
-            Command::SetReplySourceKey(RedactedSecret(value.to_string()))
+            Command::SetRelayKey(RedactedSecret(value.to_string()))
         });
         Ok(DispatchResult::empty())
+    }
+
+    /// Keys aimed at the relay's fields one by one: `key` on either, `type` on the key. They are
+    /// refused, and say what writes the field instead, or first why the page draws it read-only.
+    /// What the key field holds is never copied here, so there is nothing to add a key to or
+    /// take one off: the key is written whole. The address is written by `set_value`, and
+    /// `type` adds to it.
+    fn relay_field_keys(&self, target: &str) -> String {
+        if let Some(closed) = self.relay_field_closed(target) {
+            return closed;
+        }
+        if target == ids::RELAY_KEY {
+            format!("`{target}` takes the whole key: use set_value")
+        } else {
+            format!("`{target}` takes text, not single keys: use set_value, or type to add to it")
+        }
     }
 
     /// Settings → Logins as the page draws it: the search field with Add beside it, Import…,
@@ -5432,22 +7110,42 @@ impl NativeChatHost {
         })
     }
 
+    fn sidebar_toggle_node(&self) -> UiNode {
+        UiNode::button(ids::NAV_TOGGLE, "Hide sidebar")
+    }
+
     fn click(&mut self, target: &str) -> Result<DispatchResult, String> {
         let cmd = if target == ids::NAV_NEW_CHAT || target == "create-first-bot" {
             Command::NewChat
-        } else if target == ids::NAV_TOGGLE {
+        } else if target == ids::HEADER_LEFT_SIDEBAR {
+            if !self.sidebar_hidden {
+                return Err("the sidebar is already visible".into());
+            }
             Command::ToggleSidebar
+        } else if target == ids::NAV_TOGGLE {
+            if self.sidebar_hidden {
+                return Err("the sidebar control is hidden".into());
+            }
+            Command::ToggleSidebar
+        } else if target == ids::HEADER_MONITOR {
+            Command::ToggleComputerPane
+        } else if target == ids::HEADER_COWORKER {
+            if !self.sessions.iter().any(|session| session.active) {
+                return Err("the Bot chip is there only while a Bot is open".into());
+            }
+            Command::PressBotChip
+        } else if target == ids::HEADER_RIGHT_SIDEBAR {
+            if self.computer_open {
+                Command::ToggleComputerPane
+            } else {
+                Command::ToggleAgentSettings
+            }
         } else if target == ids::FOOTER_THEME {
             Command::ToggleTheme
         } else if target == ids::FOOTER_ACCOUNT {
             Command::ToggleAccount
         } else if target == ids::HEADER_SETTINGS || target == ids::AGENT_SETTINGS {
             Command::ToggleAgentSettings
-        } else if target == ids::CHAT_ROUTINE_BACK {
-            if self.routine_thread.is_none() {
-                return Err("the open thread is the bot's own chat already".to_string());
-            }
-            Command::BackToBotChat
         } else if target == "agent-tools-toggle" {
             if !self.agent_settings_open {
                 return Err(
@@ -5494,16 +7192,8 @@ impl NativeChatHost {
                 return Err("`agent-save` is in the bot's settings, which are closed".into());
             }
             Command::SaveAgentSettings
-        } else if target == "agent-effort" {
-            return Err(
-                "`agent-effort` is the menu: a pick is a click on its choice, \
-                 `agent-effort-{word}`"
-                    .into(),
-            );
-        } else if let Some(word) = target.strip_prefix("agent-effort-") {
-            self.effort_command(target, word)?
-        } else if target == "agent-model-field" || target == "agent-model-dismiss" {
-            Command::ToggleModelPicker
+        } else if target == "agent-model-dismiss" {
+            Command::SetModelPicker(false)
         } else if target == "avatar-trigger" || target == "avatar-editor-dismiss" {
             Command::ToggleAvatarEditor
         } else if target == ids::LOGIN_SUBMIT {
@@ -5580,11 +7270,22 @@ impl NativeChatHost {
                 );
             }
             Command::RetryTurn
+        } else if target == ids::RUN_ERROR_SEND_ON_SERVER {
+            if !self.can_send_on_server {
+                return Err(
+                    "there is no turn to send on the server's keys: the open thread's last turn \
+                     is not one the person's plan could not answer"
+                        .to_string(),
+                );
+            }
+            Command::SendOnServer
         } else if let Some(cmd) = self.reply_run_command(target) {
             cmd?
-        } else if let Some(cmd) = self.reply_source_command(target) {
-            // Before the composer's catch-all below: unlike the panel and the draft's chips, the
-            // reply-source chip is clicked, as a person clicks it.
+        } else if let Some(cmd) = self.computer_card_command(target) {
+            cmd?
+        } else if let Some(cmd) = self.default_models_command(target) {
+            cmd?
+        } else if let Some(cmd) = self.model_picker_command(target) {
             cmd?
         } else if target == ids::COMPOSER_SEND {
             if !self.turn_in_flight {
@@ -5631,6 +7332,19 @@ impl NativeChatHost {
             Command::SetAppSettingsTab(AppSettingsTab::Updates)
         } else if target == "app-settings-back" {
             Command::CloseAppSettings
+        } else if target == ids::COMPUTER_GET {
+            if !self.computer_open || self.computer_error.is_none() {
+                return Err(format!(
+                    "`{target}` is on the Computer pane only while it says why the bot has no \
+                     computer"
+                ));
+            }
+            if self.computer_asking {
+                return Err(format!(
+                    "`{target}` waits while the server is being asked for a computer"
+                ));
+            }
+            Command::GetComputer
         } else if target == "computer-update" || target == "settings-computer-update" {
             Command::OpenComputerConfirm(crate::state::ComputerAction::Update)
         } else if target == "computer-reset" {
@@ -5662,7 +7376,34 @@ impl NativeChatHost {
             Command::CloseNetworkPolicy
         } else if target == ids::ROUTINE_NEW {
             Command::OpenRoutineEditor(None)
+        } else if target == ids::ROUTINE_DELETE_CONFIRM || target == ids::ROUTINE_DELETE_CANCEL {
+            if self.routine_delete_question.is_none() {
+                return Err(format!(
+                    "`{target}` answers Delete's question, which is not asked"
+                ));
+            }
+            if target == ids::ROUTINE_DELETE_CONFIRM {
+                Command::ConfirmRoutineDelete
+            } else {
+                Command::CancelRoutineDelete
+            }
+        } else if let Some(cmd) = self.wake_command(target) {
+            cmd?
+        } else if [
+            ids::ROUTINE_HISTORY_TOGGLE,
+            ids::ROUTINE_OPEN_THREAD,
+            ids::ROUTINE_RUN_NOW,
+            ids::ROUTINE_DELETE,
+        ]
+        .contains(&target)
+        {
+            self.routine_header_command(target)?
+        } else if let Some(why) = self.skipped_line_refusal(target) {
+            return Err(why);
         } else if let Some(cmd) = self.routine_command(target) {
+            if let Command::RunRoutineNow { routine_id } = &cmd {
+                self.refuse_dead_test_run(target, routine_id)?;
+            }
             cmd
         } else if let Some(id) = self.site_login_delete_target(target) {
             Command::DeleteSiteLogin { id }
@@ -5701,8 +7442,32 @@ impl NativeChatHost {
         if target == ids::SKILLS_SEARCH {
             return self.skills_search(value.to_string());
         }
-        if target == ids::REPLY_SOURCE_URL || target == ids::REPLY_SOURCE_KEY {
-            return self.set_reply_source_field(target, value);
+        if target == ids::RELAY_ADDR || target == ids::RELAY_KEY {
+            return self.set_relay_field(target, value);
+        }
+        if let Some(which) = picker_field(target, |ids| ids.effort) {
+            return self.set_picker_effort(which, target, value);
+        }
+        if let Some(which) = picker_field(target, |ids| ids.search) {
+            return self.set_picker_search(which, target, value);
+        }
+        if let Some(which) = [
+            crate::state::WakeBox::Every,
+            crate::state::WakeBox::Hour,
+            crate::state::WakeBox::Minute,
+            crate::state::WakeBox::Cron,
+        ]
+        .into_iter()
+        .find(|which| target == ids::routine_wake_box(*which))
+        {
+            if self.routine_wake_editor.is_none() {
+                return Err(format!("`{target}` is in the wake editor, which is shut"));
+            }
+            self.pending = Some(Command::SetWakeBox {
+                which,
+                text: value.to_string(),
+            });
+            return Ok(DispatchResult::empty());
         }
         if let Some(refusal) = self.skill_sheet_field(target) {
             return refusal;
@@ -5736,12 +7501,16 @@ impl NativeChatHost {
         if target == ids::SKILLS_SEARCH {
             return self.skills_search(format!("{}{text}", self.skills_query));
         }
-        if target == ids::REPLY_SOURCE_URL {
-            let url = format!("{}{text}", self.reply_source.settings.shown_url());
-            return self.set_reply_source_field(target, &url);
+        if target == ids::RELAY_ADDR {
+            let address = format!("{}{text}", self.reply_source.relay.address);
+            return self.set_relay_field(target, &address);
         }
-        if target == ids::REPLY_SOURCE_KEY {
-            return Err(self.reply_source_field_keys(target));
+        if target == ids::RELAY_KEY {
+            return Err(self.relay_field_keys(target));
+        }
+        if let Some(which) = picker_field(target, |ids| ids.search) {
+            let query = format!("{}{text}", self.picker_snap(which).1.search);
+            return self.set_picker_search(which, target, &query);
         }
         if let Some(refusal) = self.skill_sheet_field(target) {
             return refusal;
@@ -5753,22 +7522,6 @@ impl NativeChatHost {
         })
     }
 
-    /// Keys aimed at Settings → Reply source's URL or key field, one by one: `key` on either,
-    /// `type` on the key. They are refused, and say what writes the field instead, or first why
-    /// the page draws it read-only. What the key field holds is never copied here, so there is
-    /// nothing to add a key to or take one off: the key is written whole. The URL is written by
-    /// `set_value`, and `type` adds to it.
-    fn reply_source_field_keys(&self, target: &str) -> String {
-        if let Some(closed) = self.reply_source_field_closed(target) {
-            return closed;
-        }
-        if target == ids::REPLY_SOURCE_KEY {
-            format!("`{target}` takes the whole key: use set_value")
-        } else {
-            format!("`{target}` takes text, not single keys: use set_value, or type to add to it")
-        }
-    }
-
     /// Press one key. No modifiers: a chord is `op keybinding`'s business, not this one's.
     fn key(&mut self, target: &str, key: &str) -> Result<DispatchResult, String> {
         if let Some(field) = login_field(target) {
@@ -5777,8 +7530,8 @@ impl NativeChatHost {
         if let Some(refusal) = self.skill_sheet_field(target) {
             return refusal;
         }
-        if target == ids::REPLY_SOURCE_URL || target == ids::REPLY_SOURCE_KEY {
-            return Err(self.reply_source_field_keys(target));
+        if target == ids::RELAY_ADDR || target == ids::RELAY_KEY {
+            return Err(self.relay_field_keys(target));
         }
         if target == ids::SKILLS_SEARCH {
             return match key_token(key)?.as_str() {
@@ -5792,6 +7545,23 @@ impl NativeChatHost {
                 // would be the same lie as taking the text.
                 "enter" if self.account_open && self.skills_tab => Ok(DispatchResult::empty()),
                 "enter" => Err(skills_off_screen(target)),
+                other => Err(format!(
+                    "unhandled key `{other}` on `{target}` (Enter, Backspace)"
+                )),
+            };
+        }
+        if let Some(which) = picker_field(target, |ids| ids.search) {
+            if let Some(closed) = self.picker_search_closed(which, target) {
+                return Err(closed);
+            }
+            return match key_token(key)?.as_str() {
+                "backspace" => {
+                    let mut query = self.picker_snap(which).1.search.clone();
+                    query.pop();
+                    self.set_picker_search(which, target, &query)
+                }
+                // The list filters as the text changes; Enter has nothing left to do.
+                "enter" => Ok(DispatchResult::empty()),
                 other => Err(format!(
                     "unhandled key `{other}` on `{target}` (Enter, Backspace)"
                 )),
@@ -5934,33 +7704,6 @@ impl NativeChatHost {
         }
     }
 
-    /// A choice in the bot settings' Effort menu. Refused while the settings are closed, from a
-    /// server that keeps no effort, where the menu is dead, and for a word the menu does not offer.
-    fn effort_command(&self, target: &str, word: &str) -> Result<Command, String> {
-        if !self.agent_settings_open {
-            return Err(format!(
-                "`{target}` is in the bot's settings, which are closed"
-            ));
-        }
-        let Some(effort) = &self.agent_effort else {
-            return Err(format!("`{target}` is not on screen: no bot is open"));
-        };
-        if effort.kept.is_none() {
-            return Err(format!(
-                "`{target}` is dead: this server keeps no effort (it is from before \
-                 opengrok-server#271)"
-            ));
-        }
-        let choices = effort_choices(effort.kept_word());
-        if !choices.iter().any(|choice| choice == word) {
-            return Err(format!(
-                "no effort `{word}` in the menu, which offers {}",
-                choices.join(", ")
-            ));
-        }
-        Ok(Command::PickEffort(word.to_string()))
-    }
-
     /// A button under one connected computer's local-exec mode.
     fn computer_exec_command(&self, target: &str) -> Option<Command> {
         use crate::opengrok::LocalExecMode;
@@ -5969,7 +7712,8 @@ impl NativeChatHost {
         if !(self.account_open && self.computer_tab) {
             return None;
         }
-        self.computers.iter().find_map(|(machine, _, _, _)| {
+        self.computers.iter().find_map(|card| {
+            let machine = &card.machine_id;
             [
                 LocalExecMode::Always,
                 LocalExecMode::Ask,
@@ -5981,6 +7725,29 @@ impl NativeChatHost {
                 machine_id: machine.clone(),
                 mode,
             })
+        })
+    }
+
+    /// Why a click on a skipped line of a routine's Run history does nothing, or `None` for a
+    /// target that is not one: the firing started no run, so there is no thread to open at it.
+    fn skipped_line_refusal(&self, target: &str) -> Option<String> {
+        let rest = target.strip_prefix("routine-")?;
+        self.routines.iter().find_map(|routine| {
+            let at = rest
+                .strip_prefix(routine.id.as_str())?
+                .strip_prefix("-skipped-")?;
+            routine
+                .runs
+                .iter()
+                .any(|line| {
+                    matches!(line, RunLineSnap::Skipped { at_ms, .. } if at_ms.to_string() == at)
+                })
+                .then(|| {
+                    format!(
+                        "`{target}` is a firing the server skipped: it started no run, so there \
+                         is nothing to open"
+                    )
+                })
         })
     }
 
@@ -5999,12 +7766,27 @@ impl NativeChatHost {
             if let Some(run) = rest
                 .strip_prefix(routine.id.as_str())
                 .and_then(|tail| tail.strip_prefix("-run-"))
-                && routine.runs.iter().any(|(id, _, _)| id == run)
+                && routine
+                    .runs
+                    .iter()
+                    .any(|line| matches!(line, RunLineSnap::Ran { run_id, .. } if run_id == run))
             {
-                return Some(Command::OpenRoutineThread {
+                return Some(Command::OpenRoutineRun {
                     routine_id: routine.id.clone(),
+                    run_id: run.to_string(),
                 });
             }
+        }
+        // The switch asks for the other way from where it stands, so it is read off the row
+        // and not off the id alone.
+        if let Some(routine) = rest
+            .strip_suffix("-active")
+            .and_then(|id| self.routines.iter().find(|routine| routine.id == id))
+        {
+            return Some(Command::SetRoutineActive {
+                routine_id: routine.id.clone(),
+                active: !routine.active,
+            });
         }
         let mut cmd: Option<(&str, fn(String) -> Command)> = None;
         for (tail, make) in [
@@ -6040,7 +7822,7 @@ impl NativeChatHost {
             ),
             (
                 "-delete",
-                (|id| Command::DeleteRoutine { routine_id: id }) as fn(String) -> Command,
+                (|id| Command::AskDeleteRoutine { routine_id: id }) as fn(String) -> Command,
             ),
         ] {
             if let Some(id) = rest.strip_suffix(tail) {
@@ -6066,6 +7848,7 @@ impl NativeChatHost {
             "chat.new" => Command::NewChat,
             "sidebar.toggle" => Command::ToggleSidebar,
             "sidebar.mini" => Command::ToggleMiniSidebar,
+            // The Model card's popover in the Bot's settings, as these once opened its model list.
             "model.picker" => Command::ToggleModelPicker,
             "model.picker.open" => Command::SetModelPicker(true),
             "model.picker.close" => Command::SetModelPicker(false),
@@ -6427,11 +8210,25 @@ impl NativeChatHost {
                     .ok_or_else(|| "recipe.run: no bot is granted this recipe".to_string())?;
                 Command::RunOpenRecipe(bot)
             }
-            "routine.run" => Command::RunRoutineNow {
-                routine_id: self.invoke_routine_id(args, "routine.run")?,
-            },
+            "routine.run" => {
+                let routine_id = self.invoke_routine_id(args, "routine.run")?;
+                self.refuse_dead_test_run("routine.run", &routine_id)?;
+                Command::RunRoutineNow { routine_id }
+            }
             "routine.edit" => {
                 let routine_id = self.invoke_routine_id(args, "routine.edit")?;
+                // The fields are dead on a server that cannot change a routine; an edit by name
+                // is refused in the same words, as the app would refuse it.
+                if self
+                    .routines
+                    .iter()
+                    .any(|routine| routine.id == routine_id && routine.cant_change())
+                {
+                    return Err(format!(
+                        "routine.edit is refused: {}",
+                        crate::state::ROUTINE_EDIT_UNAVAILABLE
+                    ));
+                }
                 let name = invoke_arg_str(args, &["name"]);
                 let prompt = invoke_arg_str(args, &["prompt", "instruction"]);
                 if name.is_none() && prompt.is_none() {
@@ -6447,6 +8244,153 @@ impl NativeChatHost {
         };
         self.pending = Some(cmd);
         Ok(DispatchResult::empty())
+    }
+
+    /// One of the open routine's header icons, refused when no routine is open or when the icon
+    /// is dead, in the words its tooltip says it in.
+    fn routine_header_command(&self, target: &str) -> Result<Command, String> {
+        let open = self
+            .open_routine()
+            .ok_or_else(|| format!("`{target}` is in a routine's header, and none is open"))?;
+        let routine_id = open.id.clone();
+        let on_the_server = open.kind != "draft";
+        Ok(match target {
+            ids::ROUTINE_HISTORY_TOGGLE => Command::ToggleRoutineHistory,
+            ids::ROUTINE_OPEN_THREAD if !on_the_server => {
+                return Err(format!(
+                    "`{target}` is dead: choose when it runs first; its thread is on the server"
+                ));
+            }
+            ids::ROUTINE_OPEN_THREAD => Command::OpenRoutineThread { routine_id },
+            ids::ROUTINE_RUN_NOW if !on_the_server => {
+                return Err(format!(
+                    "`{target}` is dead: choose when it runs first, then run it"
+                ));
+            }
+            ids::ROUTINE_RUN_NOW => {
+                self.refuse_dead_test_run(target, &routine_id)?;
+                Command::RunRoutineNow { routine_id }
+            }
+            _ => Command::AskDeleteRoutine { routine_id },
+        })
+    }
+
+    /// A click on "When to run" or in the wake editor, refused where the panel's control is dead,
+    /// in the words it says it in. `None` for a target that is not one of theirs.
+    fn wake_command(&self, target: &str) -> Option<Result<Command, String>> {
+        use crate::state::{WakeBox, WakeTab};
+        let rest = target.strip_prefix("routine-wake-")?;
+        let Some(open) = self.open_routine() else {
+            return Some(Err(format!(
+                "`{target}` is in a routine's panel, and none is open"
+            )));
+        };
+        let editor = self.routine_wake_editor.as_ref();
+        let dead = |why: &str| Some(Err(format!("`{target}` is dead: {why}")));
+        if target == ids::ROUTINE_WAKE_ADD {
+            if !open.wakes.is_empty() {
+                return dead(crate::state::ONE_WAKE_PER_ROUTINE);
+            }
+            if editor.is_some() {
+                return dead("the wake editor is open");
+            }
+            return Some(Ok(Command::OpenWakeEditor { index: None }));
+        }
+        if let Some(at) = rest
+            .strip_prefix("edit-")
+            .and_then(|at| at.parse::<usize>().ok())
+        {
+            let Some((_, webhook)) = open.wakes.get(at) else {
+                return Some(Err(format!("the open routine has no wake {at}")));
+            };
+            if !webhook && open.cant_change() {
+                return dead(crate::state::ROUTINE_EDIT_UNAVAILABLE);
+            }
+            return Some(Ok(Command::OpenWakeEditor { index: Some(at) }));
+        }
+        if rest.starts_with("delete-") {
+            return dead(crate::state::LAST_WAKE_STAYS);
+        }
+        let Some((editor, status)) = editor else {
+            return Some(Err(format!(
+                "`{target}` is in the wake editor, which is shut"
+            )));
+        };
+        let cmd = if let Some(word) = rest.strip_prefix("tab-") {
+            let tab = WakeTab::ALL.into_iter().find(|tab| tab.word() == word)?;
+            if !editor.tab_open(tab) {
+                return dead("a routine stays the kind it was made");
+            }
+            Command::PickWakeTab(tab)
+        } else if let Some((which, up)) = [WakeBox::Every, WakeBox::Hour, WakeBox::Minute]
+            .into_iter()
+            .flat_map(|which| [(which, true), (which, false)])
+            .find(|(which, up)| {
+                target
+                    == format!(
+                        "{}-{}",
+                        ids::routine_wake_box(*which),
+                        if *up { "up" } else { "down" }
+                    )
+            })
+        {
+            Command::StepWakeBox { which, up }
+        } else if let Some(unit) = [
+            crate::state::ScheduleUnit::Minutes,
+            crate::state::ScheduleUnit::Hours,
+            crate::state::ScheduleUnit::Days,
+        ]
+        .into_iter()
+        .find(|unit| target == ids::routine_wake_unit(*unit))
+        {
+            Command::SetWakeUnit(unit)
+        } else if target == ids::ROUTINE_WAKE_AM || target == ids::ROUTINE_WAKE_PM {
+            Command::SetWakePm(target == ids::ROUTINE_WAKE_PM)
+        } else if let Some(day) = rest.strip_prefix("day-").and_then(|d| d.parse::<u8>().ok()) {
+            Command::ToggleWakeDay(day)
+        } else if let Some(date) = rest
+            .strip_prefix("date-")
+            .and_then(|d| d.parse::<u8>().ok())
+        {
+            Command::ToggleWakeDate(date)
+        } else if let Some(month) = rest
+            .strip_prefix("month-")
+            .and_then(|m| m.parse::<u8>().ok())
+        {
+            Command::ToggleWakeMonth(month)
+        } else if target == ids::ROUTINE_WAKE_SAVE {
+            if let Some(why) = &status.error {
+                return dead(why);
+            }
+            Command::SaveWake
+        } else if target == ids::ROUTINE_WAKE_CANCEL {
+            Command::CloseWakeEditor
+        } else {
+            return None;
+        };
+        Some(Ok(cmd))
+    }
+
+    /// The routine open in the Computer pane, as the tree lists it.
+    fn open_routine(&self) -> Option<&RoutineSnap> {
+        let open = self.routine_editor.as_deref()?;
+        self.routines.iter().find(|routine| routine.id == open)
+    }
+
+    /// Test run on a server that cannot run a routine on demand is dead on screen, and refused
+    /// here in the words the editor says it in.
+    fn refuse_dead_test_run(&self, target: &str, routine_id: &str) -> Result<(), String> {
+        if self
+            .routines
+            .iter()
+            .any(|routine| routine.id == routine_id && routine.run_dead())
+        {
+            return Err(format!(
+                "`{target}` is dead: {}",
+                crate::state::ROUTINE_RUN_UNAVAILABLE
+            ));
+        }
+        Ok(())
     }
 
     /// The routine an invoke names, checked against the ones on screen: an id nobody is
@@ -6544,7 +8488,128 @@ mod tests {
             webhook_url: (kind == "webhook").then(|| "https://og.example/hooks/sch_2".to_string()),
             webhook_key: (kind == "webhook").then(|| "og_live_abc".to_string()),
             runs: Vec::new(),
+            notes: Vec::new(),
+            runs_unavailable: false,
+            unsaved: Vec::new(),
+            wakes: match kind {
+                "cron" => vec![("Every day at 9:00 AM".into(), false)],
+                "webhook" => vec![("When a webhook fires".into(), true)],
+                _ => Vec::new(),
+            },
+            zone: None,
         }
+    }
+
+    /// A run's line of a routine's Run history, as the tree is given it.
+    fn ran(run_id: &str, cause: &'static str, status: &'static str) -> RunLineSnap {
+        RunLineSnap::Ran {
+            run_id: run_id.into(),
+            cause: cause.into(),
+            status,
+        }
+    }
+
+    /// A run a Bot started with its `run_routine` tool (opengrok-server #337, built in #342) is on
+    /// the tree as the window says it, `Run by Luna`, for the run and for a firing its press set off
+    /// that the plan could not answer; the person's own Test run says what it always said, and
+    /// nothing of any Bot.
+    #[test]
+    fn a_run_a_bot_started_is_on_the_tree_as_the_window_says_it() {
+        use crate::opengrok::{RunCause, ScheduleRunStatus};
+        use crate::state::{AgentRoutine, RoutineRun, RunOutcome};
+        let line = |cause, by: Option<&str>, outcome| RoutineRun {
+            at: String::new(),
+            started_at_ms: 1_790_000_000_000,
+            cause,
+            by: by.map(str::to_string),
+            outcome,
+        };
+        let row = AgentRoutine {
+            id: "sch-1-3".into(),
+            name: "Standup".into(),
+            instruction: "post the standup".into(),
+            active: true,
+            triggers: Vec::new(),
+            runs: vec![
+                line(
+                    RunCause::Bot,
+                    Some("Luna"),
+                    RunOutcome::Ran {
+                        run_id: "run_b".into(),
+                        status: ScheduleRunStatus::Ok,
+                    },
+                ),
+                line(
+                    RunCause::Bot,
+                    Some("Luna"),
+                    RunOutcome::Skipped {
+                        reason: "Skipped: Relay is off for your plan".into(),
+                    },
+                ),
+                line(
+                    RunCause::Manual,
+                    None,
+                    RunOutcome::Ran {
+                        run_id: "run_m".into(),
+                        status: ScheduleRunStatus::Ok,
+                    },
+                ),
+            ],
+            saved: None,
+            tz: None,
+        };
+        let mut fired = routine("sch-1-3", "cron");
+        fired.runs = routine_snap(&row, &AppState::new()).runs;
+        let mut host = host();
+        host.computer_open = true;
+        host.routines = vec![fired];
+        let tree = host.snapshot();
+        let said = |id: String| tree.find(&id).expect("the line").name.clone();
+        assert_eq!(said(ids::routine_run("sch-1-3", "run_b")), "Run by Luna");
+        assert_eq!(
+            said(ids::routine_skipped("sch-1-3", 1_790_000_000_000)),
+            "Run by Luna"
+        );
+        assert_eq!(said(ids::routine_run("sch-1-3", "run_m")), "Test run");
+    }
+
+    /// A firing the server skipped is on the tree among the runs, by when it was due, with what
+    /// set it off and the server's sentence for why, and state `skipped`. It started no run, so
+    /// a click on it is refused in words rather than sent as an open of a run that is not there,
+    /// and the run beside it still opens.
+    #[test]
+    fn a_skipped_line_of_the_history_says_why_and_opens_nothing() {
+        let said = "Skipped: your computer was off, so your plan couldn't answer";
+        let mut host = host();
+        host.computer_open = true;
+        let mut fired = routine("sch-1-2", "cron");
+        fired.runs = vec![
+            RunLineSnap::Skipped {
+                at_ms: 1_790_000_000_000,
+                cause: "Schedule".into(),
+                reason: said.into(),
+            },
+            ran("run_a", "Test run", "ok"),
+        ];
+        host.routines = vec![fired];
+        let tree = host.snapshot();
+        let skipped = tree
+            .find(&ids::routine_skipped("sch-1-2", 1_790_000_000_000))
+            .expect("the skipped line");
+        assert_eq!(skipped.name, "Schedule");
+        assert_eq!(skipped.value.as_deref(), Some(said));
+        assert!(skipped.states.iter().any(|state| state == "skipped"));
+
+        let refused = host
+            .click(&ids::routine_skipped("sch-1-2", 1_790_000_000_000))
+            .unwrap_err();
+        assert!(refused.contains("started no run"), "{refused}");
+        assert!(host.take_command().is_none(), "nothing was opened");
+        host.click(&ids::routine_run("sch-1-2", "run_a")).unwrap();
+        assert!(matches!(
+            host.take_command().unwrap(),
+            Command::OpenRoutineRun { run_id, .. } if run_id == "run_a"
+        ));
     }
 
     /// A routine the server has can be test-run, and its history is on the tree line by line:
@@ -6555,8 +8620,8 @@ mod tests {
         host.computer_open = true;
         let mut fired = routine("sch-1-2", "webhook");
         fired.runs = vec![
-            ("run_b".into(), "Test run", "running"),
-            ("run_a".into(), "Webhook", "ok"),
+            ran("run_b", "Test run", "running"),
+            ran("run_a", "Webhook", "ok"),
         ];
         host.routines = vec![fired, routine("draft-1", "draft")];
         let tree = host.snapshot();
@@ -6573,6 +8638,478 @@ mod tests {
             host.take_command().unwrap(),
             Command::RunRoutineNow { routine_id } if routine_id == "sch-1-2"
         ));
+    }
+
+    /// The Active switch is on the tree where it stands, labelled as the editor labels it, and a
+    /// click asks for the other way: a paused routine is switched back on, an active one paused.
+    #[test]
+    fn a_routines_active_switch_reads_where_it_stands_and_flips() {
+        let mut host = host();
+        host.computer_open = true;
+        let mut paused = routine("sch-1-2", "cron");
+        paused.active = false;
+        host.routines = vec![routine("sch_1", "cron"), paused];
+        let tree = host.snapshot();
+        let on = tree.find(&ids::routine_active("sch_1")).unwrap();
+        assert_eq!(on.name, "Active");
+        assert!(on.checked == Some(true), "{on:?}");
+        let off = tree.find(&ids::routine_active("sch-1-2")).unwrap();
+        assert_eq!(off.name, "Paused");
+        assert!(off.checked == Some(false), "{off:?}");
+
+        host.click(&ids::routine_active("sch-1-2")).unwrap();
+        assert!(matches!(
+            host.take_command().unwrap(),
+            Command::SetRoutineActive { routine_id, active: true } if routine_id == "sch-1-2"
+        ));
+        host.click(&ids::routine_active("sch_1")).unwrap();
+        assert!(matches!(
+            host.take_command().unwrap(),
+            Command::SetRoutineActive { routine_id, active: false } if routine_id == "sch_1"
+        ));
+    }
+
+    /// On a server that cannot change a routine, run one on demand or list what one ran, the
+    /// routine says so where the editor does: a line for each, the history's place, what was
+    /// typed and not kept, and a Test run that is dead and refused in the editor's words, by
+    /// click and by name, as an edit by name is. The editor's red line is there while it shows.
+    #[test]
+    fn a_routine_says_what_its_server_cannot_do_with_it() {
+        let mut host = host();
+        host.computer_open = true;
+        let mut old = routine("sch_1", "cron");
+        old.notes = vec![
+            ("cant-change", crate::state::ROUTINE_EDIT_UNAVAILABLE),
+            ("cant-run", crate::state::ROUTINE_RUN_UNAVAILABLE),
+        ];
+        old.runs_unavailable = true;
+        old.unsaved = vec![("Name", "Daily".into()), ("When", "Every 1 minute".into())];
+        host.routines = vec![old, routine("sch_2", "cron")];
+        host.routine_error = Some("No such schedule".into());
+        let tree = host.snapshot();
+        let line = |id: String| tree.find(&id).map(|node| node.name.clone());
+        assert_eq!(
+            line(ids::routine_note("sch_1", "cant-change")).as_deref(),
+            Some(crate::state::ROUTINE_EDIT_UNAVAILABLE)
+        );
+        assert_eq!(
+            line(ids::routine_note("sch_1", "cant-run")).as_deref(),
+            Some(crate::state::ROUTINE_RUN_UNAVAILABLE)
+        );
+        assert_eq!(
+            line(ids::routine_runs_unavailable("sch_1")).as_deref(),
+            Some(crate::state::ROUTINE_RUNS_UNAVAILABLE)
+        );
+        let unsaved = tree.find(&ids::routine_unsaved("sch_1")).unwrap();
+        assert_eq!(
+            unsaved.value.as_deref(),
+            Some("Name: Daily\nWhen: Every 1 minute")
+        );
+        assert!(!tree.find(&ids::routine_test("sch_1")).unwrap().enabled);
+        assert!(tree.find(&ids::routine_test("sch_2")).unwrap().enabled);
+        assert!(tree.find(&ids::routine_runs_unavailable("sch_2")).is_none());
+        assert_eq!(
+            tree.find(ids::ROUTINE_ERROR).map(|node| node.name.as_str()),
+            Some("No such schedule")
+        );
+
+        let refused = host.click(&ids::routine_test("sch_1")).unwrap_err();
+        assert!(
+            refused.contains(crate::state::ROUTINE_RUN_UNAVAILABLE),
+            "{refused}"
+        );
+        assert!(
+            host.invoke("routine.run", &serde_json::json!({ "id": "sch_1" }))
+                .is_err()
+        );
+        let refused = host
+            .invoke(
+                "routine.edit",
+                &serde_json::json!({ "id": "sch_1", "name": "Daily" }),
+            )
+            .unwrap_err();
+        assert!(
+            refused.contains(crate::state::ROUTINE_EDIT_UNAVAILABLE),
+            "{refused}"
+        );
+        assert!(host.take_command().is_none(), "nothing was sent");
+        host.click(&ids::routine_test("sch_2")).unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::RunRoutineNow { routine_id }) if routine_id == "sch_2"
+        ));
+    }
+
+    /// The open routine's header carries its four icons, each acting on that routine: the
+    /// history toggle says which view it leads to and is `selected` while the history shows, and
+    /// Open in thread and Run it now are dead on a draft, Run it now also where the server cannot
+    /// run a routine on demand, each refused with its reason. With no routine open there are none.
+    #[test]
+    fn the_open_routines_header_icons_act_on_it() {
+        let mut host = host();
+        host.computer_open = true;
+        host.routines = vec![routine("sch_1", "cron"), routine("draft-1", "draft")];
+        assert!(host.snapshot().find(ids::ROUTINE_HISTORY_TOGGLE).is_none());
+        assert!(
+            host.click(ids::ROUTINE_RUN_NOW).is_err(),
+            "no routine is open"
+        );
+
+        host.routine_editor = Some("sch_1".into());
+        let tree = host.snapshot();
+        for id in [
+            ids::ROUTINE_HISTORY_TOGGLE,
+            ids::ROUTINE_OPEN_THREAD,
+            ids::ROUTINE_RUN_NOW,
+            ids::ROUTINE_DELETE,
+        ] {
+            assert!(tree.find(id).is_some_and(|node| node.enabled), "{id}");
+        }
+        assert_eq!(
+            tree.find(ids::ROUTINE_HISTORY_TOGGLE).unwrap().name,
+            "Run history"
+        );
+        let clicked = |host: &mut NativeChatHost, id: &str| {
+            host.click(id).unwrap();
+            host.take_command().unwrap()
+        };
+        assert!(matches!(
+            clicked(&mut host, ids::ROUTINE_HISTORY_TOGGLE),
+            Command::ToggleRoutineHistory
+        ));
+        assert!(matches!(
+            clicked(&mut host, ids::ROUTINE_OPEN_THREAD),
+            Command::OpenRoutineThread { routine_id } if routine_id == "sch_1"
+        ));
+        assert!(matches!(
+            clicked(&mut host, ids::ROUTINE_RUN_NOW),
+            Command::RunRoutineNow { routine_id } if routine_id == "sch_1"
+        ));
+        assert!(matches!(
+            clicked(&mut host, ids::ROUTINE_DELETE),
+            Command::AskDeleteRoutine { routine_id } if routine_id == "sch_1"
+        ));
+
+        host.routine_history_open = true;
+        let toggle = host
+            .snapshot()
+            .find(ids::ROUTINE_HISTORY_TOGGLE)
+            .cloned()
+            .unwrap();
+        assert_eq!(toggle.name, "Back to the routine");
+        assert!(toggle.states.iter().any(|state| state == "selected"));
+
+        host.routine_editor = Some("draft-1".into());
+        let tree = host.snapshot();
+        assert!(!tree.find(ids::ROUTINE_OPEN_THREAD).unwrap().enabled);
+        assert!(!tree.find(ids::ROUTINE_RUN_NOW).unwrap().enabled);
+        assert!(host.click(ids::ROUTINE_RUN_NOW).is_err());
+        assert!(host.click(ids::ROUTINE_OPEN_THREAD).is_err());
+
+        host.routine_editor = Some("sch_1".into());
+        host.routines[0].notes = vec![("cant-run", crate::state::ROUTINE_RUN_UNAVAILABLE)];
+        let run = host.snapshot().find(ids::ROUTINE_RUN_NOW).cloned().unwrap();
+        assert!(!run.enabled);
+        assert_eq!(
+            run.value.as_deref(),
+            Some(crate::state::ROUTINE_RUN_UNAVAILABLE)
+        );
+        assert!(host.click(ids::ROUTINE_RUN_NOW).is_err());
+    }
+
+    /// Delete asks first, by click as by hand: the question is on the tree while it asks, with
+    /// its two answers, and an answer with no question asked is refused.
+    #[test]
+    fn delete_asks_first_and_the_question_is_answered_by_id() {
+        let mut host = host();
+        host.routines = vec![routine("sch_1", "cron")];
+        assert!(
+            host.click(ids::ROUTINE_DELETE_CONFIRM).is_err(),
+            "nothing asked"
+        );
+        host.routine_delete_question = Some((
+            "Delete \"Morning post\"?".into(),
+            crate::state::ROUTINE_DELETE_KEEPS.into(),
+        ));
+        let tree = host.snapshot();
+        let prompt = tree.find(ids::ROUTINE_DELETE_PROMPT).unwrap();
+        assert_eq!(prompt.name, "Delete \"Morning post\"?");
+        assert_eq!(
+            prompt.value.as_deref(),
+            Some("It stops running. Its past runs and conversation stay.")
+        );
+        host.click(ids::ROUTINE_DELETE_CANCEL).unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::CancelRoutineDelete)
+        ));
+        host.click(ids::ROUTINE_DELETE_CONFIRM).unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::ConfirmRoutineDelete)
+        ));
+    }
+
+    /// A routine whose times are in another zone than this computer's names it under its wake
+    /// and under what the wake editor picked (opengrok-server #316: the server reads the line in
+    /// the routine's zone); in this computer's own zone nothing is named, nor on a webhook, which
+    /// has no times. The editor leaves the next run unsaid in a zone it cannot read the line in,
+    /// and says it in UTC, which it can.
+    #[test]
+    fn a_routines_zone_is_named_where_it_is_not_this_computers() {
+        use crate::state::{RoutineZone, ScheduleSpec, WakeEditor, WakeTab};
+        let mut host = host();
+        host.computer_open = true;
+        let mut away = routine("sch_1", "cron");
+        away.zone = Some("Europe/London".into());
+        let mut hook = routine("sch_2", "webhook");
+        hook.zone = Some("Europe/London".into());
+        host.routines = vec![away, hook, routine("sch_3", "cron")];
+        host.routine_editor = Some("sch_1".into());
+        let tree = host.snapshot();
+        assert_eq!(
+            tree.find(&ids::routine_wake_zone(0))
+                .expect("the zone under the wake")
+                .name,
+            "Europe/London"
+        );
+        host.routine_editor = Some("sch_2".into());
+        assert!(
+            host.snapshot().find(&ids::routine_wake_zone(0)).is_none(),
+            "a webhook has no times"
+        );
+        host.routine_editor = Some("sch_3".into());
+        assert!(
+            host.snapshot().find(&ids::routine_wake_zone(0)).is_none(),
+            "this computer's own zone"
+        );
+
+        host.routine_editor = Some("sch_1".into());
+        let editor = |name: &str, here: bool| WakeEditor {
+            routine_id: "sch_1".into(),
+            index: Some(0),
+            kind: Some(crate::opengrok::ScheduleKind::Cron),
+            tab: WakeTab::Daily,
+            spec: ScheduleSpec::advanced_daily(9, 0),
+            every: "1".into(),
+            hour: "9".into(),
+            minute: "00".into(),
+            pm: false,
+            opened: 1,
+            resync: 0,
+            zone: RoutineZone {
+                name: name.into(),
+                here,
+            },
+        };
+        let open = |host: &mut NativeChatHost, editor: WakeEditor| {
+            let status = editor.status(chrono::Utc::now());
+            host.routine_wake_editor = Some((editor, status));
+            host.snapshot()
+        };
+        let tree = open(&mut host, editor("Europe/London", false));
+        let zone = tree.find(ids::ROUTINE_WAKE_ZONE).expect("the zone");
+        assert_eq!(zone.name, "Europe/London time");
+        assert_eq!(zone.value.as_deref(), Some("Europe/London"));
+        assert_eq!(
+            tree.find(ids::ROUTINE_WAKE_SUMMARY).unwrap().name,
+            "Every day at 9:00 AM"
+        );
+        assert!(
+            tree.find(ids::ROUTINE_WAKE_NEXT).is_none(),
+            "no clock here for Europe/London"
+        );
+        assert!(tree.find(ids::ROUTINE_WAKE_SAVE).unwrap().enabled);
+        let tree = open(&mut host, editor("UTC", false));
+        assert_eq!(tree.find(ids::ROUTINE_WAKE_ZONE).unwrap().name, "UTC time");
+        assert!(tree.find(ids::ROUTINE_WAKE_NEXT).is_some(), "UTC is read");
+        let tree = open(&mut host, editor("Asia/Manila", true));
+        assert!(tree.find(ids::ROUTINE_WAKE_ZONE).is_none());
+        assert!(
+            tree.find(ids::ROUTINE_WAKE_NEXT).is_some(),
+            "this computer's own"
+        );
+    }
+
+    /// "When to run" on the open routine: + is dead while it has its one wake, saying why; the
+    /// wake is listed in words with ✎ live and 🗑 dead; ✎ is dead too where the server cannot
+    /// change a routine. The wake editor, while open, carries its tabs and the open tab's
+    /// controls, what was picked and Save, and clicks and `set_value` go to it, a dead one
+    /// refused in the words the panel says it in.
+    #[test]
+    fn when_to_run_lists_the_wake_and_the_editor_is_driven_by_id() {
+        use crate::state::{
+            LAST_WAKE_STAYS, ONE_WAKE_PER_ROUTINE, ROUTINE_EDIT_UNAVAILABLE, ScheduleSpec, WakeBox,
+            WakeEditor, WakeTab,
+        };
+        let mut host = host();
+        host.computer_open = true;
+        host.routines = vec![routine("sch_1", "cron"), routine("draft-1", "draft")];
+        host.routine_editor = Some("sch_1".into());
+        let tree = host.snapshot();
+        let add = tree.find(ids::ROUTINE_WAKE_ADD).unwrap();
+        assert!(!add.enabled);
+        assert_eq!(add.value.as_deref(), Some(ONE_WAKE_PER_ROUTINE));
+        assert_eq!(
+            tree.find(&ids::routine_wake(0)).unwrap().name,
+            "Every day at 9:00 AM"
+        );
+        assert!(tree.find(&ids::routine_wake_edit(0)).unwrap().enabled);
+        let delete = tree.find(&ids::routine_wake_delete(0)).unwrap();
+        assert!(!delete.enabled);
+        assert_eq!(delete.value.as_deref(), Some(LAST_WAKE_STAYS));
+        assert!(host.click(ids::ROUTINE_WAKE_ADD).is_err());
+        assert!(host.click(&ids::routine_wake_delete(0)).is_err());
+        host.click(&ids::routine_wake_edit(0)).unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::OpenWakeEditor { index: Some(0) })
+        ));
+
+        host.routine_editor = Some("draft-1".into());
+        assert!(host.snapshot().find(ids::ROUTINE_WAKE_ADD).unwrap().enabled);
+        host.click(ids::ROUTINE_WAKE_ADD).unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::OpenWakeEditor { index: None })
+        ));
+
+        host.routine_editor = Some("sch_1".into());
+        host.routines[0].notes = vec![("cant-change", ROUTINE_EDIT_UNAVAILABLE)];
+        let edit = host
+            .snapshot()
+            .find(&ids::routine_wake_edit(0))
+            .cloned()
+            .unwrap();
+        assert!(!edit.enabled);
+        assert_eq!(edit.value.as_deref(), Some(ROUTINE_EDIT_UNAVAILABLE));
+        assert!(host.click(&ids::routine_wake_edit(0)).is_err());
+        host.routines[0].notes.clear();
+
+        assert!(
+            host.click(&ids::routine_wake_day(1)).is_err(),
+            "the editor is shut"
+        );
+        let mut spec = ScheduleSpec::advanced_daily(9, 0).on_tab(WakeTab::Weekly);
+        spec.weekdays = vec![1, 2, 3, 4, 5];
+        let editor = WakeEditor {
+            routine_id: "sch_1".into(),
+            index: Some(0),
+            kind: Some(crate::opengrok::ScheduleKind::Cron),
+            tab: WakeTab::Weekly,
+            spec,
+            every: "1".into(),
+            hour: "9".into(),
+            minute: "00".into(),
+            pm: false,
+            opened: 1,
+            resync: 0,
+            zone: crate::state::RoutineZone {
+                name: "UTC".into(),
+                here: false,
+            },
+        };
+        let status = editor.status(chrono::Utc::now());
+        host.routine_wake_editor = Some((editor, status));
+        let tree = host.snapshot();
+        let weekly = tree.find(&ids::routine_wake_tab(WakeTab::Weekly)).unwrap();
+        assert!(weekly.states.iter().any(|state| state == "selected"));
+        assert!(
+            !tree
+                .find(&ids::routine_wake_tab(WakeTab::Webhook))
+                .unwrap()
+                .enabled
+        );
+        assert_eq!(
+            tree.find(&ids::routine_wake_day(1)).unwrap().checked,
+            Some(true)
+        );
+        assert_eq!(
+            tree.find(&ids::routine_wake_day(0)).unwrap().checked,
+            Some(false)
+        );
+        assert_eq!(
+            tree.find(ids::routine_wake_box(WakeBox::Hour))
+                .unwrap()
+                .value
+                .as_deref(),
+            Some("9")
+        );
+        assert_eq!(
+            tree.find(ids::ROUTINE_WAKE_SUMMARY).unwrap().name,
+            "Weekdays at 9:00 AM"
+        );
+        assert!(tree.find(ids::ROUTINE_WAKE_NEXT).is_some());
+        assert!(tree.find(ids::ROUTINE_WAKE_SAVE).unwrap().enabled);
+        assert!(
+            tree.find(&ids::routine_wake_date(1)).is_none(),
+            "the Monthly tab's"
+        );
+
+        let clicked = |host: &mut NativeChatHost, id: &str| {
+            host.click(id).unwrap();
+            host.take_command().unwrap()
+        };
+        assert!(matches!(
+            clicked(&mut host, &ids::routine_wake_tab(WakeTab::Daily)),
+            Command::PickWakeTab(WakeTab::Daily)
+        ));
+        assert!(
+            host.click(&ids::routine_wake_tab(WakeTab::Webhook))
+                .is_err()
+        );
+        assert!(matches!(
+            clicked(&mut host, &ids::routine_wake_day(6)),
+            Command::ToggleWakeDay(6)
+        ));
+        assert!(matches!(
+            clicked(&mut host, &ids::routine_wake_month(3)),
+            Command::ToggleWakeMonth(3)
+        ));
+        assert!(matches!(
+            clicked(&mut host, "routine-wake-hour-up"),
+            Command::StepWakeBox {
+                which: WakeBox::Hour,
+                up: true
+            }
+        ));
+        assert!(matches!(
+            clicked(&mut host, ids::ROUTINE_WAKE_PM),
+            Command::SetWakePm(true)
+        ));
+        assert!(matches!(
+            clicked(&mut host, ids::ROUTINE_WAKE_SAVE),
+            Command::SaveWake
+        ));
+        assert!(matches!(
+            clicked(&mut host, ids::ROUTINE_WAKE_CANCEL),
+            Command::CloseWakeEditor
+        ));
+        host.dispatch(&Op::SetValue {
+            target: ids::routine_wake_box(WakeBox::Hour).into(),
+            value: "7".into(),
+        })
+        .unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::SetWakeBox { which: WakeBox::Hour, text }) if text == "7"
+        ));
+
+        // A pick that is not a schedule: Save is dead, with the reason.
+        let (editor, _) = host.routine_wake_editor.take().unwrap();
+        let mut empty = editor.clone();
+        empty.spec.weekdays.clear();
+        let status = empty.status(chrono::Utc::now());
+        host.routine_wake_editor = Some((empty, status));
+        assert!(
+            !host
+                .snapshot()
+                .find(ids::ROUTINE_WAKE_SAVE)
+                .unwrap()
+                .enabled
+        );
+        let refused = host.click(ids::ROUTINE_WAKE_SAVE).unwrap_err();
+        assert!(refused.contains("day of the week"), "{refused}");
     }
 
     /// The driver's two routine verbs: Test run by name, and an edit saved the way the editor
@@ -6609,7 +9146,8 @@ mod tests {
     }
 
     /// A routine the server has opens its thread, by its button or by name. The chat then says
-    /// which routine it is and what fires it, and the way back is there only while it is open.
+    /// which routine it is and what fires it, and the way back is the Bot chip, which says it
+    /// goes home only while the thread is open. There is no Back link of its own any more.
     #[test]
     fn a_routines_thread_is_opened_and_left_by_id() {
         let mut host = host();
@@ -6620,20 +9158,20 @@ mod tests {
                 .find(&ids::routine_thread("draft-1"))
                 .is_none()
         );
-        assert!(host.snapshot().find(ids::CHAT_ROUTINE_BACK).is_none());
-        assert!(host.click(ids::CHAT_ROUTINE_BACK).is_err());
+        assert!(host.snapshot().find(ids::CHAT_ROUTINE_THREAD).is_none());
 
         host.click(&ids::routine_thread("sch-1-2")).unwrap();
         assert!(matches!(
             host.take_command().unwrap(),
             Command::OpenRoutineThread { routine_id } if routine_id == "sch-1-2"
         ));
-        // A line of its history opens the same thread, dashes in both ids and all.
-        host.routines[0].runs = vec![("run-a-1".into(), "Test run", "ok")];
+        // A line of its history opens the same thread at that run, dashes in both ids and all.
+        host.routines[0].runs = vec![ran("run-a-1", "Test run", "ok")];
         host.click(&ids::routine_run("sch-1-2", "run-a-1")).unwrap();
         assert!(matches!(
             host.take_command().unwrap(),
-            Command::OpenRoutineThread { routine_id } if routine_id == "sch-1-2"
+            Command::OpenRoutineRun { routine_id, run_id }
+                if routine_id == "sch-1-2" && run_id == "run-a-1"
         ));
         host.invoke("routine.thread", &serde_json::json!({ "id": "sch-1-2" }))
             .unwrap();
@@ -6643,15 +9181,39 @@ mod tests {
         ));
 
         host.routine_thread = Some(("Morning post".into(), "schedule".into()));
+        host.bot_chip_goes_home = true;
         let tree = host.snapshot();
         let badge = tree.find(ids::CHAT_ROUTINE_THREAD).unwrap();
         assert_eq!(badge.name, "Morning post");
         assert_eq!(badge.value.as_deref(), Some("schedule"));
-        host.click(ids::CHAT_ROUTINE_BACK).unwrap();
-        assert!(matches!(
-            host.take_command().unwrap(),
-            Command::BackToBotChat
-        ));
+        assert!(
+            tree.find("chat-routine-back").is_none(),
+            "the Back link is gone"
+        );
+        assert!(host.click("chat-routine-back").is_err());
+        let chip = tree.find(ids::HEADER_COWORKER).unwrap();
+        assert!(chip.states.iter().any(|state| state == "goes-home"));
+    }
+
+    /// The chip at the top of the chat names the open Bot and says when a press of it goes home:
+    /// in a routine's thread it goes back to the Bot's own chat (`goes-home`), and elsewhere it
+    /// opens the settings. Either way the click is the chip's own press, decided by the app.
+    #[test]
+    fn the_bot_chip_says_when_it_goes_home() {
+        let mut host = host();
+        let chip = host.snapshot().find(ids::HEADER_COWORKER).cloned().unwrap();
+        assert_eq!(chip.name, "Ada");
+        assert!(!chip.states.iter().any(|state| state == "goes-home"));
+
+        host.routine_thread = Some(("Morning post".into(), "schedule".into()));
+        host.bot_chip_goes_home = true;
+        let chip = host.snapshot().find(ids::HEADER_COWORKER).cloned().unwrap();
+        assert!(chip.states.iter().any(|state| state == "goes-home"));
+        host.click(ids::HEADER_COWORKER).unwrap();
+        assert!(matches!(host.take_command(), Some(Command::PressBotChip)));
+
+        host.sessions.clear();
+        assert!(host.click(ids::HEADER_COWORKER).is_err(), "no Bot, no chip");
     }
 
     /// A cron routine carries the line the server keeps, and nothing about a webhook it has
@@ -6756,7 +9318,7 @@ mod tests {
         ));
         assert!(matches!(
             opened(&mut host, &ids::routine_delete("sch-1-2")),
-            Command::DeleteRoutine { routine_id } if routine_id == "sch-1-2"
+            Command::AskDeleteRoutine { routine_id } if routine_id == "sch-1-2"
         ));
         assert!(matches!(
             opened(&mut host, &ids::routine_rotate("sch-1-2")),
@@ -7837,6 +10399,95 @@ mod tests {
         }
     }
 
+    /// A computer's card as Settings → Computer draws it: the computer `id`, with its relay on, not
+    /// relaying and awake, and asking each time. A test changes what it is about.
+    fn a_card(id: &str, this_computer: bool) -> ComputerCard {
+        ComputerCard {
+            machine_id: id.into(),
+            label: format!("NativeChat on {id}"),
+            this_computer,
+            online: true,
+            mode: crate::opengrok::LocalExecMode::Ask,
+            relay_on: true,
+            switching: false,
+            state: computers::RelayState::NotRelaying,
+            tried: None,
+            detail: None,
+            note: None,
+        }
+    }
+
+    #[test]
+    fn floating_header_controls_match_their_visible_actions() {
+        let mut host = host();
+        host.sidebar_hidden = true;
+        let tree = host.snapshot();
+        for id in [
+            ids::HEADER_LEFT_SIDEBAR,
+            ids::HEADER_RIGHT_SIDEBAR,
+            ids::HEADER_MONITOR,
+        ] {
+            assert!(tree.find(id).is_some(), "missing {id}");
+        }
+        host.dispatch(&Op::click(ids::HEADER_LEFT_SIDEBAR)).unwrap();
+        assert!(matches!(host.take_command(), Some(Command::ToggleSidebar)));
+        host.dispatch(&Op::click(ids::HEADER_MONITOR)).unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::ToggleComputerPane)
+        ));
+        for computer_open in [false, true] {
+            host.computer_open = computer_open;
+            host.dispatch(&Op::click(ids::HEADER_RIGHT_SIDEBAR))
+                .unwrap();
+            let command = host.take_command();
+            assert!(if computer_open {
+                matches!(command, Some(Command::ToggleComputerPane))
+            } else {
+                matches!(command, Some(Command::ToggleAgentSettings))
+            });
+        }
+        host.sessions.clear();
+        let empty_tree = host.snapshot();
+        assert!(empty_tree.find(ids::HEADER_MONITOR).is_none());
+        for id in [ids::HEADER_LEFT_SIDEBAR, ids::HEADER_RIGHT_SIDEBAR] {
+            assert!(empty_tree.find(id).is_some(), "missing {id} without a Bot");
+        }
+    }
+
+    #[test]
+    fn sidebar_has_one_visible_control_and_no_size_menu() {
+        for empty in [false, true] {
+            for hidden in [false, true] {
+                let mut host = host();
+                if empty {
+                    host.sessions.clear();
+                }
+                host.sidebar_hidden = hidden;
+                let tree = host.snapshot();
+                assert_eq!(tree.find(ids::HEADER_LEFT_SIDEBAR).is_some(), hidden);
+                assert_eq!(tree.find(ids::NAV_TOGGLE).is_some(), !hidden);
+                for removed in [
+                    "sidebar-mode-menu",
+                    "sidebar-mode-expanded",
+                    "sidebar-mode-mini",
+                    "sidebar-mode-hide",
+                ] {
+                    assert!(tree.find(removed).is_none());
+                    assert!(host.dispatch(&Op::click(removed)).is_err());
+                }
+                let (visible, absent) = if hidden {
+                    (ids::HEADER_LEFT_SIDEBAR, ids::NAV_TOGGLE)
+                } else {
+                    (ids::NAV_TOGGLE, ids::HEADER_LEFT_SIDEBAR)
+                };
+                assert!(host.dispatch(&Op::click(absent)).is_err());
+                host.dispatch(&Op::click(visible)).unwrap();
+                assert!(matches!(host.take_command(), Some(Command::ToggleSidebar)));
+            }
+        }
+    }
+
     fn recipe(values: &[(&str, &str)]) -> ActiveRecipe {
         ActiveRecipe {
             id: "rcp_1".into(),
@@ -8070,51 +10721,19 @@ mod tests {
         );
     }
 
-    /// The Model field's own account of the outage: the list it can still offer, and the note
-    /// saying why it is not longer. The note goes when the gateway answers; the count does not
-    /// drop to nothing while it is away.
+    /// While the open Bot's replies go through the person's own plan, the Usage card says it
+    /// does not count them (the server meters no turn on the person's plan): the Bot's own door,
+    /// or the account's that it follows. Not on the server's keys, and not for a Bot whose door
+    /// is the server's keys while the account is on the plan.
     #[test]
-    fn the_model_field_says_how_many_routes_it_has_and_why_it_has_no_more() {
-        let mut host = host();
-        host.model_count = 12;
-        host.model_note = Some("the gateway could not be reached: …".to_string());
-        let tree = host.snapshot();
-        assert_eq!(
-            tree.find("agent-model-list")
-                .and_then(|n| n.value.as_deref()),
-            Some("12")
-        );
-        assert!(tree.find("agent-model-note").is_some());
-
-        host.model_note = None;
-        assert!(host.snapshot().find("agent-model-note").is_none());
-    }
-
-    /// While replies go through the person's own plan the Model field says the plan's model
-    /// answers, not the pin in the field, and the Usage card says it does not count them (the
-    /// server meters no turn on the person's plan): from the account's door, or from the
-    /// composer's chip clicked to My plan. Neither line on the server's keys.
-    #[test]
-    fn the_model_field_says_when_the_plans_model_answers() {
-        use crate::opengrok::{InferenceKind, InferenceSource};
+    fn the_usage_card_says_when_the_bots_replies_are_on_the_plan() {
+        use crate::opengrok::{CoworkerSource, InferenceKind, InferenceSource};
         use crate::state::ReplySourceRead;
-        let plan_line = |state: &AppState| {
-            let tree = NativeChatHost::from_app(state).snapshot();
-            let model = tree
-                .find(ids::AGENT_MODEL_PLAN)
-                .map(|node| node.name.clone());
-            let usage = tree
+        let usage_line = |state: &AppState| {
+            NativeChatHost::from_app(state)
+                .snapshot()
                 .find(ids::AGENT_USAGE_PLAN)
-                .map(|node| node.name.clone());
-            assert_eq!(
-                usage.is_some(),
-                model.is_some(),
-                "the Usage card says so exactly when the Model field does"
-            );
-            if let Some(usage) = usage {
-                assert_eq!(usage, reply_source::PLAN_USAGE_NOTE);
-            }
-            model
+                .map(|node| node.name.clone())
         };
         let mut state = AppState::new();
         state.auth_status = crate::state::AuthStatus::SignedIn;
@@ -8123,36 +10742,43 @@ mod tests {
                 .unwrap(),
         );
         state.coworkers = vec![
-            serde_json::from_value(serde_json::json!({ "id": "cw_1", "name": "Ada" })).unwrap(),
+            serde_json::from_value(
+                serde_json::json!({ "id": "cw_1", "name": "Ada", "source": null }),
+            )
+            .unwrap(),
         ];
         state.active_coworker_id = Some("cw_1".into());
-        assert_eq!(plan_line(&state), None, "nothing read");
-        let read = |kind, local_model: Option<&str>| {
+        assert_eq!(usage_line(&state), None, "nothing read");
+        let read = |kind| {
             Some(ReplySourceRead::Read(InferenceSource {
                 kind,
                 base_url: Some("http://127.0.0.1:8080".into()),
-                local_model: local_model.map(str::to_string),
+                local_model: Some("gpt-5-codex".into()),
                 healthy: true,
                 has_api_key: false,
+                via: None,
+                relay: None,
+                new_bot_default: None,
+                relay_enabled: None,
+                plan_fallback: None,
             }))
         };
-        state.reply_source.kept = read(InferenceKind::Gateway, Some("gpt-5-codex"));
+        state.reply_source.kept = read(InferenceKind::Gateway);
+        assert_eq!(usage_line(&state), None, "the server's keys");
+        state.reply_source.kept = read(InferenceKind::LocalProxy);
         assert_eq!(
-            plan_line(&state),
-            None,
-            "the server's keys: the pin answers"
+            usage_line(&state).as_deref(),
+            Some(reply_source::PLAN_USAGE_NOTE),
+            "the account's plan, which the Bot follows"
         );
-        state.reply_source.kept = read(InferenceKind::LocalProxy, Some("gpt-5-codex"));
+        state.coworkers[0].source = CoworkerSource::Kind(InferenceKind::Gateway);
+        assert_eq!(usage_line(&state), None, "the Bot's own door is the keys");
+        state.reply_source.kept = read(InferenceKind::Gateway);
+        state.coworkers[0].source = CoworkerSource::Kind(InferenceKind::LocalProxy);
         assert_eq!(
-            plan_line(&state).as_deref(),
-            Some(reply_source::PLAN_MODEL_NOTE)
-        );
-        // The account on the server's keys, the chip clicked to My plan.
-        state.reply_source.kept = read(InferenceKind::Gateway, Some("gpt-5-codex"));
-        assert!(state.flip_turn_source());
-        assert_eq!(
-            plan_line(&state).as_deref(),
-            Some(reply_source::PLAN_MODEL_NOTE)
+            usage_line(&state).as_deref(),
+            Some(reply_source::PLAN_USAGE_NOTE),
+            "the Bot's own plan"
         );
     }
 
@@ -8197,6 +10823,43 @@ mod tests {
             "`assert --exists false` is how a driver says the app has a session again"
         );
         assert!(tree.find("signed-out-sign-in").is_none());
+    }
+
+    /// A turn the person's Mac could not answer is offered again on the server's keys, and the
+    /// offer is a click a driver can make, only while there is one; each held message the server
+    /// holds for the Mac says so under the queue.
+    #[test]
+    fn a_turn_the_mac_could_not_answer_is_offered_on_the_server_and_a_wait_for_it_is_said() {
+        let mut host = host();
+        assert!(
+            host.snapshot()
+                .find(ids::RUN_ERROR_SEND_ON_SERVER)
+                .is_none()
+        );
+        let refused = host.click(ids::RUN_ERROR_SEND_ON_SERVER).unwrap_err();
+        assert!(refused.contains("person's plan"), "{refused}");
+        host.can_send_on_server = true;
+        assert_eq!(
+            host.snapshot()
+                .find(ids::RUN_ERROR_SEND_ON_SERVER)
+                .map(|node| node.name.clone())
+                .as_deref(),
+            Some("Send this reply on Server instead")
+        );
+        host.click(ids::RUN_ERROR_SEND_ON_SERVER).unwrap();
+        assert!(matches!(host.take_command(), Some(Command::SendOnServer)));
+
+        host.queued_sends = 2;
+        host.waiting_for_mac = vec!["m_1".into()];
+        let tree = host.snapshot();
+        let queued = tree.find(ids::COMPOSER_QUEUED).unwrap();
+        assert_eq!(queued.name, "2 queued");
+        assert_eq!(
+            tree.find(&ids::queued_waiting("m_1"))
+                .map(|node| node.name.as_str()),
+            Some("Waiting for your Mac")
+        );
+        assert!(tree.find(&ids::queued_waiting("m_2")).is_none());
     }
 
     /// A turn that never left is offered again, and the offer is a click a driver can make.
@@ -9311,6 +11974,66 @@ mod tests {
         );
     }
 
+    /// Why the server could not give the bot a computer is on the tree under `computer-status`,
+    /// in the words the pane shows and with the server's code, and Get a computer beside it asks
+    /// again. The first status that names a box takes both away, and a click on Get a computer
+    /// then is refused.
+    #[test]
+    fn the_computer_pane_s_reason_for_no_computer_is_on_the_tree() {
+        let recorded = |recording: &str| -> crate::opengrok::CoworkerComputer {
+            let fixture: serde_json::Value = serde_json::from_str(recording).unwrap();
+            serde_json::from_value(fixture["body"].clone()).unwrap()
+        };
+        let mut state = AppState::new();
+        // Signed in with a bot on the roster, or the tree is the sign-in or empty-roster page
+        // and has no Computer pane in it.
+        state.auth_status = crate::state::AuthStatus::SignedIn;
+        state.account = Some(
+            serde_json::from_value(serde_json::json!({ "id": "acct_1", "email": "a@b.c" }))
+                .unwrap(),
+        );
+        state.coworkers = vec![
+            serde_json::from_value(serde_json::json!({ "id": "cw_1", "name": "Ada" })).unwrap(),
+        ];
+        state.active_coworker_id = Some("cw_1".into());
+        state.right_pane = crate::state::RightPane::Computer;
+        state.coworker_computer = Some(recorded(include_str!(
+            "../../fixtures/wire/rest/GET__coworkers__coworker_id__computer/200-a_hosted_hire_whose_ascii_create_fails_records_why_and_makes_no_box.json"
+        )));
+        let mut host = NativeChatHost::from_app(&state);
+        let tree = host.snapshot();
+        let status = tree.find("computer-status").unwrap();
+        let error = status
+            .children
+            .iter()
+            .find(|node| node.id == ids::COMPUTER_ERROR)
+            .expect("the reason, under the status");
+        assert_eq!(
+            error.name,
+            "The box refused: 429 {\"error\":\"box creation rate limit reached: \
+             https://api.box.ascii.dev/v1/boxes?key=«redacted»\"}"
+        );
+        assert_eq!(error.value.as_deref(), Some("quota_exceeded"));
+        let get = tree.find(ids::COMPUTER_GET).expect("Get a computer");
+        assert_eq!(get.name, "Get a computer");
+        assert!(get.enabled);
+        host.dispatch(&Op::click(ids::COMPUTER_GET)).unwrap();
+        assert!(matches!(host.take_command(), Some(Command::GetComputer)));
+
+        state.coworker_computer = Some(recorded(include_str!(
+            "../../fixtures/wire/rest/GET__coworkers__coworker_id__computer/200-a_healthy_local_vm_does_not_wear_another_scopes_failure.json"
+        )));
+        let mut host = NativeChatHost::from_app(&state);
+        let tree = host.snapshot();
+        assert!(
+            tree.find("computer-status").is_some(),
+            "the pane is still drawn"
+        );
+        assert!(tree.find(ids::COMPUTER_ERROR).is_none());
+        assert!(tree.find(ids::COMPUTER_GET).is_none());
+        assert!(host.dispatch(&Op::click(ids::COMPUTER_GET)).is_err());
+    }
+
     #[test]
     fn settings_updates_has_update_and_no_reset() {
         let mut host = host();
@@ -9432,6 +12155,7 @@ mod tests {
                 arguments: arguments.into(),
                 result: result.map(|(content, _)| content.to_string()),
                 ok: result.map(|(_, ok)| ok),
+                took_ms: None,
             })
         };
         let reply = |id: &str, is_me: bool, parts: Vec<ChatPart>| crate::state::Message {
@@ -9558,6 +12282,147 @@ mod tests {
         assert!(tree.find(ids::REPLY_REASONING).is_none());
     }
 
+    /// The newest reply, one call this app timed and one it did not, in a thread of its own.
+    fn one_timed_reply() -> AppState {
+        use crate::opengrok::StepSpec;
+        let step = |call_id: &str, took_ms: Option<u64>| {
+            ChatPart::Step(StepSpec {
+                call_id: call_id.into(),
+                tool: "shell".into(),
+                arguments: "{\"command\":\"uname -a\"}".into(),
+                result: Some("Darwin".into()),
+                ok: Some(true),
+                took_ms,
+            })
+        };
+        let mut state = AppState::new();
+        state.coworkers = vec![
+            serde_json::from_value(serde_json::json!({ "id": "cw_1", "name": "Hex" })).unwrap(),
+        ];
+        state.active_coworker_id = Some("cw_1".into());
+        state.active_conversation_id = Some("cw_1".into());
+        state.conversations.push(crate::state::Conversation {
+            id: "cw_1".into(),
+            title: "Hex".into(),
+            created_at: String::new(),
+            updated_at: String::new(),
+            messages: vec![crate::state::Message {
+                id: "m_new".into(),
+                sender: "AI".into(),
+                content: "It is a Mac.".into(),
+                sent_at: std::time::SystemTime::UNIX_EPOCH,
+                finished_at: None,
+                run_timing: None,
+                reply_source: None,
+                is_me: false,
+                reply_preview: None,
+                reply_to_id: None,
+                reply_is_me: false,
+                parts: vec![
+                    step("c1", Some(1000)),
+                    step("c2", None),
+                    ChatPart::Text("It is a Mac.".into()),
+                ],
+                run_id: None,
+                hidden: false,
+            }],
+            unread_count: 0,
+            origin: None,
+        });
+        state
+    }
+
+    fn signed_in_host(state: &AppState) -> NativeChatHost {
+        let mut host = NativeChatHost::from_app(state);
+        host.signed_in = true;
+        host
+    }
+
+    /// With Settings → Show turn timing on, a step whose row ends with how long the call took
+    /// has that as a state, and its value still says how it came out; a call this app did not
+    /// time has none. With the setting off, no row says it, and no step has it.
+    #[test]
+    fn a_step_s_time_is_a_state_while_its_row_says_it() {
+        let mut state = one_timed_reply();
+        let took = |state: &AppState, call_id: &str| {
+            let tree = signed_in_host(state).snapshot();
+            let node = tree.find(&ids::step(call_id)).unwrap();
+            (
+                node.value.clone().unwrap_or_default(),
+                node.states
+                    .iter()
+                    .filter(|state| state.starts_with("took-"))
+                    .cloned()
+                    .collect::<Vec<_>>(),
+            )
+        };
+        assert_eq!(took(&state, "c1"), ("ok".to_string(), Vec::new()));
+        state.show_turn_timing = true;
+        assert_eq!(
+            took(&state, "c1"),
+            ("ok".to_string(), vec!["took-1s".to_string()])
+        );
+        assert_eq!(took(&state, "c2"), ("ok".to_string(), Vec::new()));
+    }
+
+    /// With Settings → Show turn timing on, the Timing row under the newest reply is on the tree
+    /// with what it says shut, and a click opens it on its lines, as a person's does. A row that
+    /// is the total alone does not open, and the click says so. With the setting off, or with no
+    /// `run-timing` frame, it is not there, as it is not drawn.
+    #[test]
+    fn the_timing_footer_is_on_the_tree_but_never_opens() {
+        use crate::opengrok::TurnTiming;
+        let mut state = one_timed_reply();
+        state.show_turn_timing = true;
+        let timing_node = |state: &AppState| {
+            signed_in_host(state)
+                .snapshot()
+                .find(ids::REPLY_TIMING)
+                .cloned()
+        };
+        assert!(timing_node(&state).is_none(), "no frame came");
+
+        state.conversations[0].messages[0].run_timing =
+            TurnTiming::from_value(&serde_json::json!({
+                "model_ms": [2000, 2000],
+                "tools": [{ "name": "shell", "ms": 1000 }],
+                "tool_wait_ms": 1000,
+                "total_ms": 10000,
+                "tool_rounds": 1
+            }));
+        state.show_turn_timing = false;
+        assert!(timing_node(&state).is_none(), "the setting is off");
+
+        state.show_turn_timing = true;
+        let shut = timing_node(&state).expect("the Timing row");
+        assert_eq!(shut.value.as_deref(), Some("10s total"));
+        assert!(!shut.states.contains(&"expanded".to_string()));
+        assert!(shut.children.is_empty(), "shut, it is the total alone");
+        assert!(signed_in_host(&state).snapshot().ids_are_unique());
+
+        let mut driver = signed_in_host(&state);
+        assert!(driver.click(ids::REPLY_TIMING).is_err());
+        assert!(driver.take_command().is_none());
+        state.mark_steps_open(&[crate::components::steps::timing_key("m1")], true);
+        let open = timing_node(&state).expect("the Timing row");
+        assert!(!open.states.contains(&"expanded".to_string()));
+        let lines: Vec<(String, String)> = open
+            .children
+            .iter()
+            .map(|line| (line.id.clone(), line.name.clone()))
+            .collect();
+        assert_eq!(lines, Vec::<(String, String)>::new());
+
+        // A frame with a total and nothing else is a row that does not open.
+        state.conversations[0].messages[0].run_timing =
+            TurnTiming::from_value(&serde_json::json!({ "total_ms": 10000 }));
+        assert_eq!(
+            timing_node(&state).and_then(|node| node.value),
+            Some("10s total".to_string())
+        );
+        assert!(signed_in_host(&state).click(ids::REPLY_TIMING).is_err());
+    }
+
     /// Settings → Computer lists each connected computer's local-exec mode, marks this Mac, and
     /// a button per mode sets it: the Ask / Always / Never a check of this Mac's commands needs.
     #[test]
@@ -9567,8 +12432,15 @@ mod tests {
         host.account_open = true;
         host.computer_tab = true;
         host.computers = vec![
-            ("mac-1".into(), "This Mac".into(), LocalExecMode::Ask, true),
-            ("mac-2".into(), "Studio".into(), LocalExecMode::Never, false),
+            ComputerCard {
+                label: "This Mac".into(),
+                ..a_card("mac-1", true)
+            },
+            ComputerCard {
+                label: "Studio".into(),
+                mode: LocalExecMode::Never,
+                ..a_card("mac-2", false)
+            },
         ];
         let tree = host.snapshot();
         let mine = tree.find(&ids::computer_exec("mac-1")).unwrap();
@@ -9815,6 +12687,51 @@ mod tests {
         let bo = tree.find(&ids::coworker("cw_2")).unwrap();
         assert_eq!(bo.value, None);
         assert!(!bo.states.contains(&"listed".to_string()));
+    }
+
+    /// Why this Mac stopped running commands for the server by itself is a line on Settings →
+    /// Computer, in the page's words, and in the tree only while the page shows it.
+    #[test]
+    fn why_this_mac_stopped_running_commands_is_a_line_on_settings_computer() {
+        let mut state = AppState::new();
+        state.auth_status = crate::state::AuthStatus::SignedIn;
+        state.account = Some(
+            serde_json::from_value(serde_json::json!({ "id": "acct_1", "email": "a@b.c" }))
+                .unwrap(),
+        );
+        state.coworkers = vec![
+            serde_json::from_value(serde_json::json!({ "id": "cw_1", "name": "Ada" })).unwrap(),
+        ];
+        state.active_coworker_id = Some("cw_1".into());
+        state.is_app_settings_open = true;
+        state.app_settings_tab = AppSettingsTab::Computer;
+        assert!(
+            NativeChatHost::from_app(&state)
+                .snapshot()
+                .find(ids::LOCAL_EXEC_STOPPED)
+                .is_none()
+        );
+
+        let why =
+            crate::opengrok::LocalExecStopped::NotEnrolled("could not enrol the machine".into());
+        state.local_exec_stopped = Some(why.clone());
+        let tree = NativeChatHost::from_app(&state).snapshot();
+        let line = tree
+            .find(ids::LOCAL_EXEC_STOPPED)
+            .expect("the line is drawn");
+        assert_eq!(line.name, why.sentence());
+        assert!(
+            line.name.contains("could not enrol the machine"),
+            "{}",
+            line.name
+        );
+
+        state.app_settings_tab = AppSettingsTab::Logins;
+        let tree = NativeChatHost::from_app(&state).snapshot();
+        assert!(
+            tree.find(ids::LOCAL_EXEC_STOPPED).is_none(),
+            "only on Computer"
+        );
     }
 
     /// A host on Settings → Computer with this Mac's rules as the server listed them: two
@@ -10514,6 +13431,31 @@ mod tests {
         }
     }
 
+    /// The transcript says whether it keeps its newest row in view, so a driver that scrolls it
+    /// up can assert that it let go, and that it stayed let go through the redraws after.
+    #[test]
+    fn the_transcript_says_whether_it_follows_its_newest_row() {
+        let mut host = host();
+        host.transcript_following = true;
+        let tree = host.snapshot();
+        let transcript = tree.find(ids::TRANSCRIPT).unwrap();
+        assert_eq!(transcript.role, "scroll");
+        assert_eq!(transcript.value.as_deref(), Some("following"));
+
+        host.transcript_following = false;
+        let tree = host.snapshot();
+        assert_eq!(
+            tree.find(ids::TRANSCRIPT).unwrap().value.as_deref(),
+            Some("detached")
+        );
+
+        // What the host says is what the transcript published, and a thread opens following.
+        let mut state = AppState::new();
+        assert!(NativeChatHost::from_app(&state).transcript_following);
+        state.set_transcript_following(false);
+        assert!(!NativeChatHost::from_app(&state).transcript_following);
+    }
+
     /// The draft's chips are on the tree as objects under the composer, in order, with their kind.
     #[test]
     fn a_drafts_chips_are_on_the_tree() {
@@ -11026,95 +13968,6 @@ mod tests {
         );
     }
 
-    /// The Effort menu is on the tree with the word it shows as its value and one choice per word
-    /// it offers, and a driver picks from it by the road a person's click takes. `xhigh`, which
-    /// the menu does not offer, is shown as it is while the bot has it.
-    #[test]
-    fn the_effort_menu_is_on_the_tree_and_a_driver_picks_from_it() {
-        use crate::state::EffortControl;
-        let mut host = host();
-        host.agent_settings_open = true;
-        host.agent_effort = Some(EffortControl {
-            kept: Some("xhigh".into()),
-            shown: "xhigh".into(),
-        });
-        let tree = host.snapshot();
-        let menu = tree.find("agent-effort").unwrap();
-        assert_eq!(menu.value.as_deref(), Some("xhigh"));
-        assert!(menu.enabled && menu.states.is_empty(), "{menu:?}");
-        let choices: Vec<&str> = menu.children.iter().map(|c| c.id.as_str()).collect();
-        assert_eq!(
-            choices,
-            [
-                "agent-effort-inherit",
-                "agent-effort-low",
-                "agent-effort-medium",
-                "agent-effort-high",
-                "agent-effort-xhigh",
-                "agent-effort-max",
-            ]
-        );
-        let kept = tree.find("agent-effort-xhigh").unwrap();
-        assert_eq!(kept.name, "xhigh");
-        assert_eq!(kept.states, vec!["selected".to_string()]);
-        assert_eq!(tree.find("agent-effort-inherit").unwrap().name, "Inherit");
-
-        host.dispatch(&Op::click("agent-effort-high")).unwrap();
-        assert!(matches!(
-            host.take_command(),
-            Some(Command::PickEffort(word)) if word == "high"
-        ));
-        assert!(
-            host.dispatch(&Op::click("agent-effort-none")).is_err(),
-            "a word the menu does not offer"
-        );
-        assert!(
-            host.dispatch(&Op::click("agent-effort")).is_err(),
-            "the menu is not a choice"
-        );
-
-        // Picked, and not saved yet.
-        host.agent_effort = Some(EffortControl {
-            kept: Some("xhigh".into()),
-            shown: "high".into(),
-        });
-        let tree = host.snapshot();
-        let menu = tree.find("agent-effort").unwrap();
-        assert_eq!(menu.value.as_deref(), Some("high"));
-        assert_eq!(menu.states, vec!["unsaved".to_string()]);
-        assert_eq!(
-            tree.find("agent-effort-high").unwrap().states,
-            vec!["selected".to_string()]
-        );
-        assert!(tree.find("agent-effort-xhigh").unwrap().states.is_empty());
-
-        host.agent_settings_open = false;
-        assert!(
-            host.dispatch(&Op::click("agent-effort-high")).is_err(),
-            "the settings are closed"
-        );
-    }
-
-    /// From a server that keeps no effort the menu is on the tree reading inherit, and dead: a
-    /// click on a choice is refused rather than making a pick nothing would keep.
-    #[test]
-    fn the_effort_menu_is_dead_where_the_server_keeps_no_effort() {
-        use crate::state::EffortControl;
-        let mut host = host();
-        host.agent_settings_open = true;
-        host.agent_effort = Some(EffortControl {
-            kept: None,
-            shown: "inherit".into(),
-        });
-        let tree = host.snapshot();
-        let menu = tree.find("agent-effort").unwrap();
-        assert_eq!(menu.value.as_deref(), Some("inherit"));
-        assert!(!menu.enabled);
-        assert!(!tree.find("agent-effort-high").unwrap().enabled);
-        assert!(host.dispatch(&Op::click("agent-effort-high")).is_err());
-        assert!(host.take_command().is_none());
-    }
-
     /// Save is on the tree and pressed by way of the app, since the fields it sends are the
     /// pane's; a refused Save is on the tree in the server's words, where the pane shows it.
     #[test]
@@ -11133,7 +13986,7 @@ mod tests {
         ));
 
         assert!(host.snapshot().find("agent-settings-error").is_none());
-        let said = "effort must be one of inherit, none, low, medium, high, xhigh, max";
+        let said = "effort must be one of inherit, none, low, medium, high, xhigh, max, ultra";
         host.auth_error = Some(said.into());
         assert_eq!(
             host.snapshot().find("agent-settings-error").unwrap().name,
@@ -11151,367 +14004,573 @@ mod tests {
             local_model: None,
             healthy,
             has_api_key: false,
+            via: None,
+            relay: None,
+            new_bot_default: None,
+            relay_enabled: None,
+            plan_fallback: None,
         }
     }
 
-    /// Settings → Reply source is on the tree as the page draws it: the line standing in for the
-    /// form until the server has answered, then the section valued by the door the server keeps,
-    /// its radio, the proxy URL, the model picker with No model and the plan's models and the
-    /// line under it, the key field with Remove key, the health line, the note on Claude and
-    /// Gemini, the lines by Save, and Save. Each control is the page's own, and refused off the
-    /// page, before the setting is read and while it is dead; the plan's controls also where the
-    /// server is not on this Mac, which the page says. The tab answers only while Settings is
-    /// open. The typed key is never on the tree.
-    #[test]
-    fn the_reply_source_page_is_on_the_tree_and_clicks_as_the_page_does() {
-        use crate::components::reply_source::{
-            ASKING, ELSEWHERE_LINE, KEEP_KEY_LABEL, MODELS_MAY_BE_OLD, NO_MODEL_LABEL,
-            PROVIDERS_NOTE, REMOVE_KEY_LABEL, RUNNING,
-        };
-        use crate::opengrok::{InferenceKind, ProxyKey};
-        use crate::state::{
-            ProxyHealth, REPLY_SOURCE_NOT_ON_SERVER, REPLY_SOURCE_PICK_MODEL,
-            REPLY_SOURCE_RETYPE_KEY, REPLY_SOURCE_SAVE_UNKNOWN, ReplySourceNote, ReplySourceRead,
-        };
-        let mut host = host();
-        let shut = host.click(ids::SETTINGS_REPLY_SOURCE).unwrap_err();
-        assert!(shut.contains(ids::FOOTER_ACCOUNT), "{shut}");
-        host.account_open = true;
-        host.click(ids::SETTINGS_REPLY_SOURCE).unwrap();
-        assert!(matches!(
-            host.take_command(),
-            Some(Command::SetAppSettingsTab(AppSettingsTab::ReplySource))
-        ));
-        assert!(
-            host.snapshot().find(ids::REPLY_SOURCE).is_none(),
-            "Settings is not open on Reply source"
-        );
-        let off = host
-            .click(&ids::reply_source_kind(InferenceKind::LocalProxy))
-            .unwrap_err();
-        assert!(off.contains(ids::SETTINGS_REPLY_SOURCE), "{off}");
+    /// A read from a server that knows the relay, with nobody's computer holding it.
+    fn relay_read(via: &str) -> Option<crate::state::ReplySourceRead> {
+        Some(crate::state::ReplySourceRead::Read(
+            crate::opengrok::InferenceSource {
+                via: Some(via.into()),
+                relay: Some(crate::opengrok::RelayRead {
+                    connected: false,
+                    machine_id: None,
+                    machine_label: None,
+                    local_model: None,
+                }),
+                ..kept_source(crate::opengrok::InferenceKind::Gateway, true)
+            },
+        ))
+    }
 
-        // On the page, before the server has answered: the section, asking, and the line the
-        // page draws meanwhile; nothing to press.
-        host.reply_source_tab = true;
+    /// The Relay tab is gone from the tree: Settings' pages are General, Computer, Updates, Logins,
+    /// Connections and Skills, nothing answers at the id the Relay tab had, and none of the ids of
+    /// the page it held is on the tree or takes a click. The relay is on Computer, in each
+    /// computer's card.
+    #[test]
+    fn the_relay_tab_is_gone_from_the_tree_and_answers_no_click() {
+        let mut host = host();
+        host.account_open = true;
+        host.computer_tab = true;
+        host.computers = vec![a_card("mac_1", true)];
         let tree = host.snapshot();
-        let section = tree.find(ids::REPLY_SOURCE).unwrap();
-        assert!(section.states.contains(&"asking".to_string()));
+        for id in [
+            ids::SETTINGS_GENERAL,
+            "settings-tab-computer",
+            "settings-tab-updates",
+            "settings-tab-logins",
+            ids::SETTINGS_CONNECTIONS,
+            ids::SETTINGS_SKILLS,
+        ] {
+            assert!(tree.find(id).is_some(), "{id} is a page of Settings");
+        }
+        for gone in [
+            "settings-tab-reply-source",
+            "settings-reply-source",
+            "settings-relay",
+            "settings-relay-switch",
+            "settings-relay-switch-error",
+            "settings-relay-status",
+        ] {
+            assert!(tree.find(gone).is_none(), "{gone} is gone from the tree");
+            let refused = host.click(gone).unwrap_err();
+            assert!(
+                refused.contains(&format!("no `{gone}` on screen"))
+                    && refused.contains("settings-computer-{id}-relay"),
+                "{gone}: {refused}"
+            );
+            assert!(host.take_command().is_none(), "{gone} sent nothing");
+        }
+        assert!(tree.ids_are_unique());
+    }
+
+    /// Each computer is a card on the tree as the window draws it, while Settings is open on
+    /// Computer: `settings-computer-{id}`, this computer's marked `this-computer`, holding its Relay
+    /// your plan switch (checked as drawn, dead while a switch is with the server), where its relay
+    /// stands, and what became of a switch that did not go as asked, under the switch. The switch
+    /// asks for the other way from where it is drawn, from any computer's card; the card and its
+    /// lines are no controls. This computer's card alone holds why its relay is not relaying. Off the
+    /// page, none of it is on the tree or takes a click.
+    #[test]
+    fn each_computer_is_a_card_on_the_tree_and_its_switch_clicks_as_the_windows_does() {
+        use crate::components::computers::RelayState;
+        let mut host = host();
+        host.computers = vec![
+            ComputerCard {
+                state: RelayState::Relaying,
+                ..a_card("mac_1", true)
+            },
+            ComputerCard {
+                online: false,
+                state: RelayState::OnButAsleep,
+                ..a_card("mac_2", false)
+            },
+            ComputerCard {
+                relay_on: false,
+                ..a_card("mac_3", false)
+            },
+        ];
+        assert!(
+            host.snapshot().find(&ids::computer_card("mac_1")).is_none(),
+            "Settings is shut"
+        );
+        let shut = host.click(&ids::computer_relay("mac_1")).unwrap_err();
+        assert!(shut.contains("settings-tab-computer"), "{shut}");
+        host.account_open = true;
+        let tree = host.snapshot();
+        assert!(
+            tree.find(&ids::computer_card("mac_1")).is_none(),
+            "not on Computer"
+        );
+        host.computer_tab = true;
+        let tree = host.snapshot();
+        assert!(tree.ids_are_unique());
+
+        // The cards, this computer first, and what each says.
+        for (id, label, states) in [
+            (
+                "mac_1",
+                "NativeChat on mac_1",
+                vec!["online", "this-computer"],
+            ),
+            ("mac_2", "NativeChat on mac_2", vec!["offline"]),
+            ("mac_3", "NativeChat on mac_3", vec!["online"]),
+        ] {
+            let card = tree.find(&ids::computer_card(id)).expect("a card");
+            assert_eq!((card.role.as_str(), card.name.as_str()), ("group", label));
+            assert_eq!(card.states, states, "{id}");
+            assert_eq!(
+                card.children
+                    .iter()
+                    .take(2)
+                    .map(|node| node.id.clone())
+                    .collect::<Vec<_>>(),
+                [ids::computer_relay(id), ids::computer_status(id)],
+                "{id}: the switch, then where its relay stands"
+            );
+        }
+        for (id, checked, name, value) in [
+            ("mac_1", true, "Relaying", "relaying"),
+            (
+                "mac_2",
+                true,
+                "On, but asleep: it can't answer right now",
+                "asleep",
+            ),
+            ("mac_3", false, "Not relaying", "not-relaying"),
+        ] {
+            let switch = tree.find(&ids::computer_relay(id)).unwrap();
+            assert_eq!(
+                (
+                    switch.role.as_str(),
+                    switch.name.as_str(),
+                    switch.checked,
+                    switch.enabled
+                ),
+                ("switch", "Relay your plan", Some(checked), true),
+                "{id}"
+            );
+            let status = tree.find(&ids::computer_status(id)).unwrap();
+            assert_eq!(
+                (status.name.as_str(), status.value.as_deref()),
+                (name, Some(value)),
+                "{id}"
+            );
+            assert!(
+                tree.find(&ids::computer_error(id)).is_none(),
+                "{id}: nothing said"
+            );
+        }
+        // Only this computer's card holds its opencodex's fields.
+        assert!(
+            tree.find(ids::RELAY_ADDR).is_none(),
+            "the setting is not read, and nothing is drawn but the line saying so"
+        );
         assert_eq!(
-            section
+            tree.find(ids::REPLY_SOURCE_UNAVAILABLE)
+                .map(|node| node.name.as_str()),
+            Some("Asking the server…")
+        );
+        let mine = tree.find(&ids::computer_card("mac_1")).unwrap();
+        assert!(mine.find(ids::REPLY_SOURCE_UNAVAILABLE).is_some());
+        for other in ["mac_2", "mac_3"] {
+            let card = tree.find(&ids::computer_card(other)).unwrap();
+            assert!(
+                card.find(ids::REPLY_SOURCE_UNAVAILABLE).is_none(),
+                "{other}"
+            );
+        }
+
+        // Each switch asks for the other way, from any computer's card.
+        for (id, on) in [("mac_1", false), ("mac_2", false), ("mac_3", true)] {
+            host.click(&ids::computer_relay(id)).unwrap();
+            assert!(
+                matches!(host.take_command(), Some(Command::SetComputerRelay { machine_id, on: asked })
+                    if machine_id == id && asked == on),
+                "{id}"
+            );
+        }
+        // The card and its lines are no controls, and the lines are named for what they are.
+        for id in [ids::computer_card("mac_1"), ids::computer_status("mac_1")] {
+            let line = host.click(&id).unwrap_err();
+            assert!(line.contains("not a control"), "{id}: {line}");
+        }
+
+        // What a refused switch says, under the switch, in the server's words; and while a switch is
+        // with the server the card draws it where it was asked and takes no click.
+        host.computers[1].note = Some("no computer of yours has that id".into());
+        host.computers[2].switching = true;
+        let tree = host.snapshot();
+        let error = tree.find(&ids::computer_error("mac_2")).unwrap();
+        assert_eq!(error.name, "no computer of yours has that id");
+        assert_eq!(
+            tree.find(&ids::computer_card("mac_2"))
+                .unwrap()
                 .children
                 .iter()
-                .map(|node| (node.id.as_str(), node.name.as_str()))
+                .take(3)
+                .map(|node| node.id.clone())
                 .collect::<Vec<_>>(),
-            [(ids::REPLY_SOURCE_UNAVAILABLE, ASKING)],
-            "as drawn"
+            [
+                ids::computer_relay("mac_2"),
+                ids::computer_status("mac_2"),
+                ids::computer_error("mac_2")
+            ],
+            "under the switch"
         );
-        assert!(host.click(ids::REPLY_SOURCE_SAVE).is_err());
-        assert!(host.set_value(ids::REPLY_SOURCE_URL, "x").is_err());
+        assert!(host.click(&ids::computer_error("mac_2")).is_err(), "a line");
+        let switch = tree.find(&ids::computer_relay("mac_3")).unwrap();
+        assert!(!switch.enabled, "with the server");
+        let dead = host.click(&ids::computer_relay("mac_3")).unwrap_err();
+        assert!(dead.contains("with the server"), "{dead}");
+        assert!(host.take_command().is_none());
+        assert!(tree.ids_are_unique());
 
-        // A server without reply sources: the page says so, and there is still nothing to press.
+        // Off the page, nothing of it is a target.
+        host.computer_tab = false;
+        assert!(host.snapshot().find(&ids::computer_card("mac_1")).is_none());
+        let off = host.click(&ids::computer_relay("mac_1")).unwrap_err();
+        assert!(off.contains("settings-tab-computer"), "{off}");
+    }
+
+    /// This computer's relay fields are on its card, from a server that knows the relay: opencodex's
+    /// address and the key field (never its text: states `set` while the Keychain holds a key,
+    /// `typed` while one waits for Save) with Remove key, and Save; and why this computer's relay is
+    /// not relaying, under its status. Each is the card's own, refused off the page and from a
+    /// server without the relay; the typed key is never on the tree.
+    #[test]
+    fn this_computers_relay_fields_are_on_its_card_and_click_as_the_card_does() {
+        use crate::components::computers::{
+            RELAY_ADDR_LABEL, RELAY_KEY_LABEL, RELAY_NOT_ON_SERVER, RelayDetail, TAKE_BACK,
+        };
+        use crate::opengrok::InferenceKind;
+        use crate::state::{REPLY_SOURCE_NOT_ON_SERVER, ReplySourceNote, ReplySourceRead};
+        let mut host = host();
+        host.computers = vec![a_card("mac_1", true), a_card("mac_2", false)];
+        assert!(
+            host.click(ids::RELAY_KEY_REMOVE).is_err(),
+            "Settings is shut"
+        );
+        host.account_open = true;
+        let off = host.click(ids::RELAY_KEY_REMOVE).unwrap_err();
+        assert!(off.contains("settings-tab-computer"), "{off}");
+        host.computer_tab = true;
+
+        // Before the server has answered: the line the card draws meanwhile, and nothing to press.
+        let tree = host.snapshot();
+        let asking = tree.find(ids::REPLY_SOURCE_UNAVAILABLE).unwrap();
+        assert_eq!(asking.name, "Asking the server…");
+        assert!(asking.states.contains(&"asking".to_string()));
+        assert!(host.click(ids::REPLY_SOURCE_SAVE).is_err());
+        assert!(host.click(ids::RELAY_KEY_REMOVE).is_err());
+
+        // A server without reply sources says so, and there is still nothing to press.
         host.reply_source.settings.kept = Some(ReplySourceRead::NotOnServer);
         let tree = host.snapshot();
-        assert!(
-            !tree
-                .find(ids::REPLY_SOURCE)
-                .unwrap()
-                .states
-                .contains(&"asking".to_string())
-        );
-        assert_eq!(
-            tree.find(ids::REPLY_SOURCE_UNAVAILABLE).unwrap().name,
-            REPLY_SOURCE_NOT_ON_SERVER
-        );
-        let refused = host
-            .click(&ids::reply_source_kind(InferenceKind::LocalProxy))
-            .unwrap_err();
+        let said = tree.find(ids::REPLY_SOURCE_UNAVAILABLE).unwrap();
+        assert_eq!(said.name, REPLY_SOURCE_NOT_ON_SERVER);
+        assert!(!said.states.contains(&"asking".to_string()));
+        let refused = host.click(ids::REPLY_SOURCE_SAVE).unwrap_err();
         assert!(refused.contains(REPLY_SOURCE_NOT_ON_SERVER), "{refused}");
 
-        // Read, with the server on this Mac: the account is on the server's keys with an address
-        // kept, opencodex is not answering, and the models it listed last are offered.
-        host.reply_source.settings.kept =
-            Some(ReplySourceRead::Read(crate::opengrok::InferenceSource {
-                base_url: Some("http://127.0.0.1:8080".into()),
-                ..kept_source(InferenceKind::Gateway, false)
-            }));
-        host.reply_source.settings.server_on_this_mac = true;
-        host.reply_source.health = Some(ProxyHealth::NotRunning);
-        host.reply_source.models = vec!["gpt-5-codex".into(), "grok-4".into()];
+        // A server from before the relay: the line saying so in the fields' place, no Save.
+        host.reply_source.settings.kept = Some(ReplySourceRead::Read(kept_source(
+            InferenceKind::Gateway,
+            true,
+        )));
         let tree = host.snapshot();
-        let section = tree.find(ids::REPLY_SOURCE).unwrap();
-        assert_eq!(section.value.as_deref(), Some("gateway"));
-        assert!(section.states.is_empty(), "{:?}", section.states);
-        let radio = tree.find(ids::REPLY_SOURCE_KIND).unwrap();
-        assert_eq!(radio.value.as_deref(), Some("gateway"));
-        let server = tree
-            .find(&ids::reply_source_kind(InferenceKind::Gateway))
-            .unwrap();
+        let mine = tree.find(&ids::computer_card("mac_1")).unwrap();
         assert_eq!(
-            (server.name.as_str(), server.checked, server.enabled),
-            ("Server (paid keys)", Some(true), true)
-        );
-        let plan = tree
-            .find(&ids::reply_source_kind(InferenceKind::LocalProxy))
-            .unwrap();
-        assert_eq!(
-            (plan.name.as_str(), plan.checked, plan.enabled),
-            ("My subscription", Some(false), true)
-        );
-        assert!(tree.find(ids::REPLY_SOURCE_ELSEWHERE).is_none());
-        assert_eq!(
-            tree.find(ids::REPLY_SOURCE_URL).unwrap().value.as_deref(),
-            Some("http://127.0.0.1:8080")
-        );
-        let models = tree.find(ids::REPLY_SOURCE_MODEL).unwrap();
-        assert_eq!(
-            (models.name.as_str(), models.children.len()),
-            ("Pick a model", 2),
-            "no model shown, so no No model"
-        );
-        assert!(tree.find(&ids::reply_source_model("grok-4")).is_some());
-        assert_eq!(
-            tree.find(ids::REPLY_SOURCE_MODELS_NOTE).unwrap().name,
-            MODELS_MAY_BE_OLD
-        );
-        let health = tree.find(ids::REPLY_SOURCE_HEALTH).unwrap();
-        assert_eq!(
-            (health.name.as_str(), health.value.as_deref()),
-            ("Not running — start it with ocx start", Some("not-running"))
-        );
-        assert_eq!(
-            tree.find(ids::REPLY_SOURCE_PROVIDERS).unwrap().name,
-            PROVIDERS_NOTE
+            mine.find(ids::RELAY_UNAVAILABLE).unwrap().name,
+            RELAY_NOT_ON_SERVER
         );
         assert!(
-            tree.find(ids::REPLY_SOURCE_REMOVE_KEY).is_none(),
-            "no key held"
+            tree.find(ids::RELAY_ADDR).is_none() && tree.find(ids::REPLY_SOURCE_SAVE).is_none()
+        );
+        let refused = host.click(ids::REPLY_SOURCE_SAVE).unwrap_err();
+        assert!(refused.contains(RELAY_NOT_ON_SERVER), "{refused}");
+        assert!(
+            host.set_value(ids::RELAY_ADDR, "http://127.0.0.1:9090")
+                .is_err()
+        );
+
+        // A server with the relay, a key kept and one typed.
+        host.reply_source.settings.kept = relay_read("loopback");
+        host.reply_source.relay = RelaySnap {
+            address: "http://127.0.0.1:8080".into(),
+            has_key: true,
+            key_typed: true,
+        };
+        host.reply_source.unsaved = true;
+        let tree = host.snapshot();
+        let mine = tree.find(&ids::computer_card("mac_1")).unwrap();
+        assert!(mine.states.contains(&"unsaved".to_string()));
+        assert_eq!(
+            mine.children
+                .iter()
+                .map(|node| node.id.as_str())
+                .collect::<Vec<_>>(),
+            [
+                ids::computer_relay("mac_1").as_str(),
+                ids::computer_status("mac_1").as_str(),
+                ids::RELAY_ADDR,
+                ids::RELAY_KEY,
+                ids::RELAY_KEY_REMOVE,
+                ids::REPLY_SOURCE_SAVE
+            ],
+            "the switch and its status, then what its relay needs: no model of the relay's own, \
+             and nothing of the account's way"
+        );
+        let other = tree.find(&ids::computer_card("mac_2")).unwrap();
+        assert_eq!(
+            other.children.len(),
+            2,
+            "another computer's has only its switch and status"
+        );
+        let address = tree.find(ids::RELAY_ADDR).unwrap();
+        assert_eq!(
+            (address.name.as_str(), address.value.as_deref()),
+            (RELAY_ADDR_LABEL, Some("http://127.0.0.1:8080"))
+        );
+        let key = tree.find(ids::RELAY_KEY).unwrap();
+        assert_eq!(key.name, RELAY_KEY_LABEL);
+        assert!(key.value.is_none(), "the key is never on the tree");
+        assert!(
+            key.states.contains(&"set".to_string()) && key.states.contains(&"typed".to_string())
         );
         let save = tree.find(ids::REPLY_SOURCE_SAVE).unwrap();
         assert_eq!((save.name.as_str(), save.enabled), ("Save", false));
-        assert!(tree.find(ids::REPLY_SOURCE_ERROR).is_none());
-        assert!(tree.find(ids::REPLY_SOURCE_HINT).is_none());
         assert!(tree.ids_are_unique());
 
-        // Each control is the page's own.
-        host.click(&ids::reply_source_kind(InferenceKind::LocalProxy))
+        // Each control is the card's own.
+        host.click(ids::RELAY_KEY_REMOVE).unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::ToggleRemoveRelayKey)
+        ));
+        host.set_value(ids::RELAY_ADDR, "http://127.0.0.1:9090")
             .unwrap();
         assert!(matches!(
             host.take_command(),
-            Some(Command::PickReplySourceKind(InferenceKind::LocalProxy))
+            Some(Command::SetRelayAddress(address)) if address == "http://127.0.0.1:9090"
         ));
-        host.set_value(ids::REPLY_SOURCE_URL, "http://127.0.0.1:9090")
-            .unwrap();
+        host.type_into(ids::RELAY_ADDR, "1").unwrap();
         assert!(matches!(
             host.take_command(),
-            Some(Command::SetReplySourceUrl(url)) if url == "http://127.0.0.1:9090"
+            Some(Command::SetRelayAddress(address)) if address == "http://127.0.0.1:80801"
         ));
-        host.set_value(ids::REPLY_SOURCE_KEY, "sk-proxy-1").unwrap();
+        host.set_value(ids::RELAY_KEY, "opencodex-test-key")
+            .unwrap();
         let typed = host.take_command().expect("the key goes to the page");
+        assert!(!format!("{typed:?}").contains("opencodex-test-key"));
+        assert!(matches!(typed, Command::SetRelayKey(key) if key.0 == "opencodex-test-key"));
+        assert!(host.type_into(ids::RELAY_KEY, "more").is_err());
         assert!(
-            !format!("{typed:?}").contains("sk-proxy-1"),
-            "no command prints the key: {typed:?}"
-        );
-        assert!(matches!(typed, Command::SetReplySourceKey(key) if key.0 == "sk-proxy-1"));
-        assert!(host.type_into(ids::REPLY_SOURCE_KEY, "more").is_err());
-        host.click(&ids::reply_source_model("grok-4")).unwrap();
-        assert!(matches!(
-            host.take_command(),
-            Some(Command::PickReplySourceModel(model)) if model == "grok-4"
-        ));
-        assert!(host.click(&ids::reply_source_model("claude-opus")).is_err());
-        assert!(
-            host.click(ids::REPLY_SOURCE_NO_MODEL).is_err(),
-            "no model shown to take away"
-        );
-        assert!(
-            host.click(ids::REPLY_SOURCE_REMOVE_KEY).is_err(),
-            "no key held to remove"
-        );
-        assert!(
-            host.click(ids::REPLY_SOURCE_MODEL).is_err(),
-            "the menu is not a choice"
-        );
-        assert!(
-            host.click(ids::REPLY_SOURCE_HEALTH).is_err(),
-            "a line is not a control"
+            host.dispatch(&Op::key(ids::RELAY_ADDR, "backspace"))
+                .is_err()
         );
         let nothing = host.click(ids::REPLY_SOURCE_SAVE).unwrap_err();
-        assert!(nothing.contains("nothing on the page differs"), "{nothing}");
+        assert!(
+            nothing.contains("differs from what this computer keeps"),
+            "{nothing}"
+        );
 
-        // My subscription picked with no model: Save says what it waits for, beside it and when
-        // clicked.
-        host.reply_source.settings.kind_pick = Some(InferenceKind::LocalProxy);
-        host.reply_source.unsaved = true;
-        host.reply_source.hint = Some(REPLY_SOURCE_PICK_MODEL);
+        // A change waiting for Save, and what it waits for, beside it and when clicked.
+        host.reply_source.hint = Some(crate::state::RELAY_ADDRESS_NOT_HERE);
         let tree = host.snapshot();
         assert_eq!(
             tree.find(ids::REPLY_SOURCE_HINT).unwrap().name,
-            REPLY_SOURCE_PICK_MODEL
+            crate::state::RELAY_ADDRESS_NOT_HERE
         );
         let waiting = host.click(ids::REPLY_SOURCE_SAVE).unwrap_err();
-        assert!(waiting.contains(REPLY_SOURCE_PICK_MODEL), "{waiting}");
-
-        // A model picked, a key typed, and the server holding a key: No model and Remove key are
-        // there to press; the key is said to be there and never shown. Save sends it all.
-        host.reply_source.hint = None;
-        host.reply_source.settings.model_pick = Some(Some("gpt-5-codex".into()));
-        host.reply_source.settings.kept =
-            Some(ReplySourceRead::Read(crate::opengrok::InferenceSource {
-                base_url: Some("http://127.0.0.1:8080".into()),
-                has_api_key: true,
-                ..kept_source(InferenceKind::Gateway, false)
-            }));
-        host.reply_source.can_save = true;
-        host.reply_source.key_typed = true;
-        let tree = host.snapshot();
         assert!(
-            tree.find(ids::REPLY_SOURCE)
-                .unwrap()
-                .states
-                .contains(&"unsaved".to_string())
+            waiting.contains(crate::state::RELAY_ADDRESS_NOT_HERE),
+            "{waiting}"
         );
-        assert_eq!(
-            tree.find(ids::REPLY_SOURCE_KIND).unwrap().value.as_deref(),
-            Some("local_proxy")
-        );
-        let models = tree.find(ids::REPLY_SOURCE_MODEL).unwrap();
-        assert_eq!(models.value.as_deref(), Some("gpt-5-codex"));
-        assert_eq!(
-            tree.find(ids::REPLY_SOURCE_NO_MODEL).unwrap().name,
-            NO_MODEL_LABEL
-        );
-        let key = tree.find(ids::REPLY_SOURCE_KEY).unwrap();
-        assert!(key.states.contains(&"typed".to_string()) && key.value.is_none());
-        assert!(key.states.contains(&"set".to_string()));
-        let remove = tree.find(ids::REPLY_SOURCE_REMOVE_KEY).unwrap();
-        assert_eq!(
-            (remove.name.as_str(), remove.enabled),
-            (REMOVE_KEY_LABEL, true)
-        );
-        host.click(ids::REPLY_SOURCE_NO_MODEL).unwrap();
-        assert!(matches!(
-            host.take_command(),
-            Some(Command::ClearReplySourceModel)
-        ));
-        host.click(ids::REPLY_SOURCE_REMOVE_KEY).unwrap();
-        assert!(matches!(
-            host.take_command(),
-            Some(Command::ToggleRemoveReplySourceKey)
-        ));
-        host.reply_source.settings.remove_key = true;
-        let tree = host.snapshot();
-        let remove = tree.find(ids::REPLY_SOURCE_REMOVE_KEY).unwrap();
-        assert_eq!(remove.name, KEEP_KEY_LABEL);
-        assert!(remove.states.contains(&"picked".to_string()));
-        assert!(!tree.find(ids::REPLY_SOURCE_KEY).unwrap().enabled);
-        host.reply_source.settings.remove_key = false;
-        assert!(tree.find(ids::REPLY_SOURCE_SAVE).unwrap().enabled);
+        host.reply_source.hint = None;
+        host.reply_source.can_save = true;
         host.click(ids::REPLY_SOURCE_SAVE).unwrap();
         assert!(matches!(
             host.take_command(),
             Some(Command::SaveReplySource)
         ));
 
-        // While the Save is out every control is dead and says why. Its fate unknown is drawn
-        // muted; a refusal, in the server's own words, is trouble; a key to type again follows
-        // either, and stays once the note has gone.
-        host.reply_source.settings.saving = Some(3);
-        host.reply_source.can_save = false;
+        // A read that failed is trouble; what the Keychain said is drawn muted.
+        host.reply_source.settings.note = Some(ReplySourceNote::ReadFailed("gone".into()));
         let tree = host.snapshot();
-        assert_eq!(tree.find(ids::REPLY_SOURCE_SAVE).unwrap().name, "Saving…");
-        assert!(
-            !tree
-                .find(&ids::reply_source_kind(InferenceKind::Gateway))
-                .unwrap()
-                .enabled
-        );
-        let dead = host
-            .click(&ids::reply_source_kind(InferenceKind::Gateway))
-            .unwrap_err();
-        assert!(dead.contains("a Save is with the server"), "{dead}");
-        assert!(host.set_value(ids::REPLY_SOURCE_URL, "x").is_err());
-        host.reply_source.settings.saving = None;
-        host.reply_source.settings.note = Some(ReplySourceNote::Unknown);
-        host.reply_source.settings.retype_key = true;
+        let error = tree.find(ids::REPLY_SOURCE_ERROR).unwrap();
+        assert_eq!(error.name, "gone");
+        assert!(error.states.contains(&"trouble".to_string()));
+        host.reply_source.settings.note = Some(ReplySourceNote::KeyNotKept("refused".into()));
         let error = host
             .snapshot()
             .find(ids::REPLY_SOURCE_ERROR)
             .cloned()
             .unwrap();
-        assert_eq!(
-            error.name,
-            format!("{REPLY_SOURCE_SAVE_UNKNOWN} {REPLY_SOURCE_RETYPE_KEY}")
-        );
-        assert!(error.states.is_empty(), "checking again is not trouble");
-        let said = "baseUrl must be a literal loopback address such as http://127.0.0.1:8080";
-        host.reply_source.settings.note = Some(ReplySourceNote::Refused(said.into()));
-        host.reply_source.settings.retype_key = false;
-        host.reply_source.health = Some(ProxyHealth::Running);
-        let tree = host.snapshot();
-        let error = tree.find(ids::REPLY_SOURCE_ERROR).unwrap();
-        assert_eq!(error.name, said);
-        assert!(error.states.contains(&"trouble".to_string()));
-        assert_eq!(tree.find(ids::REPLY_SOURCE_HEALTH).unwrap().name, RUNNING);
-        assert!(tree.ids_are_unique());
+        assert!(error.states.is_empty());
+        let line = host.click(ids::REPLY_SOURCE_ERROR).unwrap_err();
+        assert!(line.contains("a line on the card"), "{line}");
 
-        // The app's server is not on this Mac: the page says the plan is set up only from the
-        // server's own Mac, and the plan's controls are dead; Server is still there to pick.
-        host.reply_source.settings.note = None;
-        host.reply_source.settings.kind_pick = None;
-        host.reply_source.settings.model_pick = None;
-        host.reply_source.settings.server_on_this_mac = false;
-        host.reply_source.health = Some(ProxyHealth::NotRunning);
+        // Why this computer's relay is not relaying, in the relay's own words, under its status,
+        // and on no other card.
+        host.computers[0].detail = Some(RelayDetail {
+            words: TAKE_BACK.into(),
+            trouble: false,
+        });
+        host.computers[1].detail = None;
         let tree = host.snapshot();
-        assert_eq!(
-            tree.find(ids::REPLY_SOURCE_ELSEWHERE).unwrap().name,
-            ELSEWHERE_LINE
-        );
+        assert_eq!(tree.find(ids::RELAY_DETAIL).unwrap().name, TAKE_BACK);
+        host.computers[0].detail = Some(RelayDetail {
+            words: "Can't reach the server. Trying again…".into(),
+            trouble: true,
+        });
+        let tree = host.snapshot();
         assert!(
-            !tree
-                .find(&ids::reply_source_kind(InferenceKind::LocalProxy))
+            tree.find(ids::RELAY_DETAIL)
                 .unwrap()
-                .enabled
+                .states
+                .contains(&"trouble".to_string())
         );
-        assert!(!tree.find(ids::REPLY_SOURCE_URL).unwrap().enabled);
-        assert_eq!(
-            tree.find(ids::REPLY_SOURCE_HEALTH).unwrap().name,
-            "Not running on the server's machine",
-            "no command to start what this Mac cannot reach"
-        );
-        let elsewhere = host
-            .click(&ids::reply_source_kind(InferenceKind::LocalProxy))
-            .unwrap_err();
-        assert!(elsewhere.contains(ELSEWHERE_LINE), "{elsewhere}");
-        assert!(host.click(ids::REPLY_SOURCE_REMOVE_KEY).is_err());
-        assert!(host.set_value(ids::REPLY_SOURCE_KEY, "sk").is_err());
-        host.click(&ids::reply_source_kind(InferenceKind::Gateway))
-            .unwrap();
+        let line = host.click(ids::RELAY_DETAIL).unwrap_err();
+        assert!(line.contains("a line on the card"), "{line}");
 
         // The snapshot never holds the key the page does.
         let mut state = AppState::new();
-        state.reply_source.kept = Some(ReplySourceRead::Read(kept_source(
-            InferenceKind::Gateway,
-            false,
-        )));
-        state.reply_source.key_draft = ProxyKey::new("sk-proxy-2");
+        state.reply_source.kept = relay_read("loopback");
+        state.reply_source.relay_key_draft = crate::opengrok::RelayKey::new("opencodex-test-key");
         let host = NativeChatHost::from_app(&state);
-        assert!(host.reply_source.key_typed && host.reply_source.unsaved);
-        assert_eq!(host.reply_source.settings.key_draft, None);
+        assert!(host.reply_source.relay.key_typed && host.reply_source.unsaved);
+        assert_eq!(host.reply_source.settings.relay_key_draft, None);
     }
 
-    /// A key pressed at Settings → Reply source's URL or key field is answered as the page
-    /// answers typing there, never with the list of what takes text as if the field were not
-    /// one: first why the page draws it read-only (off the page, before the setting is read, a
-    /// Save out, the server on another machine, and for the key a Remove key waiting for Save),
-    /// and otherwise what writes it. `set_value` and `type` are refused for the same reasons.
-    /// None of them leaves a command or a keystroke behind, so no draft changes.
+    /// With no computer of the person's own on the card list yet there is no card to hold the relay
+    /// fields, and none of their ids answers: the fields are this computer's, and need its card.
     #[test]
-    fn a_key_at_a_reply_source_field_is_refused_as_the_page_refuses_typing() {
-        use crate::components::reply_source::ELSEWHERE_LINE;
-        use crate::opengrok::{InferenceKind, InferenceSource};
+    fn the_relay_fields_need_this_computers_card() {
         use crate::state::ReplySourceRead;
-        let fields = [ids::REPLY_SOURCE_URL, ids::REPLY_SOURCE_KEY];
+        let mut host = host();
+        host.account_open = true;
+        host.computer_tab = true;
+        host.reply_source.settings.kept = relay_read("loopback");
+        host.computers = vec![a_card("mac_2", false)];
+        let tree = host.snapshot();
+        assert!(tree.find(ids::RELAY_ADDR).is_none());
+        for id in [
+            ids::RELAY_KEY_REMOVE,
+            ids::REPLY_SOURCE_SAVE,
+            ids::RELAY_ADDR,
+        ] {
+            let refused = host.click(id).unwrap_err();
+            assert!(
+                refused.contains("this computer is not among"),
+                "{id}: {refused}"
+            );
+        }
+        let refused = host
+            .set_value(ids::RELAY_ADDR, "http://127.0.0.1:9090")
+            .unwrap_err();
+        assert!(refused.contains("this computer is not among"), "{refused}");
+        let _ = ReplySourceRead::Loading;
+    }
+
+    /// The card has nothing of the plan on the server's own machine (its proxy URL, its key and
+    /// Remove key, its health line, the line on where it is set up from, the note on Claude and
+    /// Gemini) and no model of the relay's own (its menu, No model, a model a computer lists, the
+    /// line under it): none is on the tree, whatever the setting, and each is refused as not on the
+    /// page, with nothing sent and nothing typed. Nor does it have a radio.
+    #[test]
+    fn the_relay_card_has_no_loopback_section_and_no_relay_model_picker() {
+        use crate::state::ReplySourceRead;
+        let gone = [
+            "settings-reply-source-url",
+            "settings-reply-source-key",
+            "settings-reply-source-health",
+            "settings-reply-source-remove-key",
+            "settings-reply-source-elsewhere",
+            "settings-reply-source-providers",
+            "settings-relay-model",
+            "settings-relay-no-model",
+            "settings-relay-model-grok-4",
+            "settings-relay-models-note",
+            "settings-reply-source-kind",
+            "settings-reply-source-kind-local_proxy",
+            "settings-reply-source-via-mac",
+            "settings-reply-source-model",
+            "settings-reply-source-no-model",
+        ];
+        let mut host = host();
+        host.account_open = true;
+        host.computer_tab = true;
+        host.computers = vec![a_card("mac_1", true)];
+        let with_everything = crate::opengrok::InferenceSource {
+            kind: crate::opengrok::InferenceKind::LocalProxy,
+            base_url: Some("http://127.0.0.1:8080".into()),
+            local_model: Some("gpt-5-codex".into()),
+            has_api_key: true,
+            via: Some("mac".into()),
+            relay: Some(crate::opengrok::RelayRead {
+                connected: true,
+                machine_id: Some("mac_1".into()),
+                machine_label: None,
+                local_model: Some("grok-4".into()),
+            }),
+            ..kept_source(crate::opengrok::InferenceKind::LocalProxy, true)
+        };
+        for kept in [
+            Some(ReplySourceRead::Read(with_everything.clone())),
+            Some(ReplySourceRead::Read(crate::opengrok::InferenceSource {
+                relay: None,
+                ..with_everything
+            })),
+        ] {
+            host.reply_source.settings.kept = kept;
+            let tree = host.snapshot();
+            assert!(tree.find(&ids::computer_card("mac_1")).is_some());
+            for id in gone {
+                assert!(tree.find(id).is_none(), "{id}");
+                let refused = host.click(id).unwrap_err();
+                assert!(
+                    refused.contains(&format!("no `{id}` on")),
+                    "{id}: {refused}"
+                );
+                for op in [
+                    Op::key(id, "a"),
+                    Op::type_text(id, "a"),
+                    Op::SetValue {
+                        target: id.into(),
+                        value: "a".into(),
+                    },
+                ] {
+                    let refused = host.dispatch(&op).unwrap_err();
+                    assert!(refused.contains("is not editable"), "{id}: {refused}");
+                }
+            }
+            assert!(host.take_command().is_none() && host.take_compose().is_none());
+        }
+        let none = host.dispatch(&Op::key(ids::SIDEBAR, "a")).unwrap_err();
+        assert!(
+            !none.contains("settings-reply-source-url") && none.contains(ids::RELAY_ADDR),
+            "{none}"
+        );
+    }
+
+    /// A key pressed at the relay's address or key field is answered as the card answers typing
+    /// there, never with the list of what takes text as if the field were not one: first why the
+    /// card draws it read-only (off the page, before the setting is read, a server without the
+    /// relay, and for the key a Remove key waiting for Save), and otherwise what writes it.
+    /// `set_value` and `type` are refused for the same reasons. None of them leaves a command or a
+    /// keystroke behind, so no draft changes.
+    #[test]
+    fn a_key_at_a_relay_field_is_refused_as_the_card_refuses_typing() {
+        use crate::components::computers::RELAY_NOT_ON_SERVER;
+        use crate::opengrok::InferenceKind;
+        use crate::state::ReplySourceRead;
+        let fields = [ids::RELAY_ADDR, ids::RELAY_KEY];
         let typing = |target: &str| {
             [
                 Op::key(target, "a"),
@@ -11524,7 +14583,8 @@ mod tests {
         };
         let mut host = host();
         host.account_open = true;
-        host.reply_source_tab = true;
+        host.computer_tab = true;
+        host.computers = vec![a_card("mac_1", true)];
         for field in fields {
             for op in typing(field) {
                 let refused = host.dispatch(&op).unwrap_err();
@@ -11534,23 +14594,26 @@ mod tests {
                 );
             }
         }
+        host.reply_source.settings.kept = Some(ReplySourceRead::Read(kept_source(
+            InferenceKind::Gateway,
+            true,
+        )));
+        for field in fields {
+            for op in typing(field) {
+                let refused = host.dispatch(&op).unwrap_err();
+                assert!(refused.contains(RELAY_NOT_ON_SERVER), "{refused}");
+            }
+        }
 
-        host.reply_source.settings.kept = Some(ReplySourceRead::Read(InferenceSource {
-            base_url: Some("http://127.0.0.1:8080".into()),
-            has_api_key: true,
-            ..kept_source(InferenceKind::Gateway, true)
-        }));
-        host.reply_source.settings.server_on_this_mac = true;
-        let url = host
-            .dispatch(&Op::key(ids::REPLY_SOURCE_URL, "backspace"))
+        host.reply_source.settings.kept = relay_read("loopback");
+        let address = host
+            .dispatch(&Op::key(ids::RELAY_ADDR, "backspace"))
             .unwrap_err();
         assert!(
-            url.contains("use set_value, or type") && !url.contains("is not editable"),
-            "{url}"
+            address.contains("use set_value, or type") && !address.contains("is not editable"),
+            "{address}"
         );
-        let key = host
-            .dispatch(&Op::key(ids::REPLY_SOURCE_KEY, "a"))
-            .unwrap_err();
+        let key = host.dispatch(&Op::key(ids::RELAY_KEY, "a")).unwrap_err();
         assert!(
             key.contains("takes the whole key: use set_value") && !key.contains("is not editable"),
             "{key}"
@@ -11558,100 +14621,691 @@ mod tests {
         assert!(host.take_compose().is_none() && host.take_command().is_none());
 
         // Remove key waits for Save: the key field is drawn read-only and takes nothing, and the
-        // URL, which Remove key has nothing to do with, still does.
-        host.reply_source.settings.remove_key = true;
-        assert!(!host.snapshot().find(ids::REPLY_SOURCE_KEY).unwrap().enabled);
-        for op in typing(ids::REPLY_SOURCE_KEY) {
+        // address, which Remove key has nothing to do with, still does.
+        host.reply_source.relay.has_key = true;
+        host.reply_source.settings.relay_remove_key = true;
+        assert!(!host.snapshot().find(ids::RELAY_KEY).unwrap().enabled);
+        for op in typing(ids::RELAY_KEY) {
             let refused = host.dispatch(&op).unwrap_err();
-            assert!(refused.contains(ids::REPLY_SOURCE_REMOVE_KEY), "{refused}");
+            assert!(refused.contains(ids::RELAY_KEY_REMOVE), "{refused}");
         }
         assert!(host.take_command().is_none());
-        host.set_value(ids::REPLY_SOURCE_URL, "http://127.0.0.1:9090")
+        host.set_value(ids::RELAY_ADDR, "http://127.0.0.1:9090")
             .unwrap();
         assert!(matches!(
             host.take_command(),
-            Some(Command::SetReplySourceUrl(url)) if url == "http://127.0.0.1:9090"
+            Some(Command::SetRelayAddress(address)) if address == "http://127.0.0.1:9090"
         ));
-        host.reply_source.settings.remove_key = false;
 
-        host.reply_source.settings.saving = Some(4);
+        host.computer_tab = false;
         for field in fields {
             for op in typing(field) {
                 let refused = host.dispatch(&op).unwrap_err();
-                assert!(refused.contains("a Save is with the server"), "{refused}");
-            }
-        }
-        host.reply_source.settings.saving = None;
-        host.reply_source.settings.server_on_this_mac = false;
-        for field in fields {
-            for op in typing(field) {
-                let refused = host.dispatch(&op).unwrap_err();
-                assert!(refused.contains(ELSEWHERE_LINE), "{refused}");
-            }
-        }
-        host.reply_source_tab = false;
-        for field in fields {
-            for op in typing(field) {
-                let refused = host.dispatch(&op).unwrap_err();
-                assert!(refused.contains(ids::SETTINGS_REPLY_SOURCE), "{refused}");
+                assert!(refused.contains("settings-tab-computer"), "{refused}");
             }
         }
         assert!(host.take_compose().is_none() && host.take_command().is_none());
+    }
 
-        // Where nothing takes text, the list of what does names both fields.
-        let elsewhere = host.dispatch(&Op::key(ids::SIDEBAR, "a")).unwrap_err();
+    /// Settings → General answers by its tab's id from anywhere in Settings, and not while
+    /// Settings is shut; on it, Default models is a section of the page, and a line, not a
+    /// control.
+    #[test]
+    fn the_general_tab_is_on_the_tree_and_holds_default_models() {
+        use crate::components::default_models::TITLE;
+        let mut host = host();
+        let tree = host.snapshot();
+        assert_eq!(tree.find(ids::SETTINGS_GENERAL).unwrap().name, "General");
+        let shut = host.click(ids::SETTINGS_GENERAL).unwrap_err();
+        assert!(shut.contains(ids::FOOTER_ACCOUNT), "{shut}");
+        host.account_open = true;
+        host.click(ids::SETTINGS_GENERAL).unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::SetAppSettingsTab(AppSettingsTab::General))
+        ));
         assert!(
-            elsewhere.contains(ids::REPLY_SOURCE_URL) && elsewhere.contains(ids::REPLY_SOURCE_KEY),
-            "{elsewhere}"
+            host.snapshot().find(ids::DEFAULT_MODELS).is_none(),
+            "Settings is not open on General"
+        );
+        host.general_tab = true;
+        let tree = host.snapshot();
+        let models = tree.find(ids::DEFAULT_MODELS).unwrap();
+        assert_eq!(models.name, TITLE);
+        assert_eq!(TITLE, "Default models");
+        assert_eq!(
+            models
+                .children
+                .iter()
+                .map(|node| node.id.as_str())
+                .collect::<Vec<_>>(),
+            [ids::NEW_BOTS, ids::PLAN_FALLBACK],
+            "its two pickers"
+        );
+        assert!(tree.ids_are_unique());
+        let line = host.click(ids::DEFAULT_MODELS).unwrap_err();
+        assert!(line.contains("not a control"), "{line}");
+        assert!(host.take_command().is_none());
+    }
+
+    /// Settings → General opens with Default models, which holds Default for new Bots: while
+    /// the server keeps no such default it says it is coming and its card is dead, the picker's
+    /// card with no model, and refused with why; off the page it is refused for that first, and
+    /// Settings → Relay does not hold it. From the app, as the state holds it.
+    #[test]
+    fn the_general_pages_default_for_new_bots_is_coming() {
+        use crate::components::default_models::{NEW_BOTS_COMING_SOON, TITLE};
+        use crate::opengrok::InferenceKind;
+        use crate::state::ReplySourceRead;
+        let mut state = AppState::new();
+        // Signed in with a Bot, or the tree is the login page's or the empty roster's.
+        state.auth_status = crate::state::AuthStatus::SignedIn;
+        state.account = Some(
+            serde_json::from_value(serde_json::json!({ "id": "acct_1", "email": "a@b.c" }))
+                .unwrap(),
+        );
+        state.coworkers = vec![
+            serde_json::from_value(serde_json::json!({ "id": "cw_1", "name": "Ada" })).unwrap(),
+        ];
+        state.is_app_settings_open = true;
+        state.app_settings_tab = AppSettingsTab::General;
+        state.reply_source.kept = Some(ReplySourceRead::Read(kept_source(
+            InferenceKind::LocalProxy,
+            true,
+        )));
+        let mut host = NativeChatHost::from_app(&state);
+        let tree = host.snapshot();
+        let models = tree.find(ids::DEFAULT_MODELS).expect("Default models");
+        assert_eq!(
+            (models.name.as_str(), models.children[0].id.as_str()),
+            (TITLE, ids::NEW_BOTS)
+        );
+        let new_bots = tree.find(ids::NEW_BOTS).unwrap();
+        assert_eq!(
+            (new_bots.name.as_str(), new_bots.states.as_slice()),
+            ("Default for new Bots", &["unavailable".to_string()][..])
+        );
+        assert_eq!(
+            tree.find(ids::NEW_BOTS_UNAVAILABLE).unwrap().name,
+            NEW_BOTS_COMING_SOON
+        );
+        let card = tree.find(ids::NEW_BOTS_CARD).unwrap();
+        assert_eq!(
+            (card.role.as_str(), card.name.as_str(), card.enabled),
+            ("button", "No model", false)
+        );
+        let dead = host.click(ids::NEW_BOTS_CARD).unwrap_err();
+        assert!(dead.contains(NEW_BOTS_COMING_SOON), "{dead}");
+        let line = host.click(ids::NEW_BOTS_UNAVAILABLE).unwrap_err();
+        assert!(line.contains("not a control"), "{line}");
+        assert!(host.take_command().is_none());
+
+        state.app_settings_tab = AppSettingsTab::Computer;
+        let mut host = NativeChatHost::from_app(&state);
+        let tree = host.snapshot();
+        assert!(tree.find(ids::DEFAULT_MODELS).is_none() && tree.find(ids::NEW_BOTS).is_none());
+        let off = host.click(ids::NEW_BOTS_CARD).unwrap_err();
+        assert!(off.contains(ids::SETTINGS_GENERAL), "{off}");
+    }
+
+    /// What `GET /models` lists in the picker tests: two gateway routes, one that lists five
+    /// levels of effort and one that lists none, and the plan's GPT-6 Luna with its fast twin
+    /// (five levels) and Sol (six, up to ultra), each with a level of its own
+    /// (`opengrok::model_fixtures::levelled_catalogue`).
+    fn a_levelled_catalogue() -> crate::opengrok::ModelCatalogue {
+        crate::opengrok::model_fixtures::levelled_catalogue()
+    }
+
+    /// Default for new Bots' picker, from the default as given, over a list of two plan models
+    /// and two gateway routes ([`a_levelled_catalogue`]).
+    fn a_new_bots_pick(
+        default: Option<crate::opengrok::NewBotDefault>,
+    ) -> crate::opengrok::ModelPick {
+        let account = kept_source(crate::opengrok::InferenceKind::Gateway, true);
+        crate::opengrok::new_bots_pick(
+            default.as_ref(),
+            Some(&account),
+            &a_levelled_catalogue(),
+            |_| vec!["gpt-6-luna".to_string(), "gpt-6-luna--fast".to_string()],
+        )
+    }
+
+    /// Where the server keeps a default for new Bots, Default for new Bots is the Bot's picker on
+    /// Settings → General, every part of it under `settings-new-bots-` for `agent-model-`, and a
+    /// driver works it by the same roads: the card, ⚡, the slider, the list with None over its
+    /// models, the search box, a model, and the popover's dismiss. Each change is sent as the
+    /// default's, and every control that sends one is dead while one is with the server. What a
+    /// refused change came to is in the popover while it is open, and under the card while it is
+    /// shut. Off the page it is all refused.
+    #[test]
+    fn the_default_for_new_bots_is_the_bots_picker_and_a_driver_works_it() {
+        use crate::opengrok::{InferenceKind, NEW_BOTS_PICK_FIRST, NewBotDefault};
+        use crate::state::DefaultForNewBots;
+        let mut host = host();
+        host.account_open = true;
+        host.general_tab = true;
+        host.reply_source.settings.kept = relay_read("loopback");
+        host.reply_source.new_bots = DefaultForNewBots::Kept(None);
+        host.new_bots_pick = Some(a_new_bots_pick(None));
+        let tree = host.snapshot();
+        let section = tree.find(ids::NEW_BOTS).unwrap();
+        assert!(section.states.is_empty(), "{:?}", section.states);
+        assert!(tree.find(ids::NEW_BOTS_UNAVAILABLE).is_none());
+        let card = tree.find(ids::NEW_BOTS_CARD).unwrap();
+        assert_eq!(
+            (card.name.as_str(), card.value.as_deref(), card.enabled),
+            ("None", Some(""), true)
+        );
+        assert!(!tree.find("settings-new-bots-pop").unwrap().visible);
+        host.click(ids::NEW_BOTS_CARD).unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::NewBots(PickerCommand::Toggle))
+        ));
+
+        // None set: ⚡ and the slider are dead and say why.
+        host.new_bots_picker.open = true;
+        let tree = host.snapshot();
+        assert!(tree.find("settings-new-bots-pop").unwrap().visible);
+        let fast = tree.find("settings-new-bots-fast").unwrap();
+        assert_eq!(
+            (fast.enabled, fast.value.as_deref()),
+            (false, Some(NEW_BOTS_PICK_FIRST))
+        );
+        assert!(
+            tree.find("settings-new-bots-effort").is_none(),
+            "no model, no levels, no slider"
+        );
+        let dead = host.click("settings-new-bots-fast").unwrap_err();
+        assert!(dead.contains(NEW_BOTS_PICK_FIRST), "{dead}");
+        let no_effort = host
+            .set_value("settings-new-bots-effort", "high")
+            .unwrap_err();
+        assert!(no_effort.contains("no model is picked"), "{no_effort}");
+        host.click("settings-new-bots-open-list").unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::NewBots(PickerCommand::ToggleList))
+        ));
+
+        // The list: None over the models, ticked while none is set, and the Bot's groups.
+        host.new_bots_picker.list_open = true;
+        let tree = host.snapshot();
+        let list = tree.find("settings-new-bots-list").unwrap();
+        let rows: Vec<(&str, &[String])> = list
+            .children
+            .iter()
+            .map(|row| (row.id.as_str(), row.states.as_slice()))
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                ("settings-new-bots-none", &["selected".to_string()][..]),
+                ("settings-new-bots-group-local_proxy", &[][..]),
+                (
+                    "settings-new-bots-row-local_proxy-gpt-6-luna",
+                    &["fast".to_string()][..]
+                ),
+                ("settings-new-bots-group-gateway", &[][..]),
+                ("settings-new-bots-row-gateway-oag/cheap", &[][..]),
+                ("settings-new-bots-row-gateway-xai/grok-4.7", &[][..]),
+            ]
+        );
+        assert_eq!(
+            ids::new_bots_row(InferenceKind::LocalProxy, "gpt-6-luna"),
+            "settings-new-bots-row-local_proxy-gpt-6-luna"
+        );
+        host.click(&ids::new_bots_row(InferenceKind::LocalProxy, "gpt-6-luna"))
+            .unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::NewBots(PickerCommand::Pick { source: InferenceKind::LocalProxy, base_id }))
+                if base_id == "gpt-6-luna"
+        ));
+        host.click("settings-new-bots-none").unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::ClearNewBotsDefault)
+        ));
+        host.set_value("settings-new-bots-search", "grok").unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::NewBots(PickerCommand::SetSearch(query))) if query == "grok"
+        ));
+        let rows: Vec<String> = host
+            .snapshot()
+            .find("settings-new-bots-list")
+            .unwrap()
+            .children
+            .iter()
+            .map(|row| row.id.clone())
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                "settings-new-bots-group-gateway",
+                "settings-new-bots-row-gateway-xai/grok-4.7"
+            ],
+            "the search leaves None out too"
+        );
+        let left_out = host.click("settings-new-bots-none").unwrap_err();
+        assert!(left_out.contains("leaves it out"), "{left_out}");
+        host.dispatch(&Op::key("settings-new-bots-search", "backspace"))
+            .unwrap();
+        assert_eq!(host.new_bots_picker.search, "gro");
+
+        // A default set: the card names it, its row is ticked, and ⚡ and the slider work.
+        host.new_bots_pick = Some(a_new_bots_pick(Some(NewBotDefault {
+            source: InferenceKind::LocalProxy,
+            model: "gpt-6-luna".into(),
+            effort: "high".into(),
+        })));
+        host.new_bots_picker.list_open = false;
+        host.new_bots_picker.search.clear();
+        let tree = host.snapshot();
+        let card = tree.find(ids::NEW_BOTS_CARD).unwrap();
+        assert_eq!(
+            (card.name.as_str(), card.states.as_slice()),
+            (
+                "GPT-6 Luna · High",
+                &["local_proxy".to_string(), "expanded".to_string()][..]
+            )
+        );
+        host.click("settings-new-bots-fast").unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::NewBots(PickerCommand::SetFast(true)))
+        ));
+        host.set_value("settings-new-bots-effort", "max").unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::NewBots(PickerCommand::SetEffort(word))) if word == "max"
+        ));
+        host.click("settings-new-bots-reset").unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::NewBots(PickerCommand::Reset))
+        ));
+
+        // A change with the server: every control that sends one is dead, and the card says so.
+        host.new_bots_busy = true;
+        let tree = host.snapshot();
+        assert!(
+            tree.find(ids::NEW_BOTS_CARD)
+                .unwrap()
+                .states
+                .contains(&"saving".to_string())
+        );
+        assert!(!tree.find("settings-new-bots-fast").unwrap().enabled);
+        for control in ["settings-new-bots-fast", "settings-new-bots-reset"] {
+            let busy = host.click(control).unwrap_err();
+            assert!(busy.contains("a change is with the server"), "{busy}");
+        }
+        assert!(host.set_value("settings-new-bots-effort", "low").is_err());
+        host.new_bots_busy = false;
+
+        // What a refusal said: in the popover while open, under the card while shut.
+        host.new_bots_note = Some("newBotDefault.effort must be one of inherit".into());
+        let tree = host.snapshot();
+        let pop = tree.find("settings-new-bots-pop").unwrap();
+        assert!(
+            pop.children
+                .iter()
+                .any(|node| node.id == "settings-new-bots-error")
+        );
+        host.click(ids::NEW_BOTS_DISMISS).unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::NewBots(PickerCommand::SetOpen(false)))
+        ));
+        host.new_bots_picker.open = false;
+        let tree = host.snapshot();
+        let section = tree.find(ids::NEW_BOTS).unwrap();
+        assert!(
+            section
+                .children
+                .iter()
+                .any(|node| node.id == "settings-new-bots-error"),
+            "under the card"
+        );
+        assert!(tree.ids_are_unique());
+        let line = host.click("settings-new-bots-error").unwrap_err();
+        assert!(line.contains("a line"), "{line}");
+        assert!(host.take_command().is_none());
+
+        // Off the page, nothing of it answers, on Computer as anywhere else; the Bot's picker is a
+        // picker of its own.
+        host.general_tab = false;
+        host.computer_tab = true;
+        let off = host.click(ids::NEW_BOTS_CARD).unwrap_err();
+        assert!(off.contains(ids::SETTINGS_GENERAL), "{off}");
+        let off = host.set_value("settings-new-bots-search", "x").unwrap_err();
+        assert!(off.contains(ids::SETTINGS_GENERAL), "{off}");
+        assert!(!is_picker_part(ids::NEW_BOTS_CARD));
+    }
+
+    /// The Relay-off fallback's picker, over a gateway route and a plan model the server lists,
+    /// with the fallback as given.
+    fn a_plan_fallback_pick(
+        fallback: Option<crate::opengrok::PlanFallback>,
+    ) -> crate::opengrok::ModelPick {
+        crate::opengrok::plan_fallback_pick(fallback.as_ref(), &a_levelled_catalogue())
+    }
+
+    /// Where the server keeps a Relay-off fallback, it is the Bot's picker on Settings → General
+    /// over the Gateway group alone, every part of it under `settings-plan-fallback-`, and a
+    /// driver works it as it works Default for new Bots: the card, the list with None over its
+    /// rows, a model, None, the search box and the popover's dismiss. Each change is sent as the
+    /// fallback's. Off the page it is all refused.
+    #[test]
+    fn the_relay_off_fallback_is_a_gateway_picker_and_a_driver_works_it() {
+        use crate::opengrok::{InferenceKind, PLAN_FALLBACK_PICK_FIRST};
+        use crate::state::RelayOffFallback;
+        let mut host = host();
+        host.account_open = true;
+        host.general_tab = true;
+        host.reply_source.plan_fallback = RelayOffFallback::Kept(None);
+        host.plan_fallback_pick = Some(a_plan_fallback_pick(None));
+        let tree = host.snapshot();
+        let section = tree.find(ids::PLAN_FALLBACK).unwrap();
+        assert_eq!(
+            (section.name.as_str(), section.states.as_slice()),
+            ("When Relay is off, Subscription Bots use", &[][..])
+        );
+        assert!(tree.find(ids::PLAN_FALLBACK_UNAVAILABLE).is_none());
+        let card = tree.find(ids::PLAN_FALLBACK_CARD).unwrap();
+        assert_eq!((card.name.as_str(), card.enabled), ("None", true));
+        host.click(ids::PLAN_FALLBACK_CARD).unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::PlanFallback(PickerCommand::Toggle))
+        ));
+
+        host.plan_fallback_picker.open = true;
+        let tree = host.snapshot();
+        assert!(tree.find("settings-plan-fallback-pop").unwrap().visible);
+        let fast = tree.find("settings-plan-fallback-fast").unwrap();
+        assert_eq!(
+            (fast.enabled, fast.value.as_deref()),
+            (false, Some(PLAN_FALLBACK_PICK_FIRST))
+        );
+        host.plan_fallback_picker.list_open = true;
+        let tree = host.snapshot();
+        let rows: Vec<(&str, Option<&str>)> = tree
+            .find("settings-plan-fallback-list")
+            .unwrap()
+            .children
+            .iter()
+            .map(|row| (row.id.as_str(), row.value.as_deref()))
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                ("settings-plan-fallback-none", Some("no fallback")),
+                ("settings-plan-fallback-group-gateway", None),
+                (
+                    "settings-plan-fallback-row-gateway-oag/cheap",
+                    Some("gateway")
+                ),
+                (
+                    "settings-plan-fallback-row-gateway-xai/grok-4.7",
+                    Some("gateway")
+                ),
+            ],
+            "the Gateway's rows alone"
+        );
+        let plan = host
+            .click("settings-plan-fallback-row-local_proxy-gpt-6-luna")
+            .unwrap_err();
+        assert!(
+            plan.contains("no `settings-plan-fallback-row-local_proxy"),
+            "{plan}"
+        );
+        host.click(&ids::plan_fallback_row("xai/grok-4.7")).unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::PlanFallback(PickerCommand::Pick { source: InferenceKind::Gateway, base_id }))
+                if base_id == "xai/grok-4.7"
+        ));
+        host.click("settings-plan-fallback-none").unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::ClearPlanFallback)
+        ));
+        host.set_value("settings-plan-fallback-search", "grok")
+            .unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::PlanFallback(PickerCommand::SetSearch(query))) if query == "grok"
+        ));
+        host.click(ids::PLAN_FALLBACK_DISMISS).unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::PlanFallback(PickerCommand::SetOpen(false)))
+        ));
+
+        // What a refusal said is under the card while the popover is shut.
+        host.plan_fallback_picker = PickerView::default();
+        host.plan_fallback_note = Some(
+            "planFallback.effort must be one of inherit, none, low, medium, high, xhigh, max, ultra"
+                .into(),
+        );
+        let tree = host.snapshot();
+        assert!(
+            tree.find(ids::PLAN_FALLBACK)
+                .unwrap()
+                .children
+                .iter()
+                .any(|node| node.id == "settings-plan-fallback-error"),
+            "under the card"
+        );
+        assert!(tree.ids_are_unique());
+
+        // Off the page, nothing of it answers.
+        host.general_tab = false;
+        let off = host.click(ids::PLAN_FALLBACK_CARD).unwrap_err();
+        assert!(off.contains(ids::SETTINGS_GENERAL), "{off}");
+        let off = host
+            .set_value("settings-plan-fallback-search", "x")
+            .unwrap_err();
+        assert!(off.contains(ids::SETTINGS_GENERAL), "{off}");
+        assert!(host.take_command().is_none());
+    }
+
+    /// From the app: the Relay-off fallback is live only where the read of the setting carries
+    /// `planFallback`, `null` or not; without the key the section says it is coming and its card
+    /// is dead and refused with why.
+    #[test]
+    fn the_relay_off_fallback_is_live_from_the_app_only_where_the_server_keeps_one() {
+        use crate::components::default_models::PLAN_FALLBACK_COMING_SOON;
+        use crate::state::ReplySourceRead;
+        let mut state = AppState::new();
+        state.auth_status = crate::state::AuthStatus::SignedIn;
+        state.account = Some(
+            serde_json::from_value(serde_json::json!({ "id": "acct_1", "email": "a@b.c" }))
+                .unwrap(),
+        );
+        state.coworkers = vec![
+            serde_json::from_value(serde_json::json!({ "id": "cw_1", "name": "Ada" })).unwrap(),
+        ];
+        state.is_app_settings_open = true;
+        state.app_settings_tab = AppSettingsTab::General;
+        let mut kept = kept_source(crate::opengrok::InferenceKind::LocalProxy, true);
+        state.reply_source.kept = Some(ReplySourceRead::Read(kept.clone()));
+        let mut host = NativeChatHost::from_app(&state);
+        let tree = host.snapshot();
+        let section = tree.find(ids::PLAN_FALLBACK).unwrap();
+        assert!(section.states.contains(&"unavailable".to_string()));
+        assert_eq!(
+            tree.find(ids::PLAN_FALLBACK_UNAVAILABLE).unwrap().name,
+            PLAN_FALLBACK_COMING_SOON
+        );
+        let card = tree.find(ids::PLAN_FALLBACK_CARD).unwrap();
+        assert_eq!((card.name.as_str(), card.enabled), ("No model", false));
+        let dead = host.click(ids::PLAN_FALLBACK_CARD).unwrap_err();
+        assert!(dead.contains(PLAN_FALLBACK_COMING_SOON), "{dead}");
+        assert!(host.take_command().is_none());
+
+        kept.plan_fallback = Some(Some(crate::opengrok::PlanFallback {
+            model: "xai/grok-4.7".into(),
+            effort: "low".into(),
+        }));
+        state.reply_source.kept = Some(ReplySourceRead::Read(kept));
+        let tree = NativeChatHost::from_app(&state).snapshot();
+        assert!(tree.find(ids::PLAN_FALLBACK_UNAVAILABLE).is_none());
+        let card = tree.find(ids::PLAN_FALLBACK_CARD).unwrap();
+        assert_eq!(
+            (card.name.as_str(), card.enabled, card.states.as_slice()),
+            ("Grok 4.7", true, &["gateway".to_string()][..])
         );
     }
 
-    /// The composer's chip is on the tree while there is a choice of door, valued by the door and
-    /// `picked` while it is the person's pick, and a click works it as a person's does, where the
-    /// composer's panel is worked from the keyboard. Each reply's badge is there as the feed draws
-    /// it: under a reply with words, and not under one that said nothing but its status line.
+    /// From the app: a read whose setting carries `newBotDefault` puts the live picker on the
+    /// tree, and one without the key the dead card that says it is coming.
     #[test]
-    fn the_composer_chip_and_each_replys_badge_are_on_the_tree() {
-        use crate::opengrok::{InferenceKind, InferenceSource, ReplySource};
-        use crate::state::{ReplySourceRead, TurnSourceChip};
-        let mut host = host();
-        assert!(host.snapshot().find(ids::COMPOSER_REPLY_SOURCE).is_none());
-        assert!(host.click(ids::COMPOSER_REPLY_SOURCE).is_err());
-        host.turn_source = Some(TurnSourceChip {
-            kind: InferenceKind::LocalProxy,
-            picked: false,
-            local_model: Some("gpt-5-codex".into()),
-        });
-        let chip = host
-            .snapshot()
-            .find(ids::COMPOSER_REPLY_SOURCE)
-            .cloned()
-            .unwrap();
-        assert_eq!(
-            (chip.name.as_str(), chip.value.as_deref()),
-            ("My plan", Some("local_proxy"))
+    fn the_default_for_new_bots_is_live_from_the_app_only_where_the_server_keeps_one() {
+        use crate::components::default_models::NEW_BOTS_COMING_SOON;
+        use crate::state::ReplySourceRead;
+        let mut state = AppState::new();
+        state.auth_status = crate::state::AuthStatus::SignedIn;
+        state.account = Some(
+            serde_json::from_value(serde_json::json!({ "id": "acct_1", "email": "a@b.c" }))
+                .unwrap(),
         );
-        assert!(chip.states.is_empty());
-        host.click(ids::COMPOSER_REPLY_SOURCE).unwrap();
-        assert!(matches!(
-            host.take_command(),
-            Some(Command::ToggleTurnSource)
-        ));
-        host.turn_source = Some(TurnSourceChip {
-            kind: InferenceKind::Gateway,
-            picked: true,
-            local_model: None,
-        });
-        let chip = host
-            .snapshot()
-            .find(ids::COMPOSER_REPLY_SOURCE)
-            .cloned()
-            .unwrap();
-        assert_eq!(chip.name, "Server");
-        assert!(chip.states.contains(&"picked".to_string()));
+        state.coworkers = vec![
+            serde_json::from_value(serde_json::json!({ "id": "cw_1", "name": "Ada" })).unwrap(),
+        ];
+        state.is_app_settings_open = true;
+        state.app_settings_tab = AppSettingsTab::General;
+        let mut kept = kept_source(crate::opengrok::InferenceKind::Gateway, true);
+        state.reply_source.kept = Some(ReplySourceRead::Read(kept.clone()));
+        let tree = NativeChatHost::from_app(&state).snapshot();
+        assert_eq!(
+            tree.find(ids::NEW_BOTS_UNAVAILABLE).unwrap().name,
+            NEW_BOTS_COMING_SOON
+        );
+        assert!(!tree.find(ids::NEW_BOTS_CARD).unwrap().enabled);
 
-        // From the app: a reply with words wears its badge, one that said only its status line
-        // does not, and the composer's chip is the account's door.
+        kept.new_bot_default = Some(Some(crate::opengrok::NewBotDefault {
+            source: crate::opengrok::InferenceKind::Gateway,
+            model: "xai/grok-4.7".into(),
+            effort: "low".into(),
+        }));
+        state.reply_source.kept = Some(ReplySourceRead::Read(kept));
+        let tree = NativeChatHost::from_app(&state).snapshot();
+        assert!(tree.find(ids::NEW_BOTS_UNAVAILABLE).is_none());
+        let card = tree.find(ids::NEW_BOTS_CARD).unwrap();
+        assert_eq!((card.name.as_str(), card.enabled), ("Grok 4.7", true));
+    }
+
+    /// The cards have no line or button of their own for the account's way to the plan: a switch
+    /// going on points the account at the relay in the same press. With the relay on, whatever way
+    /// the account keeps, and a refusal of what the switch sent said, neither the line, its button
+    /// nor a line under them is on the tree, and each is refused as not on screen, with nothing
+    /// sent.
+    #[test]
+    fn the_cards_have_no_line_or_button_for_the_accounts_way() {
+        let gone = [
+            "settings-relay-via",
+            "settings-relay-via-use",
+            "settings-relay-via-error",
+        ];
+        let mut host = host();
+        host.account_open = true;
+        host.computer_tab = true;
+        host.computers = vec![ComputerCard {
+            note: Some("via must be \"loopback\" or \"mac\"".into()),
+            ..a_card("mac_1", true)
+        }];
+        host.reply_source.relay = RelaySnap {
+            address: "http://127.0.0.1:8080".into(),
+            ..RelaySnap::default()
+        };
+        for way in ["loopback", "mac", "helper"] {
+            host.reply_source.settings.kept = relay_read(way);
+            let tree = host.snapshot();
+            assert!(tree.find(&ids::computer_relay("mac_1")).is_some(), "{way}");
+            for id in gone {
+                assert!(tree.find(id).is_none(), "{way}: {id}");
+                let refused = host.click(id).unwrap_err();
+                assert!(
+                    refused.contains(&format!("no `{id}` on")),
+                    "{way}: {id}: {refused}"
+                );
+            }
+            assert!(host.take_command().is_none(), "{way}");
+        }
+    }
+
+    /// A reply the server's paid keys answered because the relay is off wears its badge on the
+    /// tree as the feed draws it: `paid key · relay off`, valued by its door, with state
+    /// `relay-off`.
+    #[test]
+    fn a_reply_answered_because_the_relay_is_off_says_so_on_the_tree() {
+        use crate::opengrok::ReplySource;
+        let mut state = AppState::new();
+        state.auth_status = crate::state::AuthStatus::SignedIn;
+        state.account = Some(
+            serde_json::from_value(serde_json::json!({ "id": "acct_1", "email": "a@b.c" }))
+                .unwrap(),
+        );
+        state.coworkers = vec![
+            serde_json::from_value(serde_json::json!({ "id": "cw_1", "name": "Ada" })).unwrap(),
+        ];
+        state.active_coworker_id = Some("cw_1".into());
+        state.active_conversation_id = Some("cw_1".into());
+        let source = ReplySource::from_event(&serde_json::json!({
+            "type": "CUSTOM", "name": "opengrok.inferenceSource",
+            "value": {"kind": "gateway", "model": "oag/cheap", "fallbackFor": "relay_disabled"}
+        }));
+        state.conversations.push(crate::state::Conversation {
+            id: "cw_1".into(),
+            title: "Ada".into(),
+            created_at: String::new(),
+            updated_at: String::new(),
+            messages: vec![crate::state::Message {
+                id: "m_1".into(),
+                sender: "AI".into(),
+                content: "Here it is.".into(),
+                sent_at: std::time::SystemTime::UNIX_EPOCH,
+                finished_at: None,
+                run_timing: None,
+                reply_source: source,
+                is_me: false,
+                reply_preview: None,
+                reply_to_id: None,
+                reply_is_me: false,
+                parts: Vec::new(),
+                run_id: None,
+                hidden: false,
+            }],
+            unread_count: 0,
+            origin: None,
+        });
+        let tree = NativeChatHost::from_app(&state).snapshot();
+        let badge = tree.find(&ids::reply_badge("m_1")).unwrap();
+        assert_eq!(
+            (
+                badge.name.as_str(),
+                badge.value.as_deref(),
+                badge.states.as_slice()
+            ),
+            (
+                "paid key · relay off",
+                Some("gateway"),
+                &["relay-off".to_string()][..]
+            )
+        );
+    }
+
+    /// Each reply's badge is on the tree as the feed draws it: under a reply with words, and not
+    /// under one that said nothing but its status line.
+    #[test]
+    fn each_replys_badge_is_on_the_tree() {
+        use crate::opengrok::{InferenceKind, InferenceSource, ReplySource};
+        use crate::state::ReplySourceRead;
+        // From the app: a reply with words wears its badge, and one that said only its status
+        // line does not.
         let mut state = AppState::new();
         state.auth_status = crate::state::AuthStatus::SignedIn;
         state.account = Some(
@@ -11677,6 +15331,8 @@ mod tests {
             reply_source: Some(ReplySource {
                 kind,
                 model: Some("gpt-5-codex".into()),
+                via: None,
+                fallback_for: None,
             }),
             is_me: false,
             reply_preview: None,
@@ -11719,14 +15375,1239 @@ mod tests {
             tree.find(&ids::reply_badge("m_2")).is_none(),
             "a status line has no bubble to wear a badge"
         );
-        let chip = tree.find(ids::COMPOSER_REPLY_SOURCE).unwrap();
-        assert_eq!(chip.value.as_deref(), Some("local_proxy"));
+    }
 
-        // While the composer dictates the chip gives its place to the dictation's buttons, and
-        // is not in the tree either.
-        state.composer_dictating = true;
+    /// The open Bot's picker as `AppState::model_pick` builds it: the Bot's row with `source`
+    /// as given (missing where `None`), the account on the server's keys, the gateway's two
+    /// routes and a plan that lists GPT-6 Luna with its fast twin ([`a_levelled_catalogue`]).
+    fn a_pick(
+        source: Option<serde_json::Value>,
+        model: &str,
+        effort: &str,
+    ) -> crate::opengrok::ModelPick {
+        a_pick_among(&["gpt-6-luna", "gpt-6-luna--fast"], source, model, effort)
+    }
+
+    /// [`a_pick`] over the plan models given.
+    fn a_pick_among(
+        plan: &[&str],
+        source: Option<serde_json::Value>,
+        model: &str,
+        effort: &str,
+    ) -> crate::opengrok::ModelPick {
+        let mut row = serde_json::json!({
+            "id": "cw_1", "name": "Ada", "model": model, "effort": effort
+        });
+        if let Some(source) = source {
+            row["source"] = source;
+        }
+        let bot = serde_json::from_value(row).unwrap();
+        let account = crate::opengrok::InferenceSource {
+            local_model: Some("gpt-5-codex".into()),
+            ..kept_source(crate::opengrok::InferenceKind::Gateway, true)
+        };
+        crate::opengrok::bot_pick(&bot, Some(&account), &a_levelled_catalogue(), |_| {
+            plan.iter().map(|id| id.to_string()).collect()
+        })
+    }
+
+    /// The Model card is on the tree while a Bot is open, named as the picker reads in a line
+    /// and valued by the model the next turn runs on, and a driver works its popover by the roads
+    /// a person's clicks take: ⚡, the slider by its words, the list and a model in it. Each
+    /// control is refused while it is not on screen, and the card while the Bot's settings are
+    /// shut.
+    #[test]
+    fn the_model_card_opens_its_popover_and_a_driver_works_it() {
+        let mut host = host();
+        assert!(
+            host.snapshot().find(ids::AGENT_MODEL_CARD).is_none(),
+            "no Bot open"
+        );
+        assert!(host.click(ids::AGENT_MODEL_CARD).is_err());
+        host.model_pick = Some(a_pick(
+            Some(serde_json::json!("local_proxy")),
+            "gpt-6-luna",
+            "inherit",
+        ));
+        let tree = host.snapshot();
+        let card = tree.find(ids::AGENT_MODEL_CARD).unwrap();
+        assert_eq!(
+            (card.name.as_str(), card.value.as_deref()),
+            ("GPT-6 Luna · Medium", Some("gpt-6-luna")),
+            "a Bot that chose no effort is on its model's own level, by name"
+        );
+        assert_eq!(card.states, ["local_proxy"]);
+        assert!(!tree.find("agent-model-pop").unwrap().visible);
+        assert!(
+            tree.find("agent-model-fast").is_none(),
+            "shut, and no controls"
+        );
+        assert!(
+            host.click("agent-model-fast").is_err(),
+            "the popover is shut"
+        );
+        let closed = host.click(ids::AGENT_MODEL_CARD).unwrap_err();
+        assert!(closed.contains("settings, which are closed"), "{closed}");
+        host.agent_settings_open = true;
+        host.click(ids::AGENT_MODEL_CARD).unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::ToggleModelPicker)
+        ));
+
+        host.model_picker.open = true;
+        let tree = host.snapshot();
+        assert!(tree.find("agent-model-pop").unwrap().visible);
+        assert!(
+            tree.find(ids::AGENT_MODEL_CARD)
+                .unwrap()
+                .states
+                .contains(&"expanded".to_string())
+        );
+        let fast = tree.find("agent-model-fast").unwrap();
+        assert_eq!((fast.enabled, fast.checked), (true, Some(false)));
+        let effort = tree.find("agent-model-effort").unwrap();
+        assert_eq!(
+            (
+                effort.role.as_str(),
+                effort.name.as_str(),
+                effort.value.as_deref()
+            ),
+            ("slider", "Medium", Some("medium")),
+            "lit on the model's own level with nothing chosen, and valued by that level's word"
+        );
+        assert_eq!(
+            tree.find("agent-model-open-list").unwrap().name,
+            "GPT-6 Luna"
+        );
+        assert!(
+            !tree.find("agent-model-reset").unwrap().enabled,
+            "nothing chosen, and ⚡ off: nothing to put back"
+        );
+        assert!(!tree.find("agent-model-list").unwrap().visible);
+        host.click("agent-model-fast").unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::SetModelFast(true))
+        ));
+        host.dispatch(&Op::SetValue {
+            target: "agent-model-effort".into(),
+            value: "max".into(),
+        })
+        .unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::SetModelEffort(word)) if word == "max"
+        ));
+        for refused in ["inherit", "none", "Max", "ultra", "extreme"] {
+            assert!(
+                host.dispatch(&Op::SetValue {
+                    target: "agent-model-effort".into(),
+                    value: refused.into(),
+                })
+                .is_err(),
+                "{refused}"
+            );
+        }
+        let said = host
+            .dispatch(&Op::SetValue {
+                target: "agent-model-effort".into(),
+                value: "ultra".into(),
+            })
+            .unwrap_err();
+        assert!(
+            said.contains(
+                "`ultra` is not one of GPT-6 Luna's levels: low, medium, high, xhigh, max"
+            ),
+            "{said}"
+        );
+        assert!(
+            host.click("agent-model-effort").is_err(),
+            "a slider is set, not clicked"
+        );
+        assert!(
+            host.click("agent-model-reset").is_err(),
+            "nothing to put back"
+        );
+        assert!(
+            host.click("agent-model-row-local_proxy-gpt-6-luna")
+                .is_err(),
+            "the list is not showing"
+        );
+        host.click("agent-model-open-list").unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::ToggleModelList)
+        ));
+
+        host.model_picker.list_open = true;
+        let tree = host.snapshot();
+        let search = tree.find("agent-model-search").unwrap();
+        assert_eq!(
+            (
+                search.role.as_str(),
+                search.name.as_str(),
+                search.value.as_deref()
+            ),
+            ("textbox", "Search models", Some("")),
+            "at the top of the list, nothing typed"
+        );
+        let list = tree.find("agent-model-list").unwrap();
+        assert!(list.visible);
+        assert_eq!(list.value.as_deref(), Some("3"));
+        let rows: Vec<(&str, &str, &[String])> = list
+            .children
+            .iter()
+            .map(|row| (row.id.as_str(), row.name.as_str(), row.states.as_slice()))
+            .collect();
+        // Under the rows, the line saying where this Bot's routines run: its own door is the
+        // person's plan, and its routines run there.
+        let routines = host
+            .model_pick
+            .as_ref()
+            .and_then(|pick| pick.routines.clone())
+            .expect("a Bot on its own plan");
+        assert_eq!(
+            rows,
+            [
+                ("agent-model-group-local_proxy", "Subscription", &[][..]),
+                (
+                    "agent-model-row-local_proxy-gpt-6-luna",
+                    "GPT-6 Luna",
+                    &["selected".to_string(), "fast".to_string()][..]
+                ),
+                ("agent-model-group-gateway", "Gateway", &[][..]),
+                ("agent-model-row-gateway-oag/cheap", "Cheap (auto)", &[][..]),
+                ("agent-model-row-gateway-xai/grok-4.7", "Grok 4.7", &[][..]),
+                ("agent-model-routines", routines.as_str(), &[][..]),
+            ]
+        );
+        assert!(
+            tree.find("agent-model-fast").is_none(),
+            "the list has the controls' place"
+        );
+        assert!(host.click("agent-model-fast").is_err());
+        host.click("agent-model-row-gateway-xai/grok-4.7").unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::PickModel { source: crate::opengrok::InferenceKind::Gateway, base_id })
+                if base_id == "xai/grok-4.7"
+        ));
+        assert!(
+            host.click("agent-model-row-gateway-xai/grok-4.6@sub")
+                .is_err(),
+            "not a model the list offers"
+        );
+        assert!(host.click("agent-model-row-local_proxy-oag/cheap").is_err());
+
+        // On a fast twin: ⚡ is a state of the card, and checked in the popover.
+        host.model_pick = Some(a_pick(
+            Some(serde_json::json!("local_proxy")),
+            "gpt-6-luna--fast",
+            "xhigh",
+        ));
+        host.model_picker.list_open = false;
+        let tree = host.snapshot();
+        let card = tree.find(ids::AGENT_MODEL_CARD).unwrap();
+        assert_eq!(card.name, "GPT-6 Luna · Xhigh ⚡");
+        assert_eq!(card.states, ["local_proxy", "fast", "expanded"]);
+        assert_eq!(tree.find("agent-model-fast").unwrap().checked, Some(true));
+        host.click("agent-model-fast").unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::SetModelFast(false))
+        ));
+    }
+
+    /// The open Bot's picker on Cheap (auto), a gateway route that lists five levels of effort and
+    /// names none as its own, with the effort given.
+    fn an_ownless_pick(effort: &str) -> crate::opengrok::ModelPick {
+        let bot = serde_json::from_value(serde_json::json!({
+            "id": "cw_1", "name": "Ada", "model": "oag/cheap", "effort": effort,
+            "source": "gateway"
+        }))
+        .unwrap();
+        crate::opengrok::bot_pick(
+            &bot,
+            Some(&kept_source(crate::opengrok::InferenceKind::Gateway, true)),
+            &crate::opengrok::model_fixtures::levelled_catalogue_without_own("oag/cheap"),
+            |_| Vec::new(),
+        )
+    }
+
+    /// The slider has exactly the levels the model lists for its stops, low to high, and a driver
+    /// sets one by its word: GPT-6 Luna five, up to max, and Sol six, up to ultra. A level the
+    /// model does not list is refused in words that name the ones it does, and a model that lists
+    /// none has no slider on the tree at all, and nothing in its place: its node is absent, the
+    /// popover's controls are ⚡, the name and ↺ alone, and the card says no effort.
+    #[test]
+    fn the_slider_has_the_levels_the_model_lists_and_is_absent_where_it_lists_none() {
+        let set = |host: &mut NativeChatHost, value: &str| {
+            host.dispatch(&Op::SetValue {
+                target: "agent-model-effort".into(),
+                value: value.into(),
+            })
+        };
+        let mut host = host();
+        host.agent_settings_open = true;
+        host.model_picker.open = true;
+
+        // GPT-6 Luna: five levels, the one the Bot chose lit.
+        host.model_pick = Some(a_pick(
+            Some(serde_json::json!("local_proxy")),
+            "gpt-6-luna",
+            "xhigh",
+        ));
+        let tree = host.snapshot();
+        let effort = tree.find("agent-model-effort").unwrap();
+        assert_eq!(
+            (
+                effort.name.as_str(),
+                effort.value.as_deref(),
+                effort.enabled
+            ),
+            ("Xhigh", Some("xhigh"), true)
+        );
+        for word in ["low", "medium", "high", "xhigh", "max"] {
+            set(&mut host, word).unwrap();
+            assert!(
+                matches!(host.take_command(), Some(Command::SetModelEffort(sent)) if sent == word),
+                "{word}"
+            );
+        }
+        let said = set(&mut host, "ultra").unwrap_err();
+        assert!(
+            said.contains(
+                "`ultra` is not one of GPT-6 Luna's levels: low, medium, high, xhigh, max"
+            ),
+            "{said}"
+        );
+        let click = host.click("agent-model-effort").unwrap_err();
+        assert!(
+            click.contains("set_value it to one of low, medium, high, xhigh, max"),
+            "{click}"
+        );
+
+        // Sol: six levels, ultra among them, and none chosen sits on its own level, High.
+        host.model_pick = Some(a_pick_among(
+            &["gpt-6-luna", "gpt-5.6-sol"],
+            Some(serde_json::json!("local_proxy")),
+            "gpt-5.6-sol",
+            "inherit",
+        ));
+        let tree = host.snapshot();
+        let effort = tree.find("agent-model-effort").unwrap();
+        assert_eq!(
+            (effort.name.as_str(), effort.value.as_deref()),
+            ("High", Some("high")),
+            "the model's own level, with nothing chosen: its word, and not `inherit`"
+        );
+        assert_eq!(
+            tree.find(ids::AGENT_MODEL_CARD).unwrap().name,
+            "GPT-5.6 Sol · High"
+        );
+        set(&mut host, "ultra").unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::SetModelEffort(sent)) if sent == "ultra"
+        ));
+        let click = host.click("agent-model-effort").unwrap_err();
+        assert!(
+            click.contains("set_value it to one of low, medium, high, xhigh, max, ultra"),
+            "{click}"
+        );
+
+        // Cheap (auto) lists levels and names none as its own: with none chosen nothing is lit,
+        // so the slider is named for what it is and has no word to say, and it takes a level.
+        host.model_pick = Some(an_ownless_pick("inherit"));
+        let tree = host.snapshot();
+        let effort = tree.find("agent-model-effort").unwrap();
+        assert_eq!(
+            (
+                effort.name.as_str(),
+                effort.value.as_deref(),
+                effort.enabled
+            ),
+            ("Effort", None, true)
+        );
+        assert_eq!(
+            tree.find(ids::AGENT_MODEL_CARD).unwrap().name,
+            "Cheap (auto)"
+        );
+        set(&mut host, "low").unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::SetModelEffort(sent)) if sent == "low"
+        ));
+
+        // Grok 4.7's source publishes no levels: no slider, nothing in its place.
+        host.model_pick = Some(a_pick(
+            Some(serde_json::json!("gateway")),
+            "xai/grok-4.7",
+            "inherit",
+        ));
+        let tree = host.snapshot();
+        assert!(tree.find("agent-model-effort").is_none());
+        let popover: Vec<&str> = tree
+            .find("agent-model-pop")
+            .unwrap()
+            .children
+            .iter()
+            .map(|node| node.id.as_str())
+            .collect();
+        assert_eq!(
+            popover,
+            [
+                "agent-model-fast",
+                "agent-model-open-list",
+                "agent-model-reset",
+                "agent-model-list"
+            ]
+        );
+        assert_eq!(tree.find(ids::AGENT_MODEL_CARD).unwrap().name, "Grok 4.7");
+        for refused in [
+            set(&mut host, "high").unwrap_err(),
+            host.click("agent-model-effort").unwrap_err(),
+        ] {
+            assert!(
+                refused.contains("Grok 4.7 lists no levels of effort, so there is no slider"),
+                "{refused}"
+            );
+        }
+        assert!(host.take_command().is_none());
+    }
+
+    /// Nothing the picker says, in the card or in the popover, says "Default" for an effort, in
+    /// whatever state the Bot's picker, Default for new Bots' and the Relay-off fallback's are:
+    /// where no effort was chosen the model's own level is named, where the model lists no
+    /// levels nothing is, and the card that is dead names no model and no effort.
+    #[test]
+    fn no_picker_says_default_for_an_effort_in_any_state() {
+        use crate::opengrok::{InferenceKind, NewBotDefault, PlanFallback};
+        use crate::state::{DefaultForNewBots, RelayOffFallback};
+        fn said_under(node: &UiNode, into: &mut Vec<String>) {
+            into.push(node.name.clone());
+            into.extend(node.value.clone());
+            into.extend(node.states.clone());
+            for child in &node.children {
+                said_under(child, into);
+            }
+        }
+        let mut said = Vec::new();
+        let mut look = |host: &NativeChatHost, card: &str| {
+            let tree = host.snapshot();
+            let node = tree
+                .find(card)
+                .unwrap_or_else(|| panic!("{card} is on the tree"));
+            said_under(node, &mut said);
+        };
+        let states = [
+            ("gpt-6-luna", "inherit"),
+            ("gpt-6-luna", "medium"),
+            ("gpt-6-luna", "ultra"),
+            ("gpt-6-luna", "none"),
+            ("oag/cheap", "inherit"),
+            ("xai/grok-4.7", "inherit"),
+            ("xai/grok-4.7", "high"),
+            ("oag/unlisted", "inherit"),
+        ];
+        // Each of the three, shut, open on its controls, and open on its list.
+        for (open, list_open) in [(false, false), (true, false), (true, true)] {
+            for (model, effort) in states {
+                let source = if model.starts_with("gpt") {
+                    "local_proxy"
+                } else {
+                    "gateway"
+                };
+                let mut host = host();
+                host.agent_settings_open = true;
+                host.model_pick = Some(a_pick(Some(serde_json::json!(source)), model, effort));
+                host.model_picker.open = open;
+                host.model_picker.list_open = list_open;
+                look(&host, ids::AGENT_MODEL_CARD);
+
+                let mut host = self::host();
+                host.account_open = true;
+                host.general_tab = true;
+                host.reply_source.settings.kept = relay_read("loopback");
+                host.reply_source.new_bots = DefaultForNewBots::Kept(None);
+                host.new_bots_pick = Some(a_new_bots_pick(Some(NewBotDefault {
+                    source: if source == "gateway" {
+                        InferenceKind::Gateway
+                    } else {
+                        InferenceKind::LocalProxy
+                    },
+                    model: model.into(),
+                    effort: effort.into(),
+                })));
+                host.new_bots_picker.open = open;
+                host.new_bots_picker.list_open = list_open;
+                look(&host, ids::NEW_BOTS_CARD);
+
+                if source == "gateway" {
+                    host.reply_source.plan_fallback = RelayOffFallback::Kept(None);
+                    host.plan_fallback_pick = Some(a_plan_fallback_pick(Some(PlanFallback {
+                        model: model.into(),
+                        effort: effort.into(),
+                    })));
+                    host.plan_fallback_picker.open = open;
+                    host.plan_fallback_picker.list_open = list_open;
+                    look(&host, ids::PLAN_FALLBACK_CARD);
+                }
+            }
+        }
+        // None set in the two that can have none, and the dead cards of a server that keeps none.
+        for open in [false, true] {
+            let mut host = host();
+            host.account_open = true;
+            host.general_tab = true;
+            host.reply_source.settings.kept = relay_read("loopback");
+            host.reply_source.new_bots = DefaultForNewBots::Kept(None);
+            host.new_bots_pick = Some(a_new_bots_pick(None));
+            host.new_bots_picker.open = open;
+            look(&host, ids::NEW_BOTS_CARD);
+            host.reply_source.plan_fallback = RelayOffFallback::Kept(None);
+            host.plan_fallback_pick = Some(a_plan_fallback_pick(None));
+            host.plan_fallback_picker.open = open;
+            look(&host, ids::PLAN_FALLBACK_CARD);
+        }
+        let mut host = host();
+        host.account_open = true;
+        host.general_tab = true;
+        look(&host, ids::NEW_BOTS_CARD);
+        look(&host, ids::PLAN_FALLBACK_CARD);
+
+        assert!(said.len() > 100, "a good many words were looked at");
+        let defaults: Vec<&String> = said
+            .iter()
+            .filter(|word| word.contains("Default"))
+            .collect();
+        assert!(defaults.is_empty(), "{defaults:?}");
+    }
+
+    /// The same slider is in all three pickers, under their own ids: the model's levels for its
+    /// stops, the model's own level lit where none was chosen, one of its levels set by its word
+    /// and any other refused in the same words, and no slider at all where there is no model, in
+    /// Default for new Bots' and the Relay-off fallback's.
+    #[test]
+    fn the_three_pickers_have_the_same_slider() {
+        use crate::opengrok::{InferenceKind, NewBotDefault, PlanFallback};
+        use crate::state::{DefaultForNewBots, RelayOffFallback};
+        // Each picker on Cheap (auto), which lists five levels, with the effort given, open on
+        // its controls.
+        let on = |which: PickerFor, effort: &str| {
+            let mut host = host();
+            host.account_open = true;
+            host.general_tab = true;
+            host.agent_settings_open = true;
+            host.reply_source.settings.kept = relay_read("loopback");
+            match which {
+                PickerFor::Bot => {
+                    host.model_pick = Some(a_pick(
+                        Some(serde_json::json!("gateway")),
+                        "oag/cheap",
+                        effort,
+                    ));
+                    host.model_picker.open = true;
+                }
+                PickerFor::NewBots => {
+                    host.reply_source.new_bots = DefaultForNewBots::Kept(None);
+                    host.new_bots_pick = Some(a_new_bots_pick(Some(NewBotDefault {
+                        source: InferenceKind::Gateway,
+                        model: "oag/cheap".into(),
+                        effort: effort.into(),
+                    })));
+                    host.new_bots_picker.open = true;
+                }
+                PickerFor::PlanFallback => {
+                    host.reply_source.plan_fallback = RelayOffFallback::Kept(None);
+                    host.plan_fallback_pick = Some(a_plan_fallback_pick(Some(PlanFallback {
+                        model: "oag/cheap".into(),
+                        effort: effort.into(),
+                    })));
+                    host.plan_fallback_picker.open = true;
+                }
+            }
+            host
+        };
+        let ids_of = |which: PickerFor| model_picker::ids(which).effort;
+        // The word of the level each picker's command carries, if it is a slider's.
+        let sent_word = |command: Option<Command>, which: PickerFor| match (which, command) {
+            (PickerFor::Bot, Some(Command::SetModelEffort(word))) => Some(word),
+            (PickerFor::NewBots, Some(Command::NewBots(PickerCommand::SetEffort(word)))) => {
+                Some(word)
+            }
+            (
+                PickerFor::PlanFallback,
+                Some(Command::PlanFallback(PickerCommand::SetEffort(word))),
+            ) => Some(word),
+            _ => None,
+        };
+        for which in [PickerFor::Bot, PickerFor::NewBots, PickerFor::PlanFallback] {
+            let effort = ids_of(which);
+            // None chosen: the model's own level, Medium, is lit, and its word is the
+            // node's, which a driver can write back; the word kept is still `inherit`.
+            let mut host = on(which, "inherit");
+            let tree = host.snapshot();
+            let node = tree.find(effort).unwrap();
+            assert_eq!(
+                (
+                    node.role.as_str(),
+                    node.name.as_str(),
+                    node.value.as_deref(),
+                    node.enabled
+                ),
+                ("slider", "Medium", Some("medium"), true),
+                "{effort}"
+            );
+            let read = node.value.clone().expect("a level is lit");
+            host.set_value(effort, &read).unwrap();
+            assert_eq!(
+                sent_word(host.take_command(), which),
+                Some(read),
+                "{effort}: what was read is taken back"
+            );
+            // A level the Bot chose: lit by name, and valued by its word.
+            let host_high = on(which, "xhigh");
+            let tree = host_high.snapshot();
+            let node = tree.find(effort).unwrap();
+            assert_eq!(
+                (node.name.as_str(), node.value.as_deref()),
+                ("Xhigh", Some("xhigh")),
+                "{effort}"
+            );
+            // A level of the model's is sent, and one that is not is refused in the same words.
+            host.set_value(effort, "max").unwrap();
+            assert_eq!(
+                sent_word(host.take_command(), which).as_deref(),
+                Some("max"),
+                "{effort}"
+            );
+            let refused = host.set_value(effort, "ultra").unwrap_err();
+            assert!(
+                refused.ends_with(
+                    "`ultra` is not one of Cheap (auto)'s levels: low, medium, high, xhigh, max"
+                ),
+                "{refused}"
+            );
+        }
+
+        // Cheap (auto) lists five levels and names none as the one it runs at: with none
+        // chosen nothing is lit in any of the three, so the slider is named for what it is and
+        // has no word to say, and it still takes a level.
+        let ownless = crate::opengrok::model_fixtures::levelled_catalogue_without_own("oag/cheap");
+        for which in [PickerFor::Bot, PickerFor::NewBots, PickerFor::PlanFallback] {
+            let effort = ids_of(which);
+            let mut host = on(which, "inherit");
+            let account = kept_source(InferenceKind::Gateway, true);
+            match which {
+                PickerFor::Bot => host.model_pick = Some(an_ownless_pick("inherit")),
+                PickerFor::NewBots => {
+                    host.new_bots_pick = Some(crate::opengrok::new_bots_pick(
+                        Some(&NewBotDefault {
+                            source: InferenceKind::Gateway,
+                            model: "oag/cheap".into(),
+                            effort: "inherit".into(),
+                        }),
+                        Some(&account),
+                        &ownless,
+                        |_| Vec::new(),
+                    ))
+                }
+                PickerFor::PlanFallback => {
+                    host.plan_fallback_pick = Some(crate::opengrok::plan_fallback_pick(
+                        Some(&PlanFallback {
+                            model: "oag/cheap".into(),
+                            effort: "inherit".into(),
+                        }),
+                        &ownless,
+                    ))
+                }
+            }
+            let tree = host.snapshot();
+            let node = tree.find(effort).unwrap();
+            assert_eq!(
+                (node.name.as_str(), node.value.as_deref(), node.enabled),
+                ("Effort", None, true),
+                "{effort}"
+            );
+            host.set_value(effort, "low").unwrap();
+            assert_eq!(
+                sent_word(host.take_command(), which).as_deref(),
+                Some("low"),
+                "{effort}"
+            );
+        }
+
+        // No model, no levels, no slider: Default for new Bots' and the fallback's, before one
+        // is picked.
+        for which in [PickerFor::NewBots, PickerFor::PlanFallback] {
+            let effort = ids_of(which);
+            let mut host = on(which, "inherit");
+            match which {
+                PickerFor::NewBots => host.new_bots_pick = Some(a_new_bots_pick(None)),
+                _ => host.plan_fallback_pick = Some(a_plan_fallback_pick(None)),
+            }
+            let tree = host.snapshot();
+            assert!(tree.find(effort).is_none(), "{effort}");
+            let refused = host.set_value(effort, "high").unwrap_err();
+            assert!(refused.contains("no model is picked"), "{refused}");
+        }
+    }
+
+    /// After a pick that put the effort back on the model's own level the popover says so in a
+    /// line under the slider, `agent-model-effort-note`, which is a line and not a control; it is
+    /// there while the controls show, and only for the model it is about.
+    #[test]
+    fn the_line_a_pick_leaves_is_under_the_slider() {
+        use crate::state::EffortNote;
+        let said = "GPT-6 Luna has no Ultra, so it's on Medium, its own level.";
+        let mut host = host();
+        host.agent_settings_open = true;
+        host.model_pick = Some(a_pick(
+            Some(serde_json::json!("local_proxy")),
+            "gpt-6-luna",
+            "inherit",
+        ));
+        host.model_picker.open = true;
+        assert!(host.snapshot().find("agent-model-effort-note").is_none());
+        host.model_picker.effort_note = Some(EffortNote {
+            base_id: "gpt-6-luna".into(),
+            line: said.into(),
+        });
+        let tree = host.snapshot();
+        let pop = tree.find("agent-model-pop").unwrap();
+        let ids: Vec<&str> = pop.children.iter().map(|node| node.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            [
+                "agent-model-fast",
+                "agent-model-open-list",
+                "agent-model-reset",
+                "agent-model-effort",
+                "agent-model-effort-note",
+                "agent-model-list"
+            ],
+            "in the window's order"
+        );
+        let line = tree.find("agent-model-effort-note").unwrap();
+        assert_eq!((line.role.as_str(), line.name.as_str()), ("status", said));
+        let click = host.click("agent-model-effort-note").unwrap_err();
+        assert!(click.contains("a line, not a control"), "{click}");
+        assert!(is_picker_part("agent-model-effort-note"));
+
+        // The list takes the controls' place, and the line with them.
+        host.model_picker.list_open = true;
+        assert!(host.snapshot().find("agent-model-effort-note").is_none());
+        host.model_picker.list_open = false;
+        // A line about a model that is not the one on the card says nothing.
+        host.model_picker.effort_note = Some(EffortNote {
+            base_id: "gpt-5.6-sol".into(),
+            line: said.into(),
+        });
+        assert!(host.snapshot().find("agent-model-effort-note").is_none());
+    }
+
+    /// The composer has no chip: a Bot's model is picked on its card in its settings, and
+    /// nowhere else. The chat page holds no part of the picker, and the composer's old ids are
+    /// no part of it, whatever is open.
+    #[test]
+    fn the_composer_has_no_model_chip() {
+        fn ids_under<'a>(node: &'a UiNode, into: &mut Vec<&'a str>) {
+            into.push(node.id.as_str());
+            for child in &node.children {
+                ids_under(child, into);
+            }
+        }
+        let mut host = host();
+        host.model_pick = Some(a_pick(
+            Some(serde_json::json!("gateway")),
+            "oag/cheap",
+            "low",
+        ));
+        host.agent_settings_open = true;
+        host.model_picker.open = true;
+        host.model_picker.list_open = true;
+        let tree = host.snapshot();
+        let mut on_the_page = Vec::new();
+        ids_under(tree.find(ids::PAGE).unwrap(), &mut on_the_page);
+        assert!(
+            on_the_page
+                .iter()
+                .all(|id| !id.starts_with("model-") && !id.starts_with("agent-model-")),
+            "{on_the_page:?}"
+        );
+        assert!(tree.find(ids::AGENT_MODEL_CARD).is_some(), "the card is");
+        for old in [
+            "model-chip",
+            "model-pop",
+            "model-fast",
+            "model-effort",
+            "model-open-list",
+            "model-reset",
+            "model-list",
+            "model-row-gateway-oag/cheap",
+            "agent-model-chip",
+        ] {
+            assert!(tree.find(old).is_none(), "{old}");
+            assert!(!is_picker_part(old), "{old}");
+            let refused = host.click(old).unwrap_err();
+            assert!(refused.contains("unknown click target"), "{old}: {refused}");
+        }
+        assert!(host.take_command().is_none());
+    }
+
+    /// The list's search box filters both groups at once, whatever the case, by a model's name
+    /// and by its id, and the tree draws what it leaves, headings and all; a search that leaves
+    /// nothing says "No model matches". A driver writes the box with `set_value`, adds to it with
+    /// `type` and takes a letter off with Backspace, and is refused while the box is not on
+    /// screen. A model the search leaves out is not on screen to pick.
+    #[test]
+    fn the_model_search_filters_both_groups_and_a_driver_writes_it() {
+        let mut host = host();
+        host.model_pick = Some(a_pick(
+            Some(serde_json::json!("local_proxy")),
+            "gpt-6-luna",
+            "medium",
+        ));
+        host.agent_settings_open = true;
+        let shut = host.set_value("agent-model-search", "grok").unwrap_err();
+        assert!(shut.contains("which is shut"), "{shut}");
+        host.model_picker.open = true;
+        let controls = host.set_value("agent-model-search", "grok").unwrap_err();
+        assert!(controls.contains("agent-model-open-list"), "{controls}");
+        assert!(host.take_command().is_none());
+        host.model_picker.list_open = true;
+        let field = host.click("agent-model-search").unwrap_err();
+        assert!(field.contains("use set_value"), "{field}");
+
+        let in_list = |host: &NativeChatHost| -> (Option<String>, Vec<(String, String)>) {
+            let tree = host.snapshot();
+            let list = tree.find("agent-model-list").unwrap();
+            (
+                list.value.clone(),
+                list.children
+                    .iter()
+                    .filter(|node| node.id != "agent-model-routines")
+                    .map(|node| (node.id.clone(), node.name.clone()))
+                    .collect(),
+            )
+        };
+        let line = |id: &str, name: &str| (id.to_string(), name.to_string());
+        host.set_value("agent-model-search", "GROK").unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::SetModelSearch(query)) if query == "GROK"
+        ));
+        assert_eq!(
+            in_list(&host),
+            (
+                Some("1".to_string()),
+                vec![
+                    line("agent-model-group-gateway", "Gateway"),
+                    line("agent-model-row-gateway-xai/grok-4.7", "Grok 4.7"),
+                ]
+            ),
+            "by name, whatever the case: the Subscription group has nothing left and goes"
+        );
+        let left_out = host
+            .click("agent-model-row-local_proxy-gpt-6-luna")
+            .unwrap_err();
+        assert!(left_out.contains("leaves it out"), "{left_out}");
+        host.click("agent-model-row-gateway-xai/grok-4.7").unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::PickModel { base_id, .. }) if base_id == "xai/grok-4.7"
+        ));
+
+        host.set_value("agent-model-search", "oag/").unwrap();
+        assert_eq!(
+            in_list(&host).1,
+            [
+                line("agent-model-group-gateway", "Gateway"),
+                line("agent-model-row-gateway-oag/cheap", "Cheap (auto)"),
+            ],
+            "by the raw id, which the name does not hold"
+        );
+
+        host.set_value("agent-model-search", "claude").unwrap();
+        assert_eq!(
+            in_list(&host),
+            (
+                Some("0".to_string()),
+                vec![line("agent-model-no-match", "No model matches")]
+            )
+        );
+        assert!(host.click("agent-model-no-match").is_err(), "a line");
+
+        host.set_value("agent-model-search", "lun").unwrap();
+        host.type_into("agent-model-search", "a").unwrap();
+        assert_eq!(host.model_picker.search, "luna");
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::SetModelSearch(query)) if query == "luna"
+        ));
+        host.dispatch(&Op::key("agent-model-search", "backspace"))
+            .unwrap();
+        assert_eq!(host.model_picker.search, "lun");
+        host.dispatch(&Op::key("agent-model-search", "enter"))
+            .unwrap();
+        assert_eq!(
+            in_list(&host).1,
+            [
+                line("agent-model-group-local_proxy", "Subscription"),
+                line("agent-model-row-local_proxy-gpt-6-luna", "GPT-6 Luna"),
+            ]
+        );
+    }
+
+    /// A long list is on the tree as the window draws it: five models at a time, each group's
+    /// heading over its first model in view and not one of the five, and the list valued by all
+    /// it holds. A model out of view is refused, as a person cannot click it without scrolling,
+    /// and the search box brings it into view; a heading is no model to pick.
+    #[test]
+    fn the_list_shows_five_models_at_a_time_and_a_driver_finds_the_rest_by_search() {
+        let mut host = host();
+        let bot = serde_json::from_value(serde_json::json!({
+            "id": "cw_1", "name": "Ada", "model": "oag/route-1", "effort": "medium",
+            "source": "gateway"
+        }))
+        .unwrap();
+        let catalogue = crate::opengrok::ModelCatalogue {
+            models: (0..6)
+                .map(|at| crate::opengrok::ModelEntry {
+                    id: format!("oag/route-{at}"),
+                    source: Some("gateway".into()),
+                    via: None,
+                    ..Default::default()
+                })
+                .collect(),
+            note: None,
+            local_proxy: None,
+        };
+        let account = kept_source(crate::opengrok::InferenceKind::Gateway, true);
+        host.model_pick = Some(crate::opengrok::bot_pick(
+            &bot,
+            Some(&account),
+            &catalogue,
+            |_| {
+                ["gpt-6-luna", "gpt-5.6-sol", "grok-4.7"]
+                    .map(str::to_string)
+                    .to_vec()
+            },
+        ));
+        host.agent_settings_open = true;
+        host.model_picker.open = true;
+        host.model_picker.list_open = true;
+        let ids_in_list = |host: &NativeChatHost| -> Vec<String> {
+            host.snapshot()
+                .find("agent-model-list")
+                .unwrap()
+                .children
+                .iter()
+                .map(|node| node.id.clone())
+                .collect()
+        };
+        assert_eq!(
+            host.snapshot()
+                .find("agent-model-list")
+                .unwrap()
+                .value
+                .as_deref(),
+            Some("9"),
+            "valued by all the list holds"
+        );
+        assert_eq!(
+            ids_in_list(&host),
+            [
+                "agent-model-group-local_proxy",
+                "agent-model-row-local_proxy-gpt-6-luna",
+                "agent-model-row-local_proxy-gpt-5.6-sol",
+                "agent-model-row-local_proxy-grok-4.7",
+                "agent-model-group-gateway",
+                "agent-model-row-gateway-oag/route-0",
+                "agent-model-row-gateway-oag/route-1",
+            ]
+        );
+        let out = host
+            .click("agent-model-row-gateway-oag/route-5")
+            .unwrap_err();
+        assert!(out.contains("out of view"), "{out}");
+        assert!(host.take_command().is_none());
+        let heading = host.click("agent-model-group-gateway").unwrap_err();
+        assert!(heading.contains("heading"), "{heading}");
+
+        // Scrolled to the end: the Gateway group's heading over its first model in view.
+        host.model_picker.list_start = 4;
+        assert_eq!(
+            ids_in_list(&host),
+            [
+                "agent-model-group-gateway",
+                "agent-model-row-gateway-oag/route-1",
+                "agent-model-row-gateway-oag/route-2",
+                "agent-model-row-gateway-oag/route-3",
+                "agent-model-row-gateway-oag/route-4",
+                "agent-model-row-gateway-oag/route-5",
+            ]
+        );
+        host.click("agent-model-row-gateway-oag/route-5").unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::PickModel { base_id, .. }) if base_id == "oag/route-5"
+        ));
+
+        // From the top again, the search box finds it.
+        host.model_picker.list_start = 0;
+        host.set_value("agent-model-search", "route-5").unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::SetModelSearch(query)) if query == "route-5"
+        ));
+        assert_eq!(
+            ids_in_list(&host),
+            [
+                "agent-model-group-gateway",
+                "agent-model-row-gateway-oag/route-5",
+            ]
+        );
+        host.click("agent-model-row-gateway-oag/route-5").unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::PickModel { base_id, .. }) if base_id == "oag/route-5"
+        ));
+    }
+
+    /// ⚡ is dead where the list holds no fast version of the model, and says why: on the tree as
+    /// its value, and as the refusal of a driver's click. ↺ puts back what there is to put back.
+    #[test]
+    fn model_fast_refuses_with_its_reason_where_there_is_no_twin() {
+        let mut host = host();
+        host.model_pick = Some(a_pick(
+            Some(serde_json::json!("gateway")),
+            "xai/grok-4.7",
+            "high",
+        ));
+        host.agent_settings_open = true;
+        host.model_picker.open = true;
+        let tree = host.snapshot();
+        let fast = tree.find("agent-model-fast").unwrap();
+        assert!(!fast.enabled);
+        assert_eq!(fast.value.as_deref(), Some(crate::opengrok::FAST_NO_TWIN));
+        let refused = host.click("agent-model-fast").unwrap_err();
+        assert!(refused.contains(crate::opengrok::FAST_NO_TWIN), "{refused}");
+        assert!(host.take_command().is_none());
+        assert!(tree.find("agent-model-reset").unwrap().enabled);
+        host.click("agent-model-reset").unwrap();
+        assert!(matches!(host.take_command(), Some(Command::ResetModelPick)));
+    }
+
+    /// A server whose rows carry no `source` keeps no door per Bot: the list offers no plan
+    /// models for the Bot, and while the account is on the plan names its plan model, which
+    /// answers for every Bot there, as a line and not a row; ⚡ is dead and says why.
+    #[test]
+    fn a_server_without_per_bot_doors_lists_no_plan_rows_for_a_bot() {
+        let mut host = host();
+        let bot = serde_json::from_value(serde_json::json!({
+            "id": "cw_1", "name": "Ada", "model": "oag/cheap", "effort": "medium"
+        }))
+        .unwrap();
+        let catalogue = crate::opengrok::ModelCatalogue {
+            models: vec![crate::opengrok::ModelEntry {
+                id: "oag/cheap".into(),
+                source: Some("gateway".into()),
+                via: None,
+                ..Default::default()
+            }],
+            note: Some("the gateway could not be reached: …".into()),
+            local_proxy: None,
+        };
+        let on_plan = crate::opengrok::InferenceSource {
+            local_model: Some("gpt-5-codex".into()),
+            ..kept_source(crate::opengrok::InferenceKind::LocalProxy, true)
+        };
+        host.model_pick = Some(crate::opengrok::bot_pick(
+            &bot,
+            Some(&on_plan),
+            &catalogue,
+            |_| vec!["gpt-6-luna".to_string()],
+        ));
+        host.model_note = catalogue.note.clone();
+        host.agent_settings_open = true;
+        host.model_picker.open = true;
+        let tree = host.snapshot();
+        assert_eq!(
+            tree.find(ids::AGENT_MODEL_CARD).unwrap().name,
+            "GPT-5 Codex",
+            "no row of the list answers, so no levels to name"
+        );
+        assert_eq!(
+            tree.find("agent-model-fast").unwrap().value.as_deref(),
+            Some(crate::opengrok::FAST_ACCOUNT_PLAN)
+        );
+        host.model_picker.list_open = true;
+        let tree = host.snapshot();
+        let list = tree.find("agent-model-list").unwrap();
+        let ids_in_list: Vec<&str> = list.children.iter().map(|node| node.id.as_str()).collect();
+        assert_eq!(
+            ids_in_list,
+            [
+                "agent-model-plan",
+                "agent-model-group-gateway",
+                "agent-model-row-gateway-oag/cheap",
+                "agent-model-note"
+            ]
+        );
+        assert_eq!(
+            tree.find("agent-model-plan").map(|node| node.name.as_str()),
+            Some("GPT-5 Codex")
+        );
+        assert!(host.click("agent-model-plan").is_err(), "a line, not a row");
+    }
+
+    /// A Bot on its own plan (opengrok-server #304, and #334 for its routines): while the list
+    /// shows, `agent-model-routines` under its rows says the Bot's routines run on that plan and
+    /// are skipped while it cannot answer, as the window does. It is a line, not a control. It is
+    /// there whatever the Bot is pinned to, a model the gateway lists included, and there is none
+    /// for a Bot that follows the account or is on the gateway.
+    #[test]
+    fn the_list_says_where_a_bot_on_its_own_plan_runs_its_routines() {
+        let said = crate::opengrok::ROUTINES_ON_PLAN;
+        let mut host = host();
+        host.model_pick = Some(a_pick(
+            Some(serde_json::json!("local_proxy")),
+            "gpt-6-luna--fast",
+            "medium",
+        ));
+        host.agent_settings_open = true;
+        host.model_picker.open = true;
+        assert!(
+            host.snapshot().find("agent-model-routines").is_none(),
+            "the popover shows its controls"
+        );
+        host.model_picker.list_open = true;
+        let tree = host.snapshot();
+        let ids_in_list: Vec<&str> = tree
+            .find("agent-model-list")
+            .unwrap()
+            .children
+            .iter()
+            .map(|node| node.id.as_str())
+            .collect();
+        assert_eq!(
+            ids_in_list,
+            [
+                "agent-model-group-local_proxy",
+                "agent-model-row-local_proxy-gpt-6-luna",
+                "agent-model-group-gateway",
+                "agent-model-row-gateway-oag/cheap",
+                "agent-model-row-gateway-xai/grok-4.7",
+                "agent-model-routines",
+            ]
+        );
+        assert_eq!(
+            tree.find("agent-model-routines")
+                .map(|node| node.name.as_str()),
+            Some(said)
+        );
+        let refused = host.click("agent-model-routines").unwrap_err();
+        assert!(refused.contains("a line, not a control"), "{refused}");
+        assert!(host.take_command().is_none());
+
+        // A pin the gateway lists: on the plan all the same.
+        host.model_pick = Some(a_pick(
+            Some(serde_json::json!("local_proxy")),
+            "xai/grok-4.7",
+            "medium",
+        ));
+        assert_eq!(
+            host.snapshot()
+                .find("agent-model-routines")
+                .map(|node| node.name.as_str()),
+            Some(said)
+        );
+        for (source, pin) in [
+            (serde_json::Value::Null, "gpt-6-luna"),
+            (serde_json::json!("gateway"), "xai/grok-4.7"),
+            (serde_json::json!("gateway"), "gpt-6-luna"),
+        ] {
+            host.model_pick = Some(a_pick(Some(source.clone()), pin, "medium"));
+            assert!(
+                host.snapshot().find("agent-model-routines").is_none(),
+                "{source} on {pin}"
+            );
+        }
+    }
+
+    /// From the app: the card is the open Bot's picker, in the Bot's settings, the chat page holds
+    /// none of it, and the list on the tree is the one the state's search and window leave.
+    #[test]
+    fn the_picker_on_the_tree_is_the_open_bots() {
+        let mut state = AppState::new();
+        state.auth_status = crate::state::AuthStatus::SignedIn;
+        state.account = Some(
+            serde_json::from_value(serde_json::json!({ "id": "acct_1", "email": "a@b.c" }))
+                .unwrap(),
+        );
+        state.coworkers = vec![
+            serde_json::from_value(serde_json::json!({
+                "id": "cw_1", "name": "Ada", "model": "oag/cheap", "effort": "low",
+                "source": "gateway"
+            }))
+            .unwrap(),
+        ];
         let tree = NativeChatHost::from_app(&state).snapshot();
-        assert!(tree.find(ids::COMPOSER_REPLY_SOURCE).is_none());
+        assert!(tree.find(ids::AGENT_MODEL_CARD).is_none(), "no Bot open");
+        state.active_coworker_id = Some("cw_1".into());
+        let tree = NativeChatHost::from_app(&state).snapshot();
+        assert_eq!(
+            tree.find(ids::AGENT_MODEL_CARD)
+                .map(|node| node.name.as_str()),
+            Some("Cheap (auto)"),
+            "no list read yet: no levels to name"
+        );
+        state.model_catalogue = a_levelled_catalogue();
+        let tree = NativeChatHost::from_app(&state).snapshot();
+        assert_eq!(
+            tree.find(ids::AGENT_MODEL_CARD)
+                .map(|node| node.name.as_str()),
+            Some("Cheap (auto) · Low")
+        );
+        assert!(
+            tree.find(ids::AGENT_SETTINGS)
+                .unwrap()
+                .children
+                .iter()
+                .any(|node| node.id == ids::AGENT_MODEL_CARD),
+            "under the Bot's settings"
+        );
+        assert!(tree.find("model-chip").is_none());
+        state.model_catalogue = crate::opengrok::ModelCatalogue {
+            models: vec![crate::opengrok::ModelEntry {
+                id: "oag/cheap".into(),
+                source: Some("gateway".into()),
+                via: None,
+                ..Default::default()
+            }],
+            note: None,
+            local_proxy: None,
+        };
+        state.model_picker.open = true;
+        state.model_picker.list_open = true;
+        state.model_picker.search = "cheap".into();
+        let tree = NativeChatHost::from_app(&state).snapshot();
+        assert_eq!(
+            tree.find("agent-model-search")
+                .and_then(|node| node.value.as_deref()),
+            Some("cheap")
+        );
+        assert!(
+            tree.find("agent-model-row-gateway-oag/cheap").is_some(),
+            "the search leaves it"
+        );
+        state.model_picker.search = "luna".into();
+        let tree = NativeChatHost::from_app(&state).snapshot();
+        assert!(tree.find("agent-model-row-gateway-oag/cheap").is_none());
+        assert!(tree.find("agent-model-no-match").is_some());
     }
 
     /// A bot's skills as the server gives them (opengrok-server#270): the owner's `triage`

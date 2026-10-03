@@ -77,6 +77,8 @@ pub struct OpenGrokError {
     code: Option<String>,
     /// OpenGrok wrote this refusal itself: see [`Self::written_by_opengrok`].
     by_opengrok: bool,
+    /// The answer had nothing in its body: see [`Self::said_nothing`].
+    said_nothing: bool,
 }
 
 impl OpenGrokError {
@@ -89,6 +91,7 @@ impl OpenGrokError {
             history_missed: false,
             code: None,
             by_opengrok: false,
+            said_nothing: false,
         }
     }
 
@@ -101,6 +104,7 @@ impl OpenGrokError {
             history_missed: false,
             code: None,
             by_opengrok: false,
+            said_nothing: false,
         }
     }
 
@@ -119,6 +123,7 @@ impl OpenGrokError {
             history_missed: false,
             code: None,
             by_opengrok: false,
+            said_nothing: false,
         }
     }
 
@@ -143,6 +148,7 @@ impl OpenGrokError {
             history_missed: false,
             code: None,
             by_opengrok: false,
+            said_nothing: false,
         }
     }
 
@@ -170,6 +176,7 @@ impl OpenGrokError {
             history_missed: false,
             code: None,
             by_opengrok: false,
+            said_nothing: false,
         }
     }
 
@@ -194,6 +201,7 @@ impl OpenGrokError {
             history_missed: false,
             code: None,
             by_opengrok: true,
+            said_nothing: false,
         }
     }
 
@@ -240,6 +248,27 @@ impl OpenGrokError {
         self.by_opengrok
     }
 
+    /// The answer came with nothing in its body, so [`Self::message`] is the client's stand-in
+    /// and not anything the server said. A caller showing a refusal to a person says what the
+    /// server answered instead, because "request failed" tells nobody anything.
+    pub fn said_nothing(&self) -> bool {
+        self.said_nothing
+    }
+
+    pub(super) fn with_said_nothing(mut self, said_nothing: bool) -> Self {
+        self.said_nothing = said_nothing;
+        self
+    }
+
+    /// The server has no route for what was asked: a `405`, which is the answer for a path it
+    /// has under other methods only (an opengrok-server from before `PATCH /schedules/{id}`
+    /// answers an edit that way), or a `404` with nothing in it, which is how it answers a path
+    /// it has never heard of. Its own `404`s always say what is missing ("no such schedule"), so
+    /// they are not this: they are about the thing asked for, not the server.
+    pub fn route_missing(&self) -> bool {
+        self.status == Some(405) || (self.status == Some(404) && self.said_nothing)
+    }
+
     /// The server's code word for this refusal: the body's `code`, or its `error` when that is a
     /// bare code word (`already-consumed`, `stale-pending-message`). It is what a caller branches
     /// on. The person is shown [`Self::message`], which is the sentence the server wrote beside
@@ -271,6 +300,14 @@ impl OpenGrokError {
         self.status == Some(409) && self.code() == Some("stale-pending-message")
     }
 
+    /// `POST /ag-ui` fired a queued send the server holds for the person's Mac: no Mac holds the
+    /// relay, so the fire was answered 202, no run started and the row stays queued
+    /// ([`Self::pending_custom`] is the row as it stands, with its `heldFor`). The server sends it
+    /// itself when a Mac opens the relay. Read off the status and the word, never the sentence.
+    pub fn is_held_for_mac(&self) -> bool {
+        self.status == Some(202) && self.code() == Some(super::inference::HELD_FOR_RELAY_OFFLINE)
+    }
+
     /// `PUT /coworkers/{id}/ceiling` named a version of the ceiling that is not the server's
     /// any more: somebody changed it after the rows the switch was built from were read, and
     /// nothing was changed (opengrok-server#268). Read off the code; the sentence beside it ("the
@@ -285,6 +322,16 @@ impl OpenGrokError {
     /// it ("the skills changed since you looked") is what the person is shown.
     pub fn is_skills_changed(&self) -> bool {
         self.status == Some(409) && self.code() == Some(super::client::SKILLS_CHANGED)
+    }
+
+    /// `POST /schedules/{id}/run` refused because the routine's Bot answers on its person's own
+    /// plan and the plan could not answer now (opengrok-server #316, #334, on main 8e7387f:
+    /// `run_schedule_now` in `crates/opengrok-server/src/autonomy/routes.rs`): `409 {error,
+    /// code}`, the code why (`relay_offline`, `proxy_down`) and the sentence what the person is
+    /// shown. The server keeps the firing in the routine's history as skipped. Its other 409, for
+    /// a retired coworker, names no code.
+    pub fn is_skipped_firing(&self) -> bool {
+        self.status == Some(409) && self.code().is_some()
     }
 
     /// `POST /pending` lost the race the server describes as "another writer got there

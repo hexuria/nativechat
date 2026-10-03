@@ -3,21 +3,18 @@ use crate::chrome::{
     chrome_floats,
 };
 use crate::components::fields::field_input;
+use crate::components::model_picker::ModelPicker;
 use crate::components::persona::PersonaMark;
+use crate::components::title_bar::window_drag;
 use crate::opengrok::{
-    BotSkillRow, BotSkillScope, CeilingRow, CoworkerPatch, CoworkerTool, EFFORT_INHERIT,
-    EFFORT_WORDS, ModelEntry, USER_MACHINE_SHELL,
+    BotSkillRow, BotSkillScope, CeilingRow, CoworkerPatch, CoworkerTool, USER_MACHINE_SHELL,
 };
 use crate::state::{
-    AppState, BotSkills, CeilingBlock, CeilingCard, CeilingSwitch, EffortControl, SkillSwitch,
+    AppState, BotSkills, CeilingBlock, CeilingCard, CeilingSwitch, PickerFor, SkillSwitch,
     SkillsBlock, SkillsCard, ToolCeiling, ToolList, UsageReport,
 };
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::input::{
-    IndentInline, Input, InputEvent, InputState, MoveDown, MoveUp, OutdentInline, Textarea,
-    TextareaState,
-};
-use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
+use gpui_kit::component::input::{Input, InputState, Textarea, TextareaState};
 use gpui_kit::component::popover::Popover;
 use gpui_kit::component::{ActiveTheme, Disableable, Icon, IconName, Selectable, v_flex};
 use gpui_kit::prelude::FluentBuilder;
@@ -53,81 +50,14 @@ impl RenderOnce for AvatarEditorTrigger {
     }
 }
 
-/// Where the model list hangs from: an element of its own under the field and the width of
-/// it, so the list lines up with the field.
-///
-/// The field itself cannot be the popover's trigger. A trigger swallows every mouse down over
-/// everything it holds, and the model field is a field a person has to be able to click into,
-/// place the caret in and select text in. So the trigger anchors the list and nothing else:
-/// the chevron beside the field opens it.
-#[derive(IntoElement)]
-struct ModelPopAnchor {
-    selected: bool,
-}
-
-impl Selectable for ModelPopAnchor {
-    fn selected(mut self, selected: bool) -> Self {
-        self.selected = selected;
-        self
-    }
-
-    fn is_selected(&self) -> bool {
-        self.selected
-    }
-}
-
-impl RenderOnce for ModelPopAnchor {
-    fn render(self, _window: &mut Window, _cx: &mut App) -> impl IntoElement {
-        div().id("agent-model-anchor").w(px(PANE_INNER)).h(px(0.))
-    }
-}
-
-/// The chevron that opens the model list, drawn inside the field's own border at its right
-/// edge so the two read as one control.
-fn model_chevron(app: Entity<AppState>, open: bool, muted: Hsla) -> impl IntoElement {
-    div()
-        .id("agent-model-chevron")
-        .size(px(20.))
-        .flex()
-        .items_center()
-        .justify_center()
-        .rounded(px(6.))
-        .cursor_pointer()
-        .hover(|s| s.bg(rgb(0x777777).opacity(0.16)))
-        .on_mouse_down(MouseButton::Left, move |_, _, cx| {
-            // The pane shuts its popovers on any mouse down that reaches it, so the click that
-            // opens one has to stop here.
-            cx.stop_propagation();
-            app.update(cx, |state, cx| {
-                state.set_model_picker_open(!open, cx);
-            });
-        })
-        .child(
-            Icon::new(IconName::ChevronDown)
-                .size(px(14.))
-                .text_color(muted),
-        )
-}
-
 pub struct AgentSettings {
     state: Entity<AppState>,
     name_input: Entity<InputState>,
     label_input: Entity<InputState>,
     role_input: Entity<TextareaState>,
-    model_input: Entity<InputState>,
-    /// The row Enter takes, counted over the routes the field's text leaves rather than over
-    /// the whole catalogue: what the arrows walk is what a person can see.
-    model_highlight: usize,
-    /// Whether the field's text is a query or still the value it was opened with. A combobox
-    /// field is each in turn, and which one it is decides whether the list is narrowed by it.
-    model_query_live: bool,
-    /// Whether the list was open at the last look. A highlight belongs to one opening of the
-    /// list, and an opening the pane did not ask for itself — the chevron's — is only ever
-    /// heard of here.
-    model_open: bool,
-    /// The list scrolls once there are more routes than fit, so a row walked onto has to be
-    /// brought into view; a highlight below the fold is a highlight nobody can see.
-    model_scroll: ScrollHandle,
+    /// The Bot's model, door, fast tier and effort, as the model picker's card, the one place a
+    /// Bot's model is picked: every change is saved on the Bot at once, and none waits for Save.
+    model_card: Entity<ModelPicker>,
     synced_id: Option<String>,
     /// The profile is with the server. The Save button is out of the person's hands until the
     /// answer comes back, whichever way it goes.
@@ -153,22 +83,8 @@ impl AgentSettings {
             state.set_auto_grow(3, 7, cx);
             state
         });
-        let model_input = cx.new(|cx| InputState::new(window, cx).placeholder("xai/grok-4.6@sub"));
+        let model_card = cx.new(|cx| ModelPicker::new(window, state.clone(), PickerFor::Bot, cx));
         cx.observe(&state, |this, state, cx| {
-            // The chevron opens the list through the app's state, so the pane learns of that
-            // opening here or not at all. Every opening starts the highlight afresh: the row the
-            // arrows were left on last time belongs to a list that is no longer up.
-            let open = state.read(cx).model_picker_open;
-            if open && !this.model_open {
-                this.reset_model_highlight(cx);
-            }
-            // The list is down, so what stands in the field is the coworker's route again
-            // rather than something being looked up, however it got there. The next opening
-            // shows the whole catalogue.
-            if !open && this.model_open {
-                this.model_query_live = false;
-            }
-            this.model_open = open;
             // A driver's Save, which comes by way of the app because the button and the fields
             // it sends are this pane's. Only for the bot the fields were filled for: a switch the
             // pane has not drawn yet leaves them holding the last bot's words, and those must
@@ -181,41 +97,12 @@ impl AgentSettings {
             cx.notify();
         })
         .detach();
-        cx.subscribe_in(
-            &model_input,
-            window,
-            |this, _input, event: &InputEvent, window, cx| match event {
-                InputEvent::Change => {
-                    // A keystroke is what turns the field's text from the coworker's route into
-                    // something being looked for, and from here on the list is narrowed by it.
-                    // Typing opens the list too: someone typing a route is choosing one, and the
-                    // routes that answer to what they have typed are no use behind a shut list.
-                    // Only a person's own edit arrives here — `set_value` says nothing — so
-                    // taking a route does not reopen the list that taking it just closed.
-                    this.model_query_live = true;
-                    this.reset_model_highlight(cx);
-                    this.state.update(cx, |state, cx| {
-                        state.set_model_picker_open(true, cx);
-                    });
-                    cx.notify();
-                }
-                // Enter takes the row the highlight is on, which is the whole point of a list
-                // that is walked from the field above it.
-                InputEvent::PressEnter { .. } => this.take_highlighted_model(window, cx),
-                _ => {}
-            },
-        )
-        .detach();
         Self {
             state,
             name_input,
             label_input,
             role_input,
-            model_input,
-            model_highlight: FIRST_MATCH,
-            model_query_live: false,
-            model_open: false,
-            model_scroll: ScrollHandle::new(),
+            model_card,
             synced_id: None,
             saving: false,
             auto_review_open: false,
@@ -250,82 +137,6 @@ impl AgentSettings {
         self.role_input.update(cx, |input, cx| {
             input.set_value(coworker.role.clone().unwrap_or_default(), window, cx);
         });
-        self.model_input.update(cx, |input, cx| {
-            input.set_value(coworker.model.clone(), window, cx);
-        });
-        // The pane has just written another coworker's route into the field, so what stands
-        // there is a value again whatever was being looked up before it.
-        self.model_query_live = false;
-        self.reset_model_highlight(cx);
-    }
-
-    /// The route the coworker is on, as the roster has it.
-    fn current_model(&self, cx: &App) -> String {
-        let state = self.state.read(cx);
-        state
-            .active_coworker_id
-            .as_ref()
-            .and_then(|id| state.coworkers.iter().find(|c| &c.id == id))
-            .map(|coworker| coworker.model.clone())
-            .unwrap_or_default()
-    }
-
-    /// What the list is narrowed by: nothing at all while the field's text is still the value
-    /// the pane put there, the text itself once somebody has typed into it.
-    fn model_filter(&self, cx: &App) -> String {
-        let text = self.model_input.read(cx).value().to_string();
-        filter_text(&text, self.model_query_live).to_string()
-    }
-
-    /// The routes the filter leaves, in the catalogue's order.
-    fn model_matches(&self, cx: &App) -> Vec<String> {
-        matching_models(
-            &self.state.read(cx).model_catalogue.models,
-            &self.model_filter(cx),
-        )
-    }
-
-    /// Put the highlight where a fresh list starts: on the route the coworker is already on
-    /// while the whole catalogue is on show, so the list opens on where they are and Enter takes
-    /// what they have rather than moving them to the top of a list they have not read; on the
-    /// first match once the text is a query.
-    fn reset_model_highlight(&mut self, cx: &App) {
-        self.model_highlight = if self.model_query_live {
-            FIRST_MATCH
-        } else {
-            current_model_row(&self.model_matches(cx), &self.current_model(cx))
-        };
-        self.model_scroll.scroll_to_item(self.model_highlight);
-    }
-
-    /// Step the highlight, and claim the keystroke while the list is open: these keys belong to
-    /// the list for as long as it is up. Shut, the keystroke is left to whoever else wants it,
-    /// which is what keeps Tab moving the focus out of a field with no list under it.
-    fn step_model_highlight(&mut self, down: bool, cx: &mut Context<Self>) {
-        if !self.state.read(cx).model_picker_open {
-            return;
-        }
-        cx.stop_propagation();
-        let len = self.model_matches(cx).len();
-        self.model_highlight = stepped_highlight(self.model_highlight, len, down);
-        self.model_scroll.scroll_to_item(self.model_highlight);
-        cx.notify();
-    }
-
-    /// Take the highlighted route, by the same road a click on that row takes.
-    fn take_highlighted_model(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.state.read(cx).model_picker_open {
-            return;
-        }
-        let query = self.model_filter(cx);
-        let catalogue = self.state.read(cx).model_catalogue.models.clone();
-        // Nothing matched what was typed, so there is nothing for Enter to take and the text
-        // stands as it is: it may well be a route this catalogue has not heard of, and Save
-        // sends what the field holds either way.
-        let Some(id) = highlighted_model(&catalogue, &query, self.model_highlight) else {
-            return;
-        };
-        take_model(&self.state, &self.model_input, id, window, cx);
     }
 
     fn commit_profile(&mut self, cx: &mut Context<Self>) {
@@ -336,21 +147,13 @@ impl AgentSettings {
         if self.saving {
             return;
         }
-        // The Model field is a field, so Save means it too. Picking from the list already
-        // patches the model on the spot; a route id typed by hand had nowhere to go, and a
-        // person who edits a box and presses the button beside it has said what they want just
-        // as plainly as one who picked from a list. Blank is the exception and is left out: an
-        // empty box is a field nobody filled, not an instruction to unpin the model, and a
-        // coworker with no route cannot answer at all.
-        let model = self.model_input.read(cx).value().trim().to_string();
+        // The words in the fields. The model, its door and the effort are the picker's, saved
+        // the moment they are picked; sent back with every Save, what the pane last read would
+        // undo a pick made since on the card or from another Mac.
         let patch = CoworkerPatch {
             name: Some(self.name_input.read(cx).value().to_string()),
             title: Some(self.label_input.read(cx).value().to_string()),
             role: Some(self.role_input.read(cx).value().to_string()),
-            model: (!model.is_empty()).then_some(model),
-            // Only a pick that changes it. The word the pane last read, sent back with every
-            // Save, would undo an effort set since from another Mac, and nobody here touched it.
-            effort: self.state.read(cx).effort_to_save(),
             ..Default::default()
         };
         self.saving = true;
@@ -418,12 +221,14 @@ fn notify_switch(on: bool) -> Div {
         )
 }
 
-/// The pane's header: "Settings", and the chevron that closes the pane. In the title bar
-/// over the pane while the pane is docked (then the title is a handle to drag the window
-/// by), in the pane itself while it floats over the chat.
-pub fn settings_header(app: Entity<AppState>, drag: bool) -> impl IntoElement {
+/// The pane's header row. "Settings" is a handle to drag the window by, whether the row is in
+/// the title bar over a docked pane or at the top of the pane itself. With `close`, the row ends
+/// in the control that closes the pane; the chat page leaves it off, because the chat's title
+/// bar floats its one window-level pane toggle over that end of the row.
+pub fn settings_header(app: Entity<AppState>, close: bool) -> impl IntoElement {
     div()
         .id("agent-settings-header")
+        .debug_selector(|| "agent-settings-header".into())
         .w_full()
         .h(px(TITLE_BAR_H))
         .px(px(HEADER_PX))
@@ -431,7 +236,7 @@ pub fn settings_header(app: Entity<AppState>, drag: bool) -> impl IntoElement {
         .items_center()
         .justify_between()
         .flex_shrink_0()
-        .child(
+        .child(window_drag(
             div()
                 .flex_1()
                 .h_full()
@@ -439,32 +244,27 @@ pub fn settings_header(app: Entity<AppState>, drag: bool) -> impl IntoElement {
                 .items_center()
                 .text_sm()
                 .font_weight(FontWeight::SEMIBOLD)
-                .child("Settings")
-                .when(drag, |this| {
-                    this.on_mouse_down(MouseButton::Left, |_, window, _| window.start_window_move())
-                }),
-        )
-        .child(
-            div()
-                .id("header-settings")
-                .size(px(28.))
-                .rounded(px(8.))
-                .flex()
-                .items_center()
-                .justify_center()
-                .cursor_pointer()
-                .hover(|s| s.bg(rgb(0x777777).opacity(0.2)))
-                .on_mouse_down(MouseButton::Left, move |_, _, cx| {
-                    app.update(cx, |state, cx| {
-                        state.close_right_pane(cx);
-                    });
-                })
-                .child(
-                    Icon::default()
-                        .path("icons/chevrons-right.svg")
-                        .size(px(16.)),
-                ),
-        )
+                .child("Settings"),
+        ))
+        .when(close, |this| {
+            this.child(
+                div()
+                    .id("header-settings")
+                    .occlude()
+                    .size(px(28.))
+                    .rounded(px(8.))
+                    .cursor_pointer()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .hover(|s| s.bg(rgb(0x777777).opacity(0.2)))
+                    .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                        cx.stop_propagation();
+                        app.update(cx, |state, cx| state.close_right_pane(cx));
+                    })
+                    .child(Icon::default().path("icons/panel-right.svg").size(px(16.))),
+            )
+        })
 }
 
 impl Render for AgentSettings {
@@ -474,7 +274,7 @@ impl Render for AgentSettings {
         let dark = theme.is_dark();
         let muted = theme.muted_foreground;
         let card_fill: Hsla = rgb(0x777777).opacity(0.173).into();
-        let (id, model, shape, color, catalogue, note, error, model_open, editor_open) = {
+        let (id, shape, color, error, editor_open) = {
             let state = self.state.read(cx);
             let coworker = state
                 .active_coworker_id
@@ -484,25 +284,13 @@ impl Render for AgentSettings {
                 coworker
                     .map(|c| c.id.clone())
                     .unwrap_or_else(|| "agent".into()),
-                coworker.map(|c| c.model.clone()).unwrap_or_default(),
                 coworker.and_then(|c| c.avatar_shape.clone()),
                 coworker.and_then(|c| c.avatar_color.clone()),
-                state.model_catalogue.models.clone(),
-                state.model_catalogue.note.clone(),
                 state.auth_error.clone(),
-                state.model_picker_open,
                 state.avatar_editor_open,
             )
         };
-        let effort = self.state.read(cx).effort_control();
         let on_plan = self.state.read(cx).replies_on_plan();
-        let model_focus = self.model_input.read(cx).focus_handle(cx);
-        // The list is what the filter leaves of the catalogue, and the row Enter takes is
-        // counted over that rather than over the catalogue behind it.
-        let model_query = self.model_filter(cx);
-        let model_matches = matching_models(&catalogue, &model_query);
-        let model_highlight = self.model_highlight;
-        let model_scroll = self.model_scroll.clone();
         let saving = self.saving;
         let usage_open = self.state.read(cx).agent_usage_open;
         let auto_review_open = self.auto_review_open;
@@ -569,9 +357,7 @@ impl Render for AgentSettings {
                 crate::components::connections::agent_card(app.clone(), &coworker_id, cx)
                     .into_any_element()
             });
-        // Floating over the chat (a narrow window), the pane carries its own header; docked,
-        // the title bar shows it over the pane.
-        let floats = chrome_floats(f32::from(window.viewport_size().width));
+        let chat_page = self.state.read(cx).page == crate::state::MainPage::Chat;
 
         v_flex()
             .id("agent-settings")
@@ -591,7 +377,14 @@ impl Render for AgentSettings {
                     });
                 }
             })
-            .when(floats, |this| this.child(settings_header(app.clone(), false)))
+            // On the chat page the pane reaches the window's top edge, under the floating title
+            // bar, so its header is the bar's row over the pane: one row, which drags the window
+            // as a title bar does. A blank row above a second header put the avatar 104px down
+            // and left the header that showed unable to move the window.
+            .when(chat_page, |this| this.child(settings_header(app.clone(), false)))
+            .when(!chat_page && chrome_floats(f32::from(window.viewport_size().width)), |this| {
+                this.child(settings_header(app.clone(), true))
+            })
             .child(
                 div()
                     .id("avatar-trigger-row")
@@ -732,145 +525,9 @@ impl Render for AgentSettings {
                                         ),
                                     )
                                     .child(heading("Model", muted))
-                                    .child(
-                                        v_flex()
-                                            .id("agent-model")
-                                            .w_full()
-                                            .on_key_down(cx.listener(
-                                                |this, event: &KeyDownEvent, _, cx| {
-                                                    // Focus is in the field and not in the
-                                                    // panel, so the popover never hears the
-                                                    // Escape itself. The pane shuts the list,
-                                                    // and the field keeps what was typed.
-                                                    if event.keystroke.key == "escape" {
-                                                        this.state.update(cx, |state, cx| {
-                                                            state.set_model_picker_open(false, cx);
-                                                        });
-                                                    }
-                                                },
-                                            ))
-                                            // The field binds the arrows and Tab to actions of
-                                            // its own, and actions are dispatched before any key
-                                            // listener, so the capture phase — which runs from
-                                            // the outside in — is the only place this row can
-                                            // take them before the field does.
-                                            .capture_action(cx.listener(
-                                                |this, _: &MoveUp, _, cx| {
-                                                    this.step_model_highlight(false, cx);
-                                                },
-                                            ))
-                                            .capture_action(cx.listener(
-                                                |this, _: &MoveDown, _, cx| {
-                                                    this.step_model_highlight(true, cx);
-                                                },
-                                            ))
-                                            // Tab is Down and Shift-Tab is Up: someone tabbing
-                                            // with a list of choices in front of them means the
-                                            // choices. The field binds the two to indent and
-                                            // outdent, which a one-line field has no use for, so
-                                            // stopping there is what keeps Tab from moving the
-                                            // focus out of the field while the list is up.
-                                            .capture_action(cx.listener(
-                                                |this, _: &IndentInline, _, cx| {
-                                                    this.step_model_highlight(true, cx);
-                                                },
-                                            ))
-                                            .capture_action(cx.listener(
-                                                |this, _: &OutdentInline, _, cx| {
-                                                    this.step_model_highlight(false, cx);
-                                                },
-                                            ))
-                                            .child(
-                                                settings_input(&self.model_input)
-                                                    .id("agent-model-field")
-                                                    .w(px(PANE_INNER))
-                                                    .suffix(model_chevron(
-                                                        app.clone(),
-                                                        model_open,
-                                                        muted,
-                                                    )),
-                                            )
-                                            .child(
-                                                Popover::new("agent-model-pop")
-                                                    .appearance(false)
-                                                    .overlay_closable(true)
-                                                    .open(model_open)
-                                                    // Opening the list must not take the
-                                                    // keyboard off the field: a popover focuses
-                                                    // its own panel unless it is told whose
-                                                    // keystrokes these are.
-                                                    .track_focus(&model_focus)
-                                                    .on_open_change({
-                                                        let app = app.clone();
-                                                        move |open, _, cx| {
-                                                            app.update(cx, |state, cx| {
-                                                                state.set_model_picker_open(
-                                                                    *open, cx,
-                                                                );
-                                                            });
-                                                        }
-                                                    })
-                                                    .trigger(ModelPopAnchor {
-                                                        selected: model_open,
-                                                    })
-                                                    .content({
-                                                        let app = app.clone();
-                                                        let theme = theme.clone();
-                                                        let model = model.clone();
-                                                        let field = self.model_input.clone();
-                                                        let matches = model_matches.clone();
-                                                        let query = model_query.clone();
-                                                        move |_, _, _| {
-                                                            model_picker_panel(
-                                                                app.clone(),
-                                                                field.clone(),
-                                                                ModelPicker {
-                                                                    matches: matches.clone(),
-                                                                    query: query.clone(),
-                                                                    highlight: model_highlight,
-                                                                    current: model.clone(),
-                                                                },
-                                                                model_scroll.clone(),
-                                                                dark,
-                                                                theme.clone(),
-                                                            )
-                                                        }
-                                                    }),
-                                            ),
-                                    )
-                                    .when_some(note, |this, note| {
-                                        this.child(
-                                            div()
-                                                .pt(px(4.))
-                                                .text_xs()
-                                                .text_color(muted)
-                                                .child(note),
-                                        )
-                                    })
-                                    // The pin above is the gateway's. On the person's own plan
-                                    // the server asks the plan's model instead, so the field
-                                    // says whose model answers rather than let the pin look
-                                    // like it does.
-                                    .when(on_plan, |this| {
-                                        this.child(
-                                            div()
-                                                .id(crate::components::reply_source::BOT_MODEL_PLAN)
-                                                .pt(px(4.))
-                                                .text_xs()
-                                                .text_color(muted)
-                                                .child(
-                                                    crate::components::reply_source::PLAN_MODEL_NOTE,
-                                                ),
-                                        )
-                                    })
-                                    .when_some(effort, |this, effort| {
-                                        this.child(effort_card(
-                                            app.clone(),
-                                            effort,
-                                            muted,
-                                            theme.border,
-                                        ))
-                                    })
+                                    // The model, its door, the fast tier and the effort, all in the
+                                    // one control, and the only place they are picked.
+                                    .child(self.model_card.clone())
                                     .child(
                                         div()
                                             .id("agent-usage")
@@ -1352,331 +1009,6 @@ fn avatar_editor_panel(
         )
 }
 
-/// The row the highlight goes back to whenever the filter changes: the first of the matches.
-/// The row the arrows were left on stands for something else once the list under it has changed,
-/// and the top of a list is where a person who has just typed is looking. It is the first row of
-/// anything, so it is also where a list with nothing to point at starts.
-const FIRST_MATCH: usize = 0;
-
-/// What the list is narrowed by, given what the field holds and whether anybody has typed into
-/// it since it was opened.
-///
-/// The field carries the coworker's own route the whole time the pane is up, so reading that
-/// text as a query would leave the chevron — the one control that says here are your choices —
-/// opening onto the single choice already made. The text is a value until a keystroke turns it
-/// into a query, and shutting the list turns it back into a value.
-fn filter_text(text: &str, live: bool) -> &str {
-    if live { text.trim() } else { "" }
-}
-
-/// Where the highlight starts when the whole catalogue is on show: on the route the coworker is
-/// already on, so the list opens on where they are and Enter takes what they have. A route this
-/// catalogue does not hold, or no route at all, starts at the first row like anything else.
-fn current_model_row(shown: &[String], current: &str) -> usize {
-    shown
-        .iter()
-        .position(|id| id == current)
-        .unwrap_or(FIRST_MATCH)
-}
-
-/// The routes a typed query leaves, in the order the catalogue gives them.
-///
-/// The match is a case-insensitive run of the route id anywhere in it rather than a prefix: a
-/// route id is read as who serves it and what it is — `oag/cheap` — and someone who remembers
-/// only the second half would be shown nothing at all by a prefix. An empty field is no filter,
-/// so it lists everything on offer.
-///
-/// Only the gateway's routes are on offer here. A Bot is pinned to a route the server's paid keys
-/// serve; a model of the person's own plan (`source: local_proxy`) is the account's, picked on
-/// Settings → Reply source, and pinned here it would send the gateway an id it does not serve.
-fn matching_models(catalogue: &[ModelEntry], query: &str) -> Vec<String> {
-    let needle = query.trim().to_lowercase();
-    catalogue
-        .iter()
-        .filter(|entry| entry.source() == Some(crate::opengrok::InferenceKind::Gateway))
-        .filter(|entry| needle.is_empty() || entry.id.to_lowercase().contains(&needle))
-        .map(|entry| entry.id.clone())
-        .collect()
-}
-
-/// The route Enter takes: the highlighted row of what the field's text leaves, and nothing at
-/// all when nothing matches.
-fn highlighted_model(catalogue: &[ModelEntry], query: &str, row: usize) -> Option<String> {
-    matching_models(catalogue, query).into_iter().nth(row)
-}
-
-/// Where the highlight lands when it is stepped one row.
-///
-/// It goes round the list rather than stopping at the ends. Tab walks a set of choices in a
-/// circle everywhere else it is used, and the ⌘K palette — this app's other list walked from a
-/// field — goes round too; Tab wrapping while the arrows stopped would be two rules for one
-/// list. Both keys step through here, so the two cannot drift apart.
-fn stepped_highlight(row: usize, len: usize, down: bool) -> usize {
-    if len == 0 {
-        return FIRST_MATCH;
-    }
-    if down {
-        (row + 1) % len
-    } else {
-        (row + len - 1) % len
-    }
-}
-
-/// Take a route: the id lands in the field as text, the list shuts and the coworker is patched.
-///
-/// The field is a field, so a pick has to land in it as text. Nothing else puts the roster's
-/// model back into the field while the same agent stays open. A click on a row and Enter on the
-/// highlighted one are the same act, so they come through here rather than doing the same three
-/// things twice.
-fn take_model(
-    app: &Entity<AppState>,
-    field: &Entity<InputState>,
-    id: String,
-    window: &mut Window,
-    cx: &mut App,
-) {
-    field.update(cx, |input, cx| {
-        input.set_value(id.clone(), window, cx);
-    });
-    app.update(cx, |state, cx| {
-        state.set_model_picker_open(false, cx);
-        state.patch_active_agent(
-            CoworkerPatch {
-                model: Some(id),
-                ..Default::default()
-            },
-            cx,
-        );
-    });
-}
-
-/// What the list needs to draw itself: the routes the field's text leaves, that text for when it
-/// leaves none, the row Enter would take, and the route the coworker is on now.
-struct ModelPicker {
-    matches: Vec<String>,
-    query: String,
-    highlight: usize,
-    current: String,
-}
-
-fn model_picker_panel(
-    app: Entity<AppState>,
-    field: Entity<InputState>,
-    picker: ModelPicker,
-    scroll: ScrollHandle,
-    dark: bool,
-    theme: gpui_kit::component::Theme,
-) -> impl IntoElement {
-    let list_bg = if dark { rgb(0x1c1c1c) } else { rgb(0xffffff) };
-    let ModelPicker {
-        matches,
-        query,
-        highlight,
-        current,
-    } = picker;
-    let muted = theme.muted_foreground;
-    let tick = theme.primary;
-    let nothing_matches = matches.is_empty();
-    v_flex()
-        .id("agent-model-list")
-        .w(px(PANE_INNER))
-        .max_h(px(262.))
-        .overflow_y_scroll()
-        .track_scroll(&scroll)
-        .p(px(4.))
-        .rounded(px(10.))
-        .border_1()
-        .border_color(theme.border)
-        .bg(list_bg)
-        .text_color(theme.foreground)
-        .shadow_lg()
-        .occlude()
-        .on_mouse_down(MouseButton::Left, |_, _, cx| {
-            cx.stop_propagation();
-        })
-        .children(matches.into_iter().enumerate().map(move |(row, mid)| {
-            let selected = mid == current;
-            let app = app.clone();
-            let field = field.clone();
-            div()
-                .id(SharedString::from(format!("model-{mid}")))
-                .flex()
-                .items_center()
-                .gap(px(6.))
-                .px(px(8.))
-                .py(px(5.))
-                .rounded(px(6.))
-                .cursor_pointer()
-                // Two different things, told apart two different ways: the filled row is what
-                // Enter would take, the ticked one is what the coworker is already on. One fill
-                // for both left a person unable to read what they have off what they are about
-                // to get.
-                .when(row == highlight, |this| {
-                    this.bg(rgb(0x777777).opacity(0.22))
-                })
-                .hover(|s| s.bg(rgb(0x777777).opacity(0.12)))
-                .on_mouse_down(MouseButton::Left, {
-                    let mid = mid.clone();
-                    move |_, window, cx| take_model(&app, &field, mid.clone(), window, cx)
-                })
-                .child(div().flex_1().min_w(px(0.)).text_sm().truncate().child(mid))
-                .when(selected, |this| {
-                    this.child(
-                        Icon::new(IconName::Check)
-                            .size(px(13.))
-                            .flex_shrink_0()
-                            .text_color(tick),
-                    )
-                })
-        }))
-        // An empty box says nothing about why it is empty, and the answer is always the same
-        // one: what was typed. The row names it and cannot be picked — there is no route behind
-        // it to pick.
-        .when(nothing_matches, |this| {
-            this.child(
-                div()
-                    .id("agent-model-empty")
-                    .px(px(8.))
-                    .py(px(6.))
-                    .text_sm()
-                    .text_color(muted)
-                    .child(format!("No route matches {query}")),
-            )
-        })
-}
-
-/// What the Effort card says under its name. Some models ignore an effort and the server cannot
-/// know which, so the card says so rather than promise a change the model may not make.
-const EFFORT_LINE: &str = "How hard the Bot thinks before it answers. Some models ignore this.";
-
-/// The same, from a server that keeps no effort (one from before opengrok-server#271). The menu
-/// is dead there: a pick would look saved and change nothing.
-const EFFORT_NOT_KEPT: &str = "How hard the Bot thinks before it answers. Not available yet: \
-                               this server has nowhere to keep it.";
-
-/// What Inherit means, under it in the menu. It is the default, and the one that sends nothing.
-const INHERIT_MEANING: &str = "Let the model decide";
-
-/// The five a person picks from. The server keeps two more, `none` and `xhigh`, which a bot can
-/// carry when something other than this pane set it: the menu shows one of those, as it is,
-/// while the bot has it, and does not offer it otherwise.
-const OFFERED_EFFORTS: [&str; 5] = ["inherit", "low", "medium", "high", "max"];
-
-/// The Effort menu's choices, in the server's order: the five on offer, and the word the bot
-/// already has when it is none of those (`none`, `xhigh`, or one this app has not heard of,
-/// which goes last), so the menu never shows a value the server does not hold.
-pub(crate) fn effort_choices(kept: &str) -> Vec<String> {
-    let mut choices: Vec<String> = EFFORT_WORDS
-        .into_iter()
-        .filter(|word| OFFERED_EFFORTS.contains(word) || *word == kept)
-        .map(str::to_string)
-        .collect();
-    if !choices.iter().any(|word| word == kept) {
-        choices.push(kept.to_string());
-    }
-    choices
-}
-
-/// A choice as the menu names it: the five on offer by name, and any other word as it is, since
-/// this app has no name of its own for it.
-pub(crate) fn effort_label(word: &str) -> String {
-    match word {
-        "inherit" => "Inherit",
-        "low" => "Low",
-        "medium" => "Medium",
-        "high" => "High",
-        "max" => "Max",
-        other => other,
-    }
-    .to_string()
-}
-
-/// The Effort card: what it is, and a menu of how hard the Bot thinks, laid out as Settings →
-/// Computer lays out a mode, the words on the left and the menu on the right. A pick waits for
-/// Save with the rest of the pane.
-fn effort_card(
-    app: Entity<AppState>,
-    effort: EffortControl,
-    muted: Hsla,
-    border: Hsla,
-) -> impl IntoElement {
-    let line = if effort.kept.is_some() {
-        EFFORT_LINE
-    } else {
-        EFFORT_NOT_KEPT
-    };
-    div()
-        .id("agent-effort-card")
-        .mt(px(14.))
-        .px(px(14.))
-        .py(px(12.))
-        .rounded(px(10.))
-        .border_1()
-        .border_color(border)
-        .child(
-            div()
-                .flex()
-                .items_center()
-                .justify_between()
-                .gap(px(10.))
-                .child(
-                    v_flex()
-                        .flex_1()
-                        .min_w(px(0.))
-                        .gap(px(2.))
-                        .child(div().text_sm().child("Effort"))
-                        .child(div().text_xs().text_color(muted).child(line)),
-                )
-                .child(effort_menu(app, effort, muted)),
-        )
-}
-
-/// The menu: a button naming the word the pane holds, opening onto the choices with that word
-/// ticked. From a server that keeps no effort it is the button alone, and dead.
-fn effort_menu(app: Entity<AppState>, effort: EffortControl, muted: Hsla) -> AnyElement {
-    let button = Button::new("agent-effort")
-        .label(effort_label(&effort.shown))
-        .ghost()
-        .compact()
-        .icon(IconName::ChevronDown);
-    if effort.kept.is_none() {
-        return button.disabled(true).into_any_element();
-    }
-    let choices = effort_choices(effort.kept_word());
-    let shown = effort.shown;
-    button
-        .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, _, _| {
-            choices.iter().fold(menu, |menu, word| {
-                menu.item(effort_item(&app, word, *word == shown, muted))
-            })
-        })
-        .into_any_element()
-}
-
-/// One choice. Its row carries the id a driver clicks, `agent-effort-{word}`, and Inherit says
-/// under its name what it means.
-fn effort_item(app: &Entity<AppState>, word: &str, current: bool, muted: Hsla) -> PopupMenuItem {
-    let id = SharedString::from(format!("agent-effort-{word}"));
-    let label = effort_label(word);
-    let meaning = (word == EFFORT_INHERIT).then_some(INHERIT_MEANING);
-    let app = app.clone();
-    let word = word.to_string();
-    PopupMenuItem::element(move |_, _| {
-        v_flex()
-            .id(id.clone())
-            .gap(px(2.))
-            .child(div().child(label.clone()))
-            .when_some(meaning, |this, meaning| {
-                this.child(div().text_xs().text_color(muted).child(meaning))
-            })
-    })
-    .checked(current)
-    .on_click(move |_, _, cx| {
-        cx.stop_propagation();
-        app.update(cx, |state, cx| state.pick_effort(word.clone(), cx));
-    })
-}
-
 impl AgentSettings {
     fn auto_review_body(&self, mode: AutoReviewMode, cx: &mut Context<Self>) -> impl IntoElement {
         v_flex()
@@ -1725,222 +1057,6 @@ impl AgentSettings {
     }
 }
 
-#[cfg(test)]
-#[allow(clippy::unwrap_used)]
-mod tests {
-    // Named imports, not a glob: `use super::*` would pull GPUI's `test` attribute in over the
-    // one the test harness wants.
-    use super::{
-        FIRST_MATCH, current_model_row, effort_choices, effort_label, filter_text,
-        highlighted_model, matching_models, stepped_highlight,
-    };
-    use crate::opengrok::ModelEntry;
-
-    /// The menu offers five, in the server's order, and never hides the word a bot already has:
-    /// `xhigh` is shown as it is, in its place between High and Max, and so is `none`, and a word
-    /// from a newer server goes last. Once the bot has an offered word, the extra one is gone.
-    #[test]
-    fn the_effort_menu_shows_a_kept_word_it_does_not_offer_as_it_is() {
-        let offered = vec!["inherit", "low", "medium", "high", "max"];
-        assert_eq!(effort_choices("inherit"), offered);
-        assert_eq!(effort_choices("high"), offered);
-        assert_eq!(
-            effort_choices("xhigh"),
-            vec!["inherit", "low", "medium", "high", "xhigh", "max"]
-        );
-        assert_eq!(effort_label("xhigh"), "xhigh");
-        assert_eq!(
-            effort_choices("none"),
-            vec!["inherit", "none", "low", "medium", "high", "max"]
-        );
-        assert_eq!(effort_label("none"), "none");
-        assert_eq!(
-            effort_choices("ultra").last().map(String::as_str),
-            Some("ultra")
-        );
-        assert_eq!(effort_label("ultra"), "ultra");
-        assert_eq!(
-            ["inherit", "low", "medium", "high", "max"].map(effort_label),
-            ["Inherit", "Low", "Medium", "High", "Max"]
-        );
-    }
-
-    fn catalogue() -> Vec<ModelEntry> {
-        [
-            "oag/cheap",
-            "xai/grok-4.6@sub",
-            "OAG/Fast",
-            "anthropic/opus",
-        ]
-        .into_iter()
-        .map(|id| ModelEntry {
-            id: id.into(),
-            source: None,
-        })
-        .collect()
-    }
-
-    /// The Bot's Model field offers the gateway's routes and nothing of the person's own plan:
-    /// a Bot pinned to one of opencodex's models would send the gateway an id it does not serve.
-    /// A model whose door this app cannot name is offered by neither.
-    #[test]
-    fn a_bots_model_field_offers_only_the_gateways_routes() {
-        let entry = |id: &str, source: Option<&str>| ModelEntry {
-            id: id.into(),
-            source: source.map(str::to_string),
-        };
-        let catalogue = vec![
-            entry("oag/cheap", None),
-            entry("gpt-5-codex", Some("local_proxy")),
-            entry("oag/fast", Some("gateway")),
-            entry("odd", Some("byok")),
-        ];
-        assert_eq!(
-            matching_models(&catalogue, ""),
-            vec!["oag/cheap", "oag/fast"]
-        );
-        assert!(matching_models(&catalogue, "codex").is_empty());
-    }
-
-    #[test]
-    fn the_filter_reads_any_run_of_a_route_id_in_any_case() {
-        let catalogue = catalogue();
-        assert_eq!(
-            matching_models(&catalogue, "oag"),
-            vec!["oag/cheap", "OAG/Fast"]
-        );
-        assert_eq!(
-            matching_models(&catalogue, "OAG"),
-            vec!["oag/cheap", "OAG/Fast"],
-            "nobody types a route id in the case the catalogue keeps it in"
-        );
-        assert_eq!(
-            matching_models(&catalogue, "grok"),
-            vec!["xai/grok-4.6@sub"],
-            "a route is looked for by the part of it a person remembers, which is rarely its start"
-        );
-        assert_eq!(
-            matching_models(&catalogue, "4.6@sub"),
-            vec!["xai/grok-4.6@sub"]
-        );
-    }
-
-    #[test]
-    fn an_empty_field_is_no_filter_at_all() {
-        let catalogue = catalogue();
-        assert_eq!(
-            matching_models(&catalogue, ""),
-            vec![
-                "oag/cheap",
-                "xai/grok-4.6@sub",
-                "OAG/Fast",
-                "anthropic/opus"
-            ],
-            "everything on offer, in the order the catalogue gives it"
-        );
-        assert_eq!(
-            matching_models(&catalogue, "   "),
-            matching_models(&catalogue, ""),
-            "a space is not something a route id is looked for by"
-        );
-    }
-
-    #[test]
-    fn a_query_no_route_answers_to_leaves_nothing() {
-        let catalogue = catalogue();
-        assert!(matching_models(&catalogue, "not showing the options").is_empty());
-        assert_eq!(
-            highlighted_model(&catalogue, "not showing the options", FIRST_MATCH),
-            None,
-            "Enter has nothing to take, so what was typed stands"
-        );
-    }
-
-    #[test]
-    fn an_untouched_field_is_a_value_and_the_chevron_opens_on_the_whole_catalogue() {
-        let catalogue = catalogue();
-        let current = "OAG/Fast";
-        // The coworker's route is in the field whenever the pane is up, so narrowing the list by
-        // it would open the chevron onto the one choice already made.
-        let shown = matching_models(&catalogue, filter_text(current, false));
-        assert_eq!(shown, matching_models(&catalogue, ""));
-        assert_eq!(
-            current_model_row(&shown, current),
-            2,
-            "the list opens on the row the coworker is already on"
-        );
-    }
-
-    #[test]
-    fn the_first_keystroke_turns_the_value_into_a_query() {
-        let catalogue = catalogue();
-        let shown = matching_models(&catalogue, filter_text("oag", true));
-        assert_eq!(shown, vec!["oag/cheap", "OAG/Fast"]);
-        assert_eq!(
-            highlighted_model(&catalogue, filter_text("oag", true), FIRST_MATCH).unwrap(),
-            "oag/cheap",
-            "a query lights its first match, wherever the coworker's own route sits"
-        );
-    }
-
-    #[test]
-    fn a_route_the_catalogue_does_not_hold_starts_at_the_first_row() {
-        let shown = matching_models(&catalogue(), "");
-        assert_eq!(current_model_row(&shown, "who/knows"), FIRST_MATCH);
-        assert_eq!(current_model_row(&[], "oag/cheap"), FIRST_MATCH);
-    }
-
-    #[test]
-    fn the_highlight_goes_round_the_list_rather_than_stopping_at_its_ends() {
-        // Four rows. Up from the first is the last and down from the last is the first, and it
-        // is the same rule whether the key was an arrow or Tab: both step through here.
-        assert_eq!(stepped_highlight(0, 4, false), 3);
-        assert_eq!(stepped_highlight(3, 4, true), 0);
-        assert_eq!(stepped_highlight(1, 4, true), 2);
-        assert_eq!(stepped_highlight(1, 4, false), 0);
-        // A step each way is where it started, from every row and from either end.
-        for row in 0..4 {
-            assert_eq!(
-                stepped_highlight(stepped_highlight(row, 4, true), 4, false),
-                row
-            );
-            assert_eq!(
-                stepped_highlight(stepped_highlight(row, 4, false), 4, true),
-                row
-            );
-        }
-        assert_eq!(
-            stepped_highlight(0, 0, true),
-            FIRST_MATCH,
-            "with no rows to walk there is nowhere to walk to"
-        );
-    }
-
-    #[test]
-    fn the_highlight_lands_on_the_first_match_whenever_the_filter_changes() {
-        let catalogue = catalogue();
-        // A row means something else once the list under it has changed: row 1 of everything is
-        // the grok route, and row 1 of what "oag" leaves is another route altogether.
-        assert_eq!(
-            highlighted_model(&catalogue, "", 1).unwrap(),
-            "xai/grok-4.6@sub"
-        );
-        assert_eq!(highlighted_model(&catalogue, "oag", 1).unwrap(), "OAG/Fast");
-        // Which is why every change to the filter puts the highlight back to the first match,
-        // and the first match is the first of the matches rather than of the catalogue.
-        for query in ["", "oag", "fast", "anthropic"] {
-            assert_eq!(
-                highlighted_model(&catalogue, query, FIRST_MATCH),
-                matching_models(&catalogue, query).first().cloned()
-            );
-        }
-        assert_eq!(
-            highlighted_model(&catalogue, "fast", FIRST_MATCH).unwrap(),
-            "OAG/Fast"
-        );
-    }
-}
-
 /// The Usage card's second line: what the bot used this month, or why the app cannot say.
 pub(crate) fn usage_summary(report: &UsageReport) -> String {
     match report {
@@ -1985,7 +1101,7 @@ pub(crate) fn usage_summary(report: &UsageReport) -> String {
 }
 
 /// `text` with its first letter capitalised.
-fn sentence(text: &str) -> String {
+pub(crate) fn sentence(text: &str) -> String {
     let mut chars = text.chars();
     chars.next().map_or_else(String::new, |first| {
         first.to_uppercase().chain(chars).collect()
@@ -2181,8 +1297,9 @@ pub(crate) const NOTHING_TO_SWITCH: &str = "Nothing to switch on or off.";
 pub(crate) struct ShownCeilingRow {
     /// The server's name for it, which is what its switch is known by.
     pub name: String,
-    /// What the row is headed with: a builtin's wire name, which is what the model is told, or a
-    /// plugin's label, or the plugin's name where it has none.
+    /// What the row is headed with: its label where the server gives one, as a plugin's, and
+    /// the routine tools' one row's `Routines` (opengrok-server #316); else its name, which for
+    /// a builtin is its wire name, what the model is told.
     pub title: String,
     pub builtin: bool,
     /// The first line of what the server says it is.
@@ -2300,9 +1417,6 @@ pub(crate) fn ceiling_line(
 
 /// What a row is headed with; see [`ShownCeilingRow::title`].
 fn ceiling_title(row: &CeilingRow) -> String {
-    if row.is_builtin() {
-        return row.name.clone();
-    }
     row.label
         .as_deref()
         .map(str::trim)
@@ -2414,6 +1528,9 @@ fn ceiling_row(
         connector,
         note,
     } = row;
+    // A builtin headed by its wire name is drawn as code, as the model is told it; one the server
+    // labels for people, as the routine tools' row, is drawn as a name.
+    let wire_name = builtin && title == name;
     // Every id under a row has a fixed word between `agent-ceiling-` and the server's name, and
     // the card's own lines have none, so no name a plugin can have makes one id another's.
     let switch_id = SharedString::from(format!("agent-ceiling-switch-{name}"));
@@ -2438,7 +1555,7 @@ fn ceiling_row(
                         .child(
                             div()
                                 .text_sm()
-                                .when(builtin, |this| this.font_family("Menlo"))
+                                .when(wire_name, |this| this.font_family("Menlo"))
                                 .child(title),
                         )
                         .when(!first_line.is_empty(), |this| {
@@ -2819,6 +1936,44 @@ mod tools_tests {
         }
     }
 
+    /// The routine tools are one row of the ceiling, a builtin the server labels for people
+    /// (opengrok-server #316, recorded at #334, on main 8e7387f: `{name: "routines", kind:
+    /// "builtin", label: "Routines"}`), and it is headed by that label; its switch is still known
+    /// by its name. A builtin with no label is headed by its wire name, as before.
+    #[test]
+    fn a_builtin_the_server_labels_is_headed_by_its_label() {
+        let card = CeilingCard {
+            ceiling: ToolCeiling::Read(CeilingRead {
+                rows: rows(serde_json::json!([
+                    {"name": "routines", "kind": "builtin", "enabled": true, "label": "Routines",
+                        "description": "List, make, edit and delete your routines when you ask \
+                                        in chat. Deleting one always asks you first."},
+                    {"name": "message_bot", "kind": "builtin", "enabled": true}
+                ])),
+                version: Some(1),
+            }),
+            pending: None,
+            blocked: None,
+            note: None,
+        };
+        let shown = shown_ceiling_rows(&card);
+        assert_eq!(
+            shown
+                .iter()
+                .map(|row| (row.name.as_str(), row.title.as_str(), row.builtin))
+                .collect::<Vec<_>>(),
+            [
+                ("routines", "Routines", true),
+                ("message_bot", "message_bot", true)
+            ]
+        );
+        assert_eq!(
+            shown[0].first_line,
+            "List, make, edit and delete your routines when you ask in chat. Deleting one \
+             always asks you first."
+        );
+    }
+
     /// The card's line about the ceiling counts the switches as they stand on screen, and says
     /// why there are none when there are none. While it is being asked for it says nothing: the
     /// card's own line is saying that already.
@@ -2849,8 +2004,8 @@ mod tools_tests {
         );
     }
 
-    /// Each row is drawn as the server describes it: a builtin by its wire name, a plugin by its
-    /// label or else its name, the first line of its words, and why it cannot be offered when it
+    /// Each row is drawn as the server describes it: by its label or else its name, which for a
+    /// builtin is its wire name, the first line of its words, and why it cannot be offered when it
     /// cannot. Only a switch a click would send is live, and a builtin the server cannot offer
     /// now is one: the ceiling records what the owner allows.
     #[test]

@@ -1,5 +1,6 @@
 use crate::chrome::{
-    AVATAR_PX, MASCOT_BOX_PX, RAIL_HOVER, RAIL_HOVER_ALPHA, SIDEBAR_GAP, SIDEBAR_ROW,
+    AVATAR_PX, CONTROL_ICON_PX, MASCOT_BOX_PX, RAIL_HOVER, RAIL_HOVER_ALPHA, SIDEBAR_GAP,
+    SIDEBAR_ROW, TITLE_BAR_H,
 };
 use crate::components::persona::PersonaMark;
 use crate::icons::NativeIcon;
@@ -7,9 +8,10 @@ use crate::state::{AppSettingsTab, AppState, Conversation, THREAD_LIST_UNAVAILAB
 use chrono::NaiveDateTime;
 use gpui_kit::assets::IconNamed;
 use gpui_kit::base::{Align, ElementExt as _, POPUP_PRIORITY, Placement, Positioner};
+use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::menu::{ContextMenuExt, PopupMenu, PopupMenuItem};
-use gpui_kit::component::{ActiveTheme, Icon, IconName, h_flex, v_flex};
+use gpui_kit::component::{ActiveTheme, Icon, IconName, Sizable, Size, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 use std::time::{Duration, SystemTime};
@@ -115,7 +117,51 @@ pub struct SidebarView {
     hidden_row_hover: bool,
 }
 
+/// Visibility and size are independent, including while the sidebar is hidden.
+pub(crate) fn sidebar_toggle_button(
+    state: Entity<AppState>,
+    id: &'static str,
+    size: f32,
+    fg: Hsla,
+    hidden: bool,
+) -> Button {
+    Button::new(id)
+        .ghost()
+        // Custom button presets assign 75% of their size to the icon.
+        .with_size(Size::Size(px(CONTROL_ICON_PX / 0.75)))
+        .size(px(size))
+        .rounded(px(10.))
+        .icon(kit_icon("icons/panel-left.svg", CONTROL_ICON_PX, fg))
+        .tooltip(if hidden {
+            "Show sidebar · Right-click: Mini/Expanded"
+        } else {
+            "Hide sidebar · Right-click: Mini/Expanded"
+        })
+        .occlude()
+        .on_mouse_down(MouseButton::Right, {
+            let state = state.clone();
+            move |_, _, cx| {
+                cx.stop_propagation();
+                state.update(cx, |state, cx| state.toggle_sidebar_size(cx));
+            }
+        })
+        .on_click(move |_, _, cx| {
+            cx.stop_propagation();
+            state.update(cx, |state, cx| state.toggle_sidebar(cx));
+        })
+}
+
 impl SidebarView {
+    fn sidebar_button(&self, collapsed: bool, fg: Hsla) -> impl IntoElement {
+        sidebar_toggle_button(
+            self.state.clone(),
+            "nav-toggle-sidebar",
+            if collapsed { SIDEBAR_ROW } else { 28. },
+            fg,
+            false,
+        )
+    }
+
     pub fn new(window: &mut Window, state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
         let rename_input = cx.new(|cx| InputState::new(window, cx).placeholder("Name"));
         let search_input = cx.new(|cx| InputState::new(window, cx).placeholder("Search"));
@@ -267,7 +313,7 @@ impl Render for SidebarView {
             .overflow_hidden()
             .on_mouse_down(MouseButton::Left, move |_, _, cx| {
                 app.update(cx, |state, cx| {
-                    if state.model_picker_open || state.avatar_editor_open {
+                    if state.model_picker.open || state.avatar_editor_open {
                         state.dismiss_popovers(cx);
                     }
                 });
@@ -275,6 +321,9 @@ impl Render for SidebarView {
             .bg(theme.sidebar)
             .border_r_1()
             .border_color(theme.border)
+            .when(state.page == crate::state::MainPage::Chat, |this| {
+                this.child(div().h(px(TITLE_BAR_H)).flex_shrink_0())
+            })
             .child(
                 v_flex()
                     .id("sidebar-main")
@@ -580,29 +629,7 @@ impl SidebarView {
             .when(collapsed, |this| this.justify_center())
             .when(!collapsed, |this| this.px(px(12.)).pl(px(16.)).gap(px(8.)))
             .when(collapsed, |this| {
-                this.child(
-                    div()
-                        .id("nav-toggle-sidebar")
-                        .w(px(SIDEBAR_ROW))
-                        .h(px(SIDEBAR_ROW))
-                        .rounded(px(10.))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .cursor_pointer()
-                        .hover(|s| s.bg(hover))
-                        .on_mouse_down(MouseButton::Left, {
-                            let view = view.clone();
-                            move |_, _, cx| {
-                                view.update(cx, |this, cx| {
-                                    this.state.update(cx, |state, cx| {
-                                        state.set_sidebar_collapsed(false, false, cx);
-                                    });
-                                });
-                            }
-                        })
-                        .child(kit_icon("icons/panel-left.svg", 16.0, fg)),
-                )
+                this.child(self.sidebar_button(collapsed, fg))
             })
             .when(!collapsed, |this| {
                 this.child(
@@ -621,15 +648,23 @@ impl SidebarView {
                 )
                 .child(
                     div()
+                        .min_w_0()
+                        .truncate()
                         .text_sm()
                         .font_weight(FontWeight::SEMIBOLD)
                         .child("NativeChat"),
                 )
                 .child(
                     div()
-                        .id("nav-new-chat")
                         .ml_auto()
+                        .flex_shrink_0()
+                        .child(self.sidebar_button(collapsed, fg)),
+                )
+                .child(
+                    div()
+                        .id("nav-new-chat")
                         .size(px(28.))
+                        .flex_shrink_0()
                         .rounded(px(8.))
                         .flex()
                         .items_center()
@@ -654,7 +689,7 @@ impl SidebarView {
                                 }
                             })
                         })
-                        .child(Icon::new(IconName::Plus).size(px(16.))),
+                        .child(Icon::new(IconName::Plus).size(px(CONTROL_ICON_PX))),
                 )
             })
     }
@@ -752,7 +787,7 @@ impl SidebarView {
                     })
                     .child(
                         Icon::new(IconName::Plus)
-                            .size(px(16.))
+                            .size(px(CONTROL_ICON_PX))
                             .text_color(icon_color),
                     ),
             )
@@ -779,7 +814,7 @@ impl SidebarView {
                     })
                     .child(
                         Icon::new(IconName::Search)
-                            .size(px(16.))
+                            .size(px(CONTROL_ICON_PX))
                             .text_color(icon_color),
                     )
                     .child(div().text_sm().text_color(icon_color).child("Search")),
@@ -959,7 +994,12 @@ impl SidebarView {
                     on_click(cx);
                 })
             })
-            .child(Icon::default().path(icon).size(px(16.)).text_color(fg))
+            .child(
+                Icon::default()
+                    .path(icon)
+                    .size(px(CONTROL_ICON_PX))
+                    .text_color(fg),
+            )
             .when(!collapsed, |this| this.child(div().text_sm().child(label)))
     }
 }
@@ -1159,6 +1199,128 @@ mod tests {
     use super::{rail_card_time, rail_preview};
     use crate::state::Conversation;
     use std::time::{Duration, SystemTime};
+
+    struct SidebarClicks {
+        state: gpui_kit::Entity<crate::state::AppState>,
+        sidebar: gpui_kit::Entity<super::SidebarView>,
+    }
+
+    impl gpui_kit::Render for SidebarClicks {
+        fn render(
+            &mut self,
+            _: &mut gpui_kit::Window,
+            cx: &mut gpui_kit::Context<Self>,
+        ) -> impl gpui_kit::IntoElement {
+            use gpui_kit::component::ActiveTheme as _;
+            use gpui_kit::{IntoElement as _, ParentElement as _, Styled as _};
+            let state = self.state.read(cx);
+            gpui_kit::div()
+                .w(gpui_kit::px(300.))
+                .h(gpui_kit::px(200.))
+                .child(if state.sidebar_hidden {
+                    super::sidebar_toggle_button(
+                        self.state.clone(),
+                        "header-left-sidebar",
+                        28.,
+                        cx.theme().foreground,
+                        true,
+                    )
+                    .into_any_element()
+                } else {
+                    self.sidebar
+                        .read(cx)
+                        .sidebar_button(state.sidebar_collapsed, cx.theme().foreground)
+                        .into_any_element()
+                })
+        }
+    }
+
+    #[gpui_kit::test]
+    fn sidebar_left_click_hides_without_a_menu(cx: &mut gpui_kit::TestAppContext) {
+        use gpui_kit::{AppContext as _, Modifiers, point, px};
+        cx.update(gpui_kit::init);
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let state = cx.new(|_| crate::state::AppState::new());
+            let sidebar = cx.new(|cx| super::SidebarView::new(window, state.clone(), cx));
+            SidebarClicks { state, sidebar }
+        });
+        cx.simulate_mouse_move(point(px(14.), px(14.)), None, Modifiers::none());
+        cx.simulate_click(point(px(14.), px(14.)), Modifiers::none());
+        assert!(view.update(cx, |view, cx| view.state.read(cx).sidebar_hidden));
+        // Repaint the harness with the real hidden-sidebar header control.
+        view.update(cx, |_, cx| cx.notify());
+        cx.simulate_mouse_move(point(px(14.), px(14.)), None, Modifiers::none());
+        cx.simulate_click(point(px(14.), px(14.)), Modifiers::none());
+        assert!(!view.update(cx, |view, cx| view.state.read(cx).sidebar_hidden));
+    }
+
+    #[gpui_kit::test]
+    fn sidebar_right_click_changes_size_without_hiding(cx: &mut gpui_kit::TestAppContext) {
+        use gpui_kit::{AppContext as _, Modifiers, MouseButton, point, px};
+        cx.update(gpui_kit::init);
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let state = cx.new(|_| crate::state::AppState::new());
+            let sidebar = cx.new(|cx| super::SidebarView::new(window, state.clone(), cx));
+            SidebarClicks { state, sidebar }
+        });
+        let initial = view.update(cx, |view, cx| view.state.read(cx).sidebar_collapsed);
+        cx.simulate_mouse_move(point(px(14.), px(14.)), None, Modifiers::none());
+        cx.simulate_mouse_down(
+            point(px(14.), px(14.)),
+            MouseButton::Right,
+            Modifiers::none(),
+        );
+        cx.simulate_mouse_up(
+            point(px(14.), px(14.)),
+            MouseButton::Right,
+            Modifiers::none(),
+        );
+        view.update(cx, |view, cx| {
+            let state = view.state.read(cx);
+            assert_eq!(state.sidebar_collapsed, !initial);
+            assert!(!state.sidebar_hidden);
+        });
+    }
+
+    #[gpui_kit::test]
+    fn sidebar_right_click_while_hidden_only_changes_remembered_size(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        use gpui_kit::{AppContext as _, Modifiers, MouseButton, point, px};
+        cx.update(gpui_kit::init);
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let state = cx.new(|_| {
+                let mut state = crate::state::AppState::new();
+                state.sidebar_hidden = true;
+                state
+            });
+            let sidebar = cx.new(|cx| super::SidebarView::new(window, state.clone(), cx));
+            SidebarClicks { state, sidebar }
+        });
+        let initial = view.update(cx, |view, cx| view.state.read(cx).sidebar_collapsed);
+        cx.simulate_mouse_move(point(px(14.), px(14.)), None, Modifiers::none());
+        cx.simulate_mouse_down(
+            point(px(14.), px(14.)),
+            MouseButton::Right,
+            Modifiers::none(),
+        );
+        cx.simulate_mouse_up(
+            point(px(14.), px(14.)),
+            MouseButton::Right,
+            Modifiers::none(),
+        );
+        view.update(cx, |view, cx| {
+            let state = view.state.read(cx);
+            assert_eq!(state.sidebar_collapsed, !initial);
+            assert!(state.sidebar_hidden);
+        });
+        cx.simulate_click(point(px(14.), px(14.)), Modifiers::none());
+        view.update(cx, |view, cx| {
+            let state = view.state.read(cx);
+            assert_eq!(state.sidebar_collapsed, !initial);
+            assert!(!state.sidebar_hidden);
+        });
+    }
 
     fn unopened(created_at: &str, updated_at: &str) -> Conversation {
         Conversation {

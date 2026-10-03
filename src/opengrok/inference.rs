@@ -4,9 +4,10 @@
 //! The app never calls a model, whichever it is. The fork is in opengrok-server's model door:
 //! the harness, the tools and the journal stay on the server either way, and when the source is
 //! `local_proxy` it is the server that talks to opencodex, the proxy that holds the person's
-//! sign-in, over the server's own loopback. So opencodex runs on the same machine as the server,
-//! and the person's plan can be set up only from a Mac that is that machine ([`is_loopback`]).
-//! What lives here is the cockpit's half of that: the account's setting (`GET` and
+//! sign-in: over the server's own loopback, or through the person's computer (the relay, below).
+//! The account's loopback half (the proxy's address and key on the server's machine) is the
+//! server's to keep, and this app no longer sets it up or sends it: Settings → Relay is the relay
+//! alone. What lives here is the cockpit's half of the rest: the account's setting (`GET` and
 //! `PUT /account/inference-source`), the door one turn names in
 //! `forwardedProps.inferenceSource`, and the CUSTOM frame (`opengrok.inferenceSource`) that says
 //! which door a reply came through.
@@ -18,25 +19,46 @@
 //! `crates/opengrok-harness/src/local_proxy.rs`, and the door's words and the models a
 //! subscription may answer in `crates/opengrok-core/src/inference.rs`. The conformance ledger
 //! reads the two routes and the CUSTOM frame against the server's recording, vendored in
-//! `fixtures/wire/` from its main at e55a8c8 (pin f56bbde, after #296).
+//! `fixtures/wire/` from opengrok-server #332 (PR #338 at 66b9f7b), recorded on main eaaa291
+//! (its MANIFEST.json names 79d711f, the PR's commit it was recorded at). These shapes are as
+//! they were at main cad36fd (#303, after #298): #306 changed no
+//! crate, #304 puts a Bot's own door between a turn's and the account's (`route` in
+//! `crates/opengrok-harness/src/local_proxy.rs`), #308 lets a retry of a queued send's reply
+//! name its own door over the one the send was queued with (`consume_for_turn` in
+//! `crates/opengrok-server/src/agui/pending.rs`), and #322 adds the account's default for new
+//! Bots (`newBotDefault`, in `described` and `apply`). #325 and #316 change where a Bot's message
+//! and a routine's firing are answered (`for_message` there, and `routine_route` in the server's
+//! `crates/opengrok-server/src/autonomy/mod.rs`), and no shape read here. #332 adds the relay's
+//! switch and what answers while it is off (`relayEnabled` and `planFallback`, in `described`,
+//! and in `InferenceSource::applied` in `crates/opengrok-core/src/inference.rs`, which reads a
+//! Save where `apply` did), and says on a reply's frame why the server's keys answered it
+//! (`fallbackFor`, `converse_raw` in `crates/opengrok-harness/src/lib.rs`). #342 makes the switch
+//! each computer's own (`PATCH /local-exec/daemon/{machine_id}`, `super::client::DaemonMachine`)
+//! and the account's `relayEnabled` is derived from them: read, and never sent again.
+//!
+//! The relay (opengrok-server #292, built in #298, whose recording holds its words) lifts the
+//! one-machine limit: the server sends a turn's model calls down a stream to the person's
+//! computer, whose background helper asks its own opencodex and streams the answer back
+//! (`super::relay`). The window still never calls a model. On the wire it is a second word
+//! beside the kind, the way the plan is reached ([`Via`]): the account keeps one, a turn and a
+//! queued send may name one ([`TurnSource`]), the CUSTOM frame says which one answered, and the
+//! account's setting says where the relay stands ([`RelayRead`]).
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 
 /// The CUSTOM `name` the server sends right after `RUN_STARTED`, with `value {"kind", "model"}`:
 /// which door this run's model calls go through, and the model. It is journaled with the run, so
 /// a thread's replay carries it as the live stream did.
 pub const INFERENCE_SOURCE_CUSTOM: &str = "opengrok.inferenceSource";
 
-/// Where opencodex listens unless the person says otherwise. The server follows no redirects and
-/// refuses anything that is not literal loopback, so this is also the shape a URL has to have.
+/// Where opencodex listens unless the person says otherwise: on this computer, for the relay.
 pub const DEFAULT_PROXY_URL: &str = "http://127.0.0.1:8080";
 
 /// Whether an address is the machine it is dialled from, as the server reads one: `127.0.0.0/8`,
 /// `[::1]` or the name `localhost`, with or without a port (`loopback_base` in
-/// `crates/opengrok-harness/src/local_proxy.rs`). The app asks it of its own server's address:
-/// the server calls opencodex on its own loopback, so the person's plan is set up from this Mac
-/// only when the server runs on it.
+/// `crates/opengrok-harness/src/local_proxy.rs`). The relay asks it of opencodex's address: it
+/// calls only an opencodex on this computer, as the server does on its own machine.
 pub fn is_loopback(url: &url::Url) -> bool {
     match url.host() {
         Some(url::Host::Domain(name)) => name.eq_ignore_ascii_case("localhost"),
@@ -74,19 +96,130 @@ impl InferenceKind {
     pub fn from_word(word: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|kind| kind.word() == word)
     }
+}
 
-    /// The other door: what the composer's chip turns to when it is clicked.
-    pub fn other(self) -> Self {
+/// The way the person's own plan is reached, in the server's words (opengrok-server #292: `Via`
+/// in `crates/opengrok-core/src/inference.rs`, server main cad36fd (#303, after #298), pin
+/// 47a5d6b): `loopback`, the server calling opencodex on its own machine as it
+/// always has; `mac`, the server sending each model call down the relay stream to the person's
+/// computer, which asks its own opencodex. The contract's third word, `helper`, the server refuses
+/// until its #293, so it is offered nowhere here and reads like any word this app has not heard
+/// of: a way it cannot name, never mistaken for one of these two.
+///
+/// The relay is the app on the person's computer, which need not be a Mac, and the server is being
+/// asked to take `computer` as a new name for `mac`. No server sends or takes it yet: this app
+/// reads it as [`Via::Mac`] should it ever arrive, and sends `mac`, the word every server with the
+/// relay reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Via {
+    Loopback,
+    #[serde(alias = "computer")]
+    Mac,
+}
+
+impl Via {
+    pub const ALL: [Self; 2] = [Self::Loopback, Self::Mac];
+
+    /// The word on the wire: `via` in the account's setting, on a turn's door, in the CUSTOM
+    /// frame and on a `/models` entry. The relay's is `mac`, whatever this app calls it.
+    pub fn word(self) -> &'static str {
         match self {
-            Self::Gateway => Self::LocalProxy,
-            Self::LocalProxy => Self::Gateway,
+            Self::Loopback => "loopback",
+            Self::Mac => "mac",
         }
+    }
+
+    /// The way a wire word names, or `None` for one this app has not heard of. `computer`, the
+    /// name the server is being asked to take for `mac`, reads as it.
+    pub fn from_word(word: &str) -> Option<Self> {
+        match word {
+            "computer" => Some(Self::Mac),
+            _ => Self::ALL.into_iter().find(|via| via.word() == word),
+        }
+    }
+}
+
+/// The door one turn names in `forwardedProps.inferenceSource`, and that a queued send's row
+/// keeps as `inferenceSource`: the kind, and for the person's plan the way to it when this app
+/// names one (opengrok-server #292: `TurnSource` in `crates/opengrok-core/src/inference.rs`,
+/// server main cad36fd (#303, after #298), pin 47a5d6b).
+///
+/// It goes as every turn went before the relay, the kind's bare word, when it names no way, and
+/// as `{"kind", "via"}` when it does. A server from before the relay takes only the bare word and
+/// refuses anything else, so a way is named only to a server that said it knows them (its
+/// setting carries `relay`); the plan on its own machine is then the only way there is. The
+/// server's own way stands when none is named, which is also how a way this app cannot name is
+/// left to it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TurnSource {
+    pub kind: InferenceKind,
+    /// `None` names the kind alone. Never set on the gateway's door, which has no way.
+    pub via: Option<Via>,
+}
+
+impl TurnSource {
+    /// The server's paid keys.
+    pub const GATEWAY: Self = Self {
+        kind: InferenceKind::Gateway,
+        via: None,
+    };
+
+    /// The person's own plan, reached `via`, or the account's own way when it is `None`.
+    pub fn plan(via: Option<Via>) -> Self {
+        Self {
+            kind: InferenceKind::LocalProxy,
+            via,
+        }
+    }
+
+    /// As a turn and a queued send's row carry it: the kind's bare word with no way named, and
+    /// `{"kind", "via"}` with one.
+    pub fn to_value(self) -> Value {
+        match self.via.filter(|_| self.kind == InferenceKind::LocalProxy) {
+            None => Value::String(self.kind.word().to_string()),
+            Some(via) => json!({ "kind": self.kind.word(), "via": via.word() }),
+        }
+    }
+
+    /// Either shape, as a row brings it back. A kind this app has not heard of, or a way it
+    /// cannot name, is `None`: the turn that fires such a row names nothing either, and the server
+    /// goes by the row's own word, rather than a door being guessed for it.
+    pub fn from_value(value: &Value) -> Option<Self> {
+        match value {
+            Value::String(word) => InferenceKind::from_word(word).map(Self::from),
+            Value::Object(door) => {
+                let kind = InferenceKind::from_word(door.get("kind")?.as_str()?)?;
+                if kind == InferenceKind::Gateway {
+                    return Some(Self::GATEWAY);
+                }
+                let via = match door.get("via") {
+                    None | Some(Value::Null) => None,
+                    Some(word) => Some(Via::from_word(word.as_str()?)?),
+                };
+                Some(Self::plan(via))
+            }
+            _ => None,
+        }
+    }
+}
+
+impl From<InferenceKind> for TurnSource {
+    fn from(kind: InferenceKind) -> Self {
+        Self { kind, via: None }
+    }
+}
+
+impl Serialize for TurnSource {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.to_value().serialize(serializer)
     }
 }
 
 /// The account's reply source, as `GET /account/inference-source` answers and as `PUT` answers
 /// with once it has kept a change: `{"kind", "baseUrl", "localModel", "healthy", "hasApiKey"}`,
-/// with `baseUrl` and `localModel` `null` while none is set.
+/// with `baseUrl` and `localModel` `null` while none is set; and from a server with the Mac relay,
+/// `"via"` and `"relay"` beside them.
 ///
 /// `kind` and the two flags are always there, so a body without one is refused rather than read
 /// as `false`: "not running" and "no key" are things the person acts on, and a missing field is
@@ -106,73 +239,264 @@ pub struct InferenceSource {
     pub healthy: bool,
     /// The server holds a key for the proxy. The key itself never comes back.
     pub has_api_key: bool,
+    /// The account's own way to the person's plan, the word as sent: `loopback` until one is saved
+    /// (opengrok-server #292: `described` in `crates/opengrok-harness/src/local_proxy.rs`, server
+    /// main cad36fd (#303, after #298), pin 47a5d6b). Absent from a
+    /// server before the relay, which has no other. Kept as the word and read through
+    /// [`Self::default_via`], so a way this app cannot name never fails the read.
+    #[serde(default)]
+    pub via: Option<String>,
+    /// Where the Mac relay stands, from a server that has one, which sends it on every read, nulls
+    /// and all when no Mac holds it (the same PR); absent from a server before it, which is how
+    /// this app knows not to offer it.
+    #[serde(default)]
+    pub relay: Option<RelayRead>,
+    /// Default for new Bots, from a server that keeps one, which sends the key on every read,
+    /// `null` until the person sets one (opengrok-server #322, on main c0bb6ae: `described` in
+    /// `crates/opengrok-harness/src/local_proxy.rs`). `None` is the key left out, a server before
+    /// it, which keeps no such default; `Some(None)` is `null`, none set.
+    #[serde(default, deserialize_with = "keyed")]
+    pub new_bot_default: Option<Option<NewBotDefault>>,
+    /// Whether the relay is on for the account, from a server that keeps it, which sends it on
+    /// every read (opengrok-server #332 (PR #338 at 66b9f7b): `described` in
+    /// `crates/opengrok-harness/src/local_proxy.rs`). Since each computer has its own switch
+    /// (opengrok-server #342 (main 2136ffc)) it is DERIVED: true while any
+    /// un-revoked computer's own switch is on, false with none, none enrolled included. It is the
+    /// Mac's way's alone: the server's own machine never reads it. `None` is the key left out, a
+    /// server before it. Read, and never sent: a `PUT` of it switches every one of the person's
+    /// computers, which is only for an app from before each had its own switch.
+    #[serde(default)]
+    pub relay_enabled: Option<bool>,
+    /// The Relay-off fallback, from a server that keeps one, which sends the key on every read,
+    /// `null` until the person sets one (opengrok-server #332 (PR #338 at 66b9f7b): `described`
+    /// in `crates/opengrok-harness/src/local_proxy.rs`). `None` is the key left out, a server
+    /// before it, which keeps no such fallback; `Some(None)` is `null`, none set.
+    #[serde(default, deserialize_with = "keyed")]
+    pub plan_fallback: Option<Option<PlanFallback>>,
 }
 
-/// A `PUT /account/inference-source` body: `{"kind", "baseUrl"?, "localModel"?, "apiKey"?}`.
+/// A key that is there, `null` or not: `Some(None)` for `null` and `Some(Some(_))` for a value,
+/// so the field's default, `None`, is the key left out.
+pub(super) fn keyed<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer).map(Some)
+}
+
+/// A person's default for new Bots, as opengrok-server #322 (on main c0bb6ae) writes it:
+/// `NewBotDefault` in `crates/opengrok-core/src/inference.rs`,
+/// `{"source", "model", "effort"}`. A Bot hired with no model of its own, and none from its
+/// template, is born on it whole, its door, the model it is pinned to and how hard it thinks
+/// written onto the Bot at its hire, so a changed default moves only the Bots hired after it
+/// (`hire_model` in `crates/opengrok-server/src/inference.rs`). Fast is the model's `--fast` id,
+/// not a field.
 ///
-/// `kind` is always there. Each other field is there only when the page changes it, and the
-/// server reads a field three ways (`apply` in `crates/opengrok-harness/src/local_proxy.rs`):
-/// absent keeps what it has, `null` (or `""`) clears it, and a value replaces it. So each is
-/// `None` to leave out, `Some(None)` for `null`, and `Some(Some(_))` for a value; `apiKey: null`
-/// is Remove key.
+/// The server holds a `PUT` of it to what its parts are held to elsewhere, and refuses the whole
+/// body with a 400 and `{"error"}` in their words (`NewBotDefault::named`): a `source` that is not
+/// one of its two words (`newBotDefault.source must be "gateway" or "local_proxy"`), an effort
+/// that is not a Bot's (`newBotDefault.effort must be one of inherit, none, low, medium, high,
+/// xhigh, max, ultra`), and a model refused as a hire's is on the gateway
+/// (`newBotDefault.model: a coworker needs a model to think with`) or as a plan's is on the
+/// person's plan (`newBotDefault.model: ` and the allowlist's sentence). So is an effort the
+/// chosen model does not list, in words that name the levels it does: `newBotDefault.effort:
+/// gpt-6-luna takes low, medium, high, xhigh or max, not "none"`, and for `ultra`, taken only
+/// where a listing names it, `newBotDefault.effort: no listing of xai/grok-4.6 names "ultra", and
+/// it is taken only where one does` (opengrok-server #342 (main 2136ffc): `effort_refused` in
+/// `crates/opengrok-server/src/inference.rs`, which `save` asks of the default on its own
+/// source); `inherit` is always taken.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NewBotDefault {
+    /// The door a new Bot is born on: `gateway` or `local_proxy`.
+    pub source: InferenceKind,
+    /// The id it is pinned to.
+    pub model: String,
+    /// A Bot's effort word: a level of the model's, or `inherit`; left out or `null`, `inherit`.
+    #[serde(default = "effort_inherit", deserialize_with = "effort_word")]
+    pub effort: String,
+}
+
+/// What a Bot on the person's plan answers with while the relay is off, the account's Relay-off
+/// fallback: `planFallback: {model, effort} | null` on `GET` and `PUT
+/// /account/inference-source` (opengrok-server #332 (PR #338 at 66b9f7b): `PlanFallback` in
+/// `crates/opengrok-core/src/inference.rs`). Its model is on the server's paid keys, held to what
+/// a Bot's gateway pin is held to, and its effort is one of a Bot's words. Fast is the model's
+/// `--fast` id, as everywhere, not a field.
 ///
-/// The server keeps it or refuses the whole of it with a 400 and `{"error": sentence}`, and asks
-/// every field that is there whatever the kind: a `baseUrl` that is not literal loopback (it
-/// follows no redirects), or a `localModel` from a provider it will not route a subscription to.
-/// It routes only OpenAI/Codex and xAI/Grok models that way, and fails closed on anything else.
+/// The server refuses a `PUT` of it with a 400 and `{"error"}` in its words, and keeps none of
+/// the body (`PlanFallback::named`): `planFallback must be an object or null`, a blank model
+/// (`planFallback.model: a coworker needs a model to think with`), and an effort that is not a
+/// Bot's (`planFallback.effort must be one of inherit, none, low, medium, high, xhigh, max,
+/// ultra`). So is an effort the model does not list on the gateway, which answers the fallback,
+/// in words that name the levels it does: `planFallback.effort: openai/gpt-6-luna takes low,
+/// medium or high, not "max"` (opengrok-server #342 (main 2136ffc): `effort_refused` in
+/// `crates/opengrok-server/src/inference.rs`, which `save` asks of the fallback on the gateway's
+/// levels, as `InferenceSource::named_efforts` in `crates/opengrok-core/src/inference.rs` says).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanFallback {
+    /// The gateway id a Bot on the plan answers on while the relay is off.
+    pub model: String,
+    /// A Bot's effort word: a level of the model's, or `inherit`; left out or `null`, `inherit`.
+    #[serde(default = "effort_inherit", deserialize_with = "effort_word")]
+    pub effort: String,
+}
+
+fn effort_inherit() -> String {
+    super::EFFORT_INHERIT.to_string()
+}
+
+/// An effort as a default for new Bots carries it: `null` is `inherit`, as the server reads it.
+fn effort_word<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<String>::deserialize(deserializer)?.unwrap_or_else(effort_inherit))
+}
+
+impl InferenceSource {
+    /// The server knows the Mac relay: it said where the relay stands, which a server from before
+    /// #292 never does. Only then is a way to the plan named to it, the Mac offered as one, and
+    /// this Mac's switch live.
+    pub fn knows_relay(&self) -> bool {
+        self.relay.is_some()
+    }
+
+    /// The account's own way to the person's plan: the word the server keeps, `loopback` from a
+    /// server that keeps none, and `None` for a word this app has not heard of.
+    pub fn default_via(&self) -> Option<Via> {
+        match self.via.as_deref() {
+            None => Some(Via::Loopback),
+            Some(word) => Via::from_word(word),
+        }
+    }
+
+    /// The account's own door as a turn names it: its kind, and for the plan its way, named only
+    /// to a server that knows the relay and only when this app can name it.
+    pub fn door(&self) -> TurnSource {
+        match self.kind {
+            InferenceKind::Gateway => TurnSource::GATEWAY,
+            InferenceKind::LocalProxy => {
+                TurnSource::plan(self.default_via().filter(|_| self.knows_relay()))
+            }
+        }
+    }
+
+    /// The model a turn through a Mac runs on, as the server keeps it.
+    pub fn relay_model(&self) -> Option<&str> {
+        self.relay.as_ref()?.local_model.as_deref()
+    }
+}
+
+/// Where the Mac relay stands, as the account's setting says it: `{"connected", "machineId",
+/// "machineLabel", "localModel"}` (opengrok-server #292: `described` in
+/// `crates/opengrok-harness/src/local_proxy.rs`, server main cad36fd (#303, after #298), pin
+/// 47a5d6b). The Mac answering is the account's enrolled machine that most
+/// recently opened the relay stream; `connected` is whether one holds it now. `connected` is
+/// always there, so a relay without it is refused rather than read as no Mac.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RelayRead {
+    pub connected: bool,
+    /// The Mac holding the stream, by its local-exec machine id.
+    #[serde(default)]
+    pub machine_id: Option<String>,
+    /// That Mac's name, as it enrolled.
+    #[serde(default)]
+    pub machine_label: Option<String>,
+    /// The model a turn through a Mac runs on.
+    #[serde(default)]
+    pub local_model: Option<String>,
+}
+
+/// A `PUT /account/inference-source` body, as this app sends one: `{"kind", "via"?,
+/// "newBotDefault"?, "planFallback"?}`. NEVER `relayEnabled`: it is each computer's own switch now
+/// and the account's is read from them, so a `PUT` of it would switch every one of the person's
+/// computers (opengrok-server #342 (main 2136ffc): `switch_every` in
+/// `crates/opengrok-server/src/inference.rs`). There is no field for it here, so no `PUT` can carry
+/// one.
 ///
-/// Not `Clone`: it can hold the key.
-#[derive(Debug, PartialEq, Eq, Serialize)]
+/// The server takes no `PUT` without a kind (`apply` in
+/// `crates/opengrok-harness/src/local_proxy.rs`, and since opengrok-server #332 (PR #338 at
+/// 66b9f7b) `InferenceSource::applied` in `crates/opengrok-core/src/inference.rs`), and this app
+/// switches no kind, so `kind` is the one the server keeps, sent back as it is. Every other field
+/// is there only when the app changes it, and the server reads a field three ways: absent keeps
+/// what it has, `null` clears it, and a value replaces it. A body it refuses in any part is a 400
+/// in its words, and none of it is kept.
+///
+/// There is no field here for the plan on the server's own machine (`baseUrl`, `apiKey`,
+/// `localModel`) nor for the relay's own model (`relay.localModel`): the app no longer sets up
+/// either, and a field it cannot write is a field no `PUT` of it carries. Absent, the server keeps
+/// them as they are, and the Bots that go that way keep going as it decides.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct InferenceSourceUpdate {
     pub kind: InferenceKind,
+    /// The account's way to the plan, sent only when the app changes it, and only to a server
+    /// that knows the relay (opengrok-server #292: `apply` in
+    /// `crates/opengrok-harness/src/local_proxy.rs`, server main cad36fd (#303, after #298), pin
+    /// 47a5d6b), which keeps it as the account's way whatever the kind.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub base_url: Option<Option<String>>,
+    pub via: Option<Via>,
+    /// Default for new Bots, sent whole when the app changes it, only to a server whose read
+    /// carries the key, and `null` to take it away (opengrok-server #322, on main c0bb6ae:
+    /// `apply` in `crates/opengrok-harness/src/local_proxy.rs`): absent keeps it, `null` clears
+    /// it, and a value replaces it whole.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub local_model: Option<Option<String>>,
-    /// Sent once, when the person typed one, and kept by the server: `hasApiKey` is all that
-    /// ever comes back. `Some(None)` asks the server to forget the one it has; absent leaves it.
+    pub new_bot_default: Option<Option<NewBotDefault>>,
+    /// The Relay-off fallback, sent whole when the app changes it, only to a server whose read
+    /// carries the key, and `null` to take it away (opengrok-server #332 (PR #338 at 66b9f7b):
+    /// `PlanFallback::named`): absent keeps it, `null` clears it, and a value replaces it whole.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub api_key: Option<Option<ProxyKey>>,
+    pub plan_fallback: Option<Option<PlanFallback>>,
 }
 
-/// A key for the proxy as the person typed it, on its way to the server. This app keeps it
-/// nowhere but the page it was typed on, until it is sent in one `PUT` or the page is left: it is
-/// never cloned (the type is not `Clone`), and its `Debug` is a mark, so no log or panic message
-/// ever carries it.
-#[derive(PartialEq, Eq, Serialize)]
-#[serde(transparent)]
-pub struct ProxyKey(String);
-
-impl ProxyKey {
-    /// A key, or `None` for a field left blank, which is not a key and must not replace one.
-    pub fn new(typed: &str) -> Option<Self> {
-        let typed = typed.trim();
-        (!typed.is_empty()).then(|| Self(typed.to_string()))
-    }
-
-    /// The key, for the one field that shows it, masked: a key a driver wrote is drawn there as
-    /// the dots a typed one is.
-    pub(crate) fn as_str(&self) -> &str {
-        &self.0
-    }
+/// Why a reply came through the server's paid keys and not the door its Bot asks for, as the
+/// run's `opengrok.inferenceSource` CUSTOM says in `fallbackFor` (opengrok-server #332 (PR #338
+/// at 66b9f7b): `converse_raw` in `crates/opengrok-harness/src/lib.rs`, which writes the frame
+/// `{kind: "gateway", model, fallbackFor}` with no way). The one reason this app knows is
+/// `relay_disabled`: a fresh turn by the person's Mac answered by the account's Relay-off
+/// fallback, because the relay is off. A word this app has not heard of is no reason it can name,
+/// and the badge says only whose keys paid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FallbackFor {
+    RelayDisabled,
 }
 
-impl std::fmt::Debug for ProxyKey {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("ProxyKey(«redacted»)")
+impl FallbackFor {
+    /// The reason a wire word names, or `None` for one this app has not heard of.
+    pub fn from_word(word: &str) -> Option<Self> {
+        (word == "relay_disabled").then_some(Self::RelayDisabled)
     }
 }
 
 /// Which door one reply came through, as the run's `opengrok.inferenceSource` CUSTOM says:
-/// `value {"kind", "model"}`. It is what the reply's badge shows, live and when the thread is
-/// read back, and what the reply's row keeps on disk.
+/// `value {"kind", "model"}`, and from a server with the Mac relay `{"kind", "via", "model"}`,
+/// and `fallbackFor` beside them on a reply the Relay-off fallback answered. It is what the
+/// reply's badge shows, live and when the thread is read back, and what the reply's row keeps on
+/// disk (the same JSON column, so a `via` or a `fallbackFor` needs no migration).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReplySource {
     pub kind: InferenceKind,
+    /// The way the person's plan was reached, when the frame named one this app knows: `mac` is
+    /// a reply the person's Mac answered (opengrok-server #292, server main cad36fd (#303, after
+    /// #298), pin 47a5d6b). Never set on the gateway's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub via: Option<Via>,
     /// The model that answered, when the server named one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Why the server's paid keys answered, when the frame named a reason this app knows
+    /// ([`FallbackFor`]). Only ever on the gateway's.
+    #[serde(
+        default,
+        rename = "fallbackFor",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub fallback_for: Option<FallbackFor>,
 }
 
 impl ReplySource {
@@ -187,16 +511,38 @@ impl ReplySource {
         Self::from_value(event.get("value")?)
     }
 
-    /// `{"kind", "model"}`, as the frame's `value` and a saved row both hold it.
+    /// `{"kind", "via"?, "model", "fallbackFor"?}`, as the frame's `value` and a saved row both
+    /// hold it. A way this app cannot name, or a reason, leaves the badge saying only whose it
+    /// was: each is read only where it is a word this app knows, on the door it can be on.
     pub fn from_value(value: &Value) -> Option<Self> {
         let kind = InferenceKind::from_word(value.get("kind")?.as_str()?)?;
+        let via = value
+            .get("via")
+            .and_then(Value::as_str)
+            .and_then(Via::from_word)
+            .filter(|_| kind == InferenceKind::LocalProxy);
         let model = value
             .get("model")
             .and_then(Value::as_str)
             .map(str::trim)
             .filter(|model| !model.is_empty())
             .map(str::to_string);
-        Some(Self { kind, model })
+        let fallback_for = value
+            .get("fallbackFor")
+            .and_then(Value::as_str)
+            .and_then(FallbackFor::from_word)
+            .filter(|_| kind == InferenceKind::Gateway);
+        Some(Self {
+            kind,
+            via,
+            model,
+            fallback_for,
+        })
+    }
+
+    /// The server's paid keys answered a Bot on the person's plan because the relay is off.
+    pub fn relay_off(&self) -> bool {
+        self.fallback_for == Some(FallbackFor::RelayDisabled)
     }
 
     /// As a reply's row keeps it in sqlite.
@@ -213,11 +559,73 @@ impl ReplySource {
     }
 }
 
+/// Why the person's plan could not answer a turn, as its `RUN_ERROR` says beside its sentence in
+/// `code`: the Mac relay's three (opengrok-server #292: `ModelError::Relay` in
+/// `crates/opengrok-harness/src/relay.rs`, server main cad36fd (#303, after #298), pin 47a5d6b),
+/// and `plan_unavailable` (opengrok-server main d6f640e (#307, after #304), pin bf99845:
+/// `ModelError::PlanUnavailable` in `crates/opengrok-harness/src/model.rs`). The sentence is what
+/// the person reads; the code is what offers the turn again on the server's keys, which could
+/// answer it. A refusal with no code is none of these, and its sentence stands alone: a Mac
+/// already carrying all the calls one Mac may at once, a reply source that could not be read, or
+/// a proxy key that could not be opened. So does `relay_disabled` (opengrok-server #332 (PR #338
+/// at 66b9f7b): `refused` in `crates/opengrok-server/src/pairs.rs`), a Bot's reply to another Bot
+/// skipped because the person switched the relay off and set no fallback: it ends a run in the
+/// two Bots' pair thread, which a person reads and cannot write in, so nothing offers it again.
+/// A chat turn refused because the relay is off is `plan_unavailable`, and is offered on Server.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RunErrorCode {
+    /// No Mac held the relay.
+    RelayOffline,
+    /// The Mac said nothing for the server's sixty seconds, before the first byte or between two.
+    RelayTimeout,
+    /// The Mac answered with a failure.
+    RelayFailed,
+    /// The person's own setting left their plan nothing to answer with: a teammate with no proxy
+    /// on a shared Bot on the plan, or a proxy turn with no address or no model stored.
+    PlanUnavailable,
+}
+
+impl RunErrorCode {
+    pub const ALL: [Self; 4] = [
+        Self::RelayOffline,
+        Self::RelayTimeout,
+        Self::RelayFailed,
+        Self::PlanUnavailable,
+    ];
+
+    /// The code word on the frame.
+    pub fn word(self) -> &'static str {
+        match self {
+            Self::RelayOffline => "relay_offline",
+            Self::RelayTimeout => "relay_timeout",
+            Self::RelayFailed => "relay_failed",
+            Self::PlanUnavailable => "plan_unavailable",
+        }
+    }
+
+    /// The code a run ended with, or `None` for any other code, or none.
+    pub fn from_code(code: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|known| known.word() == code)
+    }
+}
+
+/// `heldFor` on a queued send's row while the server holds it for the person's Mac: the turn it
+/// names goes through the Mac and no Mac holds the relay (opengrok-server #292: `HELD_FOR` in
+/// `crates/opengrok-server/src/agui/pending.rs`, server main cad36fd (#303, after #298), pin
+/// 47a5d6b). Absent otherwise, and never while the person switched the relay off (opengrok-server
+/// #332 (PR #338 at 66b9f7b): `InferenceSource::by_mac`), when the send goes to their Relay-off
+/// fallback at once or is refused `plan_unavailable`. The server sends such a send itself, oldest
+/// first, when a Mac opens the relay, so this app never fires one; nor does it hold one of its
+/// own accord: a row is waiting for the Mac only while the server says so.
+pub const HELD_FOR_RELAY_OFFLINE: &str = "relay_offline";
+
 /// Whether "My subscription" may be pointed at a model, by the server's own rule, so the picker
 /// never offers what a Save would be refused for, even should a list ever carry one (a list held
 /// from before, or a server that tags a row `local_proxy` without asking): `subscription_model`
-/// in opengrok-server's `crates/opengrok-core/src/inference.rs`, anchored since #296, at the
-/// vendored pin f56bbde.
+/// in opengrok-server's `crates/opengrok-core/src/inference.rs`, anchored since #296 and unchanged
+/// in the vendored recording (#332, PR #338 at 66b9f7b), where a Bot's own plan
+/// model is held to it too, as it has been since #304, and so is a default for new Bots on the
+/// plan, since #322. A Relay-off fallback is not: it is the server's paid keys' (`PlanFallback`).
 ///
 /// An allowlist, not a denylist: an id it does not recognise is refused, so a provider nobody
 /// has looked at is not offered by being new. With an `openai/` or `xai/` prefix and the `--fast`
@@ -276,8 +684,6 @@ mod tests {
         assert_eq!(InferenceKind::LocalProxy.word(), "local_proxy");
         assert_eq!(InferenceKind::from_word("local-proxy"), None);
         assert_eq!(InferenceKind::from_word(""), None);
-        assert_eq!(InferenceKind::Gateway.other(), InferenceKind::LocalProxy);
-        assert_eq!(InferenceKind::LocalProxy.other(), InferenceKind::Gateway);
     }
 
     /// The account's setting reads as the contract writes it, the two nullable fields either
@@ -300,6 +706,11 @@ mod tests {
                 local_model: Some("gpt-5-codex".into()),
                 healthy: true,
                 has_api_key: false,
+                via: None,
+                relay: None,
+                new_bot_default: None,
+                relay_enabled: None,
+                plan_fallback: None,
             }
         );
         let unset: InferenceSource = serde_json::from_value(json!({
@@ -321,59 +732,42 @@ mod tests {
         }
     }
 
-    /// A `PUT` body names the door and only what the page changed: a value to keep, `null` to
-    /// clear, and nothing for a field left alone, which the server keeps. The key rides along
-    /// only when one was typed, and `null` is Remove key. No `Debug` of the body, or of the key,
-    /// ever prints the key.
+    /// A `PUT` body names the kind the server keeps and only what the app changed, and never
+    /// carries the plan on the server's own machine or a model of the relay's: the app no longer
+    /// sets up either, so the server keeps whatever it has of them.
     #[test]
-    fn a_put_body_carries_what_changed_and_null_clears() {
-        let full = InferenceSourceUpdate {
-            kind: InferenceKind::LocalProxy,
-            base_url: Some(Some("http://127.0.0.1:8080".into())),
-            local_model: Some(Some("gpt-5-codex".into())),
-            api_key: Some(ProxyKey::new("  sk-proxy-1  ")),
-        };
-        assert_eq!(
-            serde_json::to_value(&full).unwrap(),
-            json!({
-                "kind": "local_proxy",
-                "baseUrl": "http://127.0.0.1:8080",
-                "localModel": "gpt-5-codex",
-                "apiKey": "sk-proxy-1"
-            })
-        );
-        let printed = format!("{full:?}");
-        assert!(!printed.contains("sk-proxy-1"), "{printed}");
-        assert!(printed.contains("redacted"), "{printed}");
-        let bare = InferenceSourceUpdate {
+    fn a_put_body_carries_no_loopback_field_and_no_relay_model() {
+        for kind in InferenceKind::ALL {
+            let bare = InferenceSourceUpdate {
+                kind,
+                via: None,
+                new_bot_default: None,
+                plan_fallback: None,
+            };
+            assert_eq!(
+                serde_json::to_value(&bare).unwrap(),
+                json!({"kind": kind.word()}),
+                "a field left alone is left out"
+            );
+        }
+        let moved = InferenceSourceUpdate {
             kind: InferenceKind::Gateway,
-            base_url: None,
-            local_model: None,
-            api_key: None,
+            via: Some(Via::Mac),
+            new_bot_default: None,
+            plan_fallback: None,
         };
-        assert_eq!(
-            serde_json::to_value(&bare).unwrap(),
-            json!({"kind": "gateway"}),
-            "a field left alone is left out"
-        );
-        let cleared = InferenceSourceUpdate {
-            kind: InferenceKind::Gateway,
-            base_url: Some(None),
-            local_model: Some(None),
-            api_key: Some(None),
-        };
-        assert_eq!(
-            serde_json::to_value(&cleared).unwrap(),
-            json!({"kind": "gateway", "baseUrl": null, "localModel": null, "apiKey": null})
-        );
-        assert_eq!(ProxyKey::new("   "), None, "a blank field is no key");
+        let body = serde_json::to_value(&moved).unwrap();
+        assert_eq!(body, json!({"kind": "gateway", "via": "mac"}));
+        for field in ["baseUrl", "apiKey", "localModel", "relay"] {
+            assert!(body.get(field).is_none(), "{field} in {body}");
+        }
     }
 
-    /// The app's own server is on this Mac when its address is loopback as the server reads one:
-    /// any of 127.0.0.0/8, `[::1]`, or `localhost`, with or without a port. A name that only
-    /// starts with `localhost`, a LAN address or `0.0.0.0` is somewhere else.
+    /// An address is this computer when it is loopback as the server reads one: any of
+    /// 127.0.0.0/8, `[::1]`, or `localhost`, with or without a port. A name that only starts with
+    /// `localhost`, a LAN address or `0.0.0.0` is somewhere else.
     #[test]
-    fn this_mac_is_the_servers_machine_only_at_a_loopback_address() {
+    fn an_address_is_this_computer_only_at_a_loopback_address() {
         for here in [
             "http://127.0.0.1:1447",
             "http://127.5.6.7",
@@ -409,6 +803,8 @@ mod tests {
             Some(ReplySource {
                 kind: InferenceKind::LocalProxy,
                 model: Some("gpt-5-codex".into()),
+                via: None,
+                fallback_for: None,
             })
         );
         assert_eq!(
@@ -416,6 +812,8 @@ mod tests {
             Some(ReplySource {
                 kind: InferenceKind::Gateway,
                 model: None,
+                via: None,
+                fallback_for: None,
             })
         );
         assert_eq!(
@@ -423,6 +821,8 @@ mod tests {
             Some(ReplySource {
                 kind: InferenceKind::Gateway,
                 model: None,
+                via: None,
+                fallback_for: None,
             })
         );
         assert_eq!(
@@ -447,16 +847,485 @@ mod tests {
         let source = ReplySource {
             kind: InferenceKind::LocalProxy,
             model: Some("grok-4".into()),
+            via: None,
+            fallback_for: None,
         };
         assert_eq!(ReplySource::from_json(&source.to_json()), Some(source));
         let bare = ReplySource {
             kind: InferenceKind::Gateway,
             model: None,
+            via: None,
+            fallback_for: None,
         };
         assert_eq!(bare.to_json(), r#"{"kind":"gateway"}"#);
         assert_eq!(ReplySource::from_json(&bare.to_json()), Some(bare));
         assert_eq!(ReplySource::from_json("not json"), None);
         assert_eq!(ReplySource::from_json(r#"{"kind":"elsewhere"}"#), None);
+        // A reply the person's Mac answered keeps its way on disk, and reads back with it.
+        let mac = ReplySource {
+            kind: InferenceKind::LocalProxy,
+            via: Some(Via::Mac),
+            model: Some("gpt-5-codex".into()),
+            fallback_for: None,
+        };
+        assert_eq!(
+            mac.to_json(),
+            r#"{"kind":"local_proxy","via":"mac","model":"gpt-5-codex"}"#
+        );
+        assert_eq!(ReplySource::from_json(&mac.to_json()), Some(mac));
+    }
+
+    /// The ways are the contract's words, both ways; `helper`, which the server refuses until its
+    /// #293, and any other word are no way this app names.
+    #[test]
+    fn a_way_to_the_plan_is_the_servers_word() {
+        for via in Via::ALL {
+            assert_eq!(Via::from_word(via.word()), Some(via));
+            assert_eq!(serde_json::to_value(via).unwrap(), json!(via.word()));
+        }
+        assert_eq!((Via::Loopback.word(), Via::Mac.word()), ("loopback", "mac"));
+        for unknown in ["helper", "Mac", "", "relay", "Computer"] {
+            assert_eq!(Via::from_word(unknown), None, "{unknown:?}");
+        }
+    }
+
+    /// The default for new Bots reads as opengrok-server #322 (on main c0bb6ae) writes it on the
+    /// account's setting: left out by a server that keeps none, `null`
+    /// while none is set, and whole once set, an effort left out or `null` read as `inherit`. A
+    /// `PUT` names it only when the app changes it: whole, or `null` to take it away, with the
+    /// kind the server keeps and nothing else.
+    #[test]
+    fn the_default_for_new_bots_reads_and_puts_as_the_server_writes_it() {
+        let read = |default: Option<Value>| -> InferenceSource {
+            let mut body = json!({
+                "kind": "gateway", "via": "loopback", "baseUrl": null, "localModel": null,
+                "healthy": false, "hasApiKey": false,
+                "relay": {"connected": false, "machineId": null, "machineLabel": null,
+                          "localModel": null}
+            });
+            if let Some(default) = default {
+                body["newBotDefault"] = default;
+            }
+            serde_json::from_value(body).expect("a setting")
+        };
+        assert_eq!(read(None).new_bot_default, None, "a server that keeps none");
+        assert_eq!(read(Some(Value::Null)).new_bot_default, Some(None));
+        // As the branch's own recording of a pick words it
+        // (`PUT__account_inference-source/200-a_person_names_the_model_new_bots_are_born_on`).
+        let luna = NewBotDefault {
+            source: InferenceKind::LocalProxy,
+            model: "gpt-6-sol--fast".into(),
+            effort: "high".into(),
+        };
+        assert_eq!(
+            read(Some(
+                json!({"source": "local_proxy", "model": "gpt-6-sol--fast", "effort": "high"})
+            ))
+            .new_bot_default,
+            Some(Some(luna.clone()))
+        );
+        for left in [
+            json!({"source": "gateway", "model": "xai/grok-4.7"}),
+            json!({"source": "gateway", "model": "xai/grok-4.7", "effort": null}),
+        ] {
+            assert_eq!(
+                read(Some(left.clone()))
+                    .new_bot_default
+                    .flatten()
+                    .map(|default| default.effort),
+                Some("inherit".to_string()),
+                "{left}"
+            );
+        }
+
+        let put = |new_bot_default| {
+            serde_json::to_value(InferenceSourceUpdate {
+                kind: InferenceKind::Gateway,
+                via: None,
+                plan_fallback: None,
+                new_bot_default,
+            })
+            .unwrap()
+        };
+        assert_eq!(put(None), json!({"kind": "gateway"}), "left alone, kept");
+        assert_eq!(
+            put(Some(None)),
+            json!({"kind": "gateway", "newBotDefault": null}),
+            "taken away"
+        );
+        assert_eq!(
+            put(Some(Some(luna))),
+            json!({
+                "kind": "gateway",
+                "newBotDefault": {"source": "local_proxy", "model": "gpt-6-sol--fast", "effort": "high"}
+            }),
+            "whole"
+        );
+    }
+
+    /// Whether the relay is on for the account reads as the server writes it (opengrok-server #332
+    /// (PR #338 at 66b9f7b)), a bool on every read of a server that keeps it, and as no key from one
+    /// before it; since each computer has its own switch (opengrok-server #342 (main 2136ffc)) it
+    /// is derived from them. It is only ever read: no `PUT` body this app can build
+    /// carries it, with the way as a computer's switch goes on or alone, or with any other field,
+    /// and the body names `relayEnabled` nowhere.
+    #[test]
+    fn whether_the_relay_is_on_is_read_and_never_put() {
+        let read = |relay_enabled: Option<Value>| {
+            let mut body = json!({
+                "kind": "local_proxy", "via": "loopback", "baseUrl": null, "localModel": null,
+                "healthy": false, "hasApiKey": false,
+                "relay": {"connected": false, "machineId": null, "machineLabel": null,
+                          "localModel": null}
+            });
+            if let Some(enabled) = relay_enabled {
+                body["relayEnabled"] = enabled;
+            }
+            serde_json::from_value::<InferenceSource>(body).unwrap()
+        };
+        assert_eq!(read(None).relay_enabled, None, "a server before it");
+        assert_eq!(read(Some(json!(true))).relay_enabled, Some(true));
+        assert_eq!(read(Some(json!(false))).relay_enabled, Some(false));
+
+        let fallback = Some(Some(PlanFallback {
+            model: "oag/cheap".into(),
+            effort: "low".into(),
+        }));
+        let default = Some(Some(NewBotDefault {
+            source: InferenceKind::LocalProxy,
+            model: "gpt-6-luna".into(),
+            effort: "high".into(),
+        }));
+        for (via, new_bot_default, plan_fallback) in [
+            (None, None, None),
+            (Some(Via::Mac), None, None),
+            (Some(Via::Loopback), default.clone(), fallback.clone()),
+            (Some(Via::Mac), Some(None), Some(None)),
+        ] {
+            let body = serde_json::to_string(&InferenceSourceUpdate {
+                kind: InferenceKind::LocalProxy,
+                via,
+                new_bot_default,
+                plan_fallback,
+            })
+            .unwrap();
+            assert!(!body.contains("relayEnabled"), "{body}");
+        }
+        assert_eq!(
+            serde_json::to_value(InferenceSourceUpdate {
+                kind: InferenceKind::LocalProxy,
+                via: Some(Via::Mac),
+                new_bot_default: None,
+                plan_fallback: None,
+            })
+            .unwrap(),
+            json!({"kind": "local_proxy", "via": "mac"}),
+            "the way a computer's switch going on points the account at, and nothing beside it"
+        );
+    }
+
+    /// The Relay-off fallback reads as the server writes it (opengrok-server #332 (PR #338 at
+    /// 66b9f7b)): left out by a server that keeps none, `null` while none is set, and whole once
+    /// set, an effort left out or `null` read as `inherit`. A `PUT` names it only when the app
+    /// changes it: whole, or `null` to take it away.
+    #[test]
+    fn the_relay_off_fallback_reads_and_puts_as_the_contract_writes_it() {
+        let read = |fallback: Option<Value>| {
+            let mut body = json!({
+                "kind": "local_proxy", "baseUrl": null, "localModel": null,
+                "healthy": false, "hasApiKey": false
+            });
+            if let Some(fallback) = fallback {
+                body["planFallback"] = fallback;
+            }
+            serde_json::from_value::<InferenceSource>(body).unwrap()
+        };
+        let cheap = PlanFallback {
+            model: "oag/cheap".into(),
+            effort: "low".into(),
+        };
+        assert_eq!(read(None).plan_fallback, None, "a server before it");
+        assert_eq!(read(Some(Value::Null)).plan_fallback, Some(None));
+        assert_eq!(
+            read(Some(json!({"model": "oag/cheap", "effort": "low"}))).plan_fallback,
+            Some(Some(cheap.clone()))
+        );
+        for left in [
+            json!({"model": "oag/cheap"}),
+            json!({"model": "oag/cheap", "effort": null}),
+        ] {
+            assert_eq!(
+                read(Some(left.clone()))
+                    .plan_fallback
+                    .flatten()
+                    .map(|fallback| fallback.effort),
+                Some("inherit".to_string()),
+                "{left}"
+            );
+        }
+
+        let put = |plan_fallback| {
+            serde_json::to_value(InferenceSourceUpdate {
+                kind: InferenceKind::LocalProxy,
+                via: None,
+                new_bot_default: None,
+                plan_fallback,
+            })
+            .unwrap()
+        };
+        assert_eq!(
+            put(None),
+            json!({"kind": "local_proxy"}),
+            "left alone, kept"
+        );
+        assert_eq!(
+            put(Some(None)),
+            json!({"kind": "local_proxy", "planFallback": null}),
+            "taken away"
+        );
+        assert_eq!(
+            put(Some(Some(cheap))),
+            json!({"kind": "local_proxy", "planFallback": {"model": "oag/cheap", "effort": "low"}}),
+            "whole"
+        );
+    }
+
+    /// `computer`, the name the server is being asked to take for `mac`, reads as the relay
+    /// wherever a way is read: the account's own, a queued send's door, the CUSTOM frame, a model
+    /// the relay lists, and a row written down. The app still sends `mac`, which every server with
+    /// the relay reads.
+    #[test]
+    fn computer_reads_as_the_relay_and_mac_is_still_what_is_sent() {
+        assert_eq!(Via::from_word("computer"), Some(Via::Mac));
+        assert_eq!(
+            serde_json::from_value::<Via>(json!("computer")).unwrap(),
+            Via::Mac
+        );
+        assert_eq!(serde_json::to_value(Via::Mac).unwrap(), json!("mac"));
+        let account: InferenceSource = serde_json::from_value(json!({
+            "kind": "local_proxy", "healthy": false, "hasApiKey": false, "via": "computer",
+            "relay": {"connected": true, "machineId": "mac_1"}
+        }))
+        .unwrap();
+        assert_eq!(account.default_via(), Some(Via::Mac));
+        assert_eq!(
+            account.door().to_value(),
+            json!({"kind": "local_proxy", "via": "mac"}),
+            "named on a turn by the word every server reads"
+        );
+        assert_eq!(
+            TurnSource::from_value(&json!({"kind": "local_proxy", "via": "computer"})),
+            Some(TurnSource::plan(Some(Via::Mac)))
+        );
+        let frame = json!({
+            "type": "CUSTOM", "name": INFERENCE_SOURCE_CUSTOM,
+            "value": {"kind": "local_proxy", "via": "computer", "model": "gpt-6-luna"}
+        });
+        assert_eq!(
+            ReplySource::from_event(&frame).and_then(|source| source.via),
+            Some(Via::Mac)
+        );
+        let listed = crate::opengrok::ModelEntry {
+            id: "gpt-6-luna".into(),
+            source: Some("local_proxy".into()),
+            via: Some("computer".into()),
+            ..Default::default()
+        };
+        assert_eq!(listed.plan_via(), Some(Via::Mac));
+    }
+
+    /// A turn names its door as every turn did before the relay, the bare word, when it names no
+    /// way, and as `{"kind", "via"}` when it does; the gateway's door never carries one. A row
+    /// brings either shape back, and a kind or a way this app cannot name is no door at all, so
+    /// the server goes by the row's own word.
+    #[test]
+    fn a_turns_door_is_the_bare_word_or_the_kind_and_its_way() {
+        assert_eq!(TurnSource::GATEWAY.to_value(), json!("gateway"));
+        assert_eq!(TurnSource::plan(None).to_value(), json!("local_proxy"));
+        assert_eq!(
+            TurnSource::plan(Some(Via::Mac)).to_value(),
+            json!({"kind": "local_proxy", "via": "mac"})
+        );
+        assert_eq!(
+            TurnSource::plan(Some(Via::Loopback)).to_value(),
+            json!({"kind": "local_proxy", "via": "loopback"})
+        );
+        let odd = TurnSource {
+            kind: InferenceKind::Gateway,
+            via: Some(Via::Mac),
+        };
+        assert_eq!(odd.to_value(), json!("gateway"), "the gateway has no way");
+        assert_eq!(
+            serde_json::to_value(TurnSource::plan(Some(Via::Mac))).unwrap(),
+            json!({"kind": "local_proxy", "via": "mac"}),
+            "serialized as it is sent"
+        );
+        for (value, read) in [
+            (json!("gateway"), Some(TurnSource::GATEWAY)),
+            (json!("local_proxy"), Some(TurnSource::plan(None))),
+            (
+                json!({"kind": "local_proxy", "via": "mac"}),
+                Some(TurnSource::plan(Some(Via::Mac))),
+            ),
+            (
+                json!({"kind": "local_proxy", "via": "loopback"}),
+                Some(TurnSource::plan(Some(Via::Loopback))),
+            ),
+            (json!({"kind": "local_proxy"}), Some(TurnSource::plan(None))),
+            (
+                json!({"kind": "local_proxy", "via": null}),
+                Some(TurnSource::plan(None)),
+            ),
+            (
+                json!({"kind": "gateway", "via": "mac"}),
+                Some(TurnSource::GATEWAY),
+            ),
+            (json!({"kind": "local_proxy", "via": "helper"}), None),
+            (json!({"kind": "local_proxy", "via": 3}), None),
+            (json!({"kind": "byok"}), None),
+            (json!({"via": "mac"}), None),
+            (json!("byok"), None),
+            (json!(7), None),
+            (Value::Null, None),
+        ] {
+            assert_eq!(TurnSource::from_value(&value), read, "{value}");
+        }
+        assert_eq!(
+            TurnSource::from(InferenceKind::LocalProxy),
+            TurnSource::plan(None)
+        );
+    }
+
+    /// A server with the Mac relay says the account's way and where the relay stands, and the
+    /// account's door is named with its way; one before the relay says neither, reads as the
+    /// plan on the server's own machine, and is named the old way. A way this app cannot name
+    /// leaves the door to the server. A relay without `connected` is refused rather than read
+    /// as no Mac.
+    #[test]
+    fn the_accounts_setting_says_its_way_and_where_the_relay_stands() {
+        let read: InferenceSource = serde_json::from_value(json!({
+            "kind": "local_proxy", "baseUrl": null, "localModel": null,
+            "healthy": false, "hasApiKey": false,
+            "via": "mac",
+            "relay": {
+                "connected": true, "machineId": "mac_2",
+                "machineLabel": "NativeChat on studio", "localModel": "gpt-5-codex"
+            }
+        }))
+        .unwrap();
+        assert!(read.knows_relay());
+        assert_eq!(read.default_via(), Some(Via::Mac));
+        assert_eq!(read.door(), TurnSource::plan(Some(Via::Mac)));
+        assert_eq!(read.relay_model(), Some("gpt-5-codex"));
+        assert_eq!(
+            read.relay,
+            Some(RelayRead {
+                connected: true,
+                machine_id: Some("mac_2".into()),
+                machine_label: Some("NativeChat on studio".into()),
+                local_model: Some("gpt-5-codex".into()),
+            })
+        );
+        let nobody: InferenceSource = serde_json::from_value(json!({
+            "kind": "gateway", "healthy": false, "hasApiKey": false, "via": "loopback",
+            "relay": {"connected": false, "machineId": null, "machineLabel": null, "localModel": null}
+        }))
+        .unwrap();
+        assert_eq!(nobody.door(), TurnSource::GATEWAY);
+        assert_eq!(nobody.relay_model(), None);
+        assert!(!nobody.relay.unwrap().connected);
+
+        let before: InferenceSource = serde_json::from_value(json!({
+            "kind": "local_proxy", "baseUrl": "http://127.0.0.1:8080",
+            "localModel": "gpt-5-codex", "healthy": true, "hasApiKey": false
+        }))
+        .unwrap();
+        assert!(!before.knows_relay());
+        assert_eq!(before.default_via(), Some(Via::Loopback));
+        assert_eq!(
+            before.door(),
+            TurnSource::plan(None),
+            "named the old way, the only one such a server reads"
+        );
+
+        let helper: InferenceSource = serde_json::from_value(json!({
+            "kind": "local_proxy", "healthy": true, "hasApiKey": false, "via": "helper",
+            "relay": {"connected": false}
+        }))
+        .unwrap();
+        assert_eq!(helper.default_via(), None);
+        assert_eq!(
+            helper.door(),
+            TurnSource::plan(None),
+            "the server's own way"
+        );
+
+        let broken = json!({
+            "kind": "gateway", "healthy": false, "hasApiKey": false,
+            "relay": {"machineId": "mac_2"}
+        });
+        assert!(serde_json::from_value::<InferenceSource>(broken).is_err());
+    }
+
+    /// The CUSTOM frame's way goes on the badge when it names one this app knows, and only on the
+    /// plan's: a reply the gateway answered was reached no way, whatever a frame says.
+    #[test]
+    fn the_custom_frame_says_which_way_the_plan_answered() {
+        let frame = |value: Value| json!({"type": "CUSTOM", "name": INFERENCE_SOURCE_CUSTOM, "value": value});
+        assert_eq!(
+            ReplySource::from_event(&frame(
+                json!({"kind": "local_proxy", "via": "mac", "model": "gpt-5-codex"})
+            )),
+            Some(ReplySource {
+                kind: InferenceKind::LocalProxy,
+                via: Some(Via::Mac),
+                model: Some("gpt-5-codex".into()),
+                fallback_for: None,
+            })
+        );
+        for (value, via) in [
+            (
+                json!({"kind": "local_proxy", "via": "loopback"}),
+                Some(Via::Loopback),
+            ),
+            (json!({"kind": "local_proxy", "via": "helper"}), None),
+            (json!({"kind": "local_proxy"}), None),
+            (json!({"kind": "gateway", "via": "mac"}), None),
+        ] {
+            let read = ReplySource::from_event(&frame(value.clone())).expect("a badge");
+            assert_eq!(read.via, via, "{value}");
+        }
+    }
+
+    /// The relay's codes and `plan_unavailable` are the contracts' words; any other code, a
+    /// gateway's say, is not one, and nor is `relay_disabled`, a Bot's reply skipped in a pair
+    /// thread while the relay is off (opengrok-server #332 (PR #338 at 66b9f7b)), which nothing
+    /// sends again.
+    #[test]
+    fn a_plan_that_could_not_answer_is_read_off_its_code() {
+        for code in RunErrorCode::ALL {
+            assert_eq!(RunErrorCode::from_code(code.word()), Some(code));
+        }
+        assert_eq!(
+            RunErrorCode::ALL.map(RunErrorCode::word),
+            [
+                "relay_offline",
+                "relay_timeout",
+                "relay_failed",
+                "plan_unavailable"
+            ]
+        );
+        for other in [
+            "already-consumed",
+            "relay",
+            "",
+            "RELAY_OFFLINE",
+            "PLAN_UNAVAILABLE",
+            "plan-unavailable",
+            "relay_disabled",
+        ] {
+            assert_eq!(RunErrorCode::from_code(other), None, "{other:?}");
+        }
     }
 
     /// Only OpenAI's and xAI's models are offered for the person's subscription, as the server's

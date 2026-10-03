@@ -6,17 +6,34 @@
 //!
 //! Stable ids: `app-window`, `sidebar`, `sidebar-chat-list`, `nav-new-chat`,
 //! `nav-toggle-sidebar`, `session-{id}`, `footer-theme`, `footer-account`,
+//! `header-left-sidebar` (restore the hidden sidebar; absent while it is visible),
+//! `nav-toggle-sidebar` (hide the visible sidebar). Native right-click changes Mini/Expanded
+//! without opening a menu; the `sidebar.mini` action remains available to keyboard automation.
+//! `header-right-sidebar` (chat's window-level pane toggle),
+//! `header-monitor` (computer pane toggle while a bot is open),
+//! `header-coworker` (the chip at the top of the chat, while a bot is open: label = its name; a
+//! click opens the bot's settings, or, with state `goes-home` in one of its routines' threads,
+//! goes back to the bot's own chat),
 //! `composer`, `composer-panel`, `composer-panel-search`, `composer-recipe-bar`,
 //! `composer-skill` (the skill the next message is sent with, value = the id the turn names;
 //! in the tree only while one is on the draft),
+//! `transcript` (the chat's transcript, a scroll node: value `following` while it keeps the
+//! newest row in view, `detached` once the person has scrolled back up. Any step toward older
+//! messages detaches it, however small, and only the person makes it follow again: a step to
+//! the very bottom, a drag of the scrollbar to its end, Jump to latest, or a message of their
+//! own. No op scrolls it: gpui-agent has no scroll op and this host no scroll invoke, so a live
+//! check scrolls with the trackpad or the wheel and asserts the value),
 //! `image-thumb-{n}`, `lightbox`, `user-form-{key}`, `user-form-field-{key}-{id}`,
 //! `user-form-continue-{key}`, `user-form-dismiss-{key}`, `user-form-screen-{key}`,
 //! `user-form-pill-{key}`, `computer-handoff-{key}`,
 //! `computer-handoff-takeover-{key}`, `computer-handoff-done-{key}`,
 //! `computer-handoff-skip-{key}`,
 //! `save-login-{entry}`, `save-login-save-{entry}`, `save-login-skip-{entry}`,
-//! `user-form-use-saved-{key}-{login}` (one per saved account for the card's site),
-//! `user-form-saved-note-{key}`, `user-form-saved-clear-{key}`,
+//! `user-form-use-saved-{key}-{login}` (one per saved account for the card's site; a sign-in
+//! that asks for the name and the password on two pages is two cards, each with a row per
+//! password login, and on the password page the login picked on the name page in that thread
+//! is the first row), `user-form-saved-note-{key}`, `user-form-saved-clear-{key}` (Change, on
+//! the password row, or on the name row of a name page),
 //! `settings-tab-logins`, `settings-logins-search` (value = the query), `settings-login-add`,
 //! `settings-login-import`, `settings-logins-notice`, `settings-logins-error`,
 //! `settings-logins-empty`, `settings-logins-group-passwords|passkeys|codes|security` (a
@@ -38,10 +55,18 @@
 //! `approval-{call}` (title = the card's own, states = reason, thread, tool),
 //! `reply-steps` (the newest coworker reply's steps, a list with value = how many; in the tree
 //! only while it has any) with `step-{call_id}` under it (label = the step row's own words,
-//! value `running` / `ok` / `failed`, state `expanded` while its row is open; a click opens or
-//! shuts it, and an open step holds its "N steps" line open), `reply-reasoning` (value = how
-//! many Thought rows that reply has, in the tree only while it has any; state `expanded` while
-//! all are open; a click opens them all, or shuts them once they all are),
+//! value `running` / `ok` / `failed`, state `expanded` while its row is open, and state
+//! `took-{time}`, e.g. `took-1s`, while the end of its row says how long the call took: Settings
+//! → Show turn timing on, and a call this Mac timed from its arguments' end to its answer, which
+//! a replay, a call answered together with another and a call that waited on a person never
+//! are; a click opens or shuts it, and an open step holds its "N steps" line open),
+//! `reply-reasoning` (value = how many Thought rows that reply has, in the tree only while it has
+//! any; state `expanded` while all are open; a click opens them all, or shuts them once they all
+//! are), with `reply-thought-{n}` underneath (name = Thinking, state `took-{time}` when that
+//! segment was timed). `reply-timing` is the plain total under that reply, value = `10s total`;
+//! in the tree only while Show turn timing is on and the run sent a total in `run-timing`.
+//! It has no children or expanded state, and refuses clicks: durations belong to action rows,
+//! not a second breakdown under the total.
 //! `recipe-run` (on the open recipe: value = the bot it plays on, disabled while it cannot run
 //! or a run is going; invoke `recipe.run {bot?}`), `recipe-run-result` (value `running` / `ok`
 //! / `failed` / `interrupted`), `recipe-error` (what the page says went wrong, e.g. a
@@ -49,7 +74,8 @@
 //! `recipe-history-run-{runId}` (value = `running` / `finished` / `interrupted`, state `ok`),
 //! `settings-computer-{machine}-exec` (a connected computer's local-exec mode, value `ask` /
 //! `bypass` / `never`, state `this-mac`) with `settings-computer-{machine}-exec-ask|bypass|never`,
-//! `settings-tab-computer`, where this Mac's standing rules sit under its mode:
+//! `settings-tab-computer` (each computer's card is below, with the relay's), where this Mac's
+//! standing rules sit under its mode:
 //! `settings-local-rules-allow|deny` (a list, value = its count; in the tree only while it has a
 //! rule on it) with its rows `settings-local-rule-allow|deny-{n}` (counted from 0 in the
 //! server's order, value = the command exactly; state `inert` on an allow the server says can
@@ -59,22 +85,92 @@
 //! `settings-local-rule-error-allow|deny-{n}` (why its last Remove did not go through);
 //! `settings-local-rules-empty` while there are none, `settings-local-rules-error` while they
 //! could not be read. Nothing for a machine that is not this Mac.
-//! `routine-new`, `routine-{id}`, `routine-{id}-trigger-schedule`,
+//! `settings-local-exec-stopped` (on `settings-tab-computer`, label = the page's words for why
+//! this Mac stopped running commands for the server by itself: enrolling it did not go through,
+//! or the server turned it away again after it enrolled again; in the tree only until the next
+//! sign-in starts it again).
+//! `routine-new`, `routine-{id}`, `routine-{id}-active` (the editor's Active switch: label
+//! `Active`, or `Paused` while it is off; checked while the routine runs on its own; a click
+//! asks for the other way), `routine-{id}-trigger-schedule`,
 //! `routine-{id}-trigger-webhook`, `routine-{id}-webhook-url`,
 //! `routine-{id}-webhook-key`, `routine-{id}-rotate`, `routine-{id}-test` (Test run, on a
-//! routine the server has), `routine-{id}-run-{runId}` (one Run history line: label `Test run` /
-//! `Webhook` / `Schedule`, value `running` / `waiting` / `ok` / `error`; a click opens the
-//! routine's thread), `routine-{id}-delete`.
+//! routine the server has; disabled, and a click refused in the editor's words, on a server that
+//! cannot run a routine on demand), `routine-{id}-run-{runId}` (one Run history line: label `Test
+//! run` / `Webhook` / `Schedule`, or `Run by <name>` for a run a Bot started with its
+//! `run_routine` tool, named as the server called it then (opengrok-server #337, built in #342),
+//! value `running` / `waiting` / `ok` / `error`; a click opens the routine's thread and brings
+//! that run into view once the thread has it),
+//! `routine-{id}-skipped-{atMs}` (a Run history line for a firing the server skipped because the
+//! Bot's own plan could not answer, opengrok-server #316, by when it was due: label as a run's,
+//! value = the server's sentence for why, e.g. "Skipped: your computer was off, so your plan
+//! couldn't answer", state `skipped`; it started no run, so a click is refused and opens nothing),
+//! `routine-{id}-delete`.
+//! While a routine is open in the Computer pane, its header's four icons are under
+//! `computer-pane`, each acting on that routine: `routine-history-toggle` (label `Run history`, or
+//! `Back to the routine` with state `selected` while the panel shows the Run history alone in
+//! place of the routine's fields), `routine-open-thread`, `routine-run-now` and `routine-delete`;
+//! one that cannot act is disabled, with the reason as its value, and a click on it is refused.
+//! "When to run" on the open routine, under `computer-pane`: `routine-wake-add` (+, disabled
+//! while the routine has its one wake, the server's limit until opengrok-server#315, with the
+//! reason as its value), `routine-wake-{i}` (a wake: label = what sets it off, in words, times on
+//! the routine's own clock, in the zone the server reads its line in, opengrok-server #316)
+//! holding `routine-wake-edit-{i}` (opens the wake editor on it; disabled on a schedule where the
+//! server cannot change a routine), `routine-wake-delete-{i}` (disabled: a routine keeps its only
+//! wake) and, on a schedule whose zone is not this computer's, `routine-wake-{i}-zone` (label =
+//! the IANA zone). While the wake editor is open, `routine-wake-editor`
+//! (value = the open tab's word) holds `routine-wake-tab-every|daily|weekly|monthly|webhook|cron`
+//! (state `selected` on the open one; disabled where the routine's kind rules it out, since a
+//! schedule never becomes a webhook nor a webhook a schedule) and the open tab's controls: on
+//! Every, `routine-wake-every` (a textbox; `set_value` writes it) with `routine-wake-every-up|down`
+//! and `routine-wake-unit-minutes|hours|days` (state `selected`); on Daily, Weekly and Monthly,
+//! `routine-wake-hour` and `routine-wake-minute` (textboxes, on a 12-hour clock) with their
+//! `-up|down` (the hour by one round the clock, the minute by five), `routine-wake-am|pm` (state
+//! `selected`) and `routine-wake-month-{1..12}` (checkboxes; none checked is every month); on
+//! Weekly, `routine-wake-day-{0..6}` (Sunday is 0); on Monthly, `routine-wake-date-{1..31}`; on
+//! Cron, `routine-wake-cron` (a textbox: five fields) and `routine-wake-cron-note` (while its days
+//! of the week are numbers: how they count, standard cron's way, 0 and 7 Sunday, since
+//! opengrok-server #331). Under them
+//! `routine-wake-summary` (label = what was picked, in words), `routine-wake-zone` (label `<zone>
+//! time`, value = the IANA zone, only where the routine's zone is not this computer's),
+//! `routine-wake-next` (when it would next run, in the person's own time; only where the line can
+//! be read here in the routine's zone, this computer's own or UTC), `routine-wake-error` (why it
+//! cannot be saved),
+//! `routine-wake-save` (label `Save`, or `Done` on a webhook; disabled while there is an error)
+//! and `routine-wake-cancel`.
+//! A click on `routine-delete` or `routine-{id}-delete` asks first, as a person's does:
+//! `routine-delete-prompt` (a dialog over the whole window, label `Delete "<name>"?`, value =
+//! what deleting it does, e.g. "It stops running. Its past runs and conversation stay.") with
+//! `routine-delete-cancel` and `routine-delete-confirm`, in the tree only while it asks. Escape
+//! answers Cancel in the window. Invoke `routine.delete` deletes outright, without asking.
+//! What an older server cannot do with a routine (one from before opengrok-server 18656e3), each
+//! in the tree only while it is so, label = the editor's words: `routine-{id}-cant-change` (it
+//! cannot change a routine once it is made: the fields are dead, and `routine.edit` is refused),
+//! `routine-{id}-cant-run` (it cannot run one on demand), `routine-{id}-runs-unavailable` (in the
+//! Run history's place: it cannot list a routine's runs) and `routine-{id}-unsaved` (label `Not
+//! saved`, value = what the person typed that it did not keep, one `Label: value` line each).
+//! `routine-error` (under `computer-pane`, while a routine's editor is open and shows one: its red
+//! line, the last refusal in the server's words or what the server answered when it said
+//! nothing; never `request failed`).
 //! `routine-{id}-thread` (Open thread, on a routine the server has); on a routine's thread the
-//! chat carries `chat-routine-thread` (label the routine's name, value `schedule` / `webhook`)
-//! and `chat-routine-back` (back to the bot's own chat), `chat-routine-instructions` (value = how many
-//! bubbles are labelled as the routine's instruction). Invoke `routine.thread {id}` opens it.
+//! chat carries `chat-routine-thread` (the line centred under the bot chip: label the routine's
+//! name, value `schedule` / `webhook`) and `chat-routine-instructions` (value = how many bubbles
+//! are labelled as the routine's instruction). There is no Back link: the way back to the bot's
+//! own chat is `header-coworker`, in state `goes-home` there. Invoke `routine.thread {id}` opens
+//! it.
 //! Invoke `routine.run {id}` is Test run; `routine.edit {id, name?, prompt?}` saves an edit the
 //! way the editor does (a `PATCH` of what changed).
 //!
 //! A routine's `{id}` is the server's schedule id. The two trigger ids are in the tree only
 //! while the routine has no trigger, and the webhook's three only while it has one, so
 //! `assert --exists false` answers "this one already fires" and "this one is not a webhook".
+//!
+//! The Computer pane: `computer-pane`, with `computer-status` (label `<state>; screen: yes|no`,
+//! `endpoint missing` or `unknown`) and, under it, `computer-error` while the pane says why the
+//! server could not give the bot a computer, in place of "No computer yet" (label = the server's
+//! words as the pane shows them, value = the server's code for it, e.g. `provider_error`; a
+//! status that names a box has none, so `assert --exists false` is "a computer was given").
+//! Beside it, only then, `computer-get` (Get a computer: asks the server again; dead while an
+//! ask is with the server). `computer-update`, `computer-reset`.
 //!
 //! Files (#90): `composer-file-{i}` under `composer` (label = the file's name, value `uploading`
 //! / `ready` / `failed`); `message-file-{artId}` on the chat page for each file a message in the
@@ -112,7 +208,9 @@
 //! switch, or a read of this Bot's ceiling, is with the server) and `agent-ceiling-note` (the
 //! server's words about the last switch when no row is the one they are about, as a 409's "the
 //! tools changed since you looked"); and one `agent-ceiling-switch-{name}` per row of the bot's
-//! tool ceiling (opengrok-server#268): a switch named by the row's heading, value `builtin` /
+//! tool ceiling (opengrok-server#268): a switch named by the row's heading (the label the
+//! server gives the row, as `Routines` for the routine tools' one row, `routines`, else its
+//! name), value `builtin` /
 //! `plugin`, `checked` where it stands (where it was asked to go while that is with the server),
 //! enabled only while a click would send it, states `switching` and `unavailable`. Under it:
 //! `agent-ceiling-why-{name}` (why the server cannot offer it now),
@@ -152,14 +250,67 @@
 //! attached, though it can always be detached. The Tools card's switches and these are apart:
 //! neither waits on the other.
 //!
-//! In the bot's settings: `agent-effort` (a menu; value = the effort word it shows, state
-//! `unsaved` while that is a pick Save has not sent; disabled and reading `inherit` from a server
-//! that keeps no effort, one from before opengrok-server#271) with one `agent-effort-{word}` per
-//! choice (`inherit`, `low`, `medium`, `high`, `max`, and the word the bot already has when it is
-//! none of those, e.g. `xhigh`; label as the menu reads it, state `selected` on the one shown). A
-//! click on a choice picks it, as the menu does, and `agent-save` sends it with the rest of the
-//! pane, as the Save button does. `agent-settings-error` is the pane's red line over Save: a
-//! refused Save, in the server's words.
+//! The Bot's model picker, on the Model card in the Bot's settings, which is the one place a
+//! Bot's model is picked: the composer has no chip for it, and no `model-*` id outside the card
+//! is the picker's. `agent-model-card`, in the tree while a Bot is open, is a button named as the
+//! picker reads in a line (`GPT-6 Luna · Medium ⚡`, the effort being the level the slider is on,
+//! which is the model's own while the Bot chose none, and nothing for a model that lists no
+//! levels: `Grok 4.7`) and valued by the model the Bot's next turn runs on, with its door's wire
+//! word as a state (`gateway` / `local_proxy`), `fast` while ⚡ is on, and `expanded` while its
+//! popover is open; a click opens or shuts the popover, only while the settings are open. The
+//! popover, `agent-model-pop`, visible while open, holds, in the window's order,
+//! `agent-model-fast` (a switch, checked while on; dead, with why as its value, where the list
+//! holds no fast version of the model or the account's plan model answers for every Bot),
+//! `agent-model-open-list` (named by the model; it opens the list) and `agent-model-reset` (↺:
+//! the effort back to `inherit`, so the slider is on the model's own level, and ⚡ off, the model
+//! left alone; live while there is something to put back); then `agent-model-effort`, a slider
+//! whose stops are the levels of effort the model itself lists, low to high, and which is not in
+//! the tree at all where the model lists none: it is named by the level it is on (the model's
+//! own while the Bot chose none, and `Effort` where the model names none as its own) and valued
+//! by that level's own word (`medium` while the Bot chose none and the model's own level is
+//! Medium, and no value where no level is lit), so a driver can write back what it reads;
+//! `set_value` takes the value of one of the model's own levels (`medium`, or `ultra` where the
+//! model lists it) and refuses any other in words that name them, and on a model with no
+//! levels it refuses that there is no slider; it is dead, with why, from a server that keeps no
+//! effort, one from before opengrok-server#271. Last, `agent-model-effort-note`, a line, not a
+//! control: after a pick of a model that has no such level as the Bot's effort was on, which
+//! the pick put back on `inherit`, it says `GPT-6 Luna has no Ultra, so it's on Medium, its own
+//! level.`, for as long as that model is on the card and nothing else is changed. The model's
+//! levels and own level are `GET /models`' `efforts` and `ownEffort` (opengrok-server #342 (main
+//! 2136ffc): `Model::entry` in `crates/opengrok-core/src/catalogue.rs`).
+//! While the list shows, those give way to `agent-model-open-list` as the heading back (state
+//! `expanded`), `agent-model-search` (the search box at the top of the list, a textbox valued by
+//! what is typed: `set_value` writes it, `type` adds to it, `key` takes Backspace and Enter; it
+//! filters both groups at once, whatever the case, by a model's name and by its raw id, and the
+//! list opens with it empty) and `agent-model-list` (always in the tree, valued by how many
+//! models the search leaves, all of them while nothing is typed). The list holds what its window
+//! draws: at most five models at a time, an `agent-model-row-{source}-{id}` each, by its door's
+//! wire word and the id a pick pins with ⚡ off (valued by its door's word, state `selected` on
+//! the one that answers and `fast` where the list holds its fast twin; a click puts the Bot on
+//! it, fast where ⚡ is on and it has a twin, and goes back to the controls), with an
+//! `agent-model-group-{source}` heading over each group's first model in view, which is not one
+//! of the five: `agent-model-group-local_proxy` is "Subscription", the person's own plan, and
+//! `agent-model-group-gateway` is "Gateway", the server's paid keys. The window opens with the
+//! model that answers in view, and the wheel scrolls it; a model out of view, or one the search
+//! leaves out, is refused, and the search box brings it into view. Then `agent-model-plan` (on a
+//! server whose rows carry no `source`, while the account is on the person's plan: the account's
+//! plan model, which answers for every Bot there; a line, not a row, which the search leaves or
+//! takes away as it would a row), `agent-model-no-match` ("No model matches", while the search
+//! leaves nothing of a list that has some), `agent-model-routines` (on a Bot whose own door is
+//! the person's plan, whatever it is pinned to: the line saying its routines run on that plan,
+//! and one due while the plan cannot answer is skipped (opengrok-server #334), or, while the
+//! person switched the relay off and the plan goes by their computer, that they run on the
+//! Relay-off fallback or, with none set, are skipped (opengrok-server #332 (PR #338 at
+//! 66b9f7b)); a line, not a row) and `agent-model-note` (the server's word on why the list is
+//! not fuller).
+//! `agent-model-error` is the server's words for the last change it refused. Every change is
+//! saved on the Bot at once, `source`, `model` and `effort` on `PATCH /coworkers/{id}`
+//! (opengrok-server main d6f640e (#307, after #304), pin bf99845). Invoke `model.picker`,
+//! `model.picker.open` and `model.picker.close` work the popover, and a click on
+//! `agent-model-dismiss` shuts it.
+//!
+//! In the bot's settings: `agent-settings-error` is the pane's red line over Save: a refused Save
+//! or pick, in the server's words.
 //!
 //! Connections (#2), a connection named by the server's id and a service by the name
 //! `GET /connectors` lists it under. Only the person's own connections are on either surface: a
@@ -193,55 +344,138 @@
 //! the card's sentence that a lent connection reaches a plugin only once the bot is allowed it in
 //! its Tools (opengrok-server#268).
 //!
-//! Reply source, where a Bot's replies are paid from: the server's paid keys or the person's own
-//! subscription through opencodex, running on the same machine as the server.
-//! `settings-tab-reply-source` (refused while Settings is shut); while Settings is open on it,
-//! `settings-reply-source` (value = the door the server keeps, `gateway` / `local_proxy`; states
-//! `unsaved` while a pick waits for Save, `saving` and `reading` while one is with the server).
-//! Until the setting has been read, on a server without reply sources, or when it could not be
-//! read, the section holds only `settings-reply-source-unavailable`, the line the page draws in
-//! place of the form (`Asking the server…` while the section has state `asking`). Once read it
-//! holds `settings-reply-source-kind` (a radio group, value = the door shown) with
-//! `settings-reply-source-kind-gateway|local_proxy` (label as the radio reads, checked on the one
-//! shown; a click picks it and it waits for Save, as on the page; `local_proxy` only where the
-//! app's server is on this Mac); `settings-reply-source-elsewhere` where it is not (the page's
-//! line saying the plan is set up only from the server's own Mac); `settings-reply-source-url`
-//! (value = the proxy URL shown; `set_value` and `type` write it as typing would, and an empty
-//! one clears the address with the next Save; `key` is refused); `settings-reply-source-model`
-//! (a menu, value = the model shown; state `empty` while the server lists no model of the
-//! person's plan) with `settings-reply-source-no-model` (while a model is shown: none, which
-//! clears it with the next Save) and a `settings-reply-source-model-{id}` per model it offers
-//! (state `selected` on the shown one; a click picks it); `settings-reply-source-models-note`
-//! (the line under the picker: why it offers nothing, or that opencodex is down and these are
-//! the models it listed last); `settings-reply-source-key` (never valued: states `set` while the
-//! server holds a key, `typed` while one waits for Save, which the window draws as masked dots
-//! whoever typed it; `set_value` writes the whole key, `type` and `key` are refused; disabled,
-//! as the window draws it, while Remove key is picked); `settings-reply-source-remove-key`
-//! (while the server holds a key: label `Remove key`, or `Keep key` with state `picked` while
-//! its removal waits for Save); `settings-reply-source-health` (label the line, value
-//! `running` / `not-running` / `no-address`); `settings-reply-source-providers` (why Claude and
-//! Gemini are not offered);
-//! `settings-reply-source-error` (the server's words for a refused Save, why nobody knows what
-//! became of one, or a read that failed, and after a Save or a page left with a key typed, the
-//! line asking for it again; state `trouble` while drawn in the danger colour, a refusal or a
-//! failed read); `settings-reply-source-hint` (what Save waits for, a model or an address, or what
-//! it keeps while no model of the plan is listed); and `settings-reply-source-save` (enabled only
-//! while a click would send something). Every control is refused off the page, before the setting
-//! is read, and while a Save is out; Save is refused while a read is out too, and says what it
-//! waits for; and the plan's controls are refused where the server is not on this Mac.
+//! General, Settings' first page: `settings-tab-general` (named `General`; refused while Settings
+//! is shut). While Settings is open on it, its first section, over Chat, is
+//! `settings-default-models` (named `Default models`; a section, not a control), which holds
+//! `settings-new-bots`: Default for new Bots, where a newly hired Bot starts (opengrok-server
+//! #322, on main c0bb6ae: the account's `newBotDefault` on `/account/inference-source`), which was
+//! on Relay and kept its ids. It is live only where the server's read carries that key, `null` or
+//! not. Otherwise (state `unavailable`) it holds `settings-new-bots-unavailable` ("Coming soon:
+//! the server can't keep a default for new Bots yet.") and `settings-new-bots-card`, the picker's
+//! card (a button named `No model`, disabled; a click is refused with why). Live,
+//! `settings-new-bots-card` is the Bot's card and popover, every part of `agent-model-*` above
+//! as `settings-new-bots-*`: the card (named as the default reads in a line, `None` while none
+//! is set, valued by its model; states its door's word, `fast`, `expanded`, and `saving` while a
+//! change is with the server), `settings-new-bots-pop`, `-fast`, `-effort` (`set_value` the
+//! value of one of the model's levels; not in the tree while none is set, which is no model and
+//! so no levels), `-effort-note`, `-reset`, `-open-list`, `-search` (`set_value`, `type`, `key`
+//! as the Bot's), `-list`, `-group-{source}`, `-row-{source}-{id}`, `-no-match`, `-note` and
+//! `-error` (the server's words for a refused change, or that nobody knows whether one was kept:
+//! in the popover while open, under the card while shut). Over the list's models,
+//! `settings-new-bots-none` (`None`, valued `the server's default`, state `selected` while
+//! none is set; a click takes the kept default away). While none is set ⚡ is dead and says
+//! why (a default starts with a model), and the slider is not in the tree: no model, no
+//! levels. Every pick is kept on the account at once, whole, as `PUT
+//! /account/inference-source` `{kind, newBotDefault}` with the kind the server keeps (None
+//! sends `null`), one at a time: every control that sends one is dead while one is out.
+//! `settings-new-bots-dismiss` shuts the popover, as `agent-model-dismiss` shuts the Bot's.
+//! All of it is refused off General, saying to open it with `settings-tab-general`.
 //!
-//! `composer-reply-source` is the composer's chip, in the tree only while there is a choice of
-//! door and the composer is not dictating (label `Server` / `My plan`, value = the door the next
-//! turns go through, which each of them names; state `picked` while that is the person's pick
-//! and not the account's own door). Unlike the composer's panel and chips it is clicked, as a
-//! person clicks it: a click switches the door, which then goes with every turn until it is
-//! switched back, and is gone with a sign-out or a relaunch. `reply-source-{messageId}` is the
-//! badge of each reply in the open thread that wears one, as the feed draws it (label `paid key`
-//! / `your plan`, value = the door), holding `reply-source-model-{messageId}` (label = the model
-//! the server named, which the badge shows on hover) when it named one. In the bot's settings,
-//! while the account's door or the chip is on the person's plan, `agent-model-plan` (under the
-//! Model field: the plan's model answers, not the pin) and `agent-usage-plan` (the Usage card
-//! does not count those replies).
+//! Under it in Default models, `settings-plan-fallback`: the Relay-off fallback, "When Relay is
+//! off, Subscription Bots use", what a Bot on the person's plan answers with while the relay is
+//! off (opengrok-server #332 (PR #338 at 66b9f7b): the account's `planFallback`, `{model,
+//! effort}` or `null`, on `/account/inference-source`). It is live only where the server's read
+//! carries that key, `null` or not. Otherwise (state
+//! `unavailable`) it holds `settings-plan-fallback-unavailable` ("Coming soon: the server can't
+//! keep a Relay-off fallback yet.") and `settings-plan-fallback-card`, disabled and refused with
+//! why. Live, it is the Bot's card and popover under `settings-plan-fallback-*` as Default for new
+//! Bots' are under `settings-new-bots-*` (`-card`, `-pop`, `-fast`, `-effort`, `-effort-note`,
+//! `-reset`, `-open-list`, `-search`, `-list`, `-no-match`, `-note`, `-error`), over the Gateway
+//! group alone: `settings-plan-fallback-group-gateway` and its rows,
+//! `settings-plan-fallback-row-gateway-{id}`, and none of the plan's models. Over them,
+//! `settings-plan-fallback-none` (`None`, valued `no fallback`, state `selected` while none is
+//! set; a click takes the kept fallback away). Every pick is kept on the account at once, whole,
+//! as `PUT /account/inference-source` `{kind, planFallback}` with the kind the server keeps (None
+//! sends `null`), one change of the account's at a time. `settings-plan-fallback-dismiss` shuts
+//! the popover. All of it is refused off General.
+//!
+//! Your computers, on Settings → Computer (`settings-tab-computer`; refused while Settings is shut):
+//! one card for each computer the person has enrolled, from `GET /local-exec/daemon`, with its own
+//! Relay your plan switch (opengrok-server #342 (main 2136ffc): each computer has its own switch,
+//! and the account's `relayEnabled` is read from them, never sent). Settings → Relay is gone, with its tab `settings-tab-reply-source`, its section
+//! `settings-reply-source`, its card `settings-relay`, `settings-relay-switch`,
+//! `settings-relay-switch-error` and `settings-relay-status`: none is on the tree, and a click on
+//! one of them (or on any other id of `settings-relay-*` or `settings-reply-source-*` that the
+//! computer's card does not draw: the plan on the server's own machine, a relay model, a radio) is
+//! refused saying where the relay moved. While Settings is open on Computer, each computer is
+//! `settings-computer-{machine}` (a group named by the computer's label; states `online` or
+//! `offline`, `this-computer` on the one the app is running on, found by the machine id this app
+//! stored when it enrolled, and `unsaved` on that one while a change to its opencodex fields waits
+//! for Save; the list is in the roster's order, this computer first). Under it:
+//! `settings-computer-{machine}-relay` (a switch named `Relay your plan`, checked while the
+//! computer's relay is on, or where a click is taking it while the server is asked, disabled then;
+//! a click asks for the other way, from any computer's card, as one `PATCH
+//! /local-exec/daemon/{machine}` of `{relayEnabled}`, and is refused with why while its last
+//! switch is with the server; turning one on also points the account's way at the relay, once,
+//! when it is not that already, as `PUT /account/inference-source` `{kind, via: "mac"}` with the
+//! kind the server keeps, one change of the account's at a time, and a computer going off moves no
+//! way; nothing this app sends of the account's setting ever carries `relayEnabled`),
+//! `settings-computer-{machine}-status` (label `Relaying`, `Not relaying`, `Not relaying: opencodex
+//! isn't answering on this computer (<address>)` or `On, but asleep: it can't answer right now`;
+//! value `relaying`, `not-relaying`, `opencodex-silent` or `asleep`: relaying while the computer's
+//! relay is on and the server holds its stream, asleep while it is on, not relaying and the server
+//! cannot reach the computer, which is never said of the computer the app is running on, and
+//! `opencodex-silent` on that computer alone, while its relay is on and nothing answers where its
+//! relay asks opencodex, the address saved or else where opencodex listens by default, which the
+//! label names: the server starts every computer's relay on, so a computer offers to relay only
+//! where opencodex answers, and asks again every twenty seconds and when the address or the key
+//! is saved)
+//! and `settings-computer-{machine}-error` (under the switch, in the tree only while it has
+//! something to say: the server's words for a refused switch, which went back, that nobody knows
+//! whether one was kept, or that the server can't switch a computer's relay yet, or the server's
+//! words for a refused change of the account's way that the switch sent; a line, not a control).
+//! A computer the server lists as revoked is left out of the list, as it always was, so nothing of
+//! it can be switched. Another computer's switch can be moved from this window; only this
+//! computer's relay is run by it (hexuria/nativechat #156, opengrok-server #292): the server asks
+//! the computer that opened its relay stream last of those that are on, and there is nothing to
+//! order. A relay the server switched off, from here or from another computer, stops, does not
+//! reconnect and waits for this computer's own row to read on again.
+//!
+//! This computer's card alone also holds what its relay needs of this computer, which were
+//! Settings → Relay's and keep their ids: `settings-relay-detail` (under its status: why it is not
+//! relaying, state `trouble`, or that it is opening its stream, or how to take the relay back from
+//! another NativeChat on this computer), `settings-relay-addr` (named `opencodex address`, value =
+//! opencodex's address on this computer; `set_value` and `type` write it; an address not on this
+//! computer is refused by Save with a hint, an emptied one goes back to the default),
+//! `settings-relay-key` (named `opencodex key (kept in this computer's secure storage)`, never
+//! valued: states `set` while the Keychain holds a key, `typed` while one waits for Save, `retype`
+//! when one typed was dropped with the page; `set_value` writes the whole key),
+//! `settings-relay-key-remove` (while a key is kept: `Remove key`, or `Keep key` with state
+//! `picked`), `settings-reply-source-error` (a read that failed, state `trouble`, or what the
+//! Keychain said when it did not keep a key), `settings-reply-source-hint` (what Save waits for: an
+//! opencodex address on this computer) and `settings-reply-source-save` (enabled only while a click
+//! would keep something). Until the setting has been read, on a server without reply sources, or when
+//! it could not be read, they are replaced by `settings-reply-source-unavailable`, the line the card
+//! draws (`Asking the server…` while it has state `asking`); from a server without the relay, by
+//! `settings-relay-unavailable` (that this server can't take replies from a computer yet) and the
+//! line under Save. Save keeps opencodex's address and key on this computer and sends the server
+//! nothing; the address and key are kept on this computer, the key in the Keychain, and never sent
+//! to the server. Every control is refused off the page, before this computer is on the list, and
+//! before the setting is read, and Save while a read is out, saying what it waits for. The tab's
+//! pages are `settings-tab-general` (Default models, and the Relay-off fallback that Subscription
+//! Bots answer with while Relay is off, "When Relay is off, Subscription Bots use": there, unmoved),
+//! this one, `settings-tab-updates`, `settings-tab-logins`, `settings-tab-connections` and
+//! `settings-tab-skills`. Default for new Bots is General's, above.
+//!
+//! `reply-source-{messageId}` is the badge of each reply in the open thread that wears one, as the
+//! feed draws it (label `paid key` / `paid key · relay off` / `your plan` / `your plan · Mac`, with
+//! ` ⚡` after it where the model that answered is a fast twin; value = the door, state `via-mac`
+//! on one the person's Mac answered, and `relay-off` on one the server's keys answered because the
+//! relay is off, as the run's frame says in `fallbackFor: "relay_disabled"` (opengrok-server
+//! #332 (PR #338 at 66b9f7b))), holding `reply-source-model-{messageId}` (label = the model
+//! the server named, which the badge shows on hover) when it named one. A reply whose run
+//! ended because the person's plan could not answer (a `RUN_ERROR` code: the relay's, where the
+//! Mac could not, or `plan_unavailable`, where the person's own setting left the plan nothing to
+//! answer with) keeps its line, and while it is the open thread's last turn the page holds
+//! `run-error-send-on-server` (`Send this reply on Server instead`): a click sends the same turn
+//! again on the server's paid keys, this once, as `retry-turn` does for a turn that never left. A
+//! reply whose run ended `relay_disabled`, a Bot's reply to another skipped while the relay is
+//! off with no fallback (opengrok-server #332 (PR #338 at 66b9f7b), only ever in the two Bots'
+//! read-only pair thread), keeps its line and has neither. Under `composer-queued`, a
+//! `queued-waiting-{messageId}` (`Waiting for your Mac`) for each held message the server holds
+//! for the person's Mac (`heldFor: "relay_offline"`, never while the relay is switched off). In the bot's settings, while the Bot's
+//! replies go through the person's plan, its own door or the account's that it follows,
+//! `agent-usage-plan` (the Usage card does not count those replies).
 //!
 //! Named invokes (parity / gpui-agent): `UserFormContinue`, `UserFormDismiss`,
 //! `UserFormOpenScreen`, `UserFormUseSaved`, `UserFormClearSaved` (also kebab

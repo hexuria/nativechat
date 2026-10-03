@@ -13,9 +13,12 @@
 //!   dir, mode 0600.
 //!
 //! A saved login is offered on the login card, and only for the card's own
-//! site. Every use asks for Touch ID first; then the password goes straight to
-//! the computer down the same channel a typed card uses. It is never painted,
-//! never put in the card's inputs, and the Bot never sees it.
+//! site. A sign-in that asks for the name and the password on two pages is two
+//! cards, and each takes its half: the name page the name, the password page
+//! the password, with the login picked for the name offered first. Every use
+//! asks for Touch ID first; then the password goes straight to the computer
+//! down the same channel a typed card uses. It is never painted, never put in
+//! the card's inputs, and the Bot never sees it.
 //!
 //! The LLM `credentials` table and local-exec daemon JSON are not this store.
 
@@ -251,6 +254,10 @@ pub enum SavedLoginUse {
         username: String,
         password: String,
     },
+    /// Touch ID passed on the name page of a two-step sign-in: the name is in its field and
+    /// nothing secret is held, because this page does not ask for one. Continue sends the name
+    /// alone, and the password page after it offers this login first.
+    NameReady { login_id: String, username: String },
     /// Continue was pressed on a code card whose step is nearly over: the digits are
     /// minted when the next step starts, and the card's buttons wait until then.
     Waiting {
@@ -289,6 +296,7 @@ impl std::fmt::Debug for SavedLoginUse {
                 .field("password", &"<redacted>")
                 .finish(),
             Self::Confirming { username } => write!(f, "Confirming({username})"),
+            Self::NameReady { username, .. } => write!(f, "NameReady({username})"),
             Self::ConfirmingRegister { site } => write!(f, "ConfirmingRegister({site})"),
             Self::Filling { username, .. } => write!(f, "Filling({username})"),
             Self::Cancelled { username } => write!(f, "Cancelled({username})"),
@@ -313,6 +321,10 @@ impl SavedLoginUse {
                 password,
                 login_id,
             } => Self::ready_note(username, password, login_id),
+            Self::NameReady { username, .. } => format!(
+                "{username} from your saved logins. Press Continue; the password is asked for \
+                 on the next card."
+            ),
             Self::Waiting { username, .. } => {
                 format!("The code for {username} is about to change; the next one is sent.")
             }
@@ -350,8 +362,8 @@ impl SavedLoginUse {
         }
     }
 
-    /// The held secret (a password, a code seed, or nothing for a passkey), once Touch ID
-    /// passed.
+    /// The held secret (a password, a code seed, or nothing for a passkey or a name page), once
+    /// Touch ID passed.
     pub fn ready(&self) -> Option<(&str, &str)> {
         match self {
             Self::Ready {
@@ -360,6 +372,7 @@ impl SavedLoginUse {
             | Self::Waiting {
                 username, password, ..
             } => Some((username.as_str(), password.as_str())),
+            Self::NameReady { username, .. } => Some((username.as_str(), "")),
             _ => None,
         }
     }
@@ -367,9 +380,9 @@ impl SavedLoginUse {
     /// The row a held pick came from, whether it is still waiting or already ready.
     pub fn held_id(&self) -> Option<&str> {
         match self {
-            Self::Ready { login_id, .. } | Self::Waiting { login_id, .. } => {
-                Some(login_id.as_str())
-            }
+            Self::Ready { login_id, .. }
+            | Self::Waiting { login_id, .. }
+            | Self::NameReady { login_id, .. } => Some(login_id.as_str()),
             _ => None,
         }
     }
@@ -604,6 +617,25 @@ mod tests {
             password: String::new(),
         };
         assert!(register.note().contains("Press Create passkey"));
+        // The name page of a two-step sign-in holds a name and nothing secret. It is no
+        // passkey, though it holds as little as one, and it says the password comes next.
+        let name = SavedLoginUse::NameReady {
+            login_id: "sl_4".into(),
+            username: "ada".into(),
+        };
+        assert!(
+            name.note().starts_with("ada from your saved logins")
+                && name
+                    .note()
+                    .contains("password is asked for on the next card")
+                && !name.note().contains("asskey"),
+            "{}",
+            name.note()
+        );
+        assert_eq!(
+            (name.ready(), name.held_id(), name.is_busy()),
+            (Some(("ada", "")), Some("sl_4"), false)
+        );
         // A pick waiting for the next code step keeps the card busy, so Continue cannot be
         // pressed a second time and send an empty field.
         let waiting = SavedLoginUse::Waiting {

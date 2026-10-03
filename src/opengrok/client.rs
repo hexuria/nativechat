@@ -5,17 +5,18 @@ use std::sync::Arc;
 use futures::StreamExt;
 use futures::future::{FutureExt, Shared};
 use reqwest::cookie::{CookieStore, Jar};
-use reqwest::header::{ACCEPT, CACHE_CONTROL, HeaderValue};
+use reqwest::header::{ACCEPT, CACHE_CONTROL, CONTENT_TYPE, HeaderValue};
 use reqwest::{Client, StatusCode, Url};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::Mutex as AsyncMutex;
 
 use super::error::OpenGrokError;
-use super::inference::{InferenceKind, InferenceSource, InferenceSourceUpdate};
+use super::inference::{InferenceSource, InferenceSourceUpdate, TurnSource};
 use super::pending::{
     PendingCustom, PendingList, PendingMutation, PendingUserMessage, PendingWrite,
 };
+use super::relay::{RelayAnswer, RelayAnswered};
 use super::types::{
     Account, AguiMessage, Coworker, CoworkerPatch, ModelCatalogue, ProfileUpdate, ThreadListing,
     error_code_from_body, error_message_from_body, written_by_opengrok,
@@ -121,12 +122,6 @@ impl OpenGrokClient {
             session_path: None,
             refresh_flight: Arc::new(AsyncMutex::new(None)),
         })
-    }
-
-    /// The server runs on this Mac: its address is loopback ([`super::is_loopback`]). The person's
-    /// own plan is set up only from there, because the server calls opencodex on its own machine.
-    pub fn is_on_this_machine(&self) -> bool {
-        super::is_loopback(&self.base)
     }
 
     pub fn with_session_file(mut self, path: PathBuf) -> Self {
@@ -445,6 +440,7 @@ impl OpenGrokClient {
         error
             .with_code(error_code_from_body(body))
             .with_pending_event(event)
+            .with_said_nothing(body.trim().is_empty())
     }
 
     /// Nothing on a 2xx, the server's error otherwise. For the doors that answer 204.
@@ -621,6 +617,23 @@ impl OpenGrokClient {
     pub async fn me(&self) -> Result<Account, OpenGrokError> {
         let response = self
             .send_json::<()>(reqwest::Method::GET, "/account", None)
+            .await?;
+        Self::json_or_error(response).await
+    }
+
+    /// `PUT /account` `{timeZone}`: keep `zone`, this computer's IANA time zone, as the one the
+    /// person's routines default to, answered with the account as `GET /account` answers it
+    /// (opengrok-server #322, on main since c0bb6ae: `put_me` in
+    /// `crates/opengrok-server/src/account_api.rs`, #316). The same zone again changes nothing
+    /// there. A zone its database does not know is a 422 `{error}` in its words, a body naming
+    /// none a 400, and signed out a 401.
+    pub async fn set_time_zone(&self, zone: &str) -> Result<Account, OpenGrokError> {
+        let response = self
+            .send_json(
+                reqwest::Method::PUT,
+                "/account",
+                Some(&json!({ "timeZone": zone })),
+            )
             .await?;
         Self::json_or_error(response).await
     }
@@ -854,13 +867,13 @@ impl OpenGrokClient {
         Self::json_or_error(response).await
     }
 
-    /// `PUT /account/inference-source` — keep a new reply source, answered with the setting as
-    /// the server now keeps it, with a fresh `healthy` (the same contract: `put_source` in
-    /// `crates/opengrok-server/src/inference.rs`, `apply` in
+    /// `PUT /account/inference-source` — keep a change to the account's setting, answered with the
+    /// setting as the server now keeps it, with a fresh `healthy` (the same contract: `put_source`
+    /// in `crates/opengrok-server/src/inference.rs`, `apply` in
     /// `crates/opengrok-harness/src/local_proxy.rs`). A field left out is kept and a `null`
-    /// clears it ([`InferenceSourceUpdate`]). A `baseUrl` that is not literal loopback, or a
-    /// `localModel` from a provider the server will not route a subscription to, is refused with
-    /// a 400 and `{"error": sentence}`, and nothing is kept. Given [`INFERENCE_SOURCE_TIMEOUT`].
+    /// clears it ([`InferenceSourceUpdate`]). A body the server will not keep is refused whole,
+    /// with a 400 and `{"error": sentence}`, and nothing is kept. Given
+    /// [`INFERENCE_SOURCE_TIMEOUT`].
     pub async fn set_inference_source(
         &self,
         update: &InferenceSourceUpdate,
@@ -923,15 +936,27 @@ impl OpenGrokClient {
     /// server drains that row atomically before the harness starts so two machines cannot both
     /// post it. Absent, a last user-message id that matches `clientMessageId` still drains.
     ///
-    /// `inference_source` is the door the composer's chip shows for this turn, the account's own
-    /// included, or for a held send the door its chip showed when it was queued: it goes as
-    /// `forwardedProps.inferenceSource` and wins over the account's setting for this turn only,
-    /// so the turn goes where the chip said even when the setting has moved since it was read
+    /// `retry_of` is the run whose reply this turn sends again: "Try again" and "Send this reply
+    /// on Server" name the run of the reply they replace, as `forwardedProps.retryOf`. A queued
+    /// send's row stays consumed by the run that fired it, and its bubble posted again without
+    /// that run named is the send firing twice, refused `already-consumed`. Named, and the run
+    /// over, the server hands the send to this run and the turn runs afresh; a run still going,
+    /// or any other, is refused as before (opengrok-server #300, server main 06db932 (#309, after
+    /// #308), pin b6ca457: `consume_for_turn` in `crates/opengrok-server/src/agui/pending.rs`).
+    /// A retry never names a queued send: beside `pendingId` the server reads no `retryOf` and
+    /// fires, or refuses, the send as a send, so `pending_id` is left off when this is given.
+    ///
+    /// `inference_source` is the Bot's own door for this turn, or for a held send the door the
+    /// Bot had when it was queued: it goes as `forwardedProps.inferenceSource` and wins over the
+    /// Bot's and the account's for this turn only, so a held send goes where it was typed to go
+    /// even when the Bot has been moved since
     /// (the inference-source contract agreed with open-ai-gateway and opengrok-server,
     /// 2026-09-30, built in opengrok-server #294: `named` in
     /// `crates/opengrok-server/src/inference.rs`,
-    /// `route` in `crates/opengrok-harness/src/local_proxy.rs`). Absent, with no chip drawn,
-    /// the account's setting decides, and the turn is the one sent before reply sources existed.
+    /// `route` in `crates/opengrok-harness/src/local_proxy.rs`). It is the bare word, or with a
+    /// way to the plan named `{"kind", "via"}` (#292: server main cad36fd (#303, after #298), pin
+    /// 47a5d6b; see [`TurnSource`]). Absent, for a Bot that follows the account's door, the
+    /// server decides, and the turn is the one sent before reply sources existed.
     ///
     /// The run id is the caller's. The server keeps every frame a run emits under it and will
     /// hand the whole lot back from `GET /ag-ui/runs/{run_id}`, which is of no use whatever to a
@@ -948,15 +973,16 @@ impl OpenGrokClient {
         recipe: Option<&TurnRecipe>,
         skill: Option<&str>,
         pending_id: Option<&str>,
-        inference_source: Option<InferenceKind>,
+        retry_of: Option<&str>,
+        inference_source: Option<TurnSource>,
         mut on_event: F,
     ) -> Result<String, OpenGrokError>
     where
-        F: FnMut(&serde_json::Value),
+        F: FnMut(&serde_json::Value, std::time::Instant),
     {
         let mut forwarded = json!({ "coworkerId": coworker_id });
-        if let Some(kind) = inference_source {
-            forwarded["inferenceSource"] = Value::String(kind.word().to_string());
+        if let Some(source) = inference_source {
+            forwarded["inferenceSource"] = source.to_value();
         }
         if let Some(recipe) = recipe {
             forwarded["recipe"] = Value::String(recipe.id.clone());
@@ -968,7 +994,9 @@ impl OpenGrokClient {
         if let Some(skill) = skill {
             forwarded["skill"] = Value::String(skill.to_string());
         }
-        if let Some(pending_id) = pending_id.filter(|id| !id.is_empty()) {
+        if let Some(retried) = retry_of.filter(|run| !run.is_empty()) {
+            forwarded["retryOf"] = Value::String(retried.to_string());
+        } else if let Some(pending_id) = pending_id.filter(|id| !id.is_empty()) {
             forwarded["pendingId"] = Value::String(pending_id.to_string());
         }
         let body = json!({
@@ -1003,6 +1031,12 @@ impl OpenGrokClient {
         if response.status() == StatusCode::UNAUTHORIZED {
             return Err(Self::signed_out_error(response).await);
         }
+        // A 202 is no stream: the queued send this turn fired is held for the person's Mac, and
+        // no run started. Read as every 2xx was, it was a turn that said nothing.
+        if response.status() == StatusCode::ACCEPTED {
+            let body = response.text().await.unwrap_or_default();
+            return Err(Self::turn_held(&body));
+        }
         if !response.status().is_success() {
             return Err(Self::read_error(response).await);
         }
@@ -1012,6 +1046,9 @@ impl OpenGrokClient {
         let mut persons = super::gen_ui::PersonsText::default();
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(|e| OpenGrokError::transport(&e))?;
+            // Every frame decoded from one delivery shares its arrival boundary. Parsing time
+            // is not tool time, and buffered END/RESULT pairs cannot be measured individually.
+            let arrived_at = std::time::Instant::now();
             buf.push_str(&String::from_utf8_lossy(&chunk));
             while let Some(idx) = buf.find("\n\n") {
                 let frame = buf[..idx].to_string();
@@ -1029,14 +1066,7 @@ impl OpenGrokClient {
                     };
                     let kind = value.get("type").and_then(|v| v.as_str()).unwrap_or("");
                     if kind == "RUN_ERROR" {
-                        let message = value
-                            .get("message")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("run failed");
-                        // The stream itself is a `200`: the run began and the server ended it
-                        // badly, and the sentence it ends with is the only thing that says
-                        // whether the model refused or the gateway was never reached.
-                        return Err(OpenGrokError::from_server(None, message));
+                        return Err(Self::run_ended_badly(&value));
                     }
                     // The person's own words, if a stream ever carries them, are not the reply.
                     let persons = kind.starts_with("TEXT_MESSAGE") && persons.is_persons(&value);
@@ -1046,11 +1076,47 @@ impl OpenGrokClient {
                     {
                         assistant.push_str(delta);
                     }
-                    on_event(&value);
+                    on_event(&value, arrived_at);
                 }
             }
         }
         Ok(assistant)
+    }
+
+    /// The turn's error from its `RUN_ERROR` frame. The stream itself is a `200`: the run began
+    /// and the server ended it badly, and the sentence it ends with is the only thing that says
+    /// whether the model refused or the gateway was never reached. A run the person's plan could
+    /// not answer names why beside the sentence ([`crate::opengrok::RunErrorCode`]: the Mac
+    /// relay's `relay_offline`, `relay_timeout` and `relay_failed`, and `plan_unavailable`), and
+    /// that code is what offers the turn again on the server's keys. Apart from the stream so the
+    /// wire conformance tests read a recorded frame with this very code.
+    pub(super) fn run_ended_badly(frame: &Value) -> OpenGrokError {
+        let message = frame
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("run failed");
+        let code = frame
+            .get("code")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        OpenGrokError::from_server(None, message).with_code(code)
+    }
+
+    /// `POST /ag-ui`'s 202, `{v, id, heldFor, message, event}`: the queued send this turn fired
+    /// is one the person's Mac would carry, and no Mac holds the relay, so the server left it
+    /// queued and started no run (opengrok-server main cad36fd (#303, after #298), pin 47a5d6b:
+    /// `consume_for_turn` in
+    /// `crates/opengrok-server/src/agui/pending.rs`). It sends the send itself when a Mac opens
+    /// the relay. Read as the turn not starting: the server's sentence, its `heldFor` word as the
+    /// code ([`OpenGrokError::is_held_for_mac`]), and the row as it now stands as the queue's
+    /// CUSTOM. Apart from the response so the wire conformance tests read the recorded answer
+    /// with this very code.
+    pub(super) fn turn_held(body: &str) -> OpenGrokError {
+        let body: Value = serde_json::from_str(body).unwrap_or(Value::Null);
+        let said = |key: &str| body.get(key).and_then(Value::as_str).map(str::to_string);
+        OpenGrokError::from_opengrok(202, said("message").unwrap_or_default())
+            .with_code(said("heldFor"))
+            .with_pending_event(body.get("event").cloned())
     }
 
     pub async fn answer_run(
@@ -1428,6 +1494,8 @@ impl OpenGrokClient {
                 mode: LocalExecMode::from_stored(&stored),
                 this_machine: false,
                 online: machine.connected,
+                relay_enabled: machine.relay_enabled,
+                relaying: machine.relaying,
             });
         }
         Ok(collapse_computers_by_machine_id(computers))
@@ -1439,6 +1507,31 @@ impl OpenGrokClient {
             .await?;
         let body: DaemonList = Self::json_or_error(response).await?;
         Ok(body.machines)
+    }
+
+    /// `PATCH /local-exec/daemon/{machine_id}` `{relayEnabled}`: one computer's own relay switch,
+    /// answered with its row (opengrok-server #342 (main 2136ffc): `switch_relay` in
+    /// `crates/opengrok-server/src/local_exec.rs`, recorded in `fixtures/wire/`). It names only the
+    /// caller's own computers, from any computer of the
+    /// account. The server refuses in `{error, code}`, and nothing is switched: `404 not_found`
+    /// ("no computer of yours has that id", the same for another account's computer as for an id
+    /// nobody enrolled), `409 revoked` ("this computer was revoked; enrol it again to use it") and
+    /// `400 bad_request` ("relayEnabled must be true or false"). Switched off, the computer's open
+    /// relay stream is sent `disabled` and closed (`super::relay`).
+    pub async fn switch_computer_relay(
+        &self,
+        machine_id: &str,
+        on: bool,
+    ) -> Result<DaemonMachine, OpenGrokError> {
+        let path = format!("/local-exec/daemon/{}", path_segment(machine_id));
+        let response = self
+            .send_json(
+                reqwest::Method::PATCH,
+                &path,
+                Some(&json!({ "relayEnabled": on })),
+            )
+            .await?;
+        Self::json_or_error(response).await
     }
 
     pub async fn coworker_computer(
@@ -2557,6 +2650,87 @@ impl OpenGrokClient {
         }
     }
 
+    /// `GET /inference-relay/requests`: the Mac relay's stream (opengrok-server #292: server main
+    /// cad36fd (#303, after #298), pin 47a5d6b), opened with this Mac's
+    /// machine token as the local-exec stream is. Answered with the response as it opens, for the
+    /// relay to read its frames off as they come ([`super::relay`]); a refusal is read as every
+    /// other, and a `401` is the server no longer taking the token, which the relay stops for.
+    pub async fn open_inference_relay(
+        &self,
+        machine_token: &str,
+    ) -> Result<reqwest::Response, OpenGrokError> {
+        let url = self.url("/inference-relay/requests")?;
+        let response = self
+            .http
+            .get(url)
+            .header(ACCEPT, "text/event-stream")
+            .header(CACHE_CONTROL, "no-cache")
+            .bearer_auth(machine_token)
+            .send()
+            .await
+            .map_err(|e| OpenGrokError::transport(&e))?;
+        if !response.status().is_success() {
+            return Err(Self::read_error(response).await);
+        }
+        Ok(response)
+    }
+
+    /// `POST /inference-relay/responses/{requestId}`: this Mac's answer to one call off the relay
+    /// stream, with its machine token (the same contract). opencodex's stream goes as
+    /// `text/event-stream`, uploaded as it arrives rather than gathered first; its model list, and
+    /// a failure as `{"error": sentence}`, as `application/json`. `204` is taken, `404` a call the
+    /// server no longer has (as good as cancelled), `409` one answered already, `401` the token
+    /// refused, and `413` an answer past the server's 32 MiB, cut off there; anything else is read
+    /// as the server's refusal.
+    pub(crate) async fn answer_inference_relay(
+        &self,
+        machine_token: &str,
+        request_id: &str,
+        answer: RelayAnswer,
+    ) -> Result<RelayAnswered, OpenGrokError> {
+        let url = self.url(&format!(
+            "/inference-relay/responses/{}",
+            path_segment(request_id)
+        ))?;
+        let (content_type, body) = match answer {
+            RelayAnswer::Stream(body) => ("text/event-stream", body),
+            RelayAnswer::Models(models) => {
+                ("application/json", reqwest::Body::from(models.to_string()))
+            }
+            RelayAnswer::Error(sentence) => (
+                "application/json",
+                reqwest::Body::from(json!({ "error": sentence }).to_string()),
+            ),
+        };
+        let response = self
+            .http
+            .post(url)
+            .bearer_auth(machine_token)
+            .header(CONTENT_TYPE, content_type)
+            .body(body)
+            .send()
+            .await
+            .map_err(|e| OpenGrokError::transport(&e))?;
+        match Self::relay_answered(response.status().as_u16()) {
+            Some(answered) => Ok(answered),
+            None => Err(Self::read_error(response).await),
+        }
+    }
+
+    /// What the server made of an answer, by its status alone, or `None` for a refusal to read as
+    /// every other. Apart from the response so the wire conformance tests read a recorded answer
+    /// with this very code.
+    pub(super) fn relay_answered(status: u16) -> Option<RelayAnswered> {
+        match status {
+            200..=299 => Some(RelayAnswered::Taken),
+            401 => Some(RelayAnswered::TokenRefused),
+            404 => Some(RelayAnswered::Gone),
+            409 => Some(RelayAnswered::AlreadyAnswered),
+            413 => Some(RelayAnswered::TooLarge),
+            _ => None,
+        }
+    }
+
     /// Hold `GET /local-exec/requests` and call `on_frame` for each JSON `data:` event.
     pub async fn stream_local_exec_requests<F>(
         &self,
@@ -2768,6 +2942,17 @@ pub(super) struct DaemonList {
     pub(super) machines: Vec<DaemonMachine>,
 }
 
+/// One computer of the account as `GET /local-exec/daemon` lists it, and as
+/// `PATCH /local-exec/daemon/{machine_id}` answers: `{machineId, label, enrolledAtMs, revoked,
+/// connected, relayEnabled, relaying}`.
+///
+/// `relayEnabled` and `relaying` are #342's (opengrok-server #342 (main 2136ffc): `row` in
+/// `crates/opengrok-server/src/local_exec.rs`, on every row of the recording in
+/// `fixtures/wire/`). `relayEnabled` is the computer's
+/// own relay switch, on for a computer enrolled before the switch existed, so a row without the key
+/// reads on; `relaying` is whether the server holds the computer's relay stream now, which is live
+/// and not a setting, so a row without it reads as not relaying. `connected` is the reverse-exec
+/// link, as it always was.
 #[derive(Debug, Clone, Deserialize)]
 pub struct DaemonMachine {
     #[serde(rename = "machineId")]
@@ -2778,6 +2963,15 @@ pub struct DaemonMachine {
     pub revoked: bool,
     #[serde(default)]
     pub connected: bool,
+    #[serde(rename = "relayEnabled", default = "relay_on_by_default")]
+    pub relay_enabled: bool,
+    #[serde(default)]
+    pub relaying: bool,
+}
+
+/// A computer's relay switch is on until somebody switches it off.
+fn relay_on_by_default() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3274,6 +3468,36 @@ pub struct CoworkerComputer {
         deserialize_with = "deserialize_optional_exec_mode"
     )]
     pub egress_policy: Option<LocalExecMode>,
+    /// Why the server could not give this Bot a computer, as it recorded it; `None` when it has
+    /// said nothing. [`Self::why_no_computer`] is when the pane shows it.
+    #[serde(rename = "computerError", default)]
+    pub computer_error: Option<ComputerError>,
+}
+
+/// Why the server could not give a Bot a computer: a stable code, the sentence a person reads,
+/// and when the server recorded it.
+///
+/// Transcribed from opengrok-server `crates/opengrok-server/src/agui/provision.rs`, checked
+/// against the server's main at e55a8c8. `coworker_screen` there puts it on
+/// `GET /coworkers/{id}/computer`, and on the `POST` that asks for a computer, which answers the
+/// same way: with `state: absent` when no box could be made and the account holds the reason,
+/// with `stopped` or `unknown` when the box's provider cannot be reached, and beside a running
+/// box when box.ascii.dev refused and a Local VM took over (`FELL_BACK`). `error_json_at` is its
+/// one shape on every surface, the hire's reply in `agui/routes.rs` among them. The corpus
+/// records it under `fixtures/wire/rest/GET__coworkers__coworker_id__computer/`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct ComputerError {
+    /// One of the server's stable codes (`no_org_key`, `quota_exceeded`, `provider_error`, …),
+    /// kept as sent.
+    pub code: String,
+    /// The server's own sentence, e.g. "the box refused: 125 Unable to find image …", which is
+    /// what the pane shows.
+    pub message: String,
+    /// When the server recorded it. The reason is kept on the account until an attempt clears
+    /// or replaces it, so it can be older than the status it rides on. `0` from a server older
+    /// than the stamp (opengrok-server 26abc27), which sent the other two alone.
+    #[serde(rename = "updatedAtMs", default)]
+    pub updated_at_ms: i64,
 }
 
 fn deserialize_optional_exec_mode<'de, D>(
@@ -3459,6 +3683,16 @@ impl CoworkerComputer {
             .map(str::trim)
             .filter(|id| !id.is_empty())
     }
+
+    /// Why the server could not give this Bot a computer, while the status names no box: the
+    /// pane says it in place of "No computer yet". A status that names a box is a computer
+    /// given, and the error it can carry is a takeover's note about that box (opengrok-server
+    /// `provision.rs` `FELL_BACK`), not a reason to ask for another.
+    pub fn why_no_computer(&self) -> Option<&ComputerError> {
+        self.computer_error
+            .as_ref()
+            .filter(|_| self.box_id.is_none())
+    }
 }
 
 /// Grok host: `SAND_EGRESS_TUNNEL_ENABLED === "1"`. OpenGrok also honors
@@ -3507,6 +3741,10 @@ pub struct ConnectedComputer {
     pub mode: LocalExecMode,
     pub this_machine: bool,
     pub online: bool,
+    /// The computer's own relay switch as the server keeps it ([`DaemonMachine::relay_enabled`]).
+    pub relay_enabled: bool,
+    /// The server holds the computer's relay stream now ([`DaemonMachine::relaying`]).
+    pub relaying: bool,
 }
 
 impl ConnectedComputer {
@@ -3675,6 +3913,13 @@ pub struct ScheduleRow {
     pub next_due_ms: Option<i64>,
     #[serde(default)]
     pub webhook: Option<WebhookInfo>,
+    /// The IANA zone the server reads the routine's cron line in (opengrok-server #316, #334, on
+    /// main 8e7387f: `tz` on every row, `row` in `crates/opengrok-server/src/autonomy/routes.rs`),
+    /// `UTC` for one stored before zones. This app names none on a create or an edit, so a new
+    /// routine takes the account's `timeZone`, else UTC (`zone_of` in `autonomy/desk.rs`), and an
+    /// edit keeps the zone it had. `None` from a server before zones, which read every line in UTC.
+    #[serde(default)]
+    pub tz: Option<String>,
 }
 
 /// What `PATCH /schedules/{id}` is asked to change. Every field is optional on the server, and
@@ -3700,18 +3945,72 @@ impl ScheduleEdit {
 
 /// One line of a routine's history, as `GET /schedules/{id}/runs` answers it
 /// (opengrok-server `autonomy/routes.rs`, `history`): `{runId, cause, status, startedAtMs,
-/// endedAtMs}`.
+/// endedAtMs}` for a run; and since #316 (#334, on main 8e7387f, the same `history`) a firing the
+/// server skipped, because the Bot answers on its person's own plan and the plan could not answer
+/// then, as `{runId: null, cause, status: null, startedAtMs: null, endedAtMs: null, at, state:
+/// "skipped", skipped, reason}`. A skip started no run, so it has nothing to open. Since #337
+/// (built in #342, the same `history`) every line also carries `by`: the Bot whose `run_routine`
+/// set the firing off, which is a run's `cause: "bot"` too, and `null` for every other cause (a
+/// line from before it has no `by` at all).
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ScheduleRun {
-    pub run_id: String,
-    pub cause: RunCause,
-    pub status: ScheduleRunStatus,
+    /// `null` on a skipped firing, which started no run.
     #[serde(default)]
-    pub started_at_ms: i64,
-    /// `null` while the run is going or waiting on the person.
+    pub run_id: Option<String>,
+    pub cause: RunCause,
+    /// `null` on a skipped firing.
+    #[serde(default)]
+    pub status: Option<ScheduleRunStatus>,
+    /// `null` on a skipped firing, whose time is [`Self::at`].
+    #[serde(default)]
+    pub started_at_ms: Option<i64>,
+    /// `null` while the run is going or waiting on the person, and on a skipped firing.
     #[serde(default)]
     pub ended_at_ms: Option<i64>,
+    /// [`SKIPPED_FIRING`] on a skipped firing; absent on a run.
+    #[serde(default)]
+    pub state: Option<String>,
+    /// When a skipped firing was due.
+    #[serde(default)]
+    pub at: Option<i64>,
+    /// Why it was skipped, as the server's code: `relay_offline` (no computer held the person's
+    /// relay) or `proxy_down` (their plan's proxy did not answer), from `SKIPPED` in
+    /// opengrok-server's `crates/opengrok-server/src/autonomy/mod.rs`. Nothing here branches on
+    /// it: the line says [`Self::reason`].
+    #[serde(default)]
+    pub skipped: Option<String>,
+    /// The server's sentence for why it was skipped (`skip_reason` there), which is what the
+    /// line says: "Skipped: your computer was off, so your plan couldn't answer".
+    #[serde(default)]
+    pub reason: Option<String>,
+    /// The Bot that started the firing, as the server named it then (opengrok-server #337, built in
+    /// #342: `history` in `crates/opengrok-server/src/autonomy/routes.rs`): `null` for the clock,
+    /// a webhook and the person's own Test run, and left out by a server from before it. The
+    /// line says it ([`RunCause::Bot`]) wherever it is a Bot's.
+    #[serde(default)]
+    pub by: Option<RunBy>,
+}
+
+/// The Bot a firing of a routine was started by, as a line of the history and a routine's `lastRun`
+/// name it: its id, and its name as it was called then, which is the name the line says (opengrok-server
+/// #337, built in #342: `by` in `crates/opengrok-server/src/autonomy/routes.rs`).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunBy {
+    pub coworker_id: String,
+    pub name: String,
+}
+
+/// `state` on a line of a routine's history that is a firing the server skipped (see
+/// [`ScheduleRun`]).
+pub const SKIPPED_FIRING: &str = "skipped";
+
+impl ScheduleRun {
+    /// A firing the server skipped, which started no run: said so, or naming no run to open.
+    pub fn is_skipped(&self) -> bool {
+        self.state.as_deref() == Some(SKIPPED_FIRING) || self.run_id.is_none()
+    }
 }
 
 /// What `POST /schedules/{id}/run` answers with: `202 {accepted, runId}` (opengrok-server
@@ -3730,6 +4029,9 @@ pub enum RunCause {
     Manual,
     Webhook,
     Clock,
+    /// A Bot ran the routine for its person with its `run_routine` tool (opengrok-server #337,
+    /// built in #342); the line's `by` names it.
+    Bot,
     /// A word this client has no name for yet: still a run, and still listed.
     #[serde(other)]
     Other,
@@ -5024,7 +5326,18 @@ mod tests {
         let server = MockServer::start().await;
         let client = OpenGrokClient::new(&server.uri()).unwrap();
         let error = client
-            .run_turn("cw", "t", "run_1", &[], None, None, None, None, |_| {})
+            .run_turn(
+                "cw",
+                "t",
+                "run_1",
+                &[],
+                None,
+                None,
+                None,
+                None,
+                None,
+                |_, _| {},
+            )
             .await
             .unwrap_err();
         assert!(error.is_signed_out());
@@ -5360,9 +5673,9 @@ mod tests {
         assert!(!error.is_signed_out());
     }
 
-    /// The queue's four routes as the v1 contract writes them. A send queued while the
-    /// composer's chip showed a door carries it (`inferenceSource`, opengrok-server #294), and
-    /// the row the server answers with names it back.
+    /// The queue's four routes as the v1 contract writes them. A send queued with a door
+    /// carries it (`inferenceSource`, opengrok-server #294), and the row the server answers with
+    /// names it back.
     #[tokio::test]
     async fn enqueue_edit_cancel_and_list_pending_follow_the_v1_contract() {
         let server = MockServer::start().await;
@@ -5460,7 +5773,7 @@ mod tests {
                     None,
                     None,
                     None,
-                    Some(crate::opengrok::InferenceKind::LocalProxy),
+                    Some(crate::opengrok::InferenceKind::LocalProxy.into()),
                 ),
             )
             .await
@@ -5470,7 +5783,7 @@ mod tests {
         assert_eq!(created_row.bubble_id(), "msg_1");
         assert_eq!(
             created_row.inference_source(),
-            Some(crate::opengrok::InferenceKind::LocalProxy)
+            Some(crate::opengrok::InferenceKind::LocalProxy.into())
         );
         assert_eq!(
             created.custom().map(|custom| custom.op),
@@ -5578,7 +5891,8 @@ mod tests {
                 None,
                 Some("pum_1"),
                 None,
-                |_| {},
+                None,
+                |_, _| {},
             )
             .await
             .unwrap();
@@ -5589,6 +5903,59 @@ mod tests {
             json!({ "coworkerId": "cw_1", "pendingId": "pum_1" })
         );
         assert_eq!(body["messages"][0]["id"], "msg_1");
+    }
+
+    /// A retry names the run whose reply it sends again, as `retryOf`, and never a queued send
+    /// beside it: beside `pendingId` the server reads no `retryOf`, and fires or refuses the send
+    /// as a send (opengrok-server #300, server main 06db932 (#309, after #308), pin b6ca457:
+    /// `consume_for_turn` in `crates/opengrok-server/src/agui/pending.rs`). An empty run is no
+    /// retry, and a queued send named with it goes as it always has.
+    #[tokio::test]
+    async fn a_retry_names_the_run_it_retries_and_never_a_queued_send() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/ag-ui"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(
+                        "data: {\"type\":\"RUN_FINISHED\",\"runId\":\"r\"}\n\n".to_string(),
+                    ),
+            )
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        put_cookie(&client, &live_session());
+        for (run, retry_of) in [("run_2", Some("run_1")), ("run_3", Some(""))] {
+            client
+                .run_turn(
+                    "cw_1",
+                    "th_1",
+                    run,
+                    &[],
+                    None,
+                    None,
+                    Some("pum_1"),
+                    retry_of,
+                    None,
+                    |_, _| {},
+                )
+                .await
+                .unwrap();
+        }
+        let requests = server.received_requests().await.expect("the turns");
+        let props: Vec<Value> = requests
+            .iter()
+            .map(|request| serde_json::from_slice::<Value>(&request.body).unwrap())
+            .map(|body| body["forwardedProps"].clone())
+            .collect();
+        assert_eq!(
+            props,
+            [
+                json!({ "coworkerId": "cw_1", "retryOf": "run_1" }),
+                json!({ "coworkerId": "cw_1", "pendingId": "pum_1" }),
+            ]
+        );
     }
 
     /// OpenGrok's 409 for a queued send whose row changed carries the row as it stands now. The
@@ -5663,7 +6030,8 @@ mod tests {
                 None,
                 Some("pum_1"),
                 None,
-                |_| {},
+                None,
+                |_, _| {},
             )
             .await
             .expect_err("refused")
@@ -5691,7 +6059,18 @@ mod tests {
             let client = OpenGrokClient::new(&server.uri()).unwrap();
             put_cookie(&client, &live_session());
             let error = client
-                .run_turn("cw_1", "th_1", "run_1", &[], None, None, None, None, |_| {})
+                .run_turn(
+                    "cw_1",
+                    "th_1",
+                    "run_1",
+                    &[],
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    |_, _| {},
+                )
                 .await
                 .expect_err("refused");
             assert_eq!(error.status, Some(409));
@@ -5790,7 +6169,18 @@ mod tests {
         // is all that is left, and the app is still showing a roster.
         put_cookie(&client, "og_refresh=tok-r; Path=/; Max-Age=3600");
         client
-            .run_turn("cw", "t", "run_1", &[], None, None, None, None, |_| {})
+            .run_turn(
+                "cw",
+                "t",
+                "run_1",
+                &[],
+                None,
+                None,
+                None,
+                None,
+                None,
+                |_, _| {},
+            )
             .await
             .expect("the turn goes out, on a token the app fetched for itself");
 
@@ -5826,7 +6216,18 @@ mod tests {
         let client = OpenGrokClient::new(&server.uri()).unwrap();
         put_cookie(&client, &live_session());
         let error = client
-            .run_turn("cw", "t", "run_1", &[], None, None, None, None, |_| {})
+            .run_turn(
+                "cw",
+                "t",
+                "run_1",
+                &[],
+                None,
+                None,
+                None,
+                None,
+                None,
+                |_, _| {},
+            )
             .await
             .unwrap_err();
         assert!(error.is_signed_out());
@@ -5857,7 +6258,18 @@ mod tests {
         let client = OpenGrokClient::new(&server.uri()).unwrap();
         put_cookie(&client, &live_session());
         let error = client
-            .run_turn("cw", "t", "run_1", &[], None, None, None, None, |_| {})
+            .run_turn(
+                "cw",
+                "t",
+                "run_1",
+                &[],
+                None,
+                None,
+                None,
+                None,
+                None,
+                |_, _| {},
+            )
             .await
             .unwrap_err();
         assert!(!error.is_signed_out(), "nobody should be asked to sign in");
@@ -6348,9 +6760,10 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
                 {
                     let first_at = first_at.clone();
-                    move |event| {
+                    move |event, _| {
                         let kind = event.get("type").and_then(|v| v.as_str()).unwrap_or("");
                         if kind == "TEXT_MESSAGE_CONTENT" {
                             let mut slot = first_at.lock().unwrap();
@@ -6371,6 +6784,60 @@ mod tests {
             until_first + Duration::from_millis(50) < total,
             "first text at {until_first:?}, stream ended at {total:?} — frames were buffered"
         );
+    }
+
+    #[tokio::test]
+    async fn buffered_sse_actions_share_arrival_instead_of_timing_callback_work() {
+        let server = MockServer::start().await;
+        let events = [
+            json!({"type":"TOOL_CALL_START","toolCallId":"c1","toolCallName":"shell"}),
+            json!({"type":"TOOL_CALL_END","toolCallId":"c1"}),
+            json!({"type":"TOOL_CALL_RESULT","toolCallId":"c1","content":"ok","ok":true}),
+            json!({"type":"RUN_FINISHED","runId":"r1"}),
+        ];
+        let body: String = events
+            .iter()
+            .map(|event| format!("data: {event}\n\n"))
+            .collect();
+        Mock::given(method("POST"))
+            .and(path("/ag-ui"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(body),
+            )
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        put_cookie(&client, &live_session());
+        let mut arrivals = Vec::new();
+        let mut turn = super::super::gen_ui::TurnAssembler::default();
+        client
+            .run_turn(
+                "cw",
+                "t",
+                "r1",
+                &[],
+                None,
+                None,
+                None,
+                None,
+                None,
+                |event, at| {
+                    arrivals.push(at);
+                    turn.push_event_at(event, Some(at));
+                    // A slow render must not turn parsing of the same delivery into tool execution.
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(arrivals.len(), events.len());
+        assert!(arrivals.windows(2).all(|pair| pair[0] == pair[1]));
+        let (_, parts) = turn.snapshot();
+        assert!(parts.iter().any(
+            |part| matches!(part, super::super::ChatPart::Step(step) if step.took_ms.is_none())
+        ));
     }
 
     /// The turn's body is a contract with the server, which reads `forwardedProps` for the
@@ -6418,7 +6885,8 @@ mod tests {
                 None,
                 None,
                 None,
-                |_| {},
+                None,
+                |_, _| {},
             )
             .await
             .unwrap();
@@ -6461,7 +6929,8 @@ mod tests {
                 None,
                 None,
                 None,
-                |_| {},
+                None,
+                |_, _| {},
             )
             .await
             .unwrap();
@@ -6519,7 +6988,8 @@ mod tests {
                 Some("skl_1"),
                 None,
                 None,
-                |_| {},
+                None,
+                |_, _| {},
             )
             .await
             .unwrap();
@@ -6533,7 +7003,8 @@ mod tests {
                 None,
                 None,
                 None,
-                |_| {},
+                None,
+                |_, _| {},
             )
             .await
             .unwrap();
@@ -6587,13 +7058,68 @@ mod tests {
         assert_eq!(cat.models[0].id, "xai/grok-4.6@sub");
     }
 
-    /// The account's reply source as the contract writes it: `GET` reads the setting, and a
-    /// Save is one `PUT` of the door and what changed, key and all when one was typed, answered
-    /// with the setting as the server now keeps it. A field emptied on the page goes as `null`,
-    /// and so does Remove key.
+    /// The account's time zone reads as opengrok-server #322 (on main since c0bb6ae) writes it
+    /// on `GET /account`: left out by a server that keeps none, `null` until set, and the zone
+    /// once set. `PUT /account` sends `{timeZone}` alone, and reads the account it is answered
+    /// with; a zone the server's database does not know is refused with a 422 in its words, as
+    /// its recording has them (`PUT__account/422-an_unknown_time_zone_is_refused_in_words`).
     #[tokio::test]
-    async fn the_reply_source_is_read_and_a_save_puts_what_changed() {
-        use crate::opengrok::{InferenceKind, InferenceSourceUpdate, ProxyKey};
+    async fn the_time_zone_is_read_off_the_account_and_put_alone() {
+        let read = |zone: Option<serde_json::Value>| -> Account {
+            let mut body = json!({
+                "id": "acct_1", "email": "ada@example.com", "firstName": "Ada", "lastName": "",
+                "avatarUrl": null, "orgId": null, "verified": true, "enabled": true,
+                "isAdmin": false
+            });
+            if let Some(zone) = zone {
+                body["timeZone"] = zone;
+            }
+            serde_json::from_value(body).expect("an account")
+        };
+        assert_eq!(read(None).time_zone, None, "a server that keeps none");
+        assert_eq!(read(Some(serde_json::Value::Null)).time_zone, Some(None));
+        assert_eq!(
+            read(Some(json!("Europe/London"))).time_zone,
+            Some(Some("Europe/London".to_string()))
+        );
+
+        let said = "\"Mars/Olympus_Mons\" is not an IANA time zone this server knows; send one \
+                    like \"Europe/London\"";
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/account"))
+            .and(body_json(json!({"timeZone": "Asia/Manila"})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "acct_1", "email": "ada@example.com", "firstName": "Ada",
+                "lastName": "", "avatarUrl": null, "orgId": null, "verified": true,
+                "enabled": true, "timeZone": "Asia/Manila", "isAdmin": false
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/account"))
+            .and(body_json(json!({"timeZone": "Mars/Olympus_Mons"})))
+            .respond_with(ResponseTemplate::new(422).set_body_json(json!({ "error": said })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        let kept = client.set_time_zone("Asia/Manila").await.unwrap();
+        assert_eq!(kept.time_zone, Some(Some("Asia/Manila".to_string())));
+        let refused = client.set_time_zone("Mars/Olympus_Mons").await.unwrap_err();
+        assert_eq!(
+            (refused.status, refused.message.as_str(), refused.failure()),
+            (Some(422), said, Failure::Verdict)
+        );
+    }
+
+    /// The account's setting as the contract writes it: `GET` reads it, and a change is one
+    /// `PUT` of the kind the server keeps and what changed, answered with the setting as the
+    /// server now keeps it. Nothing of the plan on the server's own machine goes with it.
+    #[tokio::test]
+    async fn the_reply_source_is_read_and_a_put_carries_the_kind_and_what_changed() {
+        use crate::opengrok::{InferenceKind, InferenceSourceUpdate, Via};
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/account/inference-source"))
@@ -6606,27 +7132,12 @@ mod tests {
             .await;
         Mock::given(method("PUT"))
             .and(path("/account/inference-source"))
-            .and(body_json(json!({
-                "kind": "local_proxy",
-                "baseUrl": "http://127.0.0.1:8080",
-                "localModel": "gpt-5-codex",
-                "apiKey": "sk-proxy-1"
-            })))
+            .and(body_json(json!({"kind": "gateway", "via": "mac"})))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "kind": "local_proxy", "baseUrl": "http://127.0.0.1:8080",
-                "localModel": "gpt-5-codex", "healthy": true, "hasApiKey": true
-            })))
-            .expect(1)
-            .mount(&server)
-            .await;
-        Mock::given(method("PUT"))
-            .and(path("/account/inference-source"))
-            .and(body_json(json!({
-                "kind": "gateway", "baseUrl": null, "localModel": null, "apiKey": null
-            })))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "kind": "gateway", "baseUrl": null, "localModel": null,
-                "healthy": false, "hasApiKey": false
+                "kind": "gateway", "baseUrl": "http://127.0.0.1:8080",
+                "localModel": "gpt-5-codex", "healthy": true, "hasApiKey": true, "via": "mac",
+                "relay": {"connected": false, "machineId": null, "machineLabel": null,
+                          "localModel": null}
             })))
             .expect(1)
             .mount(&server)
@@ -6639,38 +7150,28 @@ mod tests {
         );
         let kept = client
             .set_inference_source(&InferenceSourceUpdate {
-                kind: InferenceKind::LocalProxy,
-                base_url: Some(Some("http://127.0.0.1:8080".into())),
-                local_model: Some(Some("gpt-5-codex".into())),
-                api_key: Some(ProxyKey::new("sk-proxy-1")),
-            })
-            .await
-            .unwrap();
-        assert_eq!(kept.kind, InferenceKind::LocalProxy);
-        assert_eq!(kept.local_model.as_deref(), Some("gpt-5-codex"));
-        assert!(kept.healthy && kept.has_api_key);
-        let cleared = client
-            .set_inference_source(&InferenceSourceUpdate {
                 kind: InferenceKind::Gateway,
-                base_url: Some(None),
-                local_model: Some(None),
-                api_key: Some(None),
+                via: Some(Via::Mac),
+                new_bot_default: None,
+                plan_fallback: None,
             })
             .await
             .unwrap();
+        assert_eq!(kept.default_via(), Some(Via::Mac));
         assert_eq!(
-            (cleared.base_url, cleared.local_model, cleared.has_api_key),
-            (None, None, false)
+            kept.base_url.as_deref(),
+            Some("http://127.0.0.1:8080"),
+            "what the server keeps of its own machine stays as it keeps it"
         );
     }
 
-    /// A URL that is not literal loopback is refused with a 400 and the server's sentence, and
-    /// the person is shown that sentence as it was written: a verdict about what they typed,
-    /// not a server out of reach.
+    /// A `PUT` the server will not keep is refused with a 400 and the server's sentence, and the
+    /// person is shown that sentence as it was written: a verdict about what was asked, not a
+    /// server out of reach.
     #[tokio::test]
-    async fn a_url_that_is_not_loopback_is_refused_in_the_servers_words() {
-        use crate::opengrok::{InferenceKind, InferenceSourceUpdate};
-        let said = "baseUrl must be a literal loopback address such as http://127.0.0.1:8080";
+    async fn a_refused_put_is_the_servers_words() {
+        use crate::opengrok::{InferenceKind, InferenceSourceUpdate, Via};
+        let said = "via \"helper\" is not built yet (#293); use \"loopback\" or \"mac\"";
         let server = MockServer::start().await;
         Mock::given(method("PUT"))
             .and(path("/account/inference-source"))
@@ -6681,9 +7182,9 @@ mod tests {
         let refused = client
             .set_inference_source(&InferenceSourceUpdate {
                 kind: InferenceKind::LocalProxy,
-                base_url: Some(Some("http://my-mac.example.com:8080".into())),
-                local_model: None,
-                api_key: None,
+                via: Some(Via::Mac),
+                new_bot_default: None,
+                plan_fallback: None,
             })
             .await
             .unwrap_err();
@@ -6717,9 +7218,9 @@ mod tests {
             client
                 .set_inference_source(&InferenceSourceUpdate {
                     kind: InferenceKind::Gateway,
-                    base_url: None,
-                    local_model: None,
-                    api_key: None,
+                    via: None,
+                    new_bot_default: None,
+                    plan_fallback: None,
                 })
                 .await
                 .map(drop),
@@ -6735,12 +7236,13 @@ mod tests {
         }
     }
 
-    /// The door picked on the composer's chip travels as `forwardedProps.inferenceSource`, where
-    /// the server reads it and lets it win over the account's setting for this turn. A turn with
-    /// no pick is the turn this client sent before reply sources existed, byte for byte.
+    /// The Bot's door travels as `forwardedProps.inferenceSource`, where the server reads it and
+    /// lets it win for this turn: the bare word, or with a way to the plan named, `{"kind",
+    /// "via"}`. A turn with no door is the turn this client sent before reply sources existed,
+    /// byte for byte.
     #[tokio::test]
     async fn a_turn_carries_the_picked_reply_source_and_a_turn_without_one_is_unchanged() {
-        use crate::opengrok::InferenceKind;
+        use crate::opengrok::{TurnSource, Via};
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/ag-ui"))
@@ -6764,9 +7266,10 @@ mod tests {
             attachments: Vec::new(),
         };
         for (run, source) in [
-            ("run_1", Some(InferenceKind::LocalProxy)),
-            ("run_2", Some(InferenceKind::Gateway)),
+            ("run_1", Some(TurnSource::plan(None))),
+            ("run_2", Some(TurnSource::GATEWAY)),
             ("run_3", None),
+            ("run_4", Some(TurnSource::plan(Some(Via::Mac)))),
         ] {
             client
                 .run_turn(
@@ -6777,8 +7280,9 @@ mod tests {
                     None,
                     None,
                     None,
+                    None,
                     source,
-                    |_| {},
+                    |_, _| {},
                 )
                 .await
                 .unwrap();
@@ -6801,6 +7305,13 @@ mod tests {
             json!({ "coworkerId": "cw_1" }),
             "no pick leaves the account's setting to decide"
         );
+        assert_eq!(
+            bodies[3]["forwardedProps"],
+            json!({
+                "coworkerId": "cw_1",
+                "inferenceSource": {"kind": "local_proxy", "via": "mac"}
+            })
+        );
         let mut picked = bodies[0].clone();
         picked["forwardedProps"]
             .as_object_mut()
@@ -6812,6 +7323,204 @@ mod tests {
             serde_json::to_vec(&bodies[2]).unwrap(),
             "the pick is the only thing it adds to the turn"
         );
+    }
+
+    /// A run the person's plan could not answer says why beside its sentence, and the turn's
+    /// error keeps both: the sentence for the person, the code for the app to offer the turn
+    /// again on the server's keys. The relay's code (opengrok-server PR #298, which the ledger
+    /// reads the recorded frames of), and `plan_unavailable` where the person's own setting left
+    /// the plan nothing to answer with (server main d6f640e (#307, after #304), pin bf99845, whose
+    /// recorded frame the ledger reads too). A run error with no code has none.
+    #[tokio::test]
+    async fn a_run_error_keeps_its_code_beside_its_sentence() {
+        let server = MockServer::start().await;
+        let no_proxy = "You chose your own subscription, but no proxy address is set; set one in \
+                        your inference source (like http://127.0.0.1:8080), or switch this turn \
+                        to the gateway.";
+        for (run, frame) in [
+            (
+                "run_relay",
+                json!({"type": "RUN_ERROR", "message": "Your Mac isn't connected.",
+                    "code": "relay_offline"}),
+            ),
+            (
+                "run_plan",
+                json!({"type": "RUN_ERROR", "message": no_proxy, "code": "plan_unavailable"}),
+            ),
+            (
+                "run_plain",
+                json!({"type": "RUN_ERROR", "message": "the model refused"}),
+            ),
+        ] {
+            Mock::given(method("POST"))
+                .and(path("/ag-ui"))
+                .and(wiremock::matchers::body_partial_json(
+                    json!({ "runId": run }),
+                ))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("content-type", "text/event-stream")
+                        .set_body_string(format!("data: {frame}\n\n")),
+                )
+                .mount(&server)
+                .await;
+        }
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        put_cookie(&client, &live_session());
+        let turn = |run: &'static str| {
+            let client = client.clone();
+            async move {
+                client
+                    .run_turn(
+                        "cw_1",
+                        "thread_1",
+                        run,
+                        &[],
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        |_, _| {},
+                    )
+                    .await
+                    .unwrap_err()
+            }
+        };
+        let relay = turn("run_relay").await;
+        assert_eq!(
+            (relay.message.as_str(), relay.code()),
+            ("Your Mac isn't connected.", Some("relay_offline"))
+        );
+        assert_eq!(
+            relay
+                .code()
+                .and_then(crate::opengrok::RunErrorCode::from_code),
+            Some(crate::opengrok::RunErrorCode::RelayOffline)
+        );
+        let plan = turn("run_plan").await;
+        assert_eq!(
+            (plan.message.as_str(), plan.code()),
+            (no_proxy, Some("plan_unavailable"))
+        );
+        assert_eq!(
+            plan.code()
+                .and_then(crate::opengrok::RunErrorCode::from_code),
+            Some(crate::opengrok::RunErrorCode::PlanUnavailable)
+        );
+        let plain = turn("run_plain").await;
+        assert_eq!(plain.code(), None);
+    }
+
+    /// A Mac already carrying all the calls the server lets one Mac carry at once (16) is refused
+    /// a turn in words and no code: `ModelError::Proxy` in opengrok-server's relay broker, not a
+    /// relay failure (PR #298). The turn through the Mac ends with the sentence alone, naming no
+    /// relay failure, so nothing offers it again on the server's keys.
+    #[tokio::test]
+    async fn a_mac_carrying_all_it_may_ends_the_turn_in_words_alone() {
+        let server = MockServer::start().await;
+        let said = "Your Mac is already carrying 16 calls, so this one was not sent; try again \
+                    when one finishes.";
+        let stream: String = [
+            json!({"type": "RUN_STARTED", "threadId": "thread_1", "runId": "run_busy"}),
+            json!({"type": "CUSTOM", "name": "opengrok.inferenceSource",
+                "value": {"kind": "local_proxy", "via": "mac", "model": "gpt-5.5"}}),
+            json!({"type": "RUN_ERROR", "threadId": "thread_1", "runId": "run_busy",
+                "message": said}),
+        ]
+        .iter()
+        .map(|frame| format!("data: {frame}\n\n"))
+        .collect();
+        Mock::given(method("POST"))
+            .and(path("/ag-ui"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(stream),
+            )
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        put_cookie(&client, &live_session());
+        let busy = client
+            .run_turn(
+                "cw_1",
+                "thread_1",
+                "run_busy",
+                &[],
+                None,
+                None,
+                None,
+                None,
+                Some(TurnSource::plan(Some(crate::opengrok::Via::Mac))),
+                |_, _| {},
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(busy.message, said);
+        assert_eq!(busy.code(), None);
+        assert_eq!(
+            busy.code()
+                .and_then(crate::opengrok::RunErrorCode::from_code),
+            None,
+            "no relay failure, so nothing to send on the server's keys"
+        );
+    }
+
+    /// A fire of a queued send the server holds for the person's Mac is answered 202 with the row
+    /// as it stands (opengrok-server PR #298), and no run starts. The turn is not read as a stream
+    /// that said nothing: it is held for the Mac, with the server's sentence and the row, still
+    /// queued and waiting for the Mac, for the queue to put back. No frame reaches the turn.
+    #[tokio::test]
+    async fn a_fire_the_server_holds_for_the_mac_is_no_turn() {
+        let server = MockServer::start().await;
+        let row = json!({
+            "v": 1, "id": "pum_1", "threadId": "thread_1", "content": "then this, by my Mac",
+            "replyTo": null, "recipeId": null, "recipeValues": null, "skillId": null,
+            "clientMessageId": "m2", "status": "pending", "createdAtMs": 1, "updatedAtMs": 1,
+            "drainedAtMs": null, "drainedRunId": null,
+            "inferenceSource": {"kind": "local_proxy", "via": "mac"},
+            "heldFor": "relay_offline"
+        });
+        let said = "Your Mac isn't connected, so this message stays queued and goes when it \
+                    reconnects.";
+        Mock::given(method("POST"))
+            .and(path("/ag-ui"))
+            .respond_with(ResponseTemplate::new(202).set_body_json(json!({
+                "v": 1, "id": "pum_1", "heldFor": "relay_offline", "message": said,
+                "event": {
+                    "type": "CUSTOM", "timestamp": 1, "name": "pending-user-message",
+                    "value": {"v": 1, "op": "edited", "threadId": "thread_1", "message": row}
+                }
+            })))
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        put_cookie(&client, &live_session());
+        let mut frames = 0;
+        let held = client
+            .run_turn(
+                "cw_1",
+                "thread_1",
+                "run_1",
+                &[],
+                None,
+                None,
+                Some("pum_1"),
+                None,
+                None,
+                |_, _| frames += 1,
+            )
+            .await
+            .expect_err("a held send starts no turn");
+        assert!(held.is_held_for_mac(), "{held:?}");
+        assert_eq!(held.message, said);
+        assert_eq!(frames, 0);
+        let custom = held.pending_custom().expect("the row as it stands");
+        assert_eq!(custom.op, crate::opengrok::PendingOp::Edited);
+        let row = custom.message.expect("the row");
+        assert_eq!(row.id, "pum_1");
+        assert!(row.waits_for_mac());
     }
 
     #[tokio::test]
@@ -6906,7 +7615,7 @@ mod tests {
     /// owner may change (403). Both are verdicts about what was asked, not an outage.
     #[tokio::test]
     async fn a_refused_effort_is_the_servers_sentence() {
-        let unknown = "effort must be one of inherit, none, low, medium, high, xhigh, max";
+        let unknown = "effort must be one of inherit, none, low, medium, high, xhigh, max, ultra";
         let shared = "only the person who hired this coworker can change it; you can hide it \
                       from your own sidebar";
         let server = MockServer::start().await;
@@ -6941,6 +7650,81 @@ mod tests {
             assert_eq!(error.message, said);
             assert_eq!(error.failure(), Failure::Verdict);
         }
+    }
+
+    /// A change in the model picker goes as one PATCH carrying the Bot's door, its model and its
+    /// effort, each only when it changed (opengrok-server main d6f640e (#307, after #304), pin
+    /// bf99845), and the answer is the row as the server now keeps
+    /// it, door and all. A door and a model the allowlist does not take, sent together, are
+    /// refused together with a 400 in the server's words, which is what the person is shown: the
+    /// sentence the recording holds for that pair.
+    #[tokio::test]
+    async fn a_picks_patch_carries_the_door_the_model_and_the_effort() {
+        use crate::opengrok::{CoworkerSource, InferenceKind};
+        let refused = "model: claude-sonnet-4.5 is one of Anthropic's models, and Anthropic's \
+                       terms forbid using a consumer subscription through a third-party app; \
+                       pick an OpenAI or xAI model, or use the gateway";
+        let server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .and(path("/coworkers/cw_1"))
+            .and(body_json(json!({
+                "source": "local_proxy",
+                "model": "gpt-6-luna--fast",
+                "effort": "max"
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "cw_1",
+                "name": "Ada",
+                "model": "gpt-6-luna--fast",
+                "effort": "max",
+                "source": "local_proxy",
+                "visibility": "private"
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path("/coworkers/cw_1"))
+            .and(body_json(
+                json!({"source": "local_proxy", "model": "claude-sonnet-4.5"}),
+            ))
+            .respond_with(ResponseTemplate::new(400).set_body_json(json!({"error": refused})))
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        let kept = client
+            .patch_coworker(
+                "cw_1",
+                &CoworkerPatch {
+                    source: Some(InferenceKind::LocalProxy),
+                    model: Some("gpt-6-luna--fast".into()),
+                    effort: Some("max".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            (kept.source, kept.model.as_str(), kept.effort.as_deref()),
+            (
+                CoworkerSource::Kind(InferenceKind::LocalProxy),
+                "gpt-6-luna--fast",
+                Some("max")
+            )
+        );
+        let error = client
+            .patch_coworker(
+                "cw_1",
+                &CoworkerPatch {
+                    source: Some(InferenceKind::LocalProxy),
+                    model: Some("claude-sonnet-4.5".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("the server refused it");
+        assert_eq!(error.status, Some(400));
+        assert_eq!(error.message, refused);
+        assert_eq!(error.failure(), Failure::Verdict);
     }
 
     #[tokio::test]
@@ -8487,6 +9271,75 @@ mod tests {
         assert_eq!(odd.egress_policy, None, "an unknown word hides the control");
     }
 
+    /// Why the server could not give a bot a computer rides on its status, as the corpus records
+    /// it for a hire whose box could not be made: the code, the words and the stamp, as sent.
+    /// The pane reads it off any status that names no box, whether no box could be made
+    /// (`absent`, as on the owner's server with no Local VM image) or its provider cannot be
+    /// reached (`stopped`, `unknown`). Beside a box it is a takeover's note, and a healthy box's
+    /// status carries none.
+    #[test]
+    fn coworker_computer_reads_why_the_server_could_not_give_one() {
+        let recorded = |recording: &str| -> CoworkerComputer {
+            let fixture: Value = serde_json::from_str(recording).expect("the recording");
+            serde_json::from_value(fixture["body"].clone()).expect("the status")
+        };
+        let refused = recorded(include_str!(
+            "../../fixtures/wire/rest/GET__coworkers__coworker_id__computer/200-a_hosted_hire_whose_ascii_create_fails_records_why_and_makes_no_box.json"
+        ));
+        assert_eq!(refused.state, "absent");
+        assert_eq!(
+            refused.computer_error,
+            Some(ComputerError {
+                code: "quota_exceeded".into(),
+                message: "the box refused: 429 {\"error\":\"box creation rate limit reached: \
+                          https://api.box.ascii.dev/v1/boxes?key=«redacted»\"}"
+                    .into(),
+                updated_at_ms: 1_790_000_000_000,
+            })
+        );
+        assert_eq!(refused.why_no_computer(), refused.computer_error.as_ref());
+
+        let image_missing = "the box refused: 125 Unable to find image 'grok-box:local' locally \
+                             … pull access denied for grok-box";
+        for state in ["absent", "stopped", "unknown"] {
+            let status: CoworkerComputer = serde_json::from_value(json!({
+                "agentId": "cw_1",
+                "state": state,
+                "vncUrl": null,
+                "computerError": {
+                    "code": "provider_error",
+                    "message": image_missing,
+                    "updatedAtMs": 1_790_000_000_000_i64
+                },
+                "isEgressTunnelAvailable": false
+            }))
+            .unwrap();
+            assert_eq!(
+                status.why_no_computer().map(|error| error.message.as_str()),
+                Some(image_missing),
+                "{state}"
+            );
+        }
+
+        let takeover = recorded(include_str!(
+            "../../fixtures/wire/rest/GET__coworkers__coworker_id__computer/200-a_self_hosted_takeover_keeps_the_fallback_and_says_so.json"
+        ));
+        assert_eq!(
+            takeover
+                .computer_error
+                .as_ref()
+                .map(|error| error.code.as_str()),
+            Some("invalid_key")
+        );
+        assert_eq!(takeover.why_no_computer(), None, "a computer was given");
+
+        let healthy = recorded(include_str!(
+            "../../fixtures/wire/rest/GET__coworkers__coworker_id__computer/200-a_healthy_local_vm_does_not_wear_another_scopes_failure.json"
+        ));
+        assert_eq!(healthy.computer_error, None);
+        assert_eq!(healthy.why_no_computer(), None);
+    }
+
     #[tokio::test]
     async fn set_egress_policy_puts_the_stored_word() {
         let server = MockServer::start().await;
@@ -8843,6 +9696,175 @@ mod tests {
         assert!(computers[0].online);
     }
 
+    /// A computer's row carries its own relay switch and whether the server holds its relay stream
+    /// now, beside what it always carried (opengrok-server #342 (main 2136ffc), `row` in
+    /// `crates/opengrok-server/src/local_exec.rs`): every field as the server writes it,
+    /// and a row from a server before the switch, which has neither key, reads as switched on and
+    /// not relaying. The roster carries both on, for each computer's card, and leaves a revoked
+    /// computer out, as it always did: the server refuses to switch one (409 `revoked`), so a card
+    /// for it would have nothing to offer.
+    #[tokio::test]
+    async fn a_computers_row_says_its_relay_switch_and_whether_it_relays_now() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/local-exec/daemon"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "machines": [
+                    {"machineId": "mac_1", "label": "Ada's MacBook", "enrolledAtMs": 1790000000000_i64,
+                     "revoked": false, "connected": true, "relayEnabled": true, "relaying": true},
+                    {"machineId": "mac_2", "label": "Studio", "enrolledAtMs": 1790000000001_i64,
+                     "revoked": false, "connected": false, "relayEnabled": false, "relaying": false},
+                    {"machineId": "mac_3", "label": "Old server's", "revoked": false,
+                     "connected": false},
+                    {"machineId": "mac_4", "label": "Revoked", "enrolledAtMs": 1790000000002_i64,
+                     "revoked": true, "connected": false, "relayEnabled": true, "relaying": false}
+                ]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/local-exec/policy"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"mode": "ask"})))
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+
+        let rows = client.list_daemons().await.unwrap();
+        let said: Vec<(&str, bool, bool)> = rows
+            .iter()
+            .map(|row| (row.machine_id.as_str(), row.relay_enabled, row.relaying))
+            .collect();
+        assert_eq!(
+            said,
+            [
+                ("mac_1", true, true),
+                ("mac_2", false, false),
+                ("mac_3", true, false),
+                ("mac_4", true, false)
+            ],
+            "a row with neither key reads on and not relaying"
+        );
+        assert!(rows[3].revoked, "the list says which are revoked");
+        let said: Vec<(&str, bool, bool)> = said.into_iter().take(3).collect();
+
+        let computers = client.list_computers().await.unwrap();
+        let carried: Vec<(&str, bool, bool)> = computers
+            .iter()
+            .map(|computer| {
+                (
+                    computer.machine_id.as_str(),
+                    computer.relay_enabled,
+                    computer.relaying,
+                )
+            })
+            .collect();
+        assert_eq!(carried, said, "the roster carries them for the cards");
+    }
+
+    /// A computer's relay switch is one PATCH of `{relayEnabled}` to that computer's id, the same
+    /// for any computer of the account, and the server answers the computer's row as it stands
+    /// after: switched off, no longer relaying. Nothing else is in the body.
+    #[tokio::test]
+    async fn a_computers_relay_switch_is_a_patch_of_relay_enabled_and_answers_its_row() {
+        let server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .and(path("/local-exec/daemon/mac_2"))
+            .and(body_json(json!({ "relayEnabled": false })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "machineId": "mac_2", "label": "Studio", "enrolledAtMs": 1790000000001_i64,
+                "revoked": false, "connected": true, "relayEnabled": false, "relaying": false
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path("/local-exec/daemon/mac_2"))
+            .and(body_json(json!({ "relayEnabled": true })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "machineId": "mac_2", "label": "Studio", "enrolledAtMs": 1790000000001_i64,
+                "revoked": false, "connected": true, "relayEnabled": true, "relaying": true
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+
+        let off = client.switch_computer_relay("mac_2", false).await.unwrap();
+        assert_eq!(
+            (off.machine_id.as_str(), off.relay_enabled, off.relaying),
+            ("mac_2", false, false)
+        );
+        let on = client.switch_computer_relay("mac_2", true).await.unwrap();
+        assert_eq!((on.relay_enabled, on.relaying), (true, true));
+    }
+
+    /// What the server refuses a switch with is read as its words and its code, each as the server
+    /// writes them (`switch_relay` in opengrok-server #342 (main 2136ffc)): another account's
+    /// computer and one nobody enrolled
+    /// are the same 404 `not_found`, a revoked one 409 `revoked`, and a body without a true or
+    /// false 400 `bad_request`. An id with a slash in it cannot turn the route into another.
+    #[tokio::test]
+    async fn a_refused_relay_switch_reads_the_servers_words_and_code() {
+        let server = MockServer::start().await;
+        for (id, status, words, code) in [
+            (
+                "mac_theirs",
+                404,
+                "no computer of yours has that id",
+                "not_found",
+            ),
+            (
+                "mac_old",
+                409,
+                "this computer was revoked; enrol it again to use it",
+                "revoked",
+            ),
+            (
+                "mac_odd",
+                400,
+                "relayEnabled must be true or false",
+                "bad_request",
+            ),
+        ] {
+            Mock::given(method("PATCH"))
+                .and(path(format!("/local-exec/daemon/{id}")))
+                .respond_with(
+                    ResponseTemplate::new(status)
+                        .set_body_json(json!({ "error": words, "code": code })),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+            let client = OpenGrokClient::new(&server.uri()).unwrap();
+            let refused = client.switch_computer_relay(id, false).await.unwrap_err();
+            assert_eq!(refused.status, Some(status), "{id}");
+            assert_eq!(refused.message, words, "{id}");
+            assert_eq!(refused.code(), Some(code), "{id}");
+            assert!(refused.written_by_opengrok(), "{id}");
+        }
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        let odd = client
+            .switch_computer_relay("../account", true)
+            .await
+            .unwrap_err();
+        assert!(
+            odd.status.is_some(),
+            "an id that is not a path is a refusal, never another route's answer"
+        );
+        let asked: Vec<String> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|request| request.url.path().to_string())
+            .collect();
+        assert_eq!(
+            asked.last().map(String::as_str),
+            Some("/local-exec/daemon/..%2Faccount"),
+            "{asked:?}"
+        );
+    }
+
     /// Always on the local shell's card posts one rule for the command on it. A rule the server
     /// will not keep comes back as a 422 whose body is the reason, and the reason is what the
     /// card shows (opengrok-server `add_rule` in `crates/opengrok-server/src/local_exec.rs`).
@@ -8999,6 +10021,8 @@ mod tests {
             mode,
             this_machine,
             online,
+            relay_enabled: true,
+            relaying: false,
         }
     }
 
@@ -9757,6 +10781,77 @@ mod tests {
         assert_eq!(hook.header, "Authorization: Bearer og_live_abc");
     }
 
+    /// A routine's zone is read off its row as the server keeps it (opengrok-server #316, #334, on
+    /// main 8e7387f), and a server from before zones sends none. A create and an edit from this app
+    /// name no zone, so a new routine takes the account's and an edited one keeps its own.
+    #[tokio::test]
+    async fn a_routines_zone_is_read_off_its_row_and_never_sent() {
+        let row = json!({
+            "id": "sch_1", "coworkerId": "cw_1", "kind": "cron", "cron": "0 0 9 * * MON-FRI",
+            "prompt": "post the standup", "name": "Standup", "active": true,
+            "tz": "Asia/Manila"
+        });
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/schedules"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+                row.clone(),
+                {
+                    "id": "sch_2", "coworkerId": "cw_1", "kind": "cron", "cron": "0 0 8 * * *",
+                    "prompt": "write it", "active": true
+                }
+            ])))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/schedules"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(row.clone()))
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path("/schedules/sch_1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(row))
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        let rows = client.list_schedules("cw_1").await.unwrap();
+        assert_eq!(rows[0].tz.as_deref(), Some("Asia/Manila"));
+        assert_eq!(rows[1].tz, None, "a server before zones");
+        let made = client
+            .create_schedule(&NewSchedule {
+                coworker_id: "cw_1".into(),
+                kind: ScheduleKind::Cron,
+                prompt: "post the standup".into(),
+                name: "Standup".into(),
+                cron: Some("0 9 * * MON-FRI".into()),
+            })
+            .await
+            .unwrap();
+        assert_eq!(made.tz.as_deref(), Some("Asia/Manila"), "the account's");
+        client
+            .edit_schedule(
+                "sch_1",
+                &ScheduleEdit {
+                    cron: Some("0 10 * * MON-FRI".into()),
+                    ..ScheduleEdit::default()
+                },
+            )
+            .await
+            .unwrap();
+        let sent: Vec<Value> = server
+            .received_requests()
+            .await
+            .expect("the recorder is on")
+            .iter()
+            .filter(|request| request.method.as_str() != "GET")
+            .map(|request| serde_json::from_slice(&request.body).expect("a JSON body"))
+            .collect();
+        assert_eq!(sent.len(), 2, "a create and an edit");
+        for body in &sent {
+            assert!(body.get("tz").is_none(), "no zone named: {body}");
+        }
+    }
+
     /// An edit sends only what the person changed: an absent field keeps what the routine has
     /// on the server, so a rename never resends the prompt, and the row that comes back is the
     /// routine as it now is.
@@ -9842,29 +10937,183 @@ mod tests {
             .await;
         let client = OpenGrokClient::new(&server.uri()).unwrap();
         let runs = client.schedule_runs("sch_1").await.unwrap();
-        let read: Vec<(&str, RunCause, ScheduleRunStatus, Option<i64>)> = runs
+        // A line as the history reads it: the run, what set it off, where it got to, its end.
+        type Line<'a> = (
+            Option<&'a str>,
+            RunCause,
+            Option<ScheduleRunStatus>,
+            Option<i64>,
+        );
+        let read: Vec<Line> = runs
             .iter()
-            .map(|run| (run.run_id.as_str(), run.cause, run.status, run.ended_at_ms))
+            .map(|run| {
+                (
+                    run.run_id.as_deref(),
+                    run.cause,
+                    run.status,
+                    run.ended_at_ms,
+                )
+            })
             .collect();
         assert_eq!(
             read,
             vec![
-                ("run_3", RunCause::Manual, ScheduleRunStatus::Running, None),
                 (
-                    "run_2",
+                    Some("run_3"),
+                    RunCause::Manual,
+                    Some(ScheduleRunStatus::Running),
+                    None
+                ),
+                (
+                    Some("run_2"),
                     RunCause::Webhook,
-                    ScheduleRunStatus::Ok,
+                    Some(ScheduleRunStatus::Ok),
                     Some(2500)
                 ),
                 (
-                    "run_1",
+                    Some("run_1"),
                     RunCause::Clock,
-                    ScheduleRunStatus::Error,
+                    Some(ScheduleRunStatus::Error),
                     Some(1200)
                 ),
-                ("run_0", RunCause::Other, ScheduleRunStatus::Waiting, None),
+                (
+                    Some("run_0"),
+                    RunCause::Other,
+                    Some(ScheduleRunStatus::Waiting),
+                    None
+                ),
             ]
         );
+        assert!(
+            runs.iter().all(|run| !run.is_skipped()),
+            "every line is a run"
+        );
+    }
+
+    /// A firing the server skipped, because the Bot answers on its person's own plan and the plan
+    /// could not answer (opengrok-server #316, #334, on main 8e7387f), is a line of the history
+    /// with no run, no status and no start, beside its own time, the code and the server's
+    /// sentence. It reads as a skip, in its order among the runs, and leaves the runs beside it as
+    /// they were.
+    #[tokio::test]
+    async fn a_skipped_firing_is_a_line_of_the_history_with_no_run() {
+        let said = "Skipped: your computer was off, so your plan couldn't answer";
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/schedules/sch_1/runs"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+                { "runId": null, "cause": "clock", "status": null, "startedAtMs": null,
+                  "endedAtMs": null, "at": 3000, "state": "skipped", "skipped": "relay_offline",
+                  "reason": said },
+                { "runId": "run_1", "cause": "manual", "status": "ok",
+                  "startedAtMs": 1000, "endedAtMs": 1200 }
+            ])))
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        let runs = client.schedule_runs("sch_1").await.unwrap();
+        assert_eq!(runs.len(), 2);
+        let skip = &runs[0];
+        assert!(skip.is_skipped());
+        assert_eq!(
+            (
+                skip.run_id.as_deref(),
+                skip.cause,
+                skip.status,
+                skip.at,
+                skip.skipped.as_deref(),
+                skip.reason.as_deref()
+            ),
+            (
+                None,
+                RunCause::Clock,
+                None,
+                Some(3000),
+                Some("relay_offline"),
+                Some(said)
+            )
+        );
+        assert!(!runs[1].is_skipped());
+        assert_eq!(runs[1].run_id.as_deref(), Some("run_1"));
+    }
+
+    /// A run a Bot started with its `run_routine` tool (opengrok-server #337, built in #342) is a
+    /// line of the history with `cause: "bot"` and `by: {coworkerId, name}`, and so is a firing a
+    /// Bot's press set off that the plan could not answer; every other line has `by: null`, or, from
+    /// a server before it, none at all, and is read as it always was.
+    #[tokio::test]
+    async fn a_run_a_bot_started_names_the_bot_in_the_history() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/schedules/sch_1/runs"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+                { "runId": "run_4", "cause": "bot", "status": "ok", "startedAtMs": 4000,
+                  "endedAtMs": 4500, "by": { "coworkerId": "cw_luna", "name": "Luna" } },
+                { "runId": null, "cause": "bot", "status": null, "startedAtMs": null,
+                  "endedAtMs": null, "at": 3000, "state": "skipped", "skipped": "proxy_down",
+                  "reason": "Skipped: your plan's proxy didn't answer",
+                  "by": { "coworkerId": "cw_luna", "name": "Luna" } },
+                { "runId": "run_2", "cause": "manual", "status": "ok", "startedAtMs": 2000,
+                  "endedAtMs": 2500, "by": null },
+                { "runId": "run_1", "cause": "clock", "status": "ok", "startedAtMs": 1000,
+                  "endedAtMs": 1200 }
+            ])))
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        let runs = client.schedule_runs("sch_1").await.unwrap();
+        let read: Vec<(RunCause, Option<(&str, &str)>)> = runs
+            .iter()
+            .map(|run| {
+                (
+                    run.cause,
+                    run.by
+                        .as_ref()
+                        .map(|by| (by.coworker_id.as_str(), by.name.as_str())),
+                )
+            })
+            .collect();
+        assert_eq!(
+            read,
+            vec![
+                (RunCause::Bot, Some(("cw_luna", "Luna"))),
+                (RunCause::Bot, Some(("cw_luna", "Luna"))),
+                (RunCause::Manual, None),
+                (RunCause::Clock, None),
+            ]
+        );
+        assert!(runs[1].is_skipped() && !runs[0].is_skipped());
+    }
+
+    /// Run it now while the Bot's plan cannot answer is the server's 409 with the skip's code and
+    /// its sentence (opengrok-server #316, #334, on main 8e7387f: `run_schedule_now`), which is
+    /// what the person is told; the code says the firing was kept as skipped. The 409 for a retired
+    /// coworker names no code, and is no skip.
+    #[tokio::test]
+    async fn run_now_on_a_plan_that_cannot_answer_is_refused_as_a_skip() {
+        let said = "Skipped: your computer was off, so your plan couldn't answer";
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/schedules/sch_1/run"))
+            .respond_with(
+                ResponseTemplate::new(409)
+                    .set_body_json(json!({ "error": said, "code": "relay_offline" })),
+            )
+            .mount(&server)
+            .await;
+        let retired = "this routine's coworker is no longer hired; hand it to another coworker";
+        Mock::given(method("POST"))
+            .and(path("/schedules/sch_2/run"))
+            .respond_with(ResponseTemplate::new(409).set_body_json(json!({ "error": retired })))
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        let skipped = client.run_schedule_now("sch_1").await.unwrap_err();
+        assert!(skipped.is_skipped_firing(), "{skipped:?}");
+        assert_eq!(skipped.message, said, "the server's sentence, not its code");
+        assert_eq!(skipped.code(), Some("relay_offline"));
+        let retired = client.run_schedule_now("sch_2").await.unwrap_err();
+        assert!(!retired.is_skipped_firing(), "{retired:?}");
     }
 
     /// A thread id is the server's to choose, so it goes into a path as one segment: a `/` or
@@ -9922,6 +11171,79 @@ mod tests {
         let error = client.delete_schedule("sch_1").await.unwrap_err();
         assert_eq!(error.status, Some(404));
         assert_eq!(error.message, "No such schedule.");
+    }
+
+    /// An opengrok-server from before the one that can edit a routine, run it now and list what
+    /// it ran (opengrok-server 18656e3, `autonomy/routes.rs`) answers the three the way axum
+    /// answers what it has no route for: `GET …/runs` and `POST …/run` with an empty 404, and
+    /// `PATCH /schedules/{id}`, a path it has for `DELETE` only, with an empty 405. Each reads as
+    /// the route missing, which is a fact about the server and not about the routine.
+    #[tokio::test]
+    async fn an_older_server_without_the_routine_routes_says_so_by_its_empty_answers() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/schedules/sch_1/runs"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path("/schedules/sch_1"))
+            .respond_with(ResponseTemplate::new(405))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/schedules/sch_1/run"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+
+        let runs = client.schedule_runs("sch_1").await.unwrap_err();
+        assert!(runs.route_missing(), "{runs}");
+        assert!(runs.said_nothing(), "nothing the server wrote: {runs}");
+        let edit = client
+            .edit_schedule(
+                "sch_1",
+                &ScheduleEdit {
+                    cron: Some("* * * * *".into()),
+                    ..ScheduleEdit::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(edit.route_missing(), "{edit}");
+        let run = client.run_schedule_now("sch_1").await.unwrap_err();
+        assert!(run.route_missing(), "{run}");
+    }
+
+    /// The server's own 404 for a routine it does not have (or will not show this person) is
+    /// plain text, `no such schedule` (`owned_schedule`): its words, about the routine, on a
+    /// route it has. An empty 500 says nothing, and is still no missing route.
+    #[tokio::test]
+    async fn a_404_with_the_servers_words_is_about_the_routine_and_not_a_missing_route() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/schedules/sch_gone/run"))
+            .respond_with(ResponseTemplate::new(404).set_body_string("no such schedule"))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/schedules/sch_1/runs"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+
+        let gone = client.run_schedule_now("sch_gone").await.unwrap_err();
+        assert!(!gone.route_missing(), "{gone}");
+        assert!(!gone.said_nothing());
+        assert_eq!(gone.message, "no such schedule");
+        let broken = client.schedule_runs("sch_1").await.unwrap_err();
+        assert!(broken.said_nothing(), "{broken}");
+        assert!(
+            !broken.route_missing(),
+            "a 500 is not a route the server lacks"
+        );
     }
 
     #[tokio::test]

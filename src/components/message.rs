@@ -1,7 +1,7 @@
 use std::rc::Rc;
 
 use crate::actions::{CopyMessage, ToggleReadAloud};
-use crate::chrome::{BUBBLE_RADIUS, CHAT_CONTENT_MAX, chat_column_width};
+use crate::chrome::{BUBBLE_RADIUS, CHAT_BODY_REM, CHAT_CONTENT_MAX, chat_column_width};
 use crate::components::message_actions::{CONTROL_PX, MessageToolbar, TOOLBAR_W};
 use crate::state::{AppState, RightPane};
 use gpui_kit::component::text::TextView;
@@ -32,7 +32,7 @@ pub struct MessageBubble {
     is_me: bool,
     timestamp: Option<String>,
     duration: Option<String>,
-    timing_debug: Option<String>,
+    turn_total: Option<String>,
     message_id: String,
     source_id: String,
     debug_mode: bool,
@@ -56,6 +56,9 @@ pub struct MessageBubble {
     timestamps_ok: bool,
     /// Held until the thread is idle: a small "Queued" under the bubble says so.
     queued: bool,
+    /// Held by the server until a Mac holds the relay again: the queued line says it waits for
+    /// the person's Mac instead.
+    waiting_for_mac: bool,
     /// The files the person's message carried (#90), drawn under its words. A message of files
     /// alone draws only them, with the same time, toolbar and queued line a worded one has
     /// (#136).
@@ -75,7 +78,7 @@ impl MessageBubble {
             is_me: false,
             timestamp: None,
             duration: None,
-            timing_debug: None,
+            turn_total: None,
             message_id,
             source_id: String::new(),
             debug_mode: false,
@@ -95,6 +98,7 @@ impl MessageBubble {
             ts_peek: 0.0,
             timestamps_ok: true,
             queued: false,
+            waiting_for_mac: false,
             files: Vec::new(),
             source_badge: None,
             app: None,
@@ -213,10 +217,13 @@ impl MessageBubble {
         self
     }
 
-    pub fn timing_debug(mut self, timing: impl Into<String>) -> Self {
-        let timing = timing.into();
-        self.timing_debug = (!timing.trim().is_empty()).then_some(timing);
+    pub fn turn_total(mut self, total: Option<String>) -> Self {
+        self.turn_total = total;
         self
+    }
+
+    fn metadata_peek(&self) -> TimestampPeek {
+        TimestampPeek::new(self.ts_peek, self.timestamps_ok)
     }
 
     pub fn debug_mode(mut self, enabled: bool) -> Self {
@@ -258,6 +265,11 @@ impl MessageBubble {
 
     pub fn queued(mut self, queued: bool) -> Self {
         self.queued = queued;
+        self
+    }
+
+    pub fn waiting_for_mac(mut self, waiting: bool) -> Self {
+        self.waiting_for_mac = waiting;
         self
     }
 
@@ -303,17 +315,8 @@ impl RenderOnce for MessageBubble {
             cx,
             |_, _| false,
         );
-        let peek = if self.timestamps_ok {
-            self.ts_peek.clamp(0.0, TS_PEEK_MAX)
-        } else {
-            0.0
-        };
-        let peeking = peek > 0.5;
-        let progress = if TS_PEEK_MAX > 0.0 {
-            peek / TS_PEEK_MAX
-        } else {
-            0.0
-        };
+        let peek = self.metadata_peek();
+        let peeking = peek.shift > 0.5;
         let hovered = *hover_state.read(cx)
             || self.picker_open
             || *menu_state.read(cx)
@@ -370,7 +373,8 @@ impl RenderOnce for MessageBubble {
         } else if self.is_me || !self.use_markdown {
             div()
                 .id(ElementId::Name(format!("msg-body-{row_key}").into()))
-                .text_sm()
+                .text_size(rems(CHAT_BODY_REM))
+                .font_weight(FontWeight::NORMAL)
                 .child(self.text.clone())
                 .into_any_element()
         } else {
@@ -378,6 +382,8 @@ impl RenderOnce for MessageBubble {
                 ElementId::Name(format!("md-{row_key}").into()),
                 self.text.clone(),
             )
+            .text_size(rems(CHAT_BODY_REM))
+            .font_weight(FontWeight::NORMAL)
             .into_any_element()
         };
 
@@ -479,28 +485,13 @@ impl RenderOnce for MessageBubble {
                                 .text_xs()
                                 .text_color(muted)
                                 .when(is_me, |this| this.text_right())
-                                .child("Queued — sends when the coworker is free"),
+                                .child(queued_line(self.waiting_for_mac)),
                         )
                         .when_some(actions, |this, actions| this.child(actions)),
                 )
             })
             .when_some(badge, |this, badge| {
                 this.child(h_flex().mt(px(4.)).child(badge))
-            })
-            .when_some(self.timing_debug.clone(), |this, timing| {
-                this.child(
-                    v_flex()
-                        .id(ElementId::Name(format!("turn-timing-{row_key}").into()))
-                        .mt(px(4.))
-                        .gap(px(1.))
-                        .text_xs()
-                        .text_color(muted)
-                        .children(
-                            timing
-                                .lines()
-                                .map(|line| div().child(SharedString::from(line.to_string()))),
-                        ),
-                )
             })
             .when_some(self.reaction.clone(), |this, emoji| {
                 this.child(
@@ -527,7 +518,11 @@ impl RenderOnce for MessageBubble {
             if !self.show_footer {
                 return None;
             }
-            let preview = truncate_preview(&self.copy_text, 72);
+            let preview = crate::reply_preview::preview(
+                &self.copy_text,
+                !self.is_me && self.use_markdown,
+                72,
+            );
             let menu_state = menu_state.clone();
             Some(
                 MessageToolbar::new(app, row_key.clone(), source_id.clone())
@@ -632,47 +627,36 @@ impl RenderOnce for MessageBubble {
         let text = self.copy_text.clone();
         let hover_state_row = hover_state.clone();
 
-        // Grok: --sand-ts-peek shifts every row together; timestamps slide in from
-        // the right with --sand-ts-progress. The time shows only while peeking, never on
-        // hover: the space beside the bubble is the toolbar's alone.
+        // Timestamp and total share the same swipe rail. Nothing is reserved or shown at
+        // rest, and the hover toolbar gives way while the person is peeking.
+        let metadata = if let Some(total) = &self.turn_total {
+            turn_metadata(&time_label, total, cx)
+        } else {
+            v_flex()
+                .items_end()
+                .gap_0()
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(muted)
+                        .whitespace_nowrap()
+                        .child(time_label),
+                )
+                .when_some(duration_label, |this, duration| {
+                    this.child(
+                        div()
+                            .text_xs()
+                            .text_color(muted.opacity(0.85))
+                            .whitespace_nowrap()
+                            .child(duration),
+                    )
+                })
+        };
         let body_row = div()
             .relative()
             .w_full()
-            .child(div().w_full().ml(px(-peek)).child(main))
-            .child(
-                div()
-                    .absolute()
-                    .top_0()
-                    .bottom_0()
-                    .right_0()
-                    .w(px(TIMESTAMP_W))
-                    .flex()
-                    .items_center()
-                    .justify_end()
-                    .pl(px(10.))
-                    .opacity(if peeking { progress } else { 0. })
-                    .child(
-                        v_flex()
-                            .items_end()
-                            .gap(px(0.))
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(muted)
-                                    .whitespace_nowrap()
-                                    .child(time_label),
-                            )
-                            .when_some(duration_label, |this, duration| {
-                                this.child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(muted.opacity(0.85))
-                                        .whitespace_nowrap()
-                                        .child(duration),
-                                )
-                            }),
-                    ),
-            );
+            .child(div().w_full().ml(px(-peek.shift)).child(main))
+            .child(peek.rail(metadata));
 
         div()
             .id(ElementId::Name(format!("msg-row-{row_key}").into()))
@@ -701,6 +685,19 @@ impl RenderOnce for MessageBubble {
     }
 }
 
+/// The final reply's total stays directly beneath its timestamp in the swipe rail.
+pub(super) fn turn_metadata(timestamp: &str, total: &str, cx: &App) -> Div {
+    v_flex()
+        .w_full()
+        .items_end()
+        .gap_0()
+        .text_xs()
+        .text_color(cx.theme().muted_foreground)
+        .whitespace_nowrap()
+        .child(timestamp.to_string())
+        .child(total.to_string())
+}
+
 fn truncate_preview(text: &str, max: usize) -> String {
     let trimmed = text.trim().replace('\n', " ");
     if trimmed.chars().count() <= max {
@@ -708,6 +705,46 @@ fn truncate_preview(text: &str, max: usize) -> String {
     } else {
         let cut: String = trimmed.chars().take(max.saturating_sub(1)).collect();
         format!("{cut}…")
+    }
+}
+
+/// Shared swipe progress for reply words and replies ending with an action or card.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct TimestampPeek {
+    pub shift: f32,
+    pub opacity: f32,
+}
+
+impl TimestampPeek {
+    pub fn new(requested: f32, timestamps_ok: bool) -> Self {
+        let shift = if timestamps_ok {
+            requested.clamp(0.0, TS_PEEK_MAX)
+        } else {
+            0.0
+        };
+        Self {
+            shift,
+            opacity: if shift > 0.5 {
+                shift / TS_PEEK_MAX
+            } else {
+                0.0
+            },
+        }
+    }
+
+    pub fn rail(self, metadata: Div) -> Div {
+        div()
+            .absolute()
+            .top_0()
+            .bottom_0()
+            .right_0()
+            .w(px(TIMESTAMP_W))
+            .flex()
+            .items_center()
+            .justify_end()
+            .pl(px(10.))
+            .opacity(self.opacity)
+            .child(metadata)
     }
 }
 
@@ -785,6 +822,19 @@ fn find_highlighted_text(text: &str, marks: &[(std::ops::Range<usize>, bool)]) -
     };
     div().text_sm().child(body).into_any_element()
 }
+
+/// The line under a held message: it sends when the coworker is free, or, while the server holds
+/// it for the person's Mac (`heldFor: "relay_offline"`, opengrok-server #292), when their Mac is
+/// answering again.
+pub(crate) fn queued_line(waiting_for_mac: bool) -> &'static str {
+    if waiting_for_mac {
+        WAITING_FOR_YOUR_MAC
+    } else {
+        "Queued — sends when the coworker is free"
+    }
+}
+
+pub(crate) const WAITING_FOR_YOUR_MAC: &str = "Waiting for your Mac";
 
 /// Cancel and Edit under a queued bubble, so they do not wait on hovering the ⋯.
 fn queued_hold_actions(
@@ -884,5 +934,64 @@ pub(crate) fn human_size(bytes: u64) -> String {
         format!("{:.0} KB", b / KIB)
     } else {
         format!("{:.1} MB", b / KIB / KIB)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    // Item by item rather than a glob: `use super::*` would drag in gpui_kit's own `test`.
+    use super::{MessageBubble, TS_PEEK_MAX, TimestampPeek, WAITING_FOR_YOUR_MAC, queued_line};
+
+    #[test]
+    fn a_timed_reply_preserves_the_timestamp_swipe() {
+        let reply = MessageBubble::new("Done.".into())
+            .turn_total(Some("30s total".into()))
+            .ts_peek(TS_PEEK_MAX);
+        assert_eq!(
+            reply.metadata_peek(),
+            TimestampPeek {
+                shift: TS_PEEK_MAX,
+                opacity: 1.0
+            }
+        );
+    }
+
+    #[test]
+    fn reply_metadata_is_hidden_before_and_after_the_swipe() {
+        let reply = MessageBubble::new("Done.".into()).turn_total(Some("30s total".into()));
+        assert_eq!(
+            reply.metadata_peek(),
+            TimestampPeek {
+                shift: 0.0,
+                opacity: 0.0
+            }
+        );
+    }
+
+    #[test]
+    fn narrow_replies_do_not_reveal_either_metadata_line() {
+        let reply = MessageBubble::new("Done.".into())
+            .turn_total(Some("30s total".into()))
+            .ts_peek(TS_PEEK_MAX)
+            .timestamps_ok(false);
+        assert_eq!(
+            reply.metadata_peek(),
+            TimestampPeek {
+                shift: 0.0,
+                opacity: 0.0
+            }
+        );
+    }
+
+    /// A held message says what it waits for: the coworker to be free, or, while the server
+    /// holds it for the person's Mac, their Mac.
+    #[test]
+    fn a_held_message_says_what_it_waits_for() {
+        assert_eq!(
+            queued_line(false),
+            "Queued — sends when the coworker is free"
+        );
+        assert_eq!(queued_line(true), WAITING_FOR_YOUR_MAC);
+        assert_eq!(WAITING_FOR_YOUR_MAC, "Waiting for your Mac");
     }
 }

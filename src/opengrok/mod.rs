@@ -10,7 +10,12 @@ mod error;
 mod gen_ui;
 mod inference;
 mod local_exec;
+mod model_choice;
+// The list of models the tests that draw a picker read.
+#[cfg(test)]
+pub(crate) mod model_fixtures;
 mod pending;
+mod relay;
 mod timing;
 mod types;
 mod user_form;
@@ -24,20 +29,38 @@ pub use credential::{
     CREDENTIAL_OFFER_SAVE, SaveLoginSpec, keep_local_save_offer, save_login_card_id,
     save_login_from_local, save_login_save_id, save_login_skip_id,
 };
+#[cfg(test)]
 pub(crate) use gen_ui::capped;
 pub use gen_ui::{
-    ApprovalSpec, BarChartSpec, BarItem, ChatPart, ChoiceCard, CompletedUiTool, FormField,
-    FormSpec, LocalExecResolution, MAX_TURN_CONTINUES, ScreenshotSpec, StepSpec, StepStatus,
-    TurnAssembler, UI_TOOL_RESULT, USER_MACHINE_SHELL, UiSpec, agui_tools, approval_from_event,
-    approval_summary, choice_index, choice_letter, collapse_open_approvals, command_from_args,
-    command_from_replay_events, local_exec_outcome, persons_messages,
-    place_hitl_cards_in_document_order, policy_answer,
+    ApprovalSpec, BarChartSpec, BarItem, CREATE_ROUTINE, ChatPart, ChoiceCard, CompletedUiTool,
+    DELETE_ROUTINE, FormField, FormSpec, FrameArrivals, LIST_ROUTINES, LocalExecResolution,
+    MAX_TURN_CONTINUES, RUN_ROUTINE, ScreenshotSpec, StepSpec, StepStatus, ThoughtSpec,
+    TurnAssembler, UI_TOOL_RESULT, UPDATE_ROUTINE, USER_MACHINE_SHELL, UiSpec, agui_tools,
+    approval_from_event, approval_summary, choice_index, choice_letter, collapse_open_approvals,
+    command_from_args, command_from_replay_events, keep_call_times, local_exec_outcome,
+    persons_messages, place_hitl_cards_in_document_order, policy_answer,
 };
 pub use inference::{
-    DEFAULT_PROXY_URL, INFERENCE_SOURCE_CUSTOM, InferenceKind, InferenceSource,
-    InferenceSourceUpdate, ProxyKey, ReplySource, is_loopback, is_subscription_model,
+    DEFAULT_PROXY_URL, FallbackFor, HELD_FOR_RELAY_OFFLINE, INFERENCE_SOURCE_CUSTOM, InferenceKind,
+    InferenceSource, InferenceSourceUpdate, NewBotDefault, PlanFallback, RelayRead, ReplySource,
+    RunErrorCode, TurnSource, Via, is_loopback, is_subscription_model,
 };
-pub use local_exec::{enrol_this_machine, serve_local_exec, stored_machine_id};
+pub use local_exec::{
+    Enrolment, LocalExecStopped, MachineCredential, enrol_this_machine, serve_local_exec,
+    stored_machine_id,
+};
+pub use model_choice::{
+    AccountPlan, ChoiceGroup, EFFORT_NOT_KEPT, FAST_ACCOUNT_PLAN, FAST_DOOR_UNKNOWN, FAST_NO_TWIN,
+    FAST_SUFFIX, GATEWAY_GROUP, LIST_ROWS, ListLine, ModelChoice, ModelPick, NEW_BOTS_NONE,
+    NEW_BOTS_PICK_FIRST, NEW_BOTS_PICK_ID, NO_MODEL, PLAN_FALLBACK_PICK_FIRST, ROUTINES_ON_PLAN,
+    SUBSCRIPTION_GROUP, base_label, bot_pick, group_title, is_fast, last_window_start, list_window,
+    model_label, new_bots_pick, plan_choices, plan_fallback_pick, row_count, server_choices,
+    window_opening_on, without_fast,
+};
+pub use relay::{
+    OpencodexAddress, RelayHandle, RelayKey, RelayReport, RelayStatus, RelayTarget, RelayTimings,
+    SERVER_QUIET, SERVER_UNREACHED, SERVER_WITHOUT_RELAY, TOKEN_REFUSED, start_relay,
+};
 pub(crate) use user_form::USER_FORM_REASON;
 pub use user_form::{
     BOX_HANDOFF_RESOLVE_PATH, BoxHandoffReply, BoxHandoffResolution, ComputerHandoffSpec,
@@ -61,19 +84,19 @@ pub use visibility::ImageVisibility;
 
 pub use client::{
     AsyncRunResponse, BotSkillRow, BotSkillScope, BoxShareScope, CeilingKind, CeilingRow,
-    ConnectedComputer, ConnectionOwner, ConnectionView, Connector, CoworkerCeiling,
-    CoworkerComputer, CoworkerSkills, CoworkerTool, CoworkerUsage, EgressTunnel, ImageStatus,
-    InertRule, LocalExecMode, LocalExecPolicy, MAX_ATTACHMENT_BYTES, ModelUsage, NewSchedule,
-    NewSkill, OpenGrokClient, QueuedApproval, RecipeBot, RecipeDetail, RecipeGrant, RecipeKind,
-    RecipeParameter, RecipeParameterKind, RecipeRelation, RecipeRun, RecipeRunResult, RecipeScreen,
-    RecipeShare, RecipeShareState, RecipeShareTarget, RecipeStep, RecipeSummary, RecipeTape,
-    RecipeTapeEvent, RecipeVersion, RevealedSecrets, RunCause, RunRecipeResponse, RunReplay,
-    SKILL_BODY_CHARS, SKILL_BUNDLE_FILES, SKILL_BUNDLE_LIMIT, ScheduleEdit, ScheduleKind,
-    ScheduleRow, ScheduleRun, ScheduleRunStatus, SiteLoginSave, SiteLoginUpdate, SkillDetail,
-    SkillFile, SkillPatch, SkillSource, SkillSummary, SkillVersion, StopReply, ThreadReplay,
-    ThreadRun, TurnRecipe, UpdateStatus, UsageTotals, WebhookInfo, collapse_computer_roster,
-    collapse_computers_by_machine_id, env_egress_tunnel_enabled, host_egress_tunnel_available,
-    host_egress_tunnel_enabled, host_egress_tunnel_flag, thin_tape,
+    ComputerError, ConnectedComputer, ConnectionOwner, ConnectionView, Connector, CoworkerCeiling,
+    CoworkerComputer, CoworkerSkills, CoworkerTool, CoworkerUsage, DaemonMachine, EgressTunnel,
+    ImageStatus, InertRule, LocalExecMode, LocalExecPolicy, MAX_ATTACHMENT_BYTES, ModelUsage,
+    NewSchedule, NewSkill, OpenGrokClient, QueuedApproval, RecipeBot, RecipeDetail, RecipeGrant,
+    RecipeKind, RecipeParameter, RecipeParameterKind, RecipeRelation, RecipeRun, RecipeRunResult,
+    RecipeScreen, RecipeShare, RecipeShareState, RecipeShareTarget, RecipeStep, RecipeSummary,
+    RecipeTape, RecipeTapeEvent, RecipeVersion, RevealedSecrets, RunBy, RunCause,
+    RunRecipeResponse, RunReplay, SKILL_BODY_CHARS, SKILL_BUNDLE_FILES, SKILL_BUNDLE_LIMIT,
+    ScheduleEdit, ScheduleKind, ScheduleRow, ScheduleRun, ScheduleRunStatus, SiteLoginSave,
+    SiteLoginUpdate, SkillDetail, SkillFile, SkillPatch, SkillSource, SkillSummary, SkillVersion,
+    StopReply, ThreadReplay, ThreadRun, TurnRecipe, UpdateStatus, UsageTotals, WebhookInfo,
+    collapse_computer_roster, collapse_computers_by_machine_id, env_egress_tunnel_enabled,
+    host_egress_tunnel_available, host_egress_tunnel_enabled, host_egress_tunnel_flag, thin_tape,
 };
 pub use error::{Failure, OpenGrokError, Unreachable, reads_as_gateway_unreachable, retry_enqueue};
 pub use pending::{
@@ -82,7 +105,7 @@ pub use pending::{
 };
 pub use timing::{TurnTiming, stamp_duration};
 pub use types::{
-    Account, AguiMessage, Attachment, Coworker, CoworkerPatch, EFFORT_INHERIT, EFFORT_WORDS,
-    LocalProxyStatus, ModelCatalogue, ModelEntry, ProfileUpdate, ReplyQuote, SentAttachment,
-    ThreadListing, assistant_text_from_sse,
+    Account, AguiMessage, Attachment, Coworker, CoworkerPatch, CoworkerSource, EFFORT_INHERIT,
+    EffortLevel, LocalProxyStatus, ModelCatalogue, ModelEntry, ProfileUpdate, ReplyQuote,
+    SentAttachment, ThreadListing, assistant_text_from_sse,
 };

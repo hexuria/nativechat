@@ -182,6 +182,9 @@ fn deed_from_tool(name: &str, args: Option<&str>) -> Option<String> {
             .map(|name| format!("read the {name} skill"))
             .unwrap_or_else(|| "read a skill".into()),
         "run_recipe" => "ran a recipe".into(),
+        super::gen_ui::RUN_ROUTINE => routine_named(parsed.as_ref())
+            .map(|name| format!("ran the {name} routine"))
+            .unwrap_or_else(|| "ran a routine".into()),
         "Computer" | "Screenshot" | "computerUseToolCall" => {
             "took a screenshot of my screen".into()
         }
@@ -305,6 +308,18 @@ fn short_command(command: &str) -> String {
     out
 }
 
+/// What a routine's id begins with on the server (`sched_` and a uuid, as `ScheduleId` mints it).
+const ROUTINE_ID_PREFIX: &str = "sched_";
+
+/// The routine a `run_routine` call is for, by the name the model wrote in its `routine`
+/// argument, kept to one line: `None` when it wrote none, or wrote the routine's id, which
+/// is not a name a person would know it by.
+fn routine_named(arguments: Option<&Value>) -> Option<String> {
+    let routine = arguments?.get("routine")?.as_str()?.trim();
+    let name = short_command(routine);
+    (!name.is_empty() && !routine.starts_with(ROUTINE_ID_PREFIX)).then_some(name)
+}
+
 /// What a call is doing, in a line: the status strip says it while the call runs, and the call's
 /// step row in the reply says it afterwards.
 pub(crate) fn describe_tool(name: &str, args: Option<&str>) -> String {
@@ -351,6 +366,12 @@ pub(crate) fn describe_tool(name: &str, args: Option<&str>) -> String {
             .filter(|name| !name.is_empty())
             .map(|name| format!("Reading the {name} skill"))
             .unwrap_or_else(|| "Reading a skill".into()),
+        // A bot running one of its person's routines (opengrok-server #337, built in #342), by the
+        // name the model wrote. The call's own result is `{runId, threadId}`, with no name in it,
+        // and a routine's id says nothing to a person, so one named by its id is "a routine".
+        super::gen_ui::RUN_ROUTINE => routine_named(parsed.as_ref())
+            .map(|name| format!("Running the {name} routine"))
+            .unwrap_or_else(|| "Running a routine".into()),
         "Computer" | "Screenshot" | "computerUseToolCall" => "On its computer".into(),
         "computer" => match parsed
             .as_ref()
@@ -495,6 +516,89 @@ mod tests {
             deed_from_tool("use_skill", None).as_deref(),
             Some("read a skill")
         );
+    }
+
+    /// A bot running one of its person's routines (opengrok-server #337, built in #342:
+    /// `run_routine`, by the routine's id or its name as `list_routines` gives it) says which, in
+    /// the status line and on its step, and a turn that did nothing else leaves that behind, not
+    /// "Using run_routine". A routine named by the name the model wrote is said by it; one named
+    /// by its id, which is a `sched_` and a uuid and says nothing to a person, is "a routine", as
+    /// is a call with no routine yet. A name the model spread over lines or past the width of a
+    /// line is kept to one.
+    #[test]
+    fn run_routine_says_which_routine_is_being_run() {
+        let label = |args: Option<&str>| describe_tool("run_routine", args);
+        assert_eq!(
+            label(Some(r#"{"routine":"Standup"}"#)),
+            "Running the Standup routine"
+        );
+        let by_id = r#"{"routine":"sched_0199bb4e-0000-7000-8000-000000000005"}"#;
+        assert_eq!(label(Some(by_id)), "Running a routine");
+        assert_eq!(label(None), "Running a routine");
+        assert_eq!(label(Some(r#"{"routine":"  "}"#)), "Running a routine");
+        assert_eq!(label(Some(r#"{"name":"Standup"}"#)), "Running a routine");
+        let long = "x".repeat(80);
+        let cut = label(Some(
+            &json!({ "routine": format!("{long}\nmore") }).to_string(),
+        ));
+        assert!(
+            cut.starts_with("Running the x") && cut.ends_with("… routine") && cut.len() < 80,
+            "{cut}"
+        );
+
+        let mut tracker = ToolCallTracker::default();
+        tracker.tick(
+            &json!({"type":"TOOL_CALL_START","toolCallId":"c1","toolCallName":"run_routine"}),
+        );
+        tracker.tick(
+            &json!({"type":"TOOL_CALL_ARGS","toolCallId":"c1","delta":r#"{"routine":"Standup"}"#}),
+        );
+        assert_eq!(
+            tool_standin(&tracker.deeds()),
+            Some("[ran the Standup routine]".into())
+        );
+        assert_eq!(
+            deed_from_tool("run_routine", Some(by_id)).as_deref(),
+            Some("ran a routine")
+        );
+        assert_eq!(
+            deed_from_tool("run_routine", None).as_deref(),
+            Some("ran a routine")
+        );
+    }
+
+    /// The same, from the frames the server sent for one `run_routine` call: the run the server
+    /// replayed for
+    /// `fixtures/wire/rest/GET__ag-ui_threads__thread_id_/200-a_bot_runs_a_routine_by_its_id_and_its_history_names_the_bot.json`,
+    /// in which the Bot names the routine by its id. The status line says it runs a routine
+    /// while the call is out, and a turn that did nothing else leaves "ran a routine" behind.
+    #[test]
+    fn a_run_routine_call_off_the_wire_reads_as_a_routine_being_run() {
+        let path = format!(
+            "{}/fixtures/wire/rest/GET__ag-ui_threads__thread_id_/200-a_bot_runs_a_routine_by_its_id_and_its_history_names_the_bot.json",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let fixture: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect(&path)).expect(&path);
+        let events = fixture["body"]["runs"][0]["events"]
+            .as_array()
+            .expect("a run's frames");
+        let mut tracker = ToolCallTracker::default();
+        let mut said = Vec::new();
+        for event in events {
+            if let ActivityTick::Set(activity) = tracker.tick(event) {
+                said.push(activity.label);
+            }
+        }
+        assert!(
+            said.iter().any(|label| label == "Running a routine"),
+            "{said:?}"
+        );
+        assert!(
+            said.iter().all(|label| !label.starts_with("Using ")),
+            "{said:?}"
+        );
+        assert_eq!(tracker.deeds(), ["ran a routine"]);
     }
 
     /// The same, from the frames the server sent for one shell call: the start and the

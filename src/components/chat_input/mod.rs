@@ -8,6 +8,7 @@ pub use sources::{AppCommand, ComposerPick, TokenKind};
 
 use crate::actions::{Library, NewChat, OpenSettings, Projects, ToggleTheme};
 use crate::audio::AudioInput;
+use crate::chrome::COMPOSER_ICON_PX;
 use crate::components::composer_editor::ComposerEditor;
 use crate::components::composer_panel::{ComposerPanel, ComposerPanelEvent, ComposerPanelRow};
 use crate::components::voice_wave::VoiceWave;
@@ -20,7 +21,7 @@ use std::path::{Path, PathBuf};
 
 use gpui_kit::InteractiveElement;
 use gpui_kit::component::{
-    ActiveTheme, Icon, IconName,
+    ActiveTheme, Icon, IconName, Sizable, Size as ComponentSize,
     button::{Button, ButtonVariants},
     h_flex,
     input::InputEvent,
@@ -241,9 +242,6 @@ pub struct MessageInput {
     /// button. Cached off [`AppState`] like the rest, so the composer draws without reading the
     /// state on every frame.
     turn_in_flight: bool,
-    /// The chip that picks which door the next turns go through, the server's paid keys or the
-    /// person's plan, while there is a choice to make. Cached off [`AppState`] like the rest.
-    turn_source: Option<crate::state::TurnSourceChip>,
 }
 
 impl MessageInput {
@@ -265,7 +263,6 @@ impl MessageInput {
         let reply_to = app_state.reply_to.clone();
         let coworker_name = composer_bot_name(app_state);
         let turn_in_flight = app_state.is_turn_in_flight();
-        let turn_source = app_state.composer_turn_source();
 
         let this = Self {
             state: state.clone(),
@@ -291,7 +288,6 @@ impl MessageInput {
             notice: None,
             dismissed_at: None,
             turn_in_flight,
-            turn_source,
         };
 
         // Subscribe to state changes to update cached values and notify only when relevant
@@ -339,11 +335,6 @@ impl MessageInput {
                 let running = state.is_turn_in_flight();
                 if this.turn_in_flight != running {
                     this.turn_in_flight = running;
-                    changed = true;
-                }
-                let turn_source = state.composer_turn_source();
-                if this.turn_source != turn_source {
-                    this.turn_source = turn_source;
                     changed = true;
                 }
             }
@@ -651,24 +642,13 @@ impl MessageInput {
                 }
             }
         }
-        self.tell_state_dictating(cx);
         cx.notify();
-    }
-
-    /// The reply-source chip gives its place to the dictation's buttons, and the state is told:
-    /// a chip that is not drawn is not in a driver's tree, and a turn sent meanwhile names the
-    /// account's own door rather than a pick nobody can see (`AppState::turn_source_for_send`).
-    fn tell_state_dictating(&self, cx: &mut Context<Self>) {
-        let dictating = self.voice_mode;
-        self.state
-            .update(cx, |state, cx| state.set_composer_dictating(dictating, cx));
     }
 
     fn confirm_voice_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.voice_mode = false;
         self.audio_input = None;
         self.voice_wave = None;
-        self.tell_state_dictating(cx);
         cx.notify();
 
         // Mock transcription
@@ -2224,6 +2204,8 @@ impl Render for MessageInput {
                             // The one wide panel, for everything the composer offers.
                             Button::new("add-app")
                                 .icon(IconName::Plus)
+                                .with_size(ComponentSize::Large)
+                                .size(px(32.))
                                 .ghost()
                                 .rounded_full()
                                 .when(!any_modal_open, |this| this.cursor_pointer())
@@ -2478,19 +2460,6 @@ impl Render for MessageInput {
                                         confirm_btn
                                     })
                                 })
-                                // Which door the next turns go through, beside the button that
-                                // sends them. Only while there is a choice: see
-                                // `AppState::composer_turn_source`.
-                                .when_some(
-                                    self.turn_source.clone().filter(|_| !self.voice_mode),
-                                    |this, chip| {
-                                        this.child(crate::components::reply_source::composer_chip(
-                                            &chip,
-                                            state_model.clone(),
-                                            &theme,
-                                        ))
-                                    },
-                                )
                                 .when(!self.voice_mode, |this| {
                                     // Text Mode: Mic and Send/Headphone
                                     this.child({
@@ -2512,7 +2481,7 @@ impl Render for MessageInput {
                                             .child(
                                                 svg()
                                                     .path("icons/mic.svg")
-                                                    .size(px(18.0))
+                                                    .size(px(COMPOSER_ICON_PX))
                                                     .text_color(secondary_foreground),
                                             );
 
@@ -2586,7 +2555,7 @@ impl Render for MessageInput {
                                                 .child(
                                                     svg()
                                                         .path("icons/sparkles.svg")
-                                                        .size(px(18.0))
+                                                        .size(px(COMPOSER_ICON_PX))
                                                         .text_color(secondary_foreground),
                                                 );
 
@@ -2618,6 +2587,7 @@ impl Render for MessageInput {
                                                 })
                                                 .child(
                                                     Icon::new(IconName::ArrowUp)
+                                                        .size(px(COMPOSER_ICON_PX))
                                                         .text_color(background),
                                                 );
 
