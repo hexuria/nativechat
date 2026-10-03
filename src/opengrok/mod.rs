@@ -51,12 +51,12 @@ pub use local_exec::{
     stored_machine_id,
 };
 pub use model_choice::{
-    AccountPlan, ChoiceGroup, EFFORT_NOT_KEPT, FAST_ACCOUNT_PLAN, FAST_DOOR_UNKNOWN, FAST_NO_TWIN,
-    FAST_SUFFIX, GATEWAY_GROUP, LIST_ROWS, ListLine, ModelChoice, ModelPick, NEW_BOTS_NONE,
-    NEW_BOTS_PICK_FIRST, NEW_BOTS_PICK_ID, NO_MODEL, PLAN_FALLBACK_PICK_FIRST, ROUTINES_ON_PLAN,
-    SUBSCRIPTION_GROUP, base_label, bot_pick, group_title, is_fast, last_window_start, list_window,
-    model_label, new_bots_pick, plan_choices, plan_fallback_pick, row_count, server_choices,
-    window_opening_on, without_fast,
+    AccountPlan, CURRENT_TITLE, ChoiceGroup, EFFORT_NOT_KEPT, FAST_ACCOUNT_PLAN, FAST_DOOR_UNKNOWN,
+    FAST_NO_TWIN, FAST_SUFFIX, GATEWAY_GROUP, LIST_ROWS, ListLine, ModelChoice, ModelPick,
+    NEW_BOTS_NONE, NEW_BOTS_PICK_FIRST, NEW_BOTS_PICK_ID, NO_MODEL, PLAN_FALLBACK_PICK_FIRST,
+    ROUTINES_ON_PLAN, SUBSCRIPTION_GROUP, base_label, bot_pick, group_title, is_fast,
+    last_window_start, list_window, model_label, new_bots_pick, plan_choices, plan_fallback_pick,
+    row_count, server_choices, without_fast,
 };
 pub use relay::{
     OpencodexAddress, RelayHandle, RelayKey, RelayReport, RelayStatus, RelayTarget, RelayTimings,

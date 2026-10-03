@@ -13674,8 +13674,9 @@ impl AppState {
     }
 
     /// [`Self::toggle_picker_list`] without the repaint: `false` while the popover is shut. The
-    /// list opens with nothing typed in its search box and the model that answers in view,
-    /// wherever it was left.
+    /// list opens with nothing typed in its search box and at the top of its groups, wherever it
+    /// was left: the model that answers is pinned above them ([`ModelPick::pinned`]) and not
+    /// scrolled to, so the first rows of the first group are what a person sees.
     fn note_picker_list_toggled(&mut self, which: PickerFor) -> bool {
         if !self.picker_view(which).open {
             return false;
@@ -13683,13 +13684,10 @@ impl AppState {
         if self.picker_view(which).list_open {
             self.shut_picker_list(which);
         } else {
-            let start = self
-                .picker_pick(which)
-                .map_or(0, |pick| pick.opening_window_start());
             let view = self.picker_view_mut(which);
             view.list_open = true;
             view.search.clear();
-            view.list_start = start;
+            view.list_start = 0;
         }
         true
     }
@@ -39534,12 +39532,13 @@ mod tests {
         assert!(pick.account_plan.is_some());
     }
 
-    /// The list opens with nothing typed and the model that answers in view, however far down
-    /// it is; a search starts it from the top; the wheel moves it a model at a time and stops at
-    /// either end of what the search leaves; and shutting the list forgets the search and where it
-    /// was. None of it moves while the popover or the list is shut.
+    /// The list opens with nothing typed and at the top, however far down the model that answers
+    /// is: that model is pinned above the list instead, and the window shows the first five; a
+    /// search starts it from the top; the wheel moves it a model at a time and stops at either end
+    /// of what the search leaves; and shutting the list forgets the search and where it was. None
+    /// of it moves while the popover or the list is shut.
     #[test]
-    fn the_model_list_opens_on_the_model_that_answers_and_a_search_starts_from_the_top() {
+    fn the_model_list_opens_at_the_top_and_a_search_starts_from_the_top() {
         use super::PickerFor;
         use crate::opengrok::{ListLine, list_window};
         let mut state = signed_in_state();
@@ -39587,10 +39586,23 @@ mod tests {
             })
             .collect()
         };
-        assert!(
-            in_view(&state).contains(&"oag/route-7".to_string()),
-            "{:?}",
-            in_view(&state)
+        assert_eq!(state.model_picker.list_start, 0);
+        assert_eq!(
+            in_view(&state),
+            [
+                "oag/route-0",
+                "oag/route-1",
+                "oag/route-2",
+                "oag/route-3",
+                "oag/route-4"
+            ],
+            "the first five, and not the one that answers"
+        );
+        assert_eq!(
+            pick.pinned(&state.model_picker.search)
+                .map(|row| row.base_id.as_str()),
+            Some("oag/route-7"),
+            "which is pinned above them"
         );
 
         // The wheel: a model at a time, and no further than the last five.

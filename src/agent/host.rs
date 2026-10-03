@@ -5457,7 +5457,9 @@ impl NativeChatHost {
     /// most five models, an `agent-model-row-{source}-{id}` each (valued by its door's word,
     /// `selected` on the one that answers, `fast` where it has a fast version), with an
     /// `agent-model-group-{source}` heading ("Subscription", "Gateway") over each group's first
-    /// model in view; `agent-model-plan` where a server without per-Bot doors has the account's
+    /// model in view, and over them all, while nothing is typed and a model answers, that model
+    /// pinned under an `agent-model-group-current` heading as an `agent-model-row-current`;
+    /// `agent-model-plan` where a server without per-Bot doors has the account's
     /// plan model answer, `agent-model-no-match` where the search leaves nothing of a list that
     /// has some, `agent-model-routines` where the Bot's own door is the person's plan, where its
     /// routines run, and `agent-model-note`, the server's word on why the list is not
@@ -5535,6 +5537,23 @@ impl NativeChatHost {
             pop = pop.with_child(back).with_child(
                 UiNode::textbox(ids.search, SEARCH_PLACEHOLDER).with_value(view.search.clone()),
             );
+            // The model that answers, pinned over the groups under its own heading while nothing
+            // is typed, and not one of the window's models.
+            if let Some(row) = pick.pinned(&view.search) {
+                list = list.with_child(UiNode::new(
+                    ids.current_heading_id(),
+                    "heading",
+                    crate::opengrok::CURRENT_TITLE,
+                ));
+                let mut item = UiNode::listitem(ids.current_row_id(), row.label.clone())
+                    .with_value(row.source.word())
+                    .with_enabled(!busy);
+                item.states.push("selected".into());
+                if row.has_fast {
+                    item.states.push("fast".into());
+                }
+                list = list.with_child(item);
+            }
             let none = ids
                 .none
                 .filter(|_| model_picker::none_shows(&view.search, ids.none_hint));
@@ -5997,8 +6016,22 @@ impl NativeChatHost {
                 Ok(Command::ClearNewBotsDefault)
             };
         }
+        if target == ids.current_row_id() {
+            return match pick.pinned(query) {
+                None => Err(format!(
+                    "`{target}` is not on screen: the list pins the model that answers only while \
+                     nothing is typed in `{search}`, and only while one answers"
+                )),
+                Some(_) if busy => dead(),
+                Some(row) => Ok(PickerCommand::Pick {
+                    source: row.source,
+                    base_id: row.base_id.clone(),
+                }
+                .sent_to(which)),
+            };
+        }
         if target.starts_with(ids.group) {
-            return Err(format!("`{target}` is a group's heading, not a model"));
+            return Err(format!("`{target}` is a heading, not a model"));
         }
         use crate::opengrok::{LIST_ROWS, ListLine, list_window};
         let rest = target.strip_prefix(ids.row).unwrap_or(target);
@@ -15800,6 +15833,12 @@ mod tests {
         assert_eq!(
             rows,
             [
+                ("agent-model-group-current", "Current", &[][..]),
+                (
+                    "agent-model-row-current",
+                    "GPT-6 Luna",
+                    &["selected".to_string(), "fast".to_string()][..]
+                ),
                 ("agent-model-group-local_proxy", "Subscription", &[][..]),
                 (
                     "agent-model-row-local_proxy-gpt-6-luna",
@@ -16550,6 +16589,8 @@ mod tests {
         assert_eq!(
             ids_in_list(&host),
             [
+                "agent-model-group-current",
+                "agent-model-row-current",
                 "agent-model-group-local_proxy",
                 "agent-model-row-local_proxy-gpt-6-luna",
                 "agent-model-row-local_proxy-gpt-5.6-sol",
@@ -16557,7 +16598,8 @@ mod tests {
                 "agent-model-group-gateway",
                 "agent-model-row-gateway-oag/route-0",
                 "agent-model-row-gateway-oag/route-1",
-            ]
+            ],
+            "the model that answers pinned over the five the window shows from the top"
         );
         let out = host
             .click("agent-model-row-gateway-oag/route-5")
@@ -16567,11 +16609,14 @@ mod tests {
         let heading = host.click("agent-model-group-gateway").unwrap_err();
         assert!(heading.contains("heading"), "{heading}");
 
-        // Scrolled to the end: the Gateway group's heading over its first model in view.
+        // Scrolled to the end: the Gateway group's heading over its first model in view, under
+        // the pinned model, which does not scroll.
         host.model_picker.list_start = 4;
         assert_eq!(
             ids_in_list(&host),
             [
+                "agent-model-group-current",
+                "agent-model-row-current",
                 "agent-model-group-gateway",
                 "agent-model-row-gateway-oag/route-1",
                 "agent-model-row-gateway-oag/route-2",
@@ -16726,6 +16771,8 @@ mod tests {
         assert_eq!(
             ids_in_list,
             [
+                "agent-model-group-current",
+                "agent-model-row-current",
                 "agent-model-group-local_proxy",
                 "agent-model-row-local_proxy-gpt-6-luna",
                 "agent-model-group-gateway",
@@ -16838,6 +16885,88 @@ mod tests {
         let tree = NativeChatHost::from_app(&state).snapshot();
         assert!(tree.find("agent-model-row-gateway-oag/cheap").is_none());
         assert!(tree.find("agent-model-no-match").is_some());
+    }
+
+    /// The list on the tree pins the model that answers over its groups, as the window does: a
+    /// heading and a row of their own ids ahead of everything else, the row named, valued,
+    /// `selected` and `fast` as its row among the groups is, and a click on it picks the model it
+    /// is. A search takes both away, and so does a Bot no model answers.
+    #[test]
+    fn the_list_pins_the_model_that_answers_and_a_driver_clicks_it() {
+        use crate::opengrok::InferenceKind;
+        let mut host = host();
+        host.agent_settings_open = true;
+        host.model_picker.open = true;
+        host.model_picker.list_open = true;
+        host.model_pick = Some(a_pick(
+            Some(serde_json::json!("local_proxy")),
+            "gpt-6-luna--fast",
+            "medium",
+        ));
+        let tree = host.snapshot();
+        let list = tree.find("agent-model-list").unwrap();
+        let head: Vec<(&str, &str, &str)> = list
+            .children
+            .iter()
+            .take(4)
+            .map(|node| (node.id.as_str(), node.role.as_str(), node.name.as_str()))
+            .collect();
+        assert_eq!(
+            head,
+            [
+                ("agent-model-group-current", "heading", "Current"),
+                ("agent-model-row-current", "listitem", "GPT-6 Luna"),
+                ("agent-model-group-local_proxy", "heading", "Subscription"),
+                (
+                    "agent-model-row-local_proxy-gpt-6-luna",
+                    "listitem",
+                    "GPT-6 Luna"
+                ),
+            ],
+            "pinned over the groups, whose first row is in view as well"
+        );
+        let pinned = tree.find("agent-model-row-current").unwrap();
+        assert_eq!(pinned.value.as_deref(), Some("local_proxy"));
+        assert_eq!(pinned.states, ["selected", "fast"]);
+        assert!(pinned.enabled);
+        host.click("agent-model-row-current").unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::PickModel { source: InferenceKind::LocalProxy, base_id })
+                if base_id == "gpt-6-luna"
+        ));
+        assert!(
+            host.click("agent-model-group-current")
+                .unwrap_err()
+                .contains("heading"),
+            "a heading is no model"
+        );
+
+        // A search takes it away, and clicking it is refused with the reason.
+        host.model_picker.search = "luna".into();
+        let tree = host.snapshot();
+        assert!(tree.find("agent-model-row-current").is_none());
+        assert!(tree.find("agent-model-group-current").is_none());
+        let refused = host.click("agent-model-row-current").unwrap_err();
+        assert!(refused.contains("nothing is typed"), "{refused}");
+        assert!(
+            host.snapshot()
+                .find("agent-model-row-local_proxy-gpt-6-luna")
+                .is_some(),
+            "the model is in the search's list all the same"
+        );
+
+        // No model answers: nothing to pin.
+        host.model_picker.search = String::new();
+        host.model_pick = Some(a_pick(
+            Some(serde_json::json!("gateway")),
+            "oag/not-listed",
+            "medium",
+        ));
+        let tree = host.snapshot();
+        assert!(tree.find("agent-model-row-current").is_none());
+        assert!(tree.find("agent-model-group-current").is_none());
+        assert!(host.click("agent-model-row-current").is_err());
     }
 
     /// A bot's skills as the server gives them (opengrok-server#270): the owner's `triage`

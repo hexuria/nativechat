@@ -300,9 +300,16 @@
 //! it, fast where ⚡ is on and it has a twin, and goes back to the controls), with an
 //! `agent-model-group-{source}` heading over each group's first model in view, which is not one
 //! of the five: `agent-model-group-local_proxy` is "Subscription", the person's own plan, and
-//! `agent-model-group-gateway` is "Gateway", the server's paid keys. The window opens with the
-//! model that answers in view, and the wheel scrolls it; a model out of view, or one the search
-//! leaves out, is refused, and the search box brings it into view. Then `agent-model-plan` (on a
+//! `agent-model-group-gateway` is "Gateway", the server's paid keys. The window opens at the top,
+//! so the first five models of the first group show, and the wheel scrolls it; a model out of
+//! view, or one the search leaves out, is refused, and the search box brings it into view. Over
+//! the window, while nothing is typed and a model answers, the list pins that model under an
+//! `agent-model-group-current` heading ("Current"), as an `agent-model-row-current` (named,
+//! valued, `selected` and `fast` as its row in the window is, which may be in view too; a click
+//! on it picks the model it already is, and goes back to the controls); it is not one of the
+//! five, and a search takes both away, as does a list with no model answering. The three pickers
+//! pin the same way, under their own ids (`settings-new-bots-row-current`,
+//! `settings-plan-fallback-group-current`, and so on). Then `agent-model-plan` (on a
 //! server whose rows carry no `source`, while the account is on the person's plan: the account's
 //! plan model, which answers for every Bot there; a line, not a row, which the search leaves or
 //! takes away as it would a row), `agent-model-no-match` ("No model matches", while the search
