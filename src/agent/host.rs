@@ -3256,7 +3256,13 @@ pub struct NativeChatHost {
     /// Messages the open thread is holding until it is idle.
     queued_sends: usize,
     agent_settings_open: bool,
+    /// The Bot's settings draw the Connections card. They do not (hexuria/nativechat#174: it opens
+    /// from the agent monitor, #175), so the app never sets this, and the card's node and its
+    /// switches are in the tree only for a host that does, as the monitor's tests will.
+    agent_connections_card: bool,
     /// The open bot's tools as its settings list them, and whether the card is open to them.
+    /// Like [`Self::agent_ceiling`] and [`Self::agent_skills`], the app leaves them unset: the
+    /// Bot's settings draw no Tools or Skills card (hexuria/nativechat#174, #175).
     agent_tools: Option<crate::state::ToolList>,
     /// The open Bot's ceiling as its Tools card draws it: see [`AppState::ceiling_card`].
     agent_ceiling: Option<CeilingCard>,
@@ -3520,13 +3526,14 @@ impl NativeChatHost {
             turn_in_flight: state.is_turn_in_flight(),
             queued_sends: state.queued_send_count(),
             agent_settings_open: state.is_agent_settings_open(),
-            agent_tools: state
-                .coworker_tools
-                .as_ref()
-                .filter(|(owner, _)| state.active_coworker_id.as_deref() == Some(owner.as_str()))
-                .map(|(_, list)| list.clone()),
-            agent_ceiling: state.ceiling_card(),
-            agent_skills: state.skills_card(),
+            // The Bot's settings no longer draw the Tools, Skills or Connections card
+            // (hexuria/nativechat#174): they open from the agent monitor (#175), and the tree
+            // names what a window draws. Their nodes, and the state they are read from, stay for
+            // the monitor, so these are left unset until it draws them.
+            agent_connections_card: false,
+            agent_tools: None,
+            agent_ceiling: None,
+            agent_skills: None,
             agent_skills_open: state.agent_skills_open,
             agent_tools_open: state.agent_tools_open,
             agent_usage_open: state.agent_usage_open,
@@ -4482,6 +4489,7 @@ impl NativeChatHost {
             settings = settings.with_child(node);
         }
         if self.agent_settings_open
+            && self.agent_connections_card
             && let Some(bot) = self.sessions.iter().find(|session| session.active)
         {
             settings = settings.with_child(self.agent_connections_node(&bot.id));
@@ -5355,10 +5363,10 @@ impl NativeChatHost {
                 .sessions
                 .iter()
                 .find(|session| session.active)
-                .filter(|_| self.agent_settings_open);
+                .filter(|_| self.agent_settings_open && self.agent_connections_card);
             return Some(match bot {
                 None => Err(format!(
-                    "`{target}` is on a bot's settings, which are closed"
+                    "`{target}` is on a bot's Connections card, which is not on screen"
                 )),
                 Some(_) if connections.is_changing(&row.id) => busy(&row.label),
                 Some(bot) => Ok(Command::SetConnectionLent {
@@ -14034,6 +14042,13 @@ mod tests {
         assert!(host.click(&ids::connection_lend("conn_1")).is_err());
 
         host.agent_settings_open = true;
+        assert!(
+            host.snapshot().find(ids::AGENT_CONNECTIONS).is_none(),
+            "the app's settings draw no such card (#174), so none is on the tree until a host says \
+             the monitor does"
+        );
+        assert!(host.click(&ids::connection_lend("conn_1")).is_err());
+        host.agent_connections_card = true;
         let tree = host.snapshot();
         assert_eq!(
             tree.find(ids::AGENT_CONNECTIONS).unwrap().value.as_deref(),
@@ -14129,7 +14144,10 @@ mod tests {
         state.is_app_settings_open = true;
         state.app_settings_tab = AppSettingsTab::Connections;
         state.right_pane = crate::state::RightPane::Settings;
-        let host = NativeChatHost::from_app(&state);
+        let mut host = NativeChatHost::from_app(&state);
+        // The Bot's settings draw no Connections card (#174), so the card is named only for a
+        // host that is told one is on screen.
+        host.agent_connections_card = true;
         let tree = host.snapshot();
         assert_eq!(
             tree.find(ids::AGENT_CONNECTIONS).unwrap().value.as_deref(),
@@ -16885,6 +16903,60 @@ mod tests {
         let tree = NativeChatHost::from_app(&state).snapshot();
         assert!(tree.find("agent-model-row-gateway-oag/cheap").is_none());
         assert!(tree.find("agent-model-no-match").is_some());
+    }
+
+    /// From the app: the Bot's settings draw no Tools, Skills or Connections card
+    /// (hexuria/nativechat#174: Tools and Connections open from the agent monitor, #175, and
+    /// Skills from its Plugins modal), so the tree names none of them and a click on one of their
+    /// controls is refused, though what they are drawn from is read. The Model and Usage cards
+    /// are still there.
+    #[test]
+    fn the_bots_settings_on_the_tree_hold_no_tools_skills_or_connections_card() {
+        use crate::state::{BotSkills, RightPane, ToolList};
+        let mut state = AppState::new();
+        state.auth_status = crate::state::AuthStatus::SignedIn;
+        state.account = Some(
+            serde_json::from_value(serde_json::json!({ "id": "acct_1", "email": "a@b.c" }))
+                .unwrap(),
+        );
+        state.coworkers = vec![
+            serde_json::from_value(serde_json::json!({
+                "id": "cw_1", "name": "Ada", "model": "oag/cheap", "effort": "low",
+                "source": "gateway"
+            }))
+            .unwrap(),
+        ];
+        state.active_coworker_id = Some("cw_1".into());
+        state.right_pane = RightPane::Settings;
+        state.coworker_tools = Some((
+            "cw_1".into(),
+            ToolList::Listed(vec![crate::opengrok::CoworkerTool {
+                name: "shell".into(),
+                description: "Run a command.".into(),
+                kind: "builtin".into(),
+            }]),
+        ));
+        state.coworker_skills = Some(("cw_1".into(), BotSkills::Loading));
+        state.agent_tools_open = true;
+        let mut host = NativeChatHost::from_app(&state);
+        let tree = host.snapshot();
+        assert!(tree.find(ids::AGENT_SETTINGS).unwrap().visible);
+        assert!(tree.find(ids::AGENT_MODEL_CARD).is_some());
+        for id in [
+            "agent-tools",
+            "agent-tools-toggle",
+            ids::AGENT_CEILING,
+            ids::AGENT_SKILLS,
+            ids::AGENT_CONNECTIONS,
+        ] {
+            assert!(
+                tree.find(id).is_none(),
+                "`{id}` is not in the Bot's settings"
+            );
+        }
+        for id in ["agent-tools-toggle", ids::AGENT_SKILLS_TOGGLE] {
+            assert!(host.click(id).is_err(), "`{id}` is not on screen");
+        }
     }
 
     /// The list on the tree pins the model that answers over its groups, as the window does: a

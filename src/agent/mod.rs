@@ -208,7 +208,9 @@
 //! bot used this month, or why it cannot say), `agent-usage-toggle` (Show / Hide, only while the
 //! server reported models), and `agent-usage-model-{i}` per model, visible while open (#138).
 //!
-//! In the bot's settings: `agent-tools` (value = the Tools card's first line, what the server's
+//! The Tools card, which the bot's settings no longer draw (hexuria/nativechat#174: it opens from
+//! the agent monitor, #175, so the app's tree holds none of these ids until it does):
+//! `agent-tools` (value = the Tools card's first line, what the server's
 //! `GET /coworkers/{id}/tools` says the bot is offered on its next turn: `2 built in · 1 from
 //! plugins`, `Asking the server…`, or why there is no list), `agent-ceiling` (value = `3 of 8
 //! allowed`, or why there are no switches; in the tree once the server has answered), and
@@ -235,7 +237,8 @@
 //! read (a server without the route, a Bot this person does not own), the card lists what the
 //! next turn is offered instead, read-only: `agent-tool-{name}` (value `builtin` / `plugin`).
 //!
-//! In the bot's settings, below Tools: `agent-skills` (value = the Skills card's line: `2
+//! The Skills card, likewise (it moves to the monitor's Plugins modal): `agent-skills` (value =
+//! the Skills card's line: `2
 //! attached · 1 switched off`, `None attached`, `Asking the server…`, or why there are no
 //! switches, as "Only this Bot's owner can change its skills."), and `agent-skills-toggle` (Show
 //! / Hide, only while there are skills to show). Visible while the card is open: the card's own
@@ -352,7 +355,7 @@
 //! `settings-connectors-error` in its place. A click on a Connect opens the person's browser, as
 //! a person's does, once the server answers and only if the page is still on screen.
 //!
-//! In the bot's settings: `agent-connections` (value = the card's second line: `1 of 2 lent to
+//! The Connections card, likewise: `agent-connections` (value = the card's second line: `1 of 2 lent to
 //! this Bot`, `Asking the server…`, or why there is nothing to count), and per connection
 //! `agent-connection-lend-{id}` (a switch, label = its label, value = its service, checked while
 //! it shows as lent to this bot; a click asks for the other way; dead and `changing` while a

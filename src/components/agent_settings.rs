@@ -294,39 +294,6 @@ impl Render for AgentSettings {
         let saving = self.saving;
         let usage_open = self.state.read(cx).agent_usage_open;
         let auto_review_open = self.auto_review_open;
-        let tools_open = self.state.read(cx).agent_tools_open;
-        let tools = {
-            let state = self.state.read(cx);
-            state
-                .coworker_tools
-                .as_ref()
-                .filter(|(owner, _)| state.active_coworker_id.as_deref() == Some(owner.as_str()))
-                .map(|(_, list)| list.clone())
-        };
-        let ceiling = self.state.read(cx).ceiling_card();
-        let tools_line = tools.as_ref().map(tools_summary);
-        let allowed_line = ceiling
-            .as_ref()
-            .and_then(|card| ceiling_line(&card.ceiling, card.pending.as_ref()));
-        let (ceiling_rows, card_lines) = ceiling
-            .as_ref()
-            .map(|card| (shown_ceiling_rows(card), ceiling_card_lines(card)))
-            .unwrap_or_default();
-        let has_switches = !ceiling_rows.is_empty();
-        let offered = offered_without_switches(ceiling.as_ref(), tools.as_ref()).to_vec();
-        let has_list = !offered.is_empty();
-        let danger = theme.danger;
-        let skills_open = self.state.read(cx).agent_skills_open;
-        let skills = self.state.read(cx).skills_card();
-        let skills_line = skills
-            .as_ref()
-            .map(|card| skills_summary(&card.skills, card.pending.as_ref()));
-        let (skill_rows, skill_lines) = skills
-            .as_ref()
-            .map(|card| (shown_skill_rows(card), skills_card_lines(card)))
-            .unwrap_or_default();
-        let has_skill_rows = !skill_rows.is_empty();
-        let skills_shared = skills.as_ref().is_some_and(|card| card.shared);
         let usage = {
             let state = self.state.read(cx);
             state
@@ -347,16 +314,6 @@ impl Render for AgentSettings {
         let auto_review_mode = self.auto_review_mode;
         let has_custom = shape.is_some() || color.is_some();
         let app = self.state.clone();
-        // The person's connections, each lendable to this bot (#2).
-        let connections_card = self
-            .state
-            .read(cx)
-            .active_coworker_id
-            .clone()
-            .map(|coworker_id| {
-                crate::components::connections::agent_card(app.clone(), &coworker_id, cx)
-                    .into_any_element()
-            });
         let chat_page = self.state.read(cx).page == crate::state::MainPage::Chat;
 
         v_flex()
@@ -388,6 +345,7 @@ impl Render for AgentSettings {
             .child(
                 div()
                     .id("avatar-trigger-row")
+.debug_selector(|| "avatar-trigger-row".into())
                     .w_full()
                     .h(px(76.))
                     .min_h(px(76.))
@@ -452,6 +410,7 @@ impl Render for AgentSettings {
                             .child(
                                 div()
                                     .id("agent-settings-name")
+.debug_selector(|| "agent-settings-name".into())
                                     .w_full()
                                     .child(settings_input(&self.name_input)),
                             )
@@ -459,6 +418,7 @@ impl Render for AgentSettings {
                             .child(
                                 div()
                                     .id("agent-label")
+.debug_selector(|| "agent-label".into())
                                     .w_full()
                                     .child(settings_input(&self.label_input)),
                             )
@@ -466,6 +426,7 @@ impl Render for AgentSettings {
                             .child(
                                 div()
                                     .id("agent-role")
+.debug_selector(|| "agent-role".into())
                                     .w_full()
                                     .child(
                                         Textarea::new(&self.role_input)
@@ -481,6 +442,7 @@ impl Render for AgentSettings {
                                         div().pt(px(12.)).child(
                                             card(card_fill)
                                                 .id("agent-notifications")
+.debug_selector(|| "agent-notifications".into())
                                                 .child(
                                                     div()
                                                         .flex()
@@ -531,6 +493,7 @@ impl Render for AgentSettings {
                                     .child(
                                         div()
                                             .id("agent-usage")
+.debug_selector(|| "agent-usage".into())
                                             .mt(px(14.))
                                             .px(px(14.))
                                             .py(px(12.))
@@ -616,6 +579,7 @@ impl Render for AgentSettings {
                                     .child(
                                         div()
                                             .id("agent-auto-review")
+.debug_selector(|| "agent-auto-review".into())
                                             .mt(px(14.))
                                             .mb(px(16.))
                                             .px(px(14.))
@@ -657,158 +621,6 @@ impl Render for AgentSettings {
                                                 this.child(self.auto_review_body(auto_review_mode, cx))
                                             }),
                                     )
-                                    .when(tools.is_some() || ceiling.is_some(), |this| {
-                                        this.child(
-                                            div()
-                                                .id("agent-tools")
-                                                .mb(px(16.))
-                                                .px(px(14.))
-                                                .py(px(12.))
-                                                .rounded(px(10.))
-                                                .border_1()
-                                                .border_color(theme.border)
-                                                .child(
-                                                    div()
-                                                        .flex()
-                                                        .items_center()
-                                                        .justify_between()
-                                                        .gap(px(10.))
-                                                        .child(
-                                                            v_flex()
-                                                                .min_w(px(0.))
-                                                                .gap(px(2.))
-                                                                .child(div().text_sm().child("Tools"))
-                                                                // What the next turn is offered, as
-                                                                // the server lists it: the switches
-                                                                // below are one of what decides that,
-                                                                // not the whole of it.
-                                                                .when_some(tools_line, |this, line| {
-                                                                    this.child(
-                                                                        div()
-                                                                            .text_xs()
-                                                                            .text_color(muted)
-                                                                            .child(line),
-                                                                    )
-                                                                })
-                                                                .when_some(allowed_line, |this, line| {
-                                                                    this.child(
-                                                                        div()
-                                                                            .id("agent-ceiling")
-                                                                            .text_xs()
-                                                                            .text_color(muted)
-                                                                            .child(line),
-                                                                    )
-                                                                }),
-                                                        )
-                                                        .when(
-                                                            has_switches || has_list,
-                                                            |this| {
-                                                                this.child(
-                                                                    div()
-                                                                        .id("agent-tools-toggle")
-                                                                        .px(px(11.))
-                                                                        .py(px(5.))
-                                                                        .rounded(px(8.))
-                                                                        .border_1()
-                                                                        .border_color(
-                                                                            rgb(0x7f7f7f).opacity(0.4),
-                                                                        )
-                                                                        .text_xs()
-                                                                        .cursor_pointer()
-                                                                        .on_mouse_down(
-                                                                            MouseButton::Left,
-                                                                            {
-                                                                                let app = app.clone();
-                                                                                move |_, _, cx| {
-                                                                                    app.update(cx, |state, cx| state.toggle_agent_tools(cx));
-                                                                                }
-                                                                            },
-                                                                        )
-                                                                        .child(if tools_open { "Hide" } else { "Show" }),
-                                                                )
-                                                            },
-                                                        ),
-                                                )
-                                                .when(tools_open && has_switches, |this| {
-                                                    this.child(ceiling_body(
-                                                        app.clone(),
-                                                        ceiling_rows,
-                                                        card_lines,
-                                                        muted,
-                                                        danger,
-                                                    ))
-                                                })
-                                                .when(tools_open && has_list, |this| {
-                                                    this.child(tools_body(&offered, muted))
-                                                }),
-                                        )
-                                    })
-                                    // Below Tools: what the Bot is told about on every turn,
-                                    // beside what it may do (opengrok-server#270).
-                                    .when_some(skills_line, |this, line| {
-                                        this.child(
-                                            div()
-                                                .id("agent-skills")
-                                                .mb(px(16.))
-                                                .px(px(14.))
-                                                .py(px(12.))
-                                                .rounded(px(10.))
-                                                .border_1()
-                                                .border_color(theme.border)
-                                                .child(
-                                                    div()
-                                                        .flex()
-                                                        .items_center()
-                                                        .justify_between()
-                                                        .gap(px(10.))
-                                                        .child(
-                                                            v_flex()
-                                                                .min_w(px(0.))
-                                                                .gap(px(2.))
-                                                                .child(div().text_sm().child("Skills"))
-                                                                .child(
-                                                                    div()
-                                                                        .text_xs()
-                                                                        .text_color(muted)
-                                                                        .child(line),
-                                                                ),
-                                                        )
-                                                        .when(has_skill_rows, |this| {
-                                                            this.child(
-                                                                div()
-                                                                    .id("agent-skills-toggle")
-                                                                    .px(px(11.))
-                                                                    .py(px(5.))
-                                                                    .rounded(px(8.))
-                                                                    .border_1()
-                                                                    .border_color(
-                                                                        rgb(0x7f7f7f).opacity(0.4),
-                                                                    )
-                                                                    .text_xs()
-                                                                    .cursor_pointer()
-                                                                    .on_mouse_down(MouseButton::Left, {
-                                                                        let app = app.clone();
-                                                                        move |_, _, cx| {
-                                                                            app.update(cx, |state, cx| state.toggle_agent_skills(cx));
-                                                                        }
-                                                                    })
-                                                                    .child(if skills_open { "Hide" } else { "Show" }),
-                                                            )
-                                                        }),
-                                                )
-                                                .when(skills_open && has_skill_rows, |this| {
-                                                    this.child(skills_body(
-                                                        app.clone(),
-                                                        skill_rows,
-                                                        skill_lines,
-                                                        skills_shared,
-                                                        muted,
-                                                        danger,
-                                                    ))
-                                                }),
-                                        )
-                                    })
-                                    .when_some(connections_card, |this, card| this.child(card))
                                     .when_some(error, |this, message| {
                                         this.child(
                                             div()
@@ -1881,6 +1693,197 @@ fn skill_row(
         })
 }
 
+/// The Tools card: what the next turn is offered, and behind its Show button the Bot's tool
+/// switches. The Bot's settings drew it between Auto-review and Skills until Tools moved to the
+/// agent monitor (hexuria/nativechat#174, #175); this is the card as it was, built from what the
+/// state holds, for the monitor to mount. `None` while neither the tools nor the ceiling have
+/// been asked for.
+pub fn tools_card(
+    app: Entity<AppState>,
+    theme: &gpui_kit::component::Theme,
+    cx: &App,
+) -> Option<AnyElement> {
+    let state = app.read(cx);
+    let tools = state
+        .coworker_tools
+        .as_ref()
+        .filter(|(owner, _)| state.active_coworker_id.as_deref() == Some(owner.as_str()))
+        .map(|(_, list)| list.clone());
+    let ceiling = state.ceiling_card();
+    if tools.is_none() && ceiling.is_none() {
+        return None;
+    }
+    let tools_open = state.agent_tools_open;
+    let muted = theme.muted_foreground;
+    let danger = theme.danger;
+    let tools_line = tools.as_ref().map(tools_summary);
+    let allowed_line = ceiling
+        .as_ref()
+        .and_then(|card| ceiling_line(&card.ceiling, card.pending.as_ref()));
+    let (ceiling_rows, card_lines) = ceiling
+        .as_ref()
+        .map(|card| (shown_ceiling_rows(card), ceiling_card_lines(card)))
+        .unwrap_or_default();
+    let has_switches = !ceiling_rows.is_empty();
+    let offered = offered_without_switches(ceiling.as_ref(), tools.as_ref()).to_vec();
+    let has_list = !offered.is_empty();
+    Some(
+        div()
+            .id("agent-tools")
+            .debug_selector(|| "agent-tools".into())
+            .mb(px(16.))
+            .px(px(14.))
+            .py(px(12.))
+            .rounded(px(10.))
+            .border_1()
+            .border_color(theme.border)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(10.))
+                    .child(
+                        v_flex()
+                            .min_w(px(0.))
+                            .gap(px(2.))
+                            .child(div().text_sm().child("Tools"))
+                            // What the next turn is offered, as
+                            // the server lists it: the switches
+                            // below are one of what decides that,
+                            // not the whole of it.
+                            .when_some(tools_line, |this, line| {
+                                this.child(div().text_xs().text_color(muted).child(line))
+                            })
+                            .when_some(allowed_line, |this, line| {
+                                this.child(
+                                    div()
+                                        .id("agent-ceiling")
+                                        .text_xs()
+                                        .text_color(muted)
+                                        .child(line),
+                                )
+                            }),
+                    )
+                    .when(has_switches || has_list, |this| {
+                        this.child(
+                            div()
+                                .id("agent-tools-toggle")
+                                .px(px(11.))
+                                .py(px(5.))
+                                .rounded(px(8.))
+                                .border_1()
+                                .border_color(rgb(0x7f7f7f).opacity(0.4))
+                                .text_xs()
+                                .cursor_pointer()
+                                .on_mouse_down(MouseButton::Left, {
+                                    let app = app.clone();
+                                    move |_, _, cx| {
+                                        app.update(cx, |state, cx| state.toggle_agent_tools(cx));
+                                    }
+                                })
+                                .child(if tools_open { "Hide" } else { "Show" }),
+                        )
+                    }),
+            )
+            .when(tools_open && has_switches, |this| {
+                this.child(ceiling_body(
+                    app.clone(),
+                    ceiling_rows,
+                    card_lines,
+                    muted,
+                    danger,
+                ))
+            })
+            .when(tools_open && has_list, |this| {
+                this.child(tools_body(&offered, muted))
+            })
+            .into_any_element(),
+    )
+}
+
+/// The Skills card: what the Bot is told about on every turn, beside what it may do
+/// (opengrok-server#270), and behind its Show button a switch for each skill. The Bot's settings
+/// drew it below Tools until Skills moved to the agent monitor's Plugins modal
+/// (hexuria/nativechat#174, #175); this is the card as it was, built from what the state holds,
+/// for the modal to mount. `None` while the Bot's skills have not been asked for.
+pub fn skills_card(
+    app: Entity<AppState>,
+    theme: &gpui_kit::component::Theme,
+    cx: &App,
+) -> Option<AnyElement> {
+    let state = app.read(cx);
+    let skills_open = state.agent_skills_open;
+    let skills = state.skills_card();
+    let line = skills
+        .as_ref()
+        .map(|card| skills_summary(&card.skills, card.pending.as_ref()))?;
+    let muted = theme.muted_foreground;
+    let danger = theme.danger;
+    let (skill_rows, skill_lines) = skills
+        .as_ref()
+        .map(|card| (shown_skill_rows(card), skills_card_lines(card)))
+        .unwrap_or_default();
+    let has_skill_rows = !skill_rows.is_empty();
+    let skills_shared = skills.as_ref().is_some_and(|card| card.shared);
+    Some(
+        div()
+            .id("agent-skills")
+            .debug_selector(|| "agent-skills".into())
+            .mb(px(16.))
+            .px(px(14.))
+            .py(px(12.))
+            .rounded(px(10.))
+            .border_1()
+            .border_color(theme.border)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(10.))
+                    .child(
+                        v_flex()
+                            .min_w(px(0.))
+                            .gap(px(2.))
+                            .child(div().text_sm().child("Skills"))
+                            .child(div().text_xs().text_color(muted).child(line)),
+                    )
+                    .when(has_skill_rows, |this| {
+                        this.child(
+                            div()
+                                .id("agent-skills-toggle")
+                                .px(px(11.))
+                                .py(px(5.))
+                                .rounded(px(8.))
+                                .border_1()
+                                .border_color(rgb(0x7f7f7f).opacity(0.4))
+                                .text_xs()
+                                .cursor_pointer()
+                                .on_mouse_down(MouseButton::Left, {
+                                    let app = app.clone();
+                                    move |_, _, cx| {
+                                        app.update(cx, |state, cx| state.toggle_agent_skills(cx));
+                                    }
+                                })
+                                .child(if skills_open { "Hide" } else { "Show" }),
+                        )
+                    }),
+            )
+            .when(skills_open && has_skill_rows, |this| {
+                this.child(skills_body(
+                    app.clone(),
+                    skill_rows,
+                    skill_lines,
+                    skills_shared,
+                    muted,
+                    danger,
+                ))
+            })
+            .into_any_element(),
+    )
+}
+
 #[cfg(test)]
 mod tools_tests {
     use super::{
@@ -2597,5 +2600,86 @@ mod skills_tests {
             )],
             "said once"
         );
+    }
+}
+
+#[cfg(test)]
+mod pane_tests {
+    use super::AgentSettings;
+    use crate::chrome::INFO_PANE_WIDTH;
+    use crate::opengrok::CoworkerTool;
+    use crate::state::{AppState, BotSkills, ToolList};
+    use serde_json::json;
+
+    /// Ada's settings pane in a window of its own, tall enough to draw all of it, with what the
+    /// Tools and Skills cards are drawn from already read, so a card the pane still draws is
+    /// there to be found.
+    fn open_pane(cx: &mut gpui_kit::TestAppContext) -> &mut gpui_kit::VisualTestContext {
+        use gpui_kit::{AppContext as _, px, size};
+        cx.update(gpui_kit::init);
+        let mut app = AppState::new();
+        app.coworkers = vec![
+            serde_json::from_value(json!({
+                "id": "cw_1", "name": "Ada", "title": "Research", "role": "Reads papers",
+                "model": "oag/cheap", "effort": "low", "source": "gateway"
+            }))
+            .expect("a row"),
+        ];
+        app.active_coworker_id = Some("cw_1".into());
+        app.coworker_tools = Some((
+            "cw_1".into(),
+            ToolList::Listed(vec![CoworkerTool {
+                name: "shell".into(),
+                description: "Run a command.".into(),
+                kind: "builtin".into(),
+            }]),
+        ));
+        app.coworker_skills = Some(("cw_1".into(), BotSkills::Loading));
+        let state = cx.new(|_| app);
+        let (_, cx) =
+            cx.add_window_view(move |window, cx| AgentSettings::new(window, state.clone(), cx));
+        cx.simulate_resize(size(px(INFO_PANE_WIDTH), px(3000.)));
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx
+    }
+
+    /// A Bot's settings read top to bottom: its avatar, Name, Label, Description, Notifications,
+    /// Model, Usage and Auto-review, in that order (the owner's design, hexuria/nativechat#174).
+    #[gpui_kit::test]
+    fn the_pane_reads_top_to_bottom_in_the_owners_order(cx: &mut gpui_kit::TestAppContext) {
+        let cx = open_pane(cx);
+        let order = [
+            "avatar-trigger-row",
+            "agent-settings-name",
+            "agent-label",
+            "agent-role",
+            "agent-notifications",
+            "agent-model-card",
+            "agent-usage",
+            "agent-auto-review",
+        ];
+        let tops: Vec<_> = order
+            .iter()
+            .map(|id| {
+                cx.debug_bounds(id)
+                    .unwrap_or_else(|| panic!("`{id}` is drawn"))
+                    .top()
+            })
+            .collect();
+        assert!(tops.windows(2).all(|pair| pair[0] < pair[1]), "{tops:?}");
+    }
+
+    /// The Tools, Skills and Connections cards are not in the pane: Tools and Connections open
+    /// from the agent monitor (#175) and Skills from its Plugins modal, so the pane draws none of
+    /// them, though what they are drawn from is read.
+    #[gpui_kit::test]
+    fn the_pane_draws_no_tools_skills_or_connections_card(cx: &mut gpui_kit::TestAppContext) {
+        let cx = open_pane(cx);
+        for id in ["agent-tools", "agent-skills", "agent-connections"] {
+            assert!(
+                cx.debug_bounds(id).is_none(),
+                "`{id}` is not the settings pane's any more"
+            );
+        }
     }
 }
