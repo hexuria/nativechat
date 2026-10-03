@@ -102,7 +102,10 @@ fn pill_id(machine_id: &str) -> String {
 pub(crate) const RELAY_DETAIL: &str = "settings-relay-detail";
 /// Beside Save: what it will not keep as the card stands.
 pub(crate) const HINT: &str = "settings-reply-source-hint";
-pub(crate) const SAVE: &str = "settings-reply-source-save";
+/// Save, for this computer's opencodex address and key: under the relay's ids beside the fields it
+/// keeps, `settings-relay-addr` and `settings-relay-key`, where a driver looks for it. Settings →
+/// Relay had it as `settings-reply-source-save`.
+pub(crate) const SAVE: &str = "settings-relay-save";
 /// Under Save: a read that failed, and what the Keychain said when it did not keep a key.
 pub(crate) const ERROR: &str = "settings-reply-source-error";
 /// In place of this computer's opencodex fields: asking the server, a server without reply sources,
@@ -767,7 +770,7 @@ mod tests {
 
     /// The ids a driver finds a card's parts by: the card, its switch, its status and its error by
     /// the server's machine id, and what Settings → Relay's page held for this computer under the
-    /// ids it always had.
+    /// ids it always had, but for Save, which is the relay's beside the fields it keeps.
     #[test]
     fn the_cards_ids_are_the_stable_ones() {
         assert_eq!(card_id("mac_1"), "settings-computer-mac_1");
@@ -792,7 +795,7 @@ mod tests {
                 "settings-relay-key-remove",
                 "settings-relay-detail",
                 "settings-relay-unavailable",
-                "settings-reply-source-save",
+                "settings-relay-save",
                 "settings-reply-source-hint",
                 "settings-reply-source-error",
                 "settings-reply-source-unavailable",

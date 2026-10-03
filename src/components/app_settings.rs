@@ -14,6 +14,11 @@ use gpui_kit::component::{ActiveTheme, Disableable, Icon, IconName, Sizable as _
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 
+/// Settings → General's Show turn timing switch, under Debug: the row's id, which the gpui-agent
+/// tree names it by too, and the words beside the switch.
+pub(crate) const SHOW_TURN_TIMING: &str = "settings-show-turn-timing";
+pub(crate) const SHOW_TURN_TIMING_LABEL: &str = "Show turn timing";
+
 pub struct AppSettings {
     state: Entity<AppState>,
     /// Settings → Logins, made on the first render of that tab (its fields need a window).
@@ -563,7 +568,7 @@ fn general_page(
         .child(
             card().child(
                 h_flex()
-                    .id("settings-show-turn-timing")
+                    .id(SHOW_TURN_TIMING)
                     .w_full()
                     .px(px(16.))
                     .py(px(14.))
@@ -574,7 +579,7 @@ fn general_page(
                             .flex_1()
                             .min_w(px(0.))
                             .gap(px(2.))
-                            .child(div().text_sm().child("Show turn timing"))
+                            .child(div().text_sm().child(SHOW_TURN_TIMING_LABEL))
                             .child(
                                 div()
                                     .text_xs()
@@ -1491,7 +1496,7 @@ mod tests {
             "settings-relay-addr",
             "settings-relay-key",
             "settings-relay-key-remove",
-            "settings-reply-source-save",
+            "settings-relay-save",
         ] {
             let bounds = drawn(cx, field).unwrap_or_else(|| panic!("{field} is on the page"));
             assert!(

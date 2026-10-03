@@ -389,6 +389,10 @@
 //! sends `null`), one change of the account's at a time. `settings-plan-fallback-dismiss` shuts
 //! the popover. All of it is refused off General.
 //!
+//! Under Debug on General, `settings-show-turn-timing` (a switch named `Show turn timing`, checked
+//! and valued `on` while each reply shows the phases of its run, `off` while it does not): a click
+//! flips it, kept on this computer at once. Refused off General.
+//!
 //! Your computers, on Settings → Computer (`settings-tab-computer`; refused while Settings is shut):
 //! one card for each computer the person has enrolled, from `GET /local-exec/daemon`, with its own
 //! Relay your plan switch (opengrok-server #342 (main 2136ffc): each computer has its own switch,
@@ -445,8 +449,9 @@
 //! `settings-relay-key-remove` (while a key is kept: `Remove key`, or `Keep key` with state
 //! `picked`), `settings-reply-source-error` (a read that failed, state `trouble`, or what the
 //! Keychain said when it did not keep a key), `settings-reply-source-hint` (what Save waits for: an
-//! opencodex address on this computer) and `settings-reply-source-save` (enabled only while a click
-//! would keep something). Until the setting has been read, on a server without reply sources, or when
+//! opencodex address on this computer) and `settings-relay-save` (Save, named `Save`, enabled only
+//! while a click would keep something; `settings-reply-source-save`, its id on Settings → Relay, is
+//! refused saying where it is now). Until the setting has been read, on a server without reply sources, or when
 //! it could not be read, they are replaced by `settings-reply-source-unavailable`, the line the card
 //! draws (`Asking the server…` while it has state `asking`); from a server without the relay, by
 //! `settings-relay-unavailable` (that this server can't take replies from a computer yet) and the
