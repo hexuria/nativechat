@@ -57,10 +57,10 @@ use super::client::{
     AnswerReply, AsyncRunResponse, BotSkillScope, BoxShareScope, ConnectLink, ConnectionOwner,
     ConnectionView, Connector, CoworkerCeiling, CoworkerComputer, CoworkerSkills, CoworkerUsage,
     DaemonEnrol, DaemonList, DaemonMachine, LocalExecMode, LocalExecPolicy, OpenGrokClient,
-    QueuedApproval, RecipeDetail, RecipeList, RecipeParameterKind, RecipeRunResult, RunCause,
-    RunReplay, SKIPPED_FIRING, ScheduleKind, ScheduleRow, ScheduleRun, ScheduleRunStarted,
-    ScheduleRunStatus, SkillDetail, SkillSummary, SkillVersion, StopReply, ThreadReplay,
-    ToolListing, host_egress_tunnel_available, host_egress_tunnel_flag,
+    QueuedApproval, RecipeDetail, RecipeList, RecipeParameterKind, RecipeRunResult, RunBy,
+    RunCause, RunReplay, SKIPPED_FIRING, ScheduleKind, ScheduleRow, ScheduleRun,
+    ScheduleRunStarted, ScheduleRunStatus, SkillDetail, SkillSummary, SkillVersion, StopReply,
+    ThreadReplay, ToolListing, host_egress_tunnel_available, host_egress_tunnel_flag,
 };
 use super::credential::{CREDENTIAL_OFFER_SAVE, SaveLoginSpec};
 use super::error::{Failure, Unreachable, reads_as_gateway_unreachable};
@@ -529,22 +529,7 @@ const WORDS_NOT_RECORDED_YET: &[(Slot, &str, &str)] = &[];
 /// Fixtures this app still reads wrongly, with the words their check fails with and why. The
 /// check has to fail with those words: one that passes means the drift is fixed and the entry
 /// goes, and one that fails some other way is a new problem, not this one.
-const KNOWN_DRIFT: &[(&str, &str, &str)] = &[
-    (
-        "rest/GET__schedules__id__runs/200-a_bot_runs_a_routine_by_its_id_and_its_history_names_the_bot.json",
-        "a word this app has no name for",
-        "A run a Bot started (opengrok-server #337, built in #342: `run_routine` in \
-         `crates/opengrok-tools/src/routine.rs`) is a line with `cause: \"bot\"` and `by: \
-         {coworkerId, name}`, which `RunCause` has no name for and reads as `Other`, so the line \
-         says \"Run\" and not who ran it. #337's client half names it.",
-    ),
-    (
-        "rest/GET__schedules__id__runs/200-a_plan_bots_routine_run_by_a_bot_keeps_its_plans_rules.json",
-        "a word this app has no name for",
-        "A firing a Bot's press set off and the server skipped (the plan could not answer) carries \
-         `cause: \"bot\"` and `by` as a run does; see the line above.",
-    ),
-];
+const KNOWN_DRIFT: &[(&str, &str, &str)] = &[];
 
 /// How a 502, 503 or 504 the server wrote itself fails [`refusal`] when it is not in the shape
 /// that says so.
@@ -4491,7 +4476,9 @@ fn recipe_run(status: u16, body: &Value) -> Check {
 /// a name for: a cause or a status read as `Other` is the server saying something the editor
 /// cannot say back. A firing the server skipped (#316: `history` in autonomy/routes.rs) reads as
 /// a skip, with no run to open, when it was due, and the server's sentence for why, which is what
-/// its line says; and a run is never read as one.
+/// its line says; and a run is never read as one. A run a Bot started (#337, built in #342, the
+/// same `history`) is the cause `bot` and names the Bot, by its id and the name it had then, and
+/// no other line does: `by` is null on every other cause, and absent on a line from before it.
 fn schedule_runs(_: u16, body: &Value) -> Check {
     let listed: Vec<ScheduleRun> = parse(body)?;
     let raw = rows(body)?;
@@ -4500,6 +4487,17 @@ fn schedule_runs(_: u16, body: &Value) -> Check {
         must!(
             run.cause != RunCause::Other,
             "a word this app has no name for: {raw}"
+        );
+        let by = raw.get("by").filter(|by| !by.is_null());
+        must!(
+            run.by
+                .as_ref()
+                .map(|by| (by.coworker_id.as_str(), by.name.as_str()))
+                == by.map(|by| (str_at(by, "coworkerId"), str_at(by, "name")))
+                && (run.cause == RunCause::Bot) == (str_at(raw, "cause") == "bot")
+                && (run.cause == RunCause::Bot) == by.is_some(),
+            "who ran it should come through as sent, and be named exactly when a Bot did: {run:?} \
+             from {raw}"
         );
         if str_at(raw, "state") == SKIPPED_FIRING {
             must!(
@@ -4531,6 +4529,48 @@ fn schedule_runs(_: u16, body: &Value) -> Check {
         );
     }
     Ok(())
+}
+
+/// A routine's `lastRun`, on every row of the listing, says what set the run off and which Bot
+/// did when one did, as a line of the history does (opengrok-server #337, built in #342:
+/// `last_run` in `crates/opengrok-server/src/autonomy/mod.rs`): its `cause` is a word this app
+/// has a name for, and its `by` is the Bot's id and the name it had then exactly when the cause is
+/// `bot`, and null for every other. This app reads none of `lastRun` and draws no line of it, so
+/// what is held here is the shape its history reads, on the rows the server sends it with.
+#[test]
+fn a_routines_last_run_names_the_bot_that_ran_it_exactly_when_a_bot_did() {
+    let corpus = Corpus::load();
+    let (mut by_a_bot, mut by_nobody) = (0, 0);
+    for fixture in recorded(&corpus, "GET__schedules").filter(|fixture| fixture["status"] == 200) {
+        for row in fixture["body"].as_array().expect("rows") {
+            let Some(last) = row.get("lastRun").filter(|last| !last.is_null()) else {
+                continue;
+            };
+            let cause: RunCause = serde_json::from_value(last["cause"].clone())
+                .unwrap_or_else(|why| panic!("the cause of {last}: {why}"));
+            assert_ne!(
+                cause,
+                RunCause::Other,
+                "a word this app has no name for: {last}"
+            );
+            let by: Option<RunBy> = serde_json::from_value(last["by"].clone())
+                .unwrap_or_else(|why| panic!("who ran {last}: {why}"));
+            assert_eq!(
+                cause == RunCause::Bot,
+                by.is_some(),
+                "a last run names its Bot exactly when a Bot ran it: {last}"
+            );
+            if by.is_some() {
+                by_a_bot += 1;
+            } else {
+                by_nobody += 1;
+            }
+        }
+    }
+    assert!(
+        by_a_bot > 0 && by_nobody > 0,
+        "the recording holds a last run a Bot started ({by_a_bot}) and ones nobody's ({by_nobody})"
+    );
 }
 
 fn schedule_run_started(_: u16, body: &Value) -> Check {

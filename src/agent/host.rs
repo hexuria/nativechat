@@ -1882,14 +1882,14 @@ enum RunLineSnap {
     /// A run, by its id: what set it off, and where it got to.
     Ran {
         run_id: String,
-        cause: &'static str,
+        cause: String,
         status: &'static str,
     },
     /// A firing the server skipped, by when it was due: what set it off, and the server's
     /// sentence for why.
     Skipped {
         at_ms: i64,
-        cause: &'static str,
+        cause: String,
         reason: String,
     },
 }
@@ -2834,15 +2834,16 @@ fn routine_node(routine: &RoutineSnap) -> UiNode {
                 run_id,
                 cause,
                 status,
-            } => UiNode::status(ids::routine_run(&routine.id, run_id), *cause)
+            } => UiNode::status(ids::routine_run(&routine.id, run_id), cause.clone())
                 .with_value(status.to_string()),
             RunLineSnap::Skipped {
                 at_ms,
                 cause,
                 reason,
             } => {
-                let mut skipped = UiNode::status(ids::routine_skipped(&routine.id, *at_ms), *cause)
-                    .with_value(reason.clone());
+                let mut skipped =
+                    UiNode::status(ids::routine_skipped(&routine.id, *at_ms), cause.clone())
+                        .with_value(reason.clone());
                 skipped.states.push("skipped".into());
                 skipped
             }
@@ -8503,9 +8504,73 @@ mod tests {
     fn ran(run_id: &str, cause: &'static str, status: &'static str) -> RunLineSnap {
         RunLineSnap::Ran {
             run_id: run_id.into(),
-            cause,
+            cause: cause.into(),
             status,
         }
+    }
+
+    /// A run a Bot started with its `run_routine` tool (opengrok-server #337, built in #342) is on
+    /// the tree as the window says it, `Run by Luna`, for the run and for a firing its press set off
+    /// that the plan could not answer; the person's own Test run says what it always said, and
+    /// nothing of any Bot.
+    #[test]
+    fn a_run_a_bot_started_is_on_the_tree_as_the_window_says_it() {
+        use crate::opengrok::{RunCause, ScheduleRunStatus};
+        use crate::state::{AgentRoutine, RoutineRun, RunOutcome};
+        let line = |cause, by: Option<&str>, outcome| RoutineRun {
+            at: String::new(),
+            started_at_ms: 1_790_000_000_000,
+            cause,
+            by: by.map(str::to_string),
+            outcome,
+        };
+        let row = AgentRoutine {
+            id: "sch-1-3".into(),
+            name: "Standup".into(),
+            instruction: "post the standup".into(),
+            active: true,
+            triggers: Vec::new(),
+            runs: vec![
+                line(
+                    RunCause::Bot,
+                    Some("Luna"),
+                    RunOutcome::Ran {
+                        run_id: "run_b".into(),
+                        status: ScheduleRunStatus::Ok,
+                    },
+                ),
+                line(
+                    RunCause::Bot,
+                    Some("Luna"),
+                    RunOutcome::Skipped {
+                        reason: "Skipped: Relay is off for your plan".into(),
+                    },
+                ),
+                line(
+                    RunCause::Manual,
+                    None,
+                    RunOutcome::Ran {
+                        run_id: "run_m".into(),
+                        status: ScheduleRunStatus::Ok,
+                    },
+                ),
+            ],
+            saved: None,
+            tz: None,
+        };
+        let mut fired = routine("sch-1-3", "cron");
+        fired.runs = routine_snap(&row, &AppState::new()).runs;
+        let mut host = host();
+        host.computer_open = true;
+        host.routines = vec![fired];
+        let tree = host.snapshot();
+        let said = |id: String| tree.find(&id).expect("the line").name.clone();
+        assert_eq!(said(ids::routine_run("sch-1-3", "run_b")), "Run by Luna");
+        assert_eq!(
+            said(ids::routine_skipped("sch-1-3", 1_790_000_000_000)),
+            "Run by Luna"
+        );
+        assert_eq!(said(ids::routine_run("sch-1-3", "run_m")), "Test run");
     }
 
     /// A firing the server skipped is on the tree among the runs, by when it was due, with what
@@ -8521,7 +8586,7 @@ mod tests {
         fired.runs = vec![
             RunLineSnap::Skipped {
                 at_ms: 1_790_000_000_000,
-                cause: "Schedule",
+                cause: "Schedule".into(),
                 reason: said.into(),
             },
             ran("run_a", "Test run", "ok"),

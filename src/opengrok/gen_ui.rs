@@ -531,13 +531,20 @@ pub const USER_MACHINE_SHELL: &str = "user_machine_shell";
 pub const USE_SKILL: &str = "use_skill";
 
 /// The four tools a Bot lists, makes, changes and deletes its person's routines with when they ask
-/// in chat (opengrok-server #316, #334, on main 8e7387f: `crates/opengrok-tools/src/routine.rs`).
-/// None of them touches a computer, and a delete always asks first, its card's `why` naming the
-/// routine as it is stored. The tool ceiling switches all four as one row, `routines`.
+/// in chat (opengrok-server #316, #334, on main 8e7387f: `crates/opengrok-tools/src/routine.rs`),
+/// and the fifth, [`RUN_ROUTINE`], which runs one (#337, built in #342). None of them touches a
+/// computer, and a delete always asks first, its card's `why` naming the routine as it is stored.
+/// The tool ceiling switches all five as one row, `routines`.
 pub const LIST_ROUTINES: &str = "list_routines";
 pub const CREATE_ROUTINE: &str = "create_routine";
 pub const UPDATE_ROUTINE: &str = "update_routine";
 pub const DELETE_ROUTINE: &str = "delete_routine";
+/// A Bot runs one of its person's routines now, as their Run now does: `{routine}`, its id or its
+/// name as `list_routines` gives it, answered with `{runId, threadId}` (opengrok-server #337,
+/// built in #342: `RUN_ROUTINE` in `crates/opengrok-tools/src/routine.rs`). It raises no card, so
+/// [`approval_summary`] has no arm for it, as the server's `summary_for` has none. The history
+/// names the Bot that ran it ([`super::RunBy`]).
+pub const RUN_ROUTINE: &str = "run_routine";
 
 /// The CUSTOM `name` of a run parked on a card: a tool waiting on a yes, or a form waiting on the
 /// person (opengrok-harness `projection.rs` `awaiting_approval`).

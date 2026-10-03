@@ -3948,7 +3948,10 @@ impl ScheduleEdit {
 /// endedAtMs}` for a run; and since #316 (#334, on main 8e7387f, the same `history`) a firing the
 /// server skipped, because the Bot answers on its person's own plan and the plan could not answer
 /// then, as `{runId: null, cause, status: null, startedAtMs: null, endedAtMs: null, at, state:
-/// "skipped", skipped, reason}`. A skip started no run, so it has nothing to open.
+/// "skipped", skipped, reason}`. A skip started no run, so it has nothing to open. Since #337
+/// (built in #342, the same `history`) every line also carries `by`: the Bot whose `run_routine`
+/// set the firing off, which is a run's `cause: "bot"` too, and `null` for every other cause (a
+/// line from before it has no `by` at all).
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ScheduleRun {
@@ -3981,6 +3984,22 @@ pub struct ScheduleRun {
     /// line says: "Skipped: your computer was off, so your plan couldn't answer".
     #[serde(default)]
     pub reason: Option<String>,
+    /// The Bot that started the firing, as the server named it then (opengrok-server #337, built in
+    /// #342: `history` in `crates/opengrok-server/src/autonomy/routes.rs`): `null` for the clock,
+    /// a webhook and the person's own Test run, and left out by a server from before it. The
+    /// line says it ([`RunCause::Bot`]) wherever it is a Bot's.
+    #[serde(default)]
+    pub by: Option<RunBy>,
+}
+
+/// The Bot a firing of a routine was started by, as a line of the history and a routine's `lastRun`
+/// name it: its id, and its name as it was called then, which is the name the line says (opengrok-server
+/// #337, built in #342: `by` in `crates/opengrok-server/src/autonomy/routes.rs`).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunBy {
+    pub coworker_id: String,
+    pub name: String,
 }
 
 /// `state` on a line of a routine's history that is a firing the server skipped (see
@@ -4010,6 +4029,9 @@ pub enum RunCause {
     Manual,
     Webhook,
     Clock,
+    /// A Bot ran the routine for its person with its `run_routine` tool (opengrok-server #337,
+    /// built in #342); the line's `by` names it.
+    Bot,
     /// A word this client has no name for yet: still a run, and still listed.
     #[serde(other)]
     Other,
@@ -11013,6 +11035,54 @@ mod tests {
         );
         assert!(!runs[1].is_skipped());
         assert_eq!(runs[1].run_id.as_deref(), Some("run_1"));
+    }
+
+    /// A run a Bot started with its `run_routine` tool (opengrok-server #337, built in #342) is a
+    /// line of the history with `cause: "bot"` and `by: {coworkerId, name}`, and so is a firing a
+    /// Bot's press set off that the plan could not answer; every other line has `by: null`, or, from
+    /// a server before it, none at all, and is read as it always was.
+    #[tokio::test]
+    async fn a_run_a_bot_started_names_the_bot_in_the_history() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/schedules/sch_1/runs"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+                { "runId": "run_4", "cause": "bot", "status": "ok", "startedAtMs": 4000,
+                  "endedAtMs": 4500, "by": { "coworkerId": "cw_luna", "name": "Luna" } },
+                { "runId": null, "cause": "bot", "status": null, "startedAtMs": null,
+                  "endedAtMs": null, "at": 3000, "state": "skipped", "skipped": "proxy_down",
+                  "reason": "Skipped: your plan's proxy didn't answer",
+                  "by": { "coworkerId": "cw_luna", "name": "Luna" } },
+                { "runId": "run_2", "cause": "manual", "status": "ok", "startedAtMs": 2000,
+                  "endedAtMs": 2500, "by": null },
+                { "runId": "run_1", "cause": "clock", "status": "ok", "startedAtMs": 1000,
+                  "endedAtMs": 1200 }
+            ])))
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        let runs = client.schedule_runs("sch_1").await.unwrap();
+        let read: Vec<(RunCause, Option<(&str, &str)>)> = runs
+            .iter()
+            .map(|run| {
+                (
+                    run.cause,
+                    run.by
+                        .as_ref()
+                        .map(|by| (by.coworker_id.as_str(), by.name.as_str())),
+                )
+            })
+            .collect();
+        assert_eq!(
+            read,
+            vec![
+                (RunCause::Bot, Some(("cw_luna", "Luna"))),
+                (RunCause::Bot, Some(("cw_luna", "Luna"))),
+                (RunCause::Manual, None),
+                (RunCause::Clock, None),
+            ]
+        );
+        assert!(runs[1].is_skipped() && !runs[0].is_skipped());
     }
 
     /// Run it now while the Bot's plan cannot answer is the server's 409 with the skip's code and

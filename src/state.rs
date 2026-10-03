@@ -4235,6 +4235,10 @@ pub struct RoutineRun {
     pub at: String,
     pub started_at_ms: i64,
     pub cause: RunCause,
+    /// The name of the Bot that started it, as the server called it then, where one did (opengrok-server
+    /// #337, built in #342: `by` on the line); `None` for the clock, a webhook and the person's own
+    /// Test run, which the line says nothing more of.
+    pub by: Option<String>,
     pub outcome: RunOutcome,
 }
 
@@ -4293,6 +4297,7 @@ impl RoutineRun {
             at: history_time(started_at_ms),
             started_at_ms,
             cause: run.cause,
+            by: run.by.map(|by| by.name),
             outcome,
         }
     }
@@ -4304,6 +4309,7 @@ impl RoutineRun {
             at: history_time(started_at_ms),
             started_at_ms,
             cause: RunCause::Manual,
+            by: None,
             outcome: RunOutcome::Ran {
                 run_id,
                 status: ScheduleRunStatus::Running,
@@ -4330,13 +4336,24 @@ impl RoutineRun {
         )
     }
 
-    /// What set it off, in the words the editor uses for it.
-    pub fn cause_label(&self) -> &'static str {
+    /// What set it off, in the words the editor uses for it: a Bot's run says which Bot ran it, by
+    /// the name the server gave, and any other cause says nothing of any Bot, whatever else a line
+    /// carries.
+    pub fn cause_label(&self) -> String {
         match self.cause {
-            RunCause::Manual => "Test run",
-            RunCause::Webhook => "Webhook",
-            RunCause::Clock => "Schedule",
-            RunCause::Other => "Run",
+            RunCause::Manual => "Test run".to_string(),
+            RunCause::Webhook => "Webhook".to_string(),
+            RunCause::Clock => "Schedule".to_string(),
+            RunCause::Bot => match self
+                .by
+                .as_deref()
+                .map(str::trim)
+                .filter(|by| !by.is_empty())
+            {
+                Some(name) => format!("Run by {name}"),
+                None => "Run by a Bot".to_string(),
+            },
+            RunCause::Other => "Run".to_string(),
         }
     }
 }
@@ -23335,6 +23352,7 @@ mod tests {
             at: None,
             skipped: None,
             reason: None,
+            by: None,
         }
     }
 
@@ -23434,6 +23452,86 @@ mod tests {
         assert!(line(RunCause::Manual, ScheduleRunStatus::Waiting).unsettled());
         assert!(!line(RunCause::Manual, ScheduleRunStatus::Error).unsettled());
         assert!(!line(RunCause::Manual, ScheduleRunStatus::Ok).at.is_empty());
+    }
+
+    /// A routine run a Bot started (opengrok-server #337, built in #342: its history's lines carry
+    /// `cause: "bot"` and `by: {coworkerId, name}`, the Bot as it was called then) says which Bot
+    /// ran it, on its line of the Run history: the recording's own lines, a run the Bot started
+    /// beside the person's own Test run, and the two firings a Bot's press set off that the plan
+    /// could not answer, each "Run by Luna" with what became of it under or beside. A line whose
+    /// `by` is null, or that has none (a server from before it), says what it always said, and
+    /// nothing of any Bot; one that names a Bot with no name says "a Bot".
+    #[test]
+    fn a_run_a_bot_started_says_which_bot_ran_it() {
+        let lines = |fixture: &str| -> Vec<super::RoutineRun> {
+            serde_json::from_value::<Vec<crate::opengrok::ScheduleRun>>(recorded_body(fixture))
+                .expect("a history")
+                .into_iter()
+                .map(super::RoutineRun::from_server)
+                .collect()
+        };
+        let ran = lines(include_str!(
+            "../fixtures/wire/rest/GET__schedules__id__runs/200-a_bot_runs_a_routine_by_its_id_and_its_history_names_the_bot.json"
+        ));
+        assert_eq!(
+            ran.iter().map(|run| run.cause_label()).collect::<Vec<_>>(),
+            ["Run by Luna", "Test run"],
+            "the Bot's run, and the person's own, whose `by` is null"
+        );
+        assert!(ran.iter().all(|run| run.run_id().is_some()));
+
+        let skipped = lines(include_str!(
+            "../fixtures/wire/rest/GET__schedules__id__runs/200-a_plan_bots_routine_run_by_a_bot_keeps_its_plans_rules.json"
+        ));
+        assert_eq!(
+            skipped
+                .iter()
+                .map(|run| (run.cause_label().to_string(), run.outcome.clone()))
+                .collect::<Vec<_>>(),
+            [
+                (
+                    "Run by Luna".to_string(),
+                    super::RunOutcome::Skipped {
+                        reason: "Skipped: your plan's proxy didn't answer".into()
+                    }
+                ),
+                (
+                    "Run by Luna".to_string(),
+                    super::RunOutcome::Skipped {
+                        reason: "Skipped: your computer was off, so your plan couldn't answer"
+                            .into()
+                    }
+                ),
+            ]
+        );
+
+        // By null, or no `by` at all: nothing of any Bot, whatever set the run off.
+        let line = |cause: &str, by: Option<serde_json::Value>| {
+            let mut line = serde_json::json!({
+                "runId": "run_1", "cause": cause, "status": "ok",
+                "startedAtMs": 1_000, "endedAtMs": 2_000
+            });
+            if let Some(by) = by {
+                line["by"] = by;
+            }
+            let line: crate::opengrok::ScheduleRun =
+                serde_json::from_value(line).expect("a history line");
+            super::RoutineRun::from_server(line).cause_label()
+        };
+        for (cause, said) in [
+            ("manual", "Test run"),
+            ("webhook", "Webhook"),
+            ("clock", "Schedule"),
+        ] {
+            for by in [None, Some(serde_json::Value::Null)] {
+                let shown = line(cause, by);
+                assert_eq!(shown, said);
+                assert!(!shown.contains("Run by"), "{shown}");
+            }
+        }
+        let a_bot = serde_json::json!({"coworkerId": "cw_2", "name": "  "});
+        assert_eq!(line("bot", Some(a_bot)), "Run by a Bot");
+        assert_eq!(line("bot", None), "Run by a Bot");
     }
 
     /// The zone a routine's times are in (opengrok-server #316): its own, as its row says it;
@@ -28094,7 +28192,7 @@ mod tests {
         let result = client.schedule_runs("sch_1").await;
         assert!(state.settle_routine_runs("cw_1", "sch_1", read, result));
         let runs = &state.routine_mut("cw_1", "sch_1").unwrap().runs;
-        let mut causes: Vec<&str> = runs.iter().map(|run| run.cause_label()).collect();
+        let mut causes: Vec<String> = runs.iter().map(|run| run.cause_label()).collect();
         causes.sort_unstable();
         assert_eq!(causes, ["Schedule", "Test run"]);
         for run in runs {
@@ -39033,8 +39131,7 @@ mod tests {
         );
     }
 
-    /// The body of a fixture of the server's recording (opengrok-server #332 (PR #338 at
-    /// 66b9f7b), vendored in `fixtures/wire/`).
+    /// The body of a fixture of the server's recording, vendored in `fixtures/wire/`.
     fn recorded_body(fixture: &str) -> serde_json::Value {
         let recorded: serde_json::Value = serde_json::from_str(fixture).expect("the recording");
         recorded["body"].clone()

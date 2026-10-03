@@ -34,11 +34,11 @@ pub(crate) use gen_ui::capped;
 pub use gen_ui::{
     ApprovalSpec, BarChartSpec, BarItem, CREATE_ROUTINE, ChatPart, ChoiceCard, CompletedUiTool,
     DELETE_ROUTINE, FormField, FormSpec, FrameArrivals, LIST_ROUTINES, LocalExecResolution,
-    MAX_TURN_CONTINUES, ScreenshotSpec, StepSpec, StepStatus, ThoughtSpec, TurnAssembler,
-    UI_TOOL_RESULT, UPDATE_ROUTINE, USER_MACHINE_SHELL, UiSpec, agui_tools, approval_from_event,
-    approval_summary, choice_index, choice_letter, collapse_open_approvals, command_from_args,
-    command_from_replay_events, keep_call_times, local_exec_outcome, persons_messages,
-    place_hitl_cards_in_document_order, policy_answer,
+    MAX_TURN_CONTINUES, RUN_ROUTINE, ScreenshotSpec, StepSpec, StepStatus, ThoughtSpec,
+    TurnAssembler, UI_TOOL_RESULT, UPDATE_ROUTINE, USER_MACHINE_SHELL, UiSpec, agui_tools,
+    approval_from_event, approval_summary, choice_index, choice_letter, collapse_open_approvals,
+    command_from_args, command_from_replay_events, keep_call_times, local_exec_outcome,
+    persons_messages, place_hitl_cards_in_document_order, policy_answer,
 };
 pub use inference::{
     DEFAULT_PROXY_URL, FallbackFor, HELD_FOR_RELAY_OFFLINE, INFERENCE_SOURCE_CUSTOM, InferenceKind,
@@ -90,11 +90,11 @@ pub use client::{
     NewSchedule, NewSkill, OpenGrokClient, QueuedApproval, RecipeBot, RecipeDetail, RecipeGrant,
     RecipeKind, RecipeParameter, RecipeParameterKind, RecipeRelation, RecipeRun, RecipeRunResult,
     RecipeScreen, RecipeShare, RecipeShareState, RecipeShareTarget, RecipeStep, RecipeSummary,
-    RecipeTape, RecipeTapeEvent, RecipeVersion, RevealedSecrets, RunCause, RunRecipeResponse,
-    RunReplay, SKILL_BODY_CHARS, SKILL_BUNDLE_FILES, SKILL_BUNDLE_LIMIT, ScheduleEdit,
-    ScheduleKind, ScheduleRow, ScheduleRun, ScheduleRunStatus, SiteLoginSave, SiteLoginUpdate,
-    SkillDetail, SkillFile, SkillPatch, SkillSource, SkillSummary, SkillVersion, StopReply,
-    ThreadReplay, ThreadRun, TurnRecipe, UpdateStatus, UsageTotals, WebhookInfo,
+    RecipeTape, RecipeTapeEvent, RecipeVersion, RevealedSecrets, RunBy, RunCause,
+    RunRecipeResponse, RunReplay, SKILL_BODY_CHARS, SKILL_BUNDLE_FILES, SKILL_BUNDLE_LIMIT,
+    ScheduleEdit, ScheduleKind, ScheduleRow, ScheduleRun, ScheduleRunStatus, SiteLoginSave,
+    SiteLoginUpdate, SkillDetail, SkillFile, SkillPatch, SkillSource, SkillSummary, SkillVersion,
+    StopReply, ThreadReplay, ThreadRun, TurnRecipe, UpdateStatus, UsageTotals, WebhookInfo,
     collapse_computer_roster, collapse_computers_by_machine_id, env_egress_tunnel_enabled,
     host_egress_tunnel_available, host_egress_tunnel_enabled, host_egress_tunnel_flag, thin_tape,
 };
