@@ -824,17 +824,19 @@ fn find_highlighted_text(text: &str, marks: &[(std::ops::Range<usize>, bool)]) -
 }
 
 /// The line under a held message: it sends when the coworker is free, or, while the server holds
-/// it for the person's Mac (`heldFor: "relay_offline"`, opengrok-server #292), when their Mac is
-/// answering again.
+/// it for the person's computer (`heldFor: "relay_offline"`, opengrok-server #292), when their
+/// computer is answering again.
 pub(crate) fn queued_line(waiting_for_mac: bool) -> &'static str {
     if waiting_for_mac {
-        WAITING_FOR_YOUR_MAC
+        WAITING_FOR_YOUR_COMPUTER
     } else {
         "Queued — sends when the coworker is free"
     }
 }
 
-pub(crate) const WAITING_FOR_YOUR_MAC: &str = "Waiting for your Mac";
+/// The relay is the app on whatever computer the person has, so the line says "computer". The
+/// server's own sentences about it, shown as it wrote them, are the server's to word.
+pub(crate) const WAITING_FOR_YOUR_COMPUTER: &str = "Waiting for your computer";
 
 /// Cancel and Edit under a queued bubble, so they do not wait on hovering the ⋯.
 fn queued_hold_actions(
@@ -940,7 +942,7 @@ pub(crate) fn human_size(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     // Item by item rather than a glob: `use super::*` would drag in gpui_kit's own `test`.
-    use super::{MessageBubble, TS_PEEK_MAX, TimestampPeek, WAITING_FOR_YOUR_MAC, queued_line};
+    use super::{MessageBubble, TS_PEEK_MAX, TimestampPeek, queued_line};
 
     #[test]
     fn a_timed_reply_preserves_the_timestamp_swipe() {
@@ -984,14 +986,13 @@ mod tests {
     }
 
     /// A held message says what it waits for: the coworker to be free, or, while the server
-    /// holds it for the person's Mac, their Mac.
+    /// holds it for the person's computer, their computer.
     #[test]
     fn a_held_message_says_what_it_waits_for() {
         assert_eq!(
             queued_line(false),
             "Queued — sends when the coworker is free"
         );
-        assert_eq!(queued_line(true), WAITING_FOR_YOUR_MAC);
-        assert_eq!(WAITING_FOR_YOUR_MAC, "Waiting for your Mac");
+        assert_eq!(queued_line(true), "Waiting for your computer");
     }
 }

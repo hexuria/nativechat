@@ -38,8 +38,8 @@ pub(crate) const PLAN_USAGE_NOTE: &str = "Replies on your own subscription aren'
 /// because the relay is off ([`ReplySource::relay_off`]).
 pub(crate) const RELAY_OFF_BADGE: &str = "paid key · relay off";
 
-/// What a reply's badge reads: whose keys paid for it, that the person's Mac answered it where it
-/// did ([`badge_label`]), or that the server's keys answered because the relay is off; and ⚡
+/// What a reply's badge reads: whose keys paid for it, that the person's computer answered it where
+/// it did ([`badge_label`]), or that the server's keys answered because the relay is off; and ⚡
 /// where the model that answered is a fast twin, which is all fast ever is on the wire.
 pub(crate) fn badge_words(source: &ReplySource) -> String {
     let fast = source
@@ -55,17 +55,19 @@ pub(crate) fn badge_words(source: &ReplySource) -> String {
 }
 
 /// What a reply's badge reads of its door: whose keys paid for it, and for a reply the person's
-/// Mac answered through the relay, that the Mac did.
+/// computer answered through the relay, that the computer did. The wire still calls that door
+/// `via: "mac"`, but the relay is the app on whatever computer the person has, so the badge says
+/// "computer".
 pub(crate) fn badge_label(kind: InferenceKind, via: Option<Via>) -> &'static str {
     match (kind, via) {
         (InferenceKind::Gateway, _) => "paid key",
-        (InferenceKind::LocalProxy, Some(Via::Mac)) => "your plan · Mac",
+        (InferenceKind::LocalProxy, Some(Via::Mac)) => "your plan · computer",
         (InferenceKind::LocalProxy, _) => "your plan",
     }
 }
 
-/// A reply's badge: "paid key", "paid key · relay off", "your plan" or "your plan · Mac", with ⚡
-/// for a fast twin, and the model on hover when the server named one.
+/// A reply's badge: "paid key", "paid key · relay off", "your plan" or "your plan · computer", with
+/// ⚡ for a fast twin, and the model on hover when the server named one.
 /// One to a reply, on the last row of its words, so it is named by the reply's message id.
 pub(crate) fn reply_badge(
     source: &ReplySource,
@@ -97,8 +99,9 @@ mod tests {
     use crate::opengrok::{InferenceKind, Via};
 
     /// The words a reply's badge says, as the contract's doors: the server's keys, the plan on the
-    /// server's own machine, and the plan the person's Mac answers through the relay. A way never
-    /// named, as from a server before the relay, reads as the plan.
+    /// server's own machine, and the plan the person's computer answers through the relay, which
+    /// says "computer" and never "Mac". A way never named, as from a server before the relay, reads
+    /// as the plan.
     #[test]
     fn each_door_reads_as_itself_on_its_badge() {
         let doors = [
@@ -109,7 +112,7 @@ mod tests {
         ];
         assert_eq!(
             doors.map(|(kind, via)| badge_label(kind, via)),
-            ["paid key", "your plan", "your plan", "your plan · Mac"]
+            ["paid key", "your plan", "your plan", "your plan · computer"]
         );
     }
 
@@ -136,7 +139,7 @@ mod tests {
                 Some(Via::Mac),
                 Some("grok-4.7--fast")
             ),
-            "your plan · Mac ⚡"
+            "your plan · computer ⚡"
         );
         assert_eq!(
             badge(InferenceKind::Gateway, None, Some("oag/fast--fast")),
@@ -188,7 +191,7 @@ mod tests {
                 "kind": "local_proxy", "via": "mac", "model": "gpt-6-luna",
                 "fallbackFor": "relay_disabled"
             }))),
-            "your plan · Mac"
+            "your plan · computer"
         );
         let row = off.to_json();
         assert!(row.contains(r#""fallbackFor":"relay_disabled""#), "{row}");

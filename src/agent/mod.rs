@@ -465,12 +465,13 @@
 //! `settings-tab-skills`. Default for new Bots is General's, above.
 //!
 //! `reply-source-{messageId}` is the badge of each reply in the open thread that wears one, as the
-//! feed draws it (label `paid key` / `paid key · relay off` / `your plan` / `your plan · Mac`, with
-//! ` ⚡` after it where the model that answered is a fast twin; value = the door, state `via-mac`
-//! on one the person's Mac answered, and `relay-off` on one the server's keys answered because the
-//! relay is off, as the run's frame says in `fallbackFor: "relay_disabled"` (opengrok-server
-//! #332 (PR #338 at 66b9f7b))), holding `reply-source-model-{messageId}` (label = the model
-//! the server named, which the badge shows on hover) when it named one. A reply whose run
+//! feed draws it (label `paid key` / `paid key · relay off` / `your plan` /
+//! `your plan · computer`, with ` ⚡` after it where the model that answered is a fast twin; value
+//! = the door, state `via-mac` (the wire's `via: "mac"`) on one the person's computer answered,
+//! and `relay-off` on one the server's keys answered because the relay is off, as the run's frame
+//! says in `fallbackFor: "relay_disabled"` (opengrok-server #332 (PR #338 at 66b9f7b))), holding
+//! `reply-source-model-{messageId}` (label = the model the server named, which the badge shows on
+//! hover) when it named one. A reply whose run
 //! ended because the person's plan could not answer (a `RUN_ERROR` code: the relay's, where the
 //! Mac could not, or `plan_unavailable`, where the person's own setting left the plan nothing to
 //! answer with) keeps its line, and while it is the open thread's last turn the page holds
@@ -479,8 +480,8 @@
 //! reply whose run ended `relay_disabled`, a Bot's reply to another skipped while the relay is
 //! off with no fallback (opengrok-server #332 (PR #338 at 66b9f7b), only ever in the two Bots'
 //! read-only pair thread), keeps its line and has neither. Under `composer-queued`, a
-//! `queued-waiting-{messageId}` (`Waiting for your Mac`) for each held message the server holds
-//! for the person's Mac (`heldFor: "relay_offline"`, never while the relay is switched off). In the bot's settings, while the Bot's
+//! `queued-waiting-{messageId}` (`Waiting for your computer`) for each held message the server holds
+//! for the person's computer (`heldFor: "relay_offline"`, never while the relay is switched off). In the bot's settings, while the Bot's
 //! replies go through the person's plan, its own door or the account's that it follows,
 //! `agent-usage-plan` (the Usage card does not count those replies).
 //!

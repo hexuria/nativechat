@@ -4203,8 +4203,8 @@ impl NativeChatHost {
                 );
         }
         if self.queued_sends > 0 {
-            // Each held message the server holds for the person's Mac says so under it, as its
-            // bubble does.
+            // Each held message the server holds for the person's computer says so under it, as
+            // its bubble does.
             let queued = self.waiting_for_mac.iter().fold(
                 UiNode::new(
                     ids::COMPOSER_QUEUED,
@@ -4214,7 +4214,7 @@ impl NativeChatHost {
                 |queued, message_id| {
                     queued.with_child(UiNode::status(
                         ids::queued_waiting(message_id),
-                        crate::components::message::WAITING_FOR_YOUR_MAC,
+                        crate::components::message::WAITING_FOR_YOUR_COMPUTER,
                     ))
                 },
             );
@@ -10897,7 +10897,7 @@ mod tests {
         assert_eq!(
             tree.find(&ids::queued_waiting("m_1"))
                 .map(|node| node.name.as_str()),
-            Some("Waiting for your Mac")
+            Some("Waiting for your computer")
         );
         assert!(tree.find(&ids::queued_waiting("m_2")).is_none());
     }
