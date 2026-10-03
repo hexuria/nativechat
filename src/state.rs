@@ -13229,19 +13229,12 @@ impl AppState {
                     return;
                 };
                 let _ = this.update(cx, |state, cx| {
-                    state.note_model_pick_refused(bot, error);
+                    state.model_pick_note = Some((bot, error));
                     cx.notify();
                 });
             })),
             cx,
         );
-    }
-
-    /// The server's words for a change of the Bot's picker that it refused, said in the popover
-    /// until the next change is sent: an effort the model does not list, in the words that name
-    /// the levels it does.
-    fn note_model_pick_refused(&mut self, bot: String, said: String) {
-        self.model_pick_note = Some((bot, said));
     }
 
     /// None, Default for new Bots' first row: the default the server keeps goes, and a new Bot is
@@ -37589,35 +37582,28 @@ mod tests {
     }
 
     /// An effort the model does not list is refused with a 400 whose words name the levels it
-    /// does list (opengrok-server branch `model-effort-levels`, shape agreed (not recorded yet),
-    /// so the words here are samples), and nothing is kept. Each picker says the words as they
-    /// are, under its controls, where it asked: a Bot's, Default for new Bots' and the Relay-off
-    /// fallback's.
+    /// does list (opengrok-server branch `model-effort-levels`, commit d632b77: `effort_refused`
+    /// in `crates/opengrok-server/src/inference.rs`, which `save` there asks of `newBotDefault` on
+    /// its own source and of `planFallback` on the gateway), and nothing is kept. Default for new
+    /// Bots' and the Relay-off fallback's pickers each say the words as they are, under their
+    /// controls, where they asked; the Bot's is
+    /// [`a_bots_refused_effort_is_said_in_its_popover_through_the_real_refusal`].
     #[tokio::test]
-    async fn a_refused_effort_shows_the_servers_words_in_all_three_pickers() {
+    async fn a_refused_effort_shows_the_servers_words_in_default_for_new_bots_and_the_fallback() {
         use super::{AfterChange, DefaultForNewBots, PickerFor, RelayOffFallback};
-        use crate::opengrok::CoworkerPatch;
-        let bots =
-            "effort: `ultra` is not one of gpt-6-luna's levels: low, medium, high, xhigh, max";
-        let defaults = "newBotDefault.effort: `ultra` is not one of gpt-6-luna's levels: low, medium, high, \
-             xhigh, max";
-        let fallbacks = "planFallback.effort: `ultra` is not one of oag/cheap's levels: low, medium, high, \
-             xhigh, max";
+        let defaults =
+            "newBotDefault.effort: gpt-6-luna takes low, medium, high, xhigh or max, not \"none\"";
+        let fallbacks =
+            "planFallback.effort: openai/gpt-6-luna takes low, medium or high, not \"max\"";
         let server = wiremock::MockServer::start().await;
-        wiremock::Mock::given(wiremock::matchers::method("PATCH"))
-            .and(wiremock::matchers::path("/coworkers/cw_1"))
-            .and(wiremock::matchers::body_json(json!({"effort": "ultra"})))
-            .respond_with(
-                wiremock::ResponseTemplate::new(400).set_body_json(json!({"error": bots})),
-            )
-            .expect(1)
-            .mount(&server)
-            .await;
-        for (key, said) in [("newBotDefault", defaults), ("planFallback", fallbacks)] {
+        for (key, said, effort) in [
+            ("newBotDefault", defaults, "none"),
+            ("planFallback", fallbacks, "max"),
+        ] {
             wiremock::Mock::given(wiremock::matchers::method("PUT"))
                 .and(wiremock::matchers::path("/account/inference-source"))
                 .and(wiremock::matchers::body_partial_json(json!({
-                    (key): {"effort": "ultra"}
+                    (key): {"effort": effort}
                 })))
                 .respond_with(
                     wiremock::ResponseTemplate::new(400).set_body_json(json!({"error": said})),
@@ -37638,28 +37624,9 @@ mod tests {
             },
         );
 
-        // A Bot's: the client reads the 400 as the server's sentence, and the picker says it.
-        let error = state
-            .opengrok
-            .clone()
-            .expect("a client")
-            .patch_coworker(
-                "cw_1",
-                &CoworkerPatch {
-                    effort: Some("ultra".into()),
-                    ..Default::default()
-                },
-            )
-            .await
-            .expect_err("the server refused it");
-        assert_eq!((error.status, error.message.as_str()), (Some(400), bots));
-        assert_eq!(state.picker_note(PickerFor::Bot), None);
-        state.note_model_pick_refused("cw_1".into(), error.message);
-        assert_eq!(state.picker_note(PickerFor::Bot), Some(bots));
-
         // Default for new Bots': its own words, kept nowhere, and said where it asked.
         let send = state
-            .begin_new_bots_change(Some(luna("ultra")))
+            .begin_new_bots_change(Some(luna("none")))
             .expect("a change begins");
         let answer = send.client.set_inference_source(&send.update).await;
         assert_eq!(
@@ -37668,6 +37635,11 @@ mod tests {
         );
         assert_eq!(state.picker_note(PickerFor::NewBots), Some(defaults));
         assert_eq!(
+            state.picker_note(PickerFor::Bot),
+            None,
+            "said only where it was asked"
+        );
+        assert_eq!(
             state.default_for_new_bots(),
             DefaultForNewBots::Kept(Some(luna("high"))),
             "nothing was kept"
@@ -37675,7 +37647,10 @@ mod tests {
 
         // The Relay-off fallback's.
         let send = state
-            .begin_plan_fallback_change(Some(cheap("ultra")))
+            .begin_plan_fallback_change(Some(crate::opengrok::PlanFallback {
+                model: "openai/gpt-6-luna".into(),
+                effort: "max".into(),
+            }))
             .expect("a change begins");
         let answer = send.client.set_inference_source(&send.update).await;
         assert_eq!(
@@ -37692,6 +37667,98 @@ mod tests {
             None,
             "the account's one slot holds the last refusal, and says it where it was asked"
         );
+    }
+
+    /// The Bot's picker offers a level the server then refuses, as when the list the picker was
+    /// shown is not the one the server holds: the PATCH goes out, the server answers 400 in its
+    /// words, and the popover says them, as the settings pane's red line does, with the roster put
+    /// back on what the server keeps. It goes through the road a real refusal takes, over a real
+    /// answer: the callback `save_model_pick` hands the request is what puts the words in the
+    /// popover, so the test fails without it.
+    #[gpui_kit::test]
+    fn a_bots_refused_effort_is_said_in_its_popover_through_the_real_refusal(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        use super::PickerFor;
+        use gpui_kit::AppContext as _;
+        let said = "effort: gpt-6-luna takes low, medium, high, xhigh or max, not \"none\"";
+        // The answer comes back on this runtime's own threads, so it is driven, and the test
+        // waits for the answer in real time, which the scheduler is told it may.
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("a runtime");
+        let _enter = runtime.enter();
+        cx.executor().allow_parking();
+        let server = runtime.block_on(wiremock::MockServer::start());
+        runtime.block_on(
+            wiremock::Mock::given(wiremock::matchers::method("PATCH"))
+                .and(wiremock::matchers::path("/coworkers/cw_1"))
+                .and(wiremock::matchers::body_json(json!({"effort": "none"})))
+                .respond_with(
+                    wiremock::ResponseTemplate::new(400).set_body_json(json!({"error": said})),
+                )
+                .expect(1)
+                .mount(&server),
+        );
+        let mut state = signed_in_state();
+        state.opengrok = Some(runtime.block_on(client_signed_in_to(&server)));
+        read_as(
+            &mut state,
+            relay_kept(InferenceKind::Gateway, "loopback", None),
+        );
+        with_bot(&mut state, json!("local_proxy"));
+        state.coworkers[0].model = "gpt-6-luna".into();
+        state.coworkers[0].effort = Some("high".into());
+        // The picker lists `none` among GPT-6 Luna's levels, and the server, asked again, does not.
+        let levels = ["none", "low", "medium", "high", "xhigh", "max"]
+            .map(|word| json!({"value": word, "label": format!("{word} effort")}));
+        state.model_catalogue = serde_json::from_value(json!({
+            "models": [{
+                "id": "gpt-6-luna", "source": "local_proxy", "ownEffort": "medium",
+                "efforts": levels
+            }],
+            "note": null
+        }))
+        .expect("a list");
+        let app = cx.new(|_| state);
+        app.update(cx, |state, cx| {
+            state.set_picker_open(PickerFor::Bot, true, cx);
+            // None is the first of the six stops.
+            state.pick_model_effort_level(PickerFor::Bot, 0, cx);
+            assert_eq!(
+                state.coworkers[0].effort.as_deref(),
+                Some("none"),
+                "the roster takes the pick at once"
+            );
+        });
+        // The answer lands on the executor from another thread, so it is waited for.
+        let mut waited = 0;
+        while app.read_with(cx, |state, _| state.auth_error.is_none()) {
+            assert!(waited < 2000, "the server never answered");
+            cx.run_until_parked();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            waited += 1;
+        }
+        app.read_with(cx, |state, _| {
+            assert_eq!(
+                state.picker_note(PickerFor::Bot),
+                Some(said),
+                "said in the popover, in the server's words"
+            );
+            assert_eq!(
+                state.auth_error.as_deref(),
+                Some(said),
+                "and on the pane's red line"
+            );
+            assert_eq!(
+                state.coworkers[0].effort.as_deref(),
+                Some("high"),
+                "the roster is put back on what the server keeps"
+            );
+        });
+        cx.run_until_parked();
     }
 
     /// A pick that puts the effort back on the model's own level says so under the slider, for
