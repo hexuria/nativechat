@@ -40,6 +40,7 @@ pub mod switch;
 pub mod title_bar;
 mod transcript_chrome;
 pub mod transcript_scroll;
+pub mod usage_modal;
 pub mod user_form;
 pub mod voice_mode_modal;
 pub mod voice_wave;

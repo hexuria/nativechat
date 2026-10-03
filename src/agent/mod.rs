@@ -204,9 +204,26 @@
 //! takes it; a letter aimed at any other card is refused. A card the bot followed with another
 //! card is `not-answered`: only the newest card asks.
 //!
-//! In the bot's settings: `agent-usage` (value = the Usage card's line: what the server says the
-//! bot used this month, or why it cannot say), `agent-usage-toggle` (Show / Hide, only while the
-//! server reported models), and `agent-usage-model-{i}` per model, visible while open (#138).
+//! In the bot's settings: `agent-usage` (value = the Usage card's line: what the paid keys
+//! charged for what the bot used this month and across how many models, as `$0.42 this month · 3
+//! models`, or why the app cannot say) and `agent-usage-show` (`Show`, only while the server
+//! reported models some of which answered a request), which opens the Usage modal (#138,
+//! hexuria/nativechat#174).
+//!
+//! The Usage modal, over the whole window while it is open: `usage-modal` (a dialog named `Usage`,
+//! valued by the server's word for the window it is on, `24h`, `7d` or `month`), holding
+//! `usage-close` (✕), the chips `usage-window-24h`, `usage-window-7d` and `usage-window-month`
+//! (buttons named `24h`, `7d` and `Month`, state `selected` on the window it is on; a click asks
+//! the server for that window, `GET /coworkers/{id}/usage?window=`, and the modal says it is
+//! asking until it is answered; the one it is on is refused), then one `usage-row-{i}` per model
+//! that answered a request in the window (named by the model, valued `12 requests · $0.40`, and
+//! `$0.00` on the person's own subscription, which the server prices at nothing) and
+//! `usage-total` (`Total (paid keys)`, valued by what the paid keys charged for them, which a
+//! model priced at nothing adds nothing to); where there are no rows, `usage-status` says why
+//! (`Asking the server…`, the server's words, or `No requests in this window.`), with no total;
+//! and `usage-note` (`Replies on your own subscription aren't counted here.`). Escape, ✕ and a
+//! press beside the modal shut it; Show opens it on `month`, with what the card read on show at
+//! once.
 //!
 //! The Tools card, which the bot's settings no longer draw (hexuria/nativechat#174: it opens from
 //! the agent monitor, #175, so the app's tree holds none of these ids until it does):

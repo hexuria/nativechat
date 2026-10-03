@@ -398,7 +398,6 @@ impl Render for AgentSettings {
             )
         };
         let on_plan = self.state.read(cx).replies_on_plan();
-        let usage_open = self.state.read(cx).agent_usage_open;
         let auto_review_open = self.auto_review_open;
         let usage = {
             let state = self.state.read(cx);
@@ -411,12 +410,8 @@ impl Render for AgentSettings {
         let usage_line = usage
             .as_ref()
             .map_or_else(|| "Asking the server…".to_string(), usage_summary);
-        let usage_rows: Vec<String> = match &usage {
-            Some(UsageReport::Read(read)) if usage_open => {
-                read.models.iter().map(model_line).collect()
-            }
-            _ => Vec::new(),
-        };
+        // Only a list of models has anything to show: the modal's rows.
+        let usage_has_rows = matches!(usage.as_ref().map(usage_body), Some(UsageBody::Rows { .. }));
         let auto_review_mode = self.auto_review_mode;
         let has_custom = shape.is_some() || color.is_some();
         let app = self.state.clone();
@@ -656,32 +651,36 @@ impl Render for AgentSettings {
                                                                     .child(usage_line),
                                                             ),
                                                     )
-                                                    // Only a list of models has anything to open to.
-                                                    .when(
-                                                        matches!(usage, Some(UsageReport::Read(ref read)) if !read.models.is_empty()),
-                                                        |this| {
-                                                            this.child(
-                                                                div()
-                                                                    .id("agent-usage-toggle")
-                                                                    .px(px(11.))
-                                                                    .py(px(5.))
-                                                                    .rounded(px(8.))
-                                                                    .border_1()
-                                                                    .border_color(
-                                                                        rgb(0x7f7f7f).opacity(0.4),
-                                                                    )
-                                                                    .text_xs()
-                                                                    .cursor_pointer()
-                                                                    .on_mouse_down(MouseButton::Left, {
-                                                                        let app = app.clone();
-                                                                        move |_, _, cx| {
-                                                                            app.update(cx, |state, cx| state.toggle_agent_usage(cx));
-                                                                        }
-                                                                    })
-                                                                    .child(if usage_open { "Hide" } else { "Show" }),
-                                                            )
-                                                        },
-                                                    ),
+                                                    .when(usage_has_rows, |this| {
+                                                        this.child(
+                                                            div()
+                                                                .id("agent-usage-show")
+                                                                .debug_selector(|| {
+                                                                    "agent-usage-show".into()
+                                                                })
+                                                                .px(px(11.))
+                                                                .py(px(5.))
+                                                                .rounded(px(8.))
+                                                                .border_1()
+                                                                .border_color(
+                                                                    rgb(0x7f7f7f).opacity(0.4),
+                                                                )
+                                                                .text_xs()
+                                                                .cursor_pointer()
+                                                                // The Usage modal, over the whole
+                                                                // window, and not the card opened
+                                                                // out in the pane.
+                                                                .on_mouse_down(MouseButton::Left, {
+                                                                    let app = app.clone();
+                                                                    move |_, _, cx| {
+                                                                        app.update(cx, |state, cx| {
+                                                                            state.open_usage_modal(cx)
+                                                                        });
+                                                                    }
+                                                                })
+                                                                .child("Show"),
+                                                        )
+                                                    }),
                                             )
                                             // A turn on the person's own plan is not metered and
                                             // carries no gateway key, so the report above never
@@ -696,21 +695,6 @@ impl Render for AgentSettings {
                                                         .child(crate::components::reply_source::PLAN_USAGE_NOTE),
                                                 )
                                             })
-                                            // Under the header row, as the Tools card's list is, so
-                                            // the Hide button stays beside the card's own line.
-                                            .when(!usage_rows.is_empty(), |this| {
-                                                this.child(
-                                                    v_flex().pt(px(8.)).gap(px(4.)).children(
-                                                        usage_rows.into_iter().enumerate().map(|(i, line)| {
-                                                            div()
-                                                                .id(SharedString::from(format!("agent-usage-model-{i}")))
-                                                                .text_xs()
-                                                                .text_color(muted)
-                                                                .child(line)
-                                                        }),
-                                                    ),
-                                                )
-                                            }),
                                     )
                                     .child(
                                         div()
@@ -978,47 +962,127 @@ impl AgentSettings {
     }
 }
 
-/// The Usage card's second line: what the bot used this month, or why the app cannot say.
-pub(crate) fn usage_summary(report: &UsageReport) -> String {
+/// What the Usage modal shows of a report, one thing at a time. The card's summary line
+/// ([`usage_summary`]) is read off the same, so the two never disagree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum UsageBody {
+    /// The server is being asked.
+    Asking,
+    /// The server would not say, or does not measure this bot, in words that stand on their own.
+    Said(String),
+    /// A window in which no model answered a request.
+    Empty,
+    /// The models that answered, in the server's order, and what the paid keys charged for all
+    /// of them.
+    Rows { rows: Vec<UsageRow>, total: String },
+}
+
+/// One model the window used, as the modal lists it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct UsageRow {
+    pub model: String,
+    /// "12 requests".
+    pub requests: String,
+    /// What the paid keys charged for them: "$0.40", or "$0.00" on the person's own
+    /// subscription, which the server prices at nothing.
+    pub cost: String,
+}
+
+impl UsageRow {
+    /// What stands beside the model: its requests and what the paid keys charged for them,
+    /// "12 requests · $0.40".
+    pub(crate) fn detail(&self) -> String {
+        format!("{} · {}", self.requests, self.cost)
+    }
+}
+
+/// The models a report lists: those that answered a request in its window. A model the gateway
+/// reports with no request has nothing to list, nor to add up.
+pub(crate) fn used_models(
+    usage: &crate::opengrok::CoworkerUsage,
+) -> Vec<&crate::opengrok::ModelUsage> {
+    usage
+        .models
+        .iter()
+        .filter(|model| model.requests > 0)
+        .collect()
+}
+
+/// What a report says for the Usage modal, and for the card's line over it.
+pub(crate) fn usage_body(report: &UsageReport) -> UsageBody {
     match report {
-        UsageReport::Loading => "Asking the server…".to_string(),
-        UsageReport::Unavailable(why) => why.clone(),
+        UsageReport::Loading => UsageBody::Asking,
+        UsageReport::Unavailable(why) => UsageBody::Said(why.clone()),
         // A note means the numbers are not a measurement: the bot is not metered, or it is and
         // the gateway could not be asked, which the server answers with zero totals. Either way
-        // the note is what the card says, never "No requests". The note is a clause ("this
-        // coworker has no key of its own yet, …"); on the card it stands as its own line, so it
-        // starts with a capital.
-        UsageReport::Read(usage) if usage.note.is_some() || !usage.metered => usage
-            .note
-            .as_deref()
-            .map_or_else(|| "This bot's use is not measured.".to_string(), sentence),
-        // The gateway leaves attempts that were paid for but lost out of `requests`, so a month
-        // of none can still have models to show; only a month with nothing at all is "No".
-        UsageReport::Read(usage) => match usage.totals.requests.unwrap_or(0) {
-            0 if usage.models.is_empty() => "No requests this month".to_string(),
-            requests => {
-                let totals = &usage.totals;
-                let tokens = [
-                    totals.input_tokens,
-                    totals.output_tokens,
-                    totals.cache_read_tokens,
-                    totals.cache_write_tokens,
-                ]
-                .into_iter()
-                .flatten()
-                .fold(0i64, i64::saturating_add);
-                let mut line = format!(
-                    "{} this month · {} tokens",
-                    plural(requests, "request"),
-                    grouped(tokens)
-                );
-                if let Some(cost) = usage.totals.cost_usd.as_deref().and_then(dollars) {
-                    line.push_str(&format!(" · {cost}"));
-                }
-                line
+        // the note is what is said, never "No requests". The note is a clause ("this coworker has
+        // no key of its own yet, …"); it stands as its own line, so it starts with a capital.
+        UsageReport::Read(usage) if usage.note.is_some() || !usage.metered => UsageBody::Said(
+            usage
+                .note
+                .as_deref()
+                .map_or_else(|| "This bot's use is not measured.".to_string(), sentence),
+        ),
+        UsageReport::Read(usage) => {
+            let used = used_models(usage);
+            if used.is_empty() {
+                return UsageBody::Empty;
             }
-        },
+            // The paid keys' charge for the models listed, which a model on the person's own
+            // subscription adds nothing to: the server prices it at nothing.
+            let paid: i64 = used
+                .iter()
+                .filter_map(|model| millionths(&model.cost_usd))
+                .filter(|cost| *cost > 0)
+                .fold(0, i64::saturating_add);
+            UsageBody::Rows {
+                rows: used
+                    .iter()
+                    .map(|model| UsageRow {
+                        model: model.model_id.clone(),
+                        requests: plural(model.requests, "request"),
+                        cost: dollars(&model.cost_usd).unwrap_or_default(),
+                    })
+                    .collect(),
+                total: dollars(&format!("{}.{:06}", paid / 1_000_000, paid % 1_000_000))
+                    .unwrap_or_default(),
+            }
+        }
     }
+}
+
+/// The Usage card's second line: what the paid keys charged for what the bot used this month, and
+/// across how many models, or why the app cannot say.
+pub(crate) fn usage_summary(report: &UsageReport) -> String {
+    match usage_body(report) {
+        UsageBody::Asking => "Asking the server…".to_string(),
+        UsageBody::Said(words) => words,
+        UsageBody::Empty => "No requests this month".to_string(),
+        UsageBody::Rows { rows, total } => {
+            format!(
+                "{total} this month · {}",
+                plural(rows.len() as i64, "model")
+            )
+        }
+    }
+}
+
+/// The server's six-decimal dollars in millionths, whole: `"0.400000"` is 400000. `None` for what
+/// is not a plain decimal.
+fn millionths(six: &str) -> Option<i64> {
+    let (whole, fraction) = six.trim().split_once('.').unwrap_or((six.trim(), ""));
+    if whole.is_empty()
+        || !whole.bytes().all(|b| b.is_ascii_digit())
+        || !fraction.bytes().all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    let fraction: i64 = format!("{fraction:0<6}")[..6].parse().ok()?;
+    whole
+        .parse::<i64>()
+        .ok()?
+        .checked_mul(1_000_000)?
+        .checked_add(fraction)
 }
 
 /// `text` with its first letter capitalised.
@@ -1027,26 +1091,6 @@ pub(crate) fn sentence(text: &str) -> String {
     chars.next().map_or_else(String::new, |first| {
         first.to_uppercase().chain(chars).collect()
     })
-}
-
-/// One model's line once the card is open.
-pub(crate) fn model_line(model: &crate::opengrok::ModelUsage) -> String {
-    let mut line = format!(
-        "{} · {} · {} tokens",
-        model.model_id,
-        plural(model.requests, "request"),
-        grouped(
-            model
-                .input_tokens
-                .saturating_add(model.output_tokens)
-                .saturating_add(model.cache_read_tokens)
-                .saturating_add(model.cache_write_tokens)
-        )
-    );
-    if let Some(cost) = dollars(&model.cost_usd) {
-        line.push_str(&format!(" · {cost}"));
-    }
-    line
 }
 
 fn plural(n: i64, word: &str) -> String {
@@ -1997,8 +2041,8 @@ pub fn skills_card(
 mod tools_tests {
     use super::{
         CeilingCardLine, NO_LONGER_ON_THE_SERVER, NO_MAC_RUNS_COMMANDS, NOT_AVAILABLE_NOW,
-        NOTHING_TO_SWITCH, ceiling_card_lines, ceiling_line, connector_note, first_line_of,
-        model_line, shown_ceiling_rows, tools_summary, usage_summary,
+        NOTHING_TO_SWITCH, UsageBody, UsageRow, ceiling_card_lines, ceiling_line, connector_note,
+        first_line_of, shown_ceiling_rows, tools_summary, usage_body, usage_summary, used_models,
     };
     use crate::opengrok::{CeilingRow, CoworkerTool};
     use crate::state::{
@@ -2353,106 +2397,93 @@ mod tools_tests {
         );
     }
 
-    /// The Usage card says what the server says the bot used, and never "no usage" for a bot that
-    /// used some, nor for one the server does not measure (#138).
-    #[test]
-    fn the_usage_card_says_what_the_server_measured() {
-        use crate::opengrok::{CoworkerUsage, ModelUsage};
-        use crate::state::UsageReport;
-        let used = CoworkerUsage {
+    /// A model as the gateway reports it for a window.
+    fn model(id: &str, requests: i64, cost: &str) -> crate::opengrok::ModelUsage {
+        crate::opengrok::ModelUsage {
+            model_id: id.into(),
+            requests,
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            cost_usd: cost.into(),
+        }
+    }
+
+    /// A metered bot's answer for `window`, with `models`.
+    fn answer(
+        window: &str,
+        models: Vec<crate::opengrok::ModelUsage>,
+    ) -> crate::opengrok::CoworkerUsage {
+        crate::opengrok::CoworkerUsage {
             metered: true,
             note: None,
-            window: "month".into(),
-            models: vec![ModelUsage {
-                model_id: "oag/cheap".into(),
-                requests: 1234,
-                input_tokens: 20000,
-                output_tokens: 1000,
-                cache_read_tokens: 500,
-                cache_write_tokens: 0,
-                cost_usd: "2.000000".into(),
-            }],
-            totals: crate::opengrok::UsageTotals {
-                requests: Some(1234),
-                input_tokens: Some(20000),
-                output_tokens: Some(1000),
-                cache_read_tokens: Some(500),
-                cache_write_tokens: Some(0),
-                cost_usd: Some("2.000000".into()),
-            },
-        };
-        assert_eq!(
-            usage_summary(&UsageReport::Read(used.clone())),
-            "1,234 requests this month · 21,500 tokens · $2.00"
+            window: window.into(),
+            models,
+            totals: Default::default(),
+        }
+    }
+
+    /// The Usage card says what the paid keys charged this month and across how many models, and
+    /// never "no usage" for a bot that used some, nor for one the server does not measure (#138).
+    #[test]
+    fn the_usage_card_says_what_the_paid_keys_charged_and_across_how_many_models() {
+        use crate::state::UsageReport;
+        // Three models answered: two on paid keys, one on the person's own subscription, which the
+        // server prices at nothing. A fourth was asked and answered nothing, and is neither
+        // counted nor added up, whatever the gateway put against it.
+        let month = answer(
+            "month",
+            vec![
+                model("oag/cheap", 12, "0.400000"),
+                model("gpt-6-luna", 5, "0.000000"),
+                model("xai/grok-4.7", 1, "0.020000"),
+                model("oag/lost", 0, "9.990000"),
+            ],
         );
         assert_eq!(
-            model_line(&used.models[0]),
-            "oag/cheap · 1,234 requests · 21,500 tokens · $2.00"
+            usage_summary(&UsageReport::Read(month.clone())),
+            "$0.42 this month · 3 models"
         );
-        let one = ModelUsage {
-            requests: 1,
-            input_tokens: 900,
-            output_tokens: 1,
-            cache_read_tokens: 0,
-            cost_usd: "0.004000".into(),
-            ..used.models[0].clone()
-        };
+        let one = answer("month", vec![model("oag/cheap", 1234, "2.000000")]);
         assert_eq!(
-            model_line(&one),
-            "oag/cheap · 1 request · 901 tokens · under $0.01"
+            usage_summary(&UsageReport::Read(one)),
+            "$2.00 this month · 1 model"
         );
-        let idle = CoworkerUsage {
-            models: Vec::new(),
-            totals: crate::opengrok::UsageTotals {
-                requests: Some(0),
-                ..Default::default()
-            },
-            ..used.clone()
-        };
+        // Subscription alone: used, and not charged.
+        let plan = answer("month", vec![model("gpt-6-luna", 5, "0.000000")]);
         assert_eq!(
-            usage_summary(&UsageReport::Read(idle.clone())),
-            "No requests this month",
-            "a fresh bot with real zeros and no note"
+            usage_summary(&UsageReport::Read(plan)),
+            "$0.00 this month · 1 model"
         );
-        // Every attempt paid for but lost: no requests counted, yet a model with tokens and cost.
-        let lost = CoworkerUsage {
-            models: vec![ModelUsage {
-                requests: 0,
-                ..used.models[0].clone()
-            }],
-            totals: crate::opengrok::UsageTotals {
-                requests: Some(0),
-                ..used.totals.clone()
-            },
-            ..used.clone()
-        };
-        assert_eq!(
-            usage_summary(&UsageReport::Read(lost)),
-            "0 requests this month · 21,500 tokens · $2.00"
-        );
+        // Nothing answered: every model unused, or none listed.
+        for models in [Vec::new(), vec![model("oag/lost", 0, "9.990000")]] {
+            assert_eq!(
+                usage_summary(&UsageReport::Read(answer("month", models))),
+                "No requests this month",
+                "a fresh bot with real zeros and no note"
+            );
+        }
         // Metered, but the gateway could not be asked: the server sends zero totals with a
         // note, and those zeros are not a measurement.
-        let unread = CoworkerUsage {
+        let unread = crate::opengrok::CoworkerUsage {
             note: Some("the gateway could not be asked: timed out".into()),
-            ..idle
+            ..answer("month", Vec::new())
         };
         assert_eq!(
             usage_summary(&UsageReport::Read(unread)),
             "The gateway could not be asked: timed out"
         );
-        let unmetered = CoworkerUsage {
+        let unmetered = crate::opengrok::CoworkerUsage {
             metered: false,
             note: Some("this coworker's key cannot serve".into()),
-            models: Vec::new(),
-            totals: Default::default(),
-            ..used
+            ..answer("month", Vec::new())
         };
         assert_eq!(
             usage_summary(&UsageReport::Read(unmetered.clone())),
             "This coworker's key cannot serve"
         );
-        let unexplained = CoworkerUsage {
-            metered: false,
+        let unexplained = crate::opengrok::CoworkerUsage {
             note: None,
             ..unmetered
         };
@@ -2466,6 +2497,96 @@ mod tools_tests {
                 "Only this bot's owner can see its usage.".into()
             )),
             "Only this bot's owner can see its usage."
+        );
+    }
+
+    /// The Usage modal lists only the models that answered a request, each with its requests and
+    /// what the paid keys charged for them, and totals the paid keys' charges: a model priced at
+    /// nothing (the person's own subscription) is listed and adds nothing. A window with nothing in
+    /// it says so, and so does a bot the server does not measure, in the server's words.
+    #[test]
+    fn the_usage_modal_lists_the_models_used_and_totals_the_paid_keys() {
+        use crate::state::UsageReport;
+        let week = answer(
+            "7d",
+            vec![
+                model("oag/cheap", 12, "0.400000"),
+                model("oag/lost", 0, "9.990000"),
+                model("gpt-6-luna", 5, "0.000000"),
+                model("xai/grok-4.7", 1, "0.020000"),
+                model("oag/tiny", 3, "0.004000"),
+            ],
+        );
+        assert_eq!(
+            used_models(&week)
+                .iter()
+                .map(|model| model.model_id.as_str())
+                .collect::<Vec<_>>(),
+            ["oag/cheap", "gpt-6-luna", "xai/grok-4.7", "oag/tiny"],
+            "those that answered, in the server's order"
+        );
+        let row = |model: &str, requests: &str, cost: &str| UsageRow {
+            model: model.into(),
+            requests: requests.into(),
+            cost: cost.into(),
+        };
+        assert_eq!(
+            usage_body(&UsageReport::Read(week)),
+            UsageBody::Rows {
+                rows: vec![
+                    row("oag/cheap", "12 requests", "$0.40"),
+                    row("gpt-6-luna", "5 requests", "$0.00"),
+                    row("xai/grok-4.7", "1 request", "$0.02"),
+                    row("oag/tiny", "3 requests", "under $0.01"),
+                ],
+                // 0.40 + 0.02 + 0.004, to the cent
+                total: "$0.42".into(),
+            }
+        );
+        // Sums of cents too small to read alone still read, and a thousand requests are grouped.
+        let small = answer(
+            "24h",
+            vec![
+                model("oag/a", 1500, "0.003000"),
+                model("oag/b", 2, "0.003000"),
+            ],
+        );
+        assert_eq!(
+            usage_body(&UsageReport::Read(small)),
+            UsageBody::Rows {
+                rows: vec![
+                    row("oag/a", "1,500 requests", "under $0.01"),
+                    row("oag/b", "2 requests", "under $0.01"),
+                ],
+                total: "$0.01".into(),
+            }
+        );
+        assert_eq!(
+            usage_body(&UsageReport::Read(answer("24h", Vec::new()))),
+            UsageBody::Empty
+        );
+        assert_eq!(
+            usage_body(&UsageReport::Read(answer(
+                "24h",
+                vec![model("oag/lost", 0, "1.000000")]
+            ))),
+            UsageBody::Empty
+        );
+        assert_eq!(usage_body(&UsageReport::Loading), UsageBody::Asking);
+        assert_eq!(
+            usage_body(&UsageReport::Unavailable(
+                "Sign in again to see this bot's usage.".into()
+            )),
+            UsageBody::Said("Sign in again to see this bot's usage.".into())
+        );
+        let unmetered = crate::opengrok::CoworkerUsage {
+            metered: false,
+            note: Some("this coworker has no key of its own yet, so it is not metered".into()),
+            ..answer("7d", Vec::new())
+        };
+        assert_eq!(
+            usage_body(&UsageReport::Read(unmetered)),
+            UsageBody::Said("This coworker has no key of its own yet, so it is not metered".into())
         );
     }
 
@@ -3087,6 +3208,64 @@ mod pane_tests {
         assert_eq!(
             changes_asked(&runtime, &server),
             [json!({"role": "Reads papers\nand books"})]
+        );
+    }
+
+    /// The Usage card has Show only once the server has said the bot used some models, and Show
+    /// opens the Usage modal, on the month, over the window: it does not open the card out in the
+    /// pane.
+    #[gpui_kit::test]
+    fn show_on_the_usage_card_opens_the_usage_modal(cx: &mut gpui_kit::TestAppContext) {
+        use crate::opengrok::{CoworkerUsage, ModelUsage, UsageWindow};
+        use crate::state::UsageReport;
+        use gpui_kit::{Modifiers, MouseButton};
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime");
+        let _enter = runtime.enter();
+        let client = OpenGrokClient::new("http://127.0.0.1:9").expect("a URL");
+        let (state, _, cx) = open_pane(cx, Some(client));
+        assert!(
+            cx.debug_bounds("agent-usage-show").is_none(),
+            "nothing read, nothing to show"
+        );
+        state.update(cx, |state, cx| {
+            state.coworker_usage = Some((
+                "cw_1".into(),
+                UsageReport::Read(CoworkerUsage {
+                    metered: true,
+                    note: None,
+                    window: "month".into(),
+                    models: vec![ModelUsage {
+                        model_id: "oag/cheap".into(),
+                        requests: 12,
+                        input_tokens: 0,
+                        output_tokens: 0,
+                        cache_read_tokens: 0,
+                        cache_write_tokens: 0,
+                        cost_usd: "0.400000".into(),
+                    }],
+                    totals: Default::default(),
+                }),
+            ));
+            cx.notify();
+        });
+        draw(cx);
+        let at = cx
+            .debug_bounds("agent-usage-show")
+            .expect("Show is drawn once there are models")
+            .center();
+        cx.simulate_mouse_move(at, None, Modifiers::none());
+        cx.simulate_mouse_down(at, MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_up(at, MouseButton::Left, Modifiers::none());
+        draw(cx);
+        assert_eq!(
+            state.read_with(cx, |state, _| state
+                .usage_modal
+                .as_ref()
+                .map(|modal| (modal.coworker_id.clone(), modal.window))),
+            Some(("cw_1".to_string(), UsageWindow::Month))
         );
     }
 

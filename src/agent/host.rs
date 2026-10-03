@@ -23,6 +23,7 @@ use crate::components::skills::{
     NEVER_UPDATED, NOT_YET_RECORDING, NOT_YET_WITH_BOT, NOTHING_WRITTEN_YET, empty_line,
     short_relative_time, skill_matches, waiting_to_be_read,
 };
+use crate::components::usage_modal;
 use crate::opengrok::{
     BoxHandoffResolution, ChatPart, ChoiceCard, ComputerHandoffStatus, CoworkerPatch,
     LocalExecResolution, RecipeKind, RecipeSummary, ScreenshotSpec, UserFormDismissMode,
@@ -42,7 +43,9 @@ use crate::state::{
 };
 
 pub mod ids {
-    use crate::components::{computers, connections, default_models, model_picker, reply_source};
+    use crate::components::{
+        computers, connections, default_models, model_picker, reply_source, usage_modal,
+    };
     use crate::opengrok::InferenceKind;
     use crate::state::RuleKind;
 
@@ -525,6 +528,13 @@ pub mod ids {
     pub const REPLY_SOURCE_HINT: &str = computers::HINT;
     /// In a Bot's Usage card, while its replies go through the person's own plan.
     pub const AGENT_USAGE_PLAN: &str = reply_source::BOT_USAGE_PLAN;
+    /// Show, on the Usage card, which opens the Usage modal.
+    pub const AGENT_USAGE_SHOW: &str = "agent-usage-show";
+    pub const USAGE_MODAL: &str = usage_modal::MODAL;
+    pub const USAGE_CLOSE: &str = usage_modal::CLOSE;
+    pub const USAGE_STATUS: &str = usage_modal::STATUS;
+    pub const USAGE_TOTAL: &str = usage_modal::TOTAL;
+    pub const USAGE_NOTE: &str = usage_modal::NOTE;
 
     /// The Bot's model picker: the Model card in the Bot's settings, the one place a Bot's model
     /// is picked. The parts of the popover it opens are `model_picker`'s own ids, all under
@@ -586,6 +596,16 @@ pub mod ids {
     /// The model a reply's badge names on hover, under the badge.
     pub fn reply_badge_model(message_id: &str) -> String {
         reply_source::badge_model_id(message_id)
+    }
+
+    /// A chip of the Usage modal, by the server's word for its window.
+    pub fn usage_window(window: crate::opengrok::UsageWindow) -> String {
+        usage_modal::window_id(window)
+    }
+
+    /// A model's row in the Usage modal, by its place.
+    pub fn usage_row(at: usize) -> String {
+        usage_modal::row_id(at)
     }
 
     /// One connected service on Settings → Connections, by the server's connection id.
@@ -948,7 +968,12 @@ pub enum Command {
         message_id: String,
     },
     ToggleAgentTools,
-    ToggleAgentUsage,
+    /// Show, on the Usage card: the Usage modal opens.
+    OpenUsageModal,
+    /// ✕ on the Usage modal.
+    CloseUsageModal,
+    /// A chip of the Usage modal.
+    SetUsageWindow(crate::opengrok::UsageWindow),
     /// A switch on the Tools card: one row of the open Bot's ceiling on or off, sent at once.
     SetCeilingTool {
         name: String,
@@ -1262,7 +1287,9 @@ impl Command {
             }
             Self::ChoiceDismiss { message_id } => state.dismiss_choice(message_id, cx),
             Self::ToggleAgentTools => state.toggle_agent_tools(cx),
-            Self::ToggleAgentUsage => state.toggle_agent_usage(cx),
+            Self::OpenUsageModal => state.open_usage_modal(cx),
+            Self::CloseUsageModal => state.close_usage_modal(cx),
+            Self::SetUsageWindow(window) => state.set_usage_window(window, cx),
             Self::SetCeilingTool { name, enabled } => state.switch_ceiling_tool(name, enabled, cx),
             Self::ToggleAgentSkills => state.toggle_agent_skills(cx),
             Self::SetBotSkill { skill_id, attached } => {
@@ -3267,7 +3294,8 @@ pub struct NativeChatHost {
     agent_skills_open: bool,
     /// The open bot's usage this month, as its settings' Usage card shows it (#138).
     agent_usage: Option<crate::state::UsageReport>,
-    agent_usage_open: bool,
+    /// The Usage modal, while it is open.
+    usage_modal: Option<crate::state::UsageModal>,
     agent_tools_open: bool,
     avatar_editor_open: bool,
     approvals: Vec<ApprovalSnap>,
@@ -3532,7 +3560,7 @@ impl NativeChatHost {
             agent_skills: None,
             agent_skills_open: state.agent_skills_open,
             agent_tools_open: state.agent_tools_open,
-            agent_usage_open: state.agent_usage_open,
+            usage_modal: state.usage_modal.clone(),
             agent_usage: state
                 .coworker_usage
                 .as_ref()
@@ -4260,6 +4288,9 @@ impl NativeChatHost {
                     .with_child(UiNode::button(ids::ROUTINE_DELETE_CONFIRM, "Delete")),
             );
         }
+        if let Some(modal) = self.usage_modal_node() {
+            page = page.with_child(modal);
+        }
         for approval in &self.approvals {
             let id = format!("approval-{}", approval.call_id);
             let mut card = UiNode::new(id.clone(), "dialog", approval.title.clone())
@@ -4456,31 +4487,15 @@ impl NativeChatHost {
             settings = settings.with_child(agent_skills_node(card, self.agent_skills_open));
         }
         if let Some(usage) = &self.agent_usage {
-            // `agent-usage` (value = the card's second line), with `agent-usage-toggle` while
-            // there are models to show and one `agent-usage-model-{i}` per model the server
-            // reported, label = that model's line, visible while the card is open (#138).
+            // `agent-usage` (value = the card's second line), with `agent-usage-show` while there
+            // are models to show, which opens the Usage modal (hexuria/nativechat#174).
             let mut node = UiNode::new("agent-usage", "status", "Usage")
                 .with_value(crate::components::agent_settings::usage_summary(usage));
-            if let crate::state::UsageReport::Read(read) = usage
-                && !read.models.is_empty()
-            {
-                node = node.with_child(UiNode::button(
-                    "agent-usage-toggle",
-                    if self.agent_usage_open {
-                        "Hide"
-                    } else {
-                        "Show"
-                    },
-                ));
-                for (i, model) in read.models.iter().enumerate() {
-                    node = node.with_child(
-                        UiNode::listitem(
-                            format!("agent-usage-model-{i}"),
-                            crate::components::agent_settings::model_line(model),
-                        )
-                        .with_visible(self.agent_usage_open),
-                    );
-                }
+            if matches!(
+                crate::components::agent_settings::usage_body(usage),
+                crate::components::agent_settings::UsageBody::Rows { .. }
+            ) {
+                node = node.with_child(UiNode::button(ids::AGENT_USAGE_SHOW, "Show"));
             }
             settings = settings.with_child(node);
         }
@@ -5243,6 +5258,96 @@ impl NativeChatHost {
             }
         }
         nodes
+    }
+
+    /// The Usage modal as the window draws it, while it is open: `usage-modal` (a dialog named
+    /// `Usage`, valued by the server's word for the window it is on) holding `usage-close`,
+    /// the three chips `usage-window-24h`, `usage-window-7d` and `usage-window-month` (state
+    /// `selected` on the one it is on), then either a `usage-row-{i}` for each model that answered
+    /// a request (named by the model, valued `12 requests · $0.40`) and `usage-total` (`Total
+    /// (paid keys)`, valued by the paid keys' charges, which a model on the person's own
+    /// subscription adds nothing to), or `usage-status` where there are none to list (asking, the
+    /// server's words, or `No requests in this window.`), and `usage-note`, that replies on the
+    /// person's own subscription are not counted here.
+    fn usage_modal_node(&self) -> Option<UiNode> {
+        use crate::components::agent_settings::{UsageBody, usage_body};
+        let open = self.usage_modal.as_ref()?;
+        let body = usage_body(&open.report);
+        let mut node = UiNode::dialog(ids::USAGE_MODAL, usage_modal::TITLE)
+            .with_value(open.window.word())
+            .with_child(UiNode::button(ids::USAGE_CLOSE, "Close"));
+        for window in crate::opengrok::UsageWindow::ALL {
+            let mut chip = UiNode::button(ids::usage_window(window), window.label());
+            if open.window == window {
+                chip.states.push("selected".into());
+            }
+            node = node.with_child(chip);
+        }
+        match &body {
+            UsageBody::Rows { rows, total } => {
+                for (at, row) in rows.iter().enumerate() {
+                    node = node.with_child(
+                        UiNode::listitem(ids::usage_row(at), row.model.clone())
+                            .with_value(row.detail()),
+                    );
+                }
+                node = node.with_child(
+                    UiNode::listitem(ids::USAGE_TOTAL, usage_modal::TOTAL_LABEL)
+                        .with_value(total.clone()),
+                );
+            }
+            other => {
+                if let Some(words) = usage_modal::status_words(other) {
+                    node = node.with_child(UiNode::status(ids::USAGE_STATUS, words));
+                }
+            }
+        }
+        Some(node.with_child(UiNode::status(
+            ids::USAGE_NOTE,
+            reply_source::PLAN_USAGE_NOTE,
+        )))
+    }
+
+    /// A click on one of the Usage modal's controls, or `None` for a target that is not one: ✕ and
+    /// the chips, which are refused while the modal is shut, the chip it is on already is refused,
+    /// and its lines are no control.
+    fn usage_modal_command(&self, target: &str) -> Option<Result<Command, String>> {
+        let windows = crate::opengrok::UsageWindow::ALL;
+        let named = [
+            ids::USAGE_MODAL,
+            ids::USAGE_CLOSE,
+            ids::USAGE_STATUS,
+            ids::USAGE_TOTAL,
+            ids::USAGE_NOTE,
+        ]
+        .contains(&target)
+            || target.starts_with("usage-row-")
+            || windows
+                .iter()
+                .any(|window| target == ids::usage_window(*window));
+        if !named {
+            return None;
+        }
+        let Some(open) = &self.usage_modal else {
+            return Some(Err(format!(
+                "`{target}` is in the Usage modal, which is not open: Show on the Usage card \
+                 opens it"
+            )));
+        };
+        Some(if target == ids::USAGE_CLOSE {
+            Ok(Command::CloseUsageModal)
+        } else if let Some(window) = windows
+            .into_iter()
+            .find(|window| target == ids::usage_window(*window))
+        {
+            if open.window == window {
+                Err(format!("`{target}` is the window the modal is already on"))
+            } else {
+                Ok(Command::SetUsageWindow(window))
+            }
+        } else {
+            Err(format!("`{target}` is a line, not a control"))
+        })
     }
 
     /// The open bot's Connections card (#2): its second line, a switch per connection of the
@@ -7267,19 +7372,23 @@ impl NativeChatHost {
             Command::ToggleAgentSkills
         } else if target.starts_with(ids::AGENT_SKILLS) {
             self.skills_command(target)?
-        } else if target == "agent-usage-toggle" {
+        } else if target == ids::AGENT_USAGE_SHOW {
             if !self.agent_settings_open {
+                return Err("`agent-usage-show` is in the bot's settings, which are closed".into());
+            }
+            if !matches!(
+                self.agent_usage
+                    .as_ref()
+                    .map(crate::components::agent_settings::usage_body),
+                Some(crate::components::agent_settings::UsageBody::Rows { .. })
+            ) {
                 return Err(
-                    "`agent-usage-toggle` is in the bot's settings, which are closed".into(),
+                    "`agent-usage-show` is only there while the server reported models".into(),
                 );
             }
-            if !matches!(&self.agent_usage, Some(crate::state::UsageReport::Read(read)) if !read.models.is_empty())
-            {
-                return Err(
-                    "`agent-usage-toggle` is only there while the server reported models".into(),
-                );
-            }
-            Command::ToggleAgentUsage
+            Command::OpenUsageModal
+        } else if let Some(cmd) = self.usage_modal_command(target) {
+            cmd?
         } else if target == "agent-model-dismiss" {
             Command::SetModelPicker(false)
         } else if target == "avatar-trigger" || target == "avatar-editor-dismiss" {
@@ -13706,62 +13815,249 @@ mod tests {
         );
     }
 
-    /// The Usage card is on the tree with what the server said the bot used (#138).
-    #[test]
-    fn a_bots_usage_is_on_the_tree() {
-        use crate::opengrok::{CoworkerUsage, ModelUsage, UsageTotals};
-        let mut host = host();
-        host.agent_settings_open = true;
-        host.agent_usage = Some(crate::state::UsageReport::Read(CoworkerUsage {
+    /// A metered bot's usage for `window`: three models answered, one of them on the person's own
+    /// subscription, which the server prices at nothing, and a fourth was asked and answered none.
+    fn a_usage_read(window: &str) -> crate::state::UsageReport {
+        use crate::opengrok::{CoworkerUsage, ModelUsage};
+        let model = |id: &str, requests: i64, cost: &str| ModelUsage {
+            model_id: id.into(),
+            requests,
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            cost_usd: cost.into(),
+        };
+        crate::state::UsageReport::Read(CoworkerUsage {
             metered: true,
             note: None,
-            window: "month".into(),
-            models: vec![ModelUsage {
-                model_id: "oag/cheap".into(),
-                requests: 2,
-                input_tokens: 20,
-                output_tokens: 10,
-                cache_read_tokens: 0,
-                cache_write_tokens: 0,
-                cost_usd: "2.000000".into(),
-            }],
-            totals: UsageTotals {
-                requests: Some(2),
-                input_tokens: Some(20),
-                output_tokens: Some(10),
-                cache_read_tokens: Some(0),
-                cache_write_tokens: Some(0),
-                cost_usd: Some("2.000000".into()),
-            },
-        }));
+            window: window.into(),
+            models: vec![
+                model("oag/cheap", 12, "0.400000"),
+                model("gpt-6-luna", 5, "0.000000"),
+                model("xai/grok-4.7", 1, "0.020000"),
+                model("oag/lost", 0, "9.990000"),
+            ],
+            totals: Default::default(),
+        })
+    }
+
+    /// The Usage card is on the tree with what the paid keys charged this month and across how
+    /// many models, and Show, which opens the modal, where there are models to show (#138,
+    /// hexuria/nativechat#174): nothing of the old inline list is left.
+    #[test]
+    fn a_bots_usage_card_is_on_the_tree_and_show_opens_the_modal() {
+        let mut host = host();
+        host.agent_settings_open = true;
+        host.agent_usage = Some(a_usage_read("month"));
         let tree = host.snapshot();
         assert_eq!(
             tree.find("agent-usage").unwrap().value.as_deref(),
-            Some("2 requests this month · 30 tokens · $2.00")
+            Some("$0.42 this month · 3 models")
         );
-        let row = tree.find("agent-usage-model-0").unwrap();
-        assert_eq!(row.name, "oag/cheap · 2 requests · 30 tokens · $2.00");
-        assert!(
-            !row.visible,
-            "closed card: the model lines are not on screen"
-        );
-        host.dispatch(&Op::click("agent-usage-toggle")).unwrap();
-        assert!(matches!(
-            host.take_command(),
-            Some(Command::ToggleAgentUsage)
-        ));
-        host.agent_usage_open = true;
-        assert!(host.snapshot().find("agent-usage-model-0").unwrap().visible);
+        let show = tree.find("agent-usage-show").unwrap();
+        assert_eq!((show.role.as_str(), show.name.as_str()), ("button", "Show"));
+        assert!(tree.find("agent-usage-toggle").is_none());
+        assert!(tree.find("agent-usage-model-0").is_none());
+        host.dispatch(&Op::click("agent-usage-show")).unwrap();
+        assert!(matches!(host.take_command(), Some(Command::OpenUsageModal)));
 
-        // With the settings closed, the toggle is not on screen to click.
+        // With the settings closed, Show is not on screen to click.
         host.agent_settings_open = false;
-        assert!(host.dispatch(&Op::click("agent-usage-toggle")).is_err());
+        assert!(host.dispatch(&Op::click("agent-usage-show")).is_err());
         host.agent_settings_open = true;
 
-        // No models, nothing to open: the toggle is not there to click.
-        host.agent_usage = Some(crate::state::UsageReport::Loading);
-        assert!(host.snapshot().find("agent-usage-toggle").is_none());
-        assert!(host.dispatch(&Op::click("agent-usage-toggle")).is_err());
+        // No models, nothing to show: Show is not there to click.
+        for usage in [
+            crate::state::UsageReport::Loading,
+            crate::state::UsageReport::Unavailable(
+                "Only this bot's owner can see its usage.".into(),
+            ),
+        ] {
+            host.agent_usage = Some(usage);
+            assert!(host.snapshot().find("agent-usage-show").is_none());
+            assert!(host.dispatch(&Op::click("agent-usage-show")).is_err());
+        }
+    }
+
+    /// The Usage modal is on the tree while it is open: the window's chips, one the modal is on;
+    /// a row for each model that answered, with its requests and cost; the total of the paid keys'
+    /// charges; and the note that the person's own subscription is not counted. A chip asks for its
+    /// window, ✕ shuts the modal, a line is no control, and with the modal shut none of it is
+    /// there.
+    #[test]
+    fn the_usage_modal_is_on_the_tree_and_a_driver_works_its_chips() {
+        use crate::opengrok::UsageWindow::{Day, Month, Week};
+        let mut host = host();
+        host.agent_settings_open = true;
+        host.usage_modal = Some(crate::state::UsageModal {
+            coworker_id: "bot-1".into(),
+            window: Week,
+            report: a_usage_read("7d"),
+        });
+        let tree = host.snapshot();
+        let modal = tree.find("usage-modal").unwrap();
+        assert_eq!(
+            (
+                modal.role.as_str(),
+                modal.name.as_str(),
+                modal.value.as_deref()
+            ),
+            ("dialog", "Usage", Some("7d"))
+        );
+        let shown: Vec<(&str, &str, Option<&str>, &[String])> = modal
+            .children
+            .iter()
+            .map(|node| {
+                (
+                    node.id.as_str(),
+                    node.name.as_str(),
+                    node.value.as_deref(),
+                    node.states.as_slice(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            shown,
+            [
+                ("usage-close", "Close", None, &[][..]),
+                ("usage-window-24h", "24h", None, &[][..]),
+                ("usage-window-7d", "7d", None, &["selected".to_string()][..]),
+                ("usage-window-month", "Month", None, &[][..]),
+                (
+                    "usage-row-0",
+                    "oag/cheap",
+                    Some("12 requests · $0.40"),
+                    &[][..]
+                ),
+                (
+                    "usage-row-1",
+                    "gpt-6-luna",
+                    Some("5 requests · $0.00"),
+                    &[][..]
+                ),
+                (
+                    "usage-row-2",
+                    "xai/grok-4.7",
+                    Some("1 request · $0.02"),
+                    &[][..]
+                ),
+                ("usage-total", "Total (paid keys)", Some("$0.42"), &[][..]),
+                (
+                    "usage-note",
+                    "Replies on your own subscription aren't counted here.",
+                    None,
+                    &[][..]
+                ),
+            ]
+        );
+        assert!(
+            tree.find("usage-status").is_none(),
+            "there are rows to say it"
+        );
+
+        host.click("usage-window-24h").unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::SetUsageWindow(Day))
+        ));
+        host.click("usage-window-month").unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::SetUsageWindow(Month))
+        ));
+        let already = host.click("usage-window-7d").unwrap_err();
+        assert!(already.contains("already"), "{already}");
+        host.click("usage-close").unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::CloseUsageModal)
+        ));
+        for line in ["usage-row-0", "usage-total", "usage-note", "usage-modal"] {
+            let refused = host.click(line).unwrap_err();
+            assert!(
+                refused.contains("not a control") || refused.contains("line"),
+                "{refused}"
+            );
+        }
+        assert!(host.take_command().is_none());
+
+        // Asking, a refusal and an empty window say so where the rows would be, with no total.
+        for (report, words) in [
+            (crate::state::UsageReport::Loading, "Asking the server…"),
+            (
+                crate::state::UsageReport::Unavailable(
+                    "Sign in again to see this bot's usage.".into(),
+                ),
+                "Sign in again to see this bot's usage.",
+            ),
+        ] {
+            host.usage_modal.as_mut().unwrap().report = report;
+            let tree = host.snapshot();
+            assert_eq!(tree.find("usage-status").unwrap().name, words);
+            assert!(tree.find("usage-total").is_none() && tree.find("usage-row-0").is_none());
+        }
+        let crate::state::UsageReport::Read(mut idle) = a_usage_read("24h") else {
+            unreachable!()
+        };
+        idle.models.clear();
+        host.usage_modal.as_mut().unwrap().report = crate::state::UsageReport::Read(idle);
+        assert_eq!(
+            host.snapshot().find("usage-status").unwrap().name,
+            "No requests in this window."
+        );
+
+        // Shut, none of it is on the tree, and none of it can be clicked.
+        host.usage_modal = None;
+        let tree = host.snapshot();
+        for id in [
+            "usage-modal",
+            "usage-close",
+            "usage-window-7d",
+            "usage-note",
+        ] {
+            assert!(tree.find(id).is_none(), "`{id}`");
+        }
+        let shut = host.click("usage-close").unwrap_err();
+        assert!(shut.contains("not open"), "{shut}");
+        assert!(host.click("usage-window-24h").is_err());
+    }
+
+    /// From the app: the modal the state holds is the one on the tree.
+    #[test]
+    fn the_usage_modal_on_the_tree_is_the_apps() {
+        let mut state = AppState::new();
+        state.auth_status = crate::state::AuthStatus::SignedIn;
+        state.account = Some(
+            serde_json::from_value(serde_json::json!({ "id": "acct_1", "email": "a@b.c" }))
+                .unwrap(),
+        );
+        state.coworkers = vec![
+            serde_json::from_value(serde_json::json!({ "id": "cw_1", "name": "Ada" })).unwrap(),
+        ];
+        state.active_coworker_id = Some("cw_1".into());
+        assert!(
+            NativeChatHost::from_app(&state)
+                .snapshot()
+                .find("usage-modal")
+                .is_none()
+        );
+        state.usage_modal = Some(crate::state::UsageModal {
+            coworker_id: "cw_1".into(),
+            window: crate::opengrok::UsageWindow::Month,
+            report: a_usage_read("month"),
+        });
+        let tree = NativeChatHost::from_app(&state).snapshot();
+        assert_eq!(
+            tree.find("usage-total").unwrap().value.as_deref(),
+            Some("$0.42")
+        );
+        assert!(
+            tree.find("usage-window-month")
+                .unwrap()
+                .states
+                .contains(&"selected".to_string())
+        );
     }
 
     /// One of the person's own connections, as `GET /connections` lists it.

@@ -68,6 +68,15 @@ pub enum UsageReport {
     Unavailable(String),
 }
 
+/// The Usage modal, open over the window: the Bot it is about, the window its chip names, and
+/// what the server said of the Bot's use in that window.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UsageModal {
+    pub coworker_id: String,
+    pub window: crate::opengrok::UsageWindow,
+    pub report: UsageReport,
+}
+
 /// The open bot's tools, as far as the settings pane knows them.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ToolList {
@@ -5455,8 +5464,11 @@ pub struct AppState {
     usage_generation: u64,
     /// The bot settings' Tools card is open to its list.
     pub agent_tools_open: bool,
-    /// The bot settings' Usage card is open to its per-model lines (#138).
-    pub agent_usage_open: bool,
+    /// The Usage modal, while it is open ([`UsageModal`]), which the Usage card's Show opens.
+    pub usage_modal: Option<UsageModal>,
+    /// Counts the reads the Usage modal asked for, so only the newest answer is shown: a chip
+    /// pressed twice, or two in a row, can come back out of order.
+    usage_modal_generation: u64,
     /// Counts the tool listings asked for, so only the newest answer is shown: two asks for the
     /// same bot can come back out of order, and the older must not replace the newer.
     tools_generation: u64,
@@ -6136,7 +6148,8 @@ impl AppState {
             coworker_usage: None,
             usage_generation: 0,
             agent_tools_open: false,
-            agent_usage_open: false,
+            usage_modal: None,
+            usage_modal_generation: 0,
             tools_generation: 0,
             connections: AccountConnections::default(),
             connections_generation: 0,
@@ -7772,7 +7785,9 @@ impl AppState {
         self.usage_generation += 1;
         let generation = self.usage_generation;
         cx.spawn(async move |this, cx| {
-            let result = client.coworker_usage(&coworker_id).await;
+            let result = client
+                .coworker_usage(&coworker_id, crate::opengrok::UsageWindow::Month)
+                .await;
             let _ = this.update(cx, |state, cx| {
                 if state.settle_coworker_usage(generation, coworker_id, result) {
                     cx.notify();
@@ -8428,9 +8443,100 @@ impl AppState {
         cx.notify();
     }
 
-    pub fn toggle_agent_usage(&mut self, cx: &mut Context<Self>) {
-        self.agent_usage_open = !self.agent_usage_open;
+    /// Show, on the Usage card: the Usage modal opens over the window on the month, with what the
+    /// card read for the month on show at once, so it does not open blank, and read again for what
+    /// has happened since. It opens on nothing without a Bot, or a server to ask.
+    pub fn open_usage_modal(&mut self, cx: &mut Context<Self>) {
+        let (Some(_), Some(coworker_id)) =
+            (self.opengrok.as_ref(), self.active_coworker_id.clone())
+        else {
+            return;
+        };
+        let report = match &self.coworker_usage {
+            Some((id, report @ UsageReport::Read(_))) if *id == coworker_id => report.clone(),
+            _ => UsageReport::Loading,
+        };
+        self.usage_modal = Some(UsageModal {
+            coworker_id,
+            window: crate::opengrok::UsageWindow::default(),
+            report,
+        });
+        self.refresh_usage_modal(cx);
         cx.notify();
+    }
+
+    /// ✕, Escape, or a press beside the modal: it shuts, and what it was asking is dropped when it
+    /// lands.
+    pub fn close_usage_modal(&mut self, cx: &mut Context<Self>) {
+        if self.usage_modal.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// A chip of the modal: the Bot's use in that window is asked for, and the modal says so until
+    /// it is answered. The window it is on again asks nothing, and a modal that is shut has no chip
+    /// to press.
+    pub fn set_usage_window(
+        &mut self,
+        window: crate::opengrok::UsageWindow,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(modal) = self.usage_modal.as_mut() else {
+            return;
+        };
+        if modal.window == window {
+            return;
+        }
+        modal.window = window;
+        modal.report = UsageReport::Loading;
+        self.refresh_usage_modal(cx);
+        cx.notify();
+    }
+
+    /// Ask the server for the modal's Bot in the modal's window. Only the newest ask is answered
+    /// on the modal ([`Self::settle_usage_modal`]).
+    fn refresh_usage_modal(&mut self, cx: &mut Context<Self>) {
+        let (Some(client), Some(modal)) = (self.opengrok.clone(), self.usage_modal.as_ref()) else {
+            return;
+        };
+        let (coworker_id, window) = (modal.coworker_id.clone(), modal.window);
+        self.usage_modal_generation += 1;
+        let generation = self.usage_modal_generation;
+        cx.spawn(async move |this, cx| {
+            let result = client.coworker_usage(&coworker_id, window).await;
+            let _ = this.update(cx, |state, cx| {
+                if state.settle_usage_modal(generation, coworker_id, window, result) {
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Put an answer on the modal, unless it is no longer the one wanted: a newer ask was made
+    /// since, or the person went to another window or Bot, or shut it. A report is never shown
+    /// under the wrong window's chip.
+    fn settle_usage_modal(
+        &mut self,
+        generation: u64,
+        coworker_id: String,
+        window: crate::opengrok::UsageWindow,
+        result: Result<crate::opengrok::CoworkerUsage, OpenGrokError>,
+    ) -> bool {
+        let Some(modal) = self.usage_modal.as_mut() else {
+            return false;
+        };
+        if self.usage_modal_generation != generation
+            || modal.coworker_id != coworker_id
+            || modal.window != window
+        {
+            return false;
+        }
+        modal.report = match result {
+            Ok(usage) => UsageReport::Read(usage),
+            Err(error) => UsageReport::Unavailable(usage_unavailable(&error)),
+        };
+        true
     }
 
     /// Ask the server where the account's replies are paid from: on sign-in, with the roster,
@@ -14360,7 +14466,7 @@ impl AppState {
         self.coworker_usage = None;
         self.agent_tools_open = false;
         self.agent_skills_open = false;
-        self.agent_usage_open = false;
+        self.usage_modal = None;
         if self.right_pane == RightPane::Settings {
             self.refresh_coworker_tools(cx);
             self.refresh_coworker_ceiling(cx);
@@ -34314,6 +34420,176 @@ mod tests {
         state.coworker_usage = None;
         assert!(!state.settle_coworker_usage(2, "cw_1".into(), usage(9)));
         assert_eq!(state.coworker_usage, None);
+    }
+
+    /// One answer of `GET /coworkers/cw_1/usage?window=` naming `model` for `window`.
+    fn usage_answer(window: &str, model: &str) -> serde_json::Value {
+        json!({
+            "metered": true, "note": null, "window": window,
+            "models": [{"modelId": model, "requests": 3, "inputTokens": 0, "outputTokens": 0,
+                "cacheReadTokens": 0, "cacheWriteTokens": 0, "costUsd": "1.000000"}],
+            "totals": {"requests": 3, "costUsd": "1.000000"}
+        })
+    }
+
+    /// The models of a report, when it is one, and the window the modal is on.
+    fn modal_shows(
+        state: &AppState,
+    ) -> Option<(crate::opengrok::UsageWindow, Option<Vec<String>>)> {
+        state.usage_modal.as_ref().map(|modal| {
+            let models = match &modal.report {
+                super::UsageReport::Read(read) => {
+                    Some(read.models.iter().map(|m| m.model_id.clone()).collect())
+                }
+                _ => None,
+            };
+            (modal.window, models)
+        })
+    }
+
+    /// The Usage modal opens on the month, with what the card read for it already on show and read
+    /// afresh; each chip shows nothing but "asking" until its window's answer comes, asks the
+    /// server for that window and no other, and a chip pressed again asks nothing; closing it
+    /// forgets all of it.
+    #[gpui_kit::test]
+    fn the_usage_modal_opens_on_the_month_and_each_chip_asks_for_its_window(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        use crate::opengrok::UsageWindow::{Day, Month, Week};
+        use gpui_kit::AppContext as _;
+        use wiremock::matchers::query_param;
+        let runtime = a_runtime_for_the_relay(cx);
+        let _enter = runtime.enter();
+        let server = runtime.block_on(wiremock::MockServer::start());
+        runtime.block_on(async {
+            for (window, model) in [
+                ("month", "oag/month"),
+                ("24h", "oag/day"),
+                ("7d", "oag/week"),
+            ] {
+                wiremock::Mock::given(wiremock::matchers::method("GET"))
+                    .and(wiremock::matchers::path("/coworkers/cw_1/usage"))
+                    .and(query_param("window", window))
+                    .respond_with(
+                        wiremock::ResponseTemplate::new(200)
+                            .set_body_json(usage_answer(window, model)),
+                    )
+                    .mount(&server)
+                    .await;
+            }
+        });
+        let mut state = signed_in_state();
+        state.opengrok = Some(OpenGrokClient::new(&server.uri()).expect("a URL"));
+        with_bot(&mut state, json!("gateway"));
+        state.coworker_usage = Some((
+            "cw_1".into(),
+            super::UsageReport::Read(
+                serde_json::from_value(usage_answer("month", "oag/card")).expect("an answer"),
+            ),
+        ));
+        let app = cx.new(|_| state);
+        let shown = |cx: &mut gpui_kit::TestAppContext| app.read_with(cx, |s, _| modal_shows(s));
+        let windows_asked = |runtime: &tokio::runtime::Runtime| -> Vec<String> {
+            runtime
+                .block_on(server.received_requests())
+                .expect("the recorder is on")
+                .iter()
+                .filter(|request| request.url.path() == "/coworkers/cw_1/usage")
+                .filter_map(|request| {
+                    request
+                        .url
+                        .query_pairs()
+                        .find(|(key, _)| key == "window")
+                        .map(|(_, word)| word.to_string())
+                })
+                .collect()
+        };
+
+        assert_eq!(shown(cx), None);
+        app.update(cx, |state, cx| state.open_usage_modal(cx));
+        assert_eq!(
+            shown(cx),
+            Some((Month, Some(vec!["oag/card".to_string()]))),
+            "the card's month, at once"
+        );
+        wait_for(cx, "the month is read afresh", |cx| {
+            shown(cx) == Some((Month, Some(vec!["oag/month".to_string()])))
+        });
+        app.update(cx, |state, cx| state.set_usage_window(Day, cx));
+        assert_eq!(
+            shown(cx),
+            Some((Day, None)),
+            "asking, with no other window's models"
+        );
+        wait_for(cx, "the day is read", |cx| {
+            shown(cx) == Some((Day, Some(vec!["oag/day".to_string()])))
+        });
+        app.update(cx, |state, cx| state.set_usage_window(Week, cx));
+        wait_for(cx, "the week is read", |cx| {
+            shown(cx) == Some((Week, Some(vec!["oag/week".to_string()])))
+        });
+        // The same chip again is no new question.
+        app.update(cx, |state, cx| state.set_usage_window(Week, cx));
+        cx.run_until_parked();
+        assert_eq!(windows_asked(&runtime), ["month", "24h", "7d"]);
+        app.update(cx, |state, cx| state.close_usage_modal(cx));
+        assert_eq!(shown(cx), None);
+        // A chip with the modal shut opens nothing.
+        app.update(cx, |state, cx| state.set_usage_window(Day, cx));
+        assert_eq!(shown(cx), None);
+    }
+
+    /// An answer lands only on the modal that asked for it: not after a newer ask, another window,
+    /// another Bot, or the modal being shut; and a refusal reads in words.
+    #[test]
+    fn a_usage_answer_for_a_modal_the_person_has_left_is_dropped() {
+        use crate::opengrok::UsageWindow::{Day, Week};
+        let answer = |window: &str| {
+            Ok(serde_json::from_value(usage_answer(window, "oag/x")).expect("an answer"))
+        };
+        let mut state = signed_in_state();
+        with_bot(&mut state, json!("gateway"));
+        state.usage_modal = Some(super::UsageModal {
+            coworker_id: "cw_1".into(),
+            window: Day,
+            report: super::UsageReport::Loading,
+        });
+        state.usage_modal_generation = 5;
+        assert!(
+            !state.settle_usage_modal(4, "cw_1".into(), Day, answer("24h")),
+            "older"
+        );
+        assert!(
+            !state.settle_usage_modal(5, "cw_1".into(), Week, answer("7d")),
+            "another window"
+        );
+        assert!(
+            !state.settle_usage_modal(5, "cw_2".into(), Day, answer("24h")),
+            "another Bot"
+        );
+        assert_eq!(modal_shows(&state), Some((Day, None)));
+        assert!(state.settle_usage_modal(5, "cw_1".into(), Day, answer("24h")));
+        assert_eq!(
+            modal_shows(&state),
+            Some((Day, Some(vec!["oag/x".to_string()])))
+        );
+        assert!(state.settle_usage_modal(
+            5,
+            "cw_1".into(),
+            Day,
+            Err(OpenGrokError::message("boom".to_string()))
+        ));
+        assert_eq!(
+            state.usage_modal.as_ref().map(|modal| modal.report.clone()),
+            Some(super::UsageReport::Unavailable(
+                "Could not load this bot's usage: boom".into()
+            ))
+        );
+        state.usage_modal = None;
+        assert!(
+            !state.settle_usage_modal(5, "cw_1".into(), Day, answer("24h")),
+            "shut"
+        );
     }
 
     use super::{

@@ -2,9 +2,9 @@ use gpui_kit::component::Root;
 use gpui_kit::*;
 use nativechat::actions::{
     About, BranchInNewChat, CancelRoutineDelete, CloseBotFinder, CloseCommandPalette, CloseFind,
-    CloseLightbox, CloseSettings, CloseWindow, CopyMessage, FindNext, FindPrev, FocusChatInput,
-    Hide, HideOthers, LightboxNext, LightboxPrev, Minimize, NavBack, NavForward, NewChat,
-    OpenCommandPalette, OpenSettings, PaletteNextTab, PalettePrevTab, PaletteSelectNext,
+    CloseLightbox, CloseSettings, CloseUsageModal, CloseWindow, CopyMessage, FindNext, FindPrev,
+    FocusChatInput, Hide, HideOthers, LightboxNext, LightboxPrev, Minimize, NavBack, NavForward,
+    NewChat, OpenCommandPalette, OpenSettings, PaletteNextTab, PalettePrevTab, PaletteSelectNext,
     PaletteSelectPrev, PickFinderItem, Quit, ReadAloud, ReportMessage, Search, ShowAll,
     ToggleAgentSettings, ToggleComputerPane, ToggleDebugMarkdown, ToggleFps, ToggleMiniSidebar,
     ToggleSidebar, ToggleTheme, Zoom,
@@ -146,6 +146,8 @@ fn main() {
                 KeyBinding::new("right", LightboxNext, Some("Lightbox")),
                 // The routine Delete question holds focus while it asks, the same way.
                 KeyBinding::new("escape", CancelRoutineDelete, Some("RoutineDelete")),
+                // And so does the Usage modal.
+                KeyBinding::new("escape", CloseUsageModal, Some("UsageModal")),
                 KeyBinding::new("tab", PaletteNextTab, Some("CommandPalette")),
                 KeyBinding::new("shift-tab", PalettePrevTab, Some("CommandPalette")),
                 KeyBinding::new("down", PaletteSelectNext, Some("CommandPalette")),
