@@ -410,10 +410,14 @@
 //! when it is not that already, as `PUT /account/inference-source` `{kind, via: "mac"}` with the
 //! kind the server keeps, one change of the account's at a time, and a computer going off moves no
 //! way; nothing this app sends of the account's setting ever carries `relayEnabled`),
-//! `settings-computer-{machine}-status` (label `Relaying`, `Not relaying` or `On, but asleep: it
-//! can't answer right now`; value `relaying`, `not-relaying` or `asleep`: relaying while the
-//! computer's relay is on and the server holds its stream, asleep while it is on, not relaying and
-//! the server cannot reach the computer, which is never said of the computer the app is running on)
+//! `settings-computer-{machine}-status` (label `Relaying`, `Not relaying`, `Not relaying: set this
+//! computer's opencodex address` or `On, but asleep: it can't answer right now`; value
+//! `relaying`, `not-relaying`, `needs-address` or `asleep`: relaying while the computer's relay is
+//! on and the server holds its stream, asleep while it is on, not relaying and the server cannot
+//! reach the computer, which is never said of the computer the app is running on, and
+//! `needs-address` on that computer alone, while its relay is on and it has been given no
+//! opencodex address: the server starts every computer's relay on, and a computer offers to relay
+//! only with an address for opencodex)
 //! and `settings-computer-{machine}-error` (under the switch, in the tree only while it has
 //! something to say: the server's words for a refused switch, which went back, that nobody knows
 //! whether one was kept, or that the server can't switch a computer's relay yet, or the server's
@@ -429,8 +433,9 @@
 //! Settings → Relay's and keep their ids: `settings-relay-detail` (under its status: why it is not
 //! relaying, state `trouble`, or that it is opening its stream, or how to take the relay back from
 //! another NativeChat on this computer), `settings-relay-addr` (named `opencodex address`, value =
-//! opencodex's address on this computer; `set_value` and `type` write it; an address not on this
-//! computer is refused by Save with a hint, an emptied one goes back to the default),
+//! opencodex's address on this computer, empty while none has been given; `set_value` and `type`
+//! write it; an address not on this computer is refused by Save with a hint, an emptied one
+//! forgets the address kept, and without one the computer does not offer to relay),
 //! `settings-relay-key` (named `opencodex key (kept in this computer's secure storage)`, never
 //! valued: states `set` while the Keychain holds a key, `typed` while one waits for Save, `retype`
 //! when one typed was dropped with the page; `set_value` writes the whole key),

@@ -40,6 +40,11 @@
 //! `relay_requests` in `crates/opengrok-server/src/inference.rs`). So an ended stream is opened
 //! again as after any drop, with the newest token this Mac holds; one refused for an old token
 //! waits for the new.
+//!
+//! The window starts this relay only on a computer that has been given an address for opencodex
+//! (`AppState::relay_wanted`). The server starts every computer's relay on when it is enrolled
+//! (`relay_enabled` defaults true, opengrok-server #342 (main 2136ffc)), so a computer with no
+//! opencodex to answer with would offer itself, be sent the plan's turns, and fail them.
 
 use std::collections::HashMap;
 use std::fmt;
