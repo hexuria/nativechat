@@ -115,7 +115,6 @@ pub mod ids {
     /// On a routine's thread: how many bubbles are labelled as its instruction (value).
     pub const CHAT_ROUTINE_INSTRUCTIONS: &str = "chat-routine-instructions";
     pub const AGENT_SETTINGS: &str = "agent-settings";
-    pub const AGENT_SAVE: &str = "agent-save";
     /// The one control that opens a blank routine, whichever of its two shapes the Computer
     /// pane is drawing: the "Create routine" card when the bot has none, the `+` when it has.
     pub const ROUTINE_NEW: &str = "routine-new";
@@ -955,8 +954,6 @@ pub enum Command {
         name: String,
         enabled: bool,
     },
-    /// The bot settings' Save.
-    SaveAgentSettings,
     ToggleAgentSkills,
     /// A switch on the Skills card: one skill attached to the open Bot or detached from it, by
     /// the skill's id, sent at once.
@@ -1267,7 +1264,6 @@ impl Command {
             Self::ToggleAgentTools => state.toggle_agent_tools(cx),
             Self::ToggleAgentUsage => state.toggle_agent_usage(cx),
             Self::SetCeilingTool { name, enabled } => state.switch_ceiling_tool(name, enabled, cx),
-            Self::SaveAgentSettings => state.request_agent_save(cx),
             Self::ToggleAgentSkills => state.toggle_agent_skills(cx),
             Self::SetBotSkill { skill_id, attached } => {
                 state.switch_bot_skill(skill_id, attached, cx)
@@ -4502,11 +4498,11 @@ impl NativeChatHost {
                 reply_source::PLAN_USAGE_NOTE,
             ));
         }
-        // The pane's red line over Save, where a refused Save says why in the server's words.
+        // The pane's red line under the fields, where a refused save says why in the server's
+        // words.
         if let Some(error) = &self.auth_error {
             settings = settings.with_child(UiNode::status("agent-settings-error", error.clone()));
         }
-        settings = settings.with_child(UiNode::button(ids::AGENT_SAVE, "Save"));
 
         UiTree {
             app: "nativechat".into(),
@@ -7284,11 +7280,6 @@ impl NativeChatHost {
                 );
             }
             Command::ToggleAgentUsage
-        } else if target == ids::AGENT_SAVE {
-            if !self.agent_settings_open {
-                return Err("`agent-save` is in the bot's settings, which are closed".into());
-            }
-            Command::SaveAgentSettings
         } else if target == "agent-model-dismiss" {
             Command::SetModelPicker(false)
         } else if target == "avatar-trigger" || target == "avatar-editor-dismiss" {
@@ -14163,22 +14154,16 @@ mod tests {
         );
     }
 
-    /// Save is on the tree and pressed by way of the app, since the fields it sends are the
-    /// pane's; a refused Save is on the tree in the server's words, where the pane shows it.
+    /// The Bot's settings have no Save: Name, Label and Description save as they are left, so
+    /// there is no control for it on the tree and a click on the old id is refused; a refused
+    /// change is on the tree in the server's words, where the pane shows it.
     #[test]
-    fn a_driver_saves_the_bots_settings_and_reads_a_refusal() {
+    fn the_bots_settings_have_no_save_and_a_driver_reads_a_refusal() {
         let mut host = host();
-        assert!(
-            host.dispatch(&Op::click(ids::AGENT_SAVE)).is_err(),
-            "the settings are closed"
-        );
         host.agent_settings_open = true;
-        assert!(host.snapshot().find(ids::AGENT_SAVE).is_some());
-        host.dispatch(&Op::click(ids::AGENT_SAVE)).unwrap();
-        assert!(matches!(
-            host.take_command(),
-            Some(Command::SaveAgentSettings)
-        ));
+        assert!(host.snapshot().find("agent-save").is_none());
+        assert!(host.dispatch(&Op::click("agent-save")).is_err());
+        assert!(host.take_command().is_none());
 
         assert!(host.snapshot().find("agent-settings-error").is_none());
         let said = "effort must be one of inherit, none, low, medium, high, xhigh, max, ultra";

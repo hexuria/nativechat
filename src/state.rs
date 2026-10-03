@@ -5558,9 +5558,6 @@ pub struct AppState {
     ceiling_switches: u64,
     /// What the Tools card says about the last switch that did not go as asked.
     ceiling_note: Option<CeilingNote>,
-    /// A driver pressed the bot settings' Save. The button is the pane's, and so are the fields
-    /// it sends, so the pane takes this and saves as the button would.
-    agent_save_requested: bool,
     /// Every skill the open Bot's owner may attach to it and which of them are, as its Skills
     /// card's switches show them (opengrok-server#270): the Bot's id and the answer, like
     /// [`Self::coworker_tools`]. Drawn through [`Self::skills_card`].
@@ -6169,7 +6166,6 @@ impl AppState {
             ceiling_switch: None,
             ceiling_switches: 0,
             ceiling_note: None,
-            agent_save_requested: false,
             coworker_skills: None,
             skills_generation: 0,
             skills_reading: None,
@@ -9926,17 +9922,6 @@ impl AppState {
             && self.app_settings_tab == AppSettingsTab::Connections)
             || self.right_pane == RightPane::Settings;
         waiting || showing
-    }
-
-    /// A driver pressing the bot settings' Save, which the pane takes and answers as the button.
-    pub fn request_agent_save(&mut self, cx: &mut Context<Self>) {
-        self.agent_save_requested = true;
-        cx.notify();
-    }
-
-    /// Whether a driver pressed Save since the pane last asked. Each press is answered once.
-    pub fn take_agent_save_request(&mut self) -> bool {
-        std::mem::take(&mut self.agent_save_requested)
     }
 
     pub fn close_right_pane(&mut self, cx: &mut Context<Self>) {

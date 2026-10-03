@@ -329,8 +329,12 @@
 //! `model.picker.open` and `model.picker.close` work the popover, and a click on
 //! `agent-model-dismiss` shuts it.
 //!
-//! In the bot's settings: `agent-settings-error` is the pane's red line over Save: a refused Save
-//! or pick, in the server's words.
+//! In the bot's settings: `agent-settings-error` is the pane's red line under the Description: a
+//! refused save or pick, in the server's words. There is no Save: Name, Label and Description
+//! save as they are left (or on Enter, in the two single-line ones), each alone and only if it
+//! changed, on `PATCH /coworkers/{id}` (`name`, `title`, `role`), with "Saved" beside the field's
+//! heading for a moment; a refusal keeps the words in the field. The fields have no ids of their
+//! own.
 //!
 //! Connections (#2), a connection named by the server's id and a service by the name
 //! `GET /connectors` lists it under. Only the person's own connections are on either surface: a
