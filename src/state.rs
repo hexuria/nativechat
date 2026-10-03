@@ -5479,8 +5479,9 @@ pub struct AppState {
     /// The re-reads the stream asked for, by thread: one out at a time, and one owed after it.
     thread_rereads: HashMap<String, ThreadReread>,
     /// The app's own `POST /ag-ui` streams, and the runs it follows through the replay route,
-    /// still open, by thread: a re-read of the thread waits until the last of them has ended.
-    turn_streams: HashMap<String, usize>,
+    /// still open, by thread, as the runs they watch: a re-read of the thread waits until the last
+    /// of them has ended, and a change one of those runs made is no news.
+    turn_streams: HashMap<String, Vec<String>>,
     /// The runs this app started itself, newest last ([`OWN_RUNS_KEPT`]): the stream's notes
     /// about them tell the window nothing it is not already watching.
     own_runs: VecDeque<String>,
@@ -8870,7 +8871,19 @@ impl AppState {
     /// message as this app holds it), and that thread is read when it is opened.
     fn take_account_event(&mut self, event: AccountEvent, cx: &mut Context<Self>) {
         match event {
-            AccountEvent::ThreadChanged { thread_id, .. } => self.reread_thread(&thread_id, cx),
+            // A change made by a run the window watches itself, its own turn or a run it follows,
+            // is what the window is painting already. One no run made, or another run made, is
+            // read.
+            AccountEvent::ThreadChanged {
+                thread_id, run_id, ..
+            } => {
+                if !run_id
+                    .as_deref()
+                    .is_some_and(|run| self.watches_run(&thread_id, run))
+                {
+                    self.reread_thread(&thread_id, cx);
+                }
+            }
             AccountEvent::RunStarted {
                 run_id,
                 thread_id,
@@ -9029,24 +9042,28 @@ impl AppState {
         }
     }
 
-    /// The app's own turn began streaming in a thread, or it began following a run there.
-    fn turn_stream_began(&mut self, thread_id: &str) {
-        *self.turn_streams.entry(thread_id.to_string()).or_default() += 1;
+    /// The app's own turn, `run_id`, began streaming in a thread, or it began following the run
+    /// `run_id` there.
+    fn turn_stream_began(&mut self, thread_id: &str, run_id: &str) {
+        self.turn_streams
+            .entry(thread_id.to_string())
+            .or_default()
+            .push(run_id.to_string());
     }
 
     /// That stream, or that follow, ended. Once none is left in the thread, a re-read the stream
     /// asked for meanwhile goes.
-    fn turn_stream_ended(&mut self, thread_id: &str, cx: &mut Context<Self>) {
-        match self.turn_streams.get_mut(thread_id) {
-            Some(open) if *open > 1 => {
-                *open -= 1;
-                return;
-            }
-            Some(_) => {
-                self.turn_streams.remove(thread_id);
-            }
-            None => return,
+    fn turn_stream_ended(&mut self, thread_id: &str, run_id: &str, cx: &mut Context<Self>) {
+        let Some(runs) = self.turn_streams.get_mut(thread_id) else {
+            return;
+        };
+        if let Some(at) = runs.iter().position(|run| run == run_id) {
+            runs.remove(at);
         }
+        if !runs.is_empty() {
+            return;
+        }
+        self.turn_streams.remove(thread_id);
         if self
             .thread_rereads
             .get(thread_id)
@@ -9054,6 +9071,17 @@ impl AppState {
         {
             self.reread_thread(thread_id, cx);
         }
+    }
+
+    /// A run this app watches itself: one of its own turns, which it watched down the stream it
+    /// started it on, or a run it is following in the thread now. What such a run writes is what
+    /// the window is painting already.
+    fn watches_run(&self, thread_id: &str, run_id: &str) -> bool {
+        self.own_runs.iter().any(|own| own == run_id)
+            || self
+                .turn_streams
+                .get(thread_id)
+                .is_some_and(|runs| runs.iter().any(|run| run == run_id))
     }
 
     /// A run this app started, kept so that the stream's notes about it are known for its own.
@@ -15836,7 +15864,7 @@ impl AppState {
         let (run_id, reply_id) = self.open_turn(&conversation_id);
         // The thread is the app's own to paint while the turn streams: a re-read the account's
         // events ask for meanwhile waits for the stream to end.
-        self.turn_stream_began(&conversation_id);
+        self.turn_stream_began(&conversation_id, &run_id);
         if let Some(id) = self.active_coworker_id.clone() {
             self.touch_coworker_activity(&id);
         }
@@ -16231,7 +16259,7 @@ impl AppState {
             // The turn's stream is over, whatever it came to and whoever settled it: a re-read
             // the account's events asked for while it ran goes now, after the turn's own ending.
             let _ = this.update(cx, |state, cx| {
-                state.turn_stream_ended(&conversation_id, cx)
+                state.turn_stream_ended(&conversation_id, &run_id, cx)
             });
         })
         .detach();
@@ -16790,7 +16818,7 @@ impl AppState {
         // The thread's run is the app's own to paint while it is followed, as a turn's stream is:
         // a re-read the account's events ask for meanwhile waits until the follow ends.
         if let Some(id) = conversation_id.as_deref() {
-            self.turn_stream_began(id);
+            self.turn_stream_began(id, &run_id);
         }
         cx.spawn(async move |this, cx| {
             // Somebody else settled the turn, and has said what it came to.
@@ -17046,7 +17074,7 @@ impl AppState {
                 });
             }
             if let Some(id) = conversation_id {
-                let _ = this.update(cx, |state, cx| state.turn_stream_ended(&id, cx));
+                let _ = this.update(cx, |state, cx| state.turn_stream_ended(&id, &run_id, cx));
             }
         })
         .detach();
@@ -29283,9 +29311,15 @@ mod tests {
     }
 
     fn thread_changed(thread_id: &str) -> AccountEvent {
+        changed_by(thread_id, None)
+    }
+
+    /// `thread.changed` for `thread_id`, made by the run `run_id`, or by none.
+    fn changed_by(thread_id: &str, run_id: Option<&str>) -> AccountEvent {
         AccountEvent::ThreadChanged {
             thread_id: thread_id.into(),
             coworker_id: "cw_1".into(),
+            run_id: run_id.map(str::to_string),
         }
     }
 
@@ -29593,6 +29627,81 @@ mod tests {
             asked_for(&runtime, &server, "/ag-ui/threads/cw_1") == 1
         });
         wait_for(cx, "and the read lands", |cx| rereads_landed(&app, cx));
+        let_it_settle(cx);
+    }
+
+    /// A change to the open thread made by a run the window watches itself, its own turn or a run
+    /// it is following, is no news: the window is painting what that run wrote, so the thread is
+    /// not read again for it, neither while the run goes nor once it has ended.
+    #[gpui_kit::test]
+    fn a_change_the_windows_own_run_made_reads_nothing(cx: &mut gpui_kit::TestAppContext) {
+        let runtime = a_runtime_for_the_relay(cx);
+        let _enter = runtime.enter();
+        let server = runtime.block_on(wiremock::MockServer::start());
+        runtime.block_on(thread_reads(
+            &server,
+            "cw_1",
+            adas_thread_with_a_new_turn(),
+            Duration::ZERO,
+        ));
+        let app = ada_open(cx, &runtime, &server);
+        app.update(cx, |state, _| {
+            state.note_own_run("run_mine");
+            state.turn_stream_began("cw_1", "run_mine");
+        });
+        hear(&app, cx, changed_by("cw_1", Some("run_mine")));
+        app.update(cx, |state, cx| {
+            state.turn_stream_ended("cw_1", "run_mine", cx)
+        });
+        hear(&app, cx, changed_by("cw_1", Some("run_mine")));
+        app.update(cx, |state, _| {
+            state.turn_stream_began("cw_1", "run_followed")
+        });
+        hear(&app, cx, changed_by("cw_1", Some("run_followed")));
+        app.update(cx, |state, cx| {
+            state.turn_stream_ended("cw_1", "run_followed", cx)
+        });
+        let_it_settle(cx);
+        assert_eq!(asked_for(&runtime, &server, "/ag-ui/threads/cw_1"), 0);
+    }
+
+    /// A change no run made (`runId` null: a card the person settled, or notes the server merged
+    /// that disagree), or one another run made, is read: while the window's own turn streams, once
+    /// it has ended, in one read for both; and at once when nothing streams.
+    #[gpui_kit::test]
+    fn a_change_no_run_or_another_run_made_is_read(cx: &mut gpui_kit::TestAppContext) {
+        let runtime = a_runtime_for_the_relay(cx);
+        let _enter = runtime.enter();
+        let server = runtime.block_on(wiremock::MockServer::start());
+        runtime.block_on(thread_reads(
+            &server,
+            "cw_1",
+            adas_thread_with_a_new_turn(),
+            Duration::ZERO,
+        ));
+        let app = ada_open(cx, &runtime, &server);
+        app.update(cx, |state, _| {
+            state.note_own_run("run_mine");
+            state.turn_stream_began("cw_1", "run_mine");
+        });
+        hear(&app, cx, changed_by("cw_1", None));
+        hear(&app, cx, changed_by("cw_1", Some("run_2")));
+        let_it_settle(cx);
+        assert_eq!(asked_for(&runtime, &server, "/ag-ui/threads/cw_1"), 0);
+        app.update(cx, |state, cx| {
+            state.turn_stream_ended("cw_1", "run_mine", cx)
+        });
+        wait_for(cx, "read once the turn has ended", |cx| {
+            asked_for(&runtime, &server, "/ag-ui/threads/cw_1") == 1 && rereads_landed(&app, cx)
+        });
+        hear(&app, cx, changed_by("cw_1", Some("run_3")));
+        wait_for(cx, "another run's change is read at once", |cx| {
+            asked_for(&runtime, &server, "/ag-ui/threads/cw_1") == 2 && rereads_landed(&app, cx)
+        });
+        hear(&app, cx, changed_by("cw_1", None));
+        wait_for(cx, "and one no run made", |cx| {
+            asked_for(&runtime, &server, "/ag-ui/threads/cw_1") == 3 && rereads_landed(&app, cx)
+        });
         let_it_settle(cx);
     }
 

@@ -64,6 +64,9 @@ pub enum AccountEvent {
     ThreadChanged {
         thread_id: String,
         coworker_id: String,
+        /// The run whose commit made the change, or `None` when no run did (a card the person
+        /// settled). Notes the server coalesces keep the latest run, or none where they disagree.
+        run_id: Option<String>,
     },
     /// A run began in the thread. The app's own turns are among them: the stream that started a
     /// run hears about it too, and the app knows its own by the run's id.
@@ -145,6 +148,10 @@ pub enum Unread {
 struct ThreadNote {
     thread_id: String,
     coworker_id: String,
+    /// Read as `null` when it is missing, as from a server before the field: the thread is read
+    /// again for it, which is always safe.
+    #[serde(default)]
+    run_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -184,6 +191,7 @@ impl AccountEvent {
                 Ok(Self::ThreadChanged {
                     thread_id: note.thread_id,
                     coworker_id: note.coworker_id,
+                    run_id: note.run_id.filter(|id| !id.trim().is_empty()),
                 })
             }
             RUN_STARTED | RUN_FINISHED => {
@@ -547,7 +555,7 @@ mod tests {
     }
 
     fn thread_changed(thread: &str) -> serde_json::Value {
-        json!({"threadId": thread, "coworkerId": "cw_1"})
+        json!({"threadId": thread, "coworkerId": "cw_1", "runId": null})
     }
 
     /// The next thing the stream tells the window, within a few seconds.
@@ -618,6 +626,7 @@ mod tests {
             Ok(AccountEvent::ThreadChanged {
                 thread_id: "cw_1".into(),
                 coworker_id: "cw_1".into(),
+                run_id: None,
             })
         );
         let started = json!({"runId": "run_1", "threadId": "sched_1", "coworkerId": "cw_1",
@@ -713,6 +722,36 @@ mod tests {
         assert_eq!(
             AccountEvent::read(THREAD_CHANGED, "not json"),
             Err(Unread::Malformed)
+        );
+    }
+
+    /// `thread.changed` names the run whose commit made the change, `null` when no run did (a card
+    /// the person settled); a note without the field, or with a blank one, reads as `null`, for
+    /// which the thread is read again, which is always safe.
+    #[test]
+    fn a_thread_change_names_the_run_that_made_it_or_none() {
+        let read =
+            |data: serde_json::Value| match AccountEvent::read(THREAD_CHANGED, &data.to_string()) {
+                Ok(AccountEvent::ThreadChanged { run_id, .. }) => run_id,
+                other => panic!("{data}: {other:?}"),
+            };
+        assert_eq!(
+            read(json!({"threadId": "cw_1", "coworkerId": "cw_1", "runId": "run_1"})).as_deref(),
+            Some("run_1")
+        );
+        assert_eq!(
+            read(json!({"threadId": "cw_1", "coworkerId": "cw_1", "runId": null})),
+            None
+        );
+        assert_eq!(
+            read(json!({"threadId": "cw_1", "coworkerId": "cw_1"})),
+            None,
+            "a note without it reads as null"
+        );
+        assert_eq!(
+            read(json!({"threadId": "cw_1", "coworkerId": "cw_1", "runId": " "})),
+            None,
+            "a blank run is none"
         );
     }
 

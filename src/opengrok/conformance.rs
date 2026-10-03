@@ -537,12 +537,20 @@ const CLIENT_IGNORES: &[(Slot, &str, &str)] = &[
 /// [`every_word_read_ahead_of_its_recording_is_matched_and_not_sent_yet`] fails until it does,
 /// and meanwhile holds that arm to the frames [`frames_read_ahead`] writes in the agreed shape.
 const WORDS_NOT_RECORDED_YET: &[(Slot, &str, &str)] = &[
-    (Slot::AccountEvent, "thread.changed", ACCOUNT_EVENTS_AHEAD),
+    (Slot::AccountEvent, "thread.changed", THREAD_CHANGED_AHEAD),
     (Slot::AccountEvent, "run.started", ACCOUNT_EVENTS_AHEAD),
     (Slot::AccountEvent, "run.finished", ACCOUNT_EVENTS_AHEAD),
     (Slot::AccountEvent, "routine.changed", ACCOUNT_EVENTS_AHEAD),
     (Slot::AccountEvent, "reset", ACCOUNT_EVENTS_AHEAD),
 ];
+
+/// What brings `thread.changed` into the corpus: as the other notes, in the shape with the `runId`
+/// agreed after them.
+const THREAD_CHANGED_AHEAD: &str = "opengrok-server #348 contract agreed 2026-10-03, with runId \
+     added to thread.changed the same day (the run whose commit made the change, present and \
+     null when no run did; coalesced notes keep the latest, or null where they disagree), not \
+     recorded yet: it comes with the recorder addition for SSE notes, as ACCOUNT_EVENTS_AHEAD \
+     says.";
 
 /// What brings the account's events stream's notes into the corpus.
 const ACCOUNT_EVENTS_AHEAD: &str = "opengrok-server #348 contract agreed 2026-10-03, not \
@@ -6138,6 +6146,8 @@ fn account_event(id: u64, name: &str, data: Value) -> Value {
     serde_json::json!({"id": id.to_string(), "event": name, "data": data})
 }
 
+/// `thread.changed` names the run whose commit made the change, and `null` when none did; a note
+/// without the field is read as `null` too, for safety.
 fn thread_changed_ahead() -> Vec<(Value, bool)> {
     use serde_json::json;
     vec![
@@ -6145,12 +6155,28 @@ fn thread_changed_ahead() -> Vec<(Value, bool)> {
             account_event(
                 1,
                 "thread.changed",
+                json!({"threadId": "cw_1", "coworkerId": "cw_1", "runId": "run_1"}),
+            ),
+            true,
+        ),
+        (
+            account_event(
+                2,
+                "thread.changed",
+                json!({"threadId": "cw_1", "coworkerId": "cw_1", "runId": null}),
+            ),
+            true,
+        ),
+        (
+            account_event(
+                14,
+                "thread.changed",
                 json!({"threadId": "cw_1", "coworkerId": "cw_1"}),
             ),
             true,
         ),
         (
-            account_event(2, "thread.changed", json!({"coworkerId": "cw_1"})),
+            account_event(15, "thread.changed", json!({"coworkerId": "cw_1"})),
             false,
         ),
     ]
@@ -6255,6 +6281,7 @@ fn account_event_frame(frame: &Value) -> Check {
         "thread.changed" => AccountEvent::ThreadChanged {
             thread_id: text("threadId"),
             coworker_id: text("coworkerId"),
+            run_id: opt_str(data, "runId").map(str::to_string),
         },
         "run.started" => AccountEvent::RunStarted {
             run_id: text("runId"),
