@@ -555,7 +555,11 @@ impl ReplySource {
 /// the person reads; the code is what offers the turn again on the server's keys, which could
 /// answer it. A refusal with no code is none of these, and its sentence stands alone: a Mac
 /// already carrying all the calls one Mac may at once, a reply source that could not be read, or
-/// a proxy key that could not be opened.
+/// a proxy key that could not be opened. So does `relay_disabled` (opengrok-server #332 (PR #338
+/// at 66b9f7b): `refused` in `crates/opengrok-server/src/pairs.rs`), a Bot's reply to another Bot
+/// skipped because the person switched the relay off and set no fallback: it ends a run in the
+/// two Bots' pair thread, which a person reads and cannot write in, so nothing offers it again.
+/// A chat turn refused because the relay is off is `plan_unavailable`, and is offered on Server.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RunErrorCode {
     /// No Mac held the relay.
@@ -1271,7 +1275,9 @@ mod tests {
     }
 
     /// The relay's codes and `plan_unavailable` are the contracts' words; any other code, a
-    /// gateway's say, is not one.
+    /// gateway's say, is not one, and nor is `relay_disabled`, a Bot's reply skipped in a pair
+    /// thread while the relay is off (opengrok-server #332 (PR #338 at 66b9f7b)), which nothing
+    /// sends again.
     #[test]
     fn a_plan_that_could_not_answer_is_read_off_its_code() {
         for code in RunErrorCode::ALL {
@@ -1293,6 +1299,7 @@ mod tests {
             "RELAY_OFFLINE",
             "PLAN_UNAVAILABLE",
             "plan-unavailable",
+            "relay_disabled",
         ] {
             assert_eq!(RunErrorCode::from_code(other), None, "{other:?}");
         }

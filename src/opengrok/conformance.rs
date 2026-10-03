@@ -1020,14 +1020,14 @@ fn run_ended(corpus: &Corpus, frame: &Value) -> Check {
         );
         if let Some(code) = code {
             must!(
-                RUN_ERROR_CODES.contains(&code),
+                RUN_ERROR_CODES.contains(&code) || offers_nothing(code),
                 "a run ends with the code {code:?}, which nothing here reads: read it, or say \
                  here why a person can be left without it"
             );
         }
         let offered = error.code().and_then(RunErrorCode::from_code);
         must!(
-            offered.is_some() == code.is_some(),
+            offered.is_some() == code.is_some_and(|code| RUN_ERROR_CODES.contains(&code)),
             "a code on a RUN_ERROR should offer the turn again on the server's keys, and only \
              such a code: {offered:?} from {code:?}"
         );
@@ -1054,6 +1054,30 @@ const RUN_ERROR_CODES: &[&str] = &[
     "relay_failed",
     "plan_unavailable",
 ];
+
+/// Codes a `RUN_ERROR` carries that offer nothing, each with why a person is left with the
+/// sentence alone. `relay_disabled` (opengrok-server #332 (PR #338 at 66b9f7b): `refused` in
+/// `crates/opengrok-server/src/pairs.rs`, with `Skip::reason`'s words) ends a Bot's reply to
+/// another Bot that was skipped because the person switched the relay off and set no fallback. It
+/// is only ever sent in the two Bots' pair thread, which is read-only: a person's words there,
+/// live or queued, are refused 403 `read-only-thread`, so there is no turn of theirs to send
+/// again, on the server's keys or otherwise. No chat turn ends with it (one refused for the relay
+/// being off is `plan_unavailable`). The recorder keeps no frame of it, since the pair's run is
+/// journaled straight into the store and never streamed through the router it tees, so it is
+/// read beyond the recording
+/// ([`a_bots_reply_skipped_while_the_relay_is_off_is_read_beyond_the_recording`]).
+const RUN_ERROR_CODES_OFFERING_NOTHING: &[(&str, &str)] = &[(
+    "relay_disabled",
+    "a Bot's reply to another, skipped while the relay is off, in their read-only pair thread",
+)];
+
+/// Whether `code` is one a `RUN_ERROR` carries that offers nothing
+/// ([`RUN_ERROR_CODES_OFFERING_NOTHING`]).
+fn offers_nothing(code: &str) -> bool {
+    RUN_ERROR_CODES_OFFERING_NOTHING
+        .iter()
+        .any(|(word, why)| *word == code && !why.trim().is_empty())
+}
 
 /// A message's opening paints nothing, and says whose words follow. The coworker's is it writing.
 /// The person's, which a replay opens each run with right after `RUN_STARTED` (opengrok-server
@@ -5708,6 +5732,41 @@ fn a_turn_the_plan_was_unavailable_for_is_recorded_with_its_code() {
     assert!(
         check_frame(&corpus, &misspelt).is_err(),
         "a code nothing here reads is caught"
+    );
+}
+
+/// A Bot's reply to another Bot that the server skipped because the person switched the relay off
+/// and set no fallback (opengrok-server #332 (PR #338 at 66b9f7b): `refused` in
+/// `crates/opengrok-server/src/pairs.rs`, as its test
+/// `a_bot_on_its_own_plan_is_skipped_while_the_relay_is_off_with_no_fallback` has it), read
+/// beyond the recording, which keeps no frame of it ([`RUN_ERROR_CODES_OFFERING_NOTHING`]). Its
+/// `RUN_ERROR` ends the turn in the server's words and keeps `relay_disabled` beside them, and
+/// the code offers nothing: no Send this reply on Server, in a pair thread a person cannot write
+/// in. `relay_disabled` on a routine's skip and on Run it now's 409 is recorded, and read there.
+#[test]
+fn a_bots_reply_skipped_while_the_relay_is_off_is_read_beyond_the_recording() {
+    use serde_json::json;
+    let corpus = Corpus::load();
+    let said = "Skipped: Relay is off for your plan";
+    let frame = json!({
+        "type": "RUN_ERROR", "timestamp": 100, "threadId": "pair-cw_ada-cw_luna",
+        "runId": "run_1", "message": said, "code": "relay_disabled"
+    });
+    run_ended(&corpus, &frame).unwrap_or_else(|why| panic!("{frame}: {why}"));
+    let error = OpenGrokClient::run_ended_badly(&frame);
+    assert_eq!(
+        (error.message.as_str(), error.code()),
+        (said, Some("relay_disabled"))
+    );
+    assert_eq!(
+        error.code().and_then(RunErrorCode::from_code),
+        None,
+        "nothing to send again on the server's keys"
+    );
+    let unread = json!({"type": "RUN_ERROR", "message": said, "code": "relay_slow"});
+    assert!(
+        run_ended(&corpus, &unread).is_err(),
+        "a code nothing here reads is still caught"
     );
 }
 

@@ -36221,6 +36221,100 @@ mod tests {
         assert!(refused.contains("person's plan"), "{refused}");
     }
 
+    /// A turn by the person's Mac while they switched the relay off and set no fallback, and a
+    /// carry-on of one the Mac started before it went off, are refused `plan_unavailable` in the
+    /// server's words (opengrok-server #332 (PR #338 at 66b9f7b): `RELAY_OFF`, the door's refusal
+    /// in `crates/opengrok-harness/src/local_proxy.rs`), never moved to the fallback mid-run. As
+    /// the thread's last turn it is offered again on the server's keys, live by the run error's
+    /// code and read back by the code on the journal's `RUN_ERROR`; it ran, so Try again, which is
+    /// for a turn that never left, is not offered.
+    #[test]
+    fn a_turn_refused_because_the_relay_is_off_is_offered_on_server() {
+        use crate::opengrok::RunErrorCode;
+        let said = "Relay is off for your plan, so the turn was not sent. Turn Relay on, or choose \
+                    a Server model to answer while it is off, or switch this turn to the gateway.";
+        let mut state = signed_in_state();
+        with_bot(&mut state, json!("local_proxy"));
+        refused_turn(&mut state, said);
+        state.note_plan_failure("m_failed", RunErrorCode::from_code("plan_unavailable"));
+        assert_eq!(state.plan_failed_turn().as_deref(), Some("m_failed"));
+        assert_eq!(state.retryable_turn(), None);
+
+        let events = vec![
+            json!({"type": "RUN_STARTED", "runId": "run_1", "threadId": "cw_1"}),
+            json!({"type": "CUSTOM", "name": "opengrok.inferenceSource",
+                "value": {"kind": "local_proxy", "via": "mac", "model": "gpt-5.5"}}),
+            json!({"type": "RUN_ERROR", "message": said, "code": "plan_unavailable"}),
+        ];
+        let run: ThreadRun = serde_json::from_value(json!({
+            "runId": "run_1", "status": "failed", "startedAtMs": 1_000,
+            "failure": said, "events": events
+        }))
+        .expect("a run");
+        let recovered = super::missing_replies(&[message("m_ask", true, "summarise it")], &[run]);
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(
+            recovered[0].plan_failure,
+            Some(RunErrorCode::PlanUnavailable)
+        );
+        assert_eq!(recovered[0].content, format!("{RUN_ERROR_PREFIX}{said}"));
+    }
+
+    /// A Bot's reply to another Bot that the server skipped because the person switched the relay
+    /// off and set no fallback has no history row (opengrok-server #332 (PR #338 at 66b9f7b):
+    /// `refused` in `crates/opengrok-server/src/pairs.rs`): its run starts and fails at once in
+    /// the two Bots' pair thread, its `RUN_ERROR` naming `relay_disabled` beside the server's
+    /// words. Read back, or ending live, it is a failed reply in those words, and it offers
+    /// nothing: not Send this reply on Server, which no such code offers, and not Try again, which
+    /// is for a turn that never left. That thread is read-only (a person's words there are refused
+    /// 403 `read-only-thread`), so there is nothing of theirs to send again.
+    #[test]
+    fn a_bots_reply_skipped_while_the_relay_is_off_says_why_and_offers_nothing() {
+        use crate::opengrok::RunErrorCode;
+        let said = "Skipped: Relay is off for your plan";
+        let events = vec![
+            json!({"type": "RUN_STARTED", "runId": "run_1", "threadId": "pair-cw_1-cw_2"}),
+            json!({"type": "RUN_ERROR", "message": said, "code": "relay_disabled"}),
+        ];
+        assert_eq!(super::plan_failure_of(&events), None);
+        assert_eq!(RunErrorCode::from_code("relay_disabled"), None, "live, too");
+        let run: ThreadRun = serde_json::from_value(json!({
+            "runId": "run_1", "status": "failed", "startedAtMs": 1_000,
+            "failure": said, "events": events
+        }))
+        .expect("a run");
+        let recovered = super::missing_replies(&[message("m_ask", true, "the report?")], &[run]);
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].plan_failure, None);
+        assert_eq!(recovered[0].content, format!("{RUN_ERROR_PREFIX}{said}"));
+
+        let mut state = signed_in_state();
+        refused_turn(&mut state, said);
+        state.note_plan_failure("m_failed", recovered[0].plan_failure);
+        assert_eq!(state.plan_failed_turn(), None);
+        assert_eq!(state.retryable_turn(), None);
+    }
+
+    /// On a driver's tree, the same reply has neither `retry-turn` nor `run-error-send-on-server`
+    /// beside it, and a click on either is refused.
+    #[cfg(feature = "agent")]
+    #[test]
+    fn a_driver_is_offered_nothing_for_a_bots_reply_skipped_while_the_relay_is_off() {
+        use crate::agent::{NativeChatHost, ids};
+        use crate::opengrok::RunErrorCode;
+        use gpui_agent::prelude::{AgentHost, Op};
+        let mut state = signed_in_state();
+        refused_turn(&mut state, "Skipped: Relay is off for your plan");
+        state.note_plan_failure("m_failed", RunErrorCode::from_code("relay_disabled"));
+        let mut host = NativeChatHost::from_app(&state);
+        let tree = host.snapshot();
+        assert!(tree.find(ids::RUN_ERROR_SEND_ON_SERVER).is_none());
+        assert!(tree.find("retry-turn").is_none());
+        for control in [ids::RUN_ERROR_SEND_ON_SERVER, "retry-turn"] {
+            assert!(host.dispatch(&Op::click(control)).is_err(), "{control}");
+        }
+    }
+
     /// A teammate on a shared Bot its owner put on the person's plan, with no plan of their own
     /// set up, is refused the turn in the server's words: the plan is always the person's who
     /// drives the turn, and the turn is never sent on the server's keys, nor to the owner's plan
