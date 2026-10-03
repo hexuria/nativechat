@@ -5322,6 +5322,35 @@ fn a_steps_arguments_are_held_to_the_cards_rules_as_stated() {
     }
 }
 
+/// The wake editor's Cron tab refuses a line under the one-minute floor in the server's own
+/// words (`cron_spec::UNDER_A_MINUTE`), held here to the server's recording of the same refusal
+/// on a create and on an edit (#316: `FLOOR` in autonomy/desk.rs), so the two cannot drift.
+#[test]
+fn the_floor_is_said_in_the_servers_words() {
+    let corpus = Corpus::load();
+    let said: Vec<(&String, &str)> = corpus
+        .bodies
+        .iter()
+        .filter(|(file, fixture)| {
+            (file.starts_with("rest/POST__schedules/")
+                || file.starts_with("rest/PATCH__schedules__id_/"))
+                && fixture["status"] == 422
+        })
+        .filter_map(|(file, fixture)| Some((file, fixture["body"]["error"].as_str()?)))
+        .filter(|(_, error)| error.contains("once a minute"))
+        .collect();
+    assert!(
+        said.iter().any(|(file, _)| file.starts_with("rest/POST__"))
+            && said
+                .iter()
+                .any(|(file, _)| file.starts_with("rest/PATCH__")),
+        "the recording holds the floor's refusal of a create and of an edit: {said:?}"
+    );
+    for (file, error) in said {
+        assert_eq!(error, crate::cron_spec::UNDER_A_MINUTE, "{file}");
+    }
+}
+
 /// The readings of a refusal hold for the shapes opengrok-server's error-bodies change (#262)
 /// writes, beyond the ones this recording happens to hold (`run-exists` under `code`, a 502 or a
 /// 503 of the server's own as JSON), and for the shapes it still writes and may move to: the

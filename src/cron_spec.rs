@@ -511,6 +511,13 @@ impl ScheduleSpec {
     }
 }
 
+/// The words opengrok-server refuses a line in when it wakes more often than once a minute, a 6-
+/// or 7-field line whose seconds are not `0` (#315's floor, refused since #316: `FLOOR` in
+/// `crates/opengrok-server/src/autonomy/desk.rs`, found by `under_a_minute` in opengrok-core
+/// `schedule.rs`), word for word. The Cron tab says them before Save, as the server would after.
+pub const UNDER_A_MINUTE: &str =
+    "a routine can wake at most once a minute: use 5 fields, like */5 * * * *.";
+
 /// The Cron tab's line, as typed, when it is five fields: minute, hour, day of the month, month
 /// and day of the week. The server is the judge of what is in them; what this refuses is a line
 /// that is not one of its own shape at all, `@every` among them, which the server refuses too.
@@ -522,11 +529,22 @@ fn five_fields(line: &str) -> Result<String, ScheduleNotCron> {
              `0 9 * * MON-FRI`.",
         )),
         5 => Ok(fields.join(" ")),
+        // A seconds field that is not `0` wakes more often than once a minute, which the server
+        // refuses in its own words: they are said here, begun with a capital as the editor's are.
+        6 | 7 if fields[0] != "0" => Err(ScheduleNotCron::new(capitalized(UNDER_A_MINUTE))),
         _ => Err(ScheduleNotCron::new(
             "A cron line here has five fields: minute, hour, day of the month, month and day of \
              the week, like `0 9 * * MON-FRI`.",
         )),
     }
+}
+
+/// A sentence begun with a capital.
+fn capitalized(sentence: &str) -> String {
+    let mut chars = sentence.chars();
+    chars.next().map_or_else(String::new, |first| {
+        first.to_uppercase().chain(chars).collect()
+    })
 }
 
 /// `Every N minutes/hours/days` as a cron line.
@@ -1187,6 +1205,33 @@ mod tests {
 
     /// The Cron tab takes five fields, as written, and nothing else: not `@every`, which the
     /// server refuses, and not the `@daily` kind, which it takes but the tab does not offer.
+    /// A line that wakes more often than once a minute, a 6- or 7-field one whose seconds are
+    /// not `0`, is refused in the server's own words (opengrok-server #316); one whose seconds are
+    /// `0` is still not five fields, and is refused as that.
+    #[test]
+    fn a_line_under_a_minute_is_refused_in_the_servers_words() {
+        let refused = |line: &str| {
+            ScheduleSpec::custom(line)
+                .to_cron()
+                .unwrap_err()
+                .sentence()
+                .to_string()
+        };
+        let floor = "A routine can wake at most once a minute: use 5 fields, like */5 * * * *.";
+        assert_eq!(refused("*/30 * * * * *"), floor);
+        assert_eq!(refused("* * * * * * *"), floor);
+        assert_eq!(refused("15 0 9 * * MON"), floor, "a second past the minute");
+        assert!(
+            refused("0 */5 * * * *").starts_with("A cron line here has five fields"),
+            "on the minute, but not five fields"
+        );
+        assert_eq!(
+            ScheduleSpec::custom("*/5 * * * *").to_cron().as_deref(),
+            Ok("*/5 * * * *"),
+            "the line the server's words suggest"
+        );
+    }
+
     #[test]
     fn the_cron_tab_takes_five_fields_and_nothing_else() {
         assert_eq!(
