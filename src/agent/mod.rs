@@ -264,12 +264,13 @@
 //! whose stops are the levels of effort the model itself lists, low to high, and which is not in
 //! the tree at all where the model lists none: it is named by the level it is on (the model's
 //! own while the Bot chose none, and `Effort` where the model names none as its own) and valued
-//! by the server's word (`inherit` while none is chosen); `set_value` takes the value of one of
-//! the model's own levels (`medium`, or `ultra` where the model lists it) and refuses any other
-//! in words that name them, and on a model with no levels it refuses that there is no slider;
-//! it is dead, with why, from a server that keeps no effort, one from before
-//! opengrok-server#271. Last, `agent-model-effort-note`, a line, not
-//! a control: after a pick of a model that has no such level as the Bot's effort was on, which
+//! by that level's own word (`medium` while the Bot chose none and the model's own level is
+//! Medium, and no value where no level is lit), so a driver can write back what it reads;
+//! `set_value` takes the value of one of the model's own levels (`medium`, or `ultra` where the
+//! model lists it) and refuses any other in words that name them, and on a model with no
+//! levels it refuses that there is no slider; it is dead, with why, from a server that keeps no
+//! effort, one from before opengrok-server#271. Last, `agent-model-effort-note`, a line, not a
+//! control: after a pick of a model that has no such level as the Bot's effort was on, which
 //! the pick put back on `inherit`, it says `GPT-6 Luna has no Ultra, so it's on Medium, its own
 //! level.`, for as long as that model is on the card and nothing else is changed. The model's
 //! levels and own level are `GET /models`' `efforts` and `ownEffort` (opengrok-server branch

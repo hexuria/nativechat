@@ -36,3 +36,13 @@ pub(crate) fn levelled_catalogue() -> ModelCatalogue {
     }))
     .expect("a list")
 }
+
+/// [`levelled_catalogue`] with the level `id` runs at taken away: it lists its levels and names
+/// none as its own, so a Bot that chose no effort has no level to sit on.
+pub(crate) fn levelled_catalogue_without_own(id: &str) -> ModelCatalogue {
+    let mut catalogue = levelled_catalogue();
+    for entry in catalogue.models.iter_mut().filter(|entry| entry.id == id) {
+        entry.own_effort = None;
+    }
+    catalogue
+}

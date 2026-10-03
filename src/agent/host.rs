@@ -5408,12 +5408,14 @@ impl NativeChatHost {
     /// with why as its value), `agent-model-open-list` (named by the model) and
     /// `agent-model-reset` (live while there is something to put back), then
     /// `agent-model-effort`, a slider that is there only where the model lists levels of effort
-    /// (named by the level it is on, the model's own while the Bot chose none, and valued by the
-    /// server's word, `inherit` while none is chosen; dead with why as its own words from a
-    /// server that keeps no effort; `set_value` takes one of the model's own levels by its word
-    /// and refuses any other in words that name them), and `agent-model-effort-note`, the line a
-    /// pick left when it put the effort back on the model's own level, while the model it is
-    /// about is the one on the card; and while it shows its
+    /// (named by the level it is on, the model's own while the Bot chose none, and valued by that
+    /// level's own word, so a driver can write back what it reads; `Effort` and with no value
+    /// where no level is lit, a model that names none as its own and none chosen; dead with why
+    /// as its own words from a server that keeps no effort; `set_value` takes one of the model's
+    /// own levels by its word and refuses any other in words that name them), and
+    /// `agent-model-effort-note`, the line a pick left when it put the effort back on the
+    /// model's own level, while the model it is about is the one on the card; and while it shows
+    /// its
     /// list, `agent-model-open-list` as the heading back (state `expanded`) and
     /// `agent-model-search`, the search box (valued by what is typed). `agent-model-list` is
     /// always there, valued by how many models the search leaves and visible while shown, and
@@ -5469,16 +5471,20 @@ impl NativeChatHost {
                         .with_enabled(pick.can_reset() && !busy),
                 );
             if pick.has_slider() {
-                pop = pop.with_child(
-                    UiNode::new(
-                        ids.effort,
-                        "slider",
-                        pick.effort_name()
-                            .unwrap_or_else(|| model_picker::EFFORT_LABEL.to_string()),
-                    )
-                    .with_value(pick.effort.clone())
-                    .with_enabled(pick.effort_dead.is_none() && !busy),
-                );
+                // Valued by the word of the level it is lit on, the model's own where the Bot
+                // chose none, so what a driver reads is what it can write back; a slider with
+                // no level lit has no word to say.
+                let mut slider = UiNode::new(
+                    ids.effort,
+                    "slider",
+                    pick.effort_name()
+                        .unwrap_or_else(|| model_picker::EFFORT_LABEL.to_string()),
+                )
+                .with_enabled(pick.effort_dead.is_none() && !busy);
+                if let Some(level) = pick.lit_level() {
+                    slider = slider.with_value(level.value.clone());
+                }
+                pop = pop.with_child(slider);
             }
             if let Some(line) = view.effort_note_for(pick) {
                 pop = pop.with_child(UiNode::status(ids.effort_note, line));
@@ -15324,8 +15330,8 @@ mod tests {
                 effort.name.as_str(),
                 effort.value.as_deref()
             ),
-            ("slider", "Medium", Some("inherit")),
-            "lit on the model's own level, with nothing chosen"
+            ("slider", "Medium", Some("medium")),
+            "lit on the model's own level with nothing chosen, and valued by that level's word"
         );
         assert_eq!(
             tree.find("agent-model-open-list").unwrap().name,
@@ -15470,6 +15476,22 @@ mod tests {
         ));
     }
 
+    /// The open Bot's picker on Cheap (auto), a gateway route that lists five levels of effort and
+    /// names none as its own, with the effort given.
+    fn an_ownless_pick(effort: &str) -> crate::opengrok::ModelPick {
+        let bot = serde_json::from_value(serde_json::json!({
+            "id": "cw_1", "name": "Ada", "model": "oag/cheap", "effort": effort,
+            "source": "gateway"
+        }))
+        .unwrap();
+        crate::opengrok::bot_pick(
+            &bot,
+            Some(&kept_source(crate::opengrok::InferenceKind::Gateway, true)),
+            &crate::opengrok::model_fixtures::levelled_catalogue_without_own("oag/cheap"),
+            |_| Vec::new(),
+        )
+    }
+
     /// The slider has exactly the levels the model lists for its stops, low to high, and a driver
     /// sets one by its word: GPT-6 Luna five, up to max, and Sol six, up to ultra. A level the
     /// model does not list is refused in words that name the ones it does, and a model that lists
@@ -15534,7 +15556,8 @@ mod tests {
         let effort = tree.find("agent-model-effort").unwrap();
         assert_eq!(
             (effort.name.as_str(), effort.value.as_deref()),
-            ("High", Some("inherit"))
+            ("High", Some("high")),
+            "the model's own level, with nothing chosen: its word, and not `inherit`"
         );
         assert_eq!(
             tree.find(ids::AGENT_MODEL_CARD).unwrap().name,
@@ -15550,6 +15573,29 @@ mod tests {
             click.contains("set_value it to one of low, medium, high, xhigh, max, ultra"),
             "{click}"
         );
+
+        // Cheap (auto) lists levels and names none as its own: with none chosen nothing is lit,
+        // so the slider is named for what it is and has no word to say, and it takes a level.
+        host.model_pick = Some(an_ownless_pick("inherit"));
+        let tree = host.snapshot();
+        let effort = tree.find("agent-model-effort").unwrap();
+        assert_eq!(
+            (
+                effort.name.as_str(),
+                effort.value.as_deref(),
+                effort.enabled
+            ),
+            ("Effort", None, true)
+        );
+        assert_eq!(
+            tree.find(ids::AGENT_MODEL_CARD).unwrap().name,
+            "Cheap (auto)"
+        );
+        set(&mut host, "low").unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::SetModelEffort(sent)) if sent == "low"
+        ));
 
         // Grok 4.7's source publishes no levels: no slider, nothing in its place.
         host.model_pick = Some(a_pick(
@@ -15742,9 +15788,22 @@ mod tests {
             host
         };
         let ids_of = |which: PickerFor| model_picker::ids(which).effort;
+        // The word of the level each picker's command carries, if it is a slider's.
+        let sent_word = |command: Option<Command>, which: PickerFor| match (which, command) {
+            (PickerFor::Bot, Some(Command::SetModelEffort(word))) => Some(word),
+            (PickerFor::NewBots, Some(Command::NewBots(PickerCommand::SetEffort(word)))) => {
+                Some(word)
+            }
+            (
+                PickerFor::PlanFallback,
+                Some(Command::PlanFallback(PickerCommand::SetEffort(word))),
+            ) => Some(word),
+            _ => None,
+        };
         for which in [PickerFor::Bot, PickerFor::NewBots, PickerFor::PlanFallback] {
             let effort = ids_of(which);
-            // None chosen: the model's own level, Medium, is lit, and the word kept is `inherit`.
+            // None chosen: the model's own level, Medium, is lit, and its word is the
+            // node's, which a driver can write back; the word kept is still `inherit`.
             let mut host = on(which, "inherit");
             let tree = host.snapshot();
             let node = tree.find(effort).unwrap();
@@ -15755,8 +15814,15 @@ mod tests {
                     node.value.as_deref(),
                     node.enabled
                 ),
-                ("slider", "Medium", Some("inherit"), true),
+                ("slider", "Medium", Some("medium"), true),
                 "{effort}"
+            );
+            let read = node.value.clone().expect("a level is lit");
+            host.set_value(effort, &read).unwrap();
+            assert_eq!(
+                sent_word(host.take_command(), which),
+                Some(read),
+                "{effort}: what was read is taken back"
             );
             // A level the Bot chose: lit by name, and valued by its word.
             let host_high = on(which, "xhigh");
@@ -15769,16 +15835,9 @@ mod tests {
             );
             // A level of the model's is sent, and one that is not is refused in the same words.
             host.set_value(effort, "max").unwrap();
-            let sent = host.take_command();
-            assert!(
-                match which {
-                    PickerFor::Bot =>
-                        matches!(sent, Some(Command::SetModelEffort(word)) if word == "max"),
-                    PickerFor::NewBots =>
-                        matches!(sent, Some(Command::NewBots(PickerCommand::SetEffort(word))) if word == "max"),
-                    PickerFor::PlanFallback =>
-                        matches!(sent, Some(Command::PlanFallback(PickerCommand::SetEffort(word))) if word == "max"),
-                },
+            assert_eq!(
+                sent_word(host.take_command(), which).as_deref(),
+                Some("max"),
                 "{effort}"
             );
             let refused = host.set_value(effort, "ultra").unwrap_err();
@@ -15787,6 +15846,53 @@ mod tests {
                     "`ultra` is not one of Cheap (auto)'s levels: low, medium, high, xhigh, max"
                 ),
                 "{refused}"
+            );
+        }
+
+        // Cheap (auto) lists five levels and names none as the one it runs at: with none
+        // chosen nothing is lit in any of the three, so the slider is named for what it is and
+        // has no word to say, and it still takes a level.
+        let ownless = crate::opengrok::model_fixtures::levelled_catalogue_without_own("oag/cheap");
+        for which in [PickerFor::Bot, PickerFor::NewBots, PickerFor::PlanFallback] {
+            let effort = ids_of(which);
+            let mut host = on(which, "inherit");
+            let account = kept_source(InferenceKind::Gateway, true);
+            match which {
+                PickerFor::Bot => host.model_pick = Some(an_ownless_pick("inherit")),
+                PickerFor::NewBots => {
+                    host.new_bots_pick = Some(crate::opengrok::new_bots_pick(
+                        Some(&NewBotDefault {
+                            source: InferenceKind::Gateway,
+                            model: "oag/cheap".into(),
+                            effort: "inherit".into(),
+                        }),
+                        Some(&account),
+                        &ownless,
+                        |_| Vec::new(),
+                    ))
+                }
+                PickerFor::PlanFallback => {
+                    host.plan_fallback_pick = Some(crate::opengrok::plan_fallback_pick(
+                        Some(&PlanFallback {
+                            model: "oag/cheap".into(),
+                            effort: "inherit".into(),
+                        }),
+                        &ownless,
+                    ))
+                }
+            }
+            let tree = host.snapshot();
+            let node = tree.find(effort).unwrap();
+            assert_eq!(
+                (node.name.as_str(), node.value.as_deref(), node.enabled),
+                ("Effort", None, true),
+                "{effort}"
+            );
+            host.set_value(effort, "low").unwrap();
+            assert_eq!(
+                sent_word(host.take_command(), which).as_deref(),
+                Some("low"),
+                "{effort}"
             );
         }
 

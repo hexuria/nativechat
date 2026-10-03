@@ -853,10 +853,16 @@ impl ModelPick {
         chosen.or_else(|| row.own_effort.as_deref().and_then(place))
     }
 
-    /// The name of the level the slider sits on ([`Self::lit`]), as the model names it: "Medium".
-    /// What the card's line says of the effort; nothing where there is no level to name.
+    /// The level the slider sits on ([`Self::lit`]): the one the Bot chose where the model lists
+    /// it, and otherwise the model's own. Nothing where there is no level to light.
+    pub fn lit_level(&self) -> Option<&EffortLevel> {
+        self.levels().get(self.lit()?)
+    }
+
+    /// The name of the level the slider sits on, as the model names it: "Medium". What the
+    /// card's line says of the effort; nothing where there is no level to name.
     pub fn effort_name(&self) -> Option<String> {
-        self.levels().get(self.lit()?).map(EffortLevel::name)
+        self.lit_level().map(EffortLevel::name)
     }
 
     /// Every row the list offers, group by group.
