@@ -62,8 +62,8 @@ impl ComputerPane {
             (WakeBox::Every, wake_input("30", window, cx)),
             (WakeBox::Hour, wake_input("9", window, cx)),
             (WakeBox::Minute, wake_input("00", window, cx)),
-            // A real line, and one the server reads as meant: it counts days of the week from
-            // Sunday as 1, so a numbered example would teach the wrong days.
+            // A real line, and one every server reads as meant: a name is the same day to the
+            // standard counting the server reads numbers by since #331 and to the one before it.
             (WakeBox::Cron, wake_input("0 9 * * MON-FRI", window, cx)),
         ];
         // What a person types goes to the editor as it is typed. A value written into a box from

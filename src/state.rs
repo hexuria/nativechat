@@ -3715,14 +3715,16 @@ pub struct WakeStatus {
     pub next: Option<String>,
     /// Why Save cannot go: what was picked is not a schedule the server would take.
     pub error: Option<String>,
-    /// On the Cron tab, the line's days of the week are numbers, which the server counts from
-    /// Sunday as 1.
+    /// On the Cron tab, the line's days of the week are numbers, which [`NUMBERED_WEEKDAYS`]
+    /// says how the server counts.
     pub numbered_weekdays: bool,
 }
 
-/// What the Cron tab says beside a line that numbers its days of the week.
-pub const NUMBERED_WEEKDAYS: &str =
-    "On this server, day 1 of the week is Sunday and 7 is Saturday: MON-FRI says weekdays.";
+/// What the Cron tab says beside a line that numbers its days of the week: how the server counts
+/// them, standard cron's way (opengrok-server #331, on main 5567f91), which a person who counts
+/// them another way would otherwise not know.
+pub const NUMBERED_WEEKDAYS: &str = "Days of the week count as in standard cron: 0 and 7 are \
+                                     Sunday and 1 is Monday, so 1-5 is Monday to Friday.";
 
 impl WakeStatus {
     pub fn can_save(&self) -> bool {
@@ -4054,8 +4056,8 @@ fn relisted(before: Option<&[AgentRoutine]>, rows: Vec<ScheduleRow>) -> Vec<Agen
 /// what the server last said, and nothing else.
 ///
 /// The cron line is compared as the schedule it means rather than as text: the server hands a
-/// line back in its own six-field form (`0 0 9 * * 1` for Mondays at 9), which is read the way
-/// the server shows it (`from_server_cron`), so the picker's `0 9 * * 1` is no change. A
+/// line back in its own six-field form (`0 0 9 * * MON` for Mondays at 9), which is read the way
+/// the server shows it (`from_server_cron`), so the picker's `0 9 * * MON` is no change. A
 /// schedule the picker cannot turn into one line is not sent at all; the editor already says
 /// why, and the server would refuse it.
 fn routine_edit(routine: &AgentRoutine) -> ScheduleEdit {
@@ -22917,8 +22919,9 @@ mod tests {
                 .unwrap(),
             )
         };
-        // A line written with numbers reads the way the server runs it, which counts Sunday as
-        // 1: the editor's old "Weekdays", `1,2,3,4,5`, runs Sunday to Thursday, and says so.
+        // A six-field line the server kept with numbers reads the way the server runs it, the
+        // `cron` crate's way, Sunday as 1, as every line from before #331 is kept: the editor's
+        // old "Weekdays", `1,2,3,4,5`, runs Sunday to Thursday, and says so.
         assert_eq!(
             row("0 0 9 * * 1,2,3,4,5").triggers[0].label(),
             "Sun to Thu at 9:00 AM"
@@ -23022,7 +23025,8 @@ mod tests {
     }
 
     /// The server keeps a line in six fields (`0 0 9 * * 1`). Read the way the server shows it
-    /// and runs it, it is the Weekly tab's Sunday at 9:00, since the server counts Sunday as 1:
+    /// and runs it, it is the Weekly tab's Sunday at 9:00, since a six-field line's numbers are
+    /// the `cron` crate's, Sunday as 1:
     /// the editor opens on the tab and not a line to decipher, and the tab writing that same day
     /// by name is no edit at all.
     #[test]
@@ -27300,9 +27304,13 @@ mod tests {
             assert!(status.can_save() && status.next.is_some(), "{status:?}");
             state.set_wake_box(WakeBox::Cron, "0 9 * * 1-5".into(), true, cx);
             let status = state.routine_wake_editor.as_ref().unwrap().status(now);
-            assert!(status.numbered_weekdays, "the server counts Sunday as 1");
-            assert_eq!(status.summary, "Sun to Thu at 9:00 AM");
-            for refused in ["0 9 * * 0", "@every 1h", "0 9 * *"] {
+            assert!(status.numbered_weekdays, "the note says how they count");
+            assert_eq!(
+                status.summary, "Weekdays at 9:00 AM",
+                "standard cron's 1-5 (#331)"
+            );
+            assert!(status.can_save() && status.next.is_some(), "{status:?}");
+            for refused in ["0 9 * * 8", "@every 1h", "0 9 * *"] {
                 state.set_wake_box(WakeBox::Cron, refused.into(), true, cx);
                 let status = state.routine_wake_editor.as_ref().unwrap().status(now);
                 assert!(!status.can_save(), "{refused}: {status:?}");

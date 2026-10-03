@@ -125,7 +125,8 @@
 //! `selected`) and `routine-wake-month-{1..12}` (checkboxes; none checked is every month); on
 //! Weekly, `routine-wake-day-{0..6}` (Sunday is 0); on Monthly, `routine-wake-date-{1..31}`; on
 //! Cron, `routine-wake-cron` (a textbox: five fields) and `routine-wake-cron-note` (while its days
-//! of the week are numbers, which the server counts from Sunday as 1). Under them
+//! of the week are numbers: how they count, standard cron's way, 0 and 7 Sunday, since
+//! opengrok-server #331). Under them
 //! `routine-wake-summary` (label = what was picked, in words), `routine-wake-zone` (label `<zone>
 //! time`, value = the IANA zone, only where the routine's zone is not this computer's),
 //! `routine-wake-next` (when it would next run, in the person's own time; only where the line can

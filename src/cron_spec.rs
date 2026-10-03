@@ -21,10 +21,14 @@
 //!   UTC for one stored before zones), so `0 9 * * *` in Asia/Manila runs at 9:00 there. The
 //!   words here name no zone: the editor names the routine's beside them where it is not this
 //!   computer's, and says when the next run lands in the person's own time.
-//! * Days of the week count from Sunday as 1 to Saturday as 7, and 0 is refused. In the cron most
-//!   people know Sunday is 0 and Monday 1, so `1-5` there is Monday to Friday and here is Sunday
-//!   to Thursday. The lines written here name their days (`MON-FRI`), which both read alike; a
-//!   number in a line read here is read the server's way.
+//! * A five-field line's days of the week count as standard cron counts them: 0 and 7 are
+//!   Sunday and 1 is Monday, so `1-5` is Monday to Friday. The server names them so before the
+//!   `cron` crate, which counts Sunday as 1, reads them (opengrok-server #331, on main 5567f91:
+//!   `normalized_cron` and `named_weekdays` in opengrok-core `schedule.rs`), and so does this
+//!   module ([`standard_days_named`]). A six-field line the server kept, every line from before
+//!   #331 among them, counts them the crate's way, and is read back so
+//!   ([`ScheduleSpec::from_server_cron`]). The lines written here name their days (`MON-FRI`),
+//!   which every counting reads alike.
 //! * A day of the month and a day of the week given together must both hold: `0 9 1 * MON` is a
 //!   1st that falls on a Monday, where the usual cron runs on either.
 //! * A step counts from the start of its field: `*/45` minutes is :00 and :45 of each hour, and
@@ -501,12 +505,22 @@ impl ScheduleSpec {
     /// (`0 0 9 * * MON`). Read the way the server shows it (`display_cron` in opengrok-core
     /// `schedule.rs`), with that `0` dropped, so a routine opens on the tab that drew it and
     /// saving it unchanged sends nothing.
+    ///
+    /// Its numbered days of the week, if it has any, are the `cron` crate's, Sunday as 1: the
+    /// server names a five-field line's days as it stores it since #331, and keeps every line
+    /// from before, numbers and all, as it was (`display_cron` keeps one six fields for that
+    /// reason). They are named first, the crate's way ([`crate_days_named`]), so `0 0 9 * * 1`
+    /// reads as `0 9 * * SUN`, since a five-field line's numbers count the standard way.
     pub fn from_server_cron(line: &str) -> Self {
         let fields: Vec<&str> = line.split_whitespace().collect();
-        if fields.len() == 6 && fields[0] == "0" {
-            Self::from_cron(&fields[1..].join(" "))
-        } else {
-            Self::from_cron(line)
+        match fields[..] {
+            ["0", minute, hour, day_of_month, month, days] => match crate_days_named(days) {
+                Some(days) => {
+                    Self::from_cron(&format!("{minute} {hour} {day_of_month} {month} {days}"))
+                }
+                None => Self::custom(line.trim()),
+            },
+            _ => Self::from_cron(line),
         }
     }
 }
@@ -615,8 +629,9 @@ fn advanced_cron(spec: &ScheduleSpec) -> Result<String, ScheduleNotCron> {
 }
 
 /// Days of the week as a written line names them: `MON-FRI`, `MON,WED,FRI`. Names and not
-/// numbers, because the server counts Sunday as 1 where most people's cron counts it as 0, and
-/// a name means the same day to both.
+/// numbers: a name is the same day to every counting, standard cron's, which the server reads a
+/// five-field line's numbers by since #331, and the `cron` crate's, Sunday as 1, which a server
+/// from before it read them by.
 fn weekday_field(days: &[u8]) -> String {
     let mut sorted: Vec<u8> = days.iter().copied().filter(|day| *day < 7).collect();
     sorted.sort_unstable();
@@ -702,7 +717,9 @@ enum Field {
 }
 
 impl Field {
-    /// The numbers the field takes, the server's way: days of the week are 1 (Sunday) to 7.
+    /// The numbers the field takes, the `cron` crate's way: days of the week are 1 (Sunday) to 7.
+    /// Only names, `*` and steps reach the day of the week here: a line's numbered days are named
+    /// before it is read ([`standard_days_named`]).
     fn bounds(self) -> (u8, u8) {
         match self {
             Self::Minute => (0, 59),
@@ -714,7 +731,7 @@ impl Field {
     }
 
     /// A name in the field, as the server takes it: three letters or the whole word, in any
-    /// case. Days of the week by the server's numbers.
+    /// case. Days of the week by the crate's numbers.
     fn named(self, word: &str) -> Option<u8> {
         let word = word.to_ascii_lowercase();
         let find = |names: &[&str]| {
@@ -813,7 +830,7 @@ fn read_field(raw: &str, field: Field) -> Option<CronField> {
     (!numbers.is_empty()).then(|| CronField::List(server_days(field, numbers)))
 }
 
-/// Days of the week from the server's numbers (1 for Sunday) to the schedule's (0 for Sunday);
+/// Days of the week from the crate's numbers (1 for Sunday) to the schedule's (0 for Sunday);
 /// any other field as it is.
 fn server_days(field: Field, numbers: Vec<u8>) -> Vec<u8> {
     if field == Field::DayOfWeek {
@@ -824,18 +841,119 @@ fn server_days(field: Field, numbers: Vec<u8>) -> Vec<u8> {
 }
 
 /// The five fields of a line, each read, or `None` for a line that is not five readable fields.
+/// Its numbered days of the week count the standard way, as the server reads them since #331.
 fn read_line(line: &str) -> Option<[CronField; 5]> {
     let fields: Vec<&str> = line.split_whitespace().collect();
     let [minute, hour, day_of_month, month, day_of_week] = fields[..] else {
         return None;
     };
+    let day_of_week = standard_days_named(day_of_week).ok()?;
     Some([
         read_field(minute, Field::Minute)?,
         read_field(hour, Field::Hour)?,
         read_field(day_of_month, Field::DayOfMonth)?,
         read_field(month, Field::Month)?,
-        read_field(day_of_week, Field::DayOfWeek)?,
+        read_field(&day_of_week, Field::DayOfWeek)?,
     ])
+}
+
+/// The `cron` crate's names for the days of the week, by standard cron's numbers: 0 and 7 are
+/// both Sunday (`WEEKDAYS` in opengrok-core `schedule.rs`).
+const STANDARD_DAYS: [&str; 8] = ["SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"];
+
+/// Why the server refuses a numbered day of the week, after the item itself, word for word
+/// (`NOT_A_DAY` in opengrok-core `schedule.rs`, #331): "8 is not a day of the week: …".
+pub const NOT_A_DAY: &str = "is not a day of the week: a day is 0 to 7, where 0 and 7 are both \
+                             Sunday, or SUN to SAT, and a range runs forward and steps by 1 to 7";
+
+/// Whether a day-of-week item counts its days by number: a digit before any step. Only those
+/// mean different days to standard cron and to the `cron` crate; `*`, `?`, a name and their
+/// steps mean the same days to both (`numbers_a_day` in opengrok-core `schedule.rs`).
+fn numbers_a_day(item: &str) -> bool {
+    let base = item.split_once('/').map_or(item, |(base, _)| base);
+    base.bytes().any(|b| b.is_ascii_digit())
+}
+
+/// A five-field line's day of the week with its numbered items named the way the server names
+/// them before the `cron` crate reads them (opengrok-server #331, on main 5567f91:
+/// `named_weekdays` in opengrok-core `schedule.rs`, transcribed): standard cron's numbers, 0 and
+/// 7 Sunday and 1 Monday, item by item so a list keeps its shape. `1-5` is `MON-FRI`, `1-5/2` is
+/// `MON-FRI/2`, a lone number with a step runs to 7 (`1/2` is Mon, Wed, Fri and Sun), and since
+/// the crate takes no range that wraps, `5-7` is `FRI-SAT,SUN`. Names, `*` and `?` pass as they
+/// are. `Err` is the server's sentence for an item it refuses: a number past 7, a range that runs
+/// backward, a step outside 1 to 7, or a digit beside a name.
+pub fn standard_days_named(field: &str) -> Result<String, String> {
+    let mut named = Vec::new();
+    for item in field.split(',') {
+        if !numbers_a_day(item) {
+            named.push(item.to_string());
+            continue;
+        }
+        let base = item.split_once('/').map_or(item, |(base, _)| base);
+        let step = item.split_once('/').map(|(_, step)| step);
+        let refused = || format!("{item} {NOT_A_DAY}");
+        let number = |text: &str| match text.parse::<usize>() {
+            Ok(n) if n <= 7 && text.bytes().all(|b| b.is_ascii_digit()) => Ok(n),
+            _ => Err(refused()),
+        };
+        let (first, last) = match base.split_once('-') {
+            Some((first, last)) => (number(first)?, number(last)?),
+            None => {
+                let day = number(base)?;
+                (day, if step.is_some() { 7 } else { day })
+            }
+        };
+        let every = step.map_or(Ok(1), number)?;
+        if first > last || every == 0 {
+            return Err(refused());
+        }
+        let sunday = last == 7 && (1..7).contains(&first) && (7 - first) % every == 0;
+        let last = if first < 7 { last.min(6) } else { last };
+        let step = step.map_or(String::new(), |step| format!("/{step}"));
+        named.push(if first == last {
+            STANDARD_DAYS[first].to_string()
+        } else {
+            format!("{}-{}{step}", STANDARD_DAYS[first], STANDARD_DAYS[last])
+        });
+        if sunday {
+            named.push("SUN".to_string());
+        }
+    }
+    Ok(named.join(","))
+}
+
+/// A day-of-week field in the `cron` crate's own numbers, 1 for Sunday to 7 for Saturday, as a
+/// six-field line the server kept counts them, named item by item, so the five-field reader,
+/// which counts numbers the standard way, reads the same days: `1-5` is `SUN-THU`, and a lone day
+/// with a step runs to the end of the crate's week (`2/2` is `MON-SAT/2`). `None` for an item
+/// that is no day of the crate's.
+fn crate_days_named(field: &str) -> Option<String> {
+    let name = |text: &str| -> Option<&str> {
+        let day: usize = text.parse().ok()?;
+        let digits = text.bytes().all(|b| b.is_ascii_digit());
+        (digits && (1..=7).contains(&day)).then(|| CRON_WEEKDAYS[day - 1])
+    };
+    let items = field.split(',').map(|item| {
+        if !numbers_a_day(item) {
+            return Some(item.to_string());
+        }
+        let (base, step) = match item.split_once('/') {
+            Some((base, step)) => (base, Some(step)),
+            None => (item, None),
+        };
+        let range = match base.split_once('-') {
+            Some((first, last)) => format!("{}-{}", name(first)?, name(last)?),
+            None if step.is_some() => format!("{}-SAT", name(base)?),
+            None => name(base)?.to_string(),
+        };
+        Some(match step {
+            Some(step) => format!("{range}/{step}"),
+            None => range,
+        })
+    });
+    items
+        .collect::<Option<Vec<_>>>()
+        .map(|items| items.join(","))
 }
 
 fn parse_cron(line: &str) -> Option<ScheduleSpec> {
@@ -906,8 +1024,8 @@ fn parse_cron(line: &str) -> Option<ScheduleSpec> {
     Some(spec)
 }
 
-/// Whether a line gives its days of the week by number, which the server counts from Sunday as
-/// 1: the Cron tab says so beside it, since most people's cron counts from Sunday as 0.
+/// Whether a line gives its days of the week by number: the Cron tab says beside it how they
+/// count, standard cron's way since opengrok-server #331, since a person may count them another.
 pub fn numbered_weekdays(line: &str) -> bool {
     line.split_whitespace()
         .nth(4)
@@ -1111,33 +1229,100 @@ mod tests {
         );
     }
 
-    /// A weekly schedule names its days, because the server numbers them from Sunday as 1 and
-    /// most people's cron from Sunday as 0: the editor's "Weekdays" used to write `1-5`, which
-    /// the server runs Sunday to Thursday. A number in a line read back is read the server's
-    /// way, so a routine already saved like that says what it really does.
+    /// A weekly schedule names its days, which every counting reads alike. A five-field line's
+    /// numbered days count as standard cron counts them, as the server reads them since #331 (on
+    /// main 5567f91): 0 and 7 are Sunday and 1 is Monday, so `1-5` is weekdays. Read the old way,
+    /// the `cron` crate's, Sunday as 1, `1-5` was Sunday to Thursday and 0 was no day at all.
     #[test]
-    fn weekdays_are_named_and_a_numbered_one_is_read_the_servers_way() {
+    fn a_numbered_day_of_the_week_counts_as_standard_cron_counts_it() {
         let label = |line: &str| ScheduleSpec::from_cron(line).label();
         assert_eq!(label("0 9 * * MON-FRI"), "Weekdays at 9:00 AM");
         assert_eq!(label("0 9 * * mon,tue,wed,thu,fri"), "Weekdays at 9:00 AM");
-        assert_eq!(
-            label("0 9 * * 2-6"),
-            "Weekdays at 9:00 AM",
-            "2 is Monday there"
-        );
-        assert_eq!(label("0 9 * * 1-5"), "Sun to Thu at 9:00 AM");
-        assert_eq!(label("0 9 * * 1,2,3,4,5"), "Sun to Thu at 9:00 AM");
-        assert_eq!(label("0 9 * * 1"), "Every Sunday at 9:00 AM");
-        assert_eq!(label("0 9 * * SAT,SUN"), "Weekends at 9:00 AM");
+        assert_eq!(label("0 9 * * 1-5"), "Weekdays at 9:00 AM", "1 is Monday");
+        assert_eq!(label("0 9 * * 1,2,3,4,5"), "Weekdays at 9:00 AM");
+        assert_eq!(label("0 9 * * 1"), "Every Monday at 9:00 AM");
+        assert_eq!(label("0 9 * * 0"), "Every Sunday at 9:00 AM", "0 is Sunday");
+        assert_eq!(label("0 9 * * 7"), "Every Sunday at 9:00 AM", "and so is 7");
+        assert_eq!(label("0 9 * * 6,0"), "Weekends at 9:00 AM");
+        assert_eq!(label("0 9 * * 0-6"), "Every day at 9:00 AM");
         assert_eq!(label("0 9 * * 1-7"), "Every day at 9:00 AM");
         assert_eq!(
-            ScheduleSpec::from_cron("0 9 * * 0").tab(),
-            WakeTab::Cron,
-            "the server refuses day 0, so no tab draws it"
+            label("0 9 * * 1/2"),
+            "Sun, Mon, Wed and Fri at 9:00 AM",
+            "a lone day with a step runs to 7, which is Sunday"
         );
+        assert_eq!(label("0 9 * * SAT,SUN"), "Weekends at 9:00 AM");
+        assert_eq!(
+            ScheduleSpec::from_cron("0 9 * * 1-5").to_cron().as_deref(),
+            Ok("0 9 * * MON-FRI"),
+            "and written back by name"
+        );
+        for refused in ["0 9 * * 8", "0 9 * * 5-1", "0 9 * * 1-5/0", "0 9 * * MON-5"] {
+            assert_eq!(
+                ScheduleSpec::from_cron(refused).tab(),
+                WakeTab::Cron,
+                "{refused}: the server refuses it, so no tab draws it"
+            );
+            assert_eq!(describe_cron(refused), None, "{refused}");
+        }
         assert!(numbered_weekdays("0 9 * * 1-5"));
         assert!(!numbered_weekdays("0 9 * * MON-FRI"));
         assert!(!numbered_weekdays("0 9 1 * *"));
+    }
+
+    /// The server's own naming of a numbered day of the week (#331: `named_weekdays` in
+    /// opengrok-core `schedule.rs`), item by item, and its refusals in its words.
+    #[test]
+    fn numbered_days_are_named_as_the_server_names_them() {
+        let named = |field: &str| standard_days_named(field).unwrap();
+        assert_eq!(named("1-5"), "MON-FRI");
+        assert_eq!(named("1,3,5"), "MON,WED,FRI");
+        assert_eq!(named("1-5/2"), "MON-FRI/2");
+        assert_eq!(named("5-7"), "FRI-SAT,SUN");
+        assert_eq!(named("1/2"), "MON-SAT/2,SUN");
+        assert_eq!(named("0"), "SUN");
+        assert_eq!(named("7"), "SUN");
+        assert_eq!(named("0-7"), "SUN-SAT");
+        assert_eq!(
+            named("*/2"),
+            "*/2",
+            "a step of every day is the same to both"
+        );
+        assert_eq!(named("MON-FRI,SUN"), "MON-FRI,SUN");
+        assert_eq!(
+            standard_days_named("8"),
+            Err(format!("8 {NOT_A_DAY}")),
+            "the server's words"
+        );
+        for refused in ["5-1", "1-5/0", "1/8", "MON-5", "1-x"] {
+            assert!(standard_days_named(refused).is_err(), "{refused}");
+        }
+    }
+
+    /// A six-field line the server kept counts its numbered days the `cron` crate's way, Sunday
+    /// as 1, as every line from before #331 does: read back, it is those days, by name, while a
+    /// five-field line's numbers count the standard way. A line it names is read as it was.
+    #[test]
+    fn a_six_field_line_from_the_server_counts_its_days_the_crates_way() {
+        let read = ScheduleSpec::from_server_cron;
+        assert_eq!(read("0 0 9 * * 1").label(), "Every Sunday at 9:00 AM");
+        assert_eq!(read("0 0 9 * * 2-6").label(), "Weekdays at 9:00 AM");
+        assert_eq!(
+            read("0 0 9 * * 1-5").to_cron().as_deref(),
+            Ok("0 9 * * SUN-THU")
+        );
+        assert_eq!(read("0 0 9 * * MON-FRI").label(), "Weekdays at 9:00 AM");
+        assert_eq!(read("0 0 9 * * 2/2").label(), "Mon, Wed and Fri at 9:00 AM");
+        assert_eq!(
+            ScheduleSpec::from_cron("0 9 * * 1").label(),
+            "Every Monday at 9:00 AM",
+            "five fields count the standard way"
+        );
+        assert_eq!(
+            read("0 0 9 * * 0"),
+            ScheduleSpec::custom("0 0 9 * * 0"),
+            "no day of the crate's: the line as the server keeps it"
+        );
     }
 
     /// What each tab says under the editor, and in the list of when a routine runs: what was
@@ -1322,7 +1507,7 @@ mod tests {
             words("0 12 * JAN-MAR SAT"),
             "Every Saturday at 12:00 PM, in Jan to Mar"
         );
-        assert_eq!(describe_cron("0 9 * * 0"), None, "the server refuses day 0");
+        assert_eq!(describe_cron("0 9 * * 8"), None, "the server refuses day 8");
         assert_eq!(describe_cron("@daily"), None, "not five fields");
     }
 
