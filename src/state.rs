@@ -27781,6 +27781,108 @@ mod tests {
         assert_eq!(runs[0].run_id(), None);
     }
 
+    /// The history the server recorded for a routine of a Bot on its person's plan, run now and
+    /// then due while they switched the relay off and set no fallback (opengrok-server #332 (PR
+    /// #338 at 66b9f7b)): two skipped lines, `skipped: "relay_disabled"` with the server's reason.
+    fn relay_off_history() -> serde_json::Value {
+        recorded_body(include_str!(
+            "../fixtures/wire/rest/GET__schedules__id__runs/200-a_plan_bots_routine_is_skipped_while_the_relay_is_off_with_no_fallback.json"
+        ))
+    }
+
+    /// A routine of a Bot on its person's plan, run now and then due while they switched the
+    /// relay off with no fallback, is skipped each time (opengrok-server #332 (PR #338 at
+    /// 66b9f7b), as recorded: Run it now is the 409 with `relay_disabled` beside the skip's
+    /// sentence, and the history keeps a line for each, `skipped: "relay_disabled"` with its
+    /// `reason`). Run it now says the server's sentence and reads the history again, and each
+    /// skipped line, Test run's and the schedule's, says the server's reason and opens nothing.
+    #[tokio::test]
+    async fn a_routine_skipped_while_the_relay_is_off_says_the_servers_reason() {
+        let said = "Skipped: Relay is off for your plan";
+        let refused = recorded_body(include_str!(
+            "../fixtures/wire/rest/POST__schedules__id__run/409-a_plan_bots_routine_is_skipped_while_the_relay_is_off_with_no_fallback.json"
+        ));
+        assert_eq!(
+            refused,
+            serde_json::json!({ "error": said, "code": "relay_disabled" })
+        );
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/schedules/sch_1/run"))
+            .respond_with(wiremock::ResponseTemplate::new(409).set_body_json(refused))
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/schedules/sch_1/runs"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(relay_off_history()))
+            .mount(&server)
+            .await;
+        let mut state = routines_on(&server);
+        let client = state
+            .begin_routine_run("cw_1", "sch_1")
+            .expect("a run to ask for");
+        let result = client.run_schedule_now("sch_1").await;
+        assert!(
+            state.settle_routine_run("cw_1", "sch_1", result),
+            "the history is read again for the skip"
+        );
+        assert_eq!(state.computer_action_error.as_deref(), Some(said));
+
+        let (client, read) = state
+            .begin_routine_runs_read("cw_1", "sch_1")
+            .expect("a read");
+        let result = client.schedule_runs("sch_1").await;
+        assert!(state.settle_routine_runs("cw_1", "sch_1", read, result));
+        let runs = &state.routine_mut("cw_1", "sch_1").unwrap().runs;
+        let mut causes: Vec<&str> = runs.iter().map(|run| run.cause_label()).collect();
+        causes.sort_unstable();
+        assert_eq!(causes, ["Schedule", "Test run"]);
+        for run in runs {
+            assert_eq!(
+                run.outcome,
+                super::RunOutcome::Skipped {
+                    reason: said.into()
+                }
+            );
+            assert_eq!(run.run_id(), None, "nothing to open");
+        }
+    }
+
+    /// On a driver's tree, each line of that history is `routine-{id}-skipped-{atMs}`, by when it
+    /// was due as the server recorded it, valued with the server's reason and in state `skipped`.
+    #[cfg(feature = "agent")]
+    #[test]
+    fn a_routine_skipped_while_the_relay_is_off_is_on_a_drivers_tree_in_the_servers_words() {
+        use crate::agent::{NativeChatHost, ids};
+        use gpui_agent::prelude::AgentHost;
+        let lines: Vec<crate::opengrok::ScheduleRun> =
+            serde_json::from_value(relay_off_history()).expect("the recorded history");
+        let due: Vec<i64> = lines.iter().filter_map(|line| line.at).collect();
+        assert_eq!(due.len(), 2);
+        let mut state = with_routines();
+        state.account = Some(
+            serde_json::from_value(serde_json::json!({ "id": "acc_1", "email": "a@example.com" }))
+                .expect("an account"),
+        );
+        state.auth_status = super::AuthStatus::SignedIn;
+        state.right_pane = super::RightPane::Computer;
+        state.routine_mut("cw_1", "sch_1").unwrap().runs = lines
+            .into_iter()
+            .map(super::RoutineRun::from_server)
+            .collect();
+        let tree = NativeChatHost::from_app(&state).snapshot();
+        for at_ms in due {
+            let line = tree
+                .find(&ids::routine_skipped("sch_1", at_ms))
+                .expect("the skipped line");
+            assert_eq!(
+                line.value.as_deref(),
+                Some("Skipped: Relay is off for your plan")
+            );
+            assert!(line.states.iter().any(|state| state == "skipped"));
+        }
+    }
+
     /// An edit the server takes is what the routine reads as from then on: its answer, in the
     /// server's six-field form, is the picker's every minute again, nothing is left to send, and a
     /// listing read later (the editor opened again from another Bot) says the same.
