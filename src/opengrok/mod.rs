@@ -7,6 +7,7 @@ mod client;
 mod conformance;
 mod credential;
 mod error;
+mod events;
 mod gen_ui;
 mod inference;
 mod local_exec;
@@ -99,6 +100,10 @@ pub use client::{
     host_egress_tunnel_available, host_egress_tunnel_enabled, host_egress_tunnel_flag, thin_tape,
 };
 pub use error::{Failure, OpenGrokError, Unreachable, reads_as_gateway_unreachable, retry_enqueue};
+pub use events::{
+    AccountEvent, AccountEvents, EventsNote, EventsTimings, RoutineChange, RunStartCause,
+    start_account_events,
+};
 pub use pending::{
     CUSTOM_NAME, PAYLOAD_V, PendingCustom, PendingList, PendingMutation, PendingOp,
     PendingUserMessage, PendingWrite,

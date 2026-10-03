@@ -2676,6 +2676,65 @@ impl OpenGrokClient {
         Ok(response)
     }
 
+    /// `GET /ag-ui/events`: the account's events stream, answered with the response as it opens,
+    /// for [`super::events`] to read its notes off as they come (opengrok-server #348, contract
+    /// agreed 2026-10-03, not recorded yet). It goes with the session's bearer, as every account
+    /// route does, and the server takes the account from it. `last_event_id` is the id of the
+    /// last note a stream carried, which the server replays after; one it cannot replay from is
+    /// answered with `reset` first.
+    ///
+    /// A `401` is the session's to answer, as on every other route: its refresh is tried once and
+    /// the stream asked again with what it brought, and a second `401` is the session gone. A
+    /// refresh that never reached the server says nothing about the session, so it is handed back
+    /// as it is, for the stream to try again after a wait like any other drop.
+    pub async fn open_account_events(
+        &self,
+        last_event_id: Option<&str>,
+    ) -> Result<reqwest::Response, OpenGrokError> {
+        let url = self.url("/ag-ui/events")?;
+        self.ensure_fresh_token("/ag-ui/events").await;
+        // An id that cannot go in a header is not resumed from; the server starts the stream
+        // over with `reset`, which reads everything again.
+        let resume = last_event_id.and_then(|id| HeaderValue::from_str(id).ok());
+        let open = |token: Option<String>| {
+            let mut request = self
+                .http
+                .get(url.clone())
+                .header(ACCEPT, "text/event-stream")
+                .header(CACHE_CONTROL, "no-cache");
+            if let Some(id) = resume.clone() {
+                request = request.header("Last-Event-ID", id);
+            }
+            if let Some(token) = token {
+                request = request.bearer_auth(token);
+            }
+            request
+        };
+        let mut response = open(self.access_token())
+            .send()
+            .await
+            .map_err(|e| OpenGrokError::transport(&e))?;
+        if response.status() == StatusCode::UNAUTHORIZED {
+            match self.refresh_after_unauthorized().await {
+                Ok(()) => {
+                    response = open(self.access_token())
+                        .send()
+                        .await
+                        .map_err(|e| OpenGrokError::transport(&e))?;
+                }
+                Err(error) if error.status.is_none() => return Err(error),
+                Err(_) => {}
+            }
+            if response.status() == StatusCode::UNAUTHORIZED {
+                return Err(Self::signed_out_error(response).await);
+            }
+        }
+        if !response.status().is_success() {
+            return Err(Self::read_error(response).await);
+        }
+        Ok(response)
+    }
+
     /// `POST /inference-relay/responses/{requestId}`: this Mac's answer to one call off the relay
     /// stream, with its machine token (the same contract). opencodex's stream goes as
     /// `text/event-stream`, uploaded as it arrives rather than gathered first; its model list, and

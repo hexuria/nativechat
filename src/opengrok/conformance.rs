@@ -64,6 +64,7 @@ use super::client::{
 };
 use super::credential::{CREDENTIAL_OFFER_SAVE, SaveLoginSpec};
 use super::error::{Failure, Unreachable, reads_as_gateway_unreachable};
+use super::events::{ACCOUNT_EVENT_NAMES, AccountEvent};
 use super::gen_ui::{
     BAR_CHART_NAMES, ChatPart, EGRESS_TUNNEL_ASK_REASON, FORM_NAMES, REVIEW_AN_ACTION_REASONS,
     RUN_AWAITING_APPROVAL, ScreenshotSpec, StepSpec, TurnAssembler, UI_CUSTOM_NAME, USE_SKILL,
@@ -114,16 +115,20 @@ enum Slot {
     /// A frame's `type` on the Mac relay's stream (`RelayFrame::from_value`), which is not an
     /// AG-UI frame: the recorder files each under `relay/<type>/`.
     RelayType,
+    /// A note's `event:` name on the account's events stream (`AccountEvent::read`, opengrok-server
+    /// #348), which is neither AG-UI nor the relay's.
+    AccountEvent,
 }
 
 impl Slot {
-    const ALL: [Slot; 6] = [
+    const ALL: [Slot; 7] = [
         Slot::AguiType,
         Slot::CustomName,
         Slot::ApprovalReason,
         Slot::FormResolution,
         Slot::RunErrorCode,
         Slot::RelayType,
+        Slot::AccountEvent,
     ];
 
     fn field(self) -> &'static str {
@@ -134,6 +139,7 @@ impl Slot {
             Slot::FormResolution => "formResolution",
             Slot::RunErrorCode => "RUN_ERROR code",
             Slot::RelayType => "relay frame type",
+            Slot::AccountEvent => "account event",
         }
     }
 }
@@ -265,6 +271,12 @@ fn ledger() -> Vec<(Slot, &'static str)> {
         RELAY_FRAME_TYPES
             .iter()
             .map(|word| (Slot::RelayType, *word)),
+    );
+    // `AccountEvent::read` reads a note off the account's events stream by its `event:` name.
+    words.extend(
+        ACCOUNT_EVENT_NAMES
+            .iter()
+            .map(|word| (Slot::AccountEvent, *word)),
     );
     words
 }
@@ -524,7 +536,19 @@ const CLIENT_IGNORES: &[(Slot, &str, &str)] = &[
 /// arm waiting for them in [`check_frame`];
 /// [`every_word_read_ahead_of_its_recording_is_matched_and_not_sent_yet`] fails until it does,
 /// and meanwhile holds that arm to the frames [`frames_read_ahead`] writes in the agreed shape.
-const WORDS_NOT_RECORDED_YET: &[(Slot, &str, &str)] = &[];
+const WORDS_NOT_RECORDED_YET: &[(Slot, &str, &str)] = &[
+    (Slot::AccountEvent, "thread.changed", ACCOUNT_EVENTS_AHEAD),
+    (Slot::AccountEvent, "run.started", ACCOUNT_EVENTS_AHEAD),
+    (Slot::AccountEvent, "run.finished", ACCOUNT_EVENTS_AHEAD),
+    (Slot::AccountEvent, "routine.changed", ACCOUNT_EVENTS_AHEAD),
+    (Slot::AccountEvent, "reset", ACCOUNT_EVENTS_AHEAD),
+];
+
+/// What brings the account's events stream's notes into the corpus.
+const ACCOUNT_EVENTS_AHEAD: &str = "opengrok-server #348 contract agreed 2026-10-03, not \
+     recorded yet: the notes of the account's events stream, GET /ag-ui/events. They are SSE \
+     events, which the recorder cannot pin by test name any more than AG-UI frames, so they come \
+     with the recorder addition for SSE notes that #348 builds.";
 
 /// Fixtures this app still reads wrongly, with the words their check fails with and why. The
 /// check has to fail with those words: one that passes means the drift is fixed and the entry
@@ -663,7 +687,14 @@ const REST_NOT_READ: &[(&str, &str, &str)] = &[
 ///
 /// Only routes built ahead of a recording are listed. Routes this app asks that no test on the
 /// server drives are a different gap, and not this list's.
-const REST_NOT_RECORDED_YET: &[(&str, &str, &str)] = &[];
+const REST_NOT_RECORDED_YET: &[(&str, &str, &str)] = &[(
+    "GET__ag-ui_events",
+    "/ag-ui/events",
+    "opengrok-server #348 contract agreed 2026-10-03, not recorded yet: the account's events \
+     stream, opened with the session's bearer and Last-Event-ID. Its refusals come with the \
+     server's own tests of the route, and its notes with the recorder addition for SSE notes \
+     (ACCOUNT_EVENTS_AHEAD).",
+)];
 
 /// Routes this app asks with this Mac's machine token (`local_exec.rs` `MachineCredential`)
 /// rather than the person's session, so they never pass through `send_json_within`: a 401 on one
@@ -714,6 +745,11 @@ struct Emits {
     /// Not the manifest's either: the `type` of each frame the recording keeps under `relay/`.
     #[serde(skip)]
     relay_types: Vec<String>,
+    /// The names of the account's events stream's notes the recording keeps, which is none yet:
+    /// they come with the recorder addition for SSE notes (opengrok-server #348), and the words
+    /// read ahead of it wait in [`WORDS_NOT_RECORDED_YET`] until then.
+    #[serde(skip)]
+    account_events: Vec<String>,
 }
 
 impl Emits {
@@ -725,6 +761,7 @@ impl Emits {
             Slot::FormResolution => &self.form_resolutions,
             Slot::RunErrorCode => &self.run_error_codes,
             Slot::RelayType => &self.relay_types,
+            Slot::AccountEvent => &self.account_events,
         }
     }
 }
@@ -6086,7 +6123,174 @@ fn a_coworker_rows_effort_has_a_reading_in_the_ledger() {
 /// holds every entry of [`WORDS_NOT_RECORDED_YET`] to these, so a word added there comes with
 /// its frames here, and leaves with it when the recording brings the real ones.
 #[allow(clippy::type_complexity)]
-const FRAMES_READ_AHEAD: &[(Slot, &str, fn() -> Vec<(Value, bool)>)] = &[];
+const FRAMES_READ_AHEAD: &[(Slot, &str, fn() -> Vec<(Value, bool)>)] = &[
+    (Slot::AccountEvent, "thread.changed", thread_changed_ahead),
+    (Slot::AccountEvent, "run.started", run_started_ahead),
+    (Slot::AccountEvent, "run.finished", run_finished_ahead),
+    (Slot::AccountEvent, "routine.changed", routine_changed_ahead),
+    (Slot::AccountEvent, "reset", reset_ahead),
+];
+
+/// A note off the account's events stream as the agreed contract frames it (opengrok-server #348,
+/// contract agreed 2026-10-03, not recorded yet): its `id:`, its `event:` name and its one line of
+/// `data:`, held here as `{"id", "event", "data"}` until the recording keeps the server's own.
+fn account_event(id: u64, name: &str, data: Value) -> Value {
+    serde_json::json!({"id": id.to_string(), "event": name, "data": data})
+}
+
+fn thread_changed_ahead() -> Vec<(Value, bool)> {
+    use serde_json::json;
+    vec![
+        (
+            account_event(
+                1,
+                "thread.changed",
+                json!({"threadId": "cw_1", "coworkerId": "cw_1"}),
+            ),
+            true,
+        ),
+        (
+            account_event(2, "thread.changed", json!({"coworkerId": "cw_1"})),
+            false,
+        ),
+    ]
+}
+
+fn run_started_ahead() -> Vec<(Value, bool)> {
+    use serde_json::json;
+    vec![
+        (
+            account_event(
+                3,
+                "run.started",
+                json!({"runId": "run_1", "threadId": "sched_1", "coworkerId": "cw_1",
+                       "routineId": "sched_1", "cause": "schedule"}),
+            ),
+            true,
+        ),
+        (
+            account_event(
+                4,
+                "run.started",
+                json!({"runId": "run_2", "threadId": "cw_1", "coworkerId": "cw_1",
+                       "cause": "chat"}),
+            ),
+            true,
+        ),
+        (
+            account_event(
+                5,
+                "run.started",
+                json!({"threadId": "cw_1", "coworkerId": "cw_1", "cause": "chat"}),
+            ),
+            false,
+        ),
+    ]
+}
+
+fn run_finished_ahead() -> Vec<(Value, bool)> {
+    use serde_json::json;
+    vec![
+        (
+            account_event(
+                6,
+                "run.finished",
+                json!({"runId": "run_1", "threadId": "sched_1", "coworkerId": "cw_1",
+                       "routineId": "sched_1", "state": "finished"}),
+            ),
+            true,
+        ),
+        (
+            account_event(
+                7,
+                "run.finished",
+                json!({"runId": "run_1", "coworkerId": "cw_1", "state": "failed"}),
+            ),
+            false,
+        ),
+    ]
+}
+
+fn routine_changed_ahead() -> Vec<(Value, bool)> {
+    use serde_json::json;
+    let changed = |id: u64, change: &str| {
+        account_event(
+            id,
+            "routine.changed",
+            json!({"routineId": "sched_1", "coworkerId": "cw_1", "change": change}),
+        )
+    };
+    vec![
+        (changed(8, "created"), true),
+        (changed(9, "updated"), true),
+        (changed(10, "deleted"), true),
+        (changed(11, "paused"), true),
+        (changed(12, "resumed"), true),
+        (
+            account_event(
+                13,
+                "routine.changed",
+                json!({"coworkerId": "cw_1", "change": "deleted"}),
+            ),
+            false,
+        ),
+    ]
+}
+
+fn reset_ahead() -> Vec<(Value, bool)> {
+    vec![(account_event(97, "reset", serde_json::json!({})), true)]
+}
+
+/// A note off the account's events stream, read by the stream's own reader (`AccountEvent::read`)
+/// as the note it is, with every id the window goes on to read again by as sent: the agreed
+/// contract's words (opengrok-server #348, contract agreed 2026-10-03, not recorded yet), stated
+/// here case by case.
+fn account_event_frame(frame: &Value) -> Check {
+    let name = str_at(frame, "event");
+    let data = &frame["data"];
+    let text = |key: &str| str_at(data, key).to_string();
+    let routine_id = opt_str(data, "routineId").map(str::to_string);
+    let word = |key: &str| data.get(key).cloned().unwrap_or(Value::Null);
+    let expected = match name {
+        "thread.changed" => AccountEvent::ThreadChanged {
+            thread_id: text("threadId"),
+            coworker_id: text("coworkerId"),
+        },
+        "run.started" => AccountEvent::RunStarted {
+            run_id: text("runId"),
+            thread_id: text("threadId"),
+            coworker_id: text("coworkerId"),
+            routine_id,
+            cause: serde_json::from_value(word("cause")).unwrap_or_default(),
+        },
+        "run.finished" => AccountEvent::RunFinished {
+            run_id: text("runId"),
+            thread_id: text("threadId"),
+            coworker_id: text("coworkerId"),
+            routine_id,
+            state: text("state"),
+        },
+        "routine.changed" => AccountEvent::RoutineChanged {
+            routine_id: text("routineId"),
+            coworker_id: text("coworkerId"),
+            change: serde_json::from_value(word("change")).unwrap_or_default(),
+        },
+        "reset" => AccountEvent::Reset,
+        other => {
+            return Err(format!(
+                "no check for an account event named {other:?}: say here what the window does \
+                 with one"
+            ));
+        }
+    };
+    let read = AccountEvent::read(name, &data.to_string())
+        .map_err(|unread| format!("the stream passes it over as {unread:?}"))?;
+    must!(
+        read == expected,
+        "the stream should read {expected:?}, not {read:?}"
+    );
+    Ok(())
+}
 
 /// [`FRAMES_READ_AHEAD`]'s frames for one word, none when it has none.
 fn frames_read_ahead(slot: Slot, word: &str) -> Vec<(Value, bool)> {
@@ -6142,9 +6346,11 @@ fn every_word_read_ahead_of_its_recording_is_matched_and_not_sent_yet() {
         }
         for (frame, reads) in frames {
             // A frame off the relay's stream is read by the relay's own reader, as the recorded
-            // ones are; any other by the chat's.
+            // ones are, and a note off the account's events stream by that stream's; any other
+            // by the chat's.
             let verdict = match slot {
                 Slot::RelayType => relay_frame(&frame),
+                Slot::AccountEvent => account_event_frame(&frame),
                 _ => check_frame(&corpus, &frame),
             };
             match (verdict, reads) {
