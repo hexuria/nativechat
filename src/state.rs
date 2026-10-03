@@ -2111,8 +2111,39 @@ pub struct ComputerRelaySwitch {
 struct ComputerRelaySend {
     client: OpenGrokClient,
     machine_id: String,
+    /// The computer's other enrolments, which its card stands for and its switch moves with it
+    /// ([`ConnectedComputer::folded`]).
+    folded: Vec<String>,
     on: bool,
     token: u64,
+}
+
+impl ComputerRelaySend {
+    /// The switch, to the server: the card's own computer first, and once the server has kept
+    /// that, each enrolment folded into the card, the same way. The answer is the card's own
+    /// computer's, and only that decides what the card says: a stale enrolment the server no
+    /// longer knows (404) or that was revoked since the roster was read (409) has nothing left to
+    /// switch, and the person never saw it, so nothing is said of it. A card the server refused
+    /// switches none of them: they only ever go where the card went.
+    async fn switch(&self) -> Result<DaemonMachine, OpenGrokError> {
+        let answer = self
+            .client
+            .switch_computer_relay(&self.machine_id, self.on)
+            .await;
+        if answer.is_ok() {
+            for stale in &self.folded {
+                match self.client.switch_computer_relay(stale, self.on).await {
+                    Err(error) if !matches!(error.status, Some(404 | 409)) => eprintln!(
+                        "NativeChat: an older enrolment of this computer ({stale}) was not \
+                         switched: {}",
+                        error.message
+                    ),
+                    _ => {}
+                }
+            }
+        }
+        answer
+    }
 }
 
 /// What follows a computer's relay switch's answer ([`AppState::settle_computer_relay`]).
@@ -20992,10 +21023,12 @@ impl AppState {
 
     /// One computer's relay switch, from its card: `PATCH /local-exec/daemon/{machine_id}
     /// {relayEnabled}`, the computer's own, whichever computer this is (a switch can be moved
-    /// from any of the person's computers, and the server tells the one it moves). The card draws
-    /// the switch where the click asked to take it while the server is asked, and the server's
-    /// answer is the computer's row from then on: a refusal leaves the row as it was, so the switch
-    /// goes back, with the server's words under it ([`Self::computer_relay_note`]).
+    /// from any of the person's computers, and the server tells the one it moves), and the same
+    /// for each enrolment of that computer the roster folds into its card, which has no card to be
+    /// switched from ([`ConnectedComputer::folded`]). The card draws the switch where the click
+    /// asked to take it while the server is asked, and the server's answer for the card's own
+    /// computer is its row from then on: a refusal leaves the row as it was, so the switch goes
+    /// back, with the server's words under it ([`Self::computer_relay_note`]).
     ///
     /// Switched on, this computer's relay looks at its row at once, and the account's way to the
     /// plan is pointed at the relay if it is not that already ([`Self::begin_relay_change`]).
@@ -21006,10 +21039,7 @@ impl AppState {
         };
         cx.notify();
         cx.spawn(async move |this, cx| {
-            let answer = send
-                .client
-                .switch_computer_relay(&send.machine_id, send.on)
-                .await;
+            let answer = send.switch().await;
             let _ = this.update(cx, |state, cx| {
                 match state.settle_computer_relay(&send.machine_id, send.token, answer) {
                     AfterComputerRelay::Dropped | AfterComputerRelay::Refused => {}
@@ -21030,10 +21060,13 @@ impl AppState {
     /// that has moved since, and goes.
     fn begin_computer_relay(&mut self, machine_id: &str, on: bool) -> Option<ComputerRelaySend> {
         let client = self.opengrok.clone()?;
-        if !self.is_signed_in()
-            || self.computer_relay_switches.contains_key(machine_id)
-            || !self.computers.iter().any(|c| c.machine_id == machine_id)
-        {
+        let folded = self
+            .computers
+            .iter()
+            .find(|c| c.machine_id == machine_id)?
+            .folded
+            .clone();
+        if !self.is_signed_in() || self.computer_relay_switches.contains_key(machine_id) {
             return None;
         }
         self.computer_relay_switch_count += 1;
@@ -21051,6 +21084,7 @@ impl AppState {
         Some(ComputerRelaySend {
             client,
             machine_id: machine_id.to_string(),
+            folded,
             on,
             token,
         })
@@ -30453,6 +30487,7 @@ mod tests {
             online: true,
             relay_enabled: true,
             relaying: false,
+            folded: Vec::new(),
         };
         state.computers = vec![other.clone()];
         assert_eq!(state.this_mac_id(), None);
@@ -30761,6 +30796,7 @@ mod tests {
             online: true,
             relay_enabled: true,
             relaying: false,
+            folded: Vec::new(),
         };
         state.computers = vec![not_this_mac.clone()];
         assert!(state.this_mac_rules().is_none());
@@ -30810,6 +30846,7 @@ mod tests {
             online: true,
             relay_enabled: true,
             relaying: false,
+            folded: Vec::new(),
         }];
         state.local_rules = Some(LocalRules::listed(
             "mac_here".into(),
@@ -38557,6 +38594,7 @@ mod tests {
             online,
             relay_enabled,
             relaying,
+            folded: Vec::new(),
         }
     }
 
@@ -38628,7 +38666,8 @@ mod tests {
             .expect("a card for the computer")
     }
 
-    /// Send the switch of `machine_id`'s card to `on` against the real client, and settle it.
+    /// Send the switch of `machine_id`'s card to `on` against the real client, as the window sends
+    /// it, and settle it.
     async fn switch_card(
         state: &mut AppState,
         machine_id: &str,
@@ -38637,10 +38676,7 @@ mod tests {
         let send = state
             .begin_computer_relay(machine_id, on)
             .expect("a switch begins");
-        let answer = send
-            .client
-            .switch_computer_relay(&send.machine_id, send.on)
-            .await;
+        let answer = send.switch().await;
         state.settle_computer_relay(machine_id, send.token, answer)
     }
 
@@ -38995,6 +39031,321 @@ mod tests {
             state.begin_computer_relay("mac_2", true).is_none(),
             "nobody is signed in"
         );
+    }
+
+    // ---- This computer's card switches every enrolment the roster folds into it ----------------
+
+    /// The label this computer enrols under, which an earlier run of the app enrolled under too.
+    const THIS_COMPUTERS_LABEL: &str = "NativeChat on uriahs-MacBook-Pro.local";
+
+    /// One enrolment as `GET /local-exec/daemon` lists it (opengrok-server #342 (main 2136ffc):
+    /// `row` in `crates/opengrok-server/src/local_exec.rs`).
+    fn enrolment(
+        machine_id: &str,
+        label: &str,
+        revoked: bool,
+        connected: bool,
+        relay_enabled: bool,
+    ) -> serde_json::Value {
+        json!({"machineId": machine_id, "label": label, "enrolledAtMs": 1_790_000_000_000_i64,
+               "revoked": revoked, "connected": connected, "relayEnabled": relay_enabled,
+               "relaying": false})
+    }
+
+    /// The live roster: this computer, `mac_live`, and two enrolments an earlier run of the app
+    /// left under the same label and never revoked, not connected; every switch `on`.
+    fn this_computer_enrolled_three_times(on: bool) -> Vec<serde_json::Value> {
+        vec![
+            enrolment("mac_live", THIS_COMPUTERS_LABEL, false, true, on),
+            enrolment("mac_old_a", THIS_COMPUTERS_LABEL, false, false, on),
+            enrolment("mac_old_b", THIS_COMPUTERS_LABEL, false, false, on),
+        ]
+    }
+
+    /// A server that keeps each computer's switch where its `PATCH` puts it and answers with the
+    /// computer's row, as `switch_relay` does (opengrok-server #342 (main 2136ffc)).
+    struct SwitchesAsAsked;
+
+    impl wiremock::Respond for SwitchesAsAsked {
+        fn respond(&self, request: &wiremock::Request) -> wiremock::ResponseTemplate {
+            let id = request
+                .url
+                .path()
+                .trim_start_matches("/local-exec/daemon/")
+                .to_string();
+            let body: serde_json::Value =
+                serde_json::from_slice(&request.body).expect("a JSON body");
+            let on = body["relayEnabled"].as_bool().expect("a true or a false");
+            wiremock::ResponseTemplate::new(200).set_body_json(enrolment(
+                &id,
+                THIS_COMPUTERS_LABEL,
+                false,
+                id == "mac_live",
+                on,
+            ))
+        }
+    }
+
+    /// A window signed in on `mac_live` against `server`, which lists `machines` as the account's
+    /// computers and keeps every switch as asked, with the roster read as Settings → Computer reads
+    /// it ([`AppState::refresh_computers`]).
+    fn a_window_reading_the_roster(
+        cx: &mut gpui_kit::TestAppContext,
+        runtime: &tokio::runtime::Runtime,
+        server: &wiremock::MockServer,
+        machines: Vec<serde_json::Value>,
+    ) -> gpui_kit::Entity<AppState> {
+        use gpui_kit::AppContext as _;
+        use wiremock::matchers::{method, path, path_regex};
+        runtime.block_on(async {
+            wiremock::Mock::given(method("GET"))
+                .and(path("/local-exec/daemon"))
+                .respond_with(
+                    wiremock::ResponseTemplate::new(200)
+                        .set_body_json(json!({ "machines": machines })),
+                )
+                .mount(server)
+                .await;
+            wiremock::Mock::given(method("PATCH"))
+                .and(path_regex("^/local-exec/daemon/[^/]+$"))
+                .respond_with(SwitchesAsAsked)
+                .mount(server)
+                .await;
+        });
+        let mut state = signed_in_state();
+        state.opengrok = Some(OpenGrokClient::new(&server.uri()).expect("a URL"));
+        state.local_exec_machine_id = Some("mac_live".into());
+        let app = cx.new(|_| state);
+        app.update(cx, |state, cx| state.refresh_computers(cx));
+        wait_for(cx, "the roster is read", |cx| {
+            app.read_with(cx, |state, _| !state.computers.is_empty())
+        });
+        app
+    }
+
+    /// Move `machine_id`'s card's switch to `on` as a click on it does, and wait for the answer.
+    fn switch_and_wait(
+        cx: &mut gpui_kit::TestAppContext,
+        app: &gpui_kit::Entity<AppState>,
+        machine_id: &str,
+        on: bool,
+    ) {
+        app.update(cx, |state, cx| {
+            state.set_computer_relay(machine_id.to_string(), on, cx)
+        });
+        wait_for(cx, "the switch is answered", |cx| {
+            app.read_with(cx, |state, _| {
+                state.computer_relay_switch(machine_id).is_none()
+            })
+        });
+    }
+
+    /// The `PATCH`es `server` was sent, as (machine id, `relayEnabled`), by machine id.
+    fn switched(
+        runtime: &tokio::runtime::Runtime,
+        server: &wiremock::MockServer,
+    ) -> Vec<(String, bool)> {
+        let mut sent: Vec<(String, bool)> = runtime
+            .block_on(patches_sent(server))
+            .into_iter()
+            .map(|(id, body)| {
+                (
+                    id,
+                    body["relayEnabled"].as_bool().expect("a true or a false"),
+                )
+            })
+            .collect();
+        sent.sort();
+        sent
+    }
+
+    fn each(ids: &[&str], on: bool) -> Vec<(String, bool)> {
+        ids.iter().map(|id| (id.to_string(), on)).collect()
+    }
+
+    /// This computer enrolled three times under one label: two earlier runs of the app left
+    /// enrolments that were never revoked, on and asleep. The roster folds them into this
+    /// computer's one card, so nobody can see them, and while any of them is on the account's relay
+    /// is on with a computer asleep, which refuses a Subscription Bot's turn rather than giving it
+    /// the Relay-off fallback. Switching the card off switches all three off, and the card reads
+    /// off.
+    #[gpui_kit::test]
+    fn switching_this_computers_card_off_switches_off_every_enrolment_folded_into_it(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        let runtime = a_runtime_for_the_relay(cx);
+        let _enter = runtime.enter();
+        let server = runtime.block_on(wiremock::MockServer::start());
+        let app = a_window_reading_the_roster(
+            cx,
+            &runtime,
+            &server,
+            this_computer_enrolled_three_times(true),
+        );
+        app.read_with(cx, |state, _| {
+            let cards = crate::components::computers::cards(state);
+            assert_eq!(cards.len(), 1, "one card for the three: {cards:?}");
+            assert!(cards[0].relay_on && cards[0].this_computer);
+        });
+
+        switch_and_wait(cx, &app, "mac_live", false);
+        assert_eq!(
+            switched(&runtime, &server),
+            each(&["mac_live", "mac_old_a", "mac_old_b"], false)
+        );
+        app.read_with(cx, |state, _| {
+            let card = card_of(state, "mac_live");
+            assert_eq!((card.relay_on, card.note.as_deref()), (false, None));
+        });
+    }
+
+    /// The same three, all off: switching the card on switches all three on, and the card reads
+    /// on.
+    #[gpui_kit::test]
+    fn switching_this_computers_card_on_switches_on_every_enrolment_folded_into_it(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        let runtime = a_runtime_for_the_relay(cx);
+        let _enter = runtime.enter();
+        let server = runtime.block_on(wiremock::MockServer::start());
+        let app = a_window_reading_the_roster(
+            cx,
+            &runtime,
+            &server,
+            this_computer_enrolled_three_times(false),
+        );
+        switch_and_wait(cx, &app, "mac_live", true);
+        assert_eq!(
+            switched(&runtime, &server),
+            each(&["mac_live", "mac_old_a", "mac_old_b"], true)
+        );
+        app.read_with(cx, |state, _| {
+            let card = card_of(state, "mac_live");
+            assert_eq!((card.relay_on, card.note.as_deref()), (true, None));
+        });
+    }
+
+    /// An enrolment of this computer that was revoked is no card's and is switched by none: the
+    /// server refuses to switch one (409 `revoked`), so only the live one and the stale one that
+    /// was never revoked are sent.
+    #[gpui_kit::test]
+    fn a_revoked_enrolment_of_this_computer_is_not_switched(cx: &mut gpui_kit::TestAppContext) {
+        let runtime = a_runtime_for_the_relay(cx);
+        let _enter = runtime.enter();
+        let server = runtime.block_on(wiremock::MockServer::start());
+        let app = a_window_reading_the_roster(
+            cx,
+            &runtime,
+            &server,
+            vec![
+                enrolment("mac_live", THIS_COMPUTERS_LABEL, false, true, true),
+                enrolment("mac_old_a", THIS_COMPUTERS_LABEL, false, false, true),
+                enrolment("mac_revoked", THIS_COMPUTERS_LABEL, true, false, true),
+            ],
+        );
+        switch_and_wait(cx, &app, "mac_live", false);
+        assert_eq!(
+            switched(&runtime, &server),
+            each(&["mac_live", "mac_old_a"], false)
+        );
+    }
+
+    /// Another computer has its own card and its own switch: switching this computer's moves this
+    /// computer's enrolments and leaves the other computer's switch where it was.
+    #[gpui_kit::test]
+    fn another_computers_switch_is_untouched_by_this_computers_card(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        let runtime = a_runtime_for_the_relay(cx);
+        let _enter = runtime.enter();
+        let server = runtime.block_on(wiremock::MockServer::start());
+        let app = a_window_reading_the_roster(
+            cx,
+            &runtime,
+            &server,
+            vec![
+                enrolment("mac_live", THIS_COMPUTERS_LABEL, false, true, true),
+                enrolment("mac_old_a", THIS_COMPUTERS_LABEL, false, false, true),
+                enrolment(
+                    "mac_studio",
+                    "NativeChat on studio.local",
+                    false,
+                    true,
+                    true,
+                ),
+            ],
+        );
+        switch_and_wait(cx, &app, "mac_live", false);
+        assert_eq!(
+            switched(&runtime, &server),
+            each(&["mac_live", "mac_old_a"], false)
+        );
+        app.read_with(cx, |state, _| {
+            assert!(!card_of(state, "mac_live").relay_on);
+            assert!(
+                card_of(state, "mac_studio").relay_on,
+                "the other's stays on"
+            );
+        });
+    }
+
+    /// A stale enrolment the server no longer knows (404 `not_found`), or revoked since the roster
+    /// was read (409 `revoked`), has nothing left to switch: the card's switch is kept all the
+    /// same, and nothing is said of the stale ones under it.
+    #[gpui_kit::test]
+    fn a_stale_enrolment_gone_or_revoked_does_not_fail_this_computers_switch(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        let runtime = a_runtime_for_the_relay(cx);
+        let _enter = runtime.enter();
+        let server = runtime.block_on(wiremock::MockServer::start());
+        runtime.block_on(async {
+            for (id, status, words, code) in [
+                (
+                    "mac_old_a",
+                    404,
+                    "no computer of yours has that id",
+                    "not_found",
+                ),
+                (
+                    "mac_old_b",
+                    409,
+                    "this computer was revoked; enrol it again to use it",
+                    "revoked",
+                ),
+            ] {
+                wiremock::Mock::given(wiremock::matchers::method("PATCH"))
+                    .and(wiremock::matchers::path(format!("/local-exec/daemon/{id}")))
+                    .respond_with(
+                        wiremock::ResponseTemplate::new(status)
+                            .set_body_json(json!({"error": words, "code": code})),
+                    )
+                    .with_priority(1)
+                    .mount(&server)
+                    .await;
+            }
+        });
+        let app = a_window_reading_the_roster(
+            cx,
+            &runtime,
+            &server,
+            this_computer_enrolled_three_times(true),
+        );
+        switch_and_wait(cx, &app, "mac_live", false);
+        assert_eq!(
+            switched(&runtime, &server),
+            each(&["mac_live", "mac_old_a", "mac_old_b"], false),
+            "each was asked"
+        );
+        app.read_with(cx, |state, _| {
+            let card = card_of(state, "mac_live");
+            assert_eq!(
+                (card.relay_on, card.switching, card.note.as_deref()),
+                (false, false, None),
+                "kept, and nothing said"
+            );
+            assert_eq!(state.computer_relay_note("mac_live"), None);
+        });
     }
 
     /// Pointing the account's way at the relay is one change of the account's at a time. A card's

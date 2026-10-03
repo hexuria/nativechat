@@ -405,8 +405,10 @@
 //! `settings-computer-{machine}-relay` (a switch named `Relay your plan`, checked while the
 //! computer's relay is on, or where a click is taking it while the server is asked, disabled then;
 //! a click asks for the other way, from any computer's card, as one `PATCH
-//! /local-exec/daemon/{machine}` of `{relayEnabled}`, and is refused with why while its last
-//! switch is with the server; turning one on also points the account's way at the relay, once,
+//! /local-exec/daemon/{machine}` of `{relayEnabled}`, and once that is kept the same for each older
+//! enrolment of the computer that the list folds into its card under the same label (never a
+//! revoked one, and nothing is said of one the server no longer knows), and is refused with why
+//! while its last switch is with the server; turning one on also points the account's way at the relay, once,
 //! when it is not that already, as `PUT /account/inference-source` `{kind, via: "mac"}` with the
 //! kind the server keeps, one change of the account's at a time, and a computer going off moves no
 //! way; nothing this app sends of the account's setting ever carries `relayEnabled`),

@@ -1496,6 +1496,7 @@ impl OpenGrokClient {
                 online: machine.connected,
                 relay_enabled: machine.relay_enabled,
                 relaying: machine.relaying,
+                folded: Vec::new(),
             });
         }
         Ok(collapse_computers_by_machine_id(computers))
@@ -3745,6 +3746,13 @@ pub struct ConnectedComputer {
     pub relay_enabled: bool,
     /// The server holds the computer's relay stream now ([`DaemonMachine::relaying`]).
     pub relaying: bool,
+    /// The machine ids of this computer's other enrolments, which the roster folds into this row
+    /// because they carry its label ([`collapse_computer_roster`]): what an earlier run of the app
+    /// on the same computer enrolled and never revoked. None of them has a card, so this row's
+    /// relay switch moves them with it: one left on keeps the account's relay on with a computer
+    /// asleep, which refuses a Subscription Bot's turn rather than giving it the Relay-off
+    /// fallback. A revoked one is never listed ([`OpenGrokClient::list_computers`]).
+    pub folded: Vec<String>,
 }
 
 impl ConnectedComputer {
@@ -3753,6 +3761,16 @@ impl ConnectedComputer {
             (true, false) => true,
             (false, true) => false,
             _ => self.online && !other.online,
+        }
+    }
+
+    /// `other`, folded into this row: its machine id and the ids folded into it, each once, and
+    /// never this row's own (the same machine listed twice is one enrolment).
+    fn fold_in(&mut self, other: ConnectedComputer) {
+        for id in std::iter::once(other.machine_id).chain(other.folded) {
+            if id != self.machine_id && !self.folded.contains(&id) {
+                self.folded.push(id);
+            }
         }
     }
 }
@@ -3780,8 +3798,11 @@ fn fold_computers(
             .iter()
             .position(|existing| key(existing).as_deref() == Some(k.as_str()))
         {
-            Some(i) if computer.preferred_over(&out[i]) => out[i] = computer,
-            Some(_) => {}
+            Some(i) if computer.preferred_over(&out[i]) => {
+                let folded = std::mem::replace(&mut out[i], computer);
+                out[i].fold_in(folded);
+            }
+            Some(i) => out[i].fold_in(computer),
             None => out.push(computer),
         }
     }
@@ -3797,7 +3818,9 @@ pub fn collapse_computers_by_machine_id(
 
 /// Settings Computers tab: one row per machine, and a stale enrol with the
 /// same label as this Mac (Online/Never + Offline/Always) collapses to the
-/// live one. Prefer `this_machine`, then online.
+/// live one. Prefer `this_machine`, then online. The row keeps the ids of the
+/// enrolments it stands for ([`ConnectedComputer::folded`]), which its relay
+/// switch moves with it.
 pub fn collapse_computer_roster(computers: Vec<ConnectedComputer>) -> Vec<ConnectedComputer> {
     fold_computers(
         collapse_computers_by_machine_id(computers),
@@ -10023,6 +10046,7 @@ mod tests {
             online,
             relay_enabled: true,
             relaying: false,
+            folded: Vec::new(),
         }
     }
 
@@ -10048,19 +10072,28 @@ mod tests {
         assert!(collapsed[0].this_machine);
         assert!(collapsed[0].online);
         assert_eq!(collapsed[0].mode, LocalExecMode::Never);
+        assert!(
+            collapsed[0].folded.is_empty(),
+            "one enrolment, listed twice"
+        );
     }
 
+    /// The stale enrolments' ids stay with the live row they fold into, each once, whichever
+    /// order the server lists them in, for its relay switch to move them too.
     #[test]
     fn collapse_roster_drops_stale_enrol_with_the_same_label() {
         let label = "NativeChat on uriahs-MacBook-Pro.local";
         let collapsed = collapse_computer_roster(vec![
             computer("mac_stale", label, false, false, LocalExecMode::Always),
             computer("mac_live", label, true, true, LocalExecMode::Never),
+            computer("mac_stale", label, false, false, LocalExecMode::Always),
+            computer("mac_older", label, false, false, LocalExecMode::Ask),
         ]);
         assert_eq!(collapsed.len(), 1);
         assert_eq!(collapsed[0].machine_id, "mac_live");
         assert!(collapsed[0].this_machine);
         assert_eq!(collapsed[0].mode, LocalExecMode::Never);
+        assert_eq!(collapsed[0].folded, ["mac_stale", "mac_older"]);
     }
 
     #[test]
@@ -10073,6 +10106,7 @@ mod tests {
         assert_eq!(collapsed.len(), 1);
         assert_eq!(collapsed[0].machine_id, "mac_on");
         assert!(collapsed[0].online);
+        assert_eq!(collapsed[0].folded, ["mac_off"]);
     }
 
     #[test]
@@ -10094,6 +10128,7 @@ mod tests {
             ),
         ]);
         assert_eq!(collapsed.len(), 2);
+        assert!(collapsed.iter().all(|computer| computer.folded.is_empty()));
     }
 
     #[test]

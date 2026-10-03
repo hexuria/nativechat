@@ -11,10 +11,12 @@
 //! the one the app is running on (by the machine id it stored when it enrolled,
 //! `opengrok::stored_machine_id`), its "Relay your plan" switch, and where the relay stands: it
 //! relays, it does not, or it is on and the computer is asleep. The switch acts at once: it sends
-//! `PATCH /local-exec/daemon/{machine_id} {relayEnabled}` for that computer, drawn where the click
-//! asked to take it while the server is asked, and a refusal goes back to where it was with the
-//! server's words under it (`AppState::set_computer_relay`). There is no ordering of computers: the
-//! server asks the one that opened its relay stream last of those that are on.
+//! `PATCH /local-exec/daemon/{machine_id} {relayEnabled}` for that computer, and for each older
+//! enrolment of it the roster folds into its card under the same label, which has no card of its
+//! own; it is drawn where the click asked to take it while the server is asked, and a refusal goes
+//! back to where it was with the server's words under it (`AppState::set_computer_relay`). There is
+//! no ordering of computers: the server asks the one that opened its relay stream last of those
+//! that are on.
 //!
 //! This computer's card alone also holds what its relay needs of this computer: opencodex's address
 //! and its key, which Save keeps here, the key in its secure storage (the Keychain). The window still

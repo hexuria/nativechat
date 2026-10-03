@@ -1334,6 +1334,7 @@ mod tests {
             online,
             relay_enabled,
             relaying,
+            folded: Vec::new(),
         }
     }
 
