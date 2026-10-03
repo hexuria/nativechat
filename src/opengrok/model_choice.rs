@@ -77,6 +77,14 @@ pub const PLAN_FALLBACK_PICK_FIRST: &str =
 /// ([`ModelPick::routines`]).
 pub const ROUTINES_ON_PLAN: &str = "This Bot's routines run on your own plan: one that's due \
                                     while your plan can't answer is skipped.";
+/// The same while the person has switched the relay off with a Relay-off fallback set, and their
+/// plan goes by their computer: its routines run on that fallback (opengrok-server #332 (PR #338
+/// at 66b9f7b), the server's own note for such a routine).
+pub const ROUTINES_ON_FALLBACK: &str =
+    "This Bot's routines run on your Server fallback model while Relay is off.";
+/// And with no fallback set: every one that is due is skipped (the same note).
+pub const ROUTINES_SKIPPED_RELAY_OFF: &str =
+    "This Bot's routines are skipped while Relay is off for your plan.";
 
 /// Whether an id is a model's fast tier.
 pub fn is_fast(id: &str) -> bool {
@@ -482,7 +490,10 @@ pub struct ModelPick {
     /// answer) is skipped, with nothing run and the history saying why (the owner's rule of 3 Oct
     /// 2026, #334 on main 8e7387f: `routine_route` and `unreachable` in opengrok-server's
     /// `crates/opengrok-server/src/autonomy/mod.rs`; before it the server refused every routine of
-    /// such a Bot). It is said for every such Bot, whatever it is pinned to. A Bot that follows
+    /// such a Bot). While the person has switched the relay off and the plan goes by their
+    /// computer, they run on the Relay-off fallback instead ([`ROUTINES_ON_FALLBACK`]), or with
+    /// none set are skipped ([`ROUTINES_SKIPPED_RELAY_OFF`]), opengrok-server #332 (PR #338 at
+    /// 66b9f7b). It is said for every such Bot, whatever it is pinned to. A Bot that follows
     /// the account (`source: null`), or is on the gateway, runs its routines through the gateway
     /// on its pin as before (opengrok-server #294), and is told nothing.
     pub routines: Option<String>,
@@ -565,10 +576,10 @@ pub fn bot_pick(
         (!per_bot && door == Some(InferenceKind::LocalProxy)).then_some(AccountPlan {
             model: account_model,
         });
-    // The Bot's own door alone decides: the routines of a Bot on its own plan run on that plan,
-    // whatever its pin (opengrok-server #334).
-    let routines =
-        (bot_door == Some(InferenceKind::LocalProxy)).then(|| ROUTINES_ON_PLAN.to_string());
+    // The Bot's own door alone decides whether it is told: the routines of a Bot on its own plan
+    // run on that plan, whatever its pin (opengrok-server #334), unless the relay is off.
+    let routines = (bot_door == Some(InferenceKind::LocalProxy))
+        .then(|| routines_on_plan(account).to_string());
     ModelPick {
         bot_id: bot.id.clone(),
         per_bot,
@@ -584,6 +595,24 @@ pub fn bot_pick(
         account_plan,
         routines,
         unset: NO_MODEL,
+    }
+}
+
+/// Where a Bot whose own door is the person's plan runs its routines, by the account's setting as
+/// last read, as the server's own note for such a routine says it (opengrok-server #332 (PR #338
+/// at 66b9f7b): `note` in `crates/opengrok-tools/src/routine.rs`, after `routine_route` in
+/// `crates/opengrok-server/src/autonomy/mod.rs`): on the plan, unless the plan goes by the
+/// person's computer and they switched the relay off, when they run on the Relay-off fallback, or
+/// with none set are skipped, every one. The switch is the computer's way's alone: a plan the
+/// server reaches on its own machine never reads it.
+fn routines_on_plan(account: Option<&InferenceSource>) -> &'static str {
+    let relay_off = account.filter(|account| {
+        account.relay_enabled == Some(false) && account_via(account) == Some(Via::Mac)
+    });
+    match relay_off.map(|account| &account.plan_fallback) {
+        None => ROUTINES_ON_PLAN,
+        Some(Some(Some(_))) => ROUTINES_ON_FALLBACK,
+        Some(_) => ROUTINES_SKIPPED_RELAY_OFF,
     }
 }
 
@@ -1948,6 +1977,65 @@ mod tests {
                 Some(ROUTINES_ON_PLAN),
                 "{pin:?} against {gateway:?} with {kept:?}"
             );
+        }
+    }
+
+    /// While the person has switched the relay off and their plan goes by their computer, a Bot
+    /// on its own plan runs its routines on the Relay-off fallback, or with none set every one is
+    /// skipped (opengrok-server #332 (PR #338 at 66b9f7b), whose recording holds a plan Bot's
+    /// routine run on the fallback and one skipped with none), and its list says so, in the words
+    /// of the server's own note for such a routine (`note` in
+    /// `crates/opengrok-tools/src/routine.rs`). Read off the settings the server recorded for
+    /// those two. With the relay on, or the plan on the server's own machine, which never reads
+    /// the switch, they run on the plan as before; and a Bot not on its own plan is told nothing.
+    #[test]
+    fn a_bot_on_its_own_plan_is_told_where_its_routines_run_while_relay_is_off() {
+        assert_eq!(
+            (ROUTINES_ON_FALLBACK, ROUTINES_SKIPPED_RELAY_OFF),
+            (
+                "This Bot's routines run on your Server fallback model while Relay is off.",
+                "This Bot's routines are skipped while Relay is off for your plan."
+            )
+        );
+        let recorded = |fixture: &str| -> InferenceSource {
+            let recorded: Value = serde_json::from_str(fixture).expect("the recording");
+            serde_json::from_value(recorded["body"].clone()).expect("a setting")
+        };
+        let on_fallback = recorded(include_str!(
+            "../../fixtures/wire/rest/PUT__account_inference-source/200-a_plan_bots_routine_runs_on_the_fallback_while_the_relay_is_off.json"
+        ));
+        let none_set = recorded(include_str!(
+            "../../fixtures/wire/rest/PUT__account_inference-source/200-a_plan_bots_routine_is_skipped_while_the_relay_is_off_with_no_fallback.json"
+        ));
+        let own = bot(Some(json!("local_proxy")), "gpt-6-luna", Some("medium"));
+        let routines = |kept: &InferenceSource, row: &Coworker| {
+            bot_pick(row, Some(kept), &catalogue(SERVER), plan(PLAN)).routines
+        };
+        assert_eq!(
+            routines(&on_fallback, &own).as_deref(),
+            Some(ROUTINES_ON_FALLBACK)
+        );
+        assert_eq!(
+            routines(&none_set, &own).as_deref(),
+            Some(ROUTINES_SKIPPED_RELAY_OFF)
+        );
+        let on = InferenceSource {
+            relay_enabled: Some(true),
+            ..on_fallback.clone()
+        };
+        assert_eq!(routines(&on, &own).as_deref(), Some(ROUTINES_ON_PLAN));
+        let loopback = InferenceSource {
+            via: Some("loopback".into()),
+            ..none_set.clone()
+        };
+        assert_eq!(
+            routines(&loopback, &own).as_deref(),
+            Some(ROUTINES_ON_PLAN),
+            "the switch is the computer's way's alone"
+        );
+        for source in [Some(Value::Null), Some(json!("gateway"))] {
+            let row = bot(source.clone(), "gpt-6-luna", Some("medium"));
+            assert_eq!(routines(&on_fallback, &row), None, "{source:?}");
         }
     }
 

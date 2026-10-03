@@ -64,8 +64,8 @@ pub(crate) const PLAN: &str = "agent-model-plan";
 /// In the list: the server's word about why it lists no more, as `GET /models` gives it.
 pub(crate) const NOTE: &str = "agent-model-note";
 /// In the list, on a Bot whose own door is the person's plan, whatever it is pinned to: its
-/// routines run on that plan, and one due while it cannot answer is skipped
-/// (`ModelPick::routines`).
+/// routines run on that plan, and one due while it cannot answer is skipped; while the relay is
+/// off, they run on the Relay-off fallback or are skipped (`ModelPick::routines`).
 pub(crate) const ROUTINES: &str = "agent-model-routines";
 /// Under the controls: the server's words for the last change that did not go through.
 pub(crate) const ERROR: &str = "agent-model-error";

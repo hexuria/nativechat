@@ -281,8 +281,11 @@
 //! takes away as it would a row), `agent-model-no-match` ("No model matches", while the search
 //! leaves nothing of a list that has some), `agent-model-routines` (on a Bot whose own door is
 //! the person's plan, whatever it is pinned to: the line saying its routines run on that plan,
-//! and one due while the plan cannot answer is skipped (opengrok-server #334); a line, not a
-//! row) and `agent-model-note` (the server's word on why the list is not fuller).
+//! and one due while the plan cannot answer is skipped (opengrok-server #334), or, while the
+//! person switched the relay off and the plan goes by their computer, that they run on the
+//! Relay-off fallback or, with none set, are skipped (opengrok-server #332 (PR #338 at
+//! 66b9f7b)); a line, not a row) and `agent-model-note` (the server's word on why the list is
+//! not fuller).
 //! `agent-model-error` is the server's words for the last change it refused. Every change is
 //! saved on the Bot at once, `source`, `model` and `effort` on `PATCH /coworkers/{id}`
 //! (opengrok-server main d6f640e (#307, after #304), pin bf99845). Invoke `model.picker`,
