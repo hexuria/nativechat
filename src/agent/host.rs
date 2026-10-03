@@ -766,9 +766,9 @@ pub enum Command {
     },
     /// ⚡, on or off, saved at once.
     SetModelFast(bool),
-    /// A stop of the effort slider, by the server's word, saved at once.
+    /// A level of the effort slider, by the server's word, saved at once.
     SetModelEffort(String),
-    /// ↺: Default effort, and ⚡ off.
+    /// ↺: the effort back to `inherit`, and ⚡ off.
     ResetModelPick,
     /// Default for new Bots' picker, on Settings → Relay: the same changes as the Bot's, each
     /// kept on the account at once.
@@ -1407,9 +1407,9 @@ pub enum PickerCommand {
     },
     /// ⚡, on or off.
     SetFast(bool),
-    /// A stop of the effort slider, by the server's word.
+    /// A level of the effort slider, by the server's word.
     SetEffort(String),
-    /// ↺: Default effort, and ⚡ off.
+    /// ↺: the effort back to `inherit`, and ⚡ off.
     Reset,
 }
 
@@ -1564,11 +1564,23 @@ fn picker_field(
         .find(|which| field(model_picker::ids(*which)) == target)
 }
 
-/// The slider's stops by the server's words, as a refusal names them.
-fn effort_stop_words() -> String {
-    crate::opengrok::EFFORT_STOPS
+/// Why a picker's slider is not on screen: no model is picked, or the model on the card lists no
+/// levels of effort.
+fn no_slider(pick: &crate::opengrok::ModelPick, target: &str) -> String {
+    let why = if pick.model.is_some() {
+        format!("{} lists no levels of effort", pick.model_label())
+    } else {
+        "no model is picked".to_string()
+    };
+    format!("`{target}` is not on screen: {why}, so there is no slider")
+}
+
+/// The levels the model on the card lists, by the server's words, low to high, as a refusal names
+/// them.
+fn levels_in_words(pick: &crate::opengrok::ModelPick) -> String {
+    pick.levels()
         .iter()
-        .map(|(_, word)| *word)
+        .map(|level| level.value.as_str())
         .collect::<Vec<_>>()
         .join(", ")
 }
@@ -5393,10 +5405,13 @@ impl NativeChatHost {
     /// state, `fast` while ⚡ is on, `expanded` while its popover is open, and `saving` while a
     /// change is with the server. Under it the popover, `agent-model-pop`, visible while open,
     /// holds while it shows its controls `agent-model-fast` (a switch, checked while on, dead
-    /// with why as its value), `agent-model-effort` (a slider named as the effort reads and valued
-    /// by the server's word, dead with why as its own words from a server that keeps no effort,
-    /// and for new Bots while none is set), `agent-model-open-list` (named by the model) and
-    /// `agent-model-reset` (live while there is something to put back); and while it shows its
+    /// with why as its value), `agent-model-open-list` (named by the model) and
+    /// `agent-model-reset` (live while there is something to put back), then
+    /// `agent-model-effort`, a slider that is there only where the model lists levels of effort
+    /// (named by the level it is on, the model's own while the Bot chose none, and valued by the
+    /// server's word, `inherit` while none is chosen; dead with why as its own words from a
+    /// server that keeps no effort; `set_value` takes one of the model's own levels by its word
+    /// and refuses any other in words that name them); and while it shows its
     /// list, `agent-model-open-list` as the heading back (state `expanded`) and
     /// `agent-model-search`, the search box (valued by what is typed). `agent-model-list` is
     /// always there, valued by how many models the search leaves and visible while shown, and
@@ -5441,22 +5456,27 @@ impl NativeChatHost {
             if let Some(why) = pick.fast_blocked {
                 fast = fast.with_value(why);
             }
+            // The window's own order: ⚡, the model's name and ↺ in a row, then the slider under
+            // them, which is not there at all where the model lists no levels.
             pop = pop
                 .with_child(fast)
-                .with_child(
-                    UiNode::new(
-                        ids.effort,
-                        "slider",
-                        crate::opengrok::effort_label(&pick.effort),
-                    )
-                    .with_value(pick.effort.clone())
-                    .with_enabled(pick.effort_dead.is_none() && !busy),
-                )
                 .with_child(UiNode::button(ids.open_list, pick.model_label()))
                 .with_child(
                     UiNode::button(ids.reset, model_picker::RESET_LABEL)
                         .with_enabled(pick.can_reset() && !busy),
                 );
+            if pick.has_slider() {
+                pop = pop.with_child(
+                    UiNode::new(
+                        ids.effort,
+                        "slider",
+                        pick.effort_name()
+                            .unwrap_or_else(|| model_picker::EFFORT_LABEL.to_string()),
+                    )
+                    .with_value(pick.effort.clone())
+                    .with_enabled(pick.effort_dead.is_none() && !busy),
+                );
+            }
         }
         // What the search leaves: the whole list while nothing is typed, which it always is while
         // the list is shut.
@@ -5614,14 +5634,13 @@ impl NativeChatHost {
         );
         match &self.reply_source.plan_fallback {
             crate::state::RelayOffFallback::NotOnServer => {
-                let (model, detail) = model_picker::dead_card_words();
                 section = section
                     .with_child(UiNode::status(
                         ids::PLAN_FALLBACK_UNAVAILABLE,
                         default_models::PLAN_FALLBACK_COMING_SOON,
                     ))
                     .with_child(
-                        UiNode::button(ids::PLAN_FALLBACK_CARD, format!("{model} · {detail}"))
+                        UiNode::button(ids::PLAN_FALLBACK_CARD, model_picker::dead_card_model())
                             .with_enabled(false),
                     );
                 section.states.push("unavailable".into());
@@ -5653,14 +5672,13 @@ impl NativeChatHost {
         let section = UiNode::new(ids::NEW_BOTS, "group", default_models::NEW_BOTS_TITLE);
         match &self.reply_source.new_bots {
             crate::state::DefaultForNewBots::NotOnServer => {
-                let (model, detail) = model_picker::dead_card_words();
                 let mut section = section
                     .with_child(UiNode::status(
                         ids::NEW_BOTS_UNAVAILABLE,
                         default_models::NEW_BOTS_COMING_SOON,
                     ))
                     .with_child(
-                        UiNode::button(ids::NEW_BOTS_CARD, format!("{model} · {detail}"))
+                        UiNode::button(ids::NEW_BOTS_CARD, model_picker::dead_card_model())
                             .with_enabled(false),
                     );
                 section.states.push("unavailable".into());
@@ -5852,16 +5870,20 @@ impl NativeChatHost {
             };
         }
         if target == ids.effort {
-            return Err(format!(
-                "`{target}` is a slider: set_value it to one of {}",
-                effort_stop_words()
-            ));
+            return Err(if pick.has_slider() {
+                format!(
+                    "`{target}` is a slider: set_value it to one of {}",
+                    levels_in_words(pick)
+                )
+            } else {
+                no_slider(pick, target)
+            });
         }
         if target == ids.reset {
             return if !pick.can_reset() {
                 Err(format!(
-                    "`{target}` has nothing to put back: the effort is Default, and ⚡ is off or \
-                     cannot be switched"
+                    "`{target}` has nothing to put back: the effort is the model's own, and ⚡ is \
+                     off or cannot be switched"
                 ))
             } else if busy {
                 dead()
@@ -5995,10 +6017,11 @@ impl NativeChatHost {
         None
     }
 
-    /// `set_value` on a picker's slider: one of its five stops by the server's word, saved at
-    /// once, as letting go of the thumb there is. Refused off screen, as a click is, where the
-    /// slider is dead (a server that keeps no effort, a default for new Bots with no model), while
-    /// a change is with the server, and for a word that is no stop (Default is ↺'s).
+    /// `set_value` on a picker's slider: one of the model's own levels by the server's word,
+    /// saved at once, as letting go of the thumb there is. Refused off screen, as a click is,
+    /// where the model lists no levels and so the slider is not there, where it is dead (a server
+    /// that keeps no effort), while a change is with the server, and for a word that is none of
+    /// the model's levels, in words that name them (`inherit` is ↺'s).
     fn set_picker_effort(
         &mut self,
         which: PickerFor,
@@ -6024,6 +6047,9 @@ impl NativeChatHost {
                 "`{target}` is not on screen: the popover shows its list, and `{}` goes back",
                 ids.open_list
             ));
+        }
+        if !pick.has_slider() {
+            return Err(no_slider(pick, target));
         }
         let word = value.trim();
         pick.effort_patch(word)
@@ -14276,7 +14302,7 @@ mod tests {
         let card = tree.find(ids::NEW_BOTS_CARD).unwrap();
         assert_eq!(
             (card.role.as_str(), card.name.as_str(), card.enabled),
-            ("button", "No model · Default", false)
+            ("button", "No model", false)
         );
         let dead = host.click(ids::NEW_BOTS_CARD).unwrap_err();
         assert!(dead.contains(NEW_BOTS_COMING_SOON), "{dead}");
@@ -14293,28 +14319,26 @@ mod tests {
         assert!(off.contains(ids::SETTINGS_GENERAL), "{off}");
     }
 
+    /// What `GET /models` lists in the picker tests: two gateway routes, one that lists five
+    /// levels of effort and one that lists none, and the plan's GPT-6 Luna with its fast twin
+    /// (five levels) and Sol (six, up to ultra), each with a level of its own
+    /// (`opengrok::levelled_catalogue`).
+    fn a_levelled_catalogue() -> crate::opengrok::ModelCatalogue {
+        crate::opengrok::levelled_catalogue()
+    }
+
     /// Default for new Bots' picker, from the default as given, over a list of two plan models
-    /// and two gateway routes.
+    /// and two gateway routes ([`a_levelled_catalogue`]).
     fn a_new_bots_pick(
         default: Option<crate::opengrok::NewBotDefault>,
     ) -> crate::opengrok::ModelPick {
-        let catalogue = crate::opengrok::ModelCatalogue {
-            models: ["oag/cheap", "xai/grok-4.7"]
-                .iter()
-                .map(|id| crate::opengrok::ModelEntry {
-                    id: (*id).into(),
-                    source: Some("gateway".into()),
-                    via: None,
-                    ..Default::default()
-                })
-                .collect(),
-            note: None,
-            local_proxy: None,
-        };
         let account = kept_source(crate::opengrok::InferenceKind::Gateway, true);
-        crate::opengrok::new_bots_pick(default.as_ref(), Some(&account), &catalogue, |_| {
-            vec!["gpt-6-luna".to_string(), "gpt-6-luna--fast".to_string()]
-        })
+        crate::opengrok::new_bots_pick(
+            default.as_ref(),
+            Some(&account),
+            &a_levelled_catalogue(),
+            |_| vec!["gpt-6-luna".to_string(), "gpt-6-luna--fast".to_string()],
+        )
     }
 
     /// Where the server keeps a default for new Bots, Default for new Bots is the Bot's picker on
@@ -14341,7 +14365,7 @@ mod tests {
         let card = tree.find(ids::NEW_BOTS_CARD).unwrap();
         assert_eq!(
             (card.name.as_str(), card.value.as_deref(), card.enabled),
-            ("None · Default", Some(""), true)
+            ("None", Some(""), true)
         );
         assert!(!tree.find("settings-new-bots-pop").unwrap().visible);
         host.click(ids::NEW_BOTS_CARD).unwrap();
@@ -14359,13 +14383,16 @@ mod tests {
             (fast.enabled, fast.value.as_deref()),
             (false, Some(NEW_BOTS_PICK_FIRST))
         );
-        assert!(!tree.find("settings-new-bots-effort").unwrap().enabled);
+        assert!(
+            tree.find("settings-new-bots-effort").is_none(),
+            "no model, no levels, no slider"
+        );
         let dead = host.click("settings-new-bots-fast").unwrap_err();
         assert!(dead.contains(NEW_BOTS_PICK_FIRST), "{dead}");
         let no_effort = host
             .set_value("settings-new-bots-effort", "high")
             .unwrap_err();
-        assert!(no_effort.contains(NEW_BOTS_PICK_FIRST), "{no_effort}");
+        assert!(no_effort.contains("no model is picked"), "{no_effort}");
         host.click("settings-new-bots-open-list").unwrap();
         assert!(matches!(
             host.take_command(),
@@ -14533,24 +14560,7 @@ mod tests {
     fn a_plan_fallback_pick(
         fallback: Option<crate::opengrok::PlanFallback>,
     ) -> crate::opengrok::ModelPick {
-        let catalogue = crate::opengrok::ModelCatalogue {
-            models: [
-                ("oag/cheap", "gateway"),
-                ("xai/grok-4.7", "gateway"),
-                ("gpt-6-luna", "local_proxy"),
-            ]
-            .iter()
-            .map(|(id, source)| crate::opengrok::ModelEntry {
-                id: (*id).into(),
-                source: Some((*source).into()),
-                via: None,
-                ..Default::default()
-            })
-            .collect(),
-            note: None,
-            local_proxy: None,
-        };
-        crate::opengrok::plan_fallback_pick(fallback.as_ref(), &catalogue)
+        crate::opengrok::plan_fallback_pick(fallback.as_ref(), &a_levelled_catalogue())
     }
 
     /// Where the server keeps a Relay-off fallback, it is the Bot's picker on Settings → General
@@ -14575,7 +14585,7 @@ mod tests {
         );
         assert!(tree.find(ids::PLAN_FALLBACK_UNAVAILABLE).is_none());
         let card = tree.find(ids::PLAN_FALLBACK_CARD).unwrap();
-        assert_eq!((card.name.as_str(), card.enabled), ("None · Default", true));
+        assert_eq!((card.name.as_str(), card.enabled), ("None", true));
         host.click(ids::PLAN_FALLBACK_CARD).unwrap();
         assert!(matches!(
             host.take_command(),
@@ -14702,10 +14712,7 @@ mod tests {
             PLAN_FALLBACK_COMING_SOON
         );
         let card = tree.find(ids::PLAN_FALLBACK_CARD).unwrap();
-        assert_eq!(
-            (card.name.as_str(), card.enabled),
-            ("No model · Default", false)
-        );
+        assert_eq!((card.name.as_str(), card.enabled), ("No model", false));
         let dead = host.click(ids::PLAN_FALLBACK_CARD).unwrap_err();
         assert!(dead.contains(PLAN_FALLBACK_COMING_SOON), "{dead}");
         assert!(host.take_command().is_none());
@@ -14720,7 +14727,7 @@ mod tests {
         let card = tree.find(ids::PLAN_FALLBACK_CARD).unwrap();
         assert_eq!(
             (card.name.as_str(), card.enabled, card.states.as_slice()),
-            ("Grok 4.7 · Light", true, &["gateway".to_string()][..])
+            ("Grok 4.7", true, &["gateway".to_string()][..])
         );
     }
 
@@ -14759,10 +14766,7 @@ mod tests {
         let tree = NativeChatHost::from_app(&state).snapshot();
         assert!(tree.find(ids::NEW_BOTS_UNAVAILABLE).is_none());
         let card = tree.find(ids::NEW_BOTS_CARD).unwrap();
-        assert_eq!(
-            (card.name.as_str(), card.enabled),
-            ("Grok 4.7 · Light", true)
-        );
+        assert_eq!((card.name.as_str(), card.enabled), ("Grok 4.7", true));
     }
 
     /// The relay card has no line or button of its own for the account's way to the plan: the
@@ -15211,8 +15215,18 @@ mod tests {
 
     /// The open Bot's picker as `AppState::model_pick` builds it: the Bot's row with `source`
     /// as given (missing where `None`), the account on the server's keys, the gateway's two
-    /// routes and a plan that lists GPT-6 Luna with its fast twin.
+    /// routes and a plan that lists GPT-6 Luna with its fast twin ([`a_levelled_catalogue`]).
     fn a_pick(
+        source: Option<serde_json::Value>,
+        model: &str,
+        effort: &str,
+    ) -> crate::opengrok::ModelPick {
+        a_pick_among(&["gpt-6-luna", "gpt-6-luna--fast"], source, model, effort)
+    }
+
+    /// [`a_pick`] over the plan models given.
+    fn a_pick_among(
+        plan: &[&str],
         source: Option<serde_json::Value>,
         model: &str,
         effort: &str,
@@ -15224,25 +15238,12 @@ mod tests {
             row["source"] = source;
         }
         let bot = serde_json::from_value(row).unwrap();
-        let catalogue = crate::opengrok::ModelCatalogue {
-            models: ["oag/cheap", "xai/grok-4.7"]
-                .iter()
-                .map(|id| crate::opengrok::ModelEntry {
-                    id: (*id).into(),
-                    source: Some("gateway".into()),
-                    via: None,
-                    ..Default::default()
-                })
-                .collect(),
-            note: None,
-            local_proxy: None,
-        };
         let account = crate::opengrok::InferenceSource {
             local_model: Some("gpt-5-codex".into()),
             ..kept_source(crate::opengrok::InferenceKind::Gateway, true)
         };
-        crate::opengrok::bot_pick(&bot, Some(&account), &catalogue, |_| {
-            vec!["gpt-6-luna".to_string(), "gpt-6-luna--fast".to_string()]
+        crate::opengrok::bot_pick(&bot, Some(&account), &a_levelled_catalogue(), |_| {
+            plan.iter().map(|id| id.to_string()).collect()
         })
     }
 
@@ -15268,7 +15269,8 @@ mod tests {
         let card = tree.find(ids::AGENT_MODEL_CARD).unwrap();
         assert_eq!(
             (card.name.as_str(), card.value.as_deref()),
-            ("GPT-6 Luna · Default", Some("gpt-6-luna"))
+            ("GPT-6 Luna · Medium", Some("gpt-6-luna")),
+            "a Bot that chose no effort is on its model's own level, by name"
         );
         assert_eq!(card.states, ["local_proxy"]);
         assert!(!tree.find("agent-model-pop").unwrap().visible);
@@ -15302,8 +15304,13 @@ mod tests {
         assert_eq!((fast.enabled, fast.checked), (true, Some(false)));
         let effort = tree.find("agent-model-effort").unwrap();
         assert_eq!(
-            (effort.name.as_str(), effort.value.as_deref()),
-            ("Default", Some("inherit"))
+            (
+                effort.role.as_str(),
+                effort.name.as_str(),
+                effort.value.as_deref()
+            ),
+            ("slider", "Medium", Some("inherit")),
+            "lit on the model's own level, with nothing chosen"
         );
         assert_eq!(
             tree.find("agent-model-open-list").unwrap().name,
@@ -15311,7 +15318,7 @@ mod tests {
         );
         assert!(
             !tree.find("agent-model-reset").unwrap().enabled,
-            "Default already, and ⚡ off: nothing to put back"
+            "nothing chosen, and ⚡ off: nothing to put back"
         );
         assert!(!tree.find("agent-model-list").unwrap().visible);
         host.click("agent-model-fast").unwrap();
@@ -15328,7 +15335,7 @@ mod tests {
             host.take_command(),
             Some(Command::SetModelEffort(word)) if word == "max"
         ));
-        for refused in ["inherit", "none", "Ultra", "extreme"] {
+        for refused in ["inherit", "none", "Max", "ultra", "extreme"] {
             assert!(
                 host.dispatch(&Op::SetValue {
                     target: "agent-model-effort".into(),
@@ -15338,6 +15345,18 @@ mod tests {
                 "{refused}"
             );
         }
+        let said = host
+            .dispatch(&Op::SetValue {
+                target: "agent-model-effort".into(),
+                value: "ultra".into(),
+            })
+            .unwrap_err();
+        assert!(
+            said.contains(
+                "`ultra` is not one of GPT-6 Luna's levels: low, medium, high, xhigh, max"
+            ),
+            "{said}"
+        );
         assert!(
             host.click("agent-model-effort").is_err(),
             "a slider is set, not clicked"
@@ -15426,7 +15445,7 @@ mod tests {
         host.model_picker.list_open = false;
         let tree = host.snapshot();
         let card = tree.find(ids::AGENT_MODEL_CARD).unwrap();
-        assert_eq!(card.name, "GPT-6 Luna · Extra ⚡");
+        assert_eq!(card.name, "GPT-6 Luna · Xhigh ⚡");
         assert_eq!(card.states, ["local_proxy", "fast", "expanded"]);
         assert_eq!(tree.find("agent-model-fast").unwrap().checked, Some(true));
         host.click("agent-model-fast").unwrap();
@@ -15434,6 +15453,342 @@ mod tests {
             host.take_command(),
             Some(Command::SetModelFast(false))
         ));
+    }
+
+    /// The slider has exactly the levels the model lists for its stops, low to high, and a driver
+    /// sets one by its word: GPT-6 Luna five, up to max, and Sol six, up to ultra. A level the
+    /// model does not list is refused in words that name the ones it does, and a model that lists
+    /// none has no slider on the tree at all, and nothing in its place: its node is absent, the
+    /// popover's controls are ⚡, the name and ↺ alone, and the card says no effort.
+    #[test]
+    fn the_slider_has_the_levels_the_model_lists_and_is_absent_where_it_lists_none() {
+        let set = |host: &mut NativeChatHost, value: &str| {
+            host.dispatch(&Op::SetValue {
+                target: "agent-model-effort".into(),
+                value: value.into(),
+            })
+        };
+        let mut host = host();
+        host.agent_settings_open = true;
+        host.model_picker.open = true;
+
+        // GPT-6 Luna: five levels, the one the Bot chose lit.
+        host.model_pick = Some(a_pick(
+            Some(serde_json::json!("local_proxy")),
+            "gpt-6-luna",
+            "xhigh",
+        ));
+        let tree = host.snapshot();
+        let effort = tree.find("agent-model-effort").unwrap();
+        assert_eq!(
+            (
+                effort.name.as_str(),
+                effort.value.as_deref(),
+                effort.enabled
+            ),
+            ("Xhigh", Some("xhigh"), true)
+        );
+        for word in ["low", "medium", "high", "xhigh", "max"] {
+            set(&mut host, word).unwrap();
+            assert!(
+                matches!(host.take_command(), Some(Command::SetModelEffort(sent)) if sent == word),
+                "{word}"
+            );
+        }
+        let said = set(&mut host, "ultra").unwrap_err();
+        assert!(
+            said.contains(
+                "`ultra` is not one of GPT-6 Luna's levels: low, medium, high, xhigh, max"
+            ),
+            "{said}"
+        );
+        let click = host.click("agent-model-effort").unwrap_err();
+        assert!(
+            click.contains("set_value it to one of low, medium, high, xhigh, max"),
+            "{click}"
+        );
+
+        // Sol: six levels, ultra among them, and none chosen sits on its own level, High.
+        host.model_pick = Some(a_pick_among(
+            &["gpt-6-luna", "gpt-5.6-sol"],
+            Some(serde_json::json!("local_proxy")),
+            "gpt-5.6-sol",
+            "inherit",
+        ));
+        let tree = host.snapshot();
+        let effort = tree.find("agent-model-effort").unwrap();
+        assert_eq!(
+            (effort.name.as_str(), effort.value.as_deref()),
+            ("High", Some("inherit"))
+        );
+        assert_eq!(
+            tree.find(ids::AGENT_MODEL_CARD).unwrap().name,
+            "GPT-5.6 Sol · High"
+        );
+        set(&mut host, "ultra").unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::SetModelEffort(sent)) if sent == "ultra"
+        ));
+        let click = host.click("agent-model-effort").unwrap_err();
+        assert!(
+            click.contains("set_value it to one of low, medium, high, xhigh, max, ultra"),
+            "{click}"
+        );
+
+        // Grok 4.7's source publishes no levels: no slider, nothing in its place.
+        host.model_pick = Some(a_pick(
+            Some(serde_json::json!("gateway")),
+            "xai/grok-4.7",
+            "inherit",
+        ));
+        let tree = host.snapshot();
+        assert!(tree.find("agent-model-effort").is_none());
+        let popover: Vec<&str> = tree
+            .find("agent-model-pop")
+            .unwrap()
+            .children
+            .iter()
+            .map(|node| node.id.as_str())
+            .collect();
+        assert_eq!(
+            popover,
+            [
+                "agent-model-fast",
+                "agent-model-open-list",
+                "agent-model-reset",
+                "agent-model-list"
+            ]
+        );
+        assert_eq!(tree.find(ids::AGENT_MODEL_CARD).unwrap().name, "Grok 4.7");
+        for refused in [
+            set(&mut host, "high").unwrap_err(),
+            host.click("agent-model-effort").unwrap_err(),
+        ] {
+            assert!(
+                refused.contains("Grok 4.7 lists no levels of effort, so there is no slider"),
+                "{refused}"
+            );
+        }
+        assert!(host.take_command().is_none());
+    }
+
+    /// Nothing the picker says, in the card or in the popover, says "Default" for an effort, in
+    /// whatever state the Bot's picker, Default for new Bots' and the Relay-off fallback's are:
+    /// where no effort was chosen the model's own level is named, where the model lists no
+    /// levels nothing is, and the card that is dead names no model and no effort.
+    #[test]
+    fn no_picker_says_default_for_an_effort_in_any_state() {
+        use crate::opengrok::{InferenceKind, NewBotDefault, PlanFallback};
+        use crate::state::{DefaultForNewBots, RelayOffFallback};
+        fn said_under(node: &UiNode, into: &mut Vec<String>) {
+            into.push(node.name.clone());
+            into.extend(node.value.clone());
+            into.extend(node.states.clone());
+            for child in &node.children {
+                said_under(child, into);
+            }
+        }
+        let mut said = Vec::new();
+        let mut look = |host: &NativeChatHost, card: &str| {
+            let tree = host.snapshot();
+            let node = tree
+                .find(card)
+                .unwrap_or_else(|| panic!("{card} is on the tree"));
+            said_under(node, &mut said);
+        };
+        let states = [
+            ("gpt-6-luna", "inherit"),
+            ("gpt-6-luna", "medium"),
+            ("gpt-6-luna", "ultra"),
+            ("gpt-6-luna", "none"),
+            ("oag/cheap", "inherit"),
+            ("xai/grok-4.7", "inherit"),
+            ("xai/grok-4.7", "high"),
+            ("oag/unlisted", "inherit"),
+        ];
+        // Each of the three, shut, open on its controls, and open on its list.
+        for (open, list_open) in [(false, false), (true, false), (true, true)] {
+            for (model, effort) in states {
+                let source = if model.starts_with("gpt") {
+                    "local_proxy"
+                } else {
+                    "gateway"
+                };
+                let mut host = host();
+                host.agent_settings_open = true;
+                host.model_pick = Some(a_pick(Some(serde_json::json!(source)), model, effort));
+                host.model_picker.open = open;
+                host.model_picker.list_open = list_open;
+                look(&host, ids::AGENT_MODEL_CARD);
+
+                let mut host = self::host();
+                host.account_open = true;
+                host.general_tab = true;
+                host.reply_source.settings.kept = relay_read("loopback");
+                host.reply_source.new_bots = DefaultForNewBots::Kept(None);
+                host.new_bots_pick = Some(a_new_bots_pick(Some(NewBotDefault {
+                    source: if source == "gateway" {
+                        InferenceKind::Gateway
+                    } else {
+                        InferenceKind::LocalProxy
+                    },
+                    model: model.into(),
+                    effort: effort.into(),
+                })));
+                host.new_bots_picker.open = open;
+                host.new_bots_picker.list_open = list_open;
+                look(&host, ids::NEW_BOTS_CARD);
+
+                if source == "gateway" {
+                    host.reply_source.plan_fallback = RelayOffFallback::Kept(None);
+                    host.plan_fallback_pick = Some(a_plan_fallback_pick(Some(PlanFallback {
+                        model: model.into(),
+                        effort: effort.into(),
+                    })));
+                    host.plan_fallback_picker.open = open;
+                    host.plan_fallback_picker.list_open = list_open;
+                    look(&host, ids::PLAN_FALLBACK_CARD);
+                }
+            }
+        }
+        // None set in the two that can have none, and the dead cards of a server that keeps none.
+        for open in [false, true] {
+            let mut host = host();
+            host.account_open = true;
+            host.general_tab = true;
+            host.reply_source.settings.kept = relay_read("loopback");
+            host.reply_source.new_bots = DefaultForNewBots::Kept(None);
+            host.new_bots_pick = Some(a_new_bots_pick(None));
+            host.new_bots_picker.open = open;
+            look(&host, ids::NEW_BOTS_CARD);
+            host.reply_source.plan_fallback = RelayOffFallback::Kept(None);
+            host.plan_fallback_pick = Some(a_plan_fallback_pick(None));
+            host.plan_fallback_picker.open = open;
+            look(&host, ids::PLAN_FALLBACK_CARD);
+        }
+        let mut host = host();
+        host.account_open = true;
+        host.general_tab = true;
+        look(&host, ids::NEW_BOTS_CARD);
+        look(&host, ids::PLAN_FALLBACK_CARD);
+
+        assert!(said.len() > 100, "a good many words were looked at");
+        let defaults: Vec<&String> = said
+            .iter()
+            .filter(|word| word.contains("Default"))
+            .collect();
+        assert!(defaults.is_empty(), "{defaults:?}");
+    }
+
+    /// The same slider is in all three pickers, under their own ids: the model's levels for its
+    /// stops, the model's own level lit where none was chosen, one of its levels set by its word
+    /// and any other refused in the same words, and no slider at all where there is no model, in
+    /// Default for new Bots' and the Relay-off fallback's.
+    #[test]
+    fn the_three_pickers_have_the_same_slider() {
+        use crate::opengrok::{InferenceKind, NewBotDefault, PlanFallback};
+        use crate::state::{DefaultForNewBots, RelayOffFallback};
+        // Each picker on Cheap (auto), which lists five levels, with the effort given, open on
+        // its controls.
+        let on = |which: PickerFor, effort: &str| {
+            let mut host = host();
+            host.account_open = true;
+            host.general_tab = true;
+            host.agent_settings_open = true;
+            host.reply_source.settings.kept = relay_read("loopback");
+            match which {
+                PickerFor::Bot => {
+                    host.model_pick = Some(a_pick(
+                        Some(serde_json::json!("gateway")),
+                        "oag/cheap",
+                        effort,
+                    ));
+                    host.model_picker.open = true;
+                }
+                PickerFor::NewBots => {
+                    host.reply_source.new_bots = DefaultForNewBots::Kept(None);
+                    host.new_bots_pick = Some(a_new_bots_pick(Some(NewBotDefault {
+                        source: InferenceKind::Gateway,
+                        model: "oag/cheap".into(),
+                        effort: effort.into(),
+                    })));
+                    host.new_bots_picker.open = true;
+                }
+                PickerFor::PlanFallback => {
+                    host.reply_source.plan_fallback = RelayOffFallback::Kept(None);
+                    host.plan_fallback_pick = Some(a_plan_fallback_pick(Some(PlanFallback {
+                        model: "oag/cheap".into(),
+                        effort: effort.into(),
+                    })));
+                    host.plan_fallback_picker.open = true;
+                }
+            }
+            host
+        };
+        let ids_of = |which: PickerFor| model_picker::ids(which).effort;
+        for which in [PickerFor::Bot, PickerFor::NewBots, PickerFor::PlanFallback] {
+            let effort = ids_of(which);
+            // None chosen: the model's own level, Medium, is lit, and the word kept is `inherit`.
+            let mut host = on(which, "inherit");
+            let tree = host.snapshot();
+            let node = tree.find(effort).unwrap();
+            assert_eq!(
+                (
+                    node.role.as_str(),
+                    node.name.as_str(),
+                    node.value.as_deref(),
+                    node.enabled
+                ),
+                ("slider", "Medium", Some("inherit"), true),
+                "{effort}"
+            );
+            // A level the Bot chose: lit by name, and valued by its word.
+            let host_high = on(which, "xhigh");
+            let tree = host_high.snapshot();
+            let node = tree.find(effort).unwrap();
+            assert_eq!(
+                (node.name.as_str(), node.value.as_deref()),
+                ("Xhigh", Some("xhigh")),
+                "{effort}"
+            );
+            // A level of the model's is sent, and one that is not is refused in the same words.
+            host.set_value(effort, "max").unwrap();
+            let sent = host.take_command();
+            assert!(
+                match which {
+                    PickerFor::Bot =>
+                        matches!(sent, Some(Command::SetModelEffort(word)) if word == "max"),
+                    PickerFor::NewBots =>
+                        matches!(sent, Some(Command::NewBots(PickerCommand::SetEffort(word))) if word == "max"),
+                    PickerFor::PlanFallback =>
+                        matches!(sent, Some(Command::PlanFallback(PickerCommand::SetEffort(word))) if word == "max"),
+                },
+                "{effort}"
+            );
+            let refused = host.set_value(effort, "ultra").unwrap_err();
+            assert!(
+                refused.ends_with(
+                    "`ultra` is not one of Cheap (auto)'s levels: low, medium, high, xhigh, max"
+                ),
+                "{refused}"
+            );
+        }
+
+        // No model, no levels, no slider: Default for new Bots' and the fallback's, before one
+        // is picked.
+        for which in [PickerFor::NewBots, PickerFor::PlanFallback] {
+            let effort = ids_of(which);
+            let mut host = on(which, "inherit");
+            match which {
+                PickerFor::NewBots => host.new_bots_pick = Some(a_new_bots_pick(None)),
+                _ => host.plan_fallback_pick = Some(a_plan_fallback_pick(None)),
+            }
+            let tree = host.snapshot();
+            assert!(tree.find(effort).is_none(), "{effort}");
+            let refused = host.set_value(effort, "high").unwrap_err();
+            assert!(refused.contains("no model is picked"), "{refused}");
+        }
     }
 
     /// The composer has no chip: a Bot's model is picked on its card in its settings, and
@@ -15765,7 +16120,8 @@ mod tests {
         let tree = host.snapshot();
         assert_eq!(
             tree.find(ids::AGENT_MODEL_CARD).unwrap().name,
-            "GPT-5 Codex · Medium"
+            "GPT-5 Codex",
+            "no row of the list answers, so no levels to name"
         );
         assert_eq!(
             tree.find("agent-model-fast").unwrap().value.as_deref(),
@@ -15889,7 +16245,15 @@ mod tests {
         assert_eq!(
             tree.find(ids::AGENT_MODEL_CARD)
                 .map(|node| node.name.as_str()),
-            Some("Cheap (auto) · Light")
+            Some("Cheap (auto)"),
+            "no list read yet: no levels to name"
+        );
+        state.model_catalogue = a_levelled_catalogue();
+        let tree = NativeChatHost::from_app(&state).snapshot();
+        assert_eq!(
+            tree.find(ids::AGENT_MODEL_CARD)
+                .map(|node| node.name.as_str()),
+            Some("Cheap (auto) · Low")
         );
         assert!(
             tree.find(ids::AGENT_SETTINGS)

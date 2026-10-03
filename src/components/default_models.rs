@@ -199,12 +199,12 @@ mod tests {
 
     /// Default for new Bots says it is coming, in the owner's words, while the server keeps no
     /// such default, which is also before the setting is read: the picker's card in it names no
-    /// model and the effort a Bot with none of its own reads as, and takes no click. Where the
-    /// server keeps one, the section says what the card is, and that None leaves it to the
-    /// server. It is under Default models.
+    /// model, and no effort, since a card with no model has no levels to name one of, and takes
+    /// no click. Where the server keeps one, the section says what the card is, and that None
+    /// leaves it to the server. It is under Default models.
     #[test]
     fn the_default_for_new_bots_is_coming_and_its_card_is_dead() {
-        use crate::components::model_picker::dead_card_words;
+        use crate::components::model_picker::dead_card_model;
         use crate::state::DefaultForNewBots;
         assert_eq!(TITLE, "Default models");
         assert_eq!(NEW_BOTS_TITLE, "Default for new Bots");
@@ -217,7 +217,7 @@ mod tests {
             crate::state::AppState::new().default_for_new_bots(),
             DefaultForNewBots::NotOnServer
         );
-        assert_eq!(dead_card_words(), ("No model", "Default"));
+        assert_eq!(dead_card_model(), "No model");
         assert!(NEW_BOTS_LINE.contains("None leaves it to the server's default"));
     }
 

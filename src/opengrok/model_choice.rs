@@ -1,6 +1,6 @@
 //! A Bot's model as its picker offers it: the models the server lists, folded and named for a
-//! person in the two groups a Bot can be answered from; the effort slider's five stops; and what
-//! each change the picker makes sends to the server.
+//! person in the two groups a Bot can be answered from; the effort slider's stops, which are the
+//! levels the model itself lists; and what each change the picker makes sends to the server.
 //!
 //! No GPUI. The Model card in the Bot's settings draws what is here (`components::model_picker`),
 //! and the gpui-agent tree names it, so the two always agree.
@@ -11,6 +11,15 @@
 //! opencodex lists a model's fast tier as a twin id, `gpt-6-luna--fast` beside `gpt-6-luna`, and
 //! the server's allowlist takes the tier off before it reads the rest ([`is_subscription_model`]),
 //! so ⚡ is the pin moved to the twin and back, offered only where the list holds both.
+//!
+//! How hard a model can think is the model's to say: `GET /models` lists each model's levels of
+//! effort, lowest first, and the one it runs at when a Bot chooses none (`efforts` and
+//! `ownEffort`, from opengrok-server branch `model-effort-levels`, shape agreed (not recorded
+//! yet)). The slider's stops are exactly those levels, named as the model names them, and a
+//! model that lists none has no slider at all. A Bot, or a setting, that chose no effort
+//! (`inherit`) sits on the model's own level, by name, and that is only what is shown: nothing
+//! is saved until the person moves the slider. This app never works a model's levels out, and
+//! it never shows "Default": the model's own level is its name.
 //!
 //! What the card says is what the server would run the Bot's next turn on, as far as this app can
 //! tell, and never a pin the server would ignore. On the person's plan the server asks the Bot's
@@ -24,8 +33,9 @@
 //! the account's plan model for every Bot on the plan.
 
 use super::{
-    Coworker, CoworkerPatch, CoworkerSource, EFFORT_INHERIT, InferenceKind, InferenceSource,
-    ModelCatalogue, NewBotDefault, PlanFallback, Via, is_subscription_model,
+    Coworker, CoworkerPatch, CoworkerSource, EFFORT_INHERIT, EffortLevel, InferenceKind,
+    InferenceSource, ModelCatalogue, ModelEntry, NewBotDefault, PlanFallback, Via,
+    is_subscription_model,
 };
 
 /// What opencodex puts after a model's id for its fast tier.
@@ -108,9 +118,46 @@ pub struct ModelChoice {
     pub has_fast: bool,
     /// What the row reads as ([`model_label`]).
     pub label: String,
+    /// The levels of effort the model lists, lowest first: the slider's stops. Empty where it
+    /// lists none, and then there is no slider. A row that folded a fast twin in has its base
+    /// model's: the twin is the same model at the faster tier.
+    pub efforts: Vec<EffortLevel>,
+    /// The `value` of the level the model runs at when a Bot chooses none, which is always one of
+    /// `efforts`: a word the model does not list is none here.
+    pub own_effort: Option<String>,
+}
+
+impl EffortLevel {
+    /// The level as the slider and the card name it: the model's own label, without the word
+    /// every one of opencodex's ends with, so "Low Effort" is "Low". A label that says nothing
+    /// else is the word itself.
+    pub fn name(&self) -> String {
+        let words: Vec<&str> = self.label.split_whitespace().collect();
+        let bare = match words.split_last() {
+            Some((last, rest)) if !rest.is_empty() && last.eq_ignore_ascii_case("effort") => {
+                rest.join(" ")
+            }
+            _ => words.join(" "),
+        };
+        if bare.is_empty() {
+            capitalised(&self.value)
+        } else {
+            bare
+        }
+    }
 }
 
 impl ModelChoice {
+    /// The level of this model that `value` is, if it lists one.
+    pub fn level(&self, value: &str) -> Option<&EffortLevel> {
+        self.efforts.iter().find(|level| level.value == value)
+    }
+
+    /// The level the model runs at when a Bot chooses none.
+    pub fn own_level(&self) -> Option<&EffortLevel> {
+        self.level(self.own_effort.as_deref()?)
+    }
+
     /// The id a pick of this row pins with ⚡ on or off: the twin only where the list has one.
     pub fn pin(&self, fast: bool) -> String {
         if fast && self.has_fast {
@@ -238,9 +285,31 @@ pub fn fold<'a>(source: InferenceKind, ids: impl IntoIterator<Item = &'a str>) -
             base_id: base.to_string(),
             has_fast: plain.is_some() || (!is_fast(id) && listed(&format!("{id}{FAST_SUFFIX}"))),
             label: model_label(base),
+            efforts: Vec::new(),
+            own_effort: None,
         });
     }
     rows
+}
+
+/// `rows` with the levels of effort each model lists, read off the entry `listed` finds for the
+/// row's `base_id`: a row that folded a fast twin in has its base model's, and a fast tier listed
+/// alone its own. A model with no entry, or an entry that lists none, lists none: this app never
+/// works a model's levels out.
+fn with_levels<'a>(
+    rows: Vec<ModelChoice>,
+    listed: impl Fn(&str) -> Option<&'a ModelEntry>,
+) -> Vec<ModelChoice> {
+    rows.into_iter()
+        .map(|row| match listed(&row.base_id) {
+            Some(entry) => ModelChoice {
+                efforts: entry.efforts.clone().unwrap_or_default(),
+                own_effort: entry.own_level().map(|level| level.value.clone()),
+                ..row
+            },
+            None => row,
+        })
+        .collect()
 }
 
 /// The Gateway group: the gateway's routes as `GET /models` lists them, in its order, less the
@@ -254,12 +323,18 @@ pub fn server_choices(catalogue: &ModelCatalogue) -> Vec<ModelChoice> {
         .map(|entry| entry.id.as_str())
         .filter(|id| !ends_with_pin(without_fast(id), SEAT_SUFFIX))
         .collect();
-    fold(
+    let rows = fold(
         InferenceKind::Gateway,
         ids.iter()
             .copied()
             .filter(|id| !api_pin_of_a_listed_model(id, &ids)),
-    )
+    );
+    with_levels(rows, |id| {
+        catalogue
+            .models
+            .iter()
+            .find(|entry| entry.source() == Some(InferenceKind::Gateway) && entry.id == id)
+    })
 }
 
 /// Whether `id` ends with a credential pin (`@sub`, `@api`), ignoring the pin's case.
@@ -280,9 +355,16 @@ fn api_pin_of_a_listed_model(id: &str, listed: &[&str]) -> bool {
 }
 
 /// The Subscription group: the person's plan's models as `AppState::plan_models` gives them for
-/// the account's way to the plan, already held to the server's allowlist.
-pub fn plan_choices(ids: &[String]) -> Vec<ModelChoice> {
-    fold(InferenceKind::LocalProxy, ids.iter().map(String::as_str))
+/// the account's way `via` to the plan, already held to the server's allowlist, with the levels of
+/// effort the catalogue lists for each of them through that way.
+pub fn plan_choices(ids: &[String], via: Via, catalogue: &ModelCatalogue) -> Vec<ModelChoice> {
+    let rows = fold(InferenceKind::LocalProxy, ids.iter().map(String::as_str));
+    with_levels(rows, |id| {
+        catalogue
+            .models
+            .iter()
+            .find(|entry| entry.plan_via() == Some(via) && entry.id == id)
+    })
 }
 
 /// A model as a person reads it: `gpt-6-luna` is "GPT-6 Luna", `openai/gpt-6.1-sol` "GPT-6.1
@@ -395,50 +477,6 @@ fn capitalised(word: &str) -> String {
     chars.next().map_or_else(String::new, |first| {
         first.to_ascii_uppercase().to_string() + chars.as_str()
     })
-}
-
-/// The slider's five stops, left to right: the name each reads as, and the server's word it
-/// keeps (opengrok-server#271's `EFFORT_WORDS`, in its order).
-pub const EFFORT_STOPS: [(&str, &str); 5] = [
-    ("Light", "low"),
-    ("Medium", "medium"),
-    ("High", "high"),
-    ("Extra", "xhigh"),
-    ("Ultra", "max"),
-];
-
-/// What a Bot with no effort of its own reads as: its turns send the gateway none, and the
-/// model's route decides.
-pub const DEFAULT_EFFORT_LABEL: &str = "Default";
-
-/// Where the slider's thumb sits for a word that is none of the stops.
-const MEDIUM_STOP: usize = 1;
-
-/// The stop a server word is, if it is one.
-pub fn effort_stop(word: &str) -> Option<usize> {
-    EFFORT_STOPS.iter().position(|(_, stop)| *stop == word)
-}
-
-/// The server word a stop keeps.
-pub fn stop_word(stop: usize) -> Option<&'static str> {
-    EFFORT_STOPS.get(stop).map(|(_, word)| *word)
-}
-
-/// An effort as the picker names it: a stop by its name, `inherit` as "Default", and a word the
-/// server keeps that is none of the stops (`none`, or one this app has not heard of) as it is,
-/// so the picker never shows a value the server does not hold.
-pub fn effort_label(word: &str) -> String {
-    if word == EFFORT_INHERIT {
-        return DEFAULT_EFFORT_LABEL.to_string();
-    }
-    effort_stop(word).map_or_else(|| word.to_string(), |stop| EFFORT_STOPS[stop].0.to_string())
-}
-
-/// Where the slider's thumb sits for a word: on its stop, and on Medium for a word with none
-/// (Default, or a kept word such as `none`), where the slider is drawn muted and the label beside
-/// it says which it is.
-pub fn slider_stop(word: &str) -> usize {
-    effort_stop(word).unwrap_or(MEDIUM_STOP)
 }
 
 /// On a server without per-Bot doors, while the account's replies are on the person's plan: the
@@ -627,7 +665,7 @@ fn choice_groups(
     plan_models: impl Fn(Via) -> Vec<String>,
 ) -> Vec<ChoiceGroup> {
     let plan = match (per_bot, account.and_then(account_via)) {
-        (true, Some(via)) => plan_choices(&plan_models(via)),
+        (true, Some(via)) => plan_choices(&plan_models(via), via, catalogue),
         _ => Vec::new(),
     };
     [
@@ -767,14 +805,47 @@ impl ModelPick {
             .map_or_else(|| self.unset.to_string(), base_label)
     }
 
-    /// The picker in a line, as a driver's tree names the card: "GPT-6 Luna · Medium ⚡".
+    /// The picker in a line, as a driver's tree names the card: "GPT-6 Luna · Medium ⚡". A model
+    /// that lists no levels of effort has none to name: "GPT-6 Luna ⚡".
     pub fn summary(&self) -> String {
         let fast = if self.is_fast() { " ⚡" } else { "" };
-        format!(
-            "{} · {}{fast}",
-            self.model_label(),
-            effort_label(&self.effort)
-        )
+        match self.effort_name() {
+            Some(effort) => format!("{} · {effort}{fast}", self.model_label()),
+            None => format!("{}{fast}", self.model_label()),
+        }
+    }
+
+    /// The levels of effort the model on the card lists, lowest first: the slider's stops. Empty
+    /// where the model lists none, or no model answers, and then the popover has no slider.
+    pub fn levels(&self) -> &[EffortLevel] {
+        self.current
+            .as_ref()
+            .map(|row| row.efforts.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// The popover draws a slider: the model lists levels of effort.
+    pub fn has_slider(&self) -> bool {
+        !self.levels().is_empty()
+    }
+
+    /// Where the slider sits, as a place among [`Self::levels`]: the effort the Bot chose, where
+    /// the model lists it, and otherwise the model's own level, which is where a Bot that chose
+    /// none (`inherit`) is. Nothing where the model names no level of its own either. Showing a
+    /// level is not saving it: an effort is saved only when the person moves the slider.
+    pub fn lit(&self) -> Option<usize> {
+        let row = self.current.as_ref()?;
+        let place = |value: &str| row.efforts.iter().position(|level| level.value == value);
+        let chosen = (self.effort != EFFORT_INHERIT)
+            .then(|| place(&self.effort))
+            .flatten();
+        chosen.or_else(|| row.own_effort.as_deref().and_then(place))
+    }
+
+    /// The name of the level the slider sits on ([`Self::lit`]), as the model names it: "Medium".
+    /// What the card's line says of the effort; nothing where there is no level to name.
+    pub fn effort_name(&self) -> Option<String> {
+        self.levels().get(self.lit()?).map(EffortLevel::name)
     }
 
     /// Every row the list offers, group by group.
@@ -879,16 +950,24 @@ impl ModelPick {
     }
 
     /// What a stop of the slider sends: its word, where it is not the Bot's already. Refused from
-    /// a server that keeps no effort, and for a word that is not one of the five stops.
+    /// a server that keeps no effort, from a model that lists no levels, and for a word that is
+    /// none of the model's own levels, in words that name them.
     pub fn effort_patch(&self, word: &str) -> Result<Option<CoworkerPatch>, String> {
         if let Some(why) = self.effort_dead {
             return Err(why.to_string());
         }
-        if effort_stop(word).is_none() {
-            let stops: Vec<&str> = EFFORT_STOPS.iter().map(|(_, word)| *word).collect();
+        let model = self.model_label();
+        let levels = self.levels();
+        if levels.is_empty() {
             return Err(format!(
-                "`{word}` is not a stop of the slider, which keeps {}",
-                stops.join(", ")
+                "{model} lists no levels of effort, so there is no slider"
+            ));
+        }
+        if !levels.iter().any(|level| level.value == word) {
+            let listed: Vec<&str> = levels.iter().map(|level| level.value.as_str()).collect();
+            return Err(format!(
+                "`{word}` is not one of {model}'s levels: {}",
+                listed.join(", ")
             ));
         }
         Ok((word != self.effort).then(|| CoworkerPatch {
@@ -897,9 +976,9 @@ impl ModelPick {
         }))
     }
 
-    /// What ↺ sends: the effort back to Default, where the server keeps one, and ⚡ off where it
-    /// is on and can be switched. The model itself is left where it is. Nothing when there is
-    /// nothing to put back.
+    /// What ↺ sends: the effort back to `inherit`, where the server keeps one, so the slider
+    /// shows the model's own level, and ⚡ off where it is on and can be switched. The model
+    /// itself is left where it is. Nothing when there is nothing to put back.
     pub fn reset_patch(&self) -> Option<CoworkerPatch> {
         let effort = (self.effort_dead.is_none() && self.effort != EFFORT_INHERIT)
             .then(|| EFFORT_INHERIT.to_string());
@@ -954,26 +1033,104 @@ impl ModelPick {
     }
 }
 
+/// What `GET /models` lists in the tests that draw a picker (opengrok-server branch
+/// `model-effort-levels`, shape agreed (not recorded yet)): two gateway routes, `oag/cheap`,
+/// which lists five levels of effort, low to max, and `medium` as its own, and `xai/grok-4.7`,
+/// whose source publishes none; and the plan's GPT-6 Luna, with its fast twin, listing the same
+/// five and `medium`, and Sol, six, up to ultra, and `high`.
+#[cfg(test)]
+pub(crate) fn levelled_catalogue() -> ModelCatalogue {
+    let levels = |words: &[&str]| -> Vec<serde_json::Value> {
+        words
+            .iter()
+            .map(|word| {
+                let name = format!("{}{}", word[..1].to_uppercase(), &word[1..]);
+                serde_json::json!({"value": word, "label": format!("{name} Effort")})
+            })
+            .collect()
+    };
+    let five = levels(&["low", "medium", "high", "xhigh", "max"]);
+    let six = levels(&["low", "medium", "high", "xhigh", "max", "ultra"]);
+    serde_json::from_value(serde_json::json!({
+        "models": [
+            {"id": "oag/cheap", "source": "gateway", "efforts": five, "ownEffort": "medium"},
+            {"id": "xai/grok-4.7", "source": "gateway", "efforts": null, "ownEffort": null},
+            {"id": "gpt-6-luna", "source": "local_proxy", "efforts": five, "ownEffort": "medium"},
+            {"id": "gpt-6-luna--fast", "source": "local_proxy", "efforts": five,
+             "ownEffort": "medium"},
+            {"id": "gpt-5.6-sol", "source": "local_proxy", "efforts": six, "ownEffort": "high"}
+        ],
+        "note": null
+    }))
+    .expect("a list")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::opengrok::{ModelEntry, RelayRead};
     use serde_json::{Value, json};
 
+    /// The levels opencodex lists for a model, as it labels them: Sol's six run up to ultra, every
+    /// other model's five up to max.
+    fn levels_of(id: &str) -> Vec<EffortLevel> {
+        let words: &[&str] = if id.contains("sol") {
+            &["low", "medium", "high", "xhigh", "max", "ultra"]
+        } else {
+            &["low", "medium", "high", "xhigh", "max"]
+        };
+        words
+            .iter()
+            .map(|word| EffortLevel {
+                value: word.to_string(),
+                label: format!("{} Effort", capitalised(word)),
+            })
+            .collect()
+    }
+
+    /// A model the list holds, listing the levels `levels_of` gives it, and running at Medium
+    /// where nothing is chosen, or at High on Sol.
     fn entry(id: &str, source: &str, via: Option<&str>) -> ModelEntry {
         ModelEntry {
             id: id.into(),
             source: Some(source.into()),
             via: via.map(str::to_string),
+            efforts: Some(levels_of(id)),
+            own_effort: Some(if id.contains("sol") { "high" } else { "medium" }.to_string()),
+        }
+    }
+
+    /// A model the list holds that lists no levels of effort: its source publishes none.
+    fn plain(id: &str, source: &str) -> ModelEntry {
+        ModelEntry {
+            id: id.into(),
+            source: Some(source.into()),
             ..Default::default()
         }
     }
 
+    /// The plan's models the picker tests offer through the person's own machine, as `PLAN` and
+    /// the lists the tests below hand `bot_pick` name them.
+    const PLAN_LISTED: &[&str] = &[
+        "gpt-6-luna",
+        "gpt-6-luna--fast",
+        "gpt-5.6-sol",
+        "gpt-6-sol",
+        "gpt-5-codex",
+    ];
+
+    /// The list `GET /models` gives: the gateway's routes `gateway`, and the plan's models
+    /// ([`PLAN_LISTED`]) through the server's own machine.
     fn catalogue(gateway: &[&str]) -> ModelCatalogue {
         ModelCatalogue {
             models: gateway
                 .iter()
                 .map(|id| entry(id, "gateway", None))
+                .chain(
+                    PLAN_LISTED
+                        .iter()
+                        .map(|id| entry(id, "local_proxy", Some("loopback"))),
+                )
                 .collect(),
             note: None,
             local_proxy: None,
@@ -1268,6 +1425,8 @@ mod tests {
                     base_id: format!("{word}-{at}"),
                     has_fast: false,
                     label: format!("{word} {at}"),
+                    efforts: Vec::new(),
+                    own_effort: None,
                 })
                 .collect()
         };
@@ -1378,37 +1537,312 @@ mod tests {
         assert!(pick.plan_line("cheap").is_none());
     }
 
-    /// The slider's five stops are the server's words, both ways; Default is `inherit`, and a
-    /// kept word that is no stop reads as itself, with the thumb on Medium.
+    /// A Bot on its own plan, pinned to `model` with `effort`, as the account on the server's keys
+    /// sees it.
+    fn on_plan(model: &str, effort: &str) -> ModelPick {
+        bot_pick(
+            &bot(Some(json!("local_proxy")), model, Some(effort)),
+            Some(&account(InferenceKind::Gateway, None)),
+            &catalogue(SERVER),
+            plan(PLAN),
+        )
+    }
+
+    /// The words the slider's stops keep, low to high.
+    fn words(pick: &ModelPick) -> Vec<&str> {
+        pick.levels()
+            .iter()
+            .map(|level| level.value.as_str())
+            .collect()
+    }
+
+    /// The names the slider's stops read as, low to high.
+    fn names(pick: &ModelPick) -> Vec<String> {
+        pick.levels().iter().map(EffortLevel::name).collect()
+    }
+
+    /// The slider's stops are exactly the levels the model lists, low to high, named as the model
+    /// names them: GPT-6 Luna five up to max, Sol six up to ultra; a model that lists none has no
+    /// slider, and nothing in its place. Fast is no other model: the twin's row is the base's.
     #[test]
-    fn the_sliders_stops_are_the_servers_effort_words() {
+    fn the_sliders_stops_are_the_levels_the_model_lists() {
+        let luna = on_plan("gpt-6-luna", "medium");
+        assert!(luna.has_slider());
+        assert_eq!(words(&luna), ["low", "medium", "high", "xhigh", "max"]);
+        assert_eq!(names(&luna), ["Low", "Medium", "High", "Xhigh", "Max"]);
+        let sol = on_plan("gpt-5.6-sol", "high");
         assert_eq!(
-            EFFORT_STOPS.map(|(name, word)| (effort_label(word), effort_stop(word), name)),
-            [
-                ("Light".to_string(), Some(0), "Light"),
-                ("Medium".to_string(), Some(1), "Medium"),
-                ("High".to_string(), Some(2), "High"),
-                ("Extra".to_string(), Some(3), "Extra"),
-                ("Ultra".to_string(), Some(4), "Ultra"),
-            ]
+            words(&sol),
+            ["low", "medium", "high", "xhigh", "max", "ultra"]
         );
         assert_eq!(
-            (0..6).map(stop_word).collect::<Vec<_>>(),
-            [
-                Some("low"),
-                Some("medium"),
-                Some("high"),
-                Some("xhigh"),
-                Some("max"),
-                None
-            ]
+            names(&sol),
+            ["Low", "Medium", "High", "Xhigh", "Max", "Ultra"]
         );
-        assert_eq!(effort_label("inherit"), "Default");
-        assert_eq!(effort_label("none"), "none");
-        assert_eq!(effort_label("ultra"), "ultra");
+        let fast = on_plan("gpt-6-luna--fast", "medium");
+        assert_eq!(words(&fast), words(&luna), "a twin's levels are its base's");
+
+        // The gateway's route that lists none: no slider, no level to name, and the card says
+        // the model and nothing of effort.
+        let mut listed = catalogue(SERVER);
+        listed.models.retain(|entry| entry.id != "oag/cheap");
+        listed.models.push(plain("oag/cheap", "gateway"));
+        let cheap = bot_pick(
+            &bot(Some(json!("gateway")), "oag/cheap", Some("inherit")),
+            None,
+            &listed,
+            plan(PLAN),
+        );
+        assert!(!cheap.has_slider());
+        assert!(cheap.levels().is_empty());
+        assert_eq!((cheap.lit(), cheap.effort_name()), (None, None));
+        assert_eq!(cheap.summary(), "Cheap (auto)");
+        // No model answering is no levels either.
+        let nobody = bot_pick(
+            &bot(Some(json!("gateway")), "oag/unlisted", Some("high")),
+            None,
+            &catalogue(SERVER),
+            plan(PLAN),
+        );
+        assert!(!nobody.has_slider());
+        assert_eq!(nobody.summary(), "Unlisted (auto)");
+    }
+
+    /// A level is named by the model's own label without the word every one of opencodex's ends
+    /// with: "Low Effort" is "Low". A label with nothing else in it, or no label, is the word.
+    #[test]
+    fn an_effort_level_is_named_without_the_word_effort() {
+        let level = |value: &str, label: &str| EffortLevel {
+            value: value.into(),
+            label: label.into(),
+        };
+        for (value, label, name) in [
+            ("low", "Low Effort", "Low"),
+            ("xhigh", "Xhigh Effort", "Xhigh"),
+            ("max", "MAX EFFORT", "MAX"),
+            ("high", "  High   effort ", "High"),
+            ("medium", "Medium", "Medium"),
+            ("ultra", "Ultra (slow)", "Ultra (slow)"),
+            ("low", "Extra low effort", "Extra low"),
+            ("medium", "Effort", "Effort"),
+            ("medium", "", "Medium"),
+            ("max", "   ", "Max"),
+        ] {
+            assert_eq!(level(value, label).name(), name, "{label:?}");
+        }
+    }
+
+    /// A fast twin lists the levels its base model lists, whatever its own entry says, since it is
+    /// the same model at the faster tier; a fast tier listed alone is a model of its own.
+    #[test]
+    fn a_fast_twins_levels_are_its_base_models() {
+        let mut listed = catalogue(SERVER);
+        let few: Vec<EffortLevel> = levels_of("gpt-6-luna")[..2].to_vec();
+        for entry in &mut listed.models {
+            if entry.id == "gpt-6-luna--fast" {
+                entry.efforts = Some(few.to_vec());
+                entry.own_effort = Some("low".into());
+            }
+        }
+        let account = account(InferenceKind::Gateway, None);
+        let pick = |model: &str, ids: &'static [&'static str], listed: &ModelCatalogue| {
+            bot_pick(
+                &bot(Some(json!("local_proxy")), model, Some("inherit")),
+                Some(&account),
+                listed,
+                plan(ids),
+            )
+        };
+        let twin = pick("gpt-6-luna--fast", PLAN, &listed);
+        assert_eq!(words(&twin), ["low", "medium", "high", "xhigh", "max"]);
+        assert_eq!(twin.effort_name().as_deref(), Some("Medium"));
+        assert_eq!(twin.summary(), "GPT-6 Luna · Medium ⚡");
+
+        listed.models.push(ModelEntry {
+            efforts: Some(few.to_vec()),
+            own_effort: Some("low".into()),
+            ..entry("grok-4.7--fast", "local_proxy", Some("loopback"))
+        });
+        let alone = pick("grok-4.7--fast", &["grok-4.7--fast"], &listed);
+        assert_eq!(words(&alone), ["low", "medium"], "its own entry's");
+        assert_eq!(alone.effort_name().as_deref(), Some("Low"));
+    }
+
+    /// A Bot that chose no effort (`inherit`) sits on the model's own level, lit by name, and the
+    /// card says it: nothing is "Default", and nothing was chosen or saved by showing it. A level
+    /// the Bot chose is lit instead; one the model does not list, and a model that names no level
+    /// of its own, light what there is to light and nothing else.
+    #[test]
+    fn a_bot_that_chose_no_effort_sits_on_the_models_own_level() {
+        let luna = on_plan("gpt-6-luna", "inherit");
+        assert_eq!(luna.effort, "inherit", "nothing is saved by showing it");
         assert_eq!(
-            ["low", "max", "inherit", "none"].map(slider_stop),
-            [0, 4, 1, 1]
+            (luna.lit(), luna.effort_name().as_deref()),
+            (Some(1), Some("Medium"))
+        );
+        assert_eq!(luna.summary(), "GPT-6 Luna · Medium");
+        assert!(!luna.can_reset(), "nothing to put back");
+        let sol = on_plan("gpt-5.6-sol", "inherit");
+        assert_eq!(
+            (sol.lit(), sol.effort_name().as_deref()),
+            (Some(2), Some("High"))
+        );
+
+        let chosen = on_plan("gpt-6-luna", "max");
+        assert_eq!(
+            (chosen.lit(), chosen.effort_name().as_deref()),
+            (Some(4), Some("Max"))
+        );
+        assert_eq!(chosen.summary(), "GPT-6 Luna · Max");
+        let stale = on_plan("gpt-6-luna", "ultra");
+        assert_eq!(
+            (stale.lit(), stale.effort_name().as_deref()),
+            (Some(1), Some("Medium")),
+            "a level the model does not list is not one to light"
+        );
+
+        let mut listed = catalogue(SERVER);
+        for entry in &mut listed.models {
+            if entry.id == "gpt-6-luna" {
+                entry.own_effort = None;
+            }
+        }
+        let ownless = bot_pick(
+            &bot(Some(json!("local_proxy")), "gpt-6-luna", Some("inherit")),
+            Some(&account(InferenceKind::Gateway, None)),
+            &listed,
+            plan(PLAN),
+        );
+        assert!(ownless.has_slider(), "it lists levels");
+        assert_eq!((ownless.lit(), ownless.effort_name()), (None, None));
+        assert_eq!(ownless.summary(), "GPT-6 Luna");
+    }
+
+    /// The slider sends a level the model lists, where it is not the effort already, and refuses
+    /// any other in words that name the levels the model does list: `inherit` is ↺'s, not a stop.
+    #[test]
+    fn an_effort_the_model_does_not_list_is_refused_in_words() {
+        let luna = on_plan("gpt-6-luna", "medium");
+        assert_eq!(
+            serde_json::to_value(luna.effort_patch("max").unwrap()).unwrap(),
+            json!({"effort": "max"})
+        );
+        assert!(luna.effort_patch("medium").unwrap().is_none(), "no change");
+        assert_eq!(
+            luna.effort_patch("ultra"),
+            Err("`ultra` is not one of GPT-6 Luna's levels: low, medium, high, xhigh, max".into())
+        );
+        for refused in ["inherit", "none", "Max", "extreme", ""] {
+            assert!(luna.effort_patch(refused).is_err(), "{refused:?}");
+        }
+        let sol = on_plan("gpt-5.6-sol", "inherit");
+        assert_eq!(
+            serde_json::to_value(sol.effort_patch("ultra").unwrap()).unwrap(),
+            json!({"effort": "ultra"}),
+            "Sol lists it"
+        );
+
+        let mut listed = catalogue(SERVER);
+        listed.models.retain(|entry| entry.id != "oag/cheap");
+        listed.models.push(plain("oag/cheap", "gateway"));
+        let cheap = bot_pick(
+            &bot(Some(json!("gateway")), "oag/cheap", Some("inherit")),
+            None,
+            &listed,
+            plan(PLAN),
+        );
+        assert_eq!(
+            cheap.effort_patch("high"),
+            Err("Cheap (auto) lists no levels of effort, so there is no slider".into())
+        );
+    }
+
+    /// A Bot's picker, Default for new Bots' and the Relay-off fallback's, each on Sol (auto), a
+    /// gateway route that lists six levels, up to ultra, with the effort given. Only the
+    /// Gateway's models are the fallback's, so the model that lists ultra is a route.
+    fn three_on_sol(effort: &str) -> [(&'static str, ModelPick); 3] {
+        let account = account(InferenceKind::Gateway, None);
+        let mut listed = catalogue(SERVER);
+        listed.models.push(entry("oag/sol", "gateway", None));
+        [
+            (
+                "Bot",
+                bot_pick(
+                    &bot(Some(json!("gateway")), "oag/sol", Some(effort)),
+                    Some(&account),
+                    &listed,
+                    plan(PLAN),
+                ),
+            ),
+            (
+                "new Bots",
+                new_bots_pick(
+                    Some(&NewBotDefault {
+                        source: InferenceKind::Gateway,
+                        model: "oag/sol".into(),
+                        effort: effort.into(),
+                    }),
+                    Some(&account),
+                    &listed,
+                    plan(PLAN),
+                ),
+            ),
+            (
+                "fallback",
+                plan_fallback_pick(
+                    Some(&PlanFallback {
+                        model: "oag/sol".into(),
+                        effort: effort.into(),
+                    }),
+                    &listed,
+                ),
+            ),
+        ]
+    }
+
+    /// A Bot's card, Default for new Bots and the Relay-off fallback are one picker: each has the
+    /// model's levels for its stops, lights its own level where no effort was chosen, and has ↺
+    /// put the effort back to `inherit`.
+    #[test]
+    fn the_three_pickers_have_the_same_levels_and_reset() {
+        // Six stops, low to ultra, each named as the model names it.
+        for (name, pick) in three_on_sol("ultra") {
+            assert_eq!(
+                words(&pick),
+                ["low", "medium", "high", "xhigh", "max", "ultra"],
+                "{name}"
+            );
+            assert_eq!(
+                names(&pick),
+                ["Low", "Medium", "High", "Xhigh", "Max", "Ultra"]
+            );
+            assert_eq!(pick.summary(), "Sol (auto) · Ultra", "{name}");
+            assert_eq!(pick.lit(), Some(5), "{name}");
+        }
+
+        // None chosen sits on the model's own level, by name, in each.
+        for (name, pick) in three_on_sol("inherit") {
+            assert_eq!(pick.effort, "inherit", "{name}");
+            assert_eq!(pick.effort_name().as_deref(), Some("High"), "{name}");
+            assert_eq!(pick.summary(), "Sol (auto) · High", "{name}");
+            assert!(!pick.can_reset(), "{name}: nothing to put back");
+        }
+
+        // ↺ in each: the effort back to `inherit`.
+        let [(_, bot_on), (_, new_bots), (_, fallback)] = three_on_sol("ultra");
+        let reset = |pick: &ModelPick| pick.reset_patch().expect("something to put back");
+        assert_eq!(reset(&bot_on).effort.as_deref(), Some("inherit"));
+        assert_eq!(
+            new_bots
+                .new_bots_default(&reset(&new_bots))
+                .map(|default| default.effort),
+            Some("inherit".to_string())
+        );
+        assert_eq!(
+            fallback
+                .plan_fallback(&reset(&fallback))
+                .map(|fallback| fallback.effort),
+            Some("inherit".to_string())
         );
     }
 
@@ -1457,6 +1891,7 @@ mod tests {
         assert!(pick.effort_patch("medium").unwrap().is_none(), "no change");
         assert!(pick.effort_patch("inherit").is_err(), "not a stop: ↺ is");
         assert!(pick.effort_patch("none").is_err());
+        assert!(pick.effort_patch("ultra").is_err(), "Luna lists no ultra");
 
         let fast = bot(Some(json!("local_proxy")), "gpt-6-luna--fast", Some("max"));
         let pick = bot_pick(
@@ -1465,7 +1900,7 @@ mod tests {
             &catalogue(SERVER),
             plan(PLAN),
         );
-        assert_eq!(pick.summary(), "GPT-6 Luna · Ultra ⚡");
+        assert_eq!(pick.summary(), "GPT-6 Luna · Max ⚡");
         assert!(pick.is_fast());
         assert_eq!(
             pick.current.as_ref().map(|row| row.base_id.as_str()),
@@ -1541,10 +1976,10 @@ mod tests {
         );
     }
 
-    /// ↺ puts the effort back to Default and turns ⚡ off, and leaves the model where it is;
-    /// with nothing to put back it has nothing to send.
+    /// ↺ puts the effort back to `inherit`, so the slider shows the model's own level, and turns ⚡
+    /// off, and leaves the model where it is; with nothing to put back it has nothing to send.
     #[test]
-    fn reset_puts_the_effort_back_to_default_and_turns_fast_off() {
+    fn reset_puts_the_effort_back_to_inherit_and_turns_fast_off() {
         let fast = bot(Some(json!("local_proxy")), "gpt-6-luna--fast", Some("max"));
         let pick = bot_pick(
             &fast,
@@ -1563,7 +1998,11 @@ mod tests {
             &catalogue(SERVER),
             plan(PLAN),
         );
-        assert_eq!(pick.summary(), "GPT-6 Luna · Default");
+        assert_eq!(
+            pick.summary(),
+            "GPT-6 Luna · Medium",
+            "the model's own level"
+        );
         assert!(!pick.can_reset());
         let effort_only = bot(Some(json!("gateway")), "oag/cheap", Some("low"));
         let pick = bot_pick(&effort_only, None, &catalogue(SERVER), plan(PLAN));
@@ -1592,7 +2031,11 @@ mod tests {
             "no plan rows for a Bot"
         );
         assert_eq!(pick.model.as_deref(), Some("gpt-5-codex"));
-        assert_eq!(pick.summary(), "GPT-5 Codex · Medium");
+        assert_eq!(
+            pick.summary(),
+            "GPT-5 Codex",
+            "no row of the list answers, so no levels to name"
+        );
         assert_eq!(
             pick.account_plan,
             Some(AccountPlan {
@@ -1629,9 +2072,10 @@ mod tests {
             Some("oag/cheap")
         );
 
-        // The account's door not read yet: the pin, and ⚡ cannot tell its group.
+        // The account's door not read yet: the pin, and ⚡ cannot tell its group, nor which row
+        // answers, so no levels either.
         let pick = bot_pick(&old, None, &catalogue(SERVER), plan(PLAN));
-        assert_eq!(pick.summary(), "Cheap (auto) · Medium");
+        assert_eq!(pick.summary(), "Cheap (auto)");
         assert_eq!(pick.fast_blocked, Some(FAST_DOOR_UNKNOWN));
     }
 
@@ -1667,7 +2111,7 @@ mod tests {
             &catalogue(SERVER),
             plan(PLAN),
         );
-        assert_eq!(pick.summary(), "No model · Medium");
+        assert_eq!(pick.summary(), "No model");
     }
 
     /// On the person's plan the server asks a Bot's pin only when the Bot's own door is the plan
@@ -1734,8 +2178,16 @@ mod tests {
             Via::Mac => vec!["grok-4.7".to_string(), "grok-4.7--fast".to_string()],
             Via::Loopback => vec!["gpt-5-codex".to_string()],
         };
+        // The Mac's opencodex lists its own models, and their levels with them.
+        let mut listed = catalogue(SERVER);
+        listed
+            .models
+            .push(entry("grok-4.7", "local_proxy", Some("mac")));
+        listed
+            .models
+            .push(entry("grok-4.7--fast", "local_proxy", Some("mac")));
         let follows = bot(Some(Value::Null), "oag/cheap", Some("high"));
-        let pick = bot_pick(&follows, Some(&relayed("mac")), &catalogue(SERVER), lists);
+        let pick = bot_pick(&follows, Some(&relayed("mac")), &listed, lists);
         assert_eq!(pick.summary(), "Grok 4.7 · High");
         assert_eq!(
             ids(&pick.groups[0].rows),
@@ -1745,15 +2197,10 @@ mod tests {
         assert_eq!(pick.fast_blocked, None);
         // Following the account, a pin the allowlist takes is not asked through the Mac either.
         let pinned = bot(Some(Value::Null), "gpt-6-sol", Some("high"));
-        let pick = bot_pick(&pinned, Some(&relayed("mac")), &catalogue(SERVER), lists);
+        let pick = bot_pick(&pinned, Some(&relayed("mac")), &listed, lists);
         assert_eq!(pick.summary(), "Grok 4.7 · High");
 
-        let pick = bot_pick(
-            &follows,
-            Some(&relayed("helper")),
-            &catalogue(SERVER),
-            lists,
-        );
+        let pick = bot_pick(&follows, Some(&relayed("helper")), &listed, lists);
         assert_eq!(
             pick.groups
                 .iter()
@@ -1761,7 +2208,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             [InferenceKind::Gateway]
         );
-        assert_eq!(pick.summary(), "No model · High");
+        assert_eq!(pick.summary(), "No model");
     }
 
     /// Default for new Bots is the Bot's picker over the same list, read as a Bot on its own door
@@ -1769,7 +2216,7 @@ mod tests {
     /// effort and ⚡, the list ticks its row, and every change makes the whole default anew, the
     /// kept door, model and effort under the change, since the server keeps it whole. With none
     /// set the card says None, nothing is ticked, ⚡ and the slider are dead and say why, and a
-    /// pick of a row starts a whole default, on its door and the Default effort.
+    /// pick of a row starts a whole default, on its door and `inherit` for its effort.
     #[test]
     fn the_default_for_new_bots_is_picked_whole_in_the_bots_picker() {
         let kept = NewBotDefault {
@@ -1824,7 +2271,7 @@ mod tests {
         );
 
         let none = new_bots_pick(None, Some(&on_keys), &catalogue(SERVER), plan(PLAN));
-        assert_eq!(none.summary(), "None · Default");
+        assert_eq!(none.summary(), "None");
         assert_eq!(none.model_label(), NEW_BOTS_NONE);
         assert!(none.current.is_none() && none.door.is_none());
         assert_eq!(none.fast_blocked, Some(NEW_BOTS_PICK_FIRST));
@@ -1852,8 +2299,9 @@ mod tests {
     /// The Relay-off fallback is the Bot's picker over the Gateway group alone (opengrok-server
     /// #332 (PR #338 at 66b9f7b)), whatever else the list of models holds: it is what a Bot on
     /// the plan answers with on the server's paid keys. Set, the card names its model and effort,
-    /// the list ticks its row, and every change makes the whole fallback anew. With none set the card says None, ⚡ and the slider are dead and say why,
-    /// and a pick starts a whole fallback on the Default effort. The plan's door makes none.
+    /// the list ticks its row, and every change makes the whole fallback anew. With none set the
+    /// card says None, ⚡ and the slider are dead and say why, and a pick starts a whole fallback
+    /// on `inherit` for its effort. The plan's door makes none.
     #[test]
     fn the_relay_off_fallback_is_picked_whole_from_the_gateway_alone() {
         let fallback = |model: &str, effort: &str| {
@@ -1910,7 +2358,7 @@ mod tests {
         );
 
         let none = plan_fallback_pick(None, &listed);
-        assert_eq!(none.summary(), "None · Default");
+        assert_eq!(none.summary(), "None");
         assert_eq!(
             (none.fast_blocked, none.effort_dead),
             (
@@ -1925,8 +2373,8 @@ mod tests {
         assert_eq!(none.plan_fallback(&first), fallback("oag/cheap", "inherit"));
     }
 
-    /// From a server that keeps no effort (before opengrok-server#271) the Bot reads Default and
-    /// the slider takes no stop; ↺ has only ⚡ to put back.
+    /// From a server that keeps no effort (before opengrok-server#271) the Bot sits on its model's
+    /// own level and the slider takes no stop; ↺ has only ⚡ to put back.
     #[test]
     fn a_server_that_keeps_no_effort_has_a_dead_slider() {
         let old = bot(Some(json!("local_proxy")), "gpt-6-luna--fast", None);
@@ -1937,7 +2385,7 @@ mod tests {
             plan(PLAN),
         );
         assert_eq!(pick.effort_dead, Some(EFFORT_NOT_KEPT));
-        assert_eq!(pick.summary(), "GPT-6 Luna · Default ⚡");
+        assert_eq!(pick.summary(), "GPT-6 Luna · Medium ⚡");
         assert_eq!(pick.effort_patch("high"), Err(EFFORT_NOT_KEPT.to_string()));
         assert_eq!(
             serde_json::to_value(pick.reset_patch().unwrap()).unwrap(),

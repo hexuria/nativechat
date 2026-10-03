@@ -46,14 +46,15 @@ pub use local_exec::{
     Enrolment, LocalExecStopped, MachineCredential, enrol_this_machine, serve_local_exec,
     stored_machine_id,
 };
+#[cfg(test)]
+pub(crate) use model_choice::levelled_catalogue;
 pub use model_choice::{
-    AccountPlan, ChoiceGroup, DEFAULT_EFFORT_LABEL, EFFORT_NOT_KEPT, EFFORT_STOPS,
-    FAST_ACCOUNT_PLAN, FAST_DOOR_UNKNOWN, FAST_NO_TWIN, FAST_SUFFIX, GATEWAY_GROUP, LIST_ROWS,
-    ListLine, ModelChoice, ModelPick, NEW_BOTS_NONE, NEW_BOTS_PICK_FIRST, NEW_BOTS_PICK_ID,
-    NO_MODEL, PLAN_FALLBACK_PICK_FIRST, ROUTINES_ON_PLAN, SUBSCRIPTION_GROUP, base_label, bot_pick,
-    effort_label, effort_stop, group_title, is_fast, last_window_start, list_window, model_label,
-    new_bots_pick, plan_choices, plan_fallback_pick, row_count, server_choices, slider_stop,
-    stop_word, window_opening_on, without_fast,
+    AccountPlan, ChoiceGroup, EFFORT_NOT_KEPT, FAST_ACCOUNT_PLAN, FAST_DOOR_UNKNOWN, FAST_NO_TWIN,
+    FAST_SUFFIX, GATEWAY_GROUP, LIST_ROWS, ListLine, ModelChoice, ModelPick, NEW_BOTS_NONE,
+    NEW_BOTS_PICK_FIRST, NEW_BOTS_PICK_ID, NO_MODEL, PLAN_FALLBACK_PICK_FIRST, ROUTINES_ON_PLAN,
+    SUBSCRIPTION_GROUP, base_label, bot_pick, group_title, is_fast, last_window_start, list_window,
+    model_label, new_bots_pick, plan_choices, plan_fallback_pick, row_count, server_choices,
+    window_opening_on, without_fast,
 };
 pub use relay::{
     OpencodexAddress, RelayHandle, RelayKey, RelayReport, RelayStatus, RelayTarget, RelayTimings,

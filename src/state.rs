@@ -13111,7 +13111,7 @@ impl AppState {
         }
     }
 
-    /// A stop of the slider, by the server's word for it.
+    /// A stop of the slider, by the server's word for it: one of the levels the model lists.
     pub fn pick_model_effort(&mut self, which: PickerFor, word: &str, cx: &mut Context<Self>) {
         if let Some(patch) = self
             .picker_pick(which)
@@ -13121,7 +13121,24 @@ impl AppState {
         }
     }
 
-    /// ↺: the effort back to Default and ⚡ off, the model left where it is.
+    /// The thumb let go at the `stop`th stop of the slider, counting from the lowest level the
+    /// model lists: that level's word is the pick. A stop past the levels the model has is none.
+    pub fn pick_model_effort_level(
+        &mut self,
+        which: PickerFor,
+        stop: usize,
+        cx: &mut Context<Self>,
+    ) {
+        let word = self
+            .picker_pick(which)
+            .and_then(|pick| pick.levels().get(stop).map(|level| level.value.clone()));
+        if let Some(word) = word {
+            self.pick_model_effort(which, &word, cx);
+        }
+    }
+
+    /// ↺: the effort back to `inherit`, so the slider shows the model's own level, and ⚡ off, the
+    /// model left where it is.
     pub fn reset_model_pick(&mut self, which: PickerFor, cx: &mut Context<Self>) {
         if let Some(patch) = self.picker_pick(which).and_then(|pick| pick.reset_patch()) {
             self.save_picker_change(which, patch, cx);
@@ -37019,12 +37036,23 @@ mod tests {
             via: None,
             ..Default::default()
         };
+        // GPT-6 Luna lists the levels of effort a model of opencodex's does.
+        let levels =
+            ["low", "medium", "high", "xhigh", "max"].map(|word| crate::opengrok::EffortLevel {
+                value: word.into(),
+                label: format!("{}{} Effort", word[..1].to_uppercase(), &word[1..]),
+            });
+        let luna = |id: &str| ModelEntry {
+            efforts: Some(levels.to_vec()),
+            own_effort: Some("medium".into()),
+            ..entry(id, "local_proxy")
+        };
         state.model_catalogue = ModelCatalogue {
             models: vec![
                 entry("oag/cheap", "gateway"),
                 entry("xai/grok-4.6@sub", "gateway"),
-                entry("gpt-6-luna", "local_proxy"),
-                entry("gpt-6-luna--fast", "local_proxy"),
+                luna("gpt-6-luna"),
+                luna("gpt-6-luna--fast"),
                 entry("claude-opus", "local_proxy"),
             ],
             note: None,
@@ -37058,7 +37086,11 @@ mod tests {
         // account's plan model is what answers.
         state.coworkers[0].source = CoworkerSource::NotKept;
         let pick = state.model_pick().expect("a Bot is open");
-        assert_eq!(pick.summary(), "GPT-5 Codex · High");
+        assert_eq!(
+            pick.summary(),
+            "GPT-5 Codex",
+            "no row of the list answers, so there are no levels to name"
+        );
         assert_eq!(
             pick.groups
                 .iter()
@@ -37356,7 +37388,7 @@ mod tests {
         read_as(&mut state, with_new_bots(None));
         assert_eq!(state.default_for_new_bots(), DefaultForNewBots::Kept(None));
         let pick = state.picker_pick(PickerFor::NewBots).expect("live");
-        assert_eq!(pick.summary(), "None · Default");
+        assert_eq!(pick.summary(), "None");
         assert!(
             state.begin_new_bots_none().is_none(),
             "none kept: nothing to send"
@@ -37367,6 +37399,12 @@ mod tests {
             state.default_for_new_bots(),
             DefaultForNewBots::Kept(Some(luna("high")))
         );
+        assert_eq!(
+            state.new_bots_pick().map(|pick| pick.summary()),
+            Some("GPT-6 Luna".to_string()),
+            "no list of models read yet, so no levels to name"
+        );
+        state.model_catalogue = crate::opengrok::levelled_catalogue();
         assert_eq!(
             state.new_bots_pick().map(|pick| pick.summary()),
             Some("GPT-6 Luna · High".to_string())
@@ -37645,7 +37683,7 @@ mod tests {
         read_as(&mut state, with_plan_fallback(None));
         assert_eq!(state.relay_off_fallback(), RelayOffFallback::Kept(None));
         let pick = state.picker_pick(PickerFor::PlanFallback).expect("live");
-        assert_eq!(pick.summary(), "None · Default");
+        assert_eq!(pick.summary(), "None");
         assert!(
             state.begin_plan_fallback_none().is_none(),
             "none kept: nothing to send"
@@ -37694,7 +37732,7 @@ mod tests {
     }
 
     /// A pick in the Relay-off fallback's list is kept on the account at once, whole: one `PUT`
-    /// of the kind the server keeps and `planFallback`, the row's model with the Default effort,
+    /// of the kind the server keeps and `planFallback`, the row's model with the effort `inherit`,
     /// and nothing else. While it is out no other change of the account's is taken, the
     /// fallback's or the default for new Bots'; what the server answers is what the card shows
     /// after. A refusal is said under the fallback's picker in the server's words, and nowhere

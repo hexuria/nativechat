@@ -250,17 +250,27 @@
 //! The Bot's model picker, on the Model card in the Bot's settings, which is the one place a
 //! Bot's model is picked: the composer has no chip for it, and no `model-*` id outside the card
 //! is the picker's. `agent-model-card`, in the tree while a Bot is open, is a button named as the
-//! picker reads in a line (`GPT-6 Luna · Medium ⚡`) and valued by the model the Bot's next turn
-//! runs on, with its door's wire word as a state (`gateway` / `local_proxy`), `fast` while ⚡ is
-//! on, and `expanded` while its popover is open; a click opens or shuts the popover, only while
-//! the settings are open. The popover, `agent-model-pop`, visible while open, holds
+//! picker reads in a line (`GPT-6 Luna · Medium ⚡`, the effort being the level the slider is on,
+//! which is the model's own while the Bot chose none, and nothing for a model that lists no
+//! levels: `Grok 4.7`) and valued by the model the Bot's next turn runs on, with its door's wire
+//! word as a state (`gateway` / `local_proxy`), `fast` while ⚡ is on, and `expanded` while its
+//! popover is open; a click opens or shuts the popover, only while the settings are open. The
+//! popover, `agent-model-pop`, visible while open, holds, in the window's order,
 //! `agent-model-fast` (a switch, checked while on; dead, with why as its value, where the list
 //! holds no fast version of the model or the account's plan model answers for every Bot),
-//! `agent-model-effort` (a slider named as the effort reads, `Light` … `Ultra` or `Default`, and
-//! valued by the server's word; `set_value` takes `low`, `medium`, `high`, `xhigh` or `max`; dead
-//! from a server that keeps no effort, one from before opengrok-server#271),
 //! `agent-model-open-list` (named by the model; it opens the list) and `agent-model-reset` (↺:
-//! Default effort and ⚡ off, the model left alone; live while there is something to put back).
+//! the effort back to `inherit`, so the slider is on the model's own level, and ⚡ off, the model
+//! left alone; live while there is something to put back); then `agent-model-effort`, a slider
+//! whose stops are the levels of effort the model itself lists, low to high, and which is not in
+//! the tree at all where the model lists none: it is named by the level it is on (the model's
+//! own while the Bot chose none, and `Effort` where the model names none as its own) and valued
+//! by the server's word (`inherit` while none is chosen); `set_value` takes the value of one of
+//! the model's own levels (`medium`, or `ultra` where the model lists it) and refuses any other
+//! in words that name them, and on a model with no levels it refuses that there is no slider;
+//! it is dead, with why, from a server that keeps no effort, one from before
+//! opengrok-server#271. The model's levels and own level are
+//! `GET /models`' `efforts` and `ownEffort` (opengrok-server branch `model-effort-levels`, shape
+//! agreed (not recorded yet)).
 //! While the list shows, those give way to `agent-model-open-list` as the heading back (state
 //! `expanded`), `agent-model-search` (the search box at the top of the list, a textbox valued by
 //! what is typed: `set_value` writes it, `type` adds to it, `key` takes Backspace and Enter; it
@@ -335,16 +345,17 @@
 //! on Relay and kept its ids. It is live only where the server's read carries that key, `null` or
 //! not. Otherwise (state `unavailable`) it holds `settings-new-bots-unavailable` ("Coming soon:
 //! the server can't keep a default for new Bots yet.") and `settings-new-bots-card`, the picker's
-//! card (a button named as it reads, `No model · Default`, disabled; a click is refused with
-//! why). Live, `settings-new-bots-card` is the Bot's card and popover, every part of
-//! `agent-model-*` above as `settings-new-bots-*`: the card
-//! (named as the default reads in a line, `None · Default` while none is set, valued by its
-//! model; states its door's word, `fast`, `expanded`, and `saving` while a change is with the
-//! server), `settings-new-bots-pop`, `-fast`, `-effort` (`set_value` a stop's word), `-reset`,
-//! `-open-list`, `-search` (`set_value`, `type`, `key` as the Bot's), `-list`,
-//! `-group-{source}`, `-row-{source}-{id}`, `-no-match`, `-note` and `-error` (the server's
-//! words for a refused change, or that nobody knows whether one was kept: in the popover while
-//! open, under the card while shut). Over the list's models, `settings-new-bots-none` (`None`,
+//! card (a button named `No model`, disabled; a click is refused with why). Live,
+//! `settings-new-bots-card` is the Bot's card and popover, every part of `agent-model-*` above
+//! as `settings-new-bots-*`: the card (named as the default reads in a line, `None` while none
+//! is set, valued by its model; states its door's word, `fast`, `expanded`, and `saving` while a
+//! change is with the server), `settings-new-bots-pop`, `-fast`, `-effort` (`set_value` the
+//! value of one of the model's levels; not in the tree while none is set, which is no model and
+//! so no levels), `-reset`, `-open-list`, `-search` (`set_value`, `type`, `key`
+//! as the Bot's), `-list`, `-group-{source}`, `-row-{source}-{id}`, `-no-match`, `-note` and
+//! `-error` (the server's words for a refused change, or that nobody knows whether one was kept:
+//! in the popover while open, under the card while shut). Over the list's models,
+//! `settings-new-bots-none` (`None`,
 //! valued `the server's default`, state `selected` while none is set; a click takes the kept
 //! default away). While none is set ⚡ and the slider are dead and say why: a default starts with
 //! a model. Every pick is kept on the account at once, whole, as `PUT /account/inference-source`

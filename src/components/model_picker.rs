@@ -1,9 +1,11 @@
 //! A Bot's model, fast tier and effort, picked the way Codex picks them, on the Model card in the
-//! Bot's settings: the model's name, over its door, the effort and ⚡. The card opens a popover
-//! whose top row is ⚡, the effort, the model's name, which opens the list of models, and ↺, over
-//! a slider of five stops of effort. The list is a combobox: a search box over the models grouped
-//! by door, Subscription (the person's own plan) and Gateway (the server's paid keys), five at a
-//! time, which the wheel scrolls.
+//! Bot's settings: the model's name, over its door and its effort. The card opens a popover whose
+//! top row is ⚡, the model's name, which opens the list of models, centred between the two, and
+//! ↺, over a slider whose stops are the levels of effort the model itself lists, named as the
+//! model names them: a model that lists none has no slider, and nothing in its place. A Bot that
+//! chose no effort sits on the model's own level, lit by name, and nothing says "Default". The
+//! list is a combobox: a search box over the models grouped by door, Subscription (the person's
+//! own plan) and Gateway (the server's paid keys), five at a time, which the wheel scrolls.
 //!
 //! The card is the only place a Bot's model is picked. The composer has no chip for it: the model
 //! is the Bot's setting, changed where the Bot's other settings are, and every turn goes through
@@ -25,9 +27,9 @@
 use crate::chrome::INFO_PANE_WIDTH;
 use crate::components::fields::field_input;
 use crate::opengrok::{
-    AccountPlan, DEFAULT_EFFORT_LABEL, EFFORT_STOPS, InferenceKind, LIST_ROWS, ListLine,
-    ModelChoice, ModelPick, NEW_BOTS_NONE, NO_MODEL, SUBSCRIPTION_GROUP, base_label, effort_label,
-    effort_stop, group_title, last_window_start, list_window, row_count, slider_stop, stop_word,
+    AccountPlan, InferenceKind, LIST_ROWS, ListLine, ModelChoice, ModelPick, NEW_BOTS_NONE,
+    NO_MODEL, SUBSCRIPTION_GROUP, base_label, group_title, last_window_start, list_window,
+    row_count,
 };
 use crate::state::{AppState, PickerFor, PickerView};
 use gpui_kit::component::input::{InputEvent, InputState};
@@ -38,6 +40,7 @@ use gpui_kit::component::{ActiveTheme, Icon, IconName, Selectable, Theme, h_flex
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 use std::cell::Cell;
+use std::collections::HashMap;
 use std::rc::Rc;
 
 /// The card in the Bot's settings, which opens the popover.
@@ -230,6 +233,10 @@ pub(crate) fn row_id(source: InferenceKind, base_id: &str) -> String {
 pub(crate) const FAST_LABEL: &str = "Fast";
 #[cfg(feature = "agent")]
 pub(crate) const RESET_LABEL: &str = "Reset";
+/// What a driver's tree names the slider by while none of its levels is lit: the model lists
+/// levels and names none as its own, and the Bot chose none.
+#[cfg(feature = "agent")]
+pub(crate) const EFFORT_LABEL: &str = "Effort";
 
 pub(crate) const MODELS_TITLE: &str = "Models";
 /// What the search box says while nothing is typed in it, and what a driver's tree names it by.
@@ -248,7 +255,7 @@ pub(crate) const PLAN_FALLBACK_NONE_HINT: &str = "no fallback";
 pub(crate) const ACCOUNT_PLAN_LINE: &str = "Your plan's model answers for every Bot on this \
      server while your account's replies are on your plan. A Gateway model picked here answers \
      once the server keeps them on its paid keys.";
-const RESET_TIP: &str = "Default effort, and ⚡ off";
+const RESET_TIP: &str = "The model's own effort, and ⚡ off";
 const FAST_ON_TIP: &str = "Fast is on. Click to turn it off.";
 const FAST_OFF_TIP: &str = "Use this model's fast version";
 
@@ -258,14 +265,14 @@ const CARD_WIDTH: f32 = INFO_PANE_WIDTH - 32.;
 /// A model's row in the list, which is also how far the wheel scrolls to move the window by one.
 const ROW_HEIGHT: f32 = 28.;
 
-/// The card's second line: the door, by the name of its group in the list, the effort, and ⚡
-/// while it is on.
+/// The card's second line: the door, by the name of its group in the list, the effort by the name
+/// of the level the slider is on, which is the model's own where the Bot chose none, and ⚡ while
+/// it is on. A model that lists no levels has no effort to name: "Subscription".
 pub(crate) fn card_detail(pick: &ModelPick) -> String {
-    let door = pick.door.map(group_title);
-    let fast = pick.is_fast().then_some("⚡ Fast");
-    let effort = effort_label(&pick.effort);
+    let door = pick.door.map(group_title).map(str::to_string);
+    let fast = pick.is_fast().then(|| "⚡ Fast".to_string());
     door.into_iter()
-        .chain([effort.as_str()])
+        .chain(pick.effort_name())
         .chain(fast)
         .collect::<Vec<_>>()
         .join(" · ")
@@ -314,10 +321,17 @@ impl Snap {
 pub struct ModelPicker {
     state: Entity<AppState>,
     which: PickerFor,
-    slider: Entity<SliderState>,
-    /// The Bot and the effort the slider was last put at: it is moved when the Bot's effort
-    /// changes (a pick saved, a refusal put back, another Bot opened), and never under a drag.
-    slider_at: Option<(String, String)>,
+    /// A slider's state for each number of stops a model has had here: a state's range is fixed
+    /// when it is made, and the stops are the levels the model lists, so a model of six has a
+    /// slider of its own beside the one of five.
+    sliders: HashMap<usize, Entity<SliderState>>,
+    /// The Bot, the number of stops and the level the slider was last put at: it is moved when
+    /// that changes (a pick saved, a refusal put back, another Bot or model opened), and never
+    /// under a drag.
+    slider_at: Option<(String, usize, Option<usize>)>,
+    /// The words of a refusal the slider was last put back for: a refusal of an effort that was
+    /// asked of the account leaves the setting as it was, and the thumb back at it.
+    refusal_seen: Option<String>,
     /// The list's search box. What is typed in it is the state's (`PickerView::search`), so a
     /// person's typing and a driver's `set_value` filter the same list.
     search: Entity<InputState>,
@@ -335,28 +349,6 @@ impl ModelPicker {
         which: PickerFor,
         cx: &mut Context<Self>,
     ) -> Self {
-        let last = (EFFORT_STOPS.len() - 1) as f32;
-        let slider = cx.new(|_| {
-            SliderState::new()
-                .min(0.)
-                .max(last)
-                .step(1.)
-                .default_value(slider_stop("medium") as f32)
-        });
-        // A drag is a pick once it is let go. Every stop the thumb crosses on the way would be a
-        // save of its own, and saves that cross on the wire can land in either order.
-        cx.subscribe(&slider, move |this, _, event: &SliderEvent, cx| {
-            let SliderEvent::Release(value) = event else {
-                return;
-            };
-            let stop = value.end().round().clamp(0., last) as usize;
-            if let Some(word) = stop_word(stop) {
-                let which = this.which;
-                this.state
-                    .update(cx, |state, cx| state.pick_model_effort(which, word, cx));
-            }
-        })
-        .detach();
         cx.observe(&state, |this, state, cx| {
             let snap = Snap::read(state.read(cx), this.which);
             if snap != this.snap {
@@ -381,8 +373,9 @@ impl ModelPicker {
         Self {
             state,
             which,
-            slider,
+            sliders: HashMap::new(),
             slider_at: None,
+            refusal_seen: None,
             search,
             search_focused: false,
             scroll_rest: Rc::new(Cell::new(0.)),
@@ -390,16 +383,55 @@ impl ModelPicker {
         }
     }
 
-    /// Put the slider at the Bot's effort, when that is not where it was last put.
-    fn sync_slider(&mut self, pick: &ModelPick, window: &mut Window, cx: &mut Context<Self>) {
-        let at = (pick.bot_id.clone(), pick.effort.clone());
-        if self.slider_at.as_ref() == Some(&at) {
-            return;
+    /// The slider for the model on the card, whose stops are the levels the model lists: `None`
+    /// where it lists none, and then the popover has no slider. Put at the level the Bot is on,
+    /// the model's own where it chose none, when that is not where it was last put. Putting it
+    /// there is showing it, and sends nothing: only letting go of the thumb does.
+    fn sync_slider(
+        &mut self,
+        pick: &ModelPick,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Entity<SliderState>> {
+        let stops = pick.levels().len();
+        if stops == 0 {
+            return None;
         }
-        let stop = slider_stop(&pick.effort) as f32;
-        self.slider
-            .update(cx, |slider, cx| slider.set_value(stop, window, cx));
-        self.slider_at = Some(at);
+        let slider = match self.sliders.get(&stops) {
+            Some(slider) => slider.clone(),
+            None => {
+                let last = (stops - 1) as f32;
+                let slider = cx.new(|_| SliderState::new().min(0.).max(last).step(1.));
+                // A drag is a pick once it is let go. Every stop the thumb crosses on the way
+                // would be a save of its own, and saves that cross on the wire can land in either
+                // order.
+                cx.subscribe(&slider, |this, _, event: &SliderEvent, cx| {
+                    let SliderEvent::Release(value) = event else {
+                        return;
+                    };
+                    let stop = value.end().round() as usize;
+                    let which = this.which;
+                    this.state.update(cx, |state, cx| {
+                        state.pick_model_effort_level(which, stop, cx)
+                    });
+                })
+                .detach();
+                self.sliders.insert(stops, slider.clone());
+                slider
+            }
+        };
+        // A refusal of what was just asked puts the thumb back where the setting is, even though
+        // the setting did not move.
+        let refused = self.snap.note.clone();
+        let put_back = refused.is_some() && refused != self.refusal_seen;
+        self.refusal_seen = refused;
+        let at = (pick.bot_id.clone(), stops, pick.lit());
+        if put_back || self.slider_at.as_ref() != Some(&at) {
+            let place = pick.lit().unwrap_or(0) as f32;
+            slider.update(cx, |slider, cx| slider.set_value(place, window, cx));
+            self.slider_at = Some(at);
+        }
+        Some(slider)
     }
 
     /// The search box follows the state, so a search a driver wrote shows in it and a list
@@ -424,7 +456,7 @@ impl Render for ModelPicker {
         let Some(pick) = self.snap.pick.clone() else {
             return div().into_any_element();
         };
-        self.sync_slider(&pick, window, cx);
+        let slider = self.sync_slider(&pick, window, cx);
         self.sync_search(window, cx);
         let which = self.which;
         let ids = ids(which);
@@ -437,7 +469,7 @@ impl Render for ModelPicker {
             note: self.snap.note.clone(),
             catalogue_note: self.snap.catalogue_note.clone(),
             busy: self.snap.busy,
-            slider: self.slider.clone(),
+            slider,
             search: self.search.clone(),
             query: self.snap.view.search.clone(),
             list_start: self.snap.view.list_start,
@@ -508,7 +540,8 @@ fn card_frame(id: &'static str, theme: &Theme) -> Stateful<Div> {
         .border_color(theme.border)
 }
 
-/// What a card says: the model's name over a second line, and the chevron that says it opens.
+/// What a card says: the model's name over a second line, which is not drawn while it says
+/// nothing, and the chevron that says it opens.
 fn card_face(model: String, detail: String, muted: Hsla) -> impl IntoElement {
     h_flex()
         .items_center()
@@ -520,7 +553,9 @@ fn card_face(model: String, detail: String, muted: Hsla) -> impl IntoElement {
                 .min_w(px(0.))
                 .gap(px(2.))
                 .child(div().text_sm().truncate().child(model))
-                .child(div().text_xs().text_color(muted).child(detail)),
+                .when(!detail.is_empty(), |this| {
+                    this.child(div().text_xs().text_color(muted).child(detail))
+                }),
         )
         .child(
             Icon::new(IconName::ChevronDown)
@@ -529,10 +564,10 @@ fn card_face(model: String, detail: String, muted: Hsla) -> impl IntoElement {
         )
 }
 
-/// What the dead card says ([`dead_card`]): no model, and the effort a Bot with none of its own
-/// reads as. A default the server does not keep has neither.
-pub(crate) fn dead_card_words() -> (&'static str, &'static str) {
-    (NO_MODEL, DEFAULT_EFFORT_LABEL)
+/// What the dead card says ([`dead_card`]): no model, and so no effort, nor a door. A default the
+/// server does not keep has none of them.
+pub(crate) fn dead_card_model() -> &'static str {
+    NO_MODEL
 }
 
 /// The picker's card, dimmed and opening nothing: Settings → General's Default for new Bots while
@@ -540,10 +575,9 @@ pub(crate) fn dead_card_words() -> (&'static str, &'static str) {
 /// look at, so the section shows what it will hold, and it takes no click, since a pick in it
 /// would change nothing on the server.
 pub(crate) fn dead_card(id: &'static str, theme: &Theme) -> impl IntoElement {
-    let (model, detail) = dead_card_words();
     card_frame(id, theme).opacity(0.5).child(card_face(
-        model.to_string(),
-        detail.to_string(),
+        dead_card_model().to_string(),
+        String::new(),
         theme.muted_foreground,
     ))
 }
@@ -587,7 +621,8 @@ struct Panel {
     /// A change is with the server: every control is drawn dimmed, and takes nothing until it
     /// answers (`AppState::picker_busy`).
     busy: bool,
-    slider: Entity<SliderState>,
+    /// The slider for the model's levels: none where the model lists none.
+    slider: Option<Entity<SliderState>>,
     search: Entity<InputState>,
     /// What is typed in the search box.
     query: String,
@@ -606,6 +641,7 @@ impl Panel {
         let ids = ids(self.which);
         v_flex()
             .id(ids.pop)
+            .debug_selector(move || ids.pop.to_string())
             .w(px(CARD_WIDTH))
             .p(px(12.))
             .gap(px(10.))
@@ -639,7 +675,7 @@ impl Panel {
             .into_any_element()
     }
 
-    /// ⚡, the effort, the model's name and ↺, over the slider.
+    /// ⚡, the model's name and ↺, over the slider of the model's levels of effort.
     fn controls(&self, app: &Entity<AppState>, theme: &Theme) -> impl IntoElement {
         let which = self.which;
         let ids = ids(which);
@@ -652,6 +688,7 @@ impl Panel {
             let blocked = pick.fast_blocked;
             div()
                 .id(ids.fast)
+                .debug_selector(move || ids.fast.to_string())
                 .size(px(28.))
                 .flex_none()
                 .rounded(px(8.))
@@ -685,6 +722,7 @@ impl Panel {
             let app = app.clone();
             h_flex()
                 .id(ids.open_list)
+                .debug_selector(move || ids.open_list.to_string())
                 .min_w(px(0.))
                 .gap(px(4.))
                 .px(px(8.))
@@ -715,6 +753,7 @@ impl Panel {
             let live = pick.can_reset();
             div()
                 .id(ids.reset)
+                .debug_selector(move || ids.reset.to_string())
                 .size(px(28.))
                 .flex_none()
                 .rounded(px(8.))
@@ -736,50 +775,53 @@ impl Panel {
                     }
                 })
         };
-        // A Bot whose effort is none of the stops (Default, or a word such as `none` that
-        // something else set) sits on Medium, drawn muted: the label beside it says which it is.
-        let on_a_stop = effort_stop(&pick.effort).is_some();
-        let shown_stop = slider_stop(&pick.effort);
+        // ⚡ and ↺ are the same size, and the same spring of space is either side of the model's
+        // name, so it sits in the middle of the row whatever it is called.
+        let top = h_flex()
+            .items_center()
+            .gap(px(8.))
+            .child(fast_toggle)
+            .child(div().flex_1())
+            .child(open_list)
+            .child(div().flex_1())
+            .child(reset);
         v_flex()
             .gap(px(10.))
+            .child(top)
+            .when_some(self.slider.clone(), |this, slider| {
+                this.child(self.effort(&slider, theme))
+            })
+            .when_some(
+                pick.effort_dead.filter(|_| self.slider.is_some()),
+                |this, why| this.child(div().text_xs().text_color(muted).child(why)),
+            )
+    }
+
+    /// The slider, over the name of each of the levels the model lists, low to high, and the one
+    /// the Bot is on lit: its own choice, or the model's own level where it chose none.
+    fn effort(&self, slider: &Entity<SliderState>, theme: &Theme) -> impl IntoElement {
+        let ids = ids(self.which);
+        let muted = theme.muted_foreground;
+        let lit = self.pick.lit();
+        v_flex()
+            .id(ids.effort)
+            .debug_selector(move || ids.effort.to_string())
+            .gap(px(4.))
+            .child(Slider::new(slider).disabled(self.pick.effort_dead.is_some()))
             .child(
                 h_flex()
-                    .items_center()
-                    .gap(px(8.))
-                    .child(fast_toggle)
-                    .child(
+                    .justify_between()
+                    .children(self.pick.levels().iter().enumerate().map(|(stop, level)| {
                         div()
-                            .flex_none()
-                            .text_sm()
-                            .text_color(muted)
-                            .child(effort_label(&pick.effort)),
-                    )
-                    .child(div().flex_1())
-                    .child(open_list)
-                    .child(reset),
+                            .text_xs()
+                            .text_color(if lit == Some(stop) {
+                                theme.foreground
+                            } else {
+                                muted
+                            })
+                            .child(level.name())
+                    })),
             )
-            .child(
-                v_flex()
-                    .id(ids.effort)
-                    .gap(px(4.))
-                    .child(
-                        Slider::new(&self.slider)
-                            .disabled(pick.effort_dead.is_some())
-                            .when(!on_a_stop, |this| this.bg(muted)),
-                    )
-                    .child(h_flex().justify_between().children(
-                        EFFORT_STOPS.iter().enumerate().map(|(stop, (name, _))| {
-                            let here = on_a_stop && stop == shown_stop;
-                            div()
-                                .text_xs()
-                                .text_color(if here { theme.foreground } else { muted })
-                                .child(*name)
-                        }),
-                    )),
-            )
-            .when_some(pick.effort_dead, |this, why| {
-                this.child(div().text_xs().text_color(muted).child(why))
-            })
     }
 
     /// The models, grouped by door, under a heading that goes back to the controls and a search
@@ -804,6 +846,7 @@ impl Panel {
             let app = app.clone();
             h_flex()
                 .id(ids.open_list)
+                .debug_selector(move || ids.open_list.to_string())
                 .gap(px(6.))
                 .items_center()
                 .cursor_pointer()
@@ -945,10 +988,10 @@ impl Panel {
         let current = self.pick.is_current(row);
         let source = row.source;
         let base_id = row.base_id.clone();
+        let id = ids(which).row_id(row.source, &row.base_id);
         h_flex()
-            .id(SharedString::from(
-                ids(which).row_id(row.source, &row.base_id),
-            ))
+            .id(SharedString::from(id.clone()))
+            .debug_selector(move || id)
             .h(px(ROW_HEIGHT))
             .flex_none()
             .gap(px(6.))
@@ -1120,17 +1163,72 @@ fn account_plan(id: &'static str, plan: &AccountPlan, theme: &Theme) -> impl Int
 mod tests {
     // Item by item rather than a glob: `use super::*` would drag in gpui_kit's own `test`.
     use super::{
-        BOT_IDS, NEW_BOTS_IDS, NONE_HINT, PLAN_FALLBACK_IDS, card_detail, none_shows, row_id,
-        wheel_rows,
+        BOT_IDS, ModelPicker, NEW_BOTS_IDS, NONE_HINT, PLAN_FALLBACK_IDS, card_detail, none_shows,
+        row_id, wheel_rows,
     };
-    use crate::opengrok::{InferenceKind, ModelCatalogue, bot_pick};
+    use crate::opengrok::{
+        InferenceKind, InferenceSource, ModelPick, NewBotDefault, OpenGrokClient, PlanFallback,
+        bot_pick, levelled_catalogue, new_bots_pick, plan_fallback_pick,
+    };
+    use crate::state::{AppState, PickerFor, ReplySourceRead};
+    use serde_json::{Value, json};
 
-    fn pick(source: serde_json::Value, model: &str, effort: &str) -> crate::opengrok::ModelPick {
-        let bot = serde_json::from_value(serde_json::json!({
+    /// The account, on the server's keys, as the picker tests read it.
+    fn account() -> InferenceSource {
+        InferenceSource {
+            kind: InferenceKind::Gateway,
+            base_url: Some("http://127.0.0.1:8080".into()),
+            local_model: None,
+            healthy: true,
+            has_api_key: false,
+            via: None,
+            relay: None,
+            new_bot_default: None,
+            relay_enabled: None,
+            plan_fallback: None,
+        }
+    }
+
+    /// The plan's models the picker tests offer.
+    const PLAN: [&str; 3] = ["gpt-6-luna", "gpt-6-luna--fast", "gpt-5.6-sol"];
+
+    /// A Bot's picker over the list of models the tests read ([`levelled_catalogue`]), the account
+    /// on the server's keys.
+    fn pick(source: Value, model: &str, effort: &str) -> ModelPick {
+        let bot = serde_json::from_value(json!({
             "id": "cw_1", "name": "Ada", "model": model, "effort": effort, "source": source
         }))
         .expect("a row");
-        bot_pick(&bot, None, &ModelCatalogue::default(), |_| Vec::new())
+        bot_pick(&bot, Some(&account()), &levelled_catalogue(), |_| {
+            PLAN.map(str::to_string).to_vec()
+        })
+    }
+
+    /// A signed-in app with Ada open, on the model, door and effort given, and the list of
+    /// models the tests read. Its client is never answered ([`undriven_runtime`]).
+    fn app(source: &str, model: &str, effort: &str) -> AppState {
+        let mut app = AppState::new();
+        app.opengrok = Some(OpenGrokClient::new("http://127.0.0.1:9").expect("a URL"));
+        app.coworkers = vec![
+            serde_json::from_value(json!({
+                "id": "cw_1", "name": "Ada", "model": model, "effort": effort, "source": source
+            }))
+            .expect("a row"),
+        ];
+        app.active_coworker_id = Some("cw_1".into());
+        app.reply_source.kept = Some(ReplySourceRead::Read(account()));
+        app.model_catalogue = levelled_catalogue();
+        app
+    }
+
+    /// A runtime that nothing drives: a request begun while it is entered never answers, and
+    /// never fails, so a change a test lets begin stays with the server for the whole test, and
+    /// what the app took of it at once can be read.
+    fn undriven_runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime")
     }
 
     /// Every part of the picker is under `agent-`, in the Bot's settings, and a row is named by
@@ -1250,14 +1348,403 @@ mod tests {
         assert_eq!(wheel_rows(&rest, 0.), 0);
     }
 
-    /// The card's second line says the door, by its group's name in the list, the effort and ⚡.
+    /// The card's second line says the door, by its group's name in the list, the effort by the
+    /// name of the level the slider is on, which is the model's own where none was chosen, and
+    /// ⚡. A model that lists no levels has no effort to say, and the line is the door alone, or
+    /// nothing where the door is not known either.
     #[test]
     fn the_card_says_the_door_the_effort_and_fast() {
-        let plan = pick(serde_json::json!("local_proxy"), "gpt-6-luna--fast", "max");
-        assert_eq!(card_detail(&plan), "Subscription · Ultra · ⚡ Fast");
-        let keys = pick(serde_json::json!("gateway"), "oag/cheap", "inherit");
-        assert_eq!(card_detail(&keys), "Gateway · Default");
-        let follows = pick(serde_json::Value::Null, "oag/cheap", "low");
-        assert_eq!(card_detail(&follows), "Light");
+        let plan = pick(json!("local_proxy"), "gpt-6-luna--fast", "max");
+        assert_eq!(card_detail(&plan), "Subscription · Max · ⚡ Fast");
+        let keys = pick(json!("gateway"), "oag/cheap", "inherit");
+        assert_eq!(card_detail(&keys), "Gateway · Medium");
+        let sol = pick(json!("local_proxy"), "gpt-5.6-sol", "inherit");
+        assert_eq!(card_detail(&sol), "Subscription · High");
+        let grok = pick(json!("gateway"), "xai/grok-4.7", "high");
+        assert_eq!(card_detail(&grok), "Gateway", "no levels, no effort");
+        let unknown = bot_pick(
+            &serde_json::from_value(json!({
+                "id": "cw_1", "name": "Ada", "model": "xai/grok-4.7", "effort": "high",
+                "source": null
+            }))
+            .expect("a row"),
+            None,
+            &levelled_catalogue(),
+            |_| Vec::new(),
+        );
+        assert_eq!(
+            card_detail(&unknown),
+            "",
+            "no door, no levels: nothing to say"
+        );
+    }
+
+    /// Nothing the picker says says "Default" for an effort, in any state of the three pickers:
+    /// where no effort was chosen it names the model's own level, and where the model lists no
+    /// levels it names none. The words the window draws are these, the tooltips, and the dead
+    /// card's.
+    #[test]
+    fn no_word_the_picker_draws_says_default() {
+        let new_bots = |door: &str, model: &str, effort: &str| {
+            new_bots_pick(
+                Some(&NewBotDefault {
+                    source: if door == "gateway" {
+                        InferenceKind::Gateway
+                    } else {
+                        InferenceKind::LocalProxy
+                    },
+                    model: model.into(),
+                    effort: effort.into(),
+                }),
+                Some(&account()),
+                &levelled_catalogue(),
+                |_| PLAN.map(str::to_string).to_vec(),
+            )
+        };
+        let fallback = |model: &str, effort: &str| {
+            plan_fallback_pick(
+                Some(&PlanFallback {
+                    model: model.into(),
+                    effort: effort.into(),
+                }),
+                &levelled_catalogue(),
+            )
+        };
+        let mut picks = vec![
+            new_bots_pick(None, Some(&account()), &levelled_catalogue(), |_| {
+                Vec::new()
+            }),
+            plan_fallback_pick(None, &levelled_catalogue()),
+        ];
+        for (door, model) in [
+            ("local_proxy", "gpt-6-luna"),
+            ("local_proxy", "gpt-6-luna--fast"),
+            ("local_proxy", "gpt-5.6-sol"),
+            ("gateway", "oag/cheap"),
+            ("gateway", "xai/grok-4.7"),
+            ("gateway", "oag/unlisted"),
+        ] {
+            for effort in ["inherit", "low", "high", "ultra", "none"] {
+                picks.push(pick(json!(door), model, effort));
+                picks.push(new_bots(door, model, effort));
+                if door == "gateway" {
+                    picks.push(fallback(model, effort));
+                }
+            }
+        }
+        let mut said = vec![
+            super::RESET_TIP.to_string(),
+            super::FAST_ON_TIP.to_string(),
+            super::FAST_OFF_TIP.to_string(),
+            super::dead_card_model().to_string(),
+        ];
+        for pick in &picks {
+            said.extend([card_detail(pick), pick.summary(), pick.model_label()]);
+            said.extend(pick.levels().iter().map(crate::opengrok::EffortLevel::name));
+            said.extend(pick.fast_blocked.map(str::to_string));
+        }
+        assert!(
+            said.iter().any(|words| words == "Medium"),
+            "the own level is named"
+        );
+        let defaults: Vec<&String> = said
+            .iter()
+            .filter(|words| words.contains("Default"))
+            .collect();
+        assert!(defaults.is_empty(), "{defaults:?}");
+    }
+
+    // ---- the picker drawn in a window ---------------------------------------------------------
+
+    /// A picker for `which` in a window of its own, over `state`, with its popover open on its
+    /// controls.
+    fn open_picker<'a>(
+        cx: &'a mut gpui_kit::TestAppContext,
+        state: &gpui_kit::Entity<AppState>,
+        which: PickerFor,
+    ) -> (
+        gpui_kit::Entity<ModelPicker>,
+        &'a mut gpui_kit::VisualTestContext,
+    ) {
+        use gpui_kit::{px, size};
+        cx.update(gpui_kit::init);
+        let (picker, cx) = cx.add_window_view({
+            let state = state.clone();
+            move |window, cx| ModelPicker::new(window, state, which, cx)
+        });
+        cx.simulate_resize(size(px(700.), px(900.)));
+        state.update(cx, |state, cx| state.set_picker_open(which, true, cx));
+        draw(cx);
+        (picker, cx)
+    }
+
+    /// The window drawn afresh.
+    fn draw(cx: &mut gpui_kit::VisualTestContext) {
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+    }
+
+    /// The model's name sits in the middle of the popover's top row, between ⚡ and ↺, whatever it
+    /// is called and whichever of the three pickers it is: the same spring of room is either side
+    /// of it, ⚡ and ↺ being the same size, and nothing of the effort is beside ⚡ to push it
+    /// off.
+    #[gpui_kit::test]
+    fn the_models_name_sits_in_the_middle_of_the_top_row(cx: &mut gpui_kit::TestAppContext) {
+        use gpui_kit::{AppContext as _, px};
+        let runtime = undriven_runtime();
+        let _enter = runtime.enter();
+        let long =
+            "oag/a-route-whose-name-is-far-too-long-to-fit-between-the-two-buttons-it-sits-by";
+        let state = cx.new(|_| app("local_proxy", "gpt-6-luna", "inherit"));
+        let (_, cx) = open_picker(cx, &state, PickerFor::Bot);
+        for (door, model, effort) in [
+            ("local_proxy", "gpt-6-luna", "inherit"),
+            ("local_proxy", "gpt-6-luna--fast", "max"),
+            ("gateway", "xai/grok-4.7", "inherit"),
+            ("gateway", "oag/cheap", "low"),
+            ("gateway", long, "inherit"),
+        ] {
+            state.update(cx, |state, cx| {
+                state.coworkers[0].model = model.into();
+                state.coworkers[0].effort = Some(effort.into());
+                state.coworkers[0].source =
+                    crate::opengrok::CoworkerSource::Kind(if door == "gateway" {
+                        InferenceKind::Gateway
+                    } else {
+                        InferenceKind::LocalProxy
+                    });
+                cx.notify();
+            });
+            draw(cx);
+            let pop = cx
+                .debug_bounds("agent-model-pop")
+                .expect("the popover is drawn");
+            let fast = cx.debug_bounds("agent-model-fast").expect("⚡ is drawn");
+            let name = cx
+                .debug_bounds("agent-model-open-list")
+                .expect("the name is drawn");
+            let reset = cx.debug_bounds("agent-model-reset").expect("↺ is drawn");
+            let (before, after) = (name.left() - fast.right(), reset.left() - name.right());
+            assert!(
+                (before - after).abs() < px(1.),
+                "{model}: {before:?} before the name and {after:?} after it, in {fast:?} {name:?} \
+                 {reset:?}"
+            );
+            assert!(
+                before > px(0.) && after > px(0.),
+                "{model}: it is between the two"
+            );
+            assert!(
+                pop.left() <= fast.left() && reset.right() <= pop.right(),
+                "{model}: all three are in the popover"
+            );
+            assert!(
+                (fast.size.width - reset.size.width).abs() < px(0.5),
+                "{model}: ⚡ and ↺ are the same size"
+            );
+        }
+    }
+
+    /// A model that lists no levels of effort has no slider in the popover and nothing in its
+    /// place: the popover is its top row alone, and its padding. One that lists levels has the
+    /// slider under the row, whatever the Bot's effort is.
+    #[gpui_kit::test]
+    fn a_model_that_lists_no_levels_has_no_slider_and_nothing_in_its_place(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        use gpui_kit::{AppContext as _, px};
+        let runtime = undriven_runtime();
+        let _enter = runtime.enter();
+        let state = cx.new(|_| app("gateway", "xai/grok-4.7", "high"));
+        let (_, cx) = open_picker(cx, &state, PickerFor::Bot);
+        let under_the_row = |cx: &mut gpui_kit::VisualTestContext| {
+            let pop = cx
+                .debug_bounds("agent-model-pop")
+                .expect("the popover is drawn");
+            let row_bottom = [
+                "agent-model-fast",
+                "agent-model-open-list",
+                "agent-model-reset",
+            ]
+            .into_iter()
+            .map(|id| cx.debug_bounds(id).expect("in the top row").bottom())
+            .fold(px(0.), |most, bottom| most.max(bottom));
+            pop.bottom() - row_bottom
+        };
+        assert!(
+            cx.debug_bounds("agent-model-effort").is_none(),
+            "no slider for Grok 4.7"
+        );
+        assert!(
+            under_the_row(cx) < px(16.),
+            "nothing under the row but the popover's own padding: {:?}",
+            under_the_row(cx)
+        );
+
+        for (door, model, effort) in [
+            ("gateway", "oag/cheap", "inherit"),
+            ("local_proxy", "gpt-5.6-sol", "ultra"),
+            ("local_proxy", "gpt-6-luna", "none"),
+        ] {
+            state.update(cx, |state, cx| {
+                state.coworkers[0].model = model.into();
+                state.coworkers[0].effort = Some(effort.into());
+                state.coworkers[0].source =
+                    crate::opengrok::CoworkerSource::Kind(if door == "gateway" {
+                        InferenceKind::Gateway
+                    } else {
+                        InferenceKind::LocalProxy
+                    });
+                cx.notify();
+            });
+            draw(cx);
+            let slider = cx
+                .debug_bounds("agent-model-effort")
+                .unwrap_or_else(|| panic!("{model} lists levels, so it has a slider"));
+            assert!(
+                under_the_row(cx) > px(40.),
+                "{model}: the slider is under the row"
+            );
+            assert!(slider.size.height > px(20.), "{model}: {slider:?}");
+        }
+        // And back to a model with none: the slider goes, and takes its room with it.
+        state.update(cx, |state, cx| {
+            state.coworkers[0].model = "xai/grok-4.7".into();
+            cx.notify();
+        });
+        draw(cx);
+        assert!(cx.debug_bounds("agent-model-effort").is_none());
+    }
+
+    /// A Bot that chose no effort has its slider on the model's own level, and showing it saves
+    /// nothing: whatever is drawn, the Bot's effort is still the one it had. A Sol Bot's slider
+    /// has six stops, and its own level is the third.
+    #[gpui_kit::test]
+    fn the_slider_shows_the_models_own_level_and_saves_nothing(cx: &mut gpui_kit::TestAppContext) {
+        use gpui_kit::AppContext as _;
+        use gpui_kit::component::slider::SliderValue;
+        let runtime = undriven_runtime();
+        let _enter = runtime.enter();
+        let state = cx.new(|_| app("local_proxy", "gpt-6-luna", "inherit"));
+        let (picker, cx) = open_picker(cx, &state, PickerFor::Bot);
+        let at = |picker: &gpui_kit::Entity<ModelPicker>,
+                  cx: &mut gpui_kit::VisualTestContext,
+                  stops: usize| {
+            picker.update(cx, |picker, cx| {
+                picker
+                    .sliders
+                    .get(&stops)
+                    .map(|slider| slider.read(cx).value())
+            })
+        };
+        assert_eq!(
+            at(&picker, cx, 5),
+            Some(SliderValue::Single(1.)),
+            "Medium of five"
+        );
+        for _ in 0..3 {
+            draw(cx);
+        }
+        state.update(cx, |state, cx| {
+            state.coworkers[0].model = "gpt-5.6-sol".into();
+            cx.notify();
+        });
+        draw(cx);
+        assert_eq!(
+            at(&picker, cx, 6),
+            Some(SliderValue::Single(2.)),
+            "High of six"
+        );
+        state.read_with(cx, |state, _| {
+            assert_eq!(
+                state.coworkers[0].effort.as_deref(),
+                Some("inherit"),
+                "nothing was chosen, and so nothing was saved"
+            );
+            assert_eq!(state.auth_error, None, "no change was even begun");
+        });
+    }
+
+    /// Letting go of the thumb saves the level it is on, whichever of the model's levels that is:
+    /// the stops are the model's, so Sol's thumb has six, and the last of them is ultra. A press
+    /// that does not move the thumb off the level it was on saves what it was on, by its word.
+    #[gpui_kit::test]
+    fn letting_go_of_the_thumb_saves_the_level_it_is_on(cx: &mut gpui_kit::TestAppContext) {
+        use gpui_kit::{AppContext as _, Modifiers, MouseButton, point, px};
+        let runtime = undriven_runtime();
+        let _enter = runtime.enter();
+        let state = cx.new(|_| app("local_proxy", "gpt-5.6-sol", "inherit"));
+        let (_, cx) = open_picker(cx, &state, PickerFor::Bot);
+        for (fraction, level) in [
+            (0.0_f32, "low"),
+            (0.2, "medium"),
+            (0.6, "xhigh"),
+            (0.999, "ultra"),
+            (0.4, "high"),
+        ] {
+            let slider = cx
+                .debug_bounds("agent-model-effort")
+                .expect("the slider is drawn");
+            // The track is the slider's first 24 pixels, as wide as the slider.
+            let at = point(
+                slider.left() + slider.size.width * fraction,
+                slider.top() + px(12.),
+            );
+            cx.simulate_mouse_move(at, None, Modifiers::none());
+            cx.simulate_mouse_down(at, MouseButton::Left, Modifiers::none());
+            draw(cx);
+            cx.simulate_mouse_up(at, MouseButton::Left, Modifiers::none());
+            draw(cx);
+            state.read_with(cx, |state, _| {
+                assert_eq!(
+                    state.coworkers[0].effort.as_deref(),
+                    Some(level),
+                    "the thumb let go at {fraction} of the slider"
+                );
+            });
+        }
+        // Whatever the last change began is polled while the runtime is entered, and stays out.
+        cx.run_until_parked();
+    }
+
+    /// ↺ puts the effort back to `inherit`, so the slider is on the model's own level, and turns
+    /// ⚡ off, in one change, and leaves the model where it is.
+    #[gpui_kit::test]
+    fn the_reset_button_puts_the_effort_back_and_turns_fast_off(cx: &mut gpui_kit::TestAppContext) {
+        use gpui_kit::{AppContext as _, Modifiers, MouseButton};
+        let runtime = undriven_runtime();
+        let _enter = runtime.enter();
+        let state = cx.new(|_| app("local_proxy", "gpt-6-luna--fast", "max"));
+        let (_, cx) = open_picker(cx, &state, PickerFor::Bot);
+        let reset = cx
+            .debug_bounds("agent-model-reset")
+            .expect("↺ is drawn")
+            .center();
+        cx.simulate_mouse_move(reset, None, Modifiers::none());
+        cx.simulate_mouse_down(reset, MouseButton::Left, Modifiers::none());
+        draw(cx);
+        cx.simulate_mouse_up(reset, MouseButton::Left, Modifiers::none());
+        draw(cx);
+        state.read_with(cx, |state, _| {
+            let bot = &state.coworkers[0];
+            assert_eq!(
+                bot.model, "gpt-6-luna",
+                "⚡ is off, and the model is the same"
+            );
+            assert_eq!(bot.effort.as_deref(), Some("inherit"));
+        });
+        // Nothing left to put back: ↺ is dimmed, and a press on it sends nothing.
+        let reset = cx
+            .debug_bounds("agent-model-reset")
+            .expect("↺ is drawn")
+            .center();
+        state.update(cx, |state, cx| {
+            state.coworkers[0].effort = Some("inherit".into());
+            cx.notify();
+        });
+        cx.simulate_mouse_move(reset, None, Modifiers::none());
+        cx.simulate_mouse_down(reset, MouseButton::Left, Modifiers::none());
+        draw(cx);
+        cx.simulate_mouse_up(reset, MouseButton::Left, Modifiers::none());
+        state.read_with(cx, |state, _| assert_eq!(state.auth_error, None));
     }
 }
