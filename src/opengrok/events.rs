@@ -384,16 +384,19 @@ async fn serve(
             tokio::time::timeout(timings.quiet, client.open_account_events(resume.as_deref()))
                 .await;
         match opened {
-            Ok(Err(error)) if error.is_signed_out() => {
-                let _ = notes.send(EventsNote::SignedOut(error));
-                return;
-            }
-            Ok(Err(error)) if error.route_missing() => {
-                let _ = notes.send(EventsNote::Unavailable);
-                return;
-            }
-            // Not answered in time, or answered with anything else: tried again after a wait.
-            Err(_) | Ok(Err(_)) => {}
+            Ok(Err(error)) => match when_refused(&error) {
+                Refused::SessionGone => {
+                    let _ = notes.send(EventsNote::SignedOut(error));
+                    return;
+                }
+                Refused::NoStream => {
+                    let _ = notes.send(EventsNote::Unavailable);
+                    return;
+                }
+                Refused::TryAgain => {}
+            },
+            // Not answered in time: tried again after a wait.
+            Err(_) => {}
             Ok(Ok(response)) => {
                 if notes.send(EventsNote::Opened).is_err() {
                     return;
@@ -441,6 +444,47 @@ async fn serve(
         let spread = rand::random_range(0.0..1.0);
         tokio::time::sleep(backoff.wait(&timings, spread)).await;
     }
+}
+
+/// What the stream does when the server will not open it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Refused {
+    /// The session is gone, after its own refresh was tried: the stream stops, and signing in
+    /// again starts it.
+    SessionGone,
+    /// No such route (a bare `404`, or a `405`): a server from before the stream. It stops.
+    NoStream,
+    /// Anything else, as a store the server could not read (a `503` in its words): the stream is
+    /// opened again after a wait.
+    TryAgain,
+}
+
+/// How the stream takes `error`, the server's refusal to open it.
+pub(super) fn when_refused(error: &OpenGrokError) -> Refused {
+    if error.is_signed_out() {
+        Refused::SessionGone
+    } else if error.route_missing() {
+        Refused::NoStream
+    } else {
+        Refused::TryAgain
+    }
+}
+
+/// The blocks of a stream's body as the stream reads them off the wire (`id`, `event` and `data`
+/// of each, comments passed over), for the wire conformance tests to read a recorded body with.
+#[cfg(test)]
+pub(super) fn blocks_of(text: &str) -> Vec<(Option<String>, Option<String>, String)> {
+    let bytes = futures::stream::iter([Ok::<_, reqwest::Error>(text.as_bytes().to_vec())]);
+    let mut items = SseEvents::new(bytes);
+    let mut blocks = Vec::new();
+    futures::executor::block_on(async {
+        while let Some(Ok(item)) = items.next_item().await {
+            if let SseItem::Event { id, name, data } = item {
+                blocks.push((id, name, data));
+            }
+        }
+    });
+    blocks
 }
 
 /// What is said, once, about a kind of note passed over. Never its data, though that is ids alone.

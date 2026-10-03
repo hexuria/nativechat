@@ -12684,8 +12684,9 @@ impl AppState {
     /// A Bot made, changed, deleted or ran one of the person's routines in a turn
     /// ([`RoutineChanges`]), and the server has it already. The open Bot's Routines list is read
     /// again, and once it lands, the history of the routine open in the Computer pane, so neither
-    /// waits for the person to switch Bots and back. It is the open Bot's list whichever Bot's turn
-    /// it was: a Bot can make a routine for another of its person's Bots.
+    /// waits for the person to switch Bots and back. It is the open Bot's list, the one on screen,
+    /// whichever Bot's turn it was; since opengrok-server #349 a Bot's routine tools reach its own
+    /// routines alone.
     ///
     /// One read at a time: a change answered while a read is out asks for one more when it lands,
     /// so the list ends on what the server has after the last of them, and a turn that makes five
@@ -24067,8 +24068,10 @@ mod tests {
     /// A routine run a Bot started (opengrok-server #337, built in #342: its history's lines carry
     /// `cause: "bot"` and `by: {coworkerId, name}`, the Bot as it was called then) says which Bot
     /// ran it, on its line of the Run history: the recording's own lines, a run the Bot started
-    /// beside the person's own Test run, and the two firings a Bot's press set off that the plan
-    /// could not answer, each "Run by Luna" with what became of it under or beside. A line whose
+    /// beside the person's own Test run ("Run by Luna"), and the two firings a Bot's press set off
+    /// that the plan could not answer, each "Run by Sol", the routine's own Bot, since a Bot runs
+    /// its own routines alone (#349, recorded in #351 at 9a2b011), with what became of it under or
+    /// beside. A line whose
     /// `by` is null, or that has none (a server from before it), says what it always said, and
     /// nothing of any Bot; one that names a Bot with no name says "a Bot".
     #[test]
@@ -24100,13 +24103,13 @@ mod tests {
                 .collect::<Vec<_>>(),
             [
                 (
-                    "Run by Luna".to_string(),
+                    "Run by Sol".to_string(),
                     super::RunOutcome::Skipped {
                         reason: "Skipped: your plan's proxy didn't answer".into()
                     }
                 ),
                 (
-                    "Run by Luna".to_string(),
+                    "Run by Sol".to_string(),
                     super::RunOutcome::Skipped {
                         reason: "Skipped: your computer was off, so your plan couldn't answer"
                             .into()

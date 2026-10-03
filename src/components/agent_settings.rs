@@ -1939,15 +1939,18 @@ mod tools_tests {
     /// The routine tools are one row of the ceiling, a builtin the server labels for people
     /// (opengrok-server #316, recorded at #334, on main 8e7387f: `{name: "routines", kind:
     /// "builtin", label: "Routines"}`), and it is headed by that label; its switch is still known
-    /// by its name. A builtin with no label is headed by its wire name, as before.
+    /// by its name. Its line is the server's description as #349 words it, a Bot's own routines
+    /// (`ROW_DESCRIPTION`, recorded in opengrok-server #351 at 9a2b011). A builtin with no label is
+    /// headed by its wire name, as before.
     #[test]
     fn a_builtin_the_server_labels_is_headed_by_its_label() {
         let card = CeilingCard {
             ceiling: ToolCeiling::Read(CeilingRead {
                 rows: rows(serde_json::json!([
                     {"name": "routines", "kind": "builtin", "enabled": true, "label": "Routines",
-                        "description": "List, make, edit and delete your routines when you ask \
-                                        in chat. Deleting one always asks you first."},
+                        "description": "List, make, edit, delete and run this Bot's routines \
+                                        when you ask in chat. Deleting one always asks you \
+                                        first."},
                     {"name": "message_bot", "kind": "builtin", "enabled": true}
                 ])),
                 version: Some(1),
@@ -1969,8 +1972,8 @@ mod tools_tests {
         );
         assert_eq!(
             shown[0].first_line,
-            "List, make, edit and delete your routines when you ask in chat. Deleting one \
-             always asks you first."
+            "List, make, edit, delete and run this Bot's routines when you ask in chat. \
+             Deleting one always asks you first."
         );
     }
 
