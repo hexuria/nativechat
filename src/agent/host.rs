@@ -82,6 +82,10 @@ pub mod ids {
     /// toward older messages, however small, makes it `detached`, and nothing but the person
     /// makes it `following` again.
     pub const TRANSCRIPT: &str = "transcript";
+    /// Where the account's events stream stands (hexuria/nativechat #171): value `connecting`,
+    /// `connected`, `reconnecting`, `unavailable` (a server without the stream) or `signed-out`.
+    /// Never visible: nothing on screen says it, and it is in the tree for a driver to wait on.
+    pub const EVENTS_STREAM: &str = "events-stream";
     pub const LIGHTBOX: &str = "lightbox";
     pub const PAGE_LOGIN: &str = "page-login";
     pub const LOGIN_EMAIL: &str = "login-email";
@@ -3286,6 +3290,8 @@ pub struct NativeChatHost {
     /// screen and are opposite in the one way that matters, which is what makes them go away.
     /// A driver that could not tell them apart is a driver that would have passed the bug.
     signed_out: Option<String>,
+    /// Where the account's events stream stands, as its word (`EventsStream::word`).
+    events_stream: &'static str,
     /// The open thread's last turn did not go through, and the feed is offering it again.
     can_retry_turn: bool,
     /// The open thread's last turn is one the person's plan could not answer, and the feed offers
@@ -3584,6 +3590,7 @@ impl NativeChatHost {
             signed_out: state
                 .session_banner()
                 .map(|(title, detail)| format!("{title} — {detail}")),
+            events_stream: state.events_stream.word(),
             can_retry_turn: state.retryable_turn().is_some(),
             can_send_on_server: state.plan_failed_turn().is_some(),
             waiting_for_mac: state.sends_waiting_for_mac(),
@@ -4402,6 +4409,7 @@ impl NativeChatHost {
         for node in self.signed_out_nodes() {
             page = page.with_child(node);
         }
+        page = page.with_child(self.events_stream_node());
         if self.can_retry_turn {
             page = page.with_child(UiNode::button("retry-turn", "Try again"));
         }
@@ -4753,6 +4761,15 @@ impl NativeChatHost {
         // it is plainly not the reconnect pill, which is the confusion that made the bug.
         node.states.push("signed-out".to_string());
         vec![node, UiNode::button("signed-out-sign-in", "Sign in again")]
+    }
+
+    /// Where the account's events stream stands, for a driver to wait on: `connected` before
+    /// checking that a run the server starts shows by itself. Not visible, since nothing on screen
+    /// says it.
+    fn events_stream_node(&self) -> UiNode {
+        UiNode::status(ids::EVENTS_STREAM, "Account events")
+            .with_value(self.events_stream)
+            .with_visible(false)
     }
 
     /// A task taught on a coworker's screen while it is being written up as a skill, and what
@@ -10759,6 +10776,42 @@ mod tests {
             host.snapshot().find("reconnect-banner").is_none(),
             "`assert --exists false` is how a driver says the app reconnected"
         );
+    }
+
+    /// Where the account's events stream stands is in the tree, as its word, for a driver to wait
+    /// on before checking that a run the server starts shows by itself; and it is never on screen,
+    /// since nothing a person sees says it (hexuria/nativechat #171).
+    #[test]
+    fn a_driver_reads_where_the_events_stream_stands_and_it_is_never_on_screen() {
+        use crate::state::EventsStream;
+        let mut state = AppState::new();
+        state.auth_status = crate::state::AuthStatus::SignedIn;
+        state.account = Some(
+            serde_json::from_value(serde_json::json!({ "id": "acct_1", "email": "a@b.c" }))
+                .unwrap(),
+        );
+        state.coworkers = vec![
+            serde_json::from_value(
+                serde_json::json!({ "id": "cw_1", "name": "Ada", "source": null }),
+            )
+            .unwrap(),
+        ];
+        state.active_coworker_id = Some("cw_1".into());
+        for (stream, word) in [
+            (EventsStream::Connecting, "connecting"),
+            (EventsStream::Connected, "connected"),
+            (EventsStream::Reconnecting, "reconnecting"),
+            (EventsStream::Unavailable, "unavailable"),
+            (EventsStream::SignedOut, "signed-out"),
+        ] {
+            state.events_stream = stream;
+            let tree = NativeChatHost::from_app(&state).snapshot();
+            let node = tree
+                .find(ids::EVENTS_STREAM)
+                .unwrap_or_else(|| panic!("{word}: in the tree"));
+            assert_eq!(node.value.as_deref(), Some(word));
+            assert!(!node.visible, "{word}: nothing on screen says it");
+        }
     }
 
     /// While the open Bot's replies go through the person's own plan, the Usage card says it

@@ -23,6 +23,10 @@
 //! the very bottom, a drag of the scrollbar to its end, Jump to latest, or a message of their
 //! own. No op scrolls it: gpui-agent has no scroll op and this host no scroll invoke, so a live
 //! check scrolls with the trackpad or the wheel and asserts the value),
+//! `events-stream` (never visible, nothing on screen says it: where the account's events stream
+//! stands, value `connecting` / `connected` / `reconnecting` / `unavailable`, from a server before
+//! opengrok-server #348, / `signed-out`; while it is `connected`, a run the server starts shows in
+//! the open thread and the open routine's Run history by itself, hexuria/nativechat #171),
 //! `image-thumb-{n}`, `lightbox`, `user-form-{key}`, `user-form-field-{key}-{id}`,
 //! `user-form-continue-{key}`, `user-form-dismiss-{key}`, `user-form-screen-{key}`,
 //! `user-form-pill-{key}`, `computer-handoff-{key}`,
