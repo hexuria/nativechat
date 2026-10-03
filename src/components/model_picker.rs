@@ -273,6 +273,9 @@ const CARD_WIDTH: f32 = INFO_PANE_WIDTH - 32.;
 /// A model's row in the list, which is also how far the wheel scrolls to move the window by one.
 const ROW_HEIGHT: f32 = 28.;
 
+/// How far the slider is dimmed while no level is lit ([`Panel::effort`]).
+const UNSET_SLIDER_OPACITY: f32 = 0.45;
+
 /// The card's second line: the door, by the name of its group in the list, the effort by the name
 /// of the level the slider is on, which is the model's own where the Bot chose none, and ⚡ while
 /// it is on. A model that lists no levels has no effort to name: "Subscription".
@@ -445,6 +448,8 @@ impl ModelPicker {
         self.refusal_seen = refused;
         let at = (pick.bot_id.clone(), stops, pick.lit());
         if put_back || self.slider_at.as_ref() != Some(&at) {
+            // With no level lit the thumb has to sit somewhere: at the lowest stop, and the
+            // slider is drawn muted ([`Panel::effort`]). Putting it there is showing it.
             let place = pick.lit().unwrap_or(0) as f32;
             slider.update(cx, |slider, cx| slider.set_value(place, window, cx));
             self.slider_at = Some(at);
@@ -829,7 +834,9 @@ impl Panel {
     }
 
     /// The slider, over the name of each of the levels the model lists, low to high, and the one
-    /// the Bot is on lit: its own choice, or the model's own level where it chose none.
+    /// the Bot is on lit: its own choice, or the model's own level where it chose none. Where
+    /// there is none to light, no name is, and the slider is muted, so its thumb at the lowest
+    /// stop does not read as Low chosen; it is the person's to move all the same.
     fn effort(&self, slider: &Entity<SliderState>, theme: &Theme) -> impl IntoElement {
         let ids = ids(self.which);
         let muted = theme.muted_foreground;
@@ -838,7 +845,15 @@ impl Panel {
             .id(ids.effort)
             .debug_selector(move || ids.effort.to_string())
             .gap(px(4.))
-            .child(Slider::new(slider).disabled(self.pick.effort_dead.is_some()))
+            .child(
+                div()
+                    .w_full()
+                    .when(lit.is_none(), |this| {
+                        this.opacity(UNSET_SLIDER_OPACITY)
+                            .debug_selector(move || format!("{}-unset", ids.effort))
+                    })
+                    .child(Slider::new(slider).disabled(self.pick.effort_dead.is_some())),
+            )
             .child(
                 h_flex()
                     .justify_between()
@@ -1197,7 +1212,7 @@ mod tests {
         BOT_IDS, ModelPicker, NEW_BOTS_IDS, NONE_HINT, PLAN_FALLBACK_IDS, card_detail, none_shows,
         row_id, wheel_rows,
     };
-    use crate::opengrok::model_fixtures::levelled_catalogue;
+    use crate::opengrok::model_fixtures::{levelled_catalogue, levelled_catalogue_without_own};
     use crate::opengrok::{
         InferenceKind, InferenceSource, ModelPick, NewBotDefault, OpenGrokClient, PlanFallback,
         bot_pick, new_bots_pick, plan_fallback_pick,
@@ -1701,6 +1716,65 @@ mod tests {
             );
             assert_eq!(state.auth_error, None, "no change was even begun");
         });
+    }
+
+    /// A model that lists levels and names none as its own, with no effort chosen, has nothing to
+    /// light: no name is lit under the slider, and the slider is drawn muted, since its thumb has
+    /// to sit somewhere and at the lowest stop would read as Low chosen. Showing it saves nothing,
+    /// a level the Bot chooses lights and un-mutes it, and a model with a level of its own is
+    /// never muted.
+    #[gpui_kit::test]
+    fn a_slider_with_no_level_to_light_is_muted_and_saves_nothing(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        use gpui_kit::AppContext as _;
+        let runtime = undriven_runtime();
+        let _enter = runtime.enter();
+        let state = cx.new(|_| {
+            let mut app = app("gateway", "oag/cheap", "inherit");
+            app.model_catalogue = levelled_catalogue_without_own("oag/cheap");
+            app
+        });
+        let (_, cx) = open_picker(cx, &state, PickerFor::Bot);
+        let muted = |cx: &mut gpui_kit::VisualTestContext| {
+            cx.debug_bounds("agent-model-effort-unset").is_some()
+        };
+        assert!(
+            cx.debug_bounds("agent-model-effort").is_some(),
+            "it lists levels, so it has a slider"
+        );
+        assert!(muted(cx), "no level is lit, so the slider is muted");
+        state.read_with(cx, |state, _| {
+            let pick = state.model_pick().expect("a Bot is open");
+            assert_eq!(
+                (pick.lit(), pick.effort_name()),
+                (None, None),
+                "no name is lit"
+            );
+            assert_eq!(
+                state.coworkers[0].effort.as_deref(),
+                Some("inherit"),
+                "nothing was chosen, and so nothing was saved"
+            );
+            assert_eq!(state.auth_error, None, "no change was even begun");
+        });
+        // A level the Bot chooses is lit, and the slider is itself again.
+        state.update(cx, |state, cx| {
+            state.coworkers[0].effort = Some("high".into());
+            cx.notify();
+        });
+        draw(cx);
+        assert!(!muted(cx), "a level is lit");
+        // And a model that names a level of its own is never muted.
+        state.update(cx, |state, cx| {
+            state.coworkers[0].effort = Some("inherit".into());
+            state.model_catalogue = levelled_catalogue();
+            cx.notify();
+        });
+        draw(cx);
+        assert!(!muted(cx), "the model's own level is lit");
+        // Whatever the last change began is polled while the runtime is entered, and stays out.
+        cx.run_until_parked();
     }
 
     /// Letting go of the thumb saves the level it is on, whichever of the model's levels that is:
