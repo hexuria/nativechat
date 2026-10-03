@@ -976,20 +976,17 @@ impl ModelPick {
     /// What the popover says of a pick of `row` that sends the effort back to `inherit`
     /// ([`Self::pick_patch`]): the model picked has no such level, so it is on its own. Not said
     /// where nothing was sent, nor of a model that lists no levels at all: it has no slider to
-    /// have moved.
+    /// have moved. And only by the name the model the Bot left gives the level it was on, so
+    /// where that model names no such level (a word it does not list, or a model that lists
+    /// none) there is no name to say, and nothing is.
     pub fn pick_effort_note(&self, source: InferenceKind, base_id: &str) -> Option<String> {
         let row = self.row(source, base_id)?;
         self.effort_after_pick(row)?;
         if row.efforts.is_empty() {
             return None;
         }
-        // The level as the model it was chosen on names it, or as the word reads where that
-        // model lists none.
-        let had = self
-            .current
-            .as_ref()
-            .and_then(|now| now.level(&self.effort))
-            .map_or_else(|| capitalised(&self.effort), EffortLevel::name);
+        // The level as the model it was chosen on names it.
+        let had = self.current.as_ref()?.level(&self.effort)?.name();
         Some(effort_reset_note(
             &base_label(&row.base_id),
             &had,
@@ -1889,14 +1886,31 @@ mod tests {
             json!({"model": "xai/grok-4.7"})
         );
 
+        // A model that lists none names no level, so the effort the Bot was on has no name
+        // there either, though the model picked does not list it: nothing says "has no Ultra".
+        let plain_ultra = bot_pick(
+            &bot(Some(json!("gateway")), "oag/cheap", Some("ultra")),
+            Some(&account(InferenceKind::Gateway, None)),
+            &listed,
+            plan(PLAN),
+        );
+        assert_eq!(
+            sent(&plain_ultra, LocalProxy, "gpt-6-luna"),
+            json!({"model": "gpt-6-luna", "source": "local_proxy", "effort": "inherit"})
+        );
+        assert_eq!(plain_ultra.pick_effort_note(LocalProxy, "gpt-6-luna"), None);
+
         // The pick that changes nothing sends nothing, whatever the effort.
         assert!(sol.pick_patch(LocalProxy, "gpt-5.6-sol").unwrap().is_none());
-        // A level the Bot's own model does not list is named as its word reads.
+        // A level the Bot's own model does not list was never one of its named levels, so the
+        // line has no name to give it: the effort goes back to `inherit` all the same, and
+        // nothing says "has no None".
         let stale = on_plan("gpt-6-luna", "none");
         assert_eq!(
-            stale.pick_effort_note(Gateway, "xai/grok-4.7").as_deref(),
-            Some("Grok 4.7 has no None, so it's on Medium, its own level.")
+            sent(&stale, Gateway, "xai/grok-4.7"),
+            json!({"model": "xai/grok-4.7", "source": "gateway", "effort": "inherit"})
         );
+        assert_eq!(stale.pick_effort_note(Gateway, "xai/grok-4.7"), None);
         // A model that lists levels and names none of its own as the one it runs at.
         listed = catalogue(SERVER);
         for entry in &mut listed.models {
@@ -1914,6 +1928,43 @@ mod tests {
             ownless.pick_effort_note(Gateway, "xai/grok-4.7").as_deref(),
             Some("Grok 4.7 has no Ultra, so it's on its own level.")
         );
+    }
+
+    /// The line a pick leaves says what the Bot was on by the name the model it left gives that
+    /// level, so it is said only where that model names the level: never "has no None", "has no
+    /// Inherit", or the word of a level the model it left does not list.
+    #[test]
+    fn a_pick_names_the_level_it_left_only_where_the_old_model_names_it() {
+        use InferenceKind::{Gateway, LocalProxy};
+        let mut said = 0;
+        for model in ["gpt-6-luna", "gpt-5.6-sol"] {
+            for effort in [
+                "inherit", "none", "low", "medium", "high", "xhigh", "max", "ultra", "extreme",
+            ] {
+                let pick = on_plan(model, effort);
+                for (source, id) in [
+                    (LocalProxy, "gpt-6-luna"),
+                    (LocalProxy, "gpt-5.6-sol"),
+                    (Gateway, "oag/cheap"),
+                    (Gateway, "xai/grok-4.7"),
+                ] {
+                    let Some(note) = pick.pick_effort_note(source, id) else {
+                        continue;
+                    };
+                    let named = pick
+                        .current
+                        .as_ref()
+                        .and_then(|row| row.level(effort))
+                        .map(EffortLevel::name);
+                    let named = named.unwrap_or_else(|| {
+                        panic!("{model} on {effort}, to {id}, said {note:?}, of no level it lists")
+                    });
+                    assert!(note.contains(&format!("has no {named},")), "{note}");
+                    said += 1;
+                }
+            }
+        }
+        assert!(said > 0, "some picks do say it");
     }
 
     /// A Bot's picker, Default for new Bots' and the Relay-off fallback's, each on Sol (auto), a
