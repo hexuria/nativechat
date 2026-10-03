@@ -146,15 +146,11 @@ pub mod ids {
     pub const ROUTINE_WAKE_AM: &str = "routine-wake-am";
     pub const ROUTINE_WAKE_PM: &str = "routine-wake-pm";
 
-    /// One of the open routine's wakes (label = what sets it off, in words), and its ✎ and 🗑.
+    /// One of the open routine's wakes (label = what sets it off, in words; value = what hovering
+    /// its line says, the zone its times are in where that is not this computer's and when it next
+    /// runs), and its ✎ and 🗑.
     pub fn routine_wake(at: usize) -> String {
         format!("routine-wake-{at}")
-    }
-
-    /// Under a schedule's wake, the zone its times are in (label = the IANA name), only where
-    /// that is not this computer's zone.
-    pub fn routine_wake_zone(at: usize) -> String {
-        format!("routine-wake-{at}-zone")
     }
 
     pub fn routine_wake_edit(at: usize) -> String {
@@ -1881,9 +1877,10 @@ struct RoutineSnap {
     unsaved: Vec<(&'static str, String)>,
     /// Its wakes, in order: what sets each off in words, and whether it is a webhook.
     wakes: Vec<(String, bool)>,
-    /// The zone its times are in, where that is not this computer's
-    /// ([`crate::state::RoutineZone::note`]).
-    zone: Option<String>,
+    /// What hovering each wake's line says, by its place in `wakes`: the zone its times are in,
+    /// where that is not this computer's, and when it next runs
+    /// ([`crate::state::RoutineZone::wake_hint`]). Where there is none the line says nothing.
+    wake_hints: Vec<Option<String>>,
 }
 
 /// One line of a routine's Run history as the driver sees it.
@@ -2470,6 +2467,8 @@ fn computer_handoff_node(handoff: &ComputerHandoffSnap) -> UiNode {
 /// worth asserting on: the cron line the server keeps, or the URL it minted.
 fn routine_snap(routine: &crate::state::AgentRoutine, state: &AppState) -> RoutineSnap {
     let on_the_server = routine.saved.is_some();
+    let zone = state.routine_zone(routine);
+    let now = chrono::Utc::now();
     let mut snap = RoutineSnap {
         id: routine.id.clone(),
         name: if routine.name.trim().is_empty() {
@@ -2521,7 +2520,11 @@ fn routine_snap(routine: &crate::state::AgentRoutine, state: &AppState) -> Routi
                 )
             })
             .collect(),
-        zone: state.routine_zone(routine).note().map(str::to_string),
+        wake_hints: routine
+            .triggers
+            .iter()
+            .map(|trigger| zone.wake_hint(trigger, now))
+            .collect(),
     };
     match routine.triggers.first() {
         Some(crate::state::RoutineTrigger::Schedule { spec, .. }) => {
@@ -2538,9 +2541,9 @@ fn routine_snap(routine: &crate::state::AgentRoutine, state: &AppState) -> Routi
     snap
 }
 
-/// The open routine's four header icons, as the panel draws them: each enabled while it can
-/// act, with the reason as the value of one that cannot.
-fn routine_header_nodes(routine: &RoutineSnap, history_open: bool) -> Vec<UiNode> {
+/// The open routine's four icons, as the panel draws them on the Active switch's row: each
+/// enabled while it can act, with the reason as the value of one that cannot.
+fn routine_icon_nodes(routine: &RoutineSnap, history_open: bool) -> Vec<UiNode> {
     let on_the_server = routine.kind != "draft";
     let mut history = UiNode::button(
         ids::ROUTINE_HISTORY_TOGGLE,
@@ -2575,7 +2578,8 @@ fn routine_header_nodes(routine: &RoutineSnap, history_open: bool) -> Vec<UiNode
 
 /// "When to run" on the open routine: +, a node per wake with its ✎ and 🗑, and the wake editor
 /// while it is open, each enabled while a click would act and with the reason as the value of
-/// one that would not.
+/// one that would not. A wake's own value is what hovering its line says, its zone and its next
+/// run, which the window shows only as that tooltip.
 fn routine_wake_nodes(
     open: &RoutineSnap,
     editor: Option<&(crate::state::WakeEditor, crate::state::WakeStatus)>,
@@ -2601,8 +2605,8 @@ fn routine_wake_nodes(
                     .with_enabled(false)
                     .with_value(LAST_WAKE_STAYS),
             );
-        if let Some(zone) = open.zone.as_ref().filter(|_| !*webhook) {
-            wake = wake.with_child(UiNode::status(ids::routine_wake_zone(at), zone.clone()));
+        if let Some(hint) = open.wake_hints.get(at).cloned().flatten() {
+            wake = wake.with_value(hint);
         }
         nodes.push(wake);
     }
@@ -4344,7 +4348,7 @@ impl NativeChatHost {
             computer = computer.with_child(UiNode::status(ids::ROUTINE_ERROR, line.clone()));
         }
         if let Some(open) = self.open_routine() {
-            for node in routine_header_nodes(open, self.routine_history_open) {
+            for node in routine_icon_nodes(open, self.routine_history_open) {
                 computer = computer.with_child(node);
             }
             for node in routine_wake_nodes(open, self.routine_wake_editor.as_ref()) {
@@ -7454,7 +7458,7 @@ impl NativeChatHost {
         ]
         .contains(&target)
         {
-            self.routine_header_command(target)?
+            self.routine_icon_command(target)?
         } else if let Some(why) = self.skipped_line_refusal(target) {
             return Err(why);
         } else if let Some(cmd) = self.routine_command(target) {
@@ -8303,12 +8307,12 @@ impl NativeChatHost {
         Ok(DispatchResult::empty())
     }
 
-    /// One of the open routine's header icons, refused when no routine is open or when the icon
-    /// is dead, in the words its tooltip says it in.
-    fn routine_header_command(&self, target: &str) -> Result<Command, String> {
+    /// One of the open routine's four icons, refused when no routine is open or when the icon is
+    /// dead, in the words its tooltip says it in.
+    fn routine_icon_command(&self, target: &str) -> Result<Command, String> {
         let open = self
             .open_routine()
-            .ok_or_else(|| format!("`{target}` is in a routine's header, and none is open"))?;
+            .ok_or_else(|| format!("`{target}` is on a routine's panel, and none is open"))?;
         let routine_id = open.id.clone();
         let on_the_server = open.kind != "draft";
         Ok(match target {
@@ -8553,7 +8557,7 @@ mod tests {
                 "webhook" => vec![("When a webhook fires".into(), true)],
                 _ => Vec::new(),
             },
-            zone: None,
+            wake_hints: Vec::new(),
         }
     }
 
@@ -8797,12 +8801,12 @@ mod tests {
         ));
     }
 
-    /// The open routine's header carries its four icons, each acting on that routine: the
-    /// history toggle says which view it leads to and is `selected` while the history shows, and
-    /// Open in thread and Run it now are dead on a draft, Run it now also where the server cannot
-    /// run a routine on demand, each refused with its reason. With no routine open there are none.
+    /// The open routine's four icons each act on that routine: the history toggle says which
+    /// view it leads to and is `selected` while the history shows, and Open in thread and Run it
+    /// now are dead on a draft, Run it now also where the server cannot run a routine on demand,
+    /// each refused with its reason. With no routine open there are none.
     #[test]
-    fn the_open_routines_header_icons_act_on_it() {
+    fn the_open_routines_icons_act_on_it() {
         let mut host = host();
         host.computer_open = true;
         host.routines = vec![routine("sch_1", "cron"), routine("draft-1", "draft")];
@@ -8907,37 +8911,46 @@ mod tests {
         ));
     }
 
-    /// A routine whose times are in another zone than this computer's names it under its wake
-    /// and under what the wake editor picked (opengrok-server #316: the server reads the line in
-    /// the routine's zone); in this computer's own zone nothing is named, nor on a webhook, which
-    /// has no times. The editor leaves the next run unsaid in a zone it cannot read the line in,
-    /// and says it in UTC, which it can.
+    /// A routine whose times are in another zone than this computer's names it on its wake line
+    /// as what hovering the line says, the wake's value, and not as a node of its own beside the
+    /// line, which the window no longer draws; and under what the wake editor picked
+    /// (opengrok-server #316: the server reads the line in the routine's zone). In this
+    /// computer's own zone nothing is named, nor on a webhook, which has no times. The editor
+    /// leaves the next run unsaid in a zone it cannot read the line in, and says it in UTC, which
+    /// it can.
     #[test]
     fn a_routines_zone_is_named_where_it_is_not_this_computers() {
         use crate::state::{RoutineZone, ScheduleSpec, WakeEditor, WakeTab};
         let mut host = host();
         host.computer_open = true;
         let mut away = routine("sch_1", "cron");
-        away.zone = Some("Europe/London".into());
-        let mut hook = routine("sch_2", "webhook");
-        hook.zone = Some("Europe/London".into());
+        away.wake_hints = vec![Some("Europe/London".into())];
+        let hook = routine("sch_2", "webhook");
         host.routines = vec![away, hook, routine("sch_3", "cron")];
         host.routine_editor = Some("sch_1".into());
         let tree = host.snapshot();
+        assert!(
+            tree.find("routine-wake-0-zone").is_none(),
+            "the window draws no zone beside the line"
+        );
         assert_eq!(
-            tree.find(&ids::routine_wake_zone(0))
-                .expect("the zone under the wake")
-                .name,
-            "Europe/London"
+            tree.find(&ids::routine_wake(0))
+                .expect("the wake")
+                .value
+                .as_deref(),
+            Some("Europe/London"),
+            "what hovering the line says"
         );
         host.routine_editor = Some("sch_2".into());
-        assert!(
-            host.snapshot().find(&ids::routine_wake_zone(0)).is_none(),
+        assert_eq!(
+            host.snapshot().find(&ids::routine_wake(0)).unwrap().value,
+            None,
             "a webhook has no times"
         );
         host.routine_editor = Some("sch_3".into());
-        assert!(
-            host.snapshot().find(&ids::routine_wake_zone(0)).is_none(),
+        assert_eq!(
+            host.snapshot().find(&ids::routine_wake(0)).unwrap().value,
+            None,
             "this computer's own zone"
         );
 
@@ -8985,6 +8998,44 @@ mod tests {
         assert!(
             tree.find(ids::ROUTINE_WAKE_NEXT).is_some(),
             "this computer's own"
+        );
+    }
+
+    /// What hovering a wake's line says is worked out from the routine and its zone when the
+    /// tree is taken, the same words the window's tooltip gives: a schedule in a zone this
+    /// computer is not in names it, and a webhook has nothing to say.
+    #[test]
+    fn a_wake_lines_hover_is_taken_from_the_routine_and_its_zone() {
+        use crate::state::{AgentRoutine, AppState, RoutineTrigger, ScheduleSpec};
+        let routine = AgentRoutine {
+            id: "sch_1".into(),
+            name: "Say hello".into(),
+            instruction: "Say hello to the team".into(),
+            active: true,
+            triggers: vec![
+                RoutineTrigger::Schedule {
+                    id: "sch_1".into(),
+                    spec: ScheduleSpec::from_cron("0 9 * * *"),
+                },
+                RoutineTrigger::Webhook {
+                    id: "sch_1".into(),
+                    url: "https://og.example/hooks/sch_1".into(),
+                    key: "og_live_abc".into(),
+                    header: "x-og-key".into(),
+                },
+            ],
+            runs: Vec::new(),
+            saved: Some(crate::opengrok::ScheduleEdit {
+                name: None,
+                prompt: None,
+                cron: None,
+            }),
+            tz: Some("Pacific/Chatham".into()),
+        };
+        let snap = routine_snap(&routine, &AppState::new());
+        assert_eq!(
+            snap.wake_hints,
+            vec![Some("Pacific/Chatham".to_string()), None]
         );
     }
 

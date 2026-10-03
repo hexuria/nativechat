@@ -109,19 +109,25 @@
 //! value = the server's sentence for why, e.g. "Skipped: your computer was off, so your plan
 //! couldn't answer", state `skipped`; it started no run, so a click is refused and opens nothing),
 //! `routine-{id}-delete`.
-//! While a routine is open in the Computer pane, its header's four icons are under
-//! `computer-pane`, each acting on that routine: `routine-history-toggle` (label `Run history`, or
-//! `Back to the routine` with state `selected` while the panel shows the Run history alone in
-//! place of the routine's fields), `routine-open-thread`, `routine-run-now` and `routine-delete`;
-//! one that cannot act is disabled, with the reason as its value, and a click on it is refused.
+//! While a routine is open in the Computer pane, its four icons are under `computer-pane`, each
+//! acting on that routine. The window draws them at the right of the Active switch's row, the
+//! size of `header-monitor` and `header-right-sidebar`, and not in the title row above, which
+//! keeps only the back control, the title and the window's toggles: `routine-history-toggle`
+//! (label `Run history`, or `Back to the routine` with state `selected` while the panel shows the
+//! Run history alone in place of the routine's fields), `routine-open-thread`, `routine-run-now`
+//! and `routine-delete`; one that cannot act is disabled, with the reason as its value, and a
+//! click on it is refused.
 //! "When to run" on the open routine, under `computer-pane`: `routine-wake-add` (+, disabled
 //! while the routine has its one wake, the server's limit until opengrok-server#315, with the
 //! reason as its value), `routine-wake-{i}` (a wake: label = what sets it off, in words, times on
-//! the routine's own clock, in the zone the server reads its line in, opengrok-server #316)
-//! holding `routine-wake-edit-{i}` (opens the wake editor on it; disabled on a schedule where the
-//! server cannot change a routine), `routine-wake-delete-{i}` (disabled: a routine keeps its only
-//! wake) and, on a schedule whose zone is not this computer's, `routine-wake-{i}-zone` (label =
-//! the IANA zone). While the wake editor is open, `routine-wake-editor`
+//! the routine's own clock, in the zone the server reads its line in, opengrok-server #316; value
+//! = what hovering the line says, which is all the window shows of its zone: the IANA zone where
+//! it is not this computer's, then when it next runs in the person's own time, where the line can
+//! be read in that zone, this computer's own or UTC, e.g. `UTC · Next run: Sun 4 Oct at 4:00 PM
+//! your time`; no value on a webhook, or where there is nothing to say) holding
+//! `routine-wake-edit-{i}` (opens the wake editor on it; disabled on a schedule where the server
+//! cannot change a routine) and `routine-wake-delete-{i}` (disabled: a routine keeps its only
+//! wake). While the wake editor is open, `routine-wake-editor`
 //! (value = the open tab's word) holds `routine-wake-tab-every|daily|weekly|monthly|webhook|cron`
 //! (state `selected` on the open one; disabled where the routine's kind rules it out, since a
 //! schedule never becomes a webhook nor a webhook a schedule) and the open tab's controls: on

@@ -3819,6 +3819,60 @@ impl RoutineZone {
     fn is_utc(&self) -> bool {
         matches!(self.name.as_str(), "UTC" | "Etc/UTC")
     }
+
+    /// When `line` next runs after `now`, the line read in this zone by the server's own parser
+    /// ([`crate::cron_next::next_run`]): `Ok(None)` for a line that never runs again, `Err` for
+    /// one the server would refuse. Read in this computer's own zone where it is, and otherwise
+    /// in UTC, which is the only other zone this app can read a line in; see
+    /// [`Self::can_say_next_run`].
+    fn next_run(
+        &self,
+        line: &str,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Option<chrono::DateTime<chrono::Utc>>, String> {
+        if self.here {
+            crate::cron_next::next_run(line, now, &chrono::Local)
+        } else {
+            crate::cron_next::next_run(line, now, &chrono::Utc)
+        }
+    }
+
+    /// Whether the next run can be said in the person's own time: only where this app can read
+    /// the line in the routine's zone, this computer's own or UTC. A routine in a third zone (one
+    /// a Bot made for somewhere else, or one from before this computer moved) is still held to
+    /// the server's parser, which no zone changes, and its next run is left unsaid rather than
+    /// worked out on another clock.
+    fn can_say_next_run(&self) -> bool {
+        self.here || self.is_utc()
+    }
+
+    /// What hovering a wake's line says: the zone its times are in, where it is not this
+    /// computer's ([`Self::note`]), then when the line next runs after `now` in the person's own
+    /// time, in the words the wake editor says it in, where this app can say it
+    /// ([`Self::can_say_next_run`]), the two joined by a dot. `None` where there is nothing to
+    /// say: a webhook has no times, and a line that never runs, or that the server would refuse,
+    /// has no next run to say.
+    pub fn wake_hint(
+        &self,
+        wake: &RoutineTrigger,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Option<String> {
+        let next = match wake {
+            RoutineTrigger::Webhook { .. } => return None,
+            RoutineTrigger::Schedule { spec, .. } => spec
+                .to_cron()
+                .ok()
+                .and_then(|line| self.next_run(&line, now).ok().flatten())
+                .filter(|_| self.can_say_next_run())
+                .map(|when| crate::cron_next::next_run_words(when, &chrono::Local)),
+            RoutineTrigger::Event { .. } => None,
+        };
+        match (self.note(), next) {
+            (Some(zone), Some(next)) => Some(format!("{zone} · {next}")),
+            (Some(zone), None) => Some(zone.to_string()),
+            (None, next) => next,
+        }
+    }
 }
 
 /// What the app says when somebody asks a routine for a second way of firing.
@@ -3974,13 +4028,8 @@ impl WakeEditor {
         };
         status.numbered_weekdays =
             self.tab == WakeTab::Cron && crate::cron_spec::numbered_weekdays(&line);
-        let next = if self.zone.here {
-            crate::cron_next::next_run(&line, now, &chrono::Local)
-        } else {
-            crate::cron_next::next_run(&line, now, &chrono::Utc)
-        };
-        match next {
-            Ok(Some(when)) if self.zone.here || self.zone.is_utc() => {
+        match self.zone.next_run(&line, now) {
+            Ok(Some(when)) if self.zone.can_say_next_run() => {
                 status.next = Some(crate::cron_next::next_run_words(when, &chrono::Local));
             }
             Ok(Some(_)) => {}
@@ -12165,7 +12214,7 @@ impl AppState {
         WakeSaved::Closed
     }
 
-    /// The history icon in a routine's header: its Run history in place of its fields, or its
+    /// The history icon on a routine's Active row: its Run history in place of its fields, or its
     /// fields again.
     pub fn toggle_routine_history(&mut self, cx: &mut Context<Self>) {
         self.routine_history_open = !self.routine_history_open;
@@ -24205,6 +24254,63 @@ mod tests {
             None,
             "a blank zone is none, and UTC here is here"
         );
+    }
+
+    /// Hovering a schedule's line says what its times are in and when it next runs, in the
+    /// words the wake editor says it in: the zone where it is not this computer's, then the next
+    /// run where the line can be read in the routine's zone (this computer's own, or UTC). Where
+    /// there is nothing to say there is no hover: a webhook has no times, and a line that never
+    /// runs has no next run.
+    #[test]
+    fn a_schedule_lines_hover_says_its_zone_and_its_next_run() {
+        use super::{RoutineTrigger, RoutineZone, ScheduleSpec};
+        use chrono::TimeZone as _;
+        let now = chrono::Utc.with_ymd_and_hms(2026, 10, 3, 12, 0, 0).unwrap();
+        let line = |cron: &str| RoutineTrigger::Schedule {
+            id: "sch_1".into(),
+            spec: ScheduleSpec::from_cron(cron),
+        };
+        let zone = |name: &str, here: bool| RoutineZone {
+            name: name.into(),
+            here,
+        };
+        let sixteen_hundred = chrono::Utc.with_ymd_and_hms(2026, 10, 3, 16, 0, 0).unwrap();
+        let said = crate::cron_next::next_run_words(sixteen_hundred, &chrono::Local);
+        assert!(said.starts_with("Next run: "), "{said}");
+
+        assert_eq!(
+            zone("UTC", false).wake_hint(&line("0 16 * * *"), now),
+            Some(format!("UTC · {said}")),
+            "UTC is read, so the zone and the next run"
+        );
+        assert_eq!(
+            zone("Europe/London", false).wake_hint(&line("0 16 * * *"), now),
+            Some("Europe/London".to_string()),
+            "a zone this app cannot read the line in is named and its next run left unsaid"
+        );
+        let here = zone("Asia/Manila", true)
+            .wake_hint(&line("0 16 * * *"), now)
+            .expect("this computer's own zone has its next run");
+        assert!(
+            here.starts_with("Next run: ") && !here.contains('·'),
+            "{here}"
+        );
+        assert_eq!(
+            zone("Asia/Manila", true).wake_hint(&line("0 9 31 2 *"), now),
+            None,
+            "the 31st of February never runs, and this computer's own zone needs no name"
+        );
+        assert_eq!(
+            zone("UTC", false).wake_hint(&line("0 9 31 2 *"), now),
+            Some("UTC".to_string())
+        );
+        let hook = RoutineTrigger::Webhook {
+            id: "sch_2".into(),
+            url: "https://og.example/hooks/sch_2".into(),
+            key: "og_live_abc".into(),
+            header: "x-og-key".into(),
+        };
+        assert_eq!(zone("UTC", false).wake_hint(&hook, now), None);
     }
 
     /// The wake editor says when its pick next runs where it can read the line in the routine's

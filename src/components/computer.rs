@@ -2,8 +2,8 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use crate::chrome::{
-    BOX_SCREEN_ASPECT, HEADER_PX, INFO_PANE_WIDTH, TITLE_BAR_H, box_screen_height_for_width,
-    chrome_floats, computer_pane_screen_width,
+    BOX_SCREEN_ASPECT, CONTROL_ICON_PX, HEADER_PX, INFO_PANE_WIDTH, TITLE_BAR_H,
+    box_screen_height_for_width, chrome_floats, computer_pane_screen_width,
 };
 use crate::components::agent_settings::sentence;
 use crate::components::alert_chrome::{
@@ -11,6 +11,7 @@ use crate::components::alert_chrome::{
 };
 use crate::components::fields::field_input;
 use crate::components::switch::Switch;
+use crate::components::title_bar::BUTTON_PX;
 use crate::opengrok::{
     BoxHandoffResolution, ComputerError, CoworkerComputer, LocalExecMode, ScheduleEdit,
     ScheduleRunStatus, computer_attention_done_id, computer_attention_id,
@@ -27,6 +28,14 @@ use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{ActiveTheme, Disableable as _, Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
+
+/// How many lines the Instruction box shows: it grows with the text from the first to the second,
+/// and a longer instruction scrolls inside it. A short one keeps the box it has always had, about
+/// four lines. The box's height is the editor's own, and nothing else is given it: a box of a
+/// fixed height round an editor that grows to more lines than the box holds draws its last lines
+/// over the fields below.
+const INSTRUCTION_MIN_ROWS: usize = 4;
+const INSTRUCTION_MAX_ROWS: usize = 6;
 
 pub struct ComputerPane {
     state: Entity<AppState>,
@@ -66,7 +75,7 @@ impl ComputerPane {
         let instruction_input = cx.new(|cx| {
             TextareaState::new(window, cx)
                 .placeholder("What should this routine do each time it runs?")
-                .auto_grow(3, 8)
+                .auto_grow(INSTRUCTION_MIN_ROWS, INSTRUCTION_MAX_ROWS)
         });
         let wake_boxes = [
             (WakeBox::Every, wake_input("30", window, cx)),
@@ -347,46 +356,24 @@ impl ComputerPane {
     /// pane; the chat page leaves it off, because the chat's title bar floats its one
     /// window-level pane toggle, and the computer's button beside it, over that end of the row,
     /// which the row keeps clear of its own controls.
-    /// Overview: nothing else (Update / Reset sit next to the screen). Routine: back, title and
-    /// the routine's four icons.
+    /// Overview: nothing else (Update / Reset sit next to the screen). Routine: back and the
+    /// title; the routine's four icons are on the Active switch's row below, not in this one.
     pub fn header(&self, cx: &App, close: bool) -> AnyElement {
         let app = self.state.clone();
         let state = self.state.read(cx);
         match state.computer_view.clone() {
-            ComputerView::Overview => {
-                pane_header(None, "", None, None, app, close).into_any_element()
-            }
+            ComputerView::Overview => pane_header(None, "", None, app, close).into_any_element(),
             ComputerView::Editor { id } => {
                 let coworker_id = state.active_coworker_id.clone().unwrap_or_default();
-                let persist = self.persist_routine(app.clone(), coworker_id.clone(), id.clone());
+                let persist = self.persist_routine(app.clone(), coworker_id, id);
                 let back = {
                     let app = app.clone();
-                    let persist = persist.clone();
                     Rc::new(move |cx: &mut App| {
                         persist(cx);
                         app.update(cx, |state, cx| state.back_to_computer(cx));
                     }) as Rc<dyn Fn(&mut App)>
                 };
-                let on_the_server = id.as_ref().is_some_and(|rid| {
-                    state
-                        .coworker_routines(&coworker_id)
-                        .iter()
-                        .any(|row| &row.id == rid && row.saved.is_some())
-                });
-                let icons = id.map(|id| {
-                    routine_icons(RoutineIcons {
-                        app: app.clone(),
-                        coworker_id,
-                        id,
-                        on_the_server,
-                        can_run: !state.routine_routes_missing.run_now,
-                        history_open: state.routine_history_open,
-                        persist,
-                        theme: cx.theme().clone(),
-                    })
-                    .into_any_element()
-                });
-                pane_header(Some(back), "Routine", None, icons, app, close).into_any_element()
+                pane_header(Some(back), "Routine", None, app, close).into_any_element()
             }
         }
     }
@@ -645,24 +632,79 @@ impl ComputerPane {
                 .child(trouble)
         });
 
-        v_flex().size_full().child(
+        // The routine's four icons are at the right of the Active switch's row, a spacer between
+        // them and the switch. The row is above the scrolling part, so the icons stay where they
+        // are however far the fields are scrolled, and whichever of the fields and the Run
+        // history is shown: the switch is the routine's own state and goes with its fields, but
+        // the history's icon is the way back to them, so the row stays without it.
+        let icons = id.clone().map(|id| {
+            routine_icons(RoutineIcons {
+                app: app.clone(),
+                coworker_id: coworker_id.clone(),
+                id,
+                on_the_server,
+                can_run: !missing.run_now,
+                history_open,
+                persist: persist.clone(),
+                theme: theme.clone(),
+            })
+        });
+        let active_row = h_flex()
+            .w_full()
+            .flex_shrink_0()
+            .items_center()
+            .px(px(16.))
+            .pt(px(12.))
+            .when(!history_open, |this| {
+                this.child(
+                    div().debug_selector(|| "routine-active".into()).child(
+                        Switch::new("routine-active")
+                            .checked(active)
+                            // Says what the position means, so off reads as a state the routine
+                            // is in and not as a label the switch has lost.
+                            .label(if active { "Active" } else { "Paused" })
+                            .on_click({
+                                let app = app.clone();
+                                let coworker_id = coworker_id.clone();
+                                let id = id.clone();
+                                move |checked, _, cx| {
+                                    if let Some(id) = id.clone() {
+                                        app.update(cx, |state, cx| {
+                                            state.set_routine_active(
+                                                &coworker_id,
+                                                &id,
+                                                *checked,
+                                                cx,
+                                            );
+                                        });
+                                    }
+                                }
+                            }),
+                    ),
+                )
+            })
+            .child(div().flex_1())
+            .children(icons);
+
+        v_flex().size_full().child(active_row).child(
             v_flex()
                 .id("routine-editor-scroll")
                 .flex_1()
                 .min_h(px(0.))
                 .overflow_y_scroll()
                 .px(px(16.))
-                .py(px(12.))
+                .pt(px(16.))
+                .pb(px(12.))
                 .gap(px(16.))
                 // What happened to the last thing asked of the routine, and what the server
-                // cannot do with it, are said over either view: the header's icons, which they
-                // are about, are over both.
+                // cannot do with it, are said over either view: the icons, which they are
+                // about, are over both.
                 .children(notes)
                 .children(trouble)
                 .map(|this| {
                     if history_open {
                         // The Run history, and nothing else: the routine's fields are behind the
-                        // header's first icon, which now says so.
+                        // row's first icon, which now says so.
                         this.child(routine_history(
                             &rid,
                             runs,
@@ -673,33 +715,7 @@ impl ComputerPane {
                             persist.clone(),
                         ))
                     } else {
-                        this.child(
-                            div().debug_selector(|| "routine-active".into()).child(
-                                Switch::new("routine-active")
-                                    .checked(active)
-                                    // Says what the position means, so off reads as a state the
-                                    // routine is in and not as a label the switch has lost.
-                                    .label(if active { "Active" } else { "Paused" })
-                                    .on_click({
-                                        let app = app.clone();
-                                        let coworker_id = coworker_id.clone();
-                                        let id = id.clone();
-                                        move |checked, _, cx| {
-                                            if let Some(id) = id.clone() {
-                                                app.update(cx, |state, cx| {
-                                                    state.set_routine_active(
-                                                        &coworker_id,
-                                                        &id,
-                                                        *checked,
-                                                        cx,
-                                                    );
-                                                });
-                                            }
-                                        }
-                                    }),
-                            ),
-                        )
-                        .when_some(unsaved, |this, edit| {
+                        this.when_some(unsaved, |this, edit| {
                             this.child(unsaved_block(&rid, &edit, muted, theme))
                         })
                         .child(field_label("Name", muted))
@@ -709,7 +725,9 @@ impl ComputerPane {
                                 .child(field_input(&self.name_input).disabled(!can_change)),
                         )
                         .child(field_label("Instruction", muted))
-                        .child(field_textarea(&self.instruction_input, theme).disabled(!can_change))
+                        .child(div().debug_selector(|| "routine-instruction".into()).child(
+                            field_textarea(&self.instruction_input, theme).disabled(!can_change),
+                        ))
                         .child(self.wake_section(
                             existing.as_ref(),
                             can_change,
@@ -750,6 +768,7 @@ impl ComputerPane {
             // One wake per routine is the server's rule today (`ONE_WAKE_PER_ROUTINE`);
             // opengrok-server#315 lifts it, and is what turns + on for a routine that has one.
             .child(routine_icon(
+                WAKE_SIZE,
                 "routine-wake-add",
                 "icons/plus.svg",
                 if can_add {
@@ -778,14 +797,7 @@ impl ComputerPane {
                 Some(editor) => self
                     .wake_editor(&editor, routine, muted, app, theme)
                     .into_any_element(),
-                None => wake_rows(
-                    routine,
-                    zone.as_ref().and_then(RoutineZone::note),
-                    can_change,
-                    muted,
-                    app,
-                    theme,
-                ),
+                None => wake_rows(routine, zone.as_ref(), can_change, muted, app, theme),
             })
             .into_any_element()
     }
@@ -1198,7 +1210,7 @@ fn skipped_line(i: usize, run: &crate::state::RoutineRun, reason: String, muted:
         .child(div().text_xs().text_color(muted).child(reason))
 }
 
-/// What a routine's header icons act on, and whether each can.
+/// What a routine's icons act on, and whether each can.
 struct RoutineIcons {
     app: Entity<AppState>,
     coworker_id: String,
@@ -1213,9 +1225,9 @@ struct RoutineIcons {
     theme: gpui_kit::component::Theme,
 }
 
-/// A routine's four icons, on the right of its header: Run history, Open in thread, Run it now
-/// and Delete. Icons, not words, so the four fit the panel's header at any width, each saying
-/// what it does in its tooltip, and why when it cannot.
+/// A routine's four icons, at the right of the Active switch's row: Run history, Open in thread,
+/// Run it now and Delete. Icons, not words, so the four fit the row at any width, each saying what
+/// it does in its tooltip, and why when it cannot.
 fn routine_icons(icons: RoutineIcons) -> impl IntoElement {
     let RoutineIcons {
         app,
@@ -1240,6 +1252,7 @@ fn routine_icons(icons: RoutineIcons) -> impl IntoElement {
         .child(
             // Its fields again, while the history is shown: the icon says where it goes.
             routine_icon(
+                TOGGLE_SIZE,
                 "routine-history-toggle",
                 if history_open {
                     "icons/list.svg"
@@ -1261,6 +1274,7 @@ fn routine_icons(icons: RoutineIcons) -> impl IntoElement {
             ),
         )
         .child(routine_icon(
+            TOGGLE_SIZE,
             "routine-open-thread",
             "icons/message-circle.svg",
             if on_the_server {
@@ -1282,6 +1296,7 @@ fn routine_icons(icons: RoutineIcons) -> impl IntoElement {
             },
         ))
         .child(routine_icon(
+            TOGGLE_SIZE,
             "routine-run-now",
             "icons/play.svg",
             run_why,
@@ -1299,6 +1314,7 @@ fn routine_icons(icons: RoutineIcons) -> impl IntoElement {
             },
         ))
         .child(routine_icon(
+            TOGGLE_SIZE,
             "routine-delete",
             "icons/trash.svg",
             "Delete",
@@ -1312,10 +1328,32 @@ fn routine_icons(icons: RoutineIcons) -> impl IntoElement {
         ))
 }
 
-/// One icon of a routine's header, with its tooltip. Dead and dimmed while what it does cannot
-/// be done, the tooltip then saying why; filled while `selected`, for the one that is a state.
+/// How big a routine icon is drawn: the button, and the glyph in it.
+#[derive(Clone, Copy)]
+struct IconSize {
+    button: f32,
+    glyph: f32,
+}
+
+/// The size of a routine's four icons: the window's own toggles' (`header-monitor` and
+/// `header-right-sidebar`, in the title bar), button and glyph, so that the two rows of icons read
+/// as one family.
+const TOGGLE_SIZE: IconSize = IconSize {
+    button: BUTTON_PX,
+    glyph: CONTROL_ICON_PX,
+};
+
+/// The size of the small icons on a wake: + beside "When to run", and ✎ and 🗑 on its line.
+const WAKE_SIZE: IconSize = IconSize {
+    button: 28.,
+    glyph: 16.,
+};
+
+/// One icon of a routine, with its tooltip. Dead and dimmed while what it does cannot be done,
+/// the tooltip then saying why; filled while `selected`, for the one that is a state.
 #[allow(clippy::too_many_arguments)]
 fn routine_icon(
+    size: IconSize,
     id: impl Into<SharedString>,
     icon: &'static str,
     tooltip: impl Into<SharedString>,
@@ -1328,8 +1366,11 @@ fn routine_icon(
     let tooltip: SharedString = tooltip.into();
     div()
         .id(id.clone())
-        .debug_selector(move || id.to_string())
-        .size(px(28.))
+        .debug_selector({
+            let id = id.clone();
+            move || id.to_string()
+        })
+        .size(px(size.button))
         .rounded(px(8.))
         .flex()
         .items_center()
@@ -1349,14 +1390,21 @@ fn routine_icon(
         .when(!enabled, |this| this.opacity(0.35))
         .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
         .child(
-            Icon::default()
-                .path(icon)
-                .size(px(16.))
-                .text_color(if selected {
-                    theme.primary_foreground
-                } else {
-                    theme.foreground
-                }),
+            div()
+                .debug_selector({
+                    let id = id.clone();
+                    move || format!("{id}-glyph")
+                })
+                .child(
+                    Icon::default()
+                        .path(icon)
+                        .size(px(size.glyph))
+                        .text_color(if selected {
+                            theme.primary_foreground
+                        } else {
+                            theme.foreground
+                        }),
+                ),
         )
 }
 
@@ -2020,7 +2068,6 @@ fn pane_header(
     back: Option<Rc<dyn Fn(&mut App)>>,
     title: &'static str,
     actions: Option<&ComputerControls>,
-    trailing: Option<AnyElement>,
     app: Entity<AppState>,
     close: bool,
 ) -> impl IntoElement {
@@ -2097,10 +2144,9 @@ fn pane_header(
         )
         // The empty run between the controls: a handle to drag the window by.
         .child(window_drag(div().flex_1().h_full()))
-        .children(trailing)
         // Beside the chat, where the row has no close control, the chat's title bar floats its
-        // two buttons over the row's right end. The row's own controls (a routine's four icons)
-        // stop short of them, and the run under them drags the window as the empty run does.
+        // two buttons over the right end of the row. The row's own controls stop short of them,
+        // and the run under them drags the window as the empty run does.
         .when(!close, |this| {
             this.child(window_drag(
                 div()
@@ -2169,7 +2215,6 @@ fn field_textarea(state: &Entity<TextareaState>, theme: &gpui_kit::component::Th
     Textarea::new(state)
         .appearance(false)
         .w_full()
-        .h(px(96.))
         .rounded(px(8.))
         .border_1()
         .border_color(theme.input)
@@ -2226,10 +2271,12 @@ fn copy_row(
         )
 }
 
-/// A routine's wakes, one row each: what sets it off in words, ✎ and 🗑.
+/// A routine's wakes, one row each: what sets it off in words, ✎ and 🗑. The words are all the
+/// line shows of when it runs; hovering it says what its times are in, where that is not this
+/// computer's zone, and when it next runs (`RoutineZone::wake_hint`).
 fn wake_rows(
     routine: Option<&AgentRoutine>,
-    zone: Option<&str>,
+    zone: Option<&RoutineZone>,
     can_change: bool,
     muted: Hsla,
     app: Entity<AppState>,
@@ -2247,6 +2294,7 @@ fn wake_rows(
             .into_any_element();
     }
     let can_remove = AppState::can_remove_wake(routine);
+    let now = chrono::Utc::now();
     v_flex()
         .w_full()
         .gap(px(6.))
@@ -2255,6 +2303,7 @@ fn wake_rows(
             // ✎ on a schedule changes it, which a server that cannot change a routine refuses;
             // on a webhook it shows the address and the key, which any server can.
             let can_edit = webhook || can_change;
+            let hint = zone.and_then(|zone| zone.wake_hint(trigger, now));
             h_flex()
                 .id(SharedString::from(format!("routine-wake-{at}")))
                 .w_full()
@@ -2265,6 +2314,17 @@ fn wake_rows(
                 .rounded(px(8.))
                 .border_1()
                 .border_color(theme.border)
+                .when_some(hint, |this, hint| {
+                    this.tooltip(move |window, cx| {
+                        let hint = hint.clone();
+                        Tooltip::element(move |_, _| {
+                            div()
+                                .debug_selector(move || format!("routine-wake-{at}-hint"))
+                                .child(hint.clone())
+                        })
+                        .build(window, cx)
+                    })
+                })
                 .child(
                     Icon::default()
                         .path(if webhook {
@@ -2275,19 +2335,16 @@ fn wake_rows(
                         .size(px(14.))
                         .text_color(muted),
                 )
-                .child(div().flex_1().min_w_0().text_sm().child(trigger.label()))
-                // A schedule's zone, small, where it is not this computer's (#316).
-                .when_some(zone.filter(|_| !webhook), |this, zone| {
-                    this.child(
-                        div()
-                            .id(SharedString::from(format!("routine-wake-{at}-zone")))
-                            .flex_shrink_0()
-                            .text_xs()
-                            .text_color(muted)
-                            .child(zone.to_string()),
-                    )
-                })
+                .child(
+                    div()
+                        .debug_selector(move || format!("routine-wake-{at}-words"))
+                        .flex_1()
+                        .min_w_0()
+                        .text_sm()
+                        .child(trigger.label()),
+                )
                 .child(routine_icon(
+                    WAKE_SIZE,
                     format!("routine-wake-edit-{at}"),
                     "icons/pencil.svg",
                     if !can_edit {
@@ -2313,6 +2370,7 @@ fn wake_rows(
                 // Taking one wake off a routine with several is opengrok-server#315's to offer;
                 // until then a routine has one, and it stays.
                 .child(routine_icon(
+                    WAKE_SIZE,
                     format!("routine-wake-delete-{at}"),
                     "icons/trash.svg",
                     if can_remove {
@@ -2783,9 +2841,9 @@ mod tests {
         state
     }
 
-    /// The routine's header carries its four icons, and the first switches the panel between
-    /// the routine's fields and its Run history alone: by default Active, Name and the rest, and
-    /// no history; pressed, the history and none of the fields; pressed again, the fields.
+    /// The routine's four icons are drawn, and the first switches the panel between the
+    /// routine's fields and its Run history alone: by default Active, Name and the rest, and no
+    /// history; pressed, the history and none of the fields; pressed again, the fields.
     #[gpui_kit::test]
     fn the_history_icon_swaps_the_routines_fields_for_its_runs(cx: &mut gpui_kit::TestAppContext) {
         use gpui_kit::{AppContext as _, Modifiers};
@@ -2804,7 +2862,7 @@ mod tests {
             "routine-run-now",
             "routine-delete",
         ] {
-            assert!(drawn(cx, icon).is_some(), "{icon} is in the header");
+            assert!(drawn(cx, icon).is_some(), "{icon} is drawn");
         }
         assert!(drawn(cx, "routine-active").is_some());
         assert!(drawn(cx, "routine-name").is_some());
@@ -2997,5 +3055,219 @@ mod tests {
         cx.simulate_mouse_move(delete, None, Modifiers::none());
         cx.simulate_click(delete, Modifiers::none());
         assert!(state.read_with(cx, |state, _| state.coworker_routines("cw_1").is_empty()));
+    }
+
+    /// The routine's four icons sit on the Active switch's row, after a spacer that pushes them
+    /// to the panel's right edge, in the order they have always had; the title row above keeps
+    /// the back control, the title and the window's toggles. The row stays while the Run history
+    /// is shown, without its switch, because the history's own icon is how a person gets back.
+    #[gpui_kit::test]
+    fn the_routines_icons_sit_beside_the_active_switch_not_in_the_title_row(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        use gpui_kit::{AppContext as _, Bounds, Modifiers, Pixels, px};
+        cx.update(gpui_kit::init);
+        let (_, cx) = cx.add_window_view(|window, cx| {
+            let state = cx.new(|_| routine_open());
+            super::ComputerPane::new(window, state, cx)
+        });
+        let drawn = |cx: &mut gpui_kit::VisualTestContext, id: &'static str| {
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            cx.debug_bounds(id)
+        };
+        let ids = [
+            "routine-history-toggle",
+            "routine-open-thread",
+            "routine-run-now",
+            "routine-delete",
+        ];
+        let panel_edge = px(crate::chrome::INFO_PANE_WIDTH - crate::chrome::HEADER_PX);
+        let icons_of =
+            |cx: &mut gpui_kit::VisualTestContext| -> Vec<(&'static str, Bounds<Pixels>)> {
+                ids.map(|id| (id, drawn(cx, id).unwrap_or_else(|| panic!("{id} is drawn"))))
+                    .to_vec()
+            };
+
+        let title = drawn(cx, "computer-header").expect("the title row");
+        let active = drawn(cx, "routine-active").expect("the Active switch");
+        let icons = icons_of(cx);
+        for (id, icon) in &icons {
+            assert!(
+                icon.top() >= title.bottom(),
+                "{id} is in the title row: {icon:?} in {title:?}"
+            );
+            assert!(
+                icon.left() >= active.right(),
+                "{id} is not after the switch: {icon:?}, switch {active:?}"
+            );
+            assert!(
+                (icon.center().y - active.center().y).abs() < px(1.),
+                "{id} is not on the switch's row: {icon:?}, switch {active:?}"
+            );
+        }
+        assert!(
+            icons
+                .windows(2)
+                .all(|pair| pair[0].1.right() <= pair[1].1.left()),
+            "the icons keep their order, left to right: {icons:?}"
+        );
+        let last = icons[3].1;
+        assert!(
+            (last.right() - panel_edge).abs() < px(1.),
+            "the spacer pushes the icons to the right edge: {last:?}, edge {panel_edge:?}"
+        );
+
+        let toggle = icons[0].1.center();
+        cx.simulate_mouse_move(toggle, None, Modifiers::none());
+        cx.simulate_click(toggle, Modifiers::none());
+        let title = drawn(cx, "computer-header").expect("the title row");
+        assert!(drawn(cx, "routine-active").is_none(), "the history alone");
+        for (id, icon) in icons_of(cx) {
+            assert!(
+                icon.top() >= title.bottom(),
+                "{id} is in the title row while the history shows"
+            );
+        }
+    }
+
+    /// An Instruction of many lines stays in its box. The box grows with the text to about six
+    /// lines and no further, the text is drawn inside it and scrolls there, and the fields
+    /// below start under the box. It was a box of a fixed height round an editor that grows to
+    /// eight lines whatever the box holds, so the last lines were drawn over the fields below.
+    #[gpui_kit::test]
+    fn a_long_instruction_scrolls_inside_its_box(cx: &mut gpui_kit::TestAppContext) {
+        use gpui_kit::component::input::Position;
+        use gpui_kit::{AppContext as _, Bounds, px, size};
+        cx.update(gpui_kit::init);
+        let long = (1..=30)
+            .map(|n| format!("Step {n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (pane, cx) = cx.add_window_view(|window, cx| {
+            let state = cx.new(|_| {
+                let mut state = routine_open();
+                state.routines.get_mut("cw_1").expect("the bot's routines")[0].instruction =
+                    long.clone();
+                state
+            });
+            super::ComputerPane::new(window, state, cx)
+        });
+        cx.simulate_resize(size(px(320.), px(1200.)));
+        let drawn = |cx: &mut gpui_kit::VisualTestContext, id: &'static str| {
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            cx.debug_bounds(id)
+        };
+        // The editor settles its rows after its first layout.
+        for _ in 0..4 {
+            drawn(cx, "routine-instruction");
+        }
+        let boxed = drawn(cx, "routine-instruction").expect("the Instruction box");
+        let (editor, line) = pane.update(cx, |pane, cx| {
+            let input = pane.instruction_input.read(cx);
+            (
+                input.input_bounds(),
+                input.line_height().expect("the editor is laid out"),
+            )
+        });
+        assert!(
+            editor.size.height <= line * 6.,
+            "the editor shows more than six lines: {editor:?}, a line is {line:?}"
+        );
+        assert!(
+            boxed.size.height <= line * 6. + px(20.),
+            "the box is taller than six lines and its padding: {boxed:?}, a line is {line:?}"
+        );
+        assert!(
+            editor.top() >= boxed.top() && editor.bottom() <= boxed.bottom(),
+            "the text is drawn outside its box: {editor:?} in {boxed:?}"
+        );
+        let below = drawn(cx, "routine-wake-add").expect("the fields below");
+        assert!(
+            below.top() >= boxed.bottom(),
+            "the fields below start under the box: {below:?}, box {boxed:?}"
+        );
+
+        // Editing goes on in the box: the caret goes to the last line, the text scrolls to bring
+        // it into view, and what is typed there is the instruction's end. The caret's bounds are
+        // the unscrolled ones, so the scroll is added to put it where it is drawn.
+        pane.update_in(cx, |pane, window, cx| {
+            pane.instruction_input.update(cx, |input, cx| {
+                input.set_cursor_position(Position::new(29, 7), window, cx)
+            })
+        });
+        let drawn_caret = |cx: &mut gpui_kit::VisualTestContext| {
+            drawn(cx, "routine-instruction");
+            pane.update(cx, |pane, cx| {
+                let input = pane.instruction_input.read(cx);
+                input
+                    .cursor_layout()
+                    .map(|(caret, _)| Bounds::new(caret.origin + input.scroll_offset(), caret.size))
+            })
+        };
+        for _ in 0..60 {
+            if drawn_caret(cx).is_some_and(|caret| caret.bottom() <= boxed.bottom()) {
+                break;
+            }
+        }
+        let caret = drawn_caret(cx).expect("the caret is laid out");
+        assert!(
+            caret.top() >= boxed.top() && caret.bottom() <= boxed.bottom(),
+            "the caret is outside the box: {caret:?}, box {boxed:?}"
+        );
+        assert!(
+            pane.update(cx, |pane, cx| pane
+                .instruction_input
+                .read(cx)
+                .scroll_offset()
+                .y)
+                < px(0.),
+            "thirty lines scroll in their box"
+        );
+        cx.simulate_input("!");
+        assert_eq!(
+            pane.update(cx, |pane, cx| pane.routine_fields(cx).1),
+            format!("{long}!")
+        );
+    }
+
+    /// A schedule's line shows what it says and no zone beside it: nothing sits between its
+    /// words and its icons. Hovering the line says the zone, and when it next runs, in a tooltip.
+    #[gpui_kit::test]
+    fn a_schedule_line_keeps_its_zone_for_a_hover(cx: &mut gpui_kit::TestAppContext) {
+        use gpui_kit::{AppContext as _, Modifiers, px};
+        cx.update(gpui_kit::init);
+        let (_, cx) = cx.add_window_view(|window, cx| {
+            let state = cx.new(|_| {
+                let mut state = routine_open();
+                // A zone this computer is not in.
+                state.routines.get_mut("cw_1").expect("the bot's routines")[0].tz =
+                    Some("Pacific/Chatham".into());
+                state
+            });
+            super::ComputerPane::new(window, state, cx)
+        });
+        let drawn = |cx: &mut gpui_kit::VisualTestContext, id: &'static str| {
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            cx.debug_bounds(id)
+        };
+        let words = drawn(cx, "routine-wake-0-words").expect("the schedule's words");
+        let edit = drawn(cx, "routine-wake-edit-0").expect("its edit icon");
+        assert!(
+            edit.left() - words.right() <= px(8.5),
+            "something sits between the words and the icons: {words:?}, {edit:?}"
+        );
+        assert!(
+            drawn(cx, "routine-wake-0-hint").is_none(),
+            "no tooltip until it is hovered"
+        );
+
+        cx.simulate_mouse_move(words.center(), None, Modifiers::none());
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(600));
+        cx.run_until_parked();
+        assert!(
+            drawn(cx, "routine-wake-0-hint").is_some(),
+            "hovering the line says its zone and its next run"
+        );
     }
 }
