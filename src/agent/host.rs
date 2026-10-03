@@ -13878,7 +13878,7 @@ mod tests {
         ));
 
         assert!(host.snapshot().find("agent-settings-error").is_none());
-        let said = "effort must be one of inherit, none, low, medium, high, xhigh, max";
+        let said = "effort must be one of inherit, none, low, medium, high, xhigh, max, ultra";
         host.auth_error = Some(said.into());
         assert_eq!(
             host.snapshot().find("agent-settings-error").unwrap().name,
@@ -14679,7 +14679,7 @@ mod tests {
         // What a refusal said is under the card while the popover is shut.
         host.plan_fallback_picker = PickerView::default();
         host.plan_fallback_note = Some(
-            "planFallback.effort must be one of inherit, none, low, medium, high, xhigh, max"
+            "planFallback.effort must be one of inherit, none, low, medium, high, xhigh, max, ultra"
                 .into(),
         );
         let tree = host.snapshot();

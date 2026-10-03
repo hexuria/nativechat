@@ -38118,8 +38118,8 @@ mod tests {
 
         // The server's words for an effort that is not a Bot's (opengrok-server #332 (PR #338 at
         // 66b9f7b): `PlanFallback::named`), which keep none of the body.
-        let said =
-            "planFallback.effort must be one of inherit, none, low, medium, high, xhigh, max";
+        let said = "planFallback.effort must be one of inherit, none, low, medium, high, xhigh, \
+                    max, ultra";
         let send = state
             .begin_plan_fallback_change(Some(cheap("loud")))
             .expect("a change begins");

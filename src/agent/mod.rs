@@ -274,7 +274,8 @@
 //! the pick put back on `inherit`, it says `GPT-6 Luna has no Ultra, so it's on Medium, its own
 //! level.`, for as long as that model is on the card and nothing else is changed. The model's
 //! levels and own level are `GET /models`' `efforts` and `ownEffort` (opengrok-server branch
-//! `model-effort-levels`, shape agreed (not recorded yet)).
+//! `model-effort-levels`, commit d632b77: `Model::entry` in
+//! `crates/opengrok-core/src/catalogue.rs`).
 //! While the list shows, those give way to `agent-model-open-list` as the heading back (state
 //! `expanded`), `agent-model-search` (the search box at the top of the list, a textbox valued by
 //! what is typed: `set_value` writes it, `type` adds to it, `key` takes Backspace and Enter; it

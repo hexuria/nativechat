@@ -7545,7 +7545,7 @@ mod tests {
     /// owner may change (403). Both are verdicts about what was asked, not an outage.
     #[tokio::test]
     async fn a_refused_effort_is_the_servers_sentence() {
-        let unknown = "effort must be one of inherit, none, low, medium, high, xhigh, max";
+        let unknown = "effort must be one of inherit, none, low, medium, high, xhigh, max, ultra";
         let shared = "only the person who hired this coworker can change it; you can hide it \
                       from your own sidebar";
         let server = MockServer::start().await;

@@ -188,8 +188,15 @@ pub struct CoworkerPatch {
     /// A level of the model's ([`ModelEntry::efforts`]) or `inherit`, sent only when the person
     /// changed it: absent leaves the stored effort alone, and `inherit` clears it
     /// (opengrok-server#271, which reads `null` the same way). The server refuses a word it does
-    /// not know with a 400 and changes nothing, and refuses it on a coworker shared with the
-    /// caller with a 403, as it does every change there but the sidebar flag.
+    /// not know with a 400 and changes nothing (`effort must be one of inherit, none, low,
+    /// medium, high, xhigh, max, ultra`), and so it does a level the model does not list, in
+    /// words that name the ones it does (`effort: gpt-6-luna takes low, medium, high, xhigh or
+    /// max, not "none"`), and `ultra` where no listing of the model names it (`effort: no
+    /// listing of xai/grok-4.6 names "ultra", and it is taken only where one does`):
+    /// opengrok-server branch `model-effort-levels`, commit d632b77, `effort_refused` in
+    /// `crates/opengrok-server/src/inference.rs`, which `repin_coworker` in
+    /// `crates/opengrok-server/src/agui/routes.rs` asks. It refuses a word on a coworker shared
+    /// with the caller with a 403, as it does every change there but the sidebar flag.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
     /// The Bot's own door, sent with the model the model picker put it on, and only to a server
@@ -251,8 +258,15 @@ pub struct ThreadListing {
 /// server keeps and a `PATCH /coworkers/{id}` takes (`low`, `medium`, `ultra`), and what the model
 /// calls it, which is a word of the source's own (opencodex says "Low Effort").
 ///
-/// Transcribed from opengrok-server branch `model-effort-levels`, shape agreed (not recorded yet,
-/// so no corpus file holds it: `REST_FIELDS_NOT_RECORDED_YET` in `opengrok/conformance.rs`).
+/// Transcribed from opengrok-server branch `model-effort-levels` (commit d632b77): `Level` and
+/// `Levels::of` in `crates/opengrok-core/src/catalogue.rs`, which `Model::entry` there writes on
+/// every row `list_models` in `crates/opengrok-server/src/agui/routes.rs` lists. The server sends
+/// a `label` on every level, showing one that was missing or blank as the `value`, and drops an
+/// entry that has no `value`; this app reads a listing the same way, so one odd entry never
+/// takes the slider from a model. The branch's own tests record the shape
+/// (`crates/opengrok-server/tests/against_a_models_own_levels.rs`), but its wire corpus is not
+/// re-recorded, so no corpus file here holds it yet (`REST_FIELDS_NOT_RECORDED_YET` in
+/// `opengrok/conformance.rs`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EffortLevel {
     pub value: String,
@@ -260,7 +274,9 @@ pub struct EffortLevel {
 }
 
 /// A model of `GET /models`. Its `efforts` and `ownEffort` are from opengrok-server branch
-/// `model-effort-levels`, shape agreed (not recorded yet).
+/// `model-effort-levels` (commit d632b77): `Model::entry` in
+/// `crates/opengrok-core/src/catalogue.rs` writes both on every row, the gateway's and the
+/// person's plan's alike, `null` where the source publishes none ([`EffortLevel`]).
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
 pub struct ModelEntry {
     pub id: String,
@@ -281,8 +297,9 @@ pub struct ModelEntry {
     pub via: Option<String>,
     /// The levels of effort the model takes, lowest first: `[{value, label}]`, or `null` when
     /// the source the model comes from publishes none. The app never works them out for a model
-    /// that lists none, and a list it cannot read whole is none: a slider drawn from a guess
-    /// would offer a stop the server then refuses. Empty is none too.
+    /// that lists none: a slider drawn from a guess would offer a stop the server then refuses.
+    /// An entry with no `value` is no level, and one with no `label` is called by its value, as
+    /// the server reads a listing itself; a list with no level left is none.
     #[serde(default, deserialize_with = "effort_levels_or_none")]
     pub efforts: Option<Vec<EffortLevel>>,
     /// The `value` of the level the model runs at when a Bot chooses none, `null` when the
@@ -364,20 +381,23 @@ where
     read_or_none(deserializer, |raw| word(raw).map(str::to_string))
 }
 
-/// The levels `efforts` lists: `[{value, label}]` lowest first. A list that is empty, or has one
-/// entry that is not a `value` and a `label`, is none.
+/// The levels `efforts` lists: `[{value, label}]` lowest first, as the server reads a listing
+/// itself (`Levels::of`): an entry with no `value` is no level, and one with no `label` is
+/// called by its value. A list with no level left is none.
 fn effort_levels(raw: &serde_json::Value) -> Option<Vec<EffortLevel>> {
-    let levels: Option<Vec<EffortLevel>> = raw
+    let levels: Vec<EffortLevel> = raw
         .as_array()?
         .iter()
-        .map(|row| {
+        .filter_map(|row| {
+            let value = word(row.get("value")?)?;
+            let label = row.get("label").and_then(word).unwrap_or(value);
             Some(EffortLevel {
-                value: word(row.get("value")?)?.to_string(),
-                label: word(row.get("label")?)?.to_string(),
+                value: value.to_string(),
+                label: label.to_string(),
             })
         })
         .collect();
-    levels.filter(|levels| !levels.is_empty())
+    (!levels.is_empty()).then_some(levels)
 }
 
 /// A word: a string with something in it.
@@ -851,11 +871,12 @@ mod tests {
     }
 
     /// A model lists the levels of effort it takes, lowest first, and the one it runs at when a
-    /// Bot chooses none (opengrok-server branch `model-effort-levels`, shape agreed (not recorded
-    /// yet)). Both are `null` where the source publishes nothing and then read as none, as when
-    /// the keys are missing; the app never works a model's levels out. A list it cannot read
-    /// whole, an empty one, and an own level the model does not list are none, and never fail
-    /// the list.
+    /// Bot chooses none (opengrok-server branch `model-effort-levels`, commit d632b77: `Levels::of`
+    /// in `crates/opengrok-core/src/catalogue.rs`). Both are `null` where the source publishes
+    /// nothing and then read as none, as when the keys are missing; the app never works a model's
+    /// levels out. A level with no label is called by its value, as the server calls it, and an
+    /// entry with no value is no level; an empty list, one with no level left, and an own level
+    /// the model does not list are none, and never fail the list.
     #[test]
     fn a_models_levels_of_effort_read_as_sent_and_as_none_where_there_are_none() {
         let catalogue: ModelCatalogue = serde_json::from_value(serde_json::json!({
@@ -869,6 +890,10 @@ mod tests {
                 {"id": "oag/fast"},
                 {"id": "empty", "efforts": [], "ownEffort": "medium"},
                 {"id": "half", "efforts": [{"value": "low"}, {"value": "high", "label": "High"}]},
+                {"id": "unlabelled", "efforts": [{"value": "medium", "label": "  "}]},
+                {"id": "dropped", "efforts": [
+                    {"label": "Nameless"}, {"value": "max", "label": "Max Effort"}
+                ]},
                 {"id": "blank", "efforts": [{"value": "", "label": "Low"}]},
                 {"id": "odd", "efforts": "low", "ownEffort": 3},
                 {"id": "unlisted", "ownEffort": "ultra", "efforts": [
@@ -902,7 +927,31 @@ mod tests {
             luna.own_level().map(|level| level.value.as_str()),
             Some("medium")
         );
-        for none in ["oag/cheap", "oag/fast", "empty", "half", "blank", "odd"] {
+        let called = |id: &str| -> Vec<(String, String)> {
+            read(id)
+                .efforts
+                .iter()
+                .flatten()
+                .map(|level| (level.value.clone(), level.label.clone()))
+                .collect()
+        };
+        let pair = |value: &str, label: &str| (value.to_string(), label.to_string());
+        assert_eq!(
+            called("half"),
+            [pair("low", "low"), pair("high", "High")],
+            "no label: the value"
+        );
+        assert_eq!(
+            called("unlabelled"),
+            [pair("medium", "medium")],
+            "a blank label too"
+        );
+        assert_eq!(
+            called("dropped"),
+            [pair("max", "Max Effort")],
+            "no value, no level"
+        );
+        for none in ["oag/cheap", "oag/fast", "empty", "blank", "odd"] {
             let entry = read(none);
             assert_eq!(entry.efforts, None, "{none}");
             assert_eq!(entry.own_level(), None, "{none}");
@@ -916,6 +965,110 @@ mod tests {
             None,
             "a level it does not list is none to light"
         );
+    }
+
+    /// The listings opengrok-server's own tests record of `GET /models`, transcribed as they are
+    /// (branch `model-effort-levels`, commit d632b77:
+    /// `crates/opengrok-server/tests/against_a_models_own_levels.rs`): the plan's gpt-6-sol with
+    /// six levels, up to `ultra`, and gpt-6-luna with five beside a model with none, and the
+    /// gateway's route with three beside one with none. Each row carries `points`, `source` and
+    /// `via` as before, and `efforts` and `ownEffort`, both `null` where the source publishes none.
+    #[test]
+    fn the_listings_the_server_branch_records_are_read_as_they_say() {
+        use crate::opengrok::{InferenceKind, Via};
+        let level = |word: &str| {
+            serde_json::json!({
+                "value": word,
+                "label": format!("{}{} Effort", word[..1].to_uppercase(), &word[1..])
+            })
+        };
+        let six = ["low", "medium", "high", "xhigh", "max", "ultra"].map(level);
+        let five = ["low", "medium", "high", "xhigh", "max"].map(level);
+        let three = ["low", "medium", "high"].map(level);
+        let plan: ModelCatalogue = serde_json::from_value(serde_json::json!({
+            "models": [
+                {"id": "gpt-6-sol", "points": null, "source": "local_proxy", "via": "loopback",
+                 "efforts": six, "ownEffort": "medium"},
+                {"id": "gpt-6-luna", "points": null, "source": "local_proxy", "via": "loopback",
+                 "efforts": five, "ownEffort": "medium"},
+                {"id": "xai/grok-4.6", "points": null, "source": "local_proxy",
+                 "via": "loopback", "efforts": null, "ownEffort": null}
+            ],
+            "note": null
+        }))
+        .expect("the plan's listing");
+        let gateway: ModelCatalogue = serde_json::from_value(serde_json::json!({
+            "models": [
+                {"id": "openai/gpt-6-luna", "points": null, "source": "gateway",
+                 "efforts": three, "ownEffort": "medium"},
+                {"id": "xai/grok-4.6", "points": null, "source": "gateway",
+                 "efforts": null, "ownEffort": null}
+            ],
+            "note": null
+        }))
+        .expect("the gateway's listing");
+        let called = |entry: &ModelEntry| -> Vec<(String, String)> {
+            entry
+                .efforts
+                .iter()
+                .flatten()
+                .map(|level| (level.value.clone(), level.label.clone()))
+                .collect()
+        };
+        let pair = |value: &str, label: &str| (value.to_string(), label.to_string());
+        let [sol, luna, grok] = &plan.models[..] else {
+            panic!("three models")
+        };
+        assert_eq!(
+            called(sol),
+            [
+                pair("low", "Low Effort"),
+                pair("medium", "Medium Effort"),
+                pair("high", "High Effort"),
+                pair("xhigh", "Xhigh Effort"),
+                pair("max", "Max Effort"),
+                pair("ultra", "Ultra Effort")
+            ]
+        );
+        assert_eq!(
+            called(luna),
+            [
+                pair("low", "Low Effort"),
+                pair("medium", "Medium Effort"),
+                pair("high", "High Effort"),
+                pair("xhigh", "Xhigh Effort"),
+                pair("max", "Max Effort")
+            ]
+        );
+        for plan_model in [sol, luna] {
+            assert_eq!(
+                plan_model.own_level().map(|level| level.value.as_str()),
+                Some("medium")
+            );
+        }
+        assert_eq!(
+            (sol.plan_via(), luna.plan_via(), grok.plan_via()),
+            (
+                Some(Via::Loopback),
+                Some(Via::Loopback),
+                Some(Via::Loopback)
+            )
+        );
+        assert_eq!((grok.efforts.as_ref(), grok.own_level()), (None, None));
+        let [luna, grok] = &gateway.models[..] else {
+            panic!("two models")
+        };
+        assert_eq!(
+            called(luna),
+            [
+                pair("low", "Low Effort"),
+                pair("medium", "Medium Effort"),
+                pair("high", "High Effort")
+            ]
+        );
+        assert_eq!(luna.own_effort.as_deref(), Some("medium"));
+        assert_eq!((grok.efforts.as_ref(), grok.own_level()), (None, None));
+        assert_eq!(luna.source(), Some(InferenceKind::Gateway));
     }
 
     /// `localProxy` says whether opencodex answered as the server listed its models: read when

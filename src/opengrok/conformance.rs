@@ -658,23 +658,35 @@ const REST_FIELDS_NOT_RECORDED_YET: &[(&str, &str, &str)] = &[
         "efforts",
         "The levels of effort a model takes, `[{value, label}] | null` on every entry, lowest \
          first, `null` where the source the model comes from publishes none: opengrok-server \
-         branch `model-effort-levels`, shape agreed (not recorded yet). A fast twin's levels are \
-         its base model's: the app folds the two into one row and reads the base's. The model \
-         picker's slider has exactly these for its stops, and none at all for a model that lists \
-         none. PATCH /coworkers/{id}, `newBotDefault` and `planFallback` refuse an effort the \
-         model does not list with a 400 whose words name the listed levels, and take `inherit` \
-         always; each is read as its sentence like every refusal of its route. Its fixtures come \
-         with the server's `model-effort-levels` and the recording after it: a model entry \
-         carrying `efforts`.",
+         branch `model-effort-levels`, commit d632b77, written by `Model::entry` in \
+         `crates/opengrok-core/src/catalogue.rs` for `list_models` in \
+         `crates/opengrok-server/src/agui/routes.rs`. Its own tests record a plan row with six \
+         levels and one with five, and a gateway row, beside rows without \
+         (`crates/opengrok-server/tests/against_a_models_own_levels.rs`), but its wire corpus is \
+         not re-recorded there, so no fixture holds a model entry carrying `efforts` yet. The \
+         server drops an entry with no `value` and shows one with no `label` as its value \
+         (`Levels::of`), and the app reads the same. A fast twin's levels are its base model's: \
+         the app folds the two into one row and reads the base's. The model picker's slider has \
+         exactly these for its stops, and none at all for a model that lists none. \
+         PATCH /coworkers/{id}, `newBotDefault` and `planFallback` (held to the gateway's levels) \
+         refuse an effort the model does not list with a 400 whose words name the listed \
+         levels, and take `inherit` always; `ultra` is taken only where a listing names it, and \
+         is refused in words of its own where none does (`effort_refused` in \
+         `crates/opengrok-server/src/inference.rs`, `refusal` in \
+         `crates/opengrok-core/src/catalogue.rs`). Each is read as its sentence like every \
+         refusal of its route. Its fixtures come with the recording after the branch lands: a \
+         model entry carrying `efforts`.",
     ),
     (
         "GET__models",
         "ownEffort",
-        "The `value` of the level a model runs at when a Bot chooses none, `null` where the source \
-         publishes none: opengrok-server branch `model-effort-levels`, shape agreed (not recorded \
-         yet). The picker lights that level by name for a Bot or a setting at `inherit`, and \
-         saves nothing by it. Its fixtures come with the server's `model-effort-levels` and the \
-         recording after it: a model entry carrying `ownEffort`.",
+        "The `value` of the level a model runs at when a Bot chooses none, `null` where the \
+         source publishes none: opengrok-server branch `model-effort-levels`, commit d632b77 \
+         (`Levels::own` in `crates/opengrok-core/src/catalogue.rs`: the row's \
+         `reasoning_effort`, else the entry marked `default`). The picker lights that level by \
+         name for a Bot or a setting at `inherit`, and saves nothing by it; a word the model \
+         does not list is no level to light. Its fixtures come with the recording after the \
+         branch lands: a model entry carrying `ownEffort`.",
     ),
 ];
 
@@ -3891,20 +3903,44 @@ fn models_listed(_: u16, body: &Value) -> Check {
         );
     }
     // Each model's levels of effort, lowest first, and the one it runs at when a Bot chooses
-    // none: opengrok-server branch `model-effort-levels`, shape agreed (not recorded yet:
-    // REST_FIELDS_NOT_RECORDED_YET). Every recording from before it has neither, which is a model
-    // that lists no levels, and a list that is `null` or empty reads the same.
+    // none: opengrok-server branch `model-effort-levels`, commit d632b77 (`Model::entry` in
+    // `crates/opengrok-core/src/catalogue.rs`), not recorded yet: REST_FIELDS_NOT_RECORDED_YET.
+    // Every recording from before it has neither, which is a model that lists no levels, and a
+    // list that is `null` or empty reads the same. The server drops an entry with no `value` and
+    // shows one with no `label` as its value (`Levels::of`), and so does this app. A key in any
+    // other shape is the server not keeping to what was agreed: the app reads it as none, and it
+    // is caught here, so a slider that goes missing is not missed.
+    fn said<'a>(level: &'a Value, key: &str) -> Option<&'a str> {
+        opt_str(level, key).filter(|word| !word.trim().is_empty())
+    }
     for (entry, raw) in catalogue.models.iter().zip(raw) {
+        must!(
+            matches!(
+                raw.get("efforts"),
+                None | Some(Value::Null | Value::Array(_))
+            ),
+            "a model's levels of effort should be a list or null: {raw}"
+        );
+        must!(
+            matches!(
+                raw.get("ownEffort"),
+                None | Some(Value::Null | Value::String(_))
+            ),
+            "a model's own level should be a word or null: {raw}"
+        );
         let sent: Option<Vec<(&str, &str)>> = raw
             .get("efforts")
             .and_then(Value::as_array)
-            .filter(|levels| !levels.is_empty())
             .map(|levels| {
                 levels
                     .iter()
-                    .map(|level| (str_at(level, "value"), str_at(level, "label")))
-                    .collect()
-            });
+                    .filter_map(|level| {
+                        let value = said(level, "value")?;
+                        Some((value, said(level, "label").unwrap_or(value)))
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .filter(|levels| !levels.is_empty());
         let read: Option<Vec<(&str, &str)>> = entry.efforts.as_ref().map(|levels| {
             levels
                 .iter()
@@ -5646,7 +5682,7 @@ fn a_coworker_rows_effort_has_a_reading_in_the_ledger() {
         patched,
         400,
         serde_json::json!({
-            "error": "effort must be one of inherit, none, low, medium, high, xhigh, max"
+            "error": "effort must be one of inherit, none, low, medium, high, xhigh, max, ultra"
         }),
     )
     .unwrap();
@@ -6334,11 +6370,55 @@ fn the_models_list_is_read_beyond_the_recording() {
         "models": [], "note": null,
         "localProxy": {"healthy": false, "relayConnected": false}
     });
-    // With the levels of effort (opengrok-server branch `model-effort-levels`, shape agreed (not
-    // recorded yet)): a model listing five, one listing six, a fast twin listing the levels its
-    // base does, a model whose source publishes none (`null`, and empty), and one that lists
-    // levels and no level of its own.
+    // With the levels of effort (opengrok-server branch `model-effort-levels`, commit d632b77,
+    // not recorded yet): the listings its own tests record
+    // (`crates/opengrok-server/tests/against_a_models_own_levels.rs`), the plan's models with six
+    // levels, up to `ultra`, and with five beside one with none, and the gateway's route with
+    // three beside one with none; and beyond them a fast twin listing the levels its base does, a
+    // model whose source publishes none (`null`, and empty), and one that lists levels and no
+    // level of its own.
     let level = |value: &str, label: &str| json!({"value": value, "label": label});
+    let five = || {
+        json!([
+            level("low", "Low Effort"),
+            level("medium", "Medium Effort"),
+            level("high", "High Effort"),
+            level("xhigh", "Xhigh Effort"),
+            level("max", "Max Effort")
+        ])
+    };
+    let six = || {
+        json!([
+            level("low", "Low Effort"),
+            level("medium", "Medium Effort"),
+            level("high", "High Effort"),
+            level("xhigh", "Xhigh Effort"),
+            level("max", "Max Effort"),
+            level("ultra", "Ultra Effort")
+        ])
+    };
+    let recorded_plan = json!({
+        "models": [
+            {"id": "gpt-6-sol", "points": null, "source": "local_proxy", "via": "loopback",
+             "efforts": six(), "ownEffort": "medium"},
+            {"id": "gpt-6-luna", "points": null, "source": "local_proxy", "via": "loopback",
+             "efforts": five(), "ownEffort": "medium"},
+            {"id": "xai/grok-4.6", "points": null, "source": "local_proxy", "via": "loopback",
+             "efforts": null, "ownEffort": null}
+        ],
+        "note": null
+    });
+    let recorded_gateway = json!({
+        "models": [
+            {"id": "openai/gpt-6-luna", "points": null, "source": "gateway",
+             "efforts": [level("low", "Low Effort"), level("medium", "Medium Effort"),
+                         level("high", "High Effort")],
+             "ownEffort": "medium"},
+            {"id": "xai/grok-4.6", "points": null, "source": "gateway",
+             "efforts": null, "ownEffort": null}
+        ],
+        "note": null
+    });
     let levelled = json!({
         "models": [
             {"id": "gpt-6-luna", "points": null, "source": "local_proxy", "ownEffort": "medium",
@@ -6373,27 +6453,44 @@ fn the_models_list_is_read_beyond_the_recording() {
         &before_reply_sources,
         &relayed,
         &relay_down,
+        &recorded_plan,
+        &recorded_gateway,
         &levelled,
     ] {
         models_listed(200, body).unwrap_or_else(|why| panic!("{body}: {why}"));
     }
     let unknown = json!({"models": [{"id": "m", "source": "byok"}], "note": null});
     assert!(models_listed(200, &unknown).is_err());
-    // A list of levels this app cannot read whole is read as none, so the picker draws no slider
-    // rather than one from a guess; the reading catches it, and says so, instead of letting a
-    // slider that is missing go unnoticed.
-    let lost = json!({
-        "models": [{"id": "m", "source": "gateway", "efforts": [level("low", "Low"), {"value": "high"}]}],
+    // A listing this app cannot read is read as none, so the picker draws no slider rather than
+    // one from a guess; the reading catches a key the server was not agreed to send in a shape
+    // like these, and says so, instead of letting a slider that is missing go unnoticed.
+    for lost in [
+        json!({"models": [{"id": "m", "source": "gateway", "efforts": "low"}], "note": null}),
+        json!({"models": [{"id": "m", "source": "gateway", "efforts": {"low": "Low"}}],
+               "note": null}),
+        json!({"models": [{"id": "m", "source": "gateway", "ownEffort": 3}], "note": null}),
+    ] {
+        assert!(models_listed(200, &lost).is_err(), "{lost}");
+    }
+    // A level with no label is called by its value, and an entry with no value is no level,
+    // as the server reads a listing itself (`Levels::of`): none of it loses a model its slider.
+    let odd = json!({
+        "models": [{"id": "m", "source": "gateway", "ownEffort": "low", "efforts": [
+            level("low", ""), {"value": "high"}, {"label": "Nameless"}, level("max", "Max")
+        ]}],
         "note": null
     });
-    assert!(models_listed(200, &lost).is_err());
+    models_listed(200, &odd).unwrap_or_else(|why| panic!("{odd}: {why}"));
 }
 
 /// An effort the model does not list is refused with a 400 in the server's words, which name the
 /// levels it lists, on the three routes that take one: a Bot's PATCH, and `newBotDefault` and
-/// `planFallback` of the account's reply source (opengrok-server branch `model-effort-levels`,
-/// shape agreed (not recorded yet), so the words here are samples of its sentences). Each is read
-/// as its sentence, which is what the picker shows under its controls; `inherit` is always taken.
+/// `planFallback` of the account's reply source, the fallback held to the gateway's levels
+/// (opengrok-server branch `model-effort-levels`, commit d632b77: `effort_refused` in
+/// `crates/opengrok-server/src/inference.rs`, whose sentences `against_a_models_own_levels.rs`
+/// records), and `ultra`, which is taken only where a listing of the model names it, in words of
+/// its own where none does. Each is read as its sentence, which is what the picker shows under
+/// its controls; `inherit` is always taken.
 #[test]
 fn a_refused_effort_is_read_as_the_servers_sentence_beyond_the_recording() {
     use serde_json::json;
@@ -6402,20 +6499,26 @@ fn a_refused_effort_is_read_as_the_servers_sentence_beyond_the_recording() {
             "PATCH__coworkers__coworker_id_",
             "/coworkers/cw_1",
             "PATCH",
-            "effort: `ultra` is not one of gpt-6-luna's levels: low, medium, high, xhigh, max",
+            "effort: gpt-6-luna takes low, medium, high, xhigh or max, not \"none\"",
+        ),
+        (
+            "PATCH__coworkers__coworker_id_",
+            "/coworkers/cw_1",
+            "PATCH",
+            "effort: no listing of xai/grok-4.6 names \"ultra\", and it is taken only where one \
+             does",
         ),
         (
             "PUT__account_inference-source",
             "/account/inference-source",
             "PUT",
-            "newBotDefault.effort: `ultra` is not one of gpt-6-luna's levels: low, medium, high, \
-             xhigh, max",
+            "newBotDefault.effort: gpt-6-luna takes low, medium, high, xhigh or max, not \"none\"",
         ),
         (
             "PUT__account_inference-source",
             "/account/inference-source",
             "PUT",
-            "planFallback.effort: `ultra` is not one of xai/grok-4.7's levels: low, medium, high",
+            "planFallback.effort: openai/gpt-6-luna takes low, medium or high, not \"max\"",
         ),
     ] {
         read_fixture(

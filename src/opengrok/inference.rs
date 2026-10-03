@@ -293,9 +293,15 @@ where
 /// body with a 400 and `{"error"}` in their words (`NewBotDefault::named`): a `source` that is not
 /// one of its two words (`newBotDefault.source must be "gateway" or "local_proxy"`), an effort
 /// that is not a Bot's (`newBotDefault.effort must be one of inherit, none, low, medium, high,
-/// xhigh, max`), and a model refused as a hire's is on the gateway (`newBotDefault.model: a
-/// coworker needs a model to think with`) or as a plan's is on the person's plan
-/// (`newBotDefault.model: ` and the allowlist's sentence).
+/// xhigh, max, ultra`), and a model refused as a hire's is on the gateway
+/// (`newBotDefault.model: a coworker needs a model to think with`) or as a plan's is on the
+/// person's plan (`newBotDefault.model: ` and the allowlist's sentence). So is an effort the
+/// chosen model does not list, in words that name the levels it does: `newBotDefault.effort:
+/// gpt-6-luna takes low, medium, high, xhigh or max, not "none"`, and for `ultra`, taken only
+/// where a listing names it, `newBotDefault.effort: no listing of xai/grok-4.6 names "ultra", and
+/// it is taken only where one does` (opengrok-server branch `model-effort-levels`, commit
+/// d632b77: `effort_refused` in `crates/opengrok-server/src/inference.rs`, which `save` asks of
+/// the default on its own source); `inherit` is always taken.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NewBotDefault {
@@ -318,7 +324,13 @@ pub struct NewBotDefault {
 /// The server refuses a `PUT` of it with a 400 and `{"error"}` in its words, and keeps none of
 /// the body (`PlanFallback::named`): `planFallback must be an object or null`, a blank model
 /// (`planFallback.model: a coworker needs a model to think with`), and an effort that is not a
-/// Bot's (`planFallback.effort must be one of inherit, none, low, medium, high, xhigh, max`).
+/// Bot's (`planFallback.effort must be one of inherit, none, low, medium, high, xhigh, max,
+/// ultra`). So is an effort the model does not list on the gateway, which answers the fallback,
+/// in words that name the levels it does: `planFallback.effort: openai/gpt-6-luna takes low,
+/// medium or high, not "max"` (opengrok-server branch `model-effort-levels`, commit d632b77:
+/// `effort_refused` in `crates/opengrok-server/src/inference.rs`, which `save` asks of the
+/// fallback on the gateway's levels, as `InferenceSource::named_efforts` in
+/// `crates/opengrok-core/src/inference.rs` says).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PlanFallback {

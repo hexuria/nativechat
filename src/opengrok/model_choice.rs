@@ -14,12 +14,13 @@
 //!
 //! How hard a model can think is the model's to say: `GET /models` lists each model's levels of
 //! effort, lowest first, and the one it runs at when a Bot chooses none (`efforts` and
-//! `ownEffort`, from opengrok-server branch `model-effort-levels`, shape agreed (not recorded
-//! yet)). The slider's stops are exactly those levels, named as the model names them, and a
-//! model that lists none has no slider at all. A Bot, or a setting, that chose no effort
-//! (`inherit`) sits on the model's own level, by name, and that is only what is shown: nothing
-//! is saved until the person moves the slider. This app never works a model's levels out, and
-//! it never shows "Default": the model's own level is its name.
+//! `ownEffort`, from opengrok-server branch `model-effort-levels`, commit d632b77: `Model::entry`
+//! in `crates/opengrok-core/src/catalogue.rs`). The slider's stops are exactly those levels,
+//! named as the model names them, and a model that lists none has no slider at all. A Bot, or
+//! a setting, that chose no effort (`inherit`) sits on the model's own level, by name, and that
+//! is only what is shown: nothing is saved until the person moves the slider. This app never
+//! works a model's levels out, and it never shows "Default": the model's own level is its
+//! name.
 //!
 //! What the card says is what the server would run the Bot's next turn on, as far as this app can
 //! tell, and never a pin the server would ignore. On the person's plan the server asks the Bot's
