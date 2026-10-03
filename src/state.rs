@@ -13,8 +13,8 @@ pub use crate::cron_spec::{
 use crate::opengrok::{
     Account, ActivityTick, AguiMessage, ApprovalSpec, BotActivity, BoxHandoffReply,
     BoxHandoffResolution, BoxShareScope, ChatPart, ChoiceCard, ComputerHandoffStatus,
-    ConnectedComputer, Coworker, CoworkerComputer, CoworkerPatch, CoworkerSource, Enrolment,
-    Failure, FormResolution, FormSpec, ImageVisibility, InferenceKind, InferenceSource,
+    ConnectedComputer, Coworker, CoworkerComputer, CoworkerPatch, CoworkerSource, DaemonMachine,
+    Enrolment, Failure, FormResolution, FormSpec, ImageVisibility, InferenceKind, InferenceSource,
     InferenceSourceUpdate, LocalExecMode, LocalExecPolicy, LocalExecResolution, LocalExecStopped,
     ModelCatalogue, ModelEntry, ModelPick, NewBotDefault, NewSchedule, NewSkill, OpenGrokClient,
     OpenGrokError, PendingCustom, PendingOp, PendingUserMessage, PendingWrite, PlanFallback,
@@ -313,19 +313,21 @@ impl AccountConnections {
     }
 }
 
-/// Settings → Relay: the account's reply source as the server keeps it, whose kind is the door
-/// every Bot that has picked none of its own follows, and this computer's half of the relay as the
-/// person has changed it on the page and not saved. Settings → General's Default models read and
-/// change the same setting.
+/// The account's reply source as the server keeps it, whose kind is the door every Bot that has
+/// picked none of its own follows, and this computer's half of the relay as the person has changed
+/// it on its card in Settings → Computer and not saved. Settings → General's Default models read
+/// and change the same setting.
 ///
 /// The setting is the server's and lives nowhere else: this app never keeps it, and never calls a
-/// model either way. What the page shows as kept is only ever what the server last said. Of it,
-/// the page changes only the way to the plan, which the relay switch points at this computer as
+/// model either way. What the card shows as kept is only ever what the server last said. Of it,
+/// the app changes only the way to the plan, which a computer's relay switch points at the relay as
 /// it goes on ([`AppState::begin_relay_change`]): not the door or the plan's model (a Bot's model,
-/// and with it its door, is picked on its card in its settings), and not the plan on the server's
-/// own machine, whose address and key the server keeps as they are. What else the page changes is
-/// this computer's: opencodex's address and key for the relay, which wait on the page, marked
-/// unsaved, until Save keeps them here. Nothing here is written to disk.
+/// and with it its door, is picked on its card in its settings), not the plan on the server's own
+/// machine, whose address and key the server keeps as they are, and never whether the relay is on:
+/// that is each computer's own switch (`PATCH /local-exec/daemon/{machine_id}`), and the account's
+/// `relayEnabled` is read from them, so no `PUT` carries it. What else this card changes is this
+/// computer's: opencodex's address and key for the relay, which wait on the card, marked unsaved,
+/// until Save keeps them here. Nothing here is written to disk.
 ///
 /// Not `Clone`: it can hold a key the person typed, and nothing copies that. The gpui-agent tree
 /// takes [`Self::without_key`].
@@ -361,12 +363,16 @@ pub struct ReplySourceSettings {
     /// about. A refusal stays until the next change of its kind; a change nobody heard back from
     /// goes with the read, or the answer to a later change, that says what the server keeps.
     pub change_note: Option<(AccountChange, ChangeNote)>,
-    /// The relay switch moved while another change was with the server: what it says goes once
-    /// that one is answered ([`AppState::begin_owed_relay_change`]).
+    /// A computer's relay switch went on while another change was with the server: pointing the
+    /// account's way at the relay goes once that one is answered
+    /// ([`AppState::begin_owed_relay_change`]).
     pub relay_change_owed: bool,
+    /// The computer whose switch sent, or owes, the account's way to the relay, by machine id: its
+    /// card says what became of it when that did not go as asked.
+    pub relay_change_for: Option<String>,
 }
 
-/// What Settings → Relay says, under Save, about the last thing that did not go as asked.
+/// What this computer's card says, under Save, about the last thing that did not go as asked.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReplySourceNote {
     /// A read failed while an earlier one's answer is still on the page, and why. The next read
@@ -402,7 +408,7 @@ pub enum ReplySourceRead {
     Unavailable(String),
 }
 
-/// What Settings → Relay says on a server without the route.
+/// What this computer's card says on a server without the route.
 pub(crate) const REPLY_SOURCE_NOT_ON_SERVER: &str =
     "This server can't switch where your replies come from yet.";
 
@@ -520,6 +526,7 @@ impl ReplySourceSettings {
             changing: self.changing,
             change_note: self.change_note.clone(),
             relay_change_owed: self.relay_change_owed,
+            relay_change_for: self.relay_change_for.clone(),
         }
     }
 
@@ -533,16 +540,17 @@ impl ReplySourceSettings {
     }
 }
 
-/// A change Settings → Relay sends the server at once, with no Save: what it is about, so what
-/// becomes of it is said where it was asked.
+/// A change of the account's setting sent the server at once, with no Save: what it is about, so
+/// what becomes of it is said where it was asked.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AccountChange {
     /// A pick in Default for new Bots' picker, or None.
     NewBots,
     /// A pick in the Relay-off fallback's picker, or None.
     PlanFallback,
-    /// The relay switch: the account's way to the plan pointed at this computer as it goes on,
-    /// and a server that keeps whether the relay is on told so either way.
+    /// A computer's relay switch going on: the account's way to the plan pointed at the relay,
+    /// once, when it is not that already. Whether the relay is on is each computer's own switch
+    /// and no part of this.
     Relay,
 }
 
@@ -703,15 +711,13 @@ struct RelayChangesHere {
     key: Option<Option<RelayKey>>,
 }
 
-/// This computer's side of the relay (opengrok-server #292): whether the relay is switched on
-/// for the account signed in, where this computer's opencodex listens and whether the Keychain
-/// holds a key for it, and the running relay's word on itself. The switch and the address are
-/// this computer's prefs; the key never leaves the Keychain but for the relay.
+/// This computer's side of the relay (opengrok-server #292): where this computer's opencodex
+/// listens and whether the Keychain holds a key for it, and the running relay's word on itself.
+/// Whether the relay is switched on is not here: it is this computer's own switch on the server
+/// (`relayEnabled` on its row, [`ConnectedComputer::relay_enabled`]), which the relay follows. The
+/// address is this computer's pref; the key never leaves the Keychain but for the relay.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RelayMac {
-    /// Switched on for the account signed in. Off until they switch it on: enrolling never makes
-    /// a computer the relay.
-    pub on: bool,
     /// opencodex's address as saved on this computer, or `None` for where it listens by default.
     pub address: Option<String>,
     /// The Keychain holds a key for this computer's opencodex.
@@ -736,20 +742,6 @@ fn relay_cannot_start(why: &str) -> RelayReport {
     }
 }
 
-/// The relay's status line ([`AppState::relay_line`]).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RelayLine {
-    /// This computer holds the relay. Nothing of the calls it is answering: the tab says who is
-    /// relaying, and no live activity.
-    Answering,
-    /// Another computer holds it, by its name when the server gave one.
-    Another { label: Option<String> },
-    /// Opening the stream.
-    Connecting,
-    /// Nobody's computer holds it, or this one cannot: and why, when the relay said.
-    NotConnected { why: Option<String> },
-}
-
 impl RelayMac {
     /// The address the relay calls, and the field shows while nothing is typed.
     pub fn shown_address(&self) -> String {
@@ -766,8 +758,11 @@ struct ActivationReads {
     connections: bool,
     /// The account's reply source.
     reply_source: bool,
-    /// `/models`, while Settings → Relay is on screen: the models a computer relaying lists.
+    /// `/models`, while Settings → General is on screen: the models a computer relaying lists.
     models: bool,
+    /// The person's computers, while Settings → Computer is on screen: a relay switch moved from
+    /// another computer meanwhile is on their cards.
+    computers: bool,
 }
 
 /// The open Bot's tool ceiling, as far as its settings know it: everything it could be offered
@@ -2070,6 +2065,67 @@ fn connectors_unavailable(error: &OpenGrokError) -> String {
     )
 }
 
+/// The roster as Settings → Computer draws it: the computers the server lists, this one marked by
+/// the machine id it is known by (`this_id`) and always online, since the app is running on it,
+/// one row to a computer that enrolled twice, and this computer first.
+fn settle_roster(
+    mut computers: Vec<ConnectedComputer>,
+    this_id: Option<&str>,
+) -> Vec<ConnectedComputer> {
+    for computer in &mut computers {
+        computer.this_machine = this_id == Some(computer.machine_id.as_str());
+        if computer.this_machine {
+            computer.online = true;
+        }
+    }
+    let mut computers = collapse_computer_roster(computers);
+    computers.sort_by_key(|computer| !computer.this_machine);
+    computers
+}
+
+/// Whether the relay's word on itself moving from `before` to `now` is the server's row for this
+/// computer moving too: it started or stopped answering (`relaying`), or the server switched it off
+/// and told it so (`relayEnabled`), which can be from another computer.
+fn relay_moved_the_row(before: Option<&RelayStatus>, now: &RelayStatus) -> bool {
+    let answering = |status: Option<&RelayStatus>| status == Some(&RelayStatus::Answering);
+    answering(before) != answering(Some(now))
+        || (*now == RelayStatus::Off && before != Some(&RelayStatus::Off))
+}
+
+/// A computer's relay switch that is with the server: where the click asked to take it, and which
+/// switch it is. Its answer is settled by `token` and by nothing else, as a tool switch's is
+/// ([`CeilingSwitch`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ComputerRelaySwitch {
+    pub on: bool,
+    token: u64,
+}
+
+/// A computer's relay switch that has begun: where to send it, and which it is, for its answer.
+struct ComputerRelaySend {
+    client: OpenGrokClient,
+    machine_id: String,
+    on: bool,
+    token: u64,
+}
+
+/// What follows a computer's relay switch's answer ([`AppState::settle_computer_relay`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AfterComputerRelay {
+    /// Not the switch that is out any more: nothing was touched.
+    Dropped,
+    /// The server kept it, and says the computer's switch is `on` now.
+    Kept { on: bool },
+    /// The server refused it, and its words are under the switch. Nothing more to ask.
+    Refused,
+    /// The roster is out of date, or nobody knows whether the switch was kept: read it again.
+    ReadAgain,
+}
+
+/// What a computer's card says under its switch of a server that has no such route yet.
+pub(crate) const COMPUTER_RELAY_NOT_ON_SERVER: &str =
+    "This server can't switch a computer's relay yet.";
+
 /// A refused change of the account's setting, as the page says it where it was asked: the
 /// server's own sentence when it wrote one (a model a plan may not answer, an effort it does not
 /// know), as it wrote it.
@@ -2083,7 +2139,7 @@ fn account_change_refusal(error: &OpenGrokError) -> String {
     rules_refusal("Not saved", error)
 }
 
-/// Why the account's reply source could not be read, in words for Settings → Relay. Nothing
+/// Why the account's reply source could not be read, in words for this computer's card. Nothing
 /// from something in front of the server is shown as the server's words.
 fn reply_source_unreadable(error: &OpenGrokError) -> String {
     if error.unreachable().is_some() {
@@ -4678,10 +4734,6 @@ pub enum AppSettingsTab {
     Logins,
     /// The services the person has signed in to for their Bots, and the ones on offer (#2).
     Connections,
-    /// Relay: the person's own plan, relayed to the server from this computer. Named for the
-    /// reply source it was, as its stable id still is. The default for new Bots, which was here,
-    /// is General's.
-    ReplySource,
     Skills,
 }
 
@@ -5191,6 +5243,19 @@ pub struct AppState {
     /// opened again, which is how a reply is meant to be read.
     pub expanded_steps: HashSet<String>,
     pub computers: Vec<ConnectedComputer>,
+    /// Numbers the reads of [`Self::computers`], so an answer that is not the newest, or that lands
+    /// after a sign-out, is dropped. A relay switch the server answers counts one too: a read begun
+    /// before it cannot put back the row the answer replaced.
+    computers_generation: u64,
+    /// The relay switches of the person's computers that are with the server, by machine id: one
+    /// to a computer at a time, drawn where the click asked to take it until the server answers
+    /// (see [`Self::set_computer_relay`]).
+    computer_relay_switches: HashMap<String, ComputerRelaySwitch>,
+    /// Counts the relay switches sent, for the token each is settled by.
+    computer_relay_switch_count: u64,
+    /// What each computer's card says about its last relay switch that did not go as asked, by
+    /// machine id: a refusal in the server's words stays until the next switch of that card.
+    computer_relay_notes: HashMap<String, ChangeNote>,
     /// This Mac's standing rules, as Settings → Computer last read them. See
     /// [`Self::this_mac_rules`] for when they are drawn.
     pub local_rules: Option<LocalRules>,
@@ -5230,9 +5295,9 @@ pub struct AppState {
     /// Connect it was asked for. The service's name cannot tell that ask from another for the
     /// same service, or from one an account that has since signed out made.
     connect_asks: u64,
-    /// Settings → Relay: where the server keeps this account's replies paid from, and the page's
-    /// unsaved changes to this computer's half of the relay. A Bot that has picked no door of its
-    /// own follows the kind the server keeps, which the page does not switch.
+    /// Where the server keeps this account's replies paid from, and the unsaved changes to this
+    /// computer's half of the relay on its card in Settings → Computer. A Bot that has picked no
+    /// door of its own follows the kind the server keeps, which nothing here switches.
     pub reply_source: ReplySourceSettings,
     /// Numbers the reads of the reply source, so an answer that is not the newest, or that lands
     /// after a sign-out, is dropped.
@@ -5240,9 +5305,9 @@ pub struct AppState {
     /// Numbers the reads of `/models`, so only the newest answer lands
     /// ([`Self::begin_models_read`]).
     models_generation: u64,
-    /// Settings → Relay was on screen when Settings last changed what it shows, so its arrival
-    /// and its leaving are each told once ([`Self::settle_reply_source_page`]).
-    reply_source_page_shown: bool,
+    /// Settings → Computer was on screen when Settings last changed what it shows, so its arrival
+    /// and its leaving are each told once ([`Self::settle_computer_page`]).
+    computer_page_shown: bool,
     /// The same of Settings → General, whose Default models read the setting and the models as
     /// it arrives ([`Self::settle_default_models_page`]).
     default_models_page_shown: bool,
@@ -5252,13 +5317,14 @@ pub struct AppState {
     /// The sign-in the time-zone watch is for: a new one starts it again, a sign-out ends it, and
     /// an answer from another lands on nothing.
     time_zone_epoch: u64,
-    /// The relay: the switch, this computer's opencodex, and the running relay's word on itself
+    /// The relay: this computer's opencodex and the running relay's word on itself
     /// (hexuria/nativechat #156, opengrok-server #292).
     pub relay_mac: RelayMac,
-    /// The relay, while it runs, or once it has stopped and says why: for good after another Mac
-    /// took over, and until this Mac enrols again after the server turned its token away.
-    /// Dropping it stops it, with every call it was answering: switched off, signed out, or the
-    /// app quitting.
+    /// The relay, while it runs, or once it has stopped and says why: for good after another
+    /// stream of this computer took over, and until this Mac enrols again after the server turned
+    /// its token away; and waiting for this computer's own row to read on while the server has its
+    /// relay switched off. Dropping it stops it, with every call it was answering: signed out, or
+    /// the app quitting.
     relay_worker: Option<RelayHandle>,
     /// A start of the relay reading its key, by its number, so a second is not begun meanwhile.
     relay_starting: Option<u64>,
@@ -5859,6 +5925,10 @@ impl AppState {
             expanded_shell_output: HashSet::new(),
             expanded_steps: HashSet::new(),
             computers: Vec::new(),
+            computers_generation: 0,
+            computer_relay_switches: HashMap::new(),
+            computer_relay_switch_count: 0,
+            computer_relay_notes: HashMap::new(),
             local_rules: None,
             local_rules_epoch: 0,
             coworker_computer: None,
@@ -5875,7 +5945,7 @@ impl AppState {
             reply_source: ReplySourceSettings::default(),
             reply_source_generation: 0,
             models_generation: 0,
-            reply_source_page_shown: false,
+            computer_page_shown: false,
             default_models_page_shown: false,
             relay_mac: RelayMac::default(),
             relay_worker: None,
@@ -6016,7 +6086,6 @@ impl AppState {
                         state.auth_error = None;
                         state.note_server_answered(cx);
                         state.watch_time_zone(cx);
-                        state.load_relay_switch();
                         state.start_local_exec(cx);
                         state.refresh_coworkers(cx);
                         state.sync_server_threads(cx);
@@ -6993,7 +7062,6 @@ impl AppState {
                         state.reload_site_logins(cx);
                         state.note_server_answered(cx);
                         state.watch_time_zone(cx);
-                        state.load_relay_switch();
                         state.start_local_exec(cx);
                         state.refresh_coworkers(cx);
                         state.sync_server_threads(cx);
@@ -7059,6 +7127,11 @@ impl AppState {
         self.stop_local_exec();
         self.approval_decisions.clear();
         self.computers.clear();
+        // The computers were this account's, and so is any read of them, or relay switch of one,
+        // still out: an answer that lands after this finds nothing waiting for it.
+        self.computers_generation += 1;
+        self.computer_relay_switches.clear();
+        self.computer_relay_notes.clear();
         // This Mac's rules were this account's, and so is any read of them still out.
         self.local_rules = None;
         self.local_rules_epoch += 1;
@@ -7072,7 +7145,7 @@ impl AppState {
         // So was the reply source, its default for new Bots, and whatever read or change of it
         // is still out.
         self.reply_source = ReplySourceSettings::default();
-        self.reply_source_page_shown = false;
+        self.computer_page_shown = false;
         self.default_models_page_shown = false;
         self.reply_source_generation += 1;
         // The time-zone watch was for them, and so is a PUT of it still out.
@@ -7084,10 +7157,9 @@ impl AppState {
         self.new_bots_picker = PickerView::default();
         self.plan_fallback_picker = PickerView::default();
         self.model_pick_note = None;
-        // The relay answered for them, and stops with every call it was answering; the switch was
-        // theirs, and is read again for whoever signs in next.
+        // The relay answered for them, and stops with every call it was answering; its switch is
+        // their computer's row, and is read again for whoever signs in next.
         self.stop_relay();
-        self.relay_mac.on = false;
         self.plan_failures.clear();
         // And any list of models still being asked for was asked as them, and the plan's models
         // listed were their plan's: the gateway's routes are the deployment's and stay.
@@ -7176,7 +7248,7 @@ impl AppState {
 
     /// Number a read of `/models`, the reconnect loop's probe among them. Every read begun
     /// before it is overtaken, and its answer is dropped when it comes: several are asked in a
-    /// row (sign-in, Settings → Reply source, a Save's answer, a Bot's settings) and they need
+    /// row (sign-in, Settings → General, a Save's answer, a Bot's settings) and they need
     /// not answer in that order, and an older list landing last would put back models the
     /// newer one no longer offers.
     fn begin_models_read(&mut self) -> Option<(OpenGrokClient, u64)> {
@@ -8152,9 +8224,9 @@ impl AppState {
     }
 
     /// Ask the server where the account's replies are paid from: on sign-in, with the roster,
-    /// because every Bot that has picked no door follows it; and whenever Settings → Relay comes
-    /// on screen, for where the relay stands. What was read stays on the page while it is asked
-    /// again.
+    /// because every Bot that has picked no door follows it; and whenever Settings → Computer
+    /// comes on screen, for what the server keeps of the relay. What was read stays on the page
+    /// while it is asked again.
     pub fn read_reply_source(&mut self, cx: &mut Context<Self>) {
         let Some((client, generation)) = self.begin_reply_source_read() else {
             return;
@@ -8232,9 +8304,9 @@ impl AppState {
         true
     }
 
-    /// Settings → Relay's Save: what the page keeps on this computer, opencodex's address and its
-    /// key for the relay, kept at once ([`Self::keep_changes_here`]). It sends the server nothing:
-    /// nothing on the page is the server's to keep.
+    /// Save, on this computer's card in Settings → Computer: what the card keeps on this computer,
+    /// opencodex's address and its key for the relay, kept at once ([`Self::keep_changes_here`]).
+    /// It sends the server nothing: nothing on the card is the server's to keep.
     pub fn save_reply_source(&mut self, cx: &mut Context<Self>) {
         let Some(here) = self.begin_reply_source_save() else {
             return;
@@ -8253,7 +8325,7 @@ impl AppState {
         Some(self.reply_source.take_changes_here())
     }
 
-    /// Begin a change Settings → Relay sends the server at once, for the caller to send: the
+    /// Begin a change of the account's setting sent the server at once, for the caller to send: the
     /// `PUT` `update` makes of the kind the server keeps, which goes back as it is, since the
     /// server takes no `PUT` without one. `None` with nobody signed in, before the setting is
     /// read, and while another change is out: one at a time. A read out now is overtaken, and its
@@ -8370,33 +8442,35 @@ impl AppState {
         })
     }
 
-    /// Begin what the relay switch sends the account now that it says [`RelayMac::on`], for the
-    /// caller to send: one `PUT /account/inference-source` with the kind the server keeps.
+    /// Begin pointing the account's way to the plan at the relay, which a computer's relay switch
+    /// going on asks, for the caller to send: one `PUT /account/inference-source` of
+    /// `{kind, via: "mac"}` with the kind the server keeps (opengrok-server #292: `apply` in
+    /// `crates/opengrok-harness/src/local_proxy.rs`, which keeps `via` as the account's way
+    /// whatever the kind), `mac` being the word every server with the relay reads, whatever this
+    /// app calls it. `machine_id` is the computer whose switch asked, which says what became of it.
     ///
-    /// On, it points the account at this computer, `{kind, via: "mac"}` (opengrok-server #292:
-    /// `apply` in `crates/opengrok-harness/src/local_proxy.rs`, which keeps `via` as the account's
-    /// way whatever the kind), `mac` being the word every server with the relay reads, whatever
-    /// this app calls it. The relay answers only the turns that ask through this computer, and a
-    /// Bot on the plan that names no way of its own asks by the account's: switched on while the
-    /// account still asked the server's own machine, the relay would answer none of them. Off,
-    /// the account keeps its way.
+    /// Still needed with each computer's own switch (opengrok-server branch per-computer-relay at
+    /// d0a9855: `resolve` and `route` in `crates/opengrok-core/src/inference.rs` and
+    /// `crates/opengrok-harness/src/local_proxy.rs`): the relay answers only the turns that ask
+    /// through it (`via: "mac"`), and a Bot on the plan that names no way of its own asks by the
+    /// account's, which is the server's own machine (`loopback`) until somebody says otherwise. A
+    /// computer switched on while the account still asked the server's own machine would answer
+    /// none of them. So it goes once, when the account's way is not the relay already, and the
+    /// way is the account's, not a computer's: any computer's switch going on asks it, and none
+    /// going off moves it (`via: "mac"` with no computer on is the server's "Relay off", which
+    /// answers on the Relay-off fallback). It never carries `relayEnabled`: that is each
+    /// computer's own switch now and the account's is read from them, so a `PUT` of it would
+    /// switch every one of the person's computers.
     ///
-    /// A server that keeps whether the relay is on, which its read says by carrying
-    /// `relayEnabled` (opengrok-server #332 (PR #338 at 66b9f7b): `InferenceSource::applied` in
-    /// `crates/opengrok-core/src/inference.rs`, where the switch moves no way), is told so in the
-    /// same body: `relayEnabled: true` beside the way, and off, `{kind, relayEnabled: false}` with
-    /// no way. Any other is sent the way alone, and nothing as the switch goes off. A refusal of
-    /// either is a 400 in the server's words, which keeps none of the body, and the words go under
-    /// the switch.
-    ///
-    /// One change of the account's at a time: while another is with the server this sends
-    /// nothing, and what the switch says once that one is answered goes then
-    /// ([`Self::begin_owed_relay_change`]). What was said of the switch's last change was said of
-    /// a switch that has moved since, and goes.
-    fn begin_relay_change(&mut self) -> Option<AccountChangeSend> {
-        let on = self.relay_mac.on;
+    /// Nothing before the setting is read (the server takes no `PUT` without the kind it keeps),
+    /// from a server that does not know the relay, or when the way is the relay's already. One
+    /// change of the account's at a time: while another is with the server this sends nothing, and
+    /// it goes once that one is answered ([`Self::begin_owed_relay_change`]). What was said of the
+    /// last such change was said of a switch that has moved since, and goes.
+    fn begin_relay_change(&mut self, machine_id: &str) -> Option<AccountChangeSend> {
         let settings = &mut self.reply_source;
         settings.relay_change_owed = false;
+        settings.relay_change_for = Some(machine_id.to_string());
         if settings
             .change_note
             .as_ref()
@@ -8404,8 +8478,8 @@ impl AppState {
         {
             settings.change_note = None;
         }
-        let keeps_enabled = settings.kept_source()?.relay_enabled.is_some();
-        if !on && !keeps_enabled {
+        let kept = settings.kept_source()?;
+        if !kept.knows_relay() || kept.default_via() == Some(Via::Mac) {
             return None;
         }
         if settings.changing.is_some() {
@@ -8414,33 +8488,35 @@ impl AppState {
         }
         self.begin_account_change(AccountChange::Relay, |kind| InferenceSourceUpdate {
             kind,
-            via: on.then_some(Via::Mac),
-            relay_enabled: keeps_enabled.then_some(on),
+            via: Some(Via::Mac),
             new_bot_default: None,
             plan_fallback: None,
         })
     }
 
-    /// The relay switch's change, when the switch moved while the change just answered was out
-    /// ([`Self::begin_relay_change`]).
+    /// The account's way to the relay, when a computer's switch went on while the change just
+    /// answered was out ([`Self::begin_relay_change`]).
     fn begin_owed_relay_change(&mut self) -> Option<AccountChangeSend> {
         if !self.reply_source.relay_change_owed {
             return None;
         }
-        self.begin_relay_change()
+        let machine_id = self.reply_source.relay_change_for.clone()?;
+        self.begin_relay_change(&machine_id)
     }
 
-    /// Settings has changed what it shows. Relay coming on screen reads the setting, for where the
-    /// relay stands and in case it changed on another computer, and the models, which a computer
-    /// relaying lists for every picker's Subscription group; leaving it drops a key typed there
-    /// and not saved ([`Self::settle_reply_source_page`]). General coming on screen reads both
-    /// too, for Default models' pickers, and leaving it shuts their popovers
-    /// ([`Self::settle_default_models_page`]).
+    /// Settings has changed what it shows. Computer coming on screen reads the setting, for what
+    /// the server keeps of the relay and in case it changed on another computer; leaving it drops
+    /// a key typed on this computer's card and not saved ([`Self::settle_computer_page`]). General
+    /// coming on screen reads the setting and the models, which a computer relaying lists for
+    /// every picker's Subscription group, for Default models' pickers, and leaving it shuts their
+    /// popovers ([`Self::settle_default_models_page`]).
     fn reply_source_page_moved(&mut self, cx: &mut Context<Self>) {
-        let relay = self.settle_reply_source_page();
+        let computer = self.settle_computer_page();
         let general = self.settle_default_models_page();
-        if relay || general {
+        if computer || general {
             self.read_reply_source(cx);
+        }
+        if general {
             self.refresh_models(cx);
         }
     }
@@ -8458,13 +8534,13 @@ impl AppState {
         arrived
     }
 
-    /// Whether Settings → Relay has just come on screen. Off screen, a key for this computer's
-    /// opencodex typed there and not saved is dropped, and the page asks for it again when it is
-    /// back: nothing keeps a key the person walked away from, in memory or anywhere else.
-    fn settle_reply_source_page(&mut self) -> bool {
-        let shown = self.reply_source_on_screen();
-        let arrived = shown && !self.reply_source_page_shown;
-        self.reply_source_page_shown = shown;
+    /// Whether Settings → Computer has just come on screen. Off screen, a key for this computer's
+    /// opencodex typed on its card and not saved is dropped, and the card asks for it again when
+    /// it is back: nothing keeps a key the person walked away from, in memory or anywhere else.
+    fn settle_computer_page(&mut self) -> bool {
+        let shown = self.computer_page_on_screen();
+        let arrived = shown && !self.computer_page_shown;
+        self.computer_page_shown = shown;
         if !shown && self.reply_source.relay_key_draft.take().is_some() {
             self.reply_source.relay_retype_key = true;
         }
@@ -8476,7 +8552,7 @@ impl AppState {
         self.reply_source.can_save()
     }
 
-    /// The line beside Save: what it waits for before it will keep the page
+    /// The line beside Save: what it waits for before it will keep what this computer's card holds
     /// ([`ReplySourceSettings::blocker`]).
     pub fn reply_source_hint(&self) -> Option<&'static str> {
         self.reply_source.blocker()
@@ -8557,9 +8633,10 @@ impl AppState {
     // ---- The relay: this computer answers for the plan (hexuria/nativechat #156, #292) ---------
 
     /// Answer with this Mac's own half, as this Mac keeps it: the Keychain for opencodex's key,
-    /// asked only whether it holds one, and the address from the prefs. The switch is the
-    /// account's, read once somebody signs in. The relay stops when the app quits, with every
-    /// call it was answering.
+    /// asked only whether it holds one, and the address from the prefs. Whether the relay is on is
+    /// not this Mac's to keep: it is this computer's own switch on the server, which the relay is
+    /// told of on its stream. The relay stops when the app quits, with every call it was
+    /// answering.
     fn open_relay_mac(&mut self, cx: &mut Context<Self>) {
         self.relay_keys = crate::relay_key::open_store();
         self.relay_mac.has_key = self.relay_keys.holds_key();
@@ -8573,45 +8650,25 @@ impl AppState {
         .detach();
     }
 
-    /// The switch as this Mac keeps it for the account now signed in: on only if they switched
-    /// it on here.
-    fn load_relay_switch(&mut self) {
-        let account = self.account.as_ref().map(|account| account.id.clone());
-        self.relay_mac.on = match (&self.config, account) {
-            (Some(config), Some(account)) => {
-                crate::prefs::load_relay(&config.data_dir).on_for.as_deref()
-                    == Some(account.as_str())
-            }
-            _ => false,
-        };
-    }
-
     /// This Mac is enrolled with the server, so it has the machine token the relay opens its
-    /// stream with. Enrolling happens at sign-in; it never makes the Mac the relay by itself.
+    /// stream with, and a row of its own among the person's computers.
     pub fn relay_enrolled(&self) -> bool {
         self.local_exec_machine_id.is_some()
     }
 
-    /// Answer with this Mac's switch takes a click: off always, and on once somebody is signed
-    /// in, this Mac is enrolled, and the server knows the relay.
-    pub fn relay_switch_live(&self) -> bool {
-        self.relay_mac.on
-            || (self.is_signed_in() && self.relay_enrolled() && self.reply_source.knows_relay())
-    }
-
-    /// Answer with this Mac should be running: somebody is signed in, the switch is on for them,
-    /// this Mac is enrolled, and the server knows the relay.
+    /// The relay should be running: somebody is signed in, this Mac is enrolled, and the server
+    /// knows the relay. Not whether this computer's switch is on: the server says so on the stream
+    /// (`disabled`, or a refusal of the stream with `relay_disabled`), and a relay it has switched
+    /// off waits for its own row to read on again without opening the stream ([`RelayHandle`]).
     fn relay_wanted(&self) -> bool {
-        self.is_signed_in()
-            && self.relay_mac.on
-            && self.relay_enrolled()
-            && self.reply_source.knows_relay()
+        self.is_signed_in() && self.relay_enrolled() && self.reply_source.knows_relay()
     }
 
     /// Start the relay where it should run and does not, and stop it where it runs and should
-    /// not. One that stopped is left as it is. After another Mac took over, only the switch turned
-    /// off and on starts it; after the server turned its token away, so does local-exec enrolling
-    /// this Mac again, which the relay follows by itself ([`Enrolment`]).
+    /// not. One that stopped is left as it is. After another stream of this computer took over,
+    /// only this computer's switch turned off and on starts it
+    /// ([`Self::relay_switched_on_here`]); after the server turned its token away, so does
+    /// local-exec enrolling this Mac again, which the relay follows by itself ([`Enrolment`]).
     fn ensure_relay(&mut self, cx: &mut Context<Self>) {
         if !self.relay_wanted() {
             if self.relay_worker.is_some() || self.relay_starting.is_some() {
@@ -8623,6 +8680,30 @@ impl AppState {
         if self.relay_worker.is_none() && self.relay_starting.is_none() {
             self.begin_relay(cx);
         }
+    }
+
+    /// This computer's relay switch has just been switched on here. A relay the server switched off
+    /// is waiting for its row to read on, and is told to look at it now. One that stopped for good
+    /// (another stream of this computer took over, or the server turned its token away) is made
+    /// again, which is how turning it off and on takes the relay back; and where there is none,
+    /// one starts if one should.
+    fn relay_switched_on_here(&mut self, cx: &mut Context<Self>) {
+        match &self.relay_worker {
+            Some(worker) if !self.relay_halted() => worker.wake(),
+            _ => {
+                self.stop_relay();
+                self.ensure_relay(cx);
+            }
+        }
+    }
+
+    /// The relay has stopped for good, by its own word: another stream of this computer took over,
+    /// or the server turned its token away. A relay waiting to be switched on is not.
+    fn relay_halted(&self) -> bool {
+        self.relay_mac
+            .report
+            .as_ref()
+            .is_some_and(|report| report.halted)
     }
 
     /// Start the relay: its key is read from the Keychain off the main thread, since the
@@ -8710,9 +8791,11 @@ impl AppState {
     }
 
     /// A report from the relay, `false` once it is not this relay's to give. Where the relay
-    /// stands is the server's word too: when this Mac starts answering, or another takes over,
-    /// the setting is read again for which Mac holds it, and while the page, or General with its
-    /// Default models, is on screen the models, which a Mac answering lists.
+    /// stands is the server's word too: when this Mac starts answering, or another stream of it
+    /// takes over, the setting is read again, and while General with its Default models is on
+    /// screen the models, which a Mac answering lists. And this computer's row says whether it
+    /// relays now and whether its switch is on, which moves with the relay: it started or stopped
+    /// answering, or the server switched it off from another computer and told it so.
     fn take_relay_report(
         &mut self,
         generation: u64,
@@ -8731,12 +8814,16 @@ impl AppState {
             report.status,
             RelayStatus::Answering | RelayStatus::Replaced
         ) && before.as_ref() != Some(&report.status);
+        let row_moved = relay_moved_the_row(before.as_ref(), &report.status);
         self.relay_mac.report = Some(report);
         if turned {
             self.read_reply_source(cx);
-            if self.reply_source_on_screen() || self.default_models_on_screen() {
+            if self.default_models_on_screen() {
                 self.refresh_models(cx);
             }
+        }
+        if row_moved {
+            self.refresh_computers(cx);
         }
         cx.notify();
         true
@@ -8753,40 +8840,6 @@ impl AppState {
     /// Where the relay calls opencodex: the address saved on this Mac, or its default.
     fn relay_address(&self) -> Option<crate::opengrok::OpencodexAddress> {
         crate::opengrok::OpencodexAddress::parse(&self.relay_mac.shown_address()).ok()
-    }
-
-    /// Answer with this Mac's switch. On, the relay starts (once this Mac is enrolled and the
-    /// server knows the relay), and the same press points the account at this computer; off, it
-    /// stops, with every call it was answering, and the account keeps its way
-    /// ([`Self::begin_relay_change`]). A refusal of what the switch sent is said under it, in the
-    /// server's words, and moves neither the switch nor the relay. Turning it off and on is also
-    /// how a relay that stopped for good starts again: after another Mac took over, it takes the
-    /// relay back. Kept on this Mac, for the account signed in.
-    pub fn set_relay_on(&mut self, on: bool, cx: &mut Context<Self>) {
-        if self.note_relay_on(on) {
-            self.stop_relay();
-            self.ensure_relay(cx);
-            if let Some(send) = self.begin_relay_change() {
-                self.send_account_change(send, cx);
-            }
-            cx.notify();
-        }
-    }
-
-    fn note_relay_on(&mut self, on: bool) -> bool {
-        let Some(account) = self.account.as_ref().map(|account| account.id.clone()) else {
-            return false;
-        };
-        if self.relay_mac.on == on || (on && !self.relay_switch_live()) {
-            return false;
-        }
-        self.relay_mac.on = on;
-        if let Some(config) = &self.config {
-            let mut prefs = crate::prefs::load_relay(&config.data_dir);
-            prefs.on_for = on.then_some(account);
-            crate::prefs::save_relay(&config.data_dir, &prefs);
-        }
-        true
     }
 
     /// This Mac's opencodex address as the field holds it now; it waits for Save. The one kept
@@ -8912,35 +8965,6 @@ impl AppState {
                      {why}"
                 )));
             }
-        }
-    }
-
-    /// What Answer with this Mac's status line says: this Mac answering, another Mac answering
-    /// (by its name, when the server gave one), connecting, or not connected; from the relay's
-    /// own word on this Mac and the server's on the others.
-    pub fn relay_line(&self) -> RelayLine {
-        let report = self.relay_mac.report.as_ref();
-        let relay = self
-            .reply_source
-            .kept_source()
-            .and_then(|kept| kept.relay.as_ref());
-        let this_mac = self.local_exec_machine_id.as_deref();
-        let another = relay
-            .filter(|relay| relay.connected)
-            .filter(|relay| relay.machine_id.as_deref() != this_mac || this_mac.is_none());
-        match report.map(|report| &report.status) {
-            Some(RelayStatus::Answering) => RelayLine::Answering,
-            Some(RelayStatus::Replaced) => RelayLine::Another {
-                label: another.and_then(|relay| relay.machine_label.clone()),
-            },
-            _ if another.is_some() => RelayLine::Another {
-                label: another.and_then(|relay| relay.machine_label.clone()),
-            },
-            Some(RelayStatus::Connecting) => RelayLine::Connecting,
-            Some(RelayStatus::Error(why)) => RelayLine::NotConnected {
-                why: Some(why.clone()),
-            },
-            Some(RelayStatus::Off) | None => RelayLine::NotConnected { why: None },
         }
     }
 
@@ -9345,6 +9369,9 @@ impl AppState {
         if reads.models {
             self.refresh_models(cx);
         }
+        if reads.computers {
+            self.refresh_computers(cx);
+        }
     }
 
     /// What coming back to the window asks the server for again.
@@ -9353,22 +9380,22 @@ impl AppState {
             connections: self.rereads_connections_on_activation(now),
             // The account's door, whenever somebody is signed in. Every Bot that has picked no
             // door follows it, and its picker names that door's model, so a door changed on
-            // another Mac meanwhile would have the picker name a model that does not answer. It
-            // is also Settings → Reply source's health line, which changes outside the app: the
-            // person starts opencodex in a terminal and comes back to see it running.
+            // another Mac meanwhile would have the picker name a model that does not answer.
             reply_source: self.is_signed_in(),
-            // And while that page, or General with its Default models, is on screen, the plan's
-            // models with it, as arriving on the page reads them: opencodex that has just been
-            // started lists them for the first time, and the health line and the pickers should
-            // not wait for the page to be left and come back to.
-            models: self.is_signed_in()
-                && (self.reply_source_on_screen() || self.default_models_on_screen()),
+            // And while General with its Default models is on screen, the plan's models with it,
+            // as arriving on the page reads them: opencodex that has just been started lists
+            // them for the first time, and the pickers should not wait for the page to be left
+            // and come back to.
+            models: self.is_signed_in() && self.default_models_on_screen(),
+            // And the person's computers while Settings is open on Computer: a relay switch
+            // moved from another computer meanwhile is on their cards.
+            computers: self.is_signed_in() && self.computer_page_on_screen(),
         }
     }
 
-    /// Settings is open on Relay.
-    fn reply_source_on_screen(&self) -> bool {
-        self.is_app_settings_open && self.app_settings_tab == AppSettingsTab::ReplySource
+    /// Settings is open on Computer, whose cards hold each computer's relay switch.
+    fn computer_page_on_screen(&self) -> bool {
+        self.is_app_settings_open && self.app_settings_tab == AppSettingsTab::Computer
     }
 
     /// Settings is open on General, whose first section is Default models.
@@ -13272,7 +13299,6 @@ impl AppState {
             kind,
             via: None,
             new_bot_default: Some(default),
-            relay_enabled: None,
             plan_fallback: None,
         })
     }
@@ -13314,7 +13340,6 @@ impl AppState {
         self.begin_account_change(AccountChange::PlanFallback, |kind| InferenceSourceUpdate {
             kind,
             via: None,
-            relay_enabled: None,
             new_bot_default: None,
             plan_fallback: Some(fallback),
         })
@@ -16713,7 +16738,7 @@ impl AppState {
                         let moved = state.note_enrolment(&enrolment);
                         if moved == Some(true) {
                             state.refresh_computers(cx);
-                            // Enrolled: Answer with this Mac can start, if it is switched on.
+                            // Enrolled: the relay can start.
                             state.ensure_relay(cx);
                             cx.notify();
                         }
@@ -20904,25 +20929,203 @@ impl AppState {
         // Settings → Computer reads them again too: opening the page, landing on it by back
         // or forward, and this Mac enrolling while it is open.
         self.refresh_local_rules(cx);
-        let this_id = self.local_exec_machine_id.clone();
+        // This computer is the one its stored machine id names, which is known from the start,
+        // before enrolling has answered ([`Self::this_mac_id`]).
+        let this_id = self.this_mac_id();
+        self.computers_generation += 1;
+        let generation = self.computers_generation;
         cx.spawn(async move |this, cx| {
-            let Ok(mut computers) = client.list_computers().await else {
+            let Ok(computers) = client.list_computers().await else {
                 return;
             };
-            for computer in &mut computers {
-                computer.this_machine = this_id.as_ref() == Some(&computer.machine_id);
-                if computer.this_machine {
-                    computer.online = true;
-                }
-            }
-            computers = collapse_computer_roster(computers);
-            computers.sort_by_key(|computer| !computer.this_machine);
+            let computers = settle_roster(computers, this_id.as_deref());
             let _ = this.update(cx, |state, cx| {
-                state.computers = computers;
+                if state.take_computers(generation, computers) {
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Put a read of the roster on screen, unless something newer has begun since or the person has
+    /// signed out. `false` when it was dropped and nothing was touched. What the server says now
+    /// answers a relay switch nobody heard back from, and a note about a computer the server no
+    /// longer lists is about nothing.
+    fn take_computers(&mut self, generation: u64, computers: Vec<ConnectedComputer>) -> bool {
+        if self.computers_generation != generation {
+            return false;
+        }
+        self.computers = computers;
+        let listed = |id: &str| self.computers.iter().any(|c| c.machine_id == id);
+        let mut notes = std::mem::take(&mut self.computer_relay_notes);
+        notes.retain(|id, note| listed(id) && !matches!(note, ChangeNote::Unknown));
+        self.computer_relay_notes = notes;
+        true
+    }
+
+    /// One computer's relay switch, from its card: `PATCH /local-exec/daemon/{machine_id}
+    /// {relayEnabled}`, the computer's own, whichever computer this is (a switch can be moved
+    /// from any of the person's computers, and the server tells the one it moves). The card draws
+    /// the switch where the click asked to take it while the server is asked, and the server's
+    /// answer is the computer's row from then on: a refusal leaves the row as it was, so the switch
+    /// goes back, with the server's words under it ([`Self::computer_relay_note`]).
+    ///
+    /// Switched on, this computer's relay looks at its row at once, and the account's way to the
+    /// plan is pointed at the relay if it is not that already ([`Self::begin_relay_change`]).
+    /// Switched off, the account keeps its way, and a computer relaying is told by the server.
+    pub fn set_computer_relay(&mut self, machine_id: String, on: bool, cx: &mut Context<Self>) {
+        let Some(send) = self.begin_computer_relay(&machine_id, on) else {
+            return;
+        };
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let answer = send
+                .client
+                .switch_computer_relay(&send.machine_id, send.on)
+                .await;
+            let _ = this.update(cx, |state, cx| {
+                match state.settle_computer_relay(&send.machine_id, send.token, answer) {
+                    AfterComputerRelay::Dropped | AfterComputerRelay::Refused => {}
+                    AfterComputerRelay::ReadAgain => state.refresh_computers(cx),
+                    AfterComputerRelay::Kept { on } => {
+                        state.after_computer_relay_kept(&send.machine_id, on, cx)
+                    }
+                }
                 cx.notify();
             });
         })
         .detach();
+    }
+
+    /// Begin one computer's relay switch, for the caller to send. `None` with nobody signed in, for
+    /// a computer the roster does not list, and while that computer's last switch is still with
+    /// the server: one at a time to a card. What was said of the card's last switch was said of one
+    /// that has moved since, and goes.
+    fn begin_computer_relay(&mut self, machine_id: &str, on: bool) -> Option<ComputerRelaySend> {
+        let client = self.opengrok.clone()?;
+        if !self.is_signed_in()
+            || self.computer_relay_switches.contains_key(machine_id)
+            || !self.computers.iter().any(|c| c.machine_id == machine_id)
+        {
+            return None;
+        }
+        self.computer_relay_switch_count += 1;
+        let token = self.computer_relay_switch_count;
+        self.computer_relay_switches
+            .insert(machine_id.to_string(), ComputerRelaySwitch { on, token });
+        self.computer_relay_notes.remove(machine_id);
+        let settings = &mut self.reply_source;
+        if settings.relay_change_for.as_deref() == Some(machine_id) {
+            settings.relay_change_for = None;
+            if matches!(settings.change_note, Some((AccountChange::Relay, _))) {
+                settings.change_note = None;
+            }
+        }
+        Some(ComputerRelaySend {
+            client,
+            machine_id: machine_id.to_string(),
+            on,
+            token,
+        })
+    }
+
+    /// Put the server's answer to a computer's relay switch on its card, unless it is not the
+    /// switch that is out any more (the person signed out meanwhile, and its answer lands on
+    /// nothing). Kept, the answer is the computer's row from now on, and any read of the roster
+    /// begun before it is dropped. Refused, nothing was kept: the row is as it was, so the switch is
+    /// drawn back, and the server's words go under it. A computer the server does not know, or one
+    /// it says is revoked, is a roster gone out of date, and is read again; and so is a switch
+    /// nobody heard the answer to, which may or may not have been kept.
+    fn settle_computer_relay(
+        &mut self,
+        machine_id: &str,
+        token: u64,
+        answer: Result<DaemonMachine, OpenGrokError>,
+    ) -> AfterComputerRelay {
+        let out = self.computer_relay_switches.get(machine_id);
+        if out.map(|switch| switch.token) != Some(token) {
+            return AfterComputerRelay::Dropped;
+        }
+        self.computer_relay_switches.remove(machine_id);
+        match answer {
+            Ok(row) => {
+                self.computers_generation += 1;
+                if let Some(computer) = self
+                    .computers
+                    .iter_mut()
+                    .find(|computer| computer.machine_id == machine_id)
+                {
+                    computer.relay_enabled = row.relay_enabled;
+                    computer.relaying = row.relaying;
+                    computer.online = computer.this_machine || row.connected;
+                }
+                AfterComputerRelay::Kept {
+                    on: row.relay_enabled,
+                }
+            }
+            // A server before the per-computer switch has no such route: a `405`, or a `404` with
+            // nothing in it. Its own `404` says what is missing, and is about the computer.
+            Err(error) if error.route_missing() => {
+                self.computer_relay_notes.insert(
+                    machine_id.to_string(),
+                    ChangeNote::Refused(COMPUTER_RELAY_NOT_ON_SERVER.to_string()),
+                );
+                AfterComputerRelay::Refused
+            }
+            // No answer at all, or one that could not be read: the server may have kept it, and
+            // only asking again can say.
+            Err(error) if error.unreachable().is_some() || error.status.is_none() => {
+                self.computer_relay_notes
+                    .insert(machine_id.to_string(), ChangeNote::Unknown);
+                AfterComputerRelay::ReadAgain
+            }
+            Err(error) => {
+                self.computer_relay_notes.insert(
+                    machine_id.to_string(),
+                    ChangeNote::Refused(account_change_refusal(&error)),
+                );
+                if matches!(error.status, Some(404 | 409)) {
+                    AfterComputerRelay::ReadAgain
+                } else {
+                    AfterComputerRelay::Refused
+                }
+            }
+        }
+    }
+
+    /// What follows a computer's relay switch the server kept, now that its row says `on`. Off
+    /// moves nothing here: the server tells a computer relaying that it is off, and the account
+    /// keeps its way. On, this computer's relay looks at its row at once if the switch was this
+    /// computer's own, and the account's way is pointed at the relay if it is not that already.
+    fn after_computer_relay_kept(&mut self, machine_id: &str, on: bool, cx: &mut Context<Self>) {
+        if !on {
+            return;
+        }
+        if self.this_mac_id().as_deref() == Some(machine_id) {
+            self.relay_switched_on_here(cx);
+        }
+        if let Some(send) = self.begin_relay_change(machine_id) {
+            self.send_account_change(send, cx);
+        }
+    }
+
+    /// The relay switch of this computer's card that is with the server, and where the click asked
+    /// to take it.
+    pub fn computer_relay_switch(&self, machine_id: &str) -> Option<&ComputerRelaySwitch> {
+        self.computer_relay_switches.get(machine_id)
+    }
+
+    /// What a computer's card says under its relay switch about the last thing that did not go as
+    /// asked: the server's words for a refusal of the switch, or of the account's way to the relay
+    /// that the switch going on sent; or that nobody knows whether a switch was kept.
+    pub fn computer_relay_note(&self, machine_id: &str) -> Option<&str> {
+        if let Some(note) = self.computer_relay_notes.get(machine_id) {
+            return Some(note.line());
+        }
+        (self.reply_source.relay_change_for.as_deref() == Some(machine_id))
+            .then(|| self.reply_source.change_note(AccountChange::Relay))
+            .flatten()
     }
 
     /// This Mac's standing rules where Settings → Computer draws them: under the roster's row
@@ -35894,12 +36097,12 @@ mod tests {
                 reply_source: true,
                 ..ActivationReads::default()
             },
-            "with Settings shut, and with no Reply source on screen"
+            "with Settings shut, and with no page of it on screen"
         );
-        // Settings → Reply source on screen: the plan's models with it, since opencodex may have
-        // just been started in a terminal and listed them for the first time.
+        // Settings → General on screen: the plan's models with it, since opencodex may have just
+        // been started in a terminal and listed them for the first time.
         state.is_app_settings_open = true;
-        state.app_settings_tab = AppSettingsTab::ReplySource;
+        state.app_settings_tab = AppSettingsTab::General;
         assert_eq!(
             state.reads_on_activation(Instant::now()),
             ActivationReads {
@@ -35908,8 +36111,33 @@ mod tests {
                 ..ActivationReads::default()
             }
         );
+        // Settings → Computer on screen: the computers, whose relay switches another computer may
+        // have moved meanwhile, and no models, which that page does not show.
+        state.app_settings_tab = AppSettingsTab::Computer;
+        assert_eq!(
+            state.reads_on_activation(Instant::now()),
+            ActivationReads {
+                reply_source: true,
+                computers: true,
+                ..ActivationReads::default()
+            }
+        );
         state.app_settings_tab = AppSettingsTab::Logins;
-        assert!(!state.reads_on_activation(Instant::now()).models);
+        assert_eq!(
+            state.reads_on_activation(Instant::now()),
+            ActivationReads {
+                reply_source: true,
+                ..ActivationReads::default()
+            }
+        );
+        state.forget_account();
+        state.app_settings_tab = AppSettingsTab::Computer;
+        state.is_app_settings_open = true;
+        assert_eq!(
+            state.reads_on_activation(Instant::now()),
+            ActivationReads::default(),
+            "nobody signed in, nothing to ask"
+        );
     }
 
     /// A message sent while a turn runs is held with the Bot's door as it was sent, and its turn
@@ -37033,7 +37261,7 @@ mod tests {
         assert!(state.settle_reply_source_read(generation, Err(OpenGrokError::status(404, ""))));
         assert_eq!(state.reply_source.kept, Some(ReplySourceRead::NotOnServer));
         assert_eq!(
-            crate::components::reply_source::unavailable_line(&state.reply_source),
+            crate::components::computers::unavailable_line(&state.reply_source),
             Some(REPLY_SOURCE_NOT_ON_SERVER)
         );
         assert!(!state.reply_source.can_edit());
@@ -37243,7 +37471,7 @@ mod tests {
         assert!(!state.note_picker_list_scroll(PickerFor::Bot, 1));
     }
 
-    // ---- The relay: this computer's half of Settings → Relay ------------------------------------
+    // ---- The relay: this computer's half, on its card in Settings → Computer ---------------------
 
     /// A read from a server that knows the relay: the account's door and way, and the relay's
     /// model, with no computer holding it.
@@ -37351,11 +37579,11 @@ mod tests {
 
         // A key typed and left behind with the page is dropped, and asked for again.
         state.is_app_settings_open = true;
-        state.app_settings_tab = AppSettingsTab::ReplySource;
-        assert!(state.settle_reply_source_page());
+        state.app_settings_tab = AppSettingsTab::Computer;
+        assert!(state.settle_computer_page());
         assert!(state.note_relay_key("opencodex-test-key"));
         state.app_settings_tab = AppSettingsTab::Logins;
-        assert!(!state.settle_reply_source_page());
+        assert!(!state.settle_computer_page());
         assert!(state.reply_source.relay_key_draft.is_none());
         assert!(state.reply_source.relay_retype_key);
         assert!(state.note_relay_key("opencodex-test-key"));
@@ -38186,12 +38414,13 @@ mod tests {
         );
     }
 
-    // ---- The relay switch: this computer relays, and the account asks through it --------------
+    // ---- A computer's relay switch: each card's own, and the account's way pointed at the relay --
 
     /// The account's setting as a server that knows the relay answers it: on the plan, its way
     /// `via`, nobody's computer holding the relay, and `relayEnabled` as given, `None` being a
     /// server that sends no such key, as every server before opengrok-server #332 (PR #338 at
-    /// 66b9f7b) does.
+    /// 66b9f7b) does. From a server with per-computer switches (opengrok-server branch
+    /// per-computer-relay at d0a9855) it is derived, and only ever read.
     fn relay_answer(via: &str, relay_enabled: Option<bool>) -> serde_json::Value {
         let mut body = json!({
             "kind": "local_proxy", "via": via, "baseUrl": "http://127.0.0.1:8080",
@@ -38205,258 +38434,481 @@ mod tests {
         body
     }
 
-    /// Somebody signed in to `server` on an enrolled computer with the relay switched off, and
-    /// the account's way to the plan still the server's own machine, as a read of
-    /// [`relay_answer`] brings it.
-    async fn ready_to_relay(
-        server: &wiremock::MockServer,
-        relay_enabled: Option<bool>,
-    ) -> AppState {
+    /// One of the person's computers as the roster holds it.
+    fn computer(
+        machine_id: &str,
+        this_machine: bool,
+        relay_enabled: bool,
+        relaying: bool,
+        online: bool,
+    ) -> ConnectedComputer {
+        ConnectedComputer {
+            machine_id: machine_id.into(),
+            label: format!("NativeChat on {machine_id}"),
+            mode: LocalExecMode::Ask,
+            this_machine,
+            online,
+            relay_enabled,
+            relaying,
+        }
+    }
+
+    /// A computer's row as `GET /local-exec/daemon` lists it and `PATCH` answers it (opengrok-server
+    /// branch per-computer-relay at d0a9855).
+    fn daemon_row(machine_id: &str, relay_enabled: bool, relaying: bool) -> serde_json::Value {
+        json!({"machineId": machine_id, "label": format!("NativeChat on {machine_id}"),
+               "enrolledAtMs": 1_790_000_000_000_i64, "revoked": false, "connected": true,
+               "relayEnabled": relay_enabled, "relaying": relaying})
+    }
+
+    /// `PATCH /local-exec/daemon/{machine_id}` `{relayEnabled: on}` is answered with the row.
+    async fn mount_switch(server: &wiremock::MockServer, machine_id: &str, on: bool) {
+        wiremock::Mock::given(wiremock::matchers::method("PATCH"))
+            .and(wiremock::matchers::path(format!(
+                "/local-exec/daemon/{machine_id}"
+            )))
+            .and(wiremock::matchers::body_json(json!({ "relayEnabled": on })))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(daemon_row(
+                    machine_id,
+                    on,
+                    on && machine_id == "mac_1",
+                )),
+            )
+            .mount(server)
+            .await;
+    }
+
+    /// Somebody signed in to `server` on an enrolled computer, `mac_1`, with its relay on and
+    /// another, `mac_2`, off and not reached by the server; the account's way to the plan `via`, as
+    /// a read of [`relay_answer`] brings it, from a server that derives `relayEnabled`.
+    async fn ready_to_switch(server: &wiremock::MockServer, via: &str) -> AppState {
         let mut state = signed_in_state();
         state.opengrok = Some(client_signed_in_to(server).await);
         state.local_exec_machine_id = Some("mac_1".into());
+        state.computers = vec![
+            computer("mac_1", true, true, true, true),
+            computer("mac_2", false, false, false, false),
+        ];
         read_as(
             &mut state,
-            serde_json::from_value(relay_answer("loopback", relay_enabled)).expect("a setting"),
+            serde_json::from_value(relay_answer(via, Some(true))).expect("a setting"),
         );
         state
     }
 
-    /// Turning the relay on points the account at this computer in the same press: one `PUT` of
-    /// the kind the server keeps and `via: "mac"`, the word every server with the relay reads,
-    /// with nothing else in it. The server's answer is what the page shows, and the models are
-    /// read again for the pickers' Subscription group. Turning it off moves no way: a server whose
-    /// read carries no `relayEnabled` is sent nothing at all, and the account keeps this computer
-    /// as its way.
+    /// The `PATCH`es of a computer's switch `server` was sent, as (machine id, body), in order.
+    async fn patches_sent(server: &wiremock::MockServer) -> Vec<(String, serde_json::Value)> {
+        server
+            .received_requests()
+            .await
+            .expect("the recorder is on")
+            .iter()
+            .filter(|request| request.method.as_str() == "PATCH")
+            .filter_map(|request| {
+                let id = request.url.path().strip_prefix("/local-exec/daemon/")?;
+                let body = serde_json::from_slice(&request.body).expect("a JSON body");
+                Some((id.to_string(), body))
+            })
+            .collect()
+    }
+
+    /// One computer's card as the window draws it.
+    fn card_of(state: &AppState, machine_id: &str) -> crate::components::computers::ComputerCard {
+        crate::components::computers::cards(state)
+            .into_iter()
+            .find(|card| card.machine_id == machine_id)
+            .expect("a card for the computer")
+    }
+
+    /// Send the switch of `machine_id`'s card to `on` against the real client, and settle it.
+    async fn switch_card(
+        state: &mut AppState,
+        machine_id: &str,
+        on: bool,
+    ) -> super::AfterComputerRelay {
+        let send = state
+            .begin_computer_relay(machine_id, on)
+            .expect("a switch begins");
+        let answer = send
+            .client
+            .switch_computer_relay(&send.machine_id, send.on)
+            .await;
+        state.settle_computer_relay(machine_id, send.token, answer)
+    }
+
+    /// A computer's card switch is its own: one `PATCH` of `{relayEnabled}` to that computer's id,
+    /// from this window whichever computer it is. The card draws the switch where the click asked to
+    /// take it while the server is asked, and takes no second click meanwhile, and another card's
+    /// switch is free; the server's answer is the row from then on. Turning one on points the
+    /// account's way at the relay in the same press, once: one `PUT` of `{kind, via: "mac"}` with
+    /// nothing else in it, and the models are read again for the pickers' Subscription group. The
+    /// next switch finds the way already the relay's and sends none, and turning one off moves no
+    /// way. (opengrok-server branch per-computer-relay at d0a9855: `resolve` and `route` read
+    /// `via`, and `via: "mac"` with no computer on is "Relay off".)
     #[tokio::test]
-    async fn turning_the_relay_on_points_the_account_at_this_computer_and_off_moves_no_way() {
-        use super::AfterChange;
+    async fn a_computers_switch_is_its_own_patch_and_on_points_the_account_at_the_relay_once() {
+        use super::{AfterChange, AfterComputerRelay};
         let server = wiremock::MockServer::start().await;
+        for (id, on) in [("mac_2", true), ("mac_2", false), ("mac_1", false)] {
+            mount_switch(&server, id, on).await;
+        }
         wiremock::Mock::given(wiremock::matchers::method("PUT"))
             .and(wiremock::matchers::path("/account/inference-source"))
             .and(wiremock::matchers::body_json(
                 json!({"kind": "local_proxy", "via": "mac"}),
             ))
             .respond_with(
-                wiremock::ResponseTemplate::new(200).set_body_json(relay_answer("mac", None)),
+                wiremock::ResponseTemplate::new(200).set_body_json(relay_answer("mac", Some(true))),
             )
             .expect(1)
             .mount(&server)
             .await;
-        let mut state = ready_to_relay(&server, None).await;
+        let mut state = ready_to_switch(&server, "loopback").await;
         assert!(!state.reply_source.on_mac());
-        assert!(state.note_relay_on(true));
-        let send = state.begin_relay_change().expect("turning it on sends");
-        let answer = send.client.set_inference_source(&send.update).await;
+        assert!(!card_of(&state, "mac_2").relay_on);
+
+        // On: drawn where the click asked while with the server, one at a time to a card.
+        let send = state
+            .begin_computer_relay("mac_2", true)
+            .expect("a switch begins");
+        let card = card_of(&state, "mac_2");
+        assert!(card.relay_on && card.switching, "{card:?}");
+        assert!(state.begin_computer_relay("mac_2", false).is_none());
+        assert!(
+            !card_of(&state, "mac_1").switching,
+            "another card's is free"
+        );
+        let answer = send
+            .client
+            .switch_computer_relay(&send.machine_id, send.on)
+            .await;
         assert_eq!(
-            state.settle_account_change(send.generation, send.about, answer),
+            state.settle_computer_relay("mac_2", send.token, answer),
+            AfterComputerRelay::Kept { on: true }
+        );
+        let card = card_of(&state, "mac_2");
+        assert!(card.relay_on && !card.switching, "the row is the answer");
+
+        // The account's way follows, once.
+        let change = state
+            .begin_relay_change("mac_2")
+            .expect("the account still asks the server's own machine");
+        assert_eq!(
+            serde_json::to_value(&change.update).unwrap(),
+            json!({"kind": "local_proxy", "via": "mac"})
+        );
+        let answer = change.client.set_inference_source(&change.update).await;
+        assert_eq!(
+            state.settle_account_change(change.generation, change.about, answer),
             Some(AfterChange::ReadModels)
         );
         assert!(state.reply_source.on_mac(), "as the server answered");
 
-        assert!(state.note_relay_on(false));
-        assert!(state.begin_relay_change().is_none(), "off sends nothing");
-        assert_eq!(state.reply_source.changing, None);
-        assert!(state.reply_source.on_mac(), "the account keeps its way");
+        // Off moves no way, and on again finds the way the relay's already.
+        assert_eq!(
+            switch_card(&mut state, "mac_2", false).await,
+            AfterComputerRelay::Kept { on: false }
+        );
+        assert!(!card_of(&state, "mac_2").relay_on);
+        assert_eq!(
+            switch_card(&mut state, "mac_2", true).await,
+            AfterComputerRelay::Kept { on: true }
+        );
+        assert!(
+            state.begin_relay_change("mac_2").is_none(),
+            "already the account's way"
+        );
+        assert_eq!(
+            patches_sent(&server).await,
+            [
+                ("mac_2".to_string(), json!({"relayEnabled": true})),
+                ("mac_2".to_string(), json!({"relayEnabled": false})),
+                ("mac_2".to_string(), json!({"relayEnabled": true})),
+            ]
+        );
         assert_eq!(
             puts_sent(&server).await,
             [json!({"kind": "local_proxy", "via": "mac"})]
         );
     }
 
-    /// A server whose read carries `relayEnabled` (opengrok-server #332 (PR #338 at 66b9f7b))
-    /// hears the switch both ways, each in one `PUT` with the kind the server keeps: on,
-    /// `{kind, relayEnabled: true, via: "mac"}`; off, `{kind, relayEnabled: false}` and no way,
-    /// which the account keeps.
+    /// The account's own `relayEnabled` is derived from the computers' switches now, and a `PUT` of
+    /// it would switch every one of them: it is read and never sent, whatever a switch does. A
+    /// server that sends it on every read (true while any computer is on, false with none) is
+    /// answered switches on and off of each card, with the way pointed at the relay or not, and no
+    /// `PUT` it was sent names `relayEnabled` anywhere; nor does any other change the app makes of
+    /// the account's setting.
     #[tokio::test]
-    async fn a_server_that_keeps_relay_enabled_hears_the_switch_both_ways() {
-        use super::AfterChange;
-        let on = json!({"kind": "local_proxy", "relayEnabled": true, "via": "mac"});
-        let off = json!({"kind": "local_proxy", "relayEnabled": false});
+    async fn no_put_of_the_account_ever_carries_relay_enabled() {
         let server = wiremock::MockServer::start().await;
-        for (sent, answered) in [
-            (on.clone(), relay_answer("mac", Some(true))),
-            (off.clone(), relay_answer("mac", Some(false))),
+        for (id, on) in [
+            ("mac_1", true),
+            ("mac_1", false),
+            ("mac_2", true),
+            ("mac_2", false),
         ] {
+            mount_switch(&server, id, on).await;
+        }
+        for relay_enabled in [true, false] {
             wiremock::Mock::given(wiremock::matchers::method("PUT"))
                 .and(wiremock::matchers::path("/account/inference-source"))
-                .and(wiremock::matchers::body_json(sent))
-                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(answered))
-                .expect(1)
+                .respond_with(
+                    wiremock::ResponseTemplate::new(200)
+                        .set_body_json(relay_answer("mac", Some(relay_enabled))),
+                )
                 .mount(&server)
                 .await;
         }
-        let mut state = ready_to_relay(&server, Some(true)).await;
-        for switched in [true, false] {
-            assert!(state.note_relay_on(switched));
+        for via in ["loopback", "mac"] {
+            let mut state = ready_to_switch(&server, via).await;
+            for (machine, on) in [
+                ("mac_2", true),
+                ("mac_1", false),
+                ("mac_2", false),
+                ("mac_1", true),
+            ] {
+                switch_card(&mut state, machine, on).await;
+                if on && let Some(change) = state.begin_relay_change(machine) {
+                    let answer = change.client.set_inference_source(&change.update).await;
+                    state.settle_account_change(change.generation, change.about, answer);
+                }
+            }
+            // The other changes of the account's setting that go at once.
+            if let Some(pick) = state.begin_new_bots_change(None) {
+                let answer = pick.client.set_inference_source(&pick.update).await;
+                state.settle_account_change(pick.generation, pick.about, answer);
+            }
+        }
+        let sent = puts_sent(&server).await;
+        assert!(!sent.is_empty(), "something was asked of the account");
+        for body in &sent {
+            assert!(!body.to_string().contains("relayEnabled"), "{body}");
+        }
+    }
+
+    /// A refused switch goes back, and the server's words are under that card's switch, in the
+    /// server's own sentence beside its code: another account's computer and one nobody enrolled
+    /// are the same 404 `not_found`, a revoked one 409 `revoked`, and a body that is not a true or
+    /// false 400 `bad_request` (opengrok-server branch per-computer-relay at d0a9855). The card was
+    /// drawn where the click asked while the server was asked, and is drawn from the row, which
+    /// nothing refused changed, from then on. A computer the server does not know, or says is
+    /// revoked, is a roster gone out of date, and is read again; no other card says anything, and
+    /// the next switch of this one takes the words away.
+    #[tokio::test]
+    async fn a_refused_switch_shows_the_servers_words_under_its_card_and_goes_back() {
+        use super::AfterComputerRelay;
+        for (status, words, code, after) in [
+            (
+                404,
+                "no computer of yours has that id",
+                "not_found",
+                AfterComputerRelay::ReadAgain,
+            ),
+            (
+                409,
+                "this computer was revoked; enrol it again to use it",
+                "revoked",
+                AfterComputerRelay::ReadAgain,
+            ),
+            (
+                400,
+                "relayEnabled must be true or false",
+                "bad_request",
+                AfterComputerRelay::Refused,
+            ),
+        ] {
+            let server = wiremock::MockServer::start().await;
+            wiremock::Mock::given(wiremock::matchers::method("PATCH"))
+                .and(wiremock::matchers::path("/local-exec/daemon/mac_2"))
+                .respond_with(
+                    wiremock::ResponseTemplate::new(status)
+                        .set_body_json(json!({"error": words, "code": code})),
+                )
+                .mount(&server)
+                .await;
+            let mut state = ready_to_switch(&server, "mac").await;
             let send = state
-                .begin_relay_change()
-                .expect("the server keeps whether the relay is on");
-            let answer = send.client.set_inference_source(&send.update).await;
+                .begin_computer_relay("mac_2", true)
+                .expect("a switch begins");
+            assert!(
+                card_of(&state, "mac_2").relay_on,
+                "drawn where it was asked"
+            );
+            let answer = send
+                .client
+                .switch_computer_relay(&send.machine_id, send.on)
+                .await;
             assert_eq!(
-                state.settle_account_change(send.generation, send.about, answer),
-                Some(AfterChange::ReadModels),
-                "{switched}"
+                state.settle_computer_relay("mac_2", send.token, answer),
+                after,
+                "{status}"
+            );
+            let card = card_of(&state, "mac_2");
+            assert_eq!(
+                (card.relay_on, card.switching, card.note.as_deref()),
+                (false, false, Some(words)),
+                "{status}: back, with the server's words under it"
+            );
+            assert_eq!(state.computer_relay_note("mac_1"), None);
+            assert!(card_of(&state, "mac_1").note.is_none());
+            assert!(
+                puts_sent(&server).await.is_empty(),
+                "{status}: nothing of the account's"
+            );
+
+            state
+                .begin_computer_relay("mac_2", true)
+                .expect("the card takes another click");
+            assert_eq!(
+                state.computer_relay_note("mac_2"),
+                None,
+                "the next switch takes the words away"
             );
         }
-        assert!(state.reply_source.on_mac(), "off moved no way");
-        assert_eq!(puts_sent(&server).await, [on, off]);
     }
 
-    /// The body of a fixture of the server's recording (opengrok-server #332 (PR #338 at
-    /// 66b9f7b), vendored in `fixtures/wire/`).
-    fn recorded_body(fixture: &str) -> serde_json::Value {
-        let recorded: serde_json::Value = serde_json::from_str(fixture).expect("the recording");
-        recorded["body"].clone()
-    }
-
-    /// The relay switch against the server as it recorded the switch (opengrok-server #332 (PR
-    /// #338 at 66b9f7b)): from its read with the relay on, this computer the account's way and a
-    /// fallback kept, the switch turned off here sends `{kind, relayEnabled: false}` and no way,
-    /// and the server's recorded answer is what the page holds after: the relay off, this
-    /// computer still the account's way, the fallback as it was. Turned on again it says the way
-    /// beside `relayEnabled: true`; refused with a 400 in the server's words (here those it
-    /// writes for the switch's own key), none of it is kept, and the words go under the switch.
+    /// A switch nobody heard the answer to may or may not have been kept: the card says so, and the
+    /// roster is read again to find out, whose answer takes the doubt away. One the server has no
+    /// route for (a server from before the per-computer switch, which answers `PATCH` with a bare
+    /// 405 or an empty 404) says so in this app's words, nothing is read again, and the switch goes
+    /// back; the server's own 404, which says what is missing, is about the computer and not that.
     #[tokio::test]
-    async fn the_relay_switch_reads_the_recorded_server_and_says_its_refusal_under_it() {
-        use super::{AccountChange, AfterChange, RelayOffFallback};
-        let read = recorded_body(include_str!(
-            "../fixtures/wire/rest/GET__account_inference-source/200-the_relay_switch_moves_no_way_and_a_fallback_is_kept_until_cleared.json"
-        ));
-        let switched_off = recorded_body(include_str!(
-            "../fixtures/wire/rest/PUT__account_inference-source/200-a_plan_bots_routine_runs_on_the_fallback_while_the_relay_is_off.json"
-        ));
-        let said = "relayEnabled must be true or false";
-        let off = json!({"kind": "local_proxy", "relayEnabled": false});
-        let on = json!({"kind": "local_proxy", "relayEnabled": true, "via": "mac"});
+    async fn a_switch_nobody_heard_back_is_checked_again_and_a_server_without_it_says_so() {
+        use super::{ACCOUNT_CHANGE_UNKNOWN, AfterComputerRelay, COMPUTER_RELAY_NOT_ON_SERVER};
         let server = wiremock::MockServer::start().await;
-        wiremock::Mock::given(wiremock::matchers::method("PUT"))
-            .and(wiremock::matchers::path("/account/inference-source"))
-            .and(wiremock::matchers::body_json(off.clone()))
-            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(switched_off))
-            .expect(1)
-            .mount(&server)
-            .await;
-        wiremock::Mock::given(wiremock::matchers::method("PUT"))
-            .and(wiremock::matchers::path("/account/inference-source"))
-            .and(wiremock::matchers::body_json(on.clone()))
-            .respond_with(
-                wiremock::ResponseTemplate::new(400).set_body_json(json!({ "error": said })),
-            )
-            .expect(1)
-            .mount(&server)
-            .await;
-        let mut state = signed_in_state();
-        state.opengrok = Some(client_signed_in_to(&server).await);
-        state.local_exec_machine_id = Some("mac_1".into());
-        read_as(
-            &mut state,
-            serde_json::from_value(read).expect("the recorded setting"),
-        );
-        let fallback = state.relay_off_fallback();
-        assert!(
-            matches!(&fallback, RelayOffFallback::Kept(Some(_))),
-            "{fallback:?}"
-        );
-        state.relay_mac.on = true;
-
-        assert!(state.note_relay_on(false));
+        let mut state = ready_to_switch(&server, "mac").await;
         let send = state
-            .begin_relay_change()
-            .expect("the server keeps the switch");
-        let answer = send.client.set_inference_source(&send.update).await;
+            .begin_computer_relay("mac_2", true)
+            .expect("a switch begins");
         assert_eq!(
-            state.settle_account_change(send.generation, send.about, answer),
-            Some(AfterChange::ReadModels)
+            state.settle_computer_relay(
+                "mac_2",
+                send.token,
+                Err(OpenGrokError::message("error sending request"))
+            ),
+            AfterComputerRelay::ReadAgain
         );
-        let kept = state
-            .reply_source
-            .kept_source()
-            .expect("the answer")
-            .clone();
-        assert_eq!(kept.relay_enabled, Some(false), "as the server answered");
-        assert!(state.reply_source.on_mac(), "off moved no way");
         assert_eq!(
-            state.relay_off_fallback(),
-            fallback,
-            "the fallback as it was"
+            state.computer_relay_note("mac_2"),
+            Some(ACCOUNT_CHANGE_UNKNOWN)
         );
+        assert!(
+            !card_of(&state, "mac_2").relay_on,
+            "back until the server says"
+        );
+        // The read of the roster that follows answers it.
+        state.computers_generation += 1;
+        let generation = state.computers_generation;
+        let listed = vec![
+            computer("mac_1", true, true, true, true),
+            computer("mac_2", false, true, false, true),
+        ];
+        assert!(state.take_computers(generation, listed));
+        assert_eq!(state.computer_relay_note("mac_2"), None);
+        assert!(card_of(&state, "mac_2").relay_on, "it was kept after all");
 
-        assert!(state.note_relay_on(true));
-        let send = state.begin_relay_change().expect("turning it on sends");
-        let answer = send.client.set_inference_source(&send.update).await;
-        assert_eq!(
-            state.settle_account_change(send.generation, send.about, answer),
-            Some(AfterChange::Done)
-        );
-        assert_eq!(
-            state.reply_source.change_note(AccountChange::Relay),
-            Some(said)
-        );
-        assert_eq!(
-            state.reply_source.kept_source(),
-            Some(&kept),
-            "nothing refused is kept"
-        );
-        assert!(state.relay_mac.on, "the switch stays as it was put");
-        assert_eq!(puts_sent(&server).await, [off, on]);
+        // A server before the switch.
+        for status in [405, 404] {
+            let server = wiremock::MockServer::start().await;
+            wiremock::Mock::given(wiremock::matchers::method("PATCH"))
+                .respond_with(wiremock::ResponseTemplate::new(status))
+                .mount(&server)
+                .await;
+            let mut state = ready_to_switch(&server, "mac").await;
+            assert_eq!(
+                switch_card(&mut state, "mac_2", true).await,
+                AfterComputerRelay::Refused,
+                "{status}"
+            );
+            assert_eq!(
+                state.computer_relay_note("mac_2"),
+                Some(COMPUTER_RELAY_NOT_ON_SERVER),
+                "{status}"
+            );
+            assert!(!card_of(&state, "mac_2").relay_on, "{status}: back");
+        }
     }
 
-    /// The server refusing to point the account at this computer is said under the switch, in its
-    /// own words, and nothing else gives: the switch stays on and the relay runs on, since whether
-    /// this computer relays is this computer's to say, and the account's way stays as the server
-    /// keeps it. Turning the switch off takes the words away with the change they were about.
+    /// A switch is settled by its own token and by nothing else: one the person signed out from is
+    /// forgotten with the session, and its answer, whenever it comes, lands on nothing. A read of
+    /// the roster begun before a switch was answered is dropped when it lands, so it cannot put
+    /// back the row the answer replaced.
     #[tokio::test]
-    async fn a_refused_relay_change_shows_the_servers_words_and_the_switch_stays_on() {
-        use super::{AccountChange, AfterChange};
-        let said = "via \"helper\" is not built yet (#293); use \"loopback\" or \"mac\"";
+    async fn a_switchs_answer_lands_only_on_its_own_switch_and_a_stale_roster_is_dropped() {
+        use super::AfterComputerRelay;
         let server = wiremock::MockServer::start().await;
-        wiremock::Mock::given(wiremock::matchers::method("PUT"))
-            .and(wiremock::matchers::path("/account/inference-source"))
-            .respond_with(
-                wiremock::ResponseTemplate::new(400).set_body_json(json!({"error": said})),
-            )
-            .expect(1)
-            .mount(&server)
+        mount_switch(&server, "mac_2", true).await;
+        let mut state = ready_to_switch(&server, "mac").await;
+        let send = state
+            .begin_computer_relay("mac_2", true)
+            .expect("a switch begins");
+        let elsewhere = send
+            .client
+            .switch_computer_relay(&send.machine_id, send.on)
             .await;
-        let mut state = ready_to_relay(&server, None).await;
-        assert!(state.note_relay_on(true));
-        let send = state.begin_relay_change().expect("turning it on sends");
-        let answer = send.client.set_inference_source(&send.update).await;
+        let answer = send
+            .client
+            .switch_computer_relay(&send.machine_id, send.on)
+            .await;
         assert_eq!(
-            state.settle_account_change(send.generation, send.about, answer),
-            Some(AfterChange::Done)
+            state.settle_computer_relay("mac_2", send.token + 1, elsewhere),
+            AfterComputerRelay::Dropped,
+            "not this switch's token"
         );
+        assert!(card_of(&state, "mac_2").switching, "still with the server");
+        // A roster read begun before the answer.
+        let stale = state.computers_generation;
         assert_eq!(
-            state.reply_source.change_note(AccountChange::Relay),
-            Some(said)
+            state.settle_computer_relay("mac_2", send.token, answer),
+            AfterComputerRelay::Kept { on: true }
         );
-        assert_eq!(state.reply_source.change_note(AccountChange::NewBots), None);
-        assert!(state.relay_mac.on, "the switch stays on");
-        assert!(state.relay_wanted(), "and the relay runs on");
-        assert!(!state.reply_source.on_mac(), "nothing was kept");
+        assert!(
+            !state.take_computers(stale, vec![computer("mac_2", false, false, false, false)]),
+            "begun before the answer"
+        );
+        assert!(card_of(&state, "mac_2").relay_on, "the answer's row stays");
 
-        assert!(state.note_relay_on(false));
-        assert!(state.begin_relay_change().is_none());
-        assert_eq!(state.reply_source.change_note(AccountChange::Relay), None);
+        let send = state
+            .begin_computer_relay("mac_2", false)
+            .expect("a switch begins");
+        state.forget_account();
+        assert_eq!(
+            state.settle_computer_relay(
+                "mac_2",
+                send.token,
+                Ok(serde_json::from_value(daemon_row("mac_2", false, false)).unwrap())
+            ),
+            AfterComputerRelay::Dropped,
+            "signed out since"
+        );
+        assert!(state.computers.is_empty());
+        assert!(
+            state.begin_computer_relay("mac_2", true).is_none(),
+            "nobody is signed in"
+        );
     }
 
-    /// One change of the account's at a time. The switch moved while a pick for new Bots is with
-    /// the server moves this computer's relay at once, and what it sends the account waits for
-    /// that pick's answer, then goes once, as the switch says by then. Its answer, the newest word
-    /// there is, also settles a pick nobody heard back from.
+    /// Pointing the account's way at the relay is one change of the account's at a time. A card's
+    /// switch going on while a pick for new Bots is with the server owes it: nothing is sent, the
+    /// pick's answer comes first, and then it goes once, as `{kind, via: "mac"}`. It is asked for
+    /// the computer whose switch owed it, whose card says what became of it. Nothing before the
+    /// setting is read, from a server that does not know the relay, or when the way is the relay's.
     #[test]
-    fn a_switch_moved_while_a_change_is_out_is_sent_once_that_one_is_answered() {
+    fn the_accounts_way_goes_once_the_change_in_flight_is_answered_and_only_where_it_is_wanted() {
         use super::{AccountChange, AfterChange};
         let mut state = signed_in_state();
-        state.local_exec_machine_id = Some("mac_1".into());
+        state.computers = vec![computer("mac_2", false, true, false, true)];
+        assert!(
+            state.begin_relay_change("mac_2").is_none(),
+            "the setting is not read"
+        );
         read_as(&mut state, with_new_bots(None));
         let pick = state
             .begin_new_bots_change(Some(luna("high")))
             .expect("a pick goes out");
-        assert!(state.note_relay_on(true), "the switch moves at once");
-        assert!(state.relay_wanted());
-        assert!(state.begin_relay_change().is_none(), "one at a time");
+        assert!(state.begin_relay_change("mac_2").is_none(), "one at a time");
+        assert!(state.reply_source.relay_change_owed);
         assert!(state.begin_owed_relay_change().is_none(), "the pick is out");
         assert_eq!(
             state.settle_account_change(
@@ -38472,43 +38924,119 @@ mod tests {
             json!({"kind": "gateway", "via": "mac"})
         );
         assert!(state.begin_owed_relay_change().is_none(), "sent once");
-        assert_eq!(
-            state.settle_account_change(send.generation, send.about, Ok(with_new_bots(None))),
-            Some(AfterChange::ReadModels)
-        );
-
-        // Off and on again while a pick is out, and the pick unanswered: the switch's change goes
-        // as it says by then, and its answer settles the pick's doubt.
-        let pick = state
-            .begin_new_bots_change(Some(luna("low")))
-            .expect("a pick goes out");
-        assert!(state.note_relay_on(false));
-        assert!(state.begin_relay_change().is_none());
-        assert!(state.note_relay_on(true));
-        assert!(state.begin_relay_change().is_none());
+        // Refused, the server's words are under the card of the computer that asked.
+        let said = "via \"helper\" is not built yet (#293); use \"loopback\" or \"mac\"";
         assert_eq!(
             state.settle_account_change(
-                pick.generation,
-                pick.about,
-                Err(OpenGrokError::message("error sending request"))
+                send.generation,
+                send.about,
+                Err(OpenGrokError::from_opengrok(400, said))
             ),
-            Some(AfterChange::ReadAgain)
+            Some(AfterChange::Done)
         );
-        let send = state.begin_owed_relay_change().expect("its turn now");
-        assert_eq!(
-            serde_json::to_value(&send.update).unwrap(),
-            json!({"kind": "gateway", "via": "mac"})
-        );
-        assert!(
-            state
-                .reply_source
-                .change_note(AccountChange::NewBots)
-                .is_some(),
-            "nobody knows yet"
-        );
-        state.settle_account_change(send.generation, send.about, Ok(with_new_bots(None)));
+        assert_eq!(state.computer_relay_note("mac_2"), Some(said));
+        assert_eq!(state.computer_relay_note("mac_1"), None);
         assert_eq!(state.reply_source.change_note(AccountChange::NewBots), None);
-        assert_eq!(state.reply_source.changing, None);
+        state
+            .computers
+            .push(computer("mac_1", true, true, true, true));
+        assert_eq!(state.computer_relay_note("mac_1"), None, "another card's");
+
+        // A server that does not know the relay is sent nothing.
+        read_as(&mut state, kept(InferenceKind::Gateway, None));
+        assert!(state.begin_relay_change("mac_2").is_none());
+        // And one whose way is the relay's already.
+        read_as(&mut state, relay_kept(InferenceKind::Gateway, "mac", None));
+        assert!(state.begin_relay_change("mac_2").is_none());
+    }
+
+    /// The relay switch against the server as it recorded the setting (opengrok-server #332 (PR
+    /// #338 at 66b9f7b)): from its read with the relay on, this computer the account's way and a
+    /// fallback kept, a card's switch goes off and on and the account's setting is not touched: no
+    /// `PUT`, the way and the fallback as they were. From the same read with the way the server's
+    /// own machine, turning one on sends the one `PUT` that points it at the relay, and the
+    /// server's recorded answer to choosing the relay is what the app holds after.
+    #[tokio::test]
+    async fn a_switch_leaves_the_recorded_setting_alone_and_points_the_way_once_where_it_is_not() {
+        use super::{AfterChange, AfterComputerRelay, RelayOffFallback};
+        let read = recorded_body(include_str!(
+            "../fixtures/wire/rest/GET__account_inference-source/200-the_relay_switch_moves_no_way_and_a_fallback_is_kept_until_cleared.json"
+        ));
+        let chosen = recorded_body(include_str!(
+            "../fixtures/wire/rest/PUT__account_inference-source/200-a_person_chooses_their_mac_and_reads_the_relay_back.json"
+        ));
+        let server = wiremock::MockServer::start().await;
+        for (id, on) in [("mac_2", true), ("mac_2", false)] {
+            mount_switch(&server, id, on).await;
+        }
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .and(wiremock::matchers::path("/account/inference-source"))
+            .and(wiremock::matchers::body_json(
+                json!({"kind": "local_proxy", "via": "mac"}),
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(chosen))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut state = ready_to_switch(&server, "mac").await;
+        read_as(
+            &mut state,
+            serde_json::from_value(read.clone()).expect("the recorded setting"),
+        );
+        let fallback = state.relay_off_fallback();
+        assert!(
+            matches!(&fallback, RelayOffFallback::Kept(Some(_))),
+            "{fallback:?}"
+        );
+        assert!(state.reply_source.on_mac());
+        for on in [true, false, true] {
+            assert_eq!(
+                switch_card(&mut state, "mac_2", on).await,
+                AfterComputerRelay::Kept { on }
+            );
+            assert!(
+                state.begin_relay_change("mac_2").is_none(),
+                "the way is the relay's"
+            );
+        }
+        assert!(
+            puts_sent(&server).await.is_empty(),
+            "nothing of the account's"
+        );
+        assert_eq!(
+            state.relay_off_fallback(),
+            fallback,
+            "the fallback as it was"
+        );
+
+        // The way the server's own machine: on points it, once.
+        let mut loopback = read;
+        loopback["via"] = json!("loopback");
+        read_as(
+            &mut state,
+            serde_json::from_value(loopback).expect("the recorded setting, the other way"),
+        );
+        assert!(!state.reply_source.on_mac());
+        let change = state
+            .begin_relay_change("mac_2")
+            .expect("the way is the server's own machine");
+        let answer = change.client.set_inference_source(&change.update).await;
+        assert_eq!(
+            state.settle_account_change(change.generation, change.about, answer),
+            Some(AfterChange::ReadModels)
+        );
+        assert!(state.reply_source.on_mac(), "as the server recorded it");
+        assert_eq!(
+            puts_sent(&server).await,
+            [json!({"kind": "local_proxy", "via": "mac"})]
+        );
+    }
+
+    /// The body of a fixture of the server's recording (opengrok-server #332 (PR #338 at
+    /// 66b9f7b), vendored in `fixtures/wire/`).
+    fn recorded_body(fixture: &str) -> serde_json::Value {
+        let recorded: serde_json::Value = serde_json::from_str(fixture).expect("the recording");
+        recorded["body"].clone()
     }
 
     // ---- The account's time zone: this computer's, for its routines (opengrok-server PR #322) ---
@@ -38655,127 +39183,218 @@ mod tests {
         assert_eq!(puts, [json!({"timeZone": "Asia/Manila"})]);
     }
 
-    /// The relay runs only for somebody signed in, with its switch on for them, on an enrolled
-    /// computer, against a server that knows the relay: enrolling alone never makes a computer the
-    /// relay. The switch goes on only where it could run, and off always; signing out stops the
-    /// relay and forgets the switch, which is the next person's to read.
+    /// The relay runs for somebody signed in, on an enrolled computer, against a server that knows
+    /// the relay, and for no other reason: not a switch of this computer's own, which is the
+    /// server's to say on the stream (`disabled`, or a refusal with `relay_disabled`) and which the
+    /// relay waits on for itself. Not before the setting is read, not before this Mac is enrolled,
+    /// and not from a server that does not know the relay; signing out stops it, and forgets what
+    /// it said.
     #[test]
-    fn the_relay_runs_only_switched_on_for_an_enrolled_mac_on_a_server_that_knows_it() {
+    fn the_relay_runs_for_an_enrolled_mac_signed_in_on_a_server_that_knows_it() {
         let mut state = signed_in_state();
-        assert!(!state.relay_wanted());
-        assert!(!state.relay_switch_live(), "the setting not read");
+        assert!(!state.relay_wanted(), "the setting not read");
         read_as(
             &mut state,
             relay_kept(InferenceKind::Gateway, "loopback", None),
         );
-        assert!(!state.relay_switch_live(), "not enrolled");
-        assert!(!state.note_relay_on(true));
+        assert!(!state.relay_wanted(), "not enrolled");
         state.local_exec_machine_id = Some("mac_1".into());
-        assert!(state.relay_switch_live());
-        assert!(!state.relay_wanted(), "enrolled, and not switched on");
-        assert!(state.note_relay_on(true));
-        assert!(state.relay_mac.on && state.relay_wanted());
-        assert!(!state.note_relay_on(true), "already on");
+        assert!(state.relay_wanted());
 
-        // A server that no longer knows the relay: it would not run, but the switch still goes
-        // off.
+        // A server that no longer knows the relay: it would not run.
         read_as(&mut state, kept(InferenceKind::Gateway, None));
         assert!(!state.relay_wanted());
-        assert!(state.relay_switch_live(), "on, so it can go off");
-        assert!(state.note_relay_on(false));
-        assert!(!state.relay_switch_live());
+        read_as(
+            &mut state,
+            relay_kept(InferenceKind::Gateway, "loopback", None),
+        );
+        assert!(state.relay_wanted());
 
-        state.relay_mac.on = true;
         state.relay_mac.report = Some(crate::opengrok::RelayReport::default());
         state.forget_account();
-        assert!(!state.relay_mac.on);
         assert_eq!(state.relay_mac.report, None);
         assert!(!state.relay_wanted());
     }
 
-    /// The status line says who is answering: this Mac by its relay's own word, and nothing of the
-    /// calls it is answering; another Mac by the server's word, by its name, whether this Mac was
-    /// replaced or is switched off; and otherwise connecting, or not connected with why. The
-    /// server saying this Mac holds the relay while its relay is not running is not this Mac
-    /// answering.
+    /// Where a computer's relay stands is on its card, from its switch, whether the server holds
+    /// its relay stream and whether the server can reach it: relaying only while it is on and the
+    /// stream is up; off is not relaying whatever else is so; on and not relaying is asleep exactly
+    /// when the server cannot reach it, and not relaying while the computer is awake. This
+    /// computer's own relay says what it does at once, and the app is open on it, so it is never
+    /// asleep.
     #[test]
-    fn the_status_line_says_who_is_answering() {
-        use super::RelayLine;
-        use crate::opengrok::{RelayRead, RelayReport, RelayStatus};
-        let with_relay = |relay: RelayRead| InferenceSource {
-            via: Some("loopback".into()),
-            relay: Some(relay),
-            ..kept(InferenceKind::Gateway, None)
-        };
-        let studio = RelayRead {
-            connected: true,
-            machine_id: Some("mac_2".into()),
-            machine_label: Some("NativeChat on studio".into()),
-            local_model: None,
-        };
+    fn a_card_says_where_its_computers_relay_stands() {
+        use crate::components::computers::{RelayState, relay_state};
+        use crate::opengrok::{RelayReport, RelayStatus};
+        for (on, relaying, online, expected) in [
+            (true, true, true, RelayState::Relaying),
+            (true, true, false, RelayState::Relaying),
+            (true, false, false, RelayState::OnButAsleep),
+            (true, false, true, RelayState::NotRelaying),
+            (false, false, true, RelayState::NotRelaying),
+            (false, false, false, RelayState::NotRelaying),
+            (false, true, true, RelayState::NotRelaying),
+        ] {
+            assert_eq!(
+                relay_state(on, relaying, online),
+                expected,
+                "on {on}, relaying {relaying}, online {online}"
+            );
+        }
+
         let mut state = signed_in_state();
         state.local_exec_machine_id = Some("mac_1".into());
-        read_as(
-            &mut state,
-            with_relay(RelayRead {
-                connected: false,
-                ..studio.clone()
-            }),
-        );
-        assert_eq!(state.relay_line(), RelayLine::NotConnected { why: None });
-        let report = |status: RelayStatus| RelayReport {
-            status,
-            halted: false,
+        state.computers = vec![
+            computer("mac_1", true, true, false, true),
+            computer("mac_2", false, true, false, false),
+            computer("mac_3", false, false, false, true),
+        ];
+        let states = |state: &AppState| {
+            crate::components::computers::cards(state)
+                .iter()
+                .map(|card| (card.machine_id.clone(), card.state, card.online))
+                .collect::<Vec<_>>()
         };
-        state.relay_mac.report = Some(report(RelayStatus::Connecting));
-        assert_eq!(state.relay_line(), RelayLine::Connecting);
-        state.relay_mac.report = Some(report(RelayStatus::Answering));
-        assert_eq!(state.relay_line(), RelayLine::Answering);
-        state.relay_mac.report = Some(report(RelayStatus::Error("gone quiet".into())));
+        let report = |status: RelayStatus| {
+            Some(RelayReport {
+                status,
+                halted: false,
+            })
+        };
+        // This computer's relay is not up yet: not relaying, and awake. Another computer's is on
+        // and nobody can reach it: asleep. A third is off.
         assert_eq!(
-            state.relay_line(),
-            RelayLine::NotConnected {
-                why: Some("gone quiet".into())
-            }
+            states(&state),
+            [
+                ("mac_1".to_string(), RelayState::NotRelaying, true),
+                ("mac_2".to_string(), RelayState::OnButAsleep, false),
+                ("mac_3".to_string(), RelayState::NotRelaying, true),
+            ]
+        );
+        // This computer's relay says it answers, before the server's row does.
+        state.relay_mac.report = report(RelayStatus::Answering);
+        assert_eq!(states(&state)[0].1, RelayState::Relaying);
+        // And it is no word about another computer's card.
+        assert_eq!(states(&state)[1].1, RelayState::OnButAsleep);
+        assert_eq!(
+            crate::components::computers::cards(&state)[1].detail,
+            None,
+            "this computer's relay's words are on this computer's card"
         );
 
-        // Another Mac took over: by its name, once the server says it.
-        state.relay_mac.report = Some(report(RelayStatus::Replaced));
-        assert_eq!(state.relay_line(), RelayLine::Another { label: None });
-        read_as(&mut state, with_relay(studio.clone()));
+        // Why this computer's relay is not relaying, in its own words, while its switch is on.
+        let detail = |state: &AppState| {
+            crate::components::computers::cards(state)[0]
+                .detail
+                .clone()
+                .map(|detail| (detail.words, detail.trouble))
+        };
+        state.relay_mac.report = report(RelayStatus::Connecting);
+        assert_eq!(detail(&state), Some(("Connecting…".to_string(), false)));
+        state.relay_mac.report = report(RelayStatus::Error("gone quiet".into()));
+        assert_eq!(detail(&state), Some(("gone quiet".to_string(), true)));
+        state.relay_mac.report = report(RelayStatus::Replaced);
+        let taken = detail(&state).expect("how to take it back");
+        assert!(taken.0.contains("Turn this off and on"), "{taken:?}");
+        state.relay_mac.report = report(RelayStatus::Off);
         assert_eq!(
-            state.relay_line(),
-            RelayLine::Another {
-                label: Some("NativeChat on studio".into())
-            }
+            detail(&state),
+            None,
+            "switched off by the server: nothing is wrong"
         );
-        // Switched off here, the other Mac is still the one answering.
-        state.relay_mac.report = None;
+        // Switched off here, nothing is said of a relay that is not meant to run.
+        state.relay_mac.report = report(RelayStatus::Error("gone quiet".into()));
+        state.computers[0].relay_enabled = false;
+        assert_eq!(detail(&state), None);
+    }
+
+    /// The relay's word on itself moving the server's row for this computer, which is when the
+    /// roster is read again: it started or stopped answering, or the server switched it off (from
+    /// another computer, say) and told it so. Opening the stream, failing and trying again, and
+    /// the other computer taking over are not.
+    #[test]
+    fn a_report_that_moves_this_computers_row_asks_for_the_roster_again() {
+        use super::relay_moved_the_row;
+        use crate::opengrok::RelayStatus::{Answering, Connecting, Error, Off, Replaced};
+        let err = || Error("gone quiet".into());
+        for (before, now, moved) in [
+            (Some(Connecting), Answering, true),
+            (Some(Answering), Connecting, true),
+            (Some(Answering), Off, true),
+            (Some(Answering), err(), true),
+            (Some(Connecting), Off, true),
+            (None, Off, true),
+            (Some(Off), Off, false),
+            (Some(Off), Connecting, false),
+            (Some(Connecting), err(), false),
+            (Some(err()), Connecting, false),
+            (Some(Connecting), Replaced, false),
+            (Some(Answering), Answering, false),
+        ] {
+            assert_eq!(
+                relay_moved_the_row(before.as_ref(), &now),
+                moved,
+                "{before:?} to {now:?}"
+            );
+        }
+    }
+
+    /// This computer is the one its stored machine id names, from the start, before enrolling has
+    /// answered: the roster marks it, always online since the app is open on it, and puts it first;
+    /// any other computer is not it, and a stale enrolment under the same name collapses into the
+    /// live one. Without a stored id, and with none enrolled, no computer is this one.
+    #[test]
+    fn this_computer_is_the_one_its_stored_machine_id_names() {
+        use super::settle_roster;
+        let dir = std::env::temp_dir().join(format!(
+            "nativechat-this-computer-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut state = signed_in_state();
+        assert_eq!(state.this_mac_id(), None, "nothing enrolled or stored");
+        state.config = Some(crate::config::Config {
+            database_url: String::new(),
+            data_dir: dir.clone(),
+            opengrok_base_url: "http://127.0.0.1:9".into(),
+        });
+        assert_eq!(state.this_mac_id(), None, "no stored id yet");
+        std::fs::write(
+            dir.join("local-exec-daemon.json"),
+            r#"{"machine_id":"mac_2","token":"tok","label":"NativeChat on studio"}"#,
+        )
+        .unwrap();
+        assert_eq!(state.this_mac_id().as_deref(), Some("mac_2"));
+
+        let listed = vec![
+            computer("mac_1", false, true, true, true),
+            computer("mac_2", false, true, false, false),
+        ];
+        let roster = settle_roster(listed.clone(), state.this_mac_id().as_deref());
+        let ids: Vec<(&str, bool, bool)> = roster
+            .iter()
+            .map(|c| (c.machine_id.as_str(), c.this_machine, c.online))
+            .collect();
         assert_eq!(
-            state.relay_line(),
-            RelayLine::Another {
-                label: Some("NativeChat on studio".into())
-            }
+            ids,
+            [("mac_2", true, true), ("mac_1", false, true)],
+            "this computer first, and online"
         );
-        // The server says this Mac, and its relay is not running: not answering.
-        read_as(
-            &mut state,
-            with_relay(RelayRead {
-                machine_id: Some("mac_1".into()),
-                ..studio
-            }),
-        );
-        assert_eq!(state.relay_line(), RelayLine::NotConnected { why: None });
+        let nobody = settle_roster(listed, None);
+        assert!(nobody.iter().all(|computer| !computer.this_machine));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The id this app knows this Mac by follows the newest enrolment, whatever machine it names,
-    /// as the relay does, so the relay the server says that machine holds is this Mac's own, and
-    /// not another Mac's under this Mac's own name. The same credential again moves nothing, and
+    /// as the relay does, so the card that says this computer's relay is this Mac's own, and not
+    /// another computer's under this Mac's own name. The same credential again moves nothing, and
     /// nor does the enrolment of a local-exec that is no longer the one running.
     #[test]
     fn this_macs_id_follows_its_newest_enrolment() {
-        use super::RelayLine;
-        use crate::opengrok::{MachineCredential, RelayRead, RelayReport, RelayStatus};
+        use crate::opengrok::{MachineCredential, RelayReport, RelayStatus};
         let mut state = signed_in_state();
         let (enrolled, enrolment) = tokio::sync::watch::channel(None);
         state.local_exec_enrolment = Some(enrolment.clone());
@@ -38792,31 +39411,36 @@ mod tests {
         );
 
         // A credential naming another machine: the relay opens its stream again with it, and
-        // the server says that machine holds it.
+        // the roster marks that computer as this one, with this Mac's own relay's word on it.
         enrolled.send_replace(Some(MachineCredential::new("mac_2", "tok_2")));
-        read_as(
-            &mut state,
-            InferenceSource {
-                via: Some("loopback".into()),
-                relay: Some(RelayRead {
-                    connected: true,
-                    machine_id: Some("mac_2".into()),
-                    machine_label: Some("NativeChat on this Mac".into()),
-                    local_model: None,
-                }),
-                ..kept(InferenceKind::Gateway, None)
-            },
-        );
         state.relay_mac.report = Some(RelayReport {
             status: RelayStatus::Connecting,
             halted: false,
         });
         assert_eq!(state.note_enrolment(&enrolment), Some(true));
         assert_eq!(state.local_exec_machine_id.as_deref(), Some("mac_2"));
+        state.computers = super::settle_roster(
+            vec![
+                computer("mac_1", false, true, false, true),
+                computer("mac_2", false, true, false, true),
+            ],
+            state.this_mac_id().as_deref(),
+        );
+        let cards = crate::components::computers::cards(&state);
+        let said: Vec<(&str, bool, bool)> = cards
+            .iter()
+            .map(|card| {
+                (
+                    card.machine_id.as_str(),
+                    card.this_computer,
+                    card.detail.is_some(),
+                )
+            })
+            .collect();
         assert_eq!(
-            state.relay_line(),
-            RelayLine::Connecting,
-            "this Mac's own relay, not another Mac's"
+            said,
+            [("mac_2", true, true), ("mac_1", false, false)],
+            "this Mac's own relay, not another computer's"
         );
 
         // A local-exec that is no longer the one running: signed out and in again since.
@@ -38926,9 +39550,9 @@ mod tests {
         );
     }
 
-    /// Settings → Relay coming on screen is told once, which is when the setting and the models
-    /// are read; and a key typed there and not saved does not outlive the page: leaving the tab,
-    /// or Settings, drops it, and the page asks for it again when it is back. Signing out drops it
+    /// Settings → Computer coming on screen is told once, which is when the setting is read; and a
+    /// key typed on this computer's card and not saved does not outlive the page: leaving the tab,
+    /// or Settings, drops it, and the card asks for it again when it is back. Signing out drops it
     /// with everything else, and the gpui-agent tree never holds it.
     #[test]
     fn the_page_reads_when_it_arrives_and_a_key_left_on_it_is_dropped() {
@@ -38937,38 +39561,35 @@ mod tests {
             &mut state,
             relay_kept(InferenceKind::Gateway, "loopback", None),
         );
-        assert!(!state.settle_reply_source_page(), "Settings is shut");
+        assert!(!state.settle_computer_page(), "Settings is shut");
         state.is_app_settings_open = true;
-        state.app_settings_tab = AppSettingsTab::ReplySource;
-        assert!(state.settle_reply_source_page(), "arrived: read");
-        assert!(
-            !state.settle_reply_source_page(),
-            "still there: no read again"
-        );
+        state.app_settings_tab = AppSettingsTab::Computer;
+        assert!(state.settle_computer_page(), "arrived: read");
+        assert!(!state.settle_computer_page(), "still there: no read again");
         assert!(state.note_relay_key("opencodex-test-key"));
         assert!(state.reply_source.without_key().relay_key_draft.is_none());
 
         state.app_settings_tab = AppSettingsTab::Logins;
-        assert!(!state.settle_reply_source_page());
+        assert!(!state.settle_computer_page());
         assert_eq!(
             state.reply_source.relay_key_draft, None,
             "gone with the tab"
         );
         assert!(state.reply_source.relay_retype_key);
 
-        state.app_settings_tab = AppSettingsTab::ReplySource;
-        assert!(state.settle_reply_source_page(), "back: read again");
+        state.app_settings_tab = AppSettingsTab::Computer;
+        assert!(state.settle_computer_page(), "back: read again");
         assert!(state.note_relay_key("opencodex-test-key"));
         assert!(!state.reply_source.relay_retype_key, "typed again");
         state.is_app_settings_open = false;
-        assert!(!state.settle_reply_source_page());
+        assert!(!state.settle_computer_page());
         assert_eq!(
             state.reply_source.relay_key_draft, None,
             "gone with Settings"
         );
 
         state.is_app_settings_open = true;
-        assert!(state.settle_reply_source_page());
+        assert!(state.settle_computer_page());
         assert!(state.note_relay_key("opencodex-test-key"));
         state.forget_account();
         assert_eq!(
@@ -38980,7 +39601,7 @@ mod tests {
     /// Settings → General coming on screen is told once, which is when the setting and the
     /// models are read for its Default models; while it is on screen, coming back to the window
     /// reads the models again. Leaving it shuts Default for new Bots' popover, which hangs from
-    /// it; Settings → Relay coming on screen does not.
+    /// it; Settings → Computer coming on screen does not.
     #[test]
     fn the_general_page_reads_when_it_arrives_and_shuts_its_pickers_when_it_goes() {
         use super::PickerView;
@@ -38992,10 +39613,10 @@ mod tests {
         assert!(!state.settle_default_models_page(), "still there");
         assert!(state.reads_on_activation(Instant::now()).models);
         state.new_bots_picker.open = true;
-        assert!(!state.settle_reply_source_page(), "Relay is not on screen");
+        assert!(!state.settle_computer_page(), "Computer is not on screen");
         assert!(state.new_bots_picker.open, "and has no say in it");
 
-        state.app_settings_tab = AppSettingsTab::ReplySource;
+        state.app_settings_tab = AppSettingsTab::Computer;
         assert!(!state.settle_default_models_page());
         assert_eq!(
             state.new_bots_picker,

@@ -7131,7 +7131,6 @@ mod tests {
                 kind: InferenceKind::Gateway,
                 via: Some(Via::Mac),
                 new_bot_default: None,
-                relay_enabled: None,
                 plan_fallback: None,
             })
             .await
@@ -7163,7 +7162,6 @@ mod tests {
                 kind: InferenceKind::LocalProxy,
                 via: Some(Via::Mac),
                 new_bot_default: None,
-                relay_enabled: None,
                 plan_fallback: None,
             })
             .await
@@ -7200,7 +7198,6 @@ mod tests {
                     kind: InferenceKind::Gateway,
                     via: None,
                     new_bot_default: None,
-                    relay_enabled: None,
                     plan_fallback: None,
                 })
                 .await

@@ -1,8 +1,8 @@
 use crate::actions::CloseSettings;
 use crate::chrome::TITLE_BAR_H;
+use crate::components::computers::{self, ComputerCard, OpencodexFields};
 use crate::components::default_models::DefaultModels;
 use crate::components::logins::LoginsPage;
-use crate::components::reply_source::ReplySourcePage;
 use crate::components::skills::SkillsPage;
 use crate::components::switch::Switch;
 use crate::opengrok::LocalExecMode;
@@ -20,8 +20,9 @@ pub struct AppSettings {
     logins: Option<Entity<LoginsPage>>,
     /// Settings → Skills, made on the first render of that tab, for the same reason.
     skills: Option<Entity<SkillsPage>>,
-    /// Settings → Relay, made on the first render of that tab, for the same reason.
-    reply_source: Option<Entity<ReplySourcePage>>,
+    /// This computer's opencodex address and key, on its card in Settings → Computer, made on the
+    /// first render of that tab, for the same reason.
+    opencodex: Option<Entity<OpencodexFields>>,
     /// Settings → General's Default models, made on the first render of that tab: its pickers
     /// need a window too.
     default_models: Option<Entity<DefaultModels>>,
@@ -34,7 +35,7 @@ impl AppSettings {
             state,
             logins: None,
             skills: None,
-            reply_source: None,
+            opencodex: None,
             default_models: None,
         }
     }
@@ -59,18 +60,18 @@ impl AppSettings {
         page
     }
 
-    fn reply_source_page(
+    fn opencodex_fields(
         &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> Entity<ReplySourcePage> {
-        if let Some(page) = &self.reply_source {
-            return page.clone();
+    ) -> Entity<OpencodexFields> {
+        if let Some(fields) = &self.opencodex {
+            return fields.clone();
         }
         let state = self.state.clone();
-        let page = cx.new(|cx| ReplySourcePage::new(window, state, cx));
-        self.reply_source = Some(page.clone());
-        page
+        let fields = cx.new(|cx| OpencodexFields::new(window, state, cx));
+        self.opencodex = Some(fields.clone());
+        fields
     }
 
     fn default_models(
@@ -100,7 +101,7 @@ impl Render for AppSettings {
             theme_mode,
             account_name,
             account_email,
-            computers,
+            cards,
             bot_name,
             controls,
         ) = {
@@ -118,7 +119,7 @@ impl Render for AppSettings {
                 state.theme_mode.clone(),
                 name,
                 email,
-                state.computers.clone(),
+                computers::cards(state),
                 state.active_bot_name(),
                 crate::components::computer::ComputerControls::from_state(state),
             )
@@ -150,7 +151,8 @@ impl Render for AppSettings {
                 Some(shortcuts_page(chord, muted, &theme).into_any_element())
             }
             AppSettingsTab::Computer => {
-                Some(computer_page(computers, muted, app.clone(), cx).into_any_element())
+                let fields = self.opencodex_fields(window, cx);
+                Some(computer_page(cards, fields, muted, app.clone(), cx).into_any_element())
             }
             AppSettingsTab::Updates => Some(
                 updates_page(&bot_name, &controls, muted, app.clone(), &theme).into_any_element(),
@@ -159,9 +161,6 @@ impl Render for AppSettings {
                 crate::components::connections::connections_page(app.clone(), cx)
                     .into_any_element(),
             ),
-            AppSettingsTab::ReplySource => {
-                Some(self.reply_source_page(window, cx).into_any_element())
-            }
             AppSettingsTab::Logins | AppSettingsTab::Skills => None,
         };
         let body = match cards {
@@ -334,13 +333,6 @@ impl AppSettings {
                 cx,
             ))
             .child(nav_item(
-                crate::components::reply_source::SETTINGS_TAB,
-                crate::components::reply_source::TAB_LABEL,
-                tab == AppSettingsTab::ReplySource,
-                AppSettingsTab::ReplySource,
-                cx,
-            ))
-            .child(nav_item(
                 "settings-tab-skills",
                 "Skills",
                 tab == AppSettingsTab::Skills,
@@ -360,7 +352,6 @@ fn tab_title(tab: AppSettingsTab) -> &'static str {
         AppSettingsTab::Updates => "Updates",
         AppSettingsTab::Logins => "Logins",
         AppSettingsTab::Connections => "Connections",
-        AppSettingsTab::ReplySource => crate::components::reply_source::TAB_LABEL,
         AppSettingsTab::Skills => "Skills",
     }
 }
@@ -455,6 +446,7 @@ fn nav_item(
 ) -> impl IntoElement {
     div()
         .id(id)
+        .debug_selector(move || id.to_string())
         .px(px(10.))
         .py(px(7.))
         .rounded(px(8.))
@@ -760,8 +752,14 @@ fn theme_chip(
         .child(div().text_sm().child(label))
 }
 
+/// Settings → Computer: Route traffic and its network choice where they apply, then "Your
+/// computers", one card for each computer the person has enrolled, this one first. Each card is
+/// the computer's Relay your plan switch with where its relay stands (`components::computers`), and
+/// below it that computer's local-exec mode; this computer's alone also holds opencodex's address
+/// and key for its relay and its standing rules.
 fn computer_page(
-    computers: Vec<crate::opengrok::ConnectedComputer>,
+    cards: Vec<ComputerCard>,
+    fields: Entity<OpencodexFields>,
     muted: Hsla,
     app: Entity<AppState>,
     cx: &App,
@@ -786,53 +784,45 @@ fn computer_page(
             let org = app.read(cx).computer_is_org_shared();
             this.child(settings_egress_policy_row(app.clone(), current, org, muted))
         })
-        .child(div().text_xs().text_color(muted).child("This Mac"))
         .child(
             div()
                 .text_xs()
                 .text_color(muted)
-                .child(
-                    "Local-exec enrolment and policy. Each bot's screen and image updates are on that bot's Computer pane.",
-                ),
+                .child(computers::SECTION_TITLE),
+        )
+        .child(
+            div()
+                .text_xs()
+                .text_color(muted)
+                .child(computers::SECTION_INTRO),
         )
         // Why this Mac stopped running commands for the server by itself, until the next
         // sign-in. Its row only says Offline, which reads as NativeChat not being open here.
         .when_some(stopped, |this, stopped| {
-            this.child(
-                div()
-                    .text_xs()
-                    .text_color(cx.theme().danger)
-                    .child(stopped),
-            )
+            this.child(div().text_xs().text_color(cx.theme().danger).child(stopped))
         });
-    if computers.is_empty() {
+    if cards.is_empty() {
         return page.child(
             div()
                 .text_sm()
                 .text_color(muted)
-                .child("No computers yet. Stay signed in here and NativeChat enrols this Mac."),
+                .child(computers::NO_COMPUTERS),
         );
     }
     let rules = app.read(cx).this_mac_rules();
     let theme = cx.theme();
-    let mut card = v_flex()
-        .w_full()
-        .rounded(px(12.))
-        .border_1()
-        .border_color(rgb(0x777777).opacity(0.24))
-        .overflow_hidden();
-    for (i, computer) in computers.into_iter().enumerate() {
-        if i > 0 {
-            card = card.child(div().h(px(1.)).bg(rgb(0x777777).opacity(0.16)));
-        }
-        // This Mac's rules go under its own row and no other: they were read for its machine,
-        // and the app keeps no other machine's.
+    page.children(cards.into_iter().map(|card| {
+        // This Mac's rules go in its own card and no other: they were read for its machine, and
+        // the app keeps no other machine's. So do opencodex's address and key, which are this
+        // computer's.
         let rules = rules
-            .filter(|rules| computer.this_machine && rules.machine_id == computer.machine_id)
+            .filter(|rules| card.this_computer && rules.machine_id == card.machine_id)
             .map(|rules| local_rules_block(rules, theme, app.clone()).into_any_element());
-        card = card.child(computer_row(computer, rules, muted, app.clone()));
-    }
-    page.child(card)
+        let fields = card
+            .this_computer
+            .then(|| fields.clone().into_any_element());
+        computer_card(card, fields, rules, muted, theme, app.clone())
+    }))
 }
 
 /// What this Mac's rules say when there are none.
@@ -1101,93 +1091,62 @@ fn egress_menu_item(
         })
 }
 
-/// One computer on the roster: what it is, and its mode. `rules` is drawn under the mode, and
-/// only this Mac's row has any.
-fn computer_row(
-    computer: crate::opengrok::ConnectedComputer,
+/// One computer's card: its Relay your plan section (`components::computers::relay_section`), and
+/// under it what commands may run on it: its mode. `fields` is this computer's opencodex address
+/// and key, and `rules` its standing rules, drawn under the mode; only this computer's card has
+/// either.
+fn computer_card(
+    card: ComputerCard,
+    fields: Option<AnyElement>,
     rules: Option<AnyElement>,
     muted: Hsla,
+    theme: &gpui_kit::component::Theme,
     app: Entity<AppState>,
 ) -> impl IntoElement {
-    let heading = if computer.this_machine {
-        "Current computer"
-    } else {
-        "Computer"
-    };
-    let hint = if !computer.online {
-        "Offline. Open NativeChat on this computer while it is online to run commands."
-    } else if computer.this_machine {
-        "This is the computer you are using now"
-    } else {
-        "Online. Agents can run commands here per the policy below."
-    };
-    let subtitle = if !computer.online {
+    let subtitle = if !card.online {
         "Local execution needs this computer connected."
     } else {
-        match computer.mode {
+        match card.mode {
             LocalExecMode::Always => "Agents run commands on this computer without asking.",
             LocalExecMode::Ask => "Agents ask before every command on this computer.",
             LocalExecMode::Never => "Agents cannot run commands on this computer.",
         }
     };
-    let status = if computer.online { "Online" } else { "Offline" };
+    let id = computers::card_id(&card.machine_id);
     v_flex()
+        .id(ElementId::Name(id.clone().into()))
+        .debug_selector(move || id)
         .w_full()
-        .px(px(16.))
-        .py(px(14.))
-        .gap(px(14.))
+        .rounded(px(12.))
+        .border_1()
+        .border_color(rgb(0x777777).opacity(0.24))
+        .overflow_hidden()
+        .child(computers::relay_section(&card, fields, theme, app.clone()))
+        .child(div().h(px(1.)).bg(rgb(0x777777).opacity(0.16)))
         .child(
-            h_flex()
+            v_flex()
                 .w_full()
-                .items_center()
-                .justify_between()
-                .gap(px(12.))
+                .px(px(16.))
+                .py(px(14.))
+                .gap(px(14.))
                 .child(
-                    v_flex()
-                        .flex_1()
-                        .min_w(px(0.))
-                        .gap(px(2.))
+                    h_flex()
+                        .w_full()
+                        .items_center()
+                        .justify_between()
+                        .gap(px(12.))
                         .child(
-                            h_flex()
-                                .gap(px(8.))
-                                .items_center()
-                                .child(div().text_sm().child(heading))
-                                .child(div().text_xs().text_color(muted).child(status)),
+                            v_flex()
+                                .flex_1()
+                                .min_w(px(0.))
+                                .gap(px(2.))
+                                .child(div().text_sm().child("Execution on this computer"))
+                                .child(div().text_xs().text_color(muted).child(subtitle)),
                         )
-                        .child(div().text_xs().text_color(muted).child(hint)),
+                        .child(exec_mode_picker(card.machine_id.clone(), card.mode, app)),
                 )
-                .child(
-                    div()
-                        .px(px(10.))
-                        .py(px(6.))
-                        .rounded(px(8.))
-                        .border_1()
-                        .border_color(rgb(0x777777).opacity(0.28))
-                        .text_xs()
-                        .child(computer.label.clone()),
-                ),
+                .when_some(rules, |this, rules| this.child(rules)),
         )
-        .child(
-            h_flex()
-                .w_full()
-                .items_center()
-                .justify_between()
-                .gap(px(12.))
-                .child(
-                    v_flex()
-                        .flex_1()
-                        .min_w(px(0.))
-                        .gap(px(2.))
-                        .child(div().text_sm().child("Execution on this computer"))
-                        .child(div().text_xs().text_color(muted).child(subtitle)),
-                )
-                .child(exec_mode_picker(
-                    computer.machine_id.clone(),
-                    computer.mode,
-                    app,
-                )),
-        )
-        .when_some(rules, |this, rules| this.child(rules))
 }
 
 fn exec_mode_picker(
@@ -1328,11 +1287,61 @@ fn shortcuts_page(
 mod tests {
     use super::not_in_effect_line;
 
+    /// The window's own drawing of `id`, after a redraw: its bounds, or none.
+    fn drawn(
+        cx: &mut gpui_kit::VisualTestContext,
+        id: &str,
+    ) -> Option<gpui_kit::Bounds<gpui_kit::Pixels>> {
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.debug_bounds(Box::leak(id.to_string().into_boxed_str()))
+    }
+
+    /// `inner` lies within `outer`.
+    fn within(
+        inner: gpui_kit::Bounds<gpui_kit::Pixels>,
+        outer: gpui_kit::Bounds<gpui_kit::Pixels>,
+    ) -> bool {
+        outer.left() <= inner.left()
+            && inner.right() <= outer.right()
+            && outer.top() <= inner.top()
+            && inner.bottom() <= outer.bottom()
+    }
+
+    /// The account's setting as a server that knows the relay answers it.
+    fn relay_setting() -> crate::opengrok::InferenceSource {
+        serde_json::from_value(serde_json::json!({
+            "kind": "local_proxy", "via": "mac", "baseUrl": null, "localModel": null,
+            "healthy": true, "hasApiKey": false,
+            "relay": {"connected": false, "machineId": null, "machineLabel": null,
+                      "localModel": null}
+        }))
+        .expect("a setting")
+    }
+
+    /// A computer as the roster holds it.
+    fn computer(
+        id: &str,
+        this_machine: bool,
+        relay_enabled: bool,
+        relaying: bool,
+        online: bool,
+    ) -> crate::opengrok::ConnectedComputer {
+        crate::opengrok::ConnectedComputer {
+            machine_id: id.into(),
+            label: format!("NativeChat on {id}"),
+            mode: crate::opengrok::LocalExecMode::Ask,
+            this_machine,
+            online,
+            relay_enabled,
+            relaying,
+        }
+    }
+
     /// Settings → General opens with Default models, over Chat: the default for new Bots and the
     /// Relay-off fallback, each in the same card a Bot's model is picked in, drawn dead while the
-    /// server keeps neither. Settings → Relay holds neither.
+    /// server keeps neither. Settings → Computer holds neither.
     #[gpui_kit::test]
-    fn general_opens_with_the_default_models_and_relay_holds_none(
+    fn general_opens_with_the_default_models_and_computer_holds_none(
         cx: &mut gpui_kit::TestAppContext,
     ) {
         use crate::state::{AppSettingsTab, AppState};
@@ -1347,10 +1356,6 @@ mod tests {
             });
             super::AppSettings::new(state, cx)
         });
-        let drawn = |cx: &mut gpui_kit::VisualTestContext, id: &'static str| {
-            cx.update(|window, cx| window.draw(cx).clear(cx));
-            cx.debug_bounds(id)
-        };
         let models = drawn(cx, "settings-default-models").expect("Default models is on General");
         let chat = drawn(cx, "settings-send-enter").expect("so is Chat");
         assert!(models.bottom() <= chat.top(), "{models:?} over {chat:?}");
@@ -1369,14 +1374,234 @@ mod tests {
 
         settings.update(cx, |settings, cx| {
             settings.state.update(cx, |state, cx| {
-                state.app_settings_tab = AppSettingsTab::ReplySource;
+                state.app_settings_tab = AppSettingsTab::Computer;
                 cx.notify();
             });
         });
         assert!(drawn(cx, "settings-default-models").is_none());
         for card in ["settings-new-bots-card", "settings-plan-fallback-card"] {
-            assert!(drawn(cx, card).is_none(), "{card} is not on Relay");
+            assert!(drawn(cx, card).is_none(), "{card} is not on Computer");
         }
+    }
+
+    /// The Relay tab is gone: Settings' list of pages has General, Profile, Appearance, Keyboard
+    /// shortcuts, Computer, Updates, Logins, Connections and Skills, and nothing at the id the Relay
+    /// tab had. The relay is on Computer, in each computer's card.
+    #[gpui_kit::test]
+    fn the_relay_tab_is_gone_from_settings(cx: &mut gpui_kit::TestAppContext) {
+        use crate::state::{AppSettingsTab, AppState};
+        use gpui_kit::AppContext as _;
+        cx.update(gpui_kit::init);
+        let (_, cx) = cx.add_window_view(|_, cx| {
+            let state = cx.new(|_| {
+                let mut state = AppState::new();
+                state.is_app_settings_open = true;
+                state.app_settings_tab = AppSettingsTab::General;
+                state
+            });
+            super::AppSettings::new(state, cx)
+        });
+        for tab in [
+            "general",
+            "profile",
+            "appearance",
+            "shortcuts",
+            "computer",
+            "updates",
+            "logins",
+            "connections",
+            "skills",
+        ] {
+            let id = format!("settings-tab-{tab}");
+            assert!(drawn(cx, &id).is_some(), "{id} is in the list of pages");
+        }
+        assert!(
+            drawn(cx, "settings-tab-reply-source").is_none(),
+            "the Relay tab is gone"
+        );
+    }
+
+    /// Settings → Computer is "Your computers": one card for each enrolled computer, this one
+    /// first, each with its label, its Relay your plan switch and where its relay stands, and the
+    /// three lines come out as the state says them: relaying, on but asleep (on, not relaying, and
+    /// the server cannot reach it), and not relaying (off). Only this computer's card has the
+    /// "This computer" pill and what its relay needs of this computer, opencodex's address and key
+    /// with Save; Remove key there is the card's own control.
+    #[gpui_kit::test]
+    fn computer_shows_your_computers_and_only_this_ones_card_holds_the_opencodex_fields(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        use crate::state::{AppSettingsTab, AppState, ReplySourceRead};
+        use gpui_kit::{AppContext as _, Modifiers, px, size};
+        cx.update(gpui_kit::init);
+        let (settings, cx) = cx.add_window_view(|_, cx| {
+            let state = cx.new(|_| {
+                let mut state = AppState::new();
+                state.is_app_settings_open = true;
+                state.app_settings_tab = AppSettingsTab::Computer;
+                state.local_exec_machine_id = Some("mac_1".into());
+                state.computers = vec![
+                    computer("mac_1", true, true, true, true),
+                    computer("mac_2", false, true, false, false),
+                    computer("mac_3", false, false, false, true),
+                ];
+                state.reply_source.kept = Some(ReplySourceRead::Read(relay_setting()));
+                state.relay_mac.has_key = true;
+                state
+            });
+            super::AppSettings::new(state, cx)
+        });
+        cx.simulate_resize(size(px(1200.), px(2400.)));
+
+        let cards: Vec<_> = ["mac_1", "mac_2", "mac_3"]
+            .into_iter()
+            .map(|id| {
+                drawn(cx, &format!("settings-computer-{id}"))
+                    .unwrap_or_else(|| panic!("a card for {id}"))
+            })
+            .collect();
+        assert!(
+            cards[0].bottom() <= cards[1].top() && cards[1].bottom() <= cards[2].top(),
+            "this computer first, then the others as listed, one card each: {cards:?}"
+        );
+        for (id, card, says) in [
+            ("mac_1", cards[0], "relaying"),
+            ("mac_2", cards[1], "asleep"),
+            ("mac_3", cards[2], "not-relaying"),
+        ] {
+            let switch = drawn(cx, &format!("settings-computer-{id}-relay"))
+                .unwrap_or_else(|| panic!("{id} has its switch"));
+            assert!(within(switch, card), "{id}'s switch is in its card");
+            let status = drawn(cx, &format!("settings-computer-{id}-status-says-{says}"))
+                .unwrap_or_else(|| panic!("{id} says {says}"));
+            assert!(within(status, card), "{id}'s status is in its card");
+            assert!(
+                drawn(cx, &format!("settings-computer-{id}-error")).is_none(),
+                "nothing refused, nothing said"
+            );
+        }
+
+        let pill = drawn(cx, "settings-computer-mac_1-pill").expect("This computer");
+        assert!(within(pill, cards[0]));
+        for other in ["mac_2", "mac_3"] {
+            assert!(drawn(cx, &format!("settings-computer-{other}-pill")).is_none());
+        }
+        for field in [
+            "settings-relay-addr",
+            "settings-relay-key",
+            "settings-relay-key-remove",
+            "settings-reply-source-save",
+        ] {
+            let bounds = drawn(cx, field).unwrap_or_else(|| panic!("{field} is on the page"));
+            assert!(
+                within(bounds, cards[0]),
+                "{field} is in this computer's card"
+            );
+            for other in &cards[1..] {
+                assert!(!within(bounds, *other), "{field} is in another card");
+            }
+        }
+        // Nothing of the old page: no section, no card of its own, no switch of its own.
+        for gone in [
+            "settings-reply-source",
+            "settings-relay",
+            "settings-relay-switch",
+            "settings-relay-status",
+        ] {
+            assert!(drawn(cx, gone).is_none(), "{gone} is gone");
+        }
+
+        // Remove key is this computer's card's own control, and takes a click.
+        let remove = drawn(cx, "settings-relay-key-remove").unwrap();
+        cx.simulate_mouse_move(remove.center(), None, Modifiers::none());
+        cx.simulate_click(remove.center(), Modifiers::none());
+        assert!(settings.update(cx, |settings, cx| {
+            settings.state.read(cx).reply_source.relay_remove_key
+        }));
+    }
+
+    /// A card's switch is the computer's own, and takes a click from this window whichever
+    /// computer it is: the click puts the switch where it asked, with the server, and the card
+    /// takes no second click meanwhile. Another card's is free.
+    #[gpui_kit::test]
+    fn a_click_on_a_cards_switch_sends_that_computers_own_switch(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        use crate::state::{AppSettingsTab, AppState, AuthStatus, ReplySourceRead};
+        use gpui_kit::{AppContext as _, Modifiers, px, size};
+        cx.update(gpui_kit::init);
+        // A runtime that is entered and never driven: the request for the switch stays with the
+        // server, which is where this test wants it. It outlives the test body, since the window's
+        // tasks are polled again as the test ends.
+        let runtime: &'static tokio::runtime::Runtime = Box::leak(Box::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("a runtime"),
+        ));
+        std::mem::forget(runtime.enter());
+        let (settings, cx) = cx.add_window_view(|_, cx| {
+            let state = cx.new(|_| {
+                let mut state = AppState::new();
+                state.opengrok = Some(
+                    crate::opengrok::OpenGrokClient::new("http://127.0.0.1:9").expect("a URL"),
+                );
+                state.account = Some(
+                    serde_json::from_value(
+                        serde_json::json!({ "id": "acc_1", "email": "ada@example.com" }),
+                    )
+                    .expect("an account"),
+                );
+                state.auth_status = AuthStatus::SignedIn;
+                state.is_app_settings_open = true;
+                state.app_settings_tab = AppSettingsTab::Computer;
+                state.local_exec_machine_id = Some("mac_1".into());
+                state.computers = vec![
+                    computer("mac_1", true, true, true, true),
+                    computer("mac_2", false, false, false, true),
+                    computer("mac_3", false, true, false, true),
+                ];
+                state.reply_source.kept = Some(ReplySourceRead::Read(relay_setting()));
+                state
+            });
+            super::AppSettings::new(state, cx)
+        });
+        cx.simulate_resize(size(px(1200.), px(2400.)));
+        let asked = |settings: &gpui_kit::Entity<super::AppSettings>,
+                     cx: &mut gpui_kit::VisualTestContext,
+                     id: &str| {
+            settings.update(cx, |settings, cx| {
+                settings
+                    .state
+                    .read(cx)
+                    .computer_relay_switch(id)
+                    .map(|switch| switch.on)
+            })
+        };
+        let press = |cx: &mut gpui_kit::VisualTestContext, id: &str| {
+            let switch = drawn(cx, &format!("settings-computer-{id}-relay")).unwrap();
+            cx.simulate_mouse_move(switch.center(), None, Modifiers::none());
+            cx.simulate_click(switch.center(), Modifiers::none());
+        };
+        assert_eq!(asked(&settings, cx, "mac_2"), None);
+        // Off to on for mac_2, and on to off for mac_3: each asks for the other way.
+        press(cx, "mac_2");
+        assert_eq!(asked(&settings, cx, "mac_2"), Some(true));
+        assert_eq!(
+            asked(&settings, cx, "mac_3"),
+            None,
+            "another card's is free"
+        );
+        press(cx, "mac_3");
+        assert_eq!(asked(&settings, cx, "mac_3"), Some(false));
+        // With the server, a card takes no second click.
+        press(cx, "mac_2");
+        assert_eq!(asked(&settings, cx, "mac_2"), Some(true), "not asked again");
+        assert_eq!(
+            asked(&settings, cx, "mac_1"),
+            None,
+            "this computer's is untouched"
+        );
     }
 
     /// An allow the gate never reads says so, in the server's sentence given whole and closed

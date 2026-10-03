@@ -13,6 +13,7 @@ pub mod computer;
 /// The coworker's screen in a window: a `wry` WebView, which only builds on macOS here.
 #[cfg(target_os = "macos")]
 pub mod computer_screen;
+pub mod computers;
 pub mod connections;
 pub mod default_models;
 pub mod emoji_picker;

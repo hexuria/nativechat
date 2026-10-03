@@ -74,7 +74,8 @@
 //! `recipe-history-run-{runId}` (value = `running` / `finished` / `interrupted`, state `ok`),
 //! `settings-computer-{machine}-exec` (a connected computer's local-exec mode, value `ask` /
 //! `bypass` / `never`, state `this-mac`) with `settings-computer-{machine}-exec-ask|bypass|never`,
-//! `settings-tab-computer`, where this Mac's standing rules sit under its mode:
+//! `settings-tab-computer` (each computer's card is below, with the relay's), where this Mac's
+//! standing rules sit under its mode:
 //! `settings-local-rules-allow|deny` (a list, value = its count; in the tree only while it has a
 //! rule on it) with its rows `settings-local-rule-allow|deny-{n}` (counted from 0 in the
 //! server's order, value = the command exactly; state `inert` on an allow the server says can
@@ -387,60 +388,68 @@
 //! sends `null`), one change of the account's at a time. `settings-plan-fallback-dismiss` shuts
 //! the popover. All of it is refused off General.
 //!
-//! Relay, Settings' page for the person's ChatGPT or Grok plan relayed to the server from this
-//! computer, which was Reply source and keeps its ids. The page switches no door: a Bot's door is
-//! picked with its model on `agent-model-card`, and the account's kind stays as the server keeps
-//! it for the Bots that have picked none. Nothing of the plan on the server's own machine is on
-//! it, nor a model of the relay's own, nor a radio: none of `settings-reply-source-url`,
-//! `settings-reply-source-key`, `settings-reply-source-remove-key`,
-//! `settings-reply-source-health`, `settings-reply-source-elsewhere`,
-//! `settings-reply-source-providers`, `settings-relay-model*`, `settings-relay-no-model`,
-//! `settings-relay-models-note`, `settings-reply-source-kind*`, `settings-reply-source-via-mac`,
-//! `settings-reply-source-model*` or `settings-reply-source-no-model` is on the tree or answers.
-//! `settings-tab-reply-source` (named `Relay`; refused while Settings is shut); while Settings is
-//! open on it, `settings-reply-source` (named `Relay`, value = the door the server keeps,
-//! `gateway` / `local_proxy`; states `unsaved` while a change to this computer's half waits for
-//! Save, `reading` while the setting is with the server, and `via-mac` while the account's way to
-//! the plan is the person's computer). Until the setting has been read, on a server without reply
-//! sources, or when it could not be read, the section holds only
-//! `settings-reply-source-unavailable`, the line the page draws in place of the page (`Asking the
-//! server…` while the section has state `asking`). From a server without the relay it holds
-//! `settings-relay-unavailable` (that this server can't take replies from a computer yet) in the
-//! card's place, and the line under Save. Default for new Bots is not on it: it is General's,
-//! below. Once read
-//! from a server with the relay it holds the relay's card, `settings-reply-source-error` (a read
-//! that failed, state `trouble`, or what the Keychain said when it did not keep a key),
-//! `settings-reply-source-hint` (what Save waits for: an opencodex address on this computer) and
-//! `settings-reply-source-save` (enabled only while a click would keep something). Save keeps
-//! opencodex's address and key on this computer and sends the server nothing. Every control is
-//! refused off the page and before the setting is read, and Save while a read is out, saying what
-//! it waits for. An id the page does not draw is refused as not on the page.
+//! Your computers, on Settings → Computer (`settings-tab-computer`; refused while Settings is shut):
+//! one card for each computer the person has enrolled, from `GET /local-exec/daemon`, with its own
+//! Relay your plan switch (the per-computer relay contract, opengrok-server branch per-computer-relay
+//! at d0a9855: each computer has its own switch, and the account's `relayEnabled` is read from them,
+//! never sent). Settings → Relay is gone, with its tab `settings-tab-reply-source`, its section
+//! `settings-reply-source`, its card `settings-relay`, `settings-relay-switch`,
+//! `settings-relay-switch-error` and `settings-relay-status`: none is on the tree, and a click on
+//! one of them (or on any other id of `settings-relay-*` or `settings-reply-source-*` that the
+//! computer's card does not draw: the plan on the server's own machine, a relay model, a radio) is
+//! refused saying where the relay moved. While Settings is open on Computer, each computer is
+//! `settings-computer-{machine}` (a group named by the computer's label; states `online` or
+//! `offline`, `this-computer` on the one the app is running on, found by the machine id this app
+//! stored when it enrolled, and `unsaved` on that one while a change to its opencodex fields waits
+//! for Save; the list is in the roster's order, this computer first). Under it:
+//! `settings-computer-{machine}-relay` (a switch named `Relay your plan`, checked while the
+//! computer's relay is on, or where a click is taking it while the server is asked, disabled then;
+//! a click asks for the other way, from any computer's card, as one `PATCH
+//! /local-exec/daemon/{machine}` of `{relayEnabled}`, and is refused with why while its last
+//! switch is with the server; turning one on also points the account's way at the relay, once,
+//! when it is not that already, as `PUT /account/inference-source` `{kind, via: "mac"}` with the
+//! kind the server keeps, one change of the account's at a time, and a computer going off moves no
+//! way; nothing this app sends of the account's setting ever carries `relayEnabled`),
+//! `settings-computer-{machine}-status` (label `Relaying`, `Not relaying` or `On, but asleep: it
+//! can't answer right now`; value `relaying`, `not-relaying` or `asleep`: relaying while the
+//! computer's relay is on and the server holds its stream, asleep while it is on, not relaying and
+//! the server cannot reach the computer, which is never said of the computer the app is running on)
+//! and `settings-computer-{machine}-error` (under the switch, in the tree only while it has
+//! something to say: the server's words for a refused switch, which went back, that nobody knows
+//! whether one was kept, or that the server can't switch a computer's relay yet, or the server's
+//! words for a refused change of the account's way that the switch sent; a line, not a control).
+//! A computer the server lists as revoked is left out of the list, as it always was, so nothing of
+//! it can be switched. Another computer's switch can be moved from this window; only this
+//! computer's relay is run by it (hexuria/nativechat #156, opengrok-server #292): the server asks
+//! the computer that opened its relay stream last of those that are on, and there is nothing to
+//! order. A relay the server switched off, from here or from another computer, stops, does not
+//! reconnect and waits for this computer's own row to read on again.
 //!
-//! The relay (hexuria/nativechat #156, opengrok-server #292), from a server that knows it (its
-//! setting carries `relay`), in words for any computer: the wire's `via: "mac"` and the drivers'
-//! words below are as they were. `settings-relay`, Relay your plan from this computer:
-//! `settings-relay-switch` (a switch, checked while on; it acts at once and waits on no Save, off
-//! always, on once this computer is enrolled; after another computer took the relay, turning it
-//! off and on takes it back. Turning it on also points the account at this computer in the same
-//! press, as `PUT /account/inference-source` `{kind, via: "mac"}` with the kind the server keeps,
-//! and `relayEnabled: true` in the same body to a server whose read carries that key; turning it
-//! off moves no way, and sends `{kind, relayEnabled: false}` to such a server and nothing to
-//! another. One change of the account's at a time: the switch moved while one is out sends once
-//! that one is answered), `settings-relay-switch-error` (under the switch: the server's words for
-//! a refusal of what it sent, or that nobody knows whether it was kept; the switch stays as it was
-//! put and the relay runs as it says), `settings-relay-unavailable` (why the card takes no change:
-//! this computer not enrolled), `settings-relay-status` (label the line, `This computer is
-//! relaying` / `Another computer (<label>) is relaying` / `Connecting…` / `Not connected`; value
-//! `answering` / `another-mac` / `connecting` / `not-connected`), `settings-relay-detail` (under
-//! it: why this computer is not connected, state `trouble`, or how to take the relay back),
-//! `settings-relay-addr` (named `opencodex address`, value = opencodex's address on this
-//! computer; `set_value` and `type` write it; an address not on this computer is refused by Save
-//! with a hint, an emptied one goes back to the default), `settings-relay-key` (named `opencodex
-//! key (kept in this computer's secure storage)`, never valued: states `set` while the Keychain
-//! holds a key, `typed` while one waits for Save, `retype` when one typed was dropped with the
-//! page; `set_value` writes the whole key) and `settings-relay-key-remove` (while a key is kept:
-//! `Remove key`, or `Keep key` with state `picked`). The address and key are kept on this
-//! computer by Save, the key in the Keychain, and never sent to the server.
+//! This computer's card alone also holds what its relay needs of this computer, which were
+//! Settings → Relay's and keep their ids: `settings-relay-detail` (under its status: why it is not
+//! relaying, state `trouble`, or that it is opening its stream, or how to take the relay back from
+//! another NativeChat on this computer), `settings-relay-addr` (named `opencodex address`, value =
+//! opencodex's address on this computer; `set_value` and `type` write it; an address not on this
+//! computer is refused by Save with a hint, an emptied one goes back to the default),
+//! `settings-relay-key` (named `opencodex key (kept in this computer's secure storage)`, never
+//! valued: states `set` while the Keychain holds a key, `typed` while one waits for Save, `retype`
+//! when one typed was dropped with the page; `set_value` writes the whole key),
+//! `settings-relay-key-remove` (while a key is kept: `Remove key`, or `Keep key` with state
+//! `picked`), `settings-reply-source-error` (a read that failed, state `trouble`, or what the
+//! Keychain said when it did not keep a key), `settings-reply-source-hint` (what Save waits for: an
+//! opencodex address on this computer) and `settings-reply-source-save` (enabled only while a click
+//! would keep something). Until the setting has been read, on a server without reply sources, or when
+//! it could not be read, they are replaced by `settings-reply-source-unavailable`, the line the card
+//! draws (`Asking the server…` while it has state `asking`); from a server without the relay, by
+//! `settings-relay-unavailable` (that this server can't take replies from a computer yet) and the
+//! line under Save. Save keeps opencodex's address and key on this computer and sends the server
+//! nothing; the address and key are kept on this computer, the key in the Keychain, and never sent
+//! to the server. Every control is refused off the page, before this computer is on the list, and
+//! before the setting is read, and Save while a read is out, saying what it waits for. The tab's
+//! pages are `settings-tab-general` (Default models, and the Relay-off fallback that Subscription
+//! Bots answer with while Relay is off, "When Relay is off, Subscription Bots use": there, unmoved),
+//! this one, `settings-tab-updates`, `settings-tab-logins`, `settings-tab-connections` and
+//! `settings-tab-skills`. Default for new Bots is General's, above.
 //!
 //! `reply-source-{messageId}` is the badge of each reply in the open thread that wears one, as the
 //! feed draws it (label `paid key` / `paid key · relay off` / `your plan` / `your plan · Mac`, with

@@ -1,8 +1,8 @@
 //! The key for this computer's opencodex, which the relay sends with every call it makes there
 //! (`opengrok::relay`). It is the person's, for a proxy on this computer, and it is kept in the
 //! macOS Keychain and nowhere else: not sqlite, not a file, not a log, and never sent to the
-//! server, whose relay frames carry no key at all (opengrok-server #292). Settings → Relay writes
-//! it and says whether one is kept; only the relay reads it back, when it starts.
+//! server, whose relay frames carry no key at all (opengrok-server #292). Settings → Computer, on this
+//! computer's card, writes it and says whether one is kept; only the relay reads it back, when it starts.
 
 use std::sync::{Arc, Mutex, PoisonError};
 

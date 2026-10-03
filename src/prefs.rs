@@ -10,13 +10,12 @@ const ON_SEND: &str = "on_send";
 const SHOW_TURN_TIMING: &str = "show_turn_timing";
 const RELAY: &str = "relay";
 
-/// "Answer with this Mac", as this Mac keeps it: who it is switched on for, and where this Mac's
-/// opencodex listens. The key for opencodex is in the Keychain (`crate::relay_key`), never here.
+/// The relay, as this Mac keeps it: where this Mac's opencodex listens. The key for opencodex is in
+/// the Keychain (`crate::relay_key`), never here. Whether the relay is on is no pref: it is this
+/// computer's own switch on the server, on its row of `GET /local-exec/daemon`. An `onFor` an older
+/// build saved is left behind: it is read by nothing, and the next save does not write it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RelayPrefs {
-    /// The account the switch is on for. Enrolling never makes a Mac the relay, and a Mac two
-    /// people sign in on answers only for the one who switched it on.
-    pub on_for: Option<String>,
     /// opencodex's address as saved, or `None` for where it listens unless told otherwise.
     pub address: Option<String>,
 }
@@ -84,7 +83,6 @@ pub fn load_relay_from(path: &Path) -> RelayPrefs {
             .map(str::to_string)
     };
     RelayPrefs {
-        on_for: field("onFor"),
         address: field("address"),
     }
 }
@@ -97,7 +95,7 @@ pub fn save_relay_to(path: &Path, relay: &RelayPrefs) {
     let mut prefs = read_object(path);
     prefs.insert(
         RELAY.to_string(),
-        serde_json::json!({ "onFor": relay.on_for, "address": relay.address }),
+        serde_json::json!({ "address": relay.address }),
     );
     write_object(path, prefs);
 }
@@ -182,20 +180,20 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Answer with this Mac is off until switched on for somebody, and keeps its address beside
-    /// the other prefs without touching them.
+    /// The relay keeps its opencodex address beside the other prefs without touching them, and
+    /// keeps no switch: an `onFor` an older build saved is read by nothing and is gone with the
+    /// next save.
     #[test]
-    fn the_relay_is_off_until_switched_on_and_keeps_its_address() {
+    fn the_relay_keeps_its_address_and_no_switch() {
         let dir = scratch("relay");
         let path = prefs_path(&dir);
         assert_eq!(load_relay_from(&path), RelayPrefs::default(), "no file yet");
         save_on_send_to(&path, OnSend::Steer);
-        let on = RelayPrefs {
-            on_for: Some("acc_1".into()),
+        let kept = RelayPrefs {
             address: Some("http://127.0.0.1:9090".into()),
         };
-        save_relay_to(&path, &on);
-        assert_eq!(load_relay_from(&path), on);
+        save_relay_to(&path, &kept);
+        assert_eq!(load_relay_from(&path), kept);
         assert_eq!(
             load_on_send_from(&path),
             OnSend::Steer,
@@ -203,6 +201,20 @@ mod tests {
         );
         save_relay_to(&path, &RelayPrefs::default());
         assert_eq!(load_relay_from(&path), RelayPrefs::default());
+
+        std::fs::write(
+            &path,
+            r#"{"relay":{"onFor":"acc_1","address":"http://127.0.0.1:9091"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            load_relay_from(&path).address.as_deref(),
+            Some("http://127.0.0.1:9091"),
+            "an older build's file reads"
+        );
+        save_relay_to(&path, &load_relay_from(&path));
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(!raw.contains("onFor"), "{raw}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

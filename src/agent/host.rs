@@ -14,6 +14,7 @@ use crate::components::chat_input::sources::{
     ParameterSource, SkillLibrary, SlashSource, ToolSource, ValueSource,
 };
 use crate::components::composer_panel::ComposerPanelRow;
+use crate::components::computers::{self, ComputerCard};
 use crate::components::connections::{self, ConnectOffer};
 use crate::components::default_models;
 use crate::components::model_picker;
@@ -41,7 +42,7 @@ use crate::state::{
 };
 
 pub mod ids {
-    use crate::components::{connections, default_models, model_picker, reply_source};
+    use crate::components::{computers, connections, default_models, model_picker, reply_source};
     use crate::opengrok::InferenceKind;
     use crate::state::RuleKind;
 
@@ -495,14 +496,31 @@ pub mod ids {
     pub const SETTINGS_GENERAL: &str = "settings-tab-general";
     pub const DEFAULT_MODELS: &str = default_models::SECTION;
 
-    /// Settings → Relay, by the tab's id from when it was Reply source, and the section it holds
-    /// once the setting has been read.
-    pub const SETTINGS_REPLY_SOURCE: &str = reply_source::SETTINGS_TAB;
-    pub const REPLY_SOURCE: &str = reply_source::SECTION;
-    pub const REPLY_SOURCE_SAVE: &str = reply_source::SAVE;
-    pub const REPLY_SOURCE_ERROR: &str = reply_source::ERROR;
-    pub const REPLY_SOURCE_UNAVAILABLE: &str = reply_source::UNAVAILABLE;
-    pub const REPLY_SOURCE_HINT: &str = reply_source::HINT;
+    /// Settings → Computer's "Your computers": one card to each enrolled computer, by the server's
+    /// machine id: the card, its Relay your plan switch, where its relay stands, and what became of
+    /// a switch that did not go as asked.
+    pub fn computer_card(machine_id: &str) -> String {
+        computers::card_id(machine_id)
+    }
+
+    pub fn computer_relay(machine_id: &str) -> String {
+        computers::relay_switch_id(machine_id)
+    }
+
+    pub fn computer_status(machine_id: &str) -> String {
+        computers::status_id(machine_id)
+    }
+
+    pub fn computer_error(machine_id: &str) -> String {
+        computers::error_id(machine_id)
+    }
+
+    /// What this computer's card alone holds of its relay: opencodex's address and key, Save, and
+    /// the lines about them, which were Settings → Relay's and keep their ids.
+    pub const REPLY_SOURCE_SAVE: &str = computers::SAVE;
+    pub const REPLY_SOURCE_ERROR: &str = computers::ERROR;
+    pub const REPLY_SOURCE_UNAVAILABLE: &str = computers::UNAVAILABLE;
+    pub const REPLY_SOURCE_HINT: &str = computers::HINT;
     /// In a Bot's Usage card, while its replies go through the person's own plan.
     pub const AGENT_USAGE_PLAN: &str = reply_source::BOT_USAGE_PLAN;
 
@@ -515,17 +533,12 @@ pub mod ids {
     pub fn model_row(source: InferenceKind, base_id: &str) -> String {
         model_picker::row_id(source, base_id)
     }
-    /// Relay your plan from this computer: the card and each of its controls and lines.
-    pub const RELAY: &str = reply_source::RELAY;
-    pub const RELAY_SWITCH: &str = reply_source::RELAY_SWITCH;
-    /// Under the switch: what became of what it sent the account, when that did not go as asked.
-    pub const RELAY_SWITCH_ERROR: &str = reply_source::RELAY_SWITCH_ERROR;
-    pub const RELAY_STATUS: &str = reply_source::RELAY_STATUS;
-    pub const RELAY_DETAIL: &str = reply_source::RELAY_DETAIL;
-    pub const RELAY_ADDR: &str = reply_source::RELAY_ADDR;
-    pub const RELAY_KEY: &str = reply_source::RELAY_KEY;
-    pub const RELAY_KEY_REMOVE: &str = reply_source::RELAY_KEY_REMOVE;
-    pub const RELAY_UNAVAILABLE: &str = reply_source::RELAY_UNAVAILABLE;
+    /// Under this computer's status line: why it is not relaying, in the relay's own words.
+    pub const RELAY_DETAIL: &str = computers::RELAY_DETAIL;
+    pub const RELAY_ADDR: &str = computers::RELAY_ADDR;
+    pub const RELAY_KEY: &str = computers::RELAY_KEY;
+    pub const RELAY_KEY_REMOVE: &str = computers::RELAY_KEY_REMOVE;
+    pub const RELAY_UNAVAILABLE: &str = computers::RELAY_UNAVAILABLE;
     /// Default for new Bots, on Settings → General: the section, the line saying it is coming,
     /// and the picker's card in it, which is dead until the server keeps such a default.
     pub const NEW_BOTS: &str = default_models::NEW_BOTS;
@@ -770,7 +783,7 @@ pub enum Command {
     SetModelEffort(String),
     /// ↺: the effort back to `inherit`, and ⚡ off.
     ResetModelPick,
-    /// Default for new Bots' picker, on Settings → Relay: the same changes as the Bot's, each
+    /// Default for new Bots' picker, on Settings → General: the same changes as the Bot's, each
     /// kept on the account at once.
     NewBots(PickerCommand),
     /// None, in Default for new Bots' list: no default, which leaves a new Bot to the server's.
@@ -1090,14 +1103,19 @@ pub enum Command {
         keys: Vec<String>,
         open: bool,
     },
-    /// Settings → Relay's Save, which keeps this computer's half of the relay.
+    /// Settings → Computer's Save, on this computer's card, which keeps this computer's half of the
+    /// relay.
     SaveReplySource,
     /// Send this reply on Server instead: the turn the person's plan could not answer, again, on
     /// the server's paid keys.
     SendOnServer,
-    /// The relay: its switch, which acts at once, and on points the account at this computer;
-    /// and opencodex's address and key on this computer, each waiting for Save as on the page.
-    SetRelayOn(bool),
+    /// A computer's Relay your plan switch, which acts at once: `PATCH /local-exec/daemon/{id}`
+    /// for that computer, and on also points the account's way at the relay once. And opencodex's
+    /// address and key on this computer, each waiting for Save as on its card.
+    SetComputerRelay {
+        machine_id: String,
+        on: bool,
+    },
     SetRelayAddress(String),
     SetRelayKey(RedactedSecret),
     /// Remove key for this computer's opencodex, or Keep key to take it back.
@@ -1378,7 +1396,9 @@ impl Command {
             Self::SetStepsOpen { keys, open } => state.set_steps_open(&keys, open, cx),
             Self::SaveReplySource => state.save_reply_source(cx),
             Self::SendOnServer => state.send_on_server(cx),
-            Self::SetRelayOn(on) => state.set_relay_on(on, cx),
+            Self::SetComputerRelay { machine_id, on } => {
+                state.set_computer_relay(machine_id, on, cx)
+            }
             Self::SetRelayAddress(address) => state.set_relay_address(address, cx),
             Self::SetRelayKey(key) => state.set_relay_key(&key.0, cx),
             Self::ToggleRemoveRelayKey => state.toggle_remove_relay_key(cx),
@@ -3126,22 +3146,25 @@ fn invoke_arg_str(args: &serde_json::Value, keys: &[&str]) -> Option<String> {
     })
 }
 
-/// The state on Settings → Relay's section and on a reply's badge while the door is the person's
-/// plan through their computer, so an assert need not match the words. A driver's word, kept as
-/// it was when the page said "Mac".
+/// The id Settings → Relay's tab had, which answers nothing now and says where the relay moved.
+const RETIRED_RELAY_TAB: &str = "settings-tab-reply-source";
+
+/// The state on a reply's badge while the door is the person's plan through their computer, so an
+/// assert need not match the words. A driver's word, kept as it was when the app said "Mac".
 const VIA_MAC: &str = "via-mac";
 
-/// Settings → Relay as the page draws it. The typed key is not copied here: the tree says only
-/// that one is waiting for Save, never what it is.
+/// This computer's card's opencodex fields as the card draws them, and General's two pickers'
+/// kept settings. The typed key is not copied here: the tree says only that one is waiting for
+/// Save, never what it is.
 #[derive(Default)]
 struct ReplySourceSnap {
-    /// The page's settings, with no key in them.
+    /// The setting and what the card has changed of it, with no key in them.
     settings: crate::state::ReplySourceSettings,
     unsaved: bool,
     can_save: bool,
     /// The line beside Save (`AppState::reply_source_hint`).
     hint: Option<&'static str>,
-    /// The relay as the card draws it, without the typed key.
+    /// This computer's opencodex address and key as the card draws them, without the typed key.
     relay: RelaySnap,
     /// Default for new Bots: whether the server keeps one, and what.
     new_bots: crate::state::DefaultForNewBots,
@@ -3152,18 +3175,12 @@ struct ReplySourceSnap {
 impl ReplySourceSnap {
     fn from_state(state: &AppState) -> Self {
         let settings = &state.reply_source;
-        let line = state.relay_line();
         Self {
             settings: settings.without_key(),
             unsaved: settings.is_unsaved(),
             can_save: state.reply_source_can_save(),
             hint: state.reply_source_hint(),
             relay: RelaySnap {
-                on: state.relay_mac.on,
-                switch_live: state.relay_switch_live(),
-                enrolled: state.relay_enrolled(),
-                detail: reply_source::relay_detail(&line, &state.relay_mac),
-                line: Some(line),
                 address: settings
                     .relay_address_draft
                     .clone()
@@ -3177,16 +3194,10 @@ impl ReplySourceSnap {
     }
 }
 
-/// The relay as the card draws it. The key is never here: the tree says only that the Keychain
-/// holds one, or that one waits for Save.
+/// This computer's opencodex fields as its card draws them. The key is never here: the tree says
+/// only that the Keychain holds one, or that one waits for Save.
 #[derive(Default)]
 struct RelaySnap {
-    on: bool,
-    switch_live: bool,
-    enrolled: bool,
-    /// The status line (`AppState::relay_line`), and the line under it.
-    line: Option<crate::state::RelayLine>,
-    detail: Option<String>,
     /// opencodex's address as the field shows it.
     address: String,
     has_key: bool,
@@ -3301,8 +3312,8 @@ pub struct NativeChatHost {
     recipe_open: Option<String>,
     /// The open recipe's Run and what it has run, when its detail has come back.
     recipe_detail: Option<RecipeDetailSnap>,
-    /// Settings → Computer's connected computers: id, name, mode, and whether it is this Mac.
-    computers: Vec<(String, String, crate::opengrok::LocalExecMode, bool)>,
+    /// Settings → Computer's cards, one to each enrolled computer, as the window draws them.
+    computers: Vec<ComputerCard>,
     /// The open bot's routines, as the Computer pane lists them.
     routines: Vec<RoutineSnap>,
     /// The red line of the routine editor, while one is open and shows one.
@@ -3404,9 +3415,9 @@ pub struct NativeChatHost {
     /// roster while signed in.
     connections: crate::state::AccountConnections,
     connections_tab: bool,
-    /// Settings → Relay as the page draws it, without the typed key.
+    /// This computer's relay fields on Settings → Computer, and General's two kept settings, as
+    /// the window draws them, without the typed key.
     reply_source: ReplySourceSnap,
-    reply_source_tab: bool,
     /// Settings is on General, whose first section is Default models.
     general_tab: bool,
     /// The badges on the open thread's replies, oldest first: (message id, source).
@@ -3663,18 +3674,7 @@ impl NativeChatHost {
                         .collect(),
                 }
             }),
-            computers: state
-                .computers
-                .iter()
-                .map(|c| {
-                    (
-                        c.machine_id.clone(),
-                        c.label.clone(),
-                        c.mode,
-                        c.this_machine,
-                    )
-                })
-                .collect(),
+            computers: computers::cards(state),
             routine_instructions: state
                 .active_conversation_id
                 .as_ref()
@@ -3989,7 +3989,6 @@ impl NativeChatHost {
                 .map(crate::opengrok::LocalExecStopped::sentence),
             connections: state.connections.clone(),
             reply_source: ReplySourceSnap::from_state(state),
-            reply_source_tab: state.app_settings_tab == AppSettingsTab::ReplySource,
             general_tab: state.app_settings_tab == AppSettingsTab::General,
             reply_sources: crate::components::chat::reply_badges(state),
             connections_tab: state.app_settings_tab == AppSettingsTab::Connections,
@@ -4498,10 +4497,6 @@ impl NativeChatHost {
                             .with_child(UiNode::button("settings-tab-updates", "Updates"))
                             .with_child(UiNode::button("settings-tab-logins", "Logins"))
                             .with_child(UiNode::button(ids::SETTINGS_CONNECTIONS, "Connections"))
-                            .with_child(UiNode::button(
-                                ids::SETTINGS_REPLY_SOURCE,
-                                reply_source::TAB_LABEL,
-                            ))
                             .with_child(UiNode::button(ids::SETTINGS_SKILLS, "Skills"));
                         if self.logins_tab {
                             settings = self.logins_nodes(settings);
@@ -4513,11 +4508,7 @@ impl NativeChatHost {
                                 settings = settings.with_child(node);
                             }
                         }
-                        // The same for Relay: its section is in the tree only while the dialog
-                        // is open on it. And for General's Default models.
-                        if self.account_open && self.reply_source_tab {
-                            settings = settings.with_child(self.reply_source_node());
-                        }
+                        // The same for General's Default models.
                         if self.account_open && self.general_tab {
                             settings = settings.with_child(self.default_models_node());
                         }
@@ -4531,9 +4522,9 @@ impl NativeChatHost {
                             ));
                         }
                         // Why this Mac stopped running commands, over its computers as on the
-                        // page, then each connected computer's local-exec mode, while Settings is
-                        // open on Computer: the choice a check of this Mac's Ask / Always / Never
-                        // sets.
+                        // page, then each computer's card, its relay switch and where its relay
+                        // stands, and its local-exec mode, while Settings is open on Computer:
+                        // the choice a check of this Mac's Ask / Always / Never sets.
                         if self.account_open && self.computer_tab {
                             if let Some(why) = &self.local_exec_stopped {
                                 settings = settings.with_child(UiNode::status(
@@ -4541,11 +4532,16 @@ impl NativeChatHost {
                                     why.clone(),
                                 ));
                             }
-                            for (machine, label, mode, this_mac) in &self.computers {
-                                let mut menu =
-                                    UiNode::new(ids::computer_exec(machine), "menu", label.clone())
-                                        .with_value(mode.as_stored());
-                                if *this_mac {
+                            for card in &self.computers {
+                                settings = settings.with_child(self.computer_card_node(card));
+                                let (machine, mode) = (&card.machine_id, card.mode);
+                                let mut menu = UiNode::new(
+                                    ids::computer_exec(machine),
+                                    "menu",
+                                    card.label.clone(),
+                                )
+                                .with_value(mode.as_stored());
+                                if card.this_computer {
                                     menu.states.push("this-mac".into());
                                 }
                                 for choice in [
@@ -4557,7 +4553,7 @@ impl NativeChatHost {
                                         ids::computer_exec_mode(machine, choice),
                                         choice.label(),
                                     );
-                                    if choice == *mode {
+                                    if choice == mode {
                                         button.states.push("selected".into());
                                     }
                                     menu = menu.with_child(button);
@@ -5565,63 +5561,146 @@ impl NativeChatHost {
         Some(trigger.with_child(pop))
     }
 
-    /// Settings → Relay as the page draws it: `settings-reply-source` (value = the door the
-    /// server keeps, which the page does not switch; states `unsaved`, `reading`, and `via-mac`
-    /// while the account's way is the person's computer) holding the relay's card, the line under
-    /// Save, the line beside it, and Save. From a server without the relay it holds the line
-    /// saying so in the card's place, and the line under Save. Before the setting has been read,
-    /// on a server without reply sources, or when it could not be read, the section holds only
-    /// the line the page draws in place of the page (state `asking` while that is the server
-    /// being asked). Nothing of the plan on the server's own machine is on it, nor a model of the
-    /// relay's own, nor Default for new Bots, which is on General.
-    fn reply_source_node(&self) -> UiNode {
+    /// One computer's card as the window draws it: `settings-computer-{id}` (named by the
+    /// computer's label; states `online` or `offline`, `this-computer` on the one the app is
+    /// running on, and `unsaved` on that one while a change to its opencodex fields waits for
+    /// Save) holding its Relay your plan switch, `settings-computer-{id}-relay` (checked while the
+    /// computer's relay is on, or where a click is taking it while the server is asked; disabled
+    /// then), where its relay stands, `settings-computer-{id}-status` (`Relaying`, `Not
+    /// relaying` or `On, but asleep: it can't answer right now`; value `relaying`,
+    /// `not-relaying` or `asleep`), and under the switch `settings-computer-{id}-error` while a
+    /// switch did not go as asked (the server's words, or that nobody knows whether it was kept).
+    /// The card of this computer alone also holds why its relay is not relaying,
+    /// `settings-relay-detail`, and what its relay needs of it ([`Self::opencodex_nodes`]).
+    fn computer_card_node(&self, card: &ComputerCard) -> UiNode {
+        let machine = &card.machine_id;
+        let mut node = UiNode::new(ids::computer_card(machine), "group", card.label.clone());
+        node.states
+            .push(if card.online { "online" } else { "offline" }.into());
+        if card.this_computer {
+            node.states.push("this-computer".into());
+            if self.reply_source.unsaved {
+                node.states.push("unsaved".into());
+            }
+        }
+        node = node
+            .with_child(
+                UiNode::new(
+                    ids::computer_relay(machine),
+                    "switch",
+                    computers::RELAY_LABEL,
+                )
+                .with_checked(card.relay_on)
+                .with_enabled(!card.switching),
+            )
+            .with_child(
+                UiNode::status(ids::computer_status(machine), card.state.words())
+                    .with_value(card.state.word()),
+            );
+        if let Some(note) = &card.note {
+            node = node.with_child(UiNode::status(ids::computer_error(machine), note.clone()));
+        }
+        if let Some(detail) = &card.detail {
+            let mut line = UiNode::status(ids::RELAY_DETAIL, detail.words.clone());
+            if detail.trouble {
+                line.states.push("trouble".into());
+            }
+            node = node.with_child(line);
+        }
+        if card.this_computer {
+            for child in self.opencodex_nodes() {
+                node = node.with_child(child);
+            }
+        }
+        node
+    }
+
+    /// This computer's opencodex address and key, and Save, as its card draws them: until the
+    /// setting has been read, on a server without reply sources, or when it could not be read,
+    /// only the line the card draws in place of them (`settings-reply-source-unavailable`, state
+    /// `asking` while that is the server being asked); from a server without the relay,
+    /// `settings-relay-unavailable` (that this server can't take replies from a computer yet) and
+    /// the line under Save; and from one with it, opencodex's address, the key field (never its
+    /// text: states `set` while the Keychain holds a key, `typed` while one waits for Save) with
+    /// Remove key, `settings-reply-source-error` (a read that failed, state `trouble`, or what
+    /// the Keychain said when it did not keep a key), `settings-reply-source-hint` (what Save
+    /// waits for) and Save. Nothing of the plan on the server's own machine is on it, nor a model
+    /// of the relay's own.
+    fn opencodex_nodes(&self) -> Vec<UiNode> {
         let snap = &self.reply_source;
         let settings = &snap.settings;
-        let mut section = UiNode::new(ids::REPLY_SOURCE, "group", reply_source::TAB_LABEL);
-        let Some(kept) = settings.kept_source() else {
-            let line = reply_source::unavailable_line(settings).unwrap_or(reply_source::ASKING);
-            if line == reply_source::ASKING {
-                section.states.push("asking".into());
+        let relay = &snap.relay;
+        let Some(_) = settings.kept_source() else {
+            let line = computers::unavailable_line(settings).unwrap_or(computers::ASKING);
+            let mut node = UiNode::status(ids::REPLY_SOURCE_UNAVAILABLE, line);
+            if line == computers::ASKING {
+                node.states.push("asking".into());
             }
-            return section.with_child(UiNode::status(ids::REPLY_SOURCE_UNAVAILABLE, line));
+            return vec![node];
         };
-        section = section.with_value(kept.kind.word());
-        for (on, state) in [
-            (snap.unsaved, "unsaved"),
-            (settings.reading.is_some(), "reading"),
-            (settings.on_mac(), VIA_MAC),
-        ] {
-            if on {
-                section.states.push(state.into());
-            }
-        }
-        // The relay, from a server that knows it, where the window draws it; one before it gets
-        // the line saying so in its place, and nothing to save.
-        let knows_relay = settings.knows_relay();
-        section = section.with_child(if knows_relay {
-            self.relay_node()
-        } else {
-            UiNode::status(ids::RELAY_UNAVAILABLE, reply_source::RELAY_NOT_ON_SERVER)
-        });
+        let mut nodes = Vec::new();
         // The line under Save: state `trouble` while it is drawn in the danger colour, a failed
         // read; what the Keychain said is drawn muted.
-        if let Some(line) = reply_source::error_line(settings) {
+        let error = computers::error_line(settings).map(|line| {
             let mut error = UiNode::status(ids::REPLY_SOURCE_ERROR, line);
-            if reply_source::error_is_trouble(settings) {
+            if computers::error_is_trouble(settings) {
                 error.states.push("trouble".into());
             }
-            section = section.with_child(error);
+            error
+        });
+        // From a server before the relay: the line saying so in the fields' place, and nothing
+        // to save.
+        if !settings.knows_relay() {
+            nodes.push(UiNode::status(
+                ids::RELAY_UNAVAILABLE,
+                computers::RELAY_NOT_ON_SERVER,
+            ));
+            nodes.extend(error);
+            return nodes;
         }
-        if knows_relay {
-            if let Some(hint) = snap.hint {
-                section = section.with_child(UiNode::status(ids::REPLY_SOURCE_HINT, hint));
+        nodes.push(
+            UiNode::textbox(ids::RELAY_ADDR, computers::RELAY_ADDR_LABEL)
+                .with_value(relay.address.clone())
+                .with_enabled(settings.relay_editable()),
+        );
+        // The window draws a key waiting for Save as masked dots in the field, a driver's too.
+        let mut key = UiNode::textbox(ids::RELAY_KEY, computers::RELAY_KEY_LABEL)
+            .with_enabled(settings.relay_key_editable());
+        if relay.has_key {
+            key.states.push("set".into());
+        }
+        if relay.key_typed {
+            key.states.push("typed".into());
+        }
+        // A key typed and left behind when the page was left: the window asks for it again.
+        if settings.relay_retype_key {
+            key.states.push("retype".into());
+        }
+        nodes.push(key);
+        if relay.has_key {
+            let mut remove = UiNode::button(
+                ids::RELAY_KEY_REMOVE,
+                if settings.relay_remove_key {
+                    computers::KEEP_KEY_LABEL
+                } else {
+                    computers::REMOVE_KEY_LABEL
+                },
+            )
+            .with_enabled(settings.relay_editable());
+            if settings.relay_remove_key {
+                remove.states.push("picked".into());
             }
-            section = section.with_child(
-                UiNode::button(ids::REPLY_SOURCE_SAVE, reply_source::SAVE_LABEL)
-                    .with_enabled(snap.can_save),
-            );
+            nodes.push(remove);
         }
-        section
+        nodes.extend(error);
+        if let Some(hint) = snap.hint {
+            nodes.push(UiNode::status(ids::REPLY_SOURCE_HINT, hint));
+        }
+        nodes.push(
+            UiNode::button(ids::REPLY_SOURCE_SAVE, computers::SAVE_LABEL)
+                .with_enabled(snap.can_save),
+        );
+        nodes
     }
 
     /// Settings → General's first section as the page draws it: `settings-default-models`
@@ -5712,80 +5791,6 @@ impl NativeChatHost {
                 section
             }
         }
-    }
-
-    /// The relay as the card draws it: the switch (checked while on, enabled while a click would
-    /// move it) and under it what became of what it sent the account when that did not go as
-    /// asked, why the card takes no change when it takes none, the status line (value
-    /// `answering` / `another-mac` / `connecting` / `not-connected`) and the line under it,
-    /// opencodex's address, and the key field (never its text: states `set` while the Keychain
-    /// holds a key, `typed` while one waits for Save) with Remove key.
-    fn relay_node(&self) -> UiNode {
-        let snap = &self.reply_source;
-        let settings = &snap.settings;
-        let relay = &snap.relay;
-        let live = settings.relay_editable();
-        let mut card = UiNode::new(ids::RELAY, "group", reply_source::RELAY_TITLE).with_child(
-            UiNode::new(ids::RELAY_SWITCH, "switch", reply_source::RELAY_TITLE)
-                .with_checked(relay.on)
-                .with_enabled(relay.switch_live),
-        );
-        if let Some(note) = settings.change_note(crate::state::AccountChange::Relay) {
-            card = card.with_child(UiNode::status(ids::RELAY_SWITCH_ERROR, note));
-        }
-        if let Some(line) =
-            reply_source::relay_unavailable_line(settings.knows_relay(), relay.enrolled)
-        {
-            card = card.with_child(UiNode::status(ids::RELAY_UNAVAILABLE, line));
-        }
-        if let Some(line) = &relay.line {
-            card = card.with_child(
-                UiNode::status(ids::RELAY_STATUS, reply_source::relay_line_words(line))
-                    .with_value(reply_source::relay_line_word(line)),
-            );
-            if let Some(detail) = &relay.detail {
-                let mut node = UiNode::status(ids::RELAY_DETAIL, detail.clone());
-                if matches!(line, crate::state::RelayLine::NotConnected { why: Some(_) }) {
-                    node.states.push("trouble".into());
-                }
-                card = card.with_child(node);
-            }
-        }
-        card = card.with_child(
-            UiNode::textbox(ids::RELAY_ADDR, reply_source::RELAY_ADDR_LABEL)
-                .with_value(relay.address.clone())
-                .with_enabled(live),
-        );
-        // The window draws a key waiting for Save as masked dots in the field, a driver's too.
-        let mut key = UiNode::textbox(ids::RELAY_KEY, reply_source::RELAY_KEY_LABEL)
-            .with_enabled(settings.relay_key_editable());
-        if relay.has_key {
-            key.states.push("set".into());
-        }
-        if relay.key_typed {
-            key.states.push("typed".into());
-        }
-        // A key typed and left behind when the page was left: the window asks for it again.
-        if settings.relay_retype_key {
-            key.states.push("retype".into());
-        }
-        card = card.with_child(key);
-        if relay.has_key {
-            let mut remove = UiNode::button(
-                ids::RELAY_KEY_REMOVE,
-                if settings.relay_remove_key {
-                    reply_source::KEEP_KEY_LABEL
-                } else {
-                    reply_source::REMOVE_KEY_LABEL
-                },
-            )
-            .with_enabled(live);
-            if settings.relay_remove_key {
-                remove.states.push("picked".into());
-            }
-            card = card.with_child(remove);
-        }
-        card
     }
 
     /// One of the Bot's model picker's controls on its card, or `None` for a target that is none
@@ -6082,28 +6087,46 @@ impl NativeChatHost {
         Ok(DispatchResult::empty())
     }
 
-    /// One of Settings → Relay's controls, or `None` for a target that is none of them. The tab
-    /// answers from anywhere in Settings, and not while Settings is shut. Every control on the
-    /// page is refused while the page is not on screen, before the setting has been read, and
-    /// while it is dead there.
-    fn reply_source_command(&self, target: &str) -> Option<Result<Command, String>> {
-        if target == ids::SETTINGS_REPLY_SOURCE {
-            return Some(if self.account_open {
-                Ok(Command::SetAppSettingsTab(AppSettingsTab::ReplySource))
-            } else {
-                Err(format!(
-                    "`{target}` is in Settings, which is shut: open it with `{}`",
-                    ids::FOOTER_ACCOUNT
-                ))
-            });
+    /// One of a computer's card's controls on Settings → Computer, or `None` for a target that is
+    /// none of them: the Relay your plan switch of a computer on the roster, which acts at once and
+    /// asks for the other way from where it is drawn; the card and its lines, which are lines and
+    /// not controls; and this computer's opencodex fields, key and Save
+    /// ([`Self::opencodex_command`]). Each is refused while Settings is not open on Computer.
+    fn computer_card_command(&self, target: &str) -> Option<Result<Command, String>> {
+        if let Some(command) = self.opencodex_command(target) {
+            return Some(command);
         }
-        if target.starts_with(ids::RELAY) {
-            return Some(self.relay_control(target));
+        let card = self.computers.iter().find(|card| {
+            let machine = &card.machine_id;
+            [
+                ids::computer_card(machine),
+                ids::computer_relay(machine),
+                ids::computer_status(machine),
+                ids::computer_error(machine),
+            ]
+            .iter()
+            .any(|id| id == target)
+        })?;
+        if let Some(off) = self.off_the_computer_page(target) {
+            return Some(Err(off));
         }
-        if !target.starts_with(ids::REPLY_SOURCE) {
-            return None;
+        if target != ids::computer_relay(&card.machine_id) {
+            return Some(Err(format!(
+                "`{target}` is a card or a line on it, not a control: its Relay your plan switch is \
+                 `{}`",
+                ids::computer_relay(&card.machine_id)
+            )));
         }
-        Some(self.reply_source_control(target))
+        Some(if card.switching {
+            Err(format!(
+                "`{target}` is dead: the switch is with the server, which has not answered"
+            ))
+        } else {
+            Ok(Command::SetComputerRelay {
+                machine_id: card.machine_id.clone(),
+                on: !card.relay_on,
+            })
+        })
     }
 
     /// One of Settings → General's Default models, or `None` for a target that is none of them.
@@ -6178,13 +6201,12 @@ impl NativeChatHost {
         })
     }
 
-    /// Why a control of Settings → Relay is not on screen: Settings is not open on the page.
-    fn off_the_relay_page(&self, target: &str) -> Option<String> {
-        (!(self.account_open && self.reply_source_tab)).then(|| {
+    /// Why a control of Settings → Computer is not on screen: Settings is not open on the page.
+    fn off_the_computer_page(&self, target: &str) -> Option<String> {
+        (!(self.account_open && self.computer_tab)).then(|| {
             format!(
-                "`{target}` is on Settings → Relay, which is not what is on screen: open it with \
-                 `{}`",
-                ids::SETTINGS_REPLY_SOURCE
+                "`{target}` is on Settings → Computer, which is not what is on screen: open it \
+                 with `settings-tab-computer`"
             )
         })
     }
@@ -6222,66 +6244,104 @@ impl NativeChatHost {
         }
     }
 
-    /// One of the relay's controls. Refused off the page, before the setting is read, and from a
-    /// server without the relay, which draws no card. The switch acts at once and waits on no
-    /// Save: off always, on once this computer is enrolled. The rest are the page's; the key's
-    /// Remove only while the Keychain holds one.
-    fn relay_control(&self, target: &str) -> Result<Command, String> {
-        if let Some(off) = self.off_the_relay_page(target) {
+    /// One of this computer's opencodex controls, or `None` for a target that is none of them:
+    /// the lines about them are lines, the address and the key are fields, Remove key only while
+    /// the Keychain holds one, and Save keeps this computer's half of the relay and is refused with
+    /// what it waits for. Refused off the page, while this computer is not on the roster (it has no
+    /// card), before the setting is read, and from a server without the relay, which draws none of
+    /// them. An id the card does not draw, the plan on the server's own machine's among them, is
+    /// no control of it either.
+    fn opencodex_command(&self, target: &str) -> Option<Result<Command, String>> {
+        let ours = [
+            ids::RELAY_DETAIL,
+            ids::RELAY_ADDR,
+            ids::RELAY_KEY,
+            ids::RELAY_KEY_REMOVE,
+            ids::RELAY_UNAVAILABLE,
+            ids::REPLY_SOURCE_SAVE,
+            ids::REPLY_SOURCE_ERROR,
+            ids::REPLY_SOURCE_HINT,
+            ids::REPLY_SOURCE_UNAVAILABLE,
+        ];
+        if ours.contains(&target) {
+            return Some(self.opencodex_control(target));
+        }
+        // Everything else of Settings → Relay is gone with the page: its tab, its section, its
+        // card, its switch and its lines, and the plan on the server's own machine that it no
+        // longer sets up. A driver that still asks for one is told where the relay is.
+        let retired = target == RETIRED_RELAY_TAB
+            || target.starts_with("settings-relay")
+            || target.starts_with("settings-reply-source");
+        retired.then(|| {
+            Err(format!(
+                "no `{target}` on screen: Settings → Relay is gone, and each computer has its own \
+                 Relay your plan switch on its card on Settings → Computer \
+                 (`settings-computer-{{id}}-relay`)"
+            ))
+        })
+    }
+
+    fn opencodex_control(&self, target: &str) -> Result<Command, String> {
+        if let Some(off) = self.off_the_computer_page(target) {
             return Err(off);
+        }
+        if !self.computers.iter().any(|card| card.this_computer) {
+            return Err(format!(
+                "no `{target}` on screen: this computer is not among the computers listed yet"
+            ));
         }
         let snap = &self.reply_source;
         let settings = &snap.settings;
-        let relay = &snap.relay;
         if settings.kept_source().is_none() {
-            let line = reply_source::unavailable_line(settings).unwrap_or(reply_source::ASKING);
-            return Err(format!("no `{target}` on screen: {line}"));
+            let line = computers::unavailable_line(settings).unwrap_or(computers::ASKING);
+            return if target == ids::REPLY_SOURCE_UNAVAILABLE {
+                Err(format!("`{target}` is a line on the card, not a control"))
+            } else {
+                Err(format!("no `{target}` on screen: {line}"))
+            };
         }
         if !settings.knows_relay() {
-            return Err(if target == ids::RELAY_UNAVAILABLE {
-                format!("`{target}` is a line on the page, not a control")
-            } else {
-                format!(
-                    "no `{target}` on screen: {}",
-                    reply_source::RELAY_NOT_ON_SERVER
-                )
-            });
-        }
-        if target == ids::RELAY_SWITCH {
-            return if relay.on {
-                Ok(Command::SetRelayOn(false))
-            } else if relay.switch_live {
-                Ok(Command::SetRelayOn(true))
-            } else {
-                Err(format!(
-                    "`{target}` is dead: {}",
-                    reply_source::RELAY_NOT_ENROLLED
-                ))
-            };
+            return Err(
+                if target == ids::RELAY_UNAVAILABLE || target == ids::REPLY_SOURCE_ERROR {
+                    format!("`{target}` is a line on the card, not a control")
+                } else {
+                    format!(
+                        "no `{target}` on screen: {}",
+                        computers::RELAY_NOT_ON_SERVER
+                    )
+                },
+            );
         }
         if target == ids::RELAY_ADDR || target == ids::RELAY_KEY {
             return Err(format!("`{target}` is a field: use set_value"));
         }
-        let lines = [
-            ids::RELAY,
-            ids::RELAY_SWITCH_ERROR,
-            ids::RELAY_STATUS,
-            ids::RELAY_DETAIL,
-            ids::RELAY_UNAVAILABLE,
-        ];
-        if lines.contains(&target) {
-            return Err(format!("`{target}` is a line on the card, not a control"));
+        if target == ids::REPLY_SOURCE_SAVE {
+            return if snap.can_save {
+                Ok(Command::SaveReplySource)
+            } else if settings.reading.is_some() {
+                Err(format!(
+                    "`{target}` is dead: the setting is being read, and Save waits for what it \
+                     brings"
+                ))
+            } else if let Some(hint) = snap.hint.filter(|_| snap.unsaved) {
+                Err(format!("`{target}` is dead: {hint}"))
+            } else {
+                Err(format!(
+                    "`{target}` is dead: nothing on the card differs from what this computer \
+                     keeps"
+                ))
+            };
         }
-        if target != ids::RELAY_KEY_REMOVE {
-            return Err(format!("no `{target}` on the card"));
+        if target == ids::RELAY_KEY_REMOVE {
+            return if snap.relay.has_key {
+                Ok(Command::ToggleRemoveRelayKey)
+            } else {
+                Err(format!(
+                    "no `{target}` on screen: this computer's secure storage holds no key"
+                ))
+            };
         }
-        if relay.has_key {
-            Ok(Command::ToggleRemoveRelayKey)
-        } else {
-            Err(format!(
-                "no `{target}` on screen: this computer's secure storage holds no key"
-            ))
-        }
+        Err(format!("`{target}` is a line on the card, not a control"))
     }
 
     /// Why the relay's address or key field takes no typing now, or `None` while it does: the
@@ -6290,18 +6350,23 @@ impl NativeChatHost {
     /// driver types asks it first (`set_value`, `type`, `key`), so none of them reaches a draft
     /// the window would not let a person change.
     fn relay_field_closed(&self, target: &str) -> Option<String> {
-        if let Some(off) = self.off_the_relay_page(target) {
+        if let Some(off) = self.off_the_computer_page(target) {
             return Some(off);
+        }
+        if !self.computers.iter().any(|card| card.this_computer) {
+            return Some(format!(
+                "no `{target}` on screen: this computer is not among the computers listed yet"
+            ));
         }
         let settings = &self.reply_source.settings;
         if settings.kept_source().is_none() {
-            let line = reply_source::unavailable_line(settings).unwrap_or(reply_source::ASKING);
+            let line = computers::unavailable_line(settings).unwrap_or(computers::ASKING);
             return Some(format!("no `{target}` on screen: {line}"));
         }
         if !settings.knows_relay() {
             return Some(format!(
                 "no `{target}` on screen: {}",
-                reply_source::RELAY_NOT_ON_SERVER
+                computers::RELAY_NOT_ON_SERVER
             ));
         }
         if target == ids::RELAY_KEY && !settings.relay_key_editable() {
@@ -6341,54 +6406,6 @@ impl NativeChatHost {
         } else {
             format!("`{target}` takes text, not single keys: use set_value, or type to add to it")
         }
-    }
-
-    /// Save and the page's lines. Save keeps this computer's half of the relay, and is refused
-    /// with what it waits for; there is nothing else on the page to press, and an id the page
-    /// does not draw, the plan's on the server's own machine among them, is no line of it either.
-    fn reply_source_control(&self, target: &str) -> Result<Command, String> {
-        if let Some(off) = self.off_the_relay_page(target) {
-            return Err(off);
-        }
-        let snap = &self.reply_source;
-        let settings = &snap.settings;
-        if settings.kept_source().is_none() {
-            let line = reply_source::unavailable_line(settings).unwrap_or(reply_source::ASKING);
-            return Err(format!("no `{target}` on screen: {line}"));
-        }
-        if target == ids::REPLY_SOURCE_SAVE {
-            return if !settings.knows_relay() {
-                Err(format!(
-                    "no `{target}` on screen: {}",
-                    reply_source::RELAY_NOT_ON_SERVER
-                ))
-            } else if snap.can_save {
-                Ok(Command::SaveReplySource)
-            } else if settings.reading.is_some() {
-                Err(format!(
-                    "`{target}` is dead: the setting is being read, and Save waits for what it \
-                     brings"
-                ))
-            } else if let Some(hint) = snap.hint.filter(|_| snap.unsaved) {
-                Err(format!("`{target}` is dead: {hint}"))
-            } else {
-                Err(format!(
-                    "`{target}` is dead: nothing on the page differs from what this computer \
-                     keeps"
-                ))
-            };
-        }
-        let lines = [
-            ids::REPLY_SOURCE,
-            ids::REPLY_SOURCE_UNAVAILABLE,
-            ids::REPLY_SOURCE_ERROR,
-            ids::REPLY_SOURCE_HINT,
-        ];
-        Err(if lines.contains(&target) {
-            format!("`{target}` is a line on the page, not a control")
-        } else {
-            format!("no `{target}` on the page")
-        })
     }
 
     /// Settings → Logins as the page draws it: the search field with Add beside it, Import…,
@@ -7263,7 +7280,7 @@ impl NativeChatHost {
             Command::SendOnServer
         } else if let Some(cmd) = self.reply_run_command(target) {
             cmd?
-        } else if let Some(cmd) = self.reply_source_command(target) {
+        } else if let Some(cmd) = self.computer_card_command(target) {
             cmd?
         } else if let Some(cmd) = self.default_models_command(target) {
             cmd?
@@ -7694,7 +7711,8 @@ impl NativeChatHost {
         if !(self.account_open && self.computer_tab) {
             return None;
         }
-        self.computers.iter().find_map(|(machine, _, _, _)| {
+        self.computers.iter().find_map(|card| {
+            let machine = &card.machine_id;
             [
                 LocalExecMode::Always,
                 LocalExecMode::Ask,
@@ -10316,6 +10334,23 @@ mod tests {
         }
     }
 
+    /// A computer's card as Settings → Computer draws it: the computer `id`, with its relay on, not
+    /// relaying and awake, and asking each time. A test changes what it is about.
+    fn a_card(id: &str, this_computer: bool) -> ComputerCard {
+        ComputerCard {
+            machine_id: id.into(),
+            label: format!("NativeChat on {id}"),
+            this_computer,
+            online: true,
+            mode: crate::opengrok::LocalExecMode::Ask,
+            relay_on: true,
+            switching: false,
+            state: computers::RelayState::NotRelaying,
+            detail: None,
+            note: None,
+        }
+    }
+
     #[test]
     fn floating_header_controls_match_their_visible_actions() {
         let mut host = host();
@@ -12331,8 +12366,15 @@ mod tests {
         host.account_open = true;
         host.computer_tab = true;
         host.computers = vec![
-            ("mac-1".into(), "This Mac".into(), LocalExecMode::Ask, true),
-            ("mac-2".into(), "Studio".into(), LocalExecMode::Never, false),
+            ComputerCard {
+                label: "This Mac".into(),
+                ..a_card("mac-1", true)
+            },
+            ComputerCard {
+                label: "Studio".into(),
+                mode: LocalExecMode::Never,
+                ..a_card("mac-2", false)
+            },
         ];
         let tree = host.snapshot();
         let mine = tree.find(&ids::computer_exec("mac-1")).unwrap();
@@ -13920,123 +13962,361 @@ mod tests {
         ))
     }
 
-    /// Settings → Relay is on the tree as the page draws it: the line standing in for the page
-    /// until the server has answered, then the section valued by the door the server keeps, the
-    /// relay's card, the lines by Save, and Save; and from a server without the relay, the line
-    /// saying so in the card's place and nothing to save. Default for new Bots is not on it: it
-    /// is on General. The tab is named Relay and answers by the id it always had, only while
-    /// Settings is open. Each control is the page's own, and refused off the page and before the
-    /// setting is read.
+    /// The Relay tab is gone from the tree: Settings' pages are General, Computer, Updates, Logins,
+    /// Connections and Skills, nothing answers at the id the Relay tab had, and none of the ids of
+    /// the page it held is on the tree or takes a click. The relay is on Computer, in each
+    /// computer's card.
     #[test]
-    fn the_relay_page_is_on_the_tree_and_clicks_as_the_page_does() {
-        use crate::components::reply_source::{
-            ASKING, RELAY_NOT_ON_SERVER, RELAY_TITLE, TAB_LABEL,
+    fn the_relay_tab_is_gone_from_the_tree_and_answers_no_click() {
+        let mut host = host();
+        host.account_open = true;
+        host.computer_tab = true;
+        host.computers = vec![a_card("mac_1", true)];
+        let tree = host.snapshot();
+        for id in [
+            ids::SETTINGS_GENERAL,
+            "settings-tab-computer",
+            "settings-tab-updates",
+            "settings-tab-logins",
+            ids::SETTINGS_CONNECTIONS,
+            ids::SETTINGS_SKILLS,
+        ] {
+            assert!(tree.find(id).is_some(), "{id} is a page of Settings");
+        }
+        for gone in [
+            "settings-tab-reply-source",
+            "settings-reply-source",
+            "settings-relay",
+            "settings-relay-switch",
+            "settings-relay-switch-error",
+            "settings-relay-status",
+        ] {
+            assert!(tree.find(gone).is_none(), "{gone} is gone from the tree");
+            let refused = host.click(gone).unwrap_err();
+            assert!(
+                refused.contains(&format!("no `{gone}` on screen"))
+                    && refused.contains("settings-computer-{id}-relay"),
+                "{gone}: {refused}"
+            );
+            assert!(host.take_command().is_none(), "{gone} sent nothing");
+        }
+        assert!(tree.ids_are_unique());
+    }
+
+    /// Each computer is a card on the tree as the window draws it, while Settings is open on
+    /// Computer: `settings-computer-{id}`, this computer's marked `this-computer`, holding its Relay
+    /// your plan switch (checked as drawn, dead while a switch is with the server), where its relay
+    /// stands, and what became of a switch that did not go as asked, under the switch. The switch
+    /// asks for the other way from where it is drawn, from any computer's card; the card and its
+    /// lines are no controls. This computer's card alone holds why its relay is not relaying. Off the
+    /// page, none of it is on the tree or takes a click.
+    #[test]
+    fn each_computer_is_a_card_on_the_tree_and_its_switch_clicks_as_the_windows_does() {
+        use crate::components::computers::RelayState;
+        let mut host = host();
+        host.computers = vec![
+            ComputerCard {
+                state: RelayState::Relaying,
+                ..a_card("mac_1", true)
+            },
+            ComputerCard {
+                online: false,
+                state: RelayState::OnButAsleep,
+                ..a_card("mac_2", false)
+            },
+            ComputerCard {
+                relay_on: false,
+                ..a_card("mac_3", false)
+            },
+        ];
+        assert!(
+            host.snapshot().find(&ids::computer_card("mac_1")).is_none(),
+            "Settings is shut"
+        );
+        let shut = host.click(&ids::computer_relay("mac_1")).unwrap_err();
+        assert!(shut.contains("settings-tab-computer"), "{shut}");
+        host.account_open = true;
+        let tree = host.snapshot();
+        assert!(
+            tree.find(&ids::computer_card("mac_1")).is_none(),
+            "not on Computer"
+        );
+        host.computer_tab = true;
+        let tree = host.snapshot();
+        assert!(tree.ids_are_unique());
+
+        // The cards, this computer first, and what each says.
+        for (id, label, states) in [
+            (
+                "mac_1",
+                "NativeChat on mac_1",
+                vec!["online", "this-computer"],
+            ),
+            ("mac_2", "NativeChat on mac_2", vec!["offline"]),
+            ("mac_3", "NativeChat on mac_3", vec!["online"]),
+        ] {
+            let card = tree.find(&ids::computer_card(id)).expect("a card");
+            assert_eq!((card.role.as_str(), card.name.as_str()), ("group", label));
+            assert_eq!(card.states, states, "{id}");
+            assert_eq!(
+                card.children
+                    .iter()
+                    .take(2)
+                    .map(|node| node.id.clone())
+                    .collect::<Vec<_>>(),
+                [ids::computer_relay(id), ids::computer_status(id)],
+                "{id}: the switch, then where its relay stands"
+            );
+        }
+        for (id, checked, name, value) in [
+            ("mac_1", true, "Relaying", "relaying"),
+            (
+                "mac_2",
+                true,
+                "On, but asleep: it can't answer right now",
+                "asleep",
+            ),
+            ("mac_3", false, "Not relaying", "not-relaying"),
+        ] {
+            let switch = tree.find(&ids::computer_relay(id)).unwrap();
+            assert_eq!(
+                (
+                    switch.role.as_str(),
+                    switch.name.as_str(),
+                    switch.checked,
+                    switch.enabled
+                ),
+                ("switch", "Relay your plan", Some(checked), true),
+                "{id}"
+            );
+            let status = tree.find(&ids::computer_status(id)).unwrap();
+            assert_eq!(
+                (status.name.as_str(), status.value.as_deref()),
+                (name, Some(value)),
+                "{id}"
+            );
+            assert!(
+                tree.find(&ids::computer_error(id)).is_none(),
+                "{id}: nothing said"
+            );
+        }
+        // Only this computer's card holds its opencodex's fields.
+        assert!(
+            tree.find(ids::RELAY_ADDR).is_none(),
+            "the setting is not read, and nothing is drawn but the line saying so"
+        );
+        assert_eq!(
+            tree.find(ids::REPLY_SOURCE_UNAVAILABLE)
+                .map(|node| node.name.as_str()),
+            Some("Asking the server…")
+        );
+        let mine = tree.find(&ids::computer_card("mac_1")).unwrap();
+        assert!(mine.find(ids::REPLY_SOURCE_UNAVAILABLE).is_some());
+        for other in ["mac_2", "mac_3"] {
+            let card = tree.find(&ids::computer_card(other)).unwrap();
+            assert!(
+                card.find(ids::REPLY_SOURCE_UNAVAILABLE).is_none(),
+                "{other}"
+            );
+        }
+
+        // Each switch asks for the other way, from any computer's card.
+        for (id, on) in [("mac_1", false), ("mac_2", false), ("mac_3", true)] {
+            host.click(&ids::computer_relay(id)).unwrap();
+            assert!(
+                matches!(host.take_command(), Some(Command::SetComputerRelay { machine_id, on: asked })
+                    if machine_id == id && asked == on),
+                "{id}"
+            );
+        }
+        // The card and its lines are no controls, and the lines are named for what they are.
+        for id in [ids::computer_card("mac_1"), ids::computer_status("mac_1")] {
+            let line = host.click(&id).unwrap_err();
+            assert!(line.contains("not a control"), "{id}: {line}");
+        }
+
+        // What a refused switch says, under the switch, in the server's words; and while a switch is
+        // with the server the card draws it where it was asked and takes no click.
+        host.computers[1].note = Some("no computer of yours has that id".into());
+        host.computers[2].switching = true;
+        let tree = host.snapshot();
+        let error = tree.find(&ids::computer_error("mac_2")).unwrap();
+        assert_eq!(error.name, "no computer of yours has that id");
+        assert_eq!(
+            tree.find(&ids::computer_card("mac_2"))
+                .unwrap()
+                .children
+                .iter()
+                .take(3)
+                .map(|node| node.id.clone())
+                .collect::<Vec<_>>(),
+            [
+                ids::computer_relay("mac_2"),
+                ids::computer_status("mac_2"),
+                ids::computer_error("mac_2")
+            ],
+            "under the switch"
+        );
+        assert!(host.click(&ids::computer_error("mac_2")).is_err(), "a line");
+        let switch = tree.find(&ids::computer_relay("mac_3")).unwrap();
+        assert!(!switch.enabled, "with the server");
+        let dead = host.click(&ids::computer_relay("mac_3")).unwrap_err();
+        assert!(dead.contains("with the server"), "{dead}");
+        assert!(host.take_command().is_none());
+        assert!(tree.ids_are_unique());
+
+        // Off the page, nothing of it is a target.
+        host.computer_tab = false;
+        assert!(host.snapshot().find(&ids::computer_card("mac_1")).is_none());
+        let off = host.click(&ids::computer_relay("mac_1")).unwrap_err();
+        assert!(off.contains("settings-tab-computer"), "{off}");
+    }
+
+    /// This computer's relay fields are on its card, from a server that knows the relay: opencodex's
+    /// address and the key field (never its text: states `set` while the Keychain holds a key,
+    /// `typed` while one waits for Save) with Remove key, and Save; and why this computer's relay is
+    /// not relaying, under its status. Each is the card's own, refused off the page and from a
+    /// server without the relay; the typed key is never on the tree.
+    #[test]
+    fn this_computers_relay_fields_are_on_its_card_and_click_as_the_card_does() {
+        use crate::components::computers::{
+            RELAY_ADDR_LABEL, RELAY_KEY_LABEL, RELAY_NOT_ON_SERVER, RelayDetail, TAKE_BACK,
         };
         use crate::opengrok::InferenceKind;
         use crate::state::{REPLY_SOURCE_NOT_ON_SERVER, ReplySourceNote, ReplySourceRead};
         let mut host = host();
-        let tab = host.snapshot();
-        assert_eq!(
-            tab.find(ids::SETTINGS_REPLY_SOURCE).unwrap().name,
-            TAB_LABEL,
-            "the tab is Relay, by the id it always had"
-        );
-        assert_eq!(ids::SETTINGS_REPLY_SOURCE, "settings-tab-reply-source");
-        let shut = host.click(ids::SETTINGS_REPLY_SOURCE).unwrap_err();
-        assert!(shut.contains(ids::FOOTER_ACCOUNT), "{shut}");
-        host.account_open = true;
-        host.click(ids::SETTINGS_REPLY_SOURCE).unwrap();
-        assert!(matches!(
-            host.take_command(),
-            Some(Command::SetAppSettingsTab(AppSettingsTab::ReplySource))
-        ));
+        host.computers = vec![a_card("mac_1", true), a_card("mac_2", false)];
         assert!(
-            host.snapshot().find(ids::REPLY_SOURCE).is_none(),
-            "Settings is not open on Relay"
+            host.click(ids::RELAY_KEY_REMOVE).is_err(),
+            "Settings is shut"
         );
-        let off = host.click(ids::REPLY_SOURCE_SAVE).unwrap_err();
-        assert!(off.contains(ids::SETTINGS_REPLY_SOURCE), "{off}");
+        host.account_open = true;
+        let off = host.click(ids::RELAY_KEY_REMOVE).unwrap_err();
+        assert!(off.contains("settings-tab-computer"), "{off}");
+        host.computer_tab = true;
 
-        // On the page, before the server has answered: the section, asking, and the line the page
-        // draws meanwhile; nothing to press, and no default for new Bots, which is on General.
-        host.reply_source_tab = true;
+        // Before the server has answered: the line the card draws meanwhile, and nothing to press.
         let tree = host.snapshot();
-        let section = tree.find(ids::REPLY_SOURCE).unwrap();
-        assert_eq!(section.name, TAB_LABEL);
-        assert!(section.states.contains(&"asking".to_string()));
-        assert_eq!(
-            section
-                .children
-                .iter()
-                .map(|node| (node.id.as_str(), node.name.as_str()))
-                .collect::<Vec<_>>(),
-            [(ids::REPLY_SOURCE_UNAVAILABLE, ASKING)],
-            "as drawn"
-        );
+        let asking = tree.find(ids::REPLY_SOURCE_UNAVAILABLE).unwrap();
+        assert_eq!(asking.name, "Asking the server…");
+        assert!(asking.states.contains(&"asking".to_string()));
         assert!(host.click(ids::REPLY_SOURCE_SAVE).is_err());
-        assert!(host.click(ids::RELAY_SWITCH).is_err());
+        assert!(host.click(ids::RELAY_KEY_REMOVE).is_err());
 
-        // A server without reply sources: the page says so, and there is still nothing to press.
+        // A server without reply sources says so, and there is still nothing to press.
         host.reply_source.settings.kept = Some(ReplySourceRead::NotOnServer);
         let tree = host.snapshot();
-        assert_eq!(
-            tree.find(ids::REPLY_SOURCE_UNAVAILABLE).unwrap().name,
-            REPLY_SOURCE_NOT_ON_SERVER
-        );
+        let said = tree.find(ids::REPLY_SOURCE_UNAVAILABLE).unwrap();
+        assert_eq!(said.name, REPLY_SOURCE_NOT_ON_SERVER);
+        assert!(!said.states.contains(&"asking".to_string()));
         let refused = host.click(ids::REPLY_SOURCE_SAVE).unwrap_err();
         assert!(refused.contains(REPLY_SOURCE_NOT_ON_SERVER), "{refused}");
 
-        // A server from before the relay: the line saying so in the card's place, and no Save.
+        // A server from before the relay: the line saying so in the fields' place, no Save.
         host.reply_source.settings.kept = Some(ReplySourceRead::Read(kept_source(
             InferenceKind::Gateway,
-            false,
+            true,
         )));
         let tree = host.snapshot();
+        let mine = tree.find(&ids::computer_card("mac_1")).unwrap();
         assert_eq!(
-            tree.find(ids::REPLY_SOURCE)
-                .unwrap()
-                .children
-                .iter()
-                .map(|node| (node.id.as_str(), node.name.as_str()))
-                .collect::<Vec<_>>(),
-            [(ids::RELAY_UNAVAILABLE, RELAY_NOT_ON_SERVER)]
+            mine.find(ids::RELAY_UNAVAILABLE).unwrap().name,
+            RELAY_NOT_ON_SERVER
         );
-        let no_save = host.click(ids::REPLY_SOURCE_SAVE).unwrap_err();
-        assert!(no_save.contains(RELAY_NOT_ON_SERVER), "{no_save}");
+        assert!(
+            tree.find(ids::RELAY_ADDR).is_none() && tree.find(ids::REPLY_SOURCE_SAVE).is_none()
+        );
+        let refused = host.click(ids::REPLY_SOURCE_SAVE).unwrap_err();
+        assert!(refused.contains(RELAY_NOT_ON_SERVER), "{refused}");
+        assert!(
+            host.set_value(ids::RELAY_ADDR, "http://127.0.0.1:9090")
+                .is_err()
+        );
 
-        // A server with the relay: the card and Save; the section valued by the door the server
-        // keeps, which nothing here switches.
+        // A server with the relay, a key kept and one typed.
         host.reply_source.settings.kept = relay_read("loopback");
+        host.reply_source.relay = RelaySnap {
+            address: "http://127.0.0.1:8080".into(),
+            has_key: true,
+            key_typed: true,
+        };
+        host.reply_source.unsaved = true;
         let tree = host.snapshot();
-        let section = tree.find(ids::REPLY_SOURCE).unwrap();
-        assert_eq!(section.value.as_deref(), Some("gateway"));
-        assert!(section.states.is_empty(), "{:?}", section.states);
+        let mine = tree.find(&ids::computer_card("mac_1")).unwrap();
+        assert!(mine.states.contains(&"unsaved".to_string()));
         assert_eq!(
-            section
-                .children
+            mine.children
                 .iter()
                 .map(|node| node.id.as_str())
                 .collect::<Vec<_>>(),
-            [ids::RELAY, ids::REPLY_SOURCE_SAVE],
-            "the relay and its Save: nothing else"
+            [
+                ids::computer_relay("mac_1").as_str(),
+                ids::computer_status("mac_1").as_str(),
+                ids::RELAY_ADDR,
+                ids::RELAY_KEY,
+                ids::RELAY_KEY_REMOVE,
+                ids::REPLY_SOURCE_SAVE
+            ],
+            "the switch and its status, then what its relay needs: no model of the relay's own, \
+             and nothing of the account's way"
         );
-        assert_eq!(tree.find(ids::RELAY).unwrap().name, RELAY_TITLE);
+        let other = tree.find(&ids::computer_card("mac_2")).unwrap();
+        assert_eq!(
+            other.children.len(),
+            2,
+            "another computer's has only its switch and status"
+        );
+        let address = tree.find(ids::RELAY_ADDR).unwrap();
+        assert_eq!(
+            (address.name.as_str(), address.value.as_deref()),
+            (RELAY_ADDR_LABEL, Some("http://127.0.0.1:8080"))
+        );
+        let key = tree.find(ids::RELAY_KEY).unwrap();
+        assert_eq!(key.name, RELAY_KEY_LABEL);
+        assert!(key.value.is_none(), "the key is never on the tree");
+        assert!(
+            key.states.contains(&"set".to_string()) && key.states.contains(&"typed".to_string())
+        );
         let save = tree.find(ids::REPLY_SOURCE_SAVE).unwrap();
         assert_eq!((save.name.as_str(), save.enabled), ("Save", false));
-        let nothing = host.click(ids::REPLY_SOURCE_SAVE).unwrap_err();
-        assert!(nothing.contains("nothing on the page differs"), "{nothing}");
         assert!(tree.ids_are_unique());
 
+        // Each control is the card's own.
+        host.click(ids::RELAY_KEY_REMOVE).unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::ToggleRemoveRelayKey)
+        ));
+        host.set_value(ids::RELAY_ADDR, "http://127.0.0.1:9090")
+            .unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::SetRelayAddress(address)) if address == "http://127.0.0.1:9090"
+        ));
+        host.type_into(ids::RELAY_ADDR, "1").unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::SetRelayAddress(address)) if address == "http://127.0.0.1:80801"
+        ));
+        host.set_value(ids::RELAY_KEY, "opencodex-test-key")
+            .unwrap();
+        let typed = host.take_command().expect("the key goes to the page");
+        assert!(!format!("{typed:?}").contains("opencodex-test-key"));
+        assert!(matches!(typed, Command::SetRelayKey(key) if key.0 == "opencodex-test-key"));
+        assert!(host.type_into(ids::RELAY_KEY, "more").is_err());
+        assert!(
+            host.dispatch(&Op::key(ids::RELAY_ADDR, "backspace"))
+                .is_err()
+        );
+        let nothing = host.click(ids::REPLY_SOURCE_SAVE).unwrap_err();
+        assert!(
+            nothing.contains("differs from what this computer keeps"),
+            "{nothing}"
+        );
+
         // A change waiting for Save, and what it waits for, beside it and when clicked.
-        host.reply_source.unsaved = true;
         host.reply_source.hint = Some(crate::state::RELAY_ADDRESS_NOT_HERE);
         let tree = host.snapshot();
-        assert!(
-            tree.find(ids::REPLY_SOURCE)
-                .unwrap()
-                .states
-                .contains(&"unsaved".to_string())
-        );
         assert_eq!(
             tree.find(ids::REPLY_SOURCE_HINT).unwrap().name,
             crate::state::RELAY_ADDRESS_NOT_HERE
@@ -14068,16 +14348,77 @@ mod tests {
             .unwrap();
         assert!(error.states.is_empty());
         let line = host.click(ids::REPLY_SOURCE_ERROR).unwrap_err();
-        assert!(line.contains("a line on the page"), "{line}");
+        assert!(line.contains("a line on the card"), "{line}");
+
+        // Why this computer's relay is not relaying, in the relay's own words, under its status,
+        // and on no other card.
+        host.computers[0].detail = Some(RelayDetail {
+            words: TAKE_BACK.into(),
+            trouble: false,
+        });
+        host.computers[1].detail = None;
+        let tree = host.snapshot();
+        assert_eq!(tree.find(ids::RELAY_DETAIL).unwrap().name, TAKE_BACK);
+        host.computers[0].detail = Some(RelayDetail {
+            words: "Can't reach the server. Trying again…".into(),
+            trouble: true,
+        });
+        let tree = host.snapshot();
+        assert!(
+            tree.find(ids::RELAY_DETAIL)
+                .unwrap()
+                .states
+                .contains(&"trouble".to_string())
+        );
+        let line = host.click(ids::RELAY_DETAIL).unwrap_err();
+        assert!(line.contains("a line on the card"), "{line}");
+
+        // The snapshot never holds the key the page does.
+        let mut state = AppState::new();
+        state.reply_source.kept = relay_read("loopback");
+        state.reply_source.relay_key_draft = crate::opengrok::RelayKey::new("opencodex-test-key");
+        let host = NativeChatHost::from_app(&state);
+        assert!(host.reply_source.relay.key_typed && host.reply_source.unsaved);
+        assert_eq!(host.reply_source.settings.relay_key_draft, None);
     }
 
-    /// The page has nothing of the plan on the server's own machine (its proxy URL, its key and
-    /// Remove key, its health line, the line on where it is set up from, the note on Claude and
-    /// Gemini) and no model of the relay's own (its menu, No model, a model a computer lists,
-    /// the line under it): none is on the tree, whatever the setting, and each is refused as
-    /// not on the page, with nothing sent and nothing typed. Nor does the page have a radio.
+    /// With no computer of the person's own on the card list yet there is no card to hold the relay
+    /// fields, and none of their ids answers: the fields are this computer's, and need its card.
     #[test]
-    fn the_relay_page_has_no_loopback_section_and_no_relay_model_picker() {
+    fn the_relay_fields_need_this_computers_card() {
+        use crate::state::ReplySourceRead;
+        let mut host = host();
+        host.account_open = true;
+        host.computer_tab = true;
+        host.reply_source.settings.kept = relay_read("loopback");
+        host.computers = vec![a_card("mac_2", false)];
+        let tree = host.snapshot();
+        assert!(tree.find(ids::RELAY_ADDR).is_none());
+        for id in [
+            ids::RELAY_KEY_REMOVE,
+            ids::REPLY_SOURCE_SAVE,
+            ids::RELAY_ADDR,
+        ] {
+            let refused = host.click(id).unwrap_err();
+            assert!(
+                refused.contains("this computer is not among"),
+                "{id}: {refused}"
+            );
+        }
+        let refused = host
+            .set_value(ids::RELAY_ADDR, "http://127.0.0.1:9090")
+            .unwrap_err();
+        assert!(refused.contains("this computer is not among"), "{refused}");
+        let _ = ReplySourceRead::Loading;
+    }
+
+    /// The card has nothing of the plan on the server's own machine (its proxy URL, its key and
+    /// Remove key, its health line, the line on where it is set up from, the note on Claude and
+    /// Gemini) and no model of the relay's own (its menu, No model, a model a computer lists, the
+    /// line under it): none is on the tree, whatever the setting, and each is refused as not on the
+    /// page, with nothing sent and nothing typed. Nor does it have a radio.
+    #[test]
+    fn the_relay_card_has_no_loopback_section_and_no_relay_model_picker() {
         use crate::state::ReplySourceRead;
         let gone = [
             "settings-reply-source-url",
@@ -14098,7 +14439,8 @@ mod tests {
         ];
         let mut host = host();
         host.account_open = true;
-        host.reply_source_tab = true;
+        host.computer_tab = true;
+        host.computers = vec![a_card("mac_1", true)];
         let with_everything = crate::opengrok::InferenceSource {
             kind: crate::opengrok::InferenceKind::LocalProxy,
             base_url: Some("http://127.0.0.1:8080".into()),
@@ -14122,7 +14464,7 @@ mod tests {
         ] {
             host.reply_source.settings.kept = kept;
             let tree = host.snapshot();
-            assert!(tree.find(ids::REPLY_SOURCE).is_some());
+            assert!(tree.find(&ids::computer_card("mac_1")).is_some());
             for id in gone {
                 assert!(tree.find(id).is_none(), "{id}");
                 let refused = host.click(id).unwrap_err();
@@ -14151,15 +14493,15 @@ mod tests {
         );
     }
 
-    /// A key pressed at the relay's address or key field is answered as the page answers typing
+    /// A key pressed at the relay's address or key field is answered as the card answers typing
     /// there, never with the list of what takes text as if the field were not one: first why the
-    /// page draws it read-only (off the page, before the setting is read, a server without the
+    /// card draws it read-only (off the page, before the setting is read, a server without the
     /// relay, and for the key a Remove key waiting for Save), and otherwise what writes it.
-    /// `set_value` and `type` are refused for the same reasons. None of them leaves a command or
-    /// a keystroke behind, so no draft changes.
+    /// `set_value` and `type` are refused for the same reasons. None of them leaves a command or a
+    /// keystroke behind, so no draft changes.
     #[test]
-    fn a_key_at_a_relay_field_is_refused_as_the_page_refuses_typing() {
-        use crate::components::reply_source::RELAY_NOT_ON_SERVER;
+    fn a_key_at_a_relay_field_is_refused_as_the_card_refuses_typing() {
+        use crate::components::computers::RELAY_NOT_ON_SERVER;
         use crate::opengrok::InferenceKind;
         use crate::state::ReplySourceRead;
         let fields = [ids::RELAY_ADDR, ids::RELAY_KEY];
@@ -14175,7 +14517,8 @@ mod tests {
         };
         let mut host = host();
         host.account_open = true;
-        host.reply_source_tab = true;
+        host.computer_tab = true;
+        host.computers = vec![a_card("mac_1", true)];
         for field in fields {
             for op in typing(field) {
                 let refused = host.dispatch(&op).unwrap_err();
@@ -14228,11 +14571,11 @@ mod tests {
             Some(Command::SetRelayAddress(address)) if address == "http://127.0.0.1:9090"
         ));
 
-        host.reply_source_tab = false;
+        host.computer_tab = false;
         for field in fields {
             for op in typing(field) {
                 let refused = host.dispatch(&op).unwrap_err();
-                assert!(refused.contains(ids::SETTINGS_REPLY_SOURCE), "{refused}");
+                assert!(refused.contains("settings-tab-computer"), "{refused}");
             }
         }
         assert!(host.take_compose().is_none() && host.take_command().is_none());
@@ -14331,10 +14674,9 @@ mod tests {
         assert!(line.contains("not a control"), "{line}");
         assert!(host.take_command().is_none());
 
-        state.app_settings_tab = AppSettingsTab::ReplySource;
+        state.app_settings_tab = AppSettingsTab::Computer;
         let mut host = NativeChatHost::from_app(&state);
         let tree = host.snapshot();
-        assert!(tree.find(ids::REPLY_SOURCE).is_some());
         assert!(tree.find(ids::DEFAULT_MODELS).is_none() && tree.find(ids::NEW_BOTS).is_none());
         let off = host.click(ids::NEW_BOTS_CARD).unwrap_err();
         assert!(off.contains(ids::SETTINGS_GENERAL), "{off}");
@@ -14565,10 +14907,10 @@ mod tests {
         assert!(line.contains("a line"), "{line}");
         assert!(host.take_command().is_none());
 
-        // Off the page, nothing of it answers, on Relay as anywhere else; the Bot's picker is a
+        // Off the page, nothing of it answers, on Computer as anywhere else; the Bot's picker is a
         // picker of its own.
         host.general_tab = false;
-        host.reply_source_tab = true;
+        host.computer_tab = true;
         let off = host.click(ids::NEW_BOTS_CARD).unwrap_err();
         assert!(off.contains(ids::SETTINGS_GENERAL), "{off}");
         let off = host.set_value("settings-new-bots-search", "x").unwrap_err();
@@ -14790,14 +15132,13 @@ mod tests {
         assert_eq!((card.name.as_str(), card.enabled), ("Grok 4.7", true));
     }
 
-    /// The relay card has no line or button of its own for the account's way to the plan: the
-    /// switch points the account at this computer as it goes on. With the relay on, whatever way
-    /// the account keeps, and a refusal of the switch's change said, neither the line, its button
-    /// nor a line under them is on the tree, and each is refused as not on the card, with nothing
+    /// The cards have no line or button of their own for the account's way to the plan: a switch
+    /// going on points the account at the relay in the same press. With the relay on, whatever way
+    /// the account keeps, and a refusal of what the switch sent said, neither the line, its button
+    /// nor a line under them is on the tree, and each is refused as not on screen, with nothing
     /// sent.
     #[test]
-    fn the_relay_card_has_no_line_or_button_for_the_accounts_way() {
-        use crate::state::{AccountChange, ChangeNote, RelayLine};
+    fn the_cards_have_no_line_or_button_for_the_accounts_way() {
         let gone = [
             "settings-relay-via",
             "settings-relay-via-use",
@@ -14805,23 +15146,19 @@ mod tests {
         ];
         let mut host = host();
         host.account_open = true;
-        host.reply_source_tab = true;
+        host.computer_tab = true;
+        host.computers = vec![ComputerCard {
+            note: Some("via must be \"loopback\" or \"mac\"".into()),
+            ..a_card("mac_1", true)
+        }];
         host.reply_source.relay = RelaySnap {
-            on: true,
-            switch_live: true,
-            enrolled: true,
-            line: Some(RelayLine::NotConnected { why: None }),
             address: "http://127.0.0.1:8080".into(),
             ..RelaySnap::default()
         };
-        host.reply_source.settings.change_note = Some((
-            AccountChange::Relay,
-            ChangeNote::Refused("via must be \"loopback\" or \"mac\"".into()),
-        ));
         for way in ["loopback", "mac", "helper"] {
             host.reply_source.settings.kept = relay_read(way);
             let tree = host.snapshot();
-            assert!(tree.find(ids::RELAY_SWITCH).is_some(), "{way}");
+            assert!(tree.find(&ids::computer_relay("mac_1")).is_some(), "{way}");
             for id in gone {
                 assert!(tree.find(id).is_none(), "{way}: {id}");
                 let refused = host.click(id).unwrap_err();
@@ -14832,266 +15169,6 @@ mod tests {
             }
             assert!(host.take_command().is_none(), "{way}");
         }
-    }
-
-    /// What became of the switch's change is under the switch, as a line and not a control: a
-    /// refusal in the server's words, or that nobody knows whether it was kept. The switch stays
-    /// as the person put it, on, and still goes off at a click. A pick for new Bots' words are its
-    /// own, under its picker.
-    #[test]
-    fn a_refusal_of_the_switchs_change_is_under_the_switch_and_the_switch_stays_on() {
-        use crate::state::{ACCOUNT_CHANGE_UNKNOWN, AccountChange, ChangeNote, RelayLine};
-        let said = "via \"helper\" is not built yet (#293); use \"loopback\" or \"mac\"";
-        let mut host = host();
-        host.account_open = true;
-        host.reply_source_tab = true;
-        host.reply_source.settings.kept = relay_read("loopback");
-        host.reply_source.relay = RelaySnap {
-            on: true,
-            switch_live: true,
-            enrolled: true,
-            line: Some(RelayLine::Connecting),
-            address: "http://127.0.0.1:8080".into(),
-            ..RelaySnap::default()
-        };
-        assert!(
-            host.snapshot().find(ids::RELAY_SWITCH_ERROR).is_none(),
-            "nothing said"
-        );
-
-        host.reply_source.settings.change_note =
-            Some((AccountChange::Relay, ChangeNote::Refused(said.into())));
-        let tree = host.snapshot();
-        let switch = tree.find(ids::RELAY_SWITCH).unwrap();
-        assert_eq!((switch.checked, switch.enabled), (Some(true), true));
-        assert_eq!(tree.find(ids::RELAY_SWITCH_ERROR).unwrap().name, said);
-        assert_eq!(
-            tree.find(ids::RELAY)
-                .unwrap()
-                .children
-                .iter()
-                .map(|node| node.id.as_str())
-                .take(3)
-                .collect::<Vec<_>>(),
-            [
-                ids::RELAY_SWITCH,
-                ids::RELAY_SWITCH_ERROR,
-                ids::RELAY_STATUS
-            ],
-            "under the switch"
-        );
-        assert!(tree.ids_are_unique());
-        let line = host.click(ids::RELAY_SWITCH_ERROR).unwrap_err();
-        assert!(line.contains("a line on the card"), "{line}");
-        host.click(ids::RELAY_SWITCH).unwrap();
-        assert!(matches!(
-            host.take_command(),
-            Some(Command::SetRelayOn(false))
-        ));
-
-        host.reply_source.settings.change_note = Some((AccountChange::Relay, ChangeNote::Unknown));
-        assert_eq!(
-            host.snapshot().find(ids::RELAY_SWITCH_ERROR).unwrap().name,
-            ACCOUNT_CHANGE_UNKNOWN
-        );
-        host.reply_source.settings.change_note =
-            Some((AccountChange::NewBots, ChangeNote::Refused(said.into())));
-        assert!(host.snapshot().find(ids::RELAY_SWITCH_ERROR).is_none());
-    }
-
-    /// The relay is on the tree as the card draws it, from a server that knows the relay: the
-    /// switch, the status line and the line under it, opencodex's address, and the key field
-    /// (never its text) with Remove key, in words for any computer. The switch acts at once, off
-    /// always and on once this computer is enrolled; the rest are the page's, and refused off the
-    /// page and from a server without the relay. The typed key is never on the tree.
-    #[test]
-    fn the_relay_card_is_on_the_tree_and_clicks_as_the_card_does() {
-        use crate::components::reply_source::{
-            RELAY_ADDR_LABEL, RELAY_KEY_LABEL, RELAY_NOT_ENROLLED, RELAY_NOT_ON_SERVER,
-            RELAY_TAKE_BACK, REMOVE_KEY_LABEL,
-        };
-        use crate::opengrok::InferenceKind;
-        use crate::state::{RelayLine, ReplySourceRead};
-        let mut host = host();
-        assert!(host.click(ids::RELAY_SWITCH).is_err(), "Settings is shut");
-        host.account_open = true;
-        host.reply_source_tab = true;
-
-        // A server from before the relay: no card, and nothing to press.
-        host.reply_source.settings.kept = Some(ReplySourceRead::Read(kept_source(
-            InferenceKind::Gateway,
-            true,
-        )));
-        let tree = host.snapshot();
-        assert!(tree.find(ids::RELAY).is_none());
-        let refused = host.click(ids::RELAY_SWITCH).unwrap_err();
-        assert!(refused.contains(RELAY_NOT_ON_SERVER), "{refused}");
-        assert!(
-            host.set_value(ids::RELAY_ADDR, "http://127.0.0.1:9090")
-                .is_err()
-        );
-
-        // A server with the relay, and this computer not enrolled yet: the card says why the
-        // switch is dead.
-        host.reply_source.settings.kept = relay_read("loopback");
-        host.reply_source.relay = RelaySnap {
-            address: "http://127.0.0.1:8080".into(),
-            line: Some(RelayLine::NotConnected { why: None }),
-            ..RelaySnap::default()
-        };
-        let tree = host.snapshot();
-        let switch = tree.find(ids::RELAY_SWITCH).unwrap();
-        assert_eq!((switch.checked, switch.enabled), (Some(false), false));
-        assert_eq!(
-            tree.find(ids::RELAY_UNAVAILABLE).unwrap().name,
-            RELAY_NOT_ENROLLED
-        );
-        let status = tree.find(ids::RELAY_STATUS).unwrap();
-        assert_eq!(
-            (status.name.as_str(), status.value.as_deref()),
-            ("Not connected", Some("not-connected"))
-        );
-        let dead = host.click(ids::RELAY_SWITCH).unwrap_err();
-        assert!(dead.contains(RELAY_NOT_ENROLLED), "{dead}");
-        assert!(tree.ids_are_unique());
-
-        // Enrolled, relaying, with a key kept: who is relaying, and nothing of what it is doing.
-        host.reply_source.relay = RelaySnap {
-            on: true,
-            switch_live: true,
-            enrolled: true,
-            line: Some(RelayLine::Answering),
-            detail: None,
-            address: "http://127.0.0.1:8080".into(),
-            has_key: true,
-            key_typed: true,
-        };
-        let tree = host.snapshot();
-        assert!(tree.find(ids::RELAY_UNAVAILABLE).is_none());
-        let switch = tree.find(ids::RELAY_SWITCH).unwrap();
-        assert_eq!((switch.checked, switch.enabled), (Some(true), true));
-        let status = tree.find(ids::RELAY_STATUS).unwrap();
-        assert_eq!(
-            (status.name.as_str(), status.value.as_deref()),
-            ("This computer is relaying", Some("answering"))
-        );
-        for node in &tree.find(ids::RELAY).unwrap().children {
-            assert!(
-                !node.name.contains("in progress")
-                    && node
-                        .value
-                        .as_deref()
-                        .is_none_or(|value| !value.contains("in progress")),
-                "{node:?}"
-            );
-        }
-        let address = tree.find(ids::RELAY_ADDR).unwrap();
-        assert_eq!(
-            (address.name.as_str(), address.value.as_deref()),
-            (RELAY_ADDR_LABEL, Some("http://127.0.0.1:8080"))
-        );
-        let key = tree.find(ids::RELAY_KEY).unwrap();
-        assert_eq!(key.name, RELAY_KEY_LABEL);
-        assert!(key.value.is_none(), "the key is never on the tree");
-        assert!(
-            key.states.contains(&"set".to_string()) && key.states.contains(&"typed".to_string())
-        );
-        assert_eq!(
-            tree.find(ids::RELAY_KEY_REMOVE).unwrap().name,
-            REMOVE_KEY_LABEL
-        );
-        assert_eq!(
-            tree.find(ids::RELAY)
-                .unwrap()
-                .children
-                .iter()
-                .map(|node| node.id.as_str())
-                .collect::<Vec<_>>(),
-            [
-                ids::RELAY_SWITCH,
-                ids::RELAY_STATUS,
-                ids::RELAY_ADDR,
-                ids::RELAY_KEY,
-                ids::RELAY_KEY_REMOVE
-            ],
-            "no model of the relay's own, and nothing of the account's way: the relay is on while \
-             the account still asks the server's own machine first, and the card says nothing of it"
-        );
-        assert!(tree.ids_are_unique());
-
-        // Each control is the card's own.
-        host.click(ids::RELAY_SWITCH).unwrap();
-        assert!(matches!(
-            host.take_command(),
-            Some(Command::SetRelayOn(false))
-        ));
-        host.click(ids::RELAY_KEY_REMOVE).unwrap();
-        assert!(matches!(
-            host.take_command(),
-            Some(Command::ToggleRemoveRelayKey)
-        ));
-        host.set_value(ids::RELAY_ADDR, "http://127.0.0.1:9090")
-            .unwrap();
-        assert!(matches!(
-            host.take_command(),
-            Some(Command::SetRelayAddress(address)) if address == "http://127.0.0.1:9090"
-        ));
-        host.type_into(ids::RELAY_ADDR, "1").unwrap();
-        assert!(matches!(
-            host.take_command(),
-            Some(Command::SetRelayAddress(address)) if address == "http://127.0.0.1:80801"
-        ));
-        host.set_value(ids::RELAY_KEY, "opencodex-test-key")
-            .unwrap();
-        let typed = host.take_command().expect("the key goes to the page");
-        assert!(!format!("{typed:?}").contains("opencodex-test-key"));
-        assert!(matches!(typed, Command::SetRelayKey(key) if key.0 == "opencodex-test-key"));
-        assert!(host.type_into(ids::RELAY_KEY, "more").is_err());
-        assert!(
-            host.dispatch(&Op::key(ids::RELAY_ADDR, "backspace"))
-                .is_err()
-        );
-        assert!(
-            host.click(ids::RELAY_STATUS).is_err(),
-            "a line is not a control"
-        );
-
-        // Replaced by another computer: its name, and how to take the relay back.
-        host.reply_source.relay.line = Some(RelayLine::Another {
-            label: Some("NativeChat on studio".into()),
-        });
-        host.reply_source.relay.detail = Some(RELAY_TAKE_BACK.into());
-        let tree = host.snapshot();
-        let status = tree.find(ids::RELAY_STATUS).unwrap();
-        assert_eq!(
-            (status.name.as_str(), status.value.as_deref()),
-            (
-                "Another computer (NativeChat on studio) is relaying",
-                Some("another-mac")
-            )
-        );
-        assert_eq!(tree.find(ids::RELAY_DETAIL).unwrap().name, RELAY_TAKE_BACK);
-
-        // The computer is the account's door, as the server keeps it: the section says so.
-        host.reply_source.settings.kept = relay_read("mac");
-        if let Some(ReplySourceRead::Read(kept)) = host.reply_source.settings.kept.as_mut() {
-            kept.kind = InferenceKind::LocalProxy;
-        }
-        let tree = host.snapshot();
-        assert!(
-            tree.find(ids::REPLY_SOURCE)
-                .unwrap()
-                .states
-                .contains(&"via-mac".to_string())
-        );
-
-        // The snapshot never holds the key the page does.
-        let mut state = AppState::new();
-        state.reply_source.kept = relay_read("loopback");
-        state.reply_source.relay_key_draft = crate::opengrok::RelayKey::new("opencodex-test-key");
-        let host = NativeChatHost::from_app(&state);
-        assert!(host.reply_source.relay.key_typed && host.reply_source.unsaved);
-        assert_eq!(host.reply_source.settings.relay_key_draft, None);
     }
 
     /// A reply the server's paid keys answered because the relay is off wears its badge on the
