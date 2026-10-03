@@ -13229,12 +13229,19 @@ impl AppState {
                     return;
                 };
                 let _ = this.update(cx, |state, cx| {
-                    state.model_pick_note = Some((bot, error));
+                    state.note_model_pick_refused(bot, error);
                     cx.notify();
                 });
             })),
             cx,
         );
+    }
+
+    /// The server's words for a change of the Bot's picker that it refused, said in the popover
+    /// until the next change is sent: an effort the model does not list, in the words that name
+    /// the levels it does.
+    fn note_model_pick_refused(&mut self, bot: String, said: String) {
+        self.model_pick_note = Some((bot, said));
     }
 
     /// None, Default for new Bots' first row: the default the server keeps goes, and a new Bot is
@@ -37579,6 +37586,112 @@ mod tests {
             .enable_all()
             .build()
             .expect("a runtime")
+    }
+
+    /// An effort the model does not list is refused with a 400 whose words name the levels it
+    /// does list (opengrok-server branch `model-effort-levels`, shape agreed (not recorded yet),
+    /// so the words here are samples), and nothing is kept. Each picker says the words as they
+    /// are, under its controls, where it asked: a Bot's, Default for new Bots' and the Relay-off
+    /// fallback's.
+    #[tokio::test]
+    async fn a_refused_effort_shows_the_servers_words_in_all_three_pickers() {
+        use super::{AfterChange, DefaultForNewBots, PickerFor, RelayOffFallback};
+        use crate::opengrok::CoworkerPatch;
+        let bots =
+            "effort: `ultra` is not one of gpt-6-luna's levels: low, medium, high, xhigh, max";
+        let defaults = "newBotDefault.effort: `ultra` is not one of gpt-6-luna's levels: low, medium, high, \
+             xhigh, max";
+        let fallbacks = "planFallback.effort: `ultra` is not one of oag/cheap's levels: low, medium, high, \
+             xhigh, max";
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("PATCH"))
+            .and(wiremock::matchers::path("/coworkers/cw_1"))
+            .and(wiremock::matchers::body_json(json!({"effort": "ultra"})))
+            .respond_with(
+                wiremock::ResponseTemplate::new(400).set_body_json(json!({"error": bots})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        for (key, said) in [("newBotDefault", defaults), ("planFallback", fallbacks)] {
+            wiremock::Mock::given(wiremock::matchers::method("PUT"))
+                .and(wiremock::matchers::path("/account/inference-source"))
+                .and(wiremock::matchers::body_partial_json(json!({
+                    (key): {"effort": "ultra"}
+                })))
+                .respond_with(
+                    wiremock::ResponseTemplate::new(400).set_body_json(json!({"error": said})),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+        }
+        let mut state = signed_in_state();
+        state.opengrok = Some(client_signed_in_to(&server).await);
+        with_bot(&mut state, json!("local_proxy"));
+        read_as(
+            &mut state,
+            InferenceSource {
+                new_bot_default: Some(Some(luna("high"))),
+                plan_fallback: Some(Some(cheap("high"))),
+                ..relay_kept(InferenceKind::Gateway, "loopback", None)
+            },
+        );
+
+        // A Bot's: the client reads the 400 as the server's sentence, and the picker says it.
+        let error = state
+            .opengrok
+            .clone()
+            .expect("a client")
+            .patch_coworker(
+                "cw_1",
+                &CoworkerPatch {
+                    effort: Some("ultra".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("the server refused it");
+        assert_eq!((error.status, error.message.as_str()), (Some(400), bots));
+        assert_eq!(state.picker_note(PickerFor::Bot), None);
+        state.note_model_pick_refused("cw_1".into(), error.message);
+        assert_eq!(state.picker_note(PickerFor::Bot), Some(bots));
+
+        // Default for new Bots': its own words, kept nowhere, and said where it asked.
+        let send = state
+            .begin_new_bots_change(Some(luna("ultra")))
+            .expect("a change begins");
+        let answer = send.client.set_inference_source(&send.update).await;
+        assert_eq!(
+            state.settle_account_change(send.generation, send.about, answer),
+            Some(AfterChange::Done)
+        );
+        assert_eq!(state.picker_note(PickerFor::NewBots), Some(defaults));
+        assert_eq!(
+            state.default_for_new_bots(),
+            DefaultForNewBots::Kept(Some(luna("high"))),
+            "nothing was kept"
+        );
+
+        // The Relay-off fallback's.
+        let send = state
+            .begin_plan_fallback_change(Some(cheap("ultra")))
+            .expect("a change begins");
+        let answer = send.client.set_inference_source(&send.update).await;
+        assert_eq!(
+            state.settle_account_change(send.generation, send.about, answer),
+            Some(AfterChange::Done)
+        );
+        assert_eq!(state.picker_note(PickerFor::PlanFallback), Some(fallbacks));
+        assert_eq!(
+            state.relay_off_fallback(),
+            RelayOffFallback::Kept(Some(cheap("high")))
+        );
+        assert_eq!(
+            state.picker_note(PickerFor::NewBots),
+            None,
+            "the account's one slot holds the last refusal, and says it where it was asked"
+        );
     }
 
     /// A pick that puts the effort back on the model's own level says so under the slider, for
