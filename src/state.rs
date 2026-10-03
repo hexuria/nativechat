@@ -20,8 +20,8 @@ use crate::opengrok::{
     OpenGrokError, PendingCustom, PendingOp, PendingUserMessage, PendingWrite, PlanFallback,
     ProfileUpdate, QueuedApproval, RecipeDetail, RecipeKind, RecipeParameter, RecipeRun,
     RecipeRunResult, RecipeShareTarget, RecipeStep, RecipeSummary, RelayHandle, RelayKey,
-    RelayReport, RelayStatus, RelayTarget, RelayTimings, ReplyQuote, ReplySource, RunCause,
-    RunErrorCode, RunRecipeResponse, RunReplay, SKILL_BODY_CHARS, SKILL_BUNDLE_FILES,
+    RelayReport, RelayStatus, RelayTarget, RelayTimings, ReplyQuote, ReplySource, RoutineChanges,
+    RunCause, RunErrorCode, RunRecipeResponse, RunReplay, SKILL_BODY_CHARS, SKILL_BUNDLE_FILES,
     SKILL_BUNDLE_LIMIT, SaveLoginSpec, ScheduleEdit, ScheduleKind, ScheduleRow, ScheduleRun,
     ScheduleRunStatus, ScreenshotSpec, SkillDetail, SkillFile, SkillPatch, SkillSource,
     SkillSummary, ThreadListing, ThreadReplay, ThreadRun, ToolCallTracker, TurnAssembler,
@@ -5161,6 +5161,11 @@ pub struct AppState {
     /// can both have one out, and an older page that missed a run must not delete the line a
     /// newer one already settled.
     routine_runs_asked: HashMap<String, u64>,
+    /// A read of the open Bot's routines is out because a Bot changed them in a turn
+    /// ([`Self::routines_changed`]), and whether another change asked for one meanwhile, which
+    /// goes when it lands: one at a time, as the Computer pane's status request is.
+    routines_reread_in_flight: bool,
+    routines_reread_again: bool,
     /// The latest edit started for each routine, kept after it settles. A read of the server's
     /// copy started before it is older than what it saved, and is dropped.
     routine_latest_edit: HashMap<String, u64>,
@@ -5919,6 +5924,8 @@ impl AppState {
             routine_edits: HashMap::new(),
             routine_seq: 0,
             routine_runs_asked: HashMap::new(),
+            routines_reread_in_flight: false,
+            routines_reread_again: false,
             routine_latest_edit: HashMap::new(),
             routine_resyncs: HashMap::new(),
             routine_routes_missing: RoutineRoutesMissing::default(),
@@ -12205,36 +12212,110 @@ impl AppState {
         cx.spawn(async move |this, cx| {
             let result = client.list_schedules(&coworker_id).await;
             let _ = this.update(cx, |state, cx| {
-                // A late answer for a bot the person has since left is stale.
-                if state.active_coworker_id.as_deref() != Some(coworker_id.as_str()) {
-                    return;
+                if state.take_routines(coworker_id, result) {
+                    cx.notify();
                 }
-                match result {
-                    Ok(rows) => {
-                        // A draft has no trigger, which means it has never been to the server,
-                        // which means no listing can know about it. Somebody is writing it.
-                        let mut routines: Vec<AgentRoutine> = state
-                            .routines
-                            .get(&coworker_id)
-                            .map(|rows| {
-                                rows.iter()
-                                    .filter(|row| row.triggers.is_empty())
-                                    .cloned()
-                                    .collect()
-                            })
-                            .unwrap_or_default();
-                        routines.extend(relisted(
-                            state.routines.get(&coworker_id).map(Vec::as_slice),
-                            rows,
-                        ));
-                        state.routines.insert(coworker_id, routines);
-                    }
-                    Err(error) => state.computer_action_error = Some(routine_trouble(&error)),
-                }
-                cx.notify();
             });
         })
         .detach();
+    }
+
+    /// A read of a Bot's routines landing, and whether it was put on screen: not for a Bot the
+    /// person has since left, whose answer is stale.
+    fn take_routines(
+        &mut self,
+        coworker_id: String,
+        result: Result<Vec<ScheduleRow>, OpenGrokError>,
+    ) -> bool {
+        if self.active_coworker_id.as_deref() != Some(coworker_id.as_str()) {
+            return false;
+        }
+        match result {
+            Ok(rows) => {
+                // A draft has no trigger, which means it has never been to the server, which
+                // means no listing can know about it. Somebody is writing it.
+                let mut routines: Vec<AgentRoutine> = self
+                    .routines
+                    .get(&coworker_id)
+                    .map(|rows| {
+                        rows.iter()
+                            .filter(|row| row.triggers.is_empty())
+                            .cloned()
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                routines.extend(relisted(
+                    self.routines.get(&coworker_id).map(Vec::as_slice),
+                    rows,
+                ));
+                self.routines.insert(coworker_id, routines);
+            }
+            Err(error) => self.computer_action_error = Some(routine_trouble(&error)),
+        }
+        true
+    }
+
+    /// A Bot made, changed, deleted or ran one of the person's routines in a turn
+    /// ([`RoutineChanges`]), and the server has it already. The open Bot's Routines list is read
+    /// again, and so is the history of the routine open in the Computer pane, so neither waits for
+    /// the person to switch Bots and back. It is the open Bot's list whichever Bot's turn it was:
+    /// a Bot can make a routine for another of its person's Bots.
+    fn routines_changed(&mut self, cx: &mut Context<Self>) {
+        self.read_routines_again(cx);
+        if self.right_pane == RightPane::Computer
+            && let (
+                Some(coworker_id),
+                ComputerView::Editor {
+                    id: Some(routine_id),
+                },
+            ) = (self.active_coworker_id.clone(), self.computer_view.clone())
+        {
+            self.load_routine_runs(&coworker_id, &routine_id, cx);
+        }
+    }
+
+    /// The open Bot's routines read again after a Bot changed them, one read at a time: a change
+    /// answered while a read is out asks for one more when it lands, so the list ends on what the
+    /// server has after the last of them, and a turn that makes five routines sends no five reads
+    /// to race each other.
+    fn read_routines_again(&mut self, cx: &mut Context<Self>) {
+        let (Some(client), Some(coworker_id)) =
+            (self.opengrok.clone(), self.active_coworker_id.clone())
+        else {
+            return;
+        };
+        if !self.begin_routines_reread() {
+            return;
+        }
+        cx.spawn(async move |this, cx| {
+            let result = client.list_schedules(&coworker_id).await;
+            let _ = this.update(cx, |state, cx| {
+                if state.settle_routines_reread() {
+                    state.read_routines_again(cx);
+                }
+                if state.take_routines(coworker_id, result) {
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Whether a read of the routines may go out now. One is out already: this one is kept as
+    /// "again", and goes when that answer lands.
+    fn begin_routines_reread(&mut self) -> bool {
+        if self.routines_reread_in_flight {
+            self.routines_reread_again = true;
+            return false;
+        }
+        self.routines_reread_in_flight = true;
+        true
+    }
+
+    /// The read's answer landed. True when another was asked for meanwhile, to send now.
+    fn settle_routines_reread(&mut self) -> bool {
+        self.routines_reread_in_flight = false;
+        std::mem::take(&mut self.routines_reread_again)
     }
 
     /// Put a routine on the server outright: a prompt and a way of firing it, no draft in
@@ -15372,6 +15453,7 @@ impl AppState {
                         );
                     }
                     let mut tracker = ToolCallTracker::default();
+                    let mut routine_changes = RoutineChanges::default();
                     let mut assembler = TurnAssembler::default();
                     let mut last_stream_paint: Option<Instant> = None;
                     let mut last_stream_sig = (0usize, 0u8);
@@ -15390,6 +15472,11 @@ impl AppState {
                             retry_of.as_deref(),
                             turn_source,
                             |event, arrived_at| {
+                                // A routine the Bot made, changed, deleted or ran is the server's
+                                // the moment the call answers, whatever becomes of the turn.
+                                if routine_changes.answered(event) {
+                                    let _ = this.update(cx, |state, cx| state.routines_changed(cx));
+                                }
                                 match tracker.tick(event) {
                                     ActivityTick::Keep => {}
                                     tick => {
@@ -16283,6 +16370,10 @@ impl AppState {
             // When each call's end and answer first came back, so the calls this poll saw
             // happen can say how long they took.
             let mut arrivals = FrameArrivals::default();
+            // The routines the run changed, read off each frame once: every poll brings the run's
+            // frames from its first, and how many have been read is where the next poll goes on.
+            let mut routine_changes = RoutineChanges::default();
+            let mut frames_read = 0usize;
             for _ in 0..400 {
                 if registered {
                     let settled = this
@@ -16301,6 +16392,18 @@ impl AppState {
                 match client.replay_run(&run_id).await {
                     Ok(replay) => {
                         arrivals.note(&replay.events, Instant::now());
+                        let changed = replay
+                            .events
+                            .get(frames_read..)
+                            .unwrap_or_default()
+                            .iter()
+                            .filter(|frame| routine_changes.answered(frame))
+                            .count()
+                            > 0;
+                        frames_read = frames_read.max(replay.events.len());
+                        if changed {
+                            let _ = this.update(cx, |state, cx| state.routines_changed(cx));
+                        }
                         // The status counts as news of its own: the frame that ends a run is
                         // often one the last poll already saw, and a run that stopped holding
                         // its text back has words to show for it even when nothing new arrived.
@@ -27870,6 +27973,227 @@ mod tests {
             .mount(&server)
             .await;
         server
+    }
+
+    // ---- A routine a Bot changes in chat is on screen when its call answers ---------------------
+
+    /// One of Ada's routines as `GET /schedules` lists it (opengrok-server #342, as recorded in
+    /// `fixtures/wire/rest/GET__schedules/200-a_bot_runs_a_routine_by_its_id_and_its_history_names_the_bot.json`).
+    fn adas_schedule(id: &str, name: &str) -> serde_json::Value {
+        json!({"id": id, "coworkerId": "cw_1", "name": name, "cron": "0 0 9 * * MON-FRI",
+               "prompt": "post the standup", "kind": "cron", "active": true,
+               "nextDueMs": 1_790_000_000_000_i64,
+               "runLimits": {"maxRounds": null, "maxComputerRounds": null, "maxWallMs": null},
+               "lastRun": null, "tz": "UTC"})
+    }
+
+    /// The frames of one Bot turn that calls `tool` with `arguments`, which answers `ok` with
+    /// `answered`, and says so; as the server streams a builtin's call (the recorded run in
+    /// `fixtures/wire/rest/GET__ag-ui_threads__thread_id_/200-a_bot_runs_a_routine_by_its_id_and_its_history_names_the_bot.json`).
+    fn a_turn_calling(tool: &str, arguments: &str, answered: &str) -> Vec<serde_json::Value> {
+        vec![
+            json!({"type": "RUN_STARTED", "threadId": "cw_1", "runId": "run_turn"}),
+            json!({"type": "TOOL_CALL_START", "toolCallId": "call-routine", "toolCallName": tool}),
+            json!({"type": "TOOL_CALL_ARGS", "toolCallId": "call-routine", "delta": arguments}),
+            json!({"type": "TOOL_CALL_END", "toolCallId": "call-routine"}),
+            json!({"type": "TOOL_CALL_RESULT", "toolCallId": "call-routine", "ok": true,
+                   "content": answered}),
+            json!({"type": "TEXT_MESSAGE_START", "messageId": "m_said", "role": "assistant"}),
+            json!({"type": "TEXT_MESSAGE_CONTENT", "messageId": "m_said", "delta": "Done."}),
+            json!({"type": "TEXT_MESSAGE_END", "messageId": "m_said"}),
+            json!({"type": "RUN_FINISHED", "threadId": "cw_1", "runId": "run_turn"}),
+        ]
+    }
+
+    /// A window signed in to `server` with Ada (`cw_1`) open on her thread, holding `routines` as
+    /// her routines, and `server` answering every turn with `frames` and every read of Ada's
+    /// routines with `listed`.
+    fn adas_window(
+        cx: &mut gpui_kit::TestAppContext,
+        runtime: &tokio::runtime::Runtime,
+        server: &wiremock::MockServer,
+        frames: &[serde_json::Value],
+        listed: serde_json::Value,
+        routines: Vec<super::AgentRoutine>,
+    ) -> gpui_kit::Entity<AppState> {
+        use gpui_kit::AppContext as _;
+        use wiremock::matchers::{method, path, query_param};
+        let stream: String = frames
+            .iter()
+            .map(|frame| format!("data: {frame}\n\n"))
+            .collect();
+        let client = runtime.block_on(async {
+            wiremock::Mock::given(method("POST"))
+                .and(path("/ag-ui"))
+                .respond_with(
+                    wiremock::ResponseTemplate::new(200)
+                        .insert_header("content-type", "text/event-stream")
+                        .set_body_string(stream),
+                )
+                .mount(server)
+                .await;
+            wiremock::Mock::given(method("GET"))
+                .and(path("/schedules"))
+                .and(query_param("coworker", "cw_1"))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(listed))
+                .mount(server)
+                .await;
+            client_signed_in_to(server).await
+        });
+        let mut state = signed_in_state();
+        state.opengrok = Some(client);
+        with_bot(&mut state, json!("gateway"));
+        state.conversations.push(thread("cw_1", Vec::new()));
+        state.active_conversation_id = Some("cw_1".into());
+        state.routines.insert("cw_1".into(), routines);
+        cx.new(|_| state)
+    }
+
+    /// A Bot asked in chat makes a routine with `create_routine` (opengrok-server #316:
+    /// `crates/opengrok-tools/src/routine.rs`), and the server has it the moment the call answers.
+    /// The Routines list is read again then, once, and lists it, with nobody switching Bots and back
+    /// for the list to be read.
+    #[gpui_kit::test]
+    fn a_routine_a_bot_makes_in_a_turn_is_listed_when_its_call_answers(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        let runtime = a_runtime_for_the_relay(cx);
+        let _enter = runtime.enter();
+        let server = runtime.block_on(wiremock::MockServer::start());
+        let frames = a_turn_calling(
+            "create_routine",
+            r#"{"name":"Standup","prompt":"post the standup","when":{"cron":"0 9 * * MON-FRI"}}"#,
+            r#"{"id":"sched_new","name":"Standup"}"#,
+        );
+        let listed = json!([adas_schedule("sched_new", "Standup")]);
+        let app = adas_window(cx, &runtime, &server, &frames, listed, Vec::new());
+        app.update(cx, |state, cx| {
+            state.send_message("Make me a standup routine at 9 on weekdays".into(), cx)
+        });
+        wait_for(cx, "the Bot's new routine is listed", |cx| {
+            app.read_with(cx, |state, _| {
+                state
+                    .coworker_routines("cw_1")
+                    .iter()
+                    .any(|routine| routine.id == "sched_new" && routine.name == "Standup")
+            })
+        });
+        assert_eq!(asked_for(&runtime, &server, "/schedules"), 1);
+    }
+
+    /// A Bot running a routine (`run_routine`, opengrok-server #337, built in #342) starts a run
+    /// the routine's history lists at once. With that routine open in the Computer pane, on its
+    /// history, the list and the history are both read again when the call answers, and the
+    /// history shows the Bot's run.
+    #[gpui_kit::test]
+    fn a_run_a_bot_starts_is_in_the_open_routines_history_when_its_call_answers(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        let runtime = a_runtime_for_the_relay(cx);
+        let _enter = runtime.enter();
+        let server = runtime.block_on(wiremock::MockServer::start());
+        runtime.block_on(
+            wiremock::Mock::given(wiremock::matchers::method("GET"))
+                .and(wiremock::matchers::path("/schedules/sched_1/runs"))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!([{
+                    "runId": "run_bot", "cause": "bot", "status": "ok",
+                    "startedAtMs": 1_790_000_000_000_i64, "endedAtMs": 1_790_000_001_000_i64,
+                    "by": {"coworkerId": "cw_1", "name": "Ada"}
+                }])))
+                .mount(&server),
+        );
+        let frames = a_turn_calling(
+            "run_routine",
+            r#"{"routine":"sched_1"}"#,
+            r#"{"runId":"run_bot","threadId":"sched_1"}"#,
+        );
+        let standup = adas_schedule("sched_1", "Standup");
+        let routine = super::routine_from_schedule(
+            serde_json::from_value(standup.clone()).expect("a routine"),
+        );
+        let app = adas_window(
+            cx,
+            &runtime,
+            &server,
+            &frames,
+            json!([standup]),
+            vec![routine],
+        );
+        app.update(cx, |state, cx| {
+            state.right_pane = super::RightPane::Computer;
+            state.computer_view = super::ComputerView::Editor {
+                id: Some("sched_1".into()),
+            };
+            state.routine_history_open = true;
+            state.send_message("Run my standup now".into(), cx)
+        });
+        wait_for(cx, "the Bot's run is in the history", |cx| {
+            app.read_with(cx, |state, _| {
+                state.coworker_routines("cw_1").iter().any(|routine| {
+                    routine.id == "sched_1"
+                        && routine
+                            .runs
+                            .iter()
+                            .any(|run| run.by.as_deref() == Some("Ada"))
+                })
+            })
+        });
+        assert_eq!(asked_for(&runtime, &server, "/schedules/sched_1/runs"), 1);
+        wait_for(cx, "the list is read again too", |_| {
+            asked_for(&runtime, &server, "/schedules") == 1
+        });
+    }
+
+    /// A delete always asks first (opengrok-server #316), so its call is answered in the run that
+    /// carries on after the person's yes, which this window follows through the replay route
+    /// ([`AppState::follow_run`]). The call's first answer, `waiting for approval`, deleted nothing
+    /// (`ok: false`, opengrok-tools `ToolResult::awaiting`) and the second did: the Routines list
+    /// is read again once, then, and the routine is gone from it.
+    #[gpui_kit::test]
+    fn a_routine_a_bot_deletes_after_a_yes_leaves_the_list_when_its_call_answers(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        let runtime = a_runtime_for_the_relay(cx);
+        let _enter = runtime.enter();
+        let server = runtime.block_on(wiremock::MockServer::start());
+        let events = json!([
+            {"type": "RUN_STARTED", "threadId": "cw_1", "runId": "run_del"},
+            {"type": "TOOL_CALL_START", "toolCallId": "call-routine",
+             "toolCallName": "delete_routine"},
+            {"type": "TOOL_CALL_ARGS", "toolCallId": "call-routine",
+             "delta": r#"{"routine":"sched_1"}"#},
+            {"type": "TOOL_CALL_END", "toolCallId": "call-routine"},
+            {"type": "TOOL_CALL_RESULT", "toolCallId": "call-routine", "ok": false,
+             "content": "waiting for approval: Delete the routine \"Standup\"? It stops for good."},
+            {"type": "CUSTOM", "name": "run-awaiting-approval", "threadId": "cw_1",
+             "runId": "run_del", "callId": "call-routine", "tool": "delete_routine",
+             "arguments": {"routine": "sched_1"}, "reason": "policy-approval",
+             "why": "Delete the routine \"Standup\"? It stops for good.",
+             "summary": "Delete the routine sched_1"},
+            {"type": "TOOL_CALL_RESULT", "toolCallId": "call-routine", "ok": true,
+             "content": "deleted the routine Standup"},
+            {"type": "RUN_FINISHED", "threadId": "cw_1", "runId": "run_del"}
+        ]);
+        runtime.block_on(
+            wiremock::Mock::given(wiremock::matchers::method("GET"))
+                .and(wiremock::matchers::path("/ag-ui/runs/run_del"))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
+                    "runId": "run_del", "status": "finished",
+                    "startedAtMs": 1_790_000_000_000_i64, "events": events
+                })))
+                .mount(&server),
+        );
+        let routine = super::routine_from_schedule(
+            serde_json::from_value(adas_schedule("sched_1", "Standup")).expect("a routine"),
+        );
+        let app = adas_window(cx, &runtime, &server, &[], json!([]), vec![routine]);
+        app.update(cx, |state, cx| {
+            state.follow_run("run_del".into(), Some("cw_1".into()), cx)
+        });
+        wait_for(cx, "the deleted routine leaves the list", |cx| {
+            app.read_with(cx, |state, _| state.coworker_routines("cw_1").is_empty())
+        });
+        assert_eq!(asked_for(&runtime, &server, "/schedules"), 1);
     }
 
     /// A server from before routines kept a history answers `GET /schedules/{id}/runs` with an

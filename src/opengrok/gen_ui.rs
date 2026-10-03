@@ -546,6 +546,47 @@ pub const DELETE_ROUTINE: &str = "delete_routine";
 /// names the Bot that ran it ([`super::RunBy`]).
 pub const RUN_ROUTINE: &str = "run_routine";
 
+/// The routine tools whose answer changes what the person's routines are or have done: a routine
+/// made, changed or deleted is a row of the Routines list, and one run is a line of its history.
+/// Listing them changes nothing.
+pub(crate) fn changes_routines(tool: &str) -> bool {
+    matches!(
+        tool,
+        CREATE_ROUTINE | UPDATE_ROUTINE | DELETE_ROUTINE | RUN_ROUTINE
+    )
+}
+
+/// Which calls of a run change the person's routines ([`changes_routines`]), from the frame that
+/// names each, so the frame that answers one is known for what it is: a `TOOL_CALL_RESULT` names
+/// no tool. Fed a run's frames in order, each once.
+#[derive(Debug, Default)]
+pub struct RoutineChanges {
+    calls: HashSet<String>,
+}
+
+impl RoutineChanges {
+    /// Whether `frame` is the server's answer to a call that changed the person's routines. Not
+    /// the answer of a call that was refused or that waits on a card (`ok: false`), which changed
+    /// nothing: a delete always asks first, and its call is answered `waiting for approval` before
+    /// the answer that follows a yes (opengrok-tools `ToolResult::awaiting`). An answer that does
+    /// not say is taken as one that did.
+    pub fn answered(&mut self, frame: &Value) -> bool {
+        let Some(call) = frame.get("toolCallId").and_then(Value::as_str) else {
+            return false;
+        };
+        if frame
+            .get("toolCallName")
+            .and_then(Value::as_str)
+            .is_some_and(changes_routines)
+        {
+            self.calls.insert(call.to_string());
+        }
+        frame.get("type").and_then(Value::as_str) == Some("TOOL_CALL_RESULT")
+            && self.calls.contains(call)
+            && frame.get("ok").and_then(Value::as_bool) != Some(false)
+    }
+}
+
 /// The CUSTOM `name` of a run parked on a card: a tool waiting on a yes, or a form waiting on the
 /// person (opengrok-harness `projection.rs` `awaiting_approval`).
 pub(crate) const RUN_AWAITING_APPROVAL: &str = "run-awaiting-approval";
@@ -5458,5 +5499,60 @@ mod tests {
             !one.answers_on_pick(),
             "a question with no choices has nothing to pick"
         );
+    }
+
+    /// The answers that change the person's routines are those of a make, a change, a delete
+    /// and a run, each told once: a listing changes nothing, and neither does another tool's
+    /// answer, nor one that waits on a card or was refused (`ok: false`). An answer is known by its
+    /// call's id from the frame that named the tool, which it does not name itself.
+    #[test]
+    fn a_routine_change_is_known_by_its_calls_answer() {
+        let start = |id: &str, tool: &str| {
+            json!({"type": "TOOL_CALL_START", "toolCallId": id,
+                   "toolCallName": tool})
+        };
+        let answer = |id: &str, ok: Option<bool>| {
+            let mut frame = json!({"type": "TOOL_CALL_RESULT", "toolCallId": id, "content": "x"});
+            if let Some(ok) = ok {
+                frame["ok"] = json!(ok);
+            }
+            frame
+        };
+        let mut changes = RoutineChanges::default();
+        for (id, tool) in [
+            ("make", CREATE_ROUTINE),
+            ("change", UPDATE_ROUTINE),
+            ("delete", DELETE_ROUTINE),
+            ("run", RUN_ROUTINE),
+            ("list", LIST_ROUTINES),
+            ("shell", "shell"),
+        ] {
+            assert!(
+                !changes.answered(&start(id, tool)),
+                "{tool}: not answered yet"
+            );
+            assert!(
+                !changes.answered(&json!({"type": "TOOL_CALL_END", "toolCallId": id})),
+                "{tool}: not answered yet"
+            );
+        }
+        for id in ["make", "change", "run"] {
+            assert!(changes.answered(&answer(id, Some(true))), "{id}");
+        }
+        assert!(
+            changes.answered(&answer("make", None)),
+            "an answer that does not say"
+        );
+        assert!(
+            !changes.answered(&answer("delete", Some(false))),
+            "waiting on a card"
+        );
+        assert!(
+            changes.answered(&answer("delete", Some(true))),
+            "after the yes"
+        );
+        assert!(!changes.answered(&answer("list", Some(true))));
+        assert!(!changes.answered(&answer("shell", Some(true))));
+        assert!(!changes.answered(&answer("never-named", Some(true))));
     }
 }
