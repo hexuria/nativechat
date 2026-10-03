@@ -1564,9 +1564,9 @@ fn picker_field(
         .find(|which| field(model_picker::ids(*which)) == target)
 }
 
-/// Why a picker's slider is not on screen: no model is picked, or the model on the card lists no
-/// levels of effort.
-fn no_slider(pick: &crate::opengrok::ModelPick, target: &str) -> String {
+/// The words a driver is refused in where a picker's slider is not on screen: no model is
+/// picked, or the model on the card lists no levels of effort.
+fn no_slider_refusal(pick: &crate::opengrok::ModelPick, target: &str) -> String {
     let why = if pick.model.is_some() {
         format!("{} lists no levels of effort", pick.model_label())
     } else {
@@ -5891,7 +5891,7 @@ impl NativeChatHost {
                     levels_in_words(pick)
                 )
             } else {
-                no_slider(pick, target)
+                no_slider_refusal(pick, target)
             });
         }
         if target == ids.reset {
@@ -6064,7 +6064,7 @@ impl NativeChatHost {
             ));
         }
         if !pick.has_slider() {
-            return Err(no_slider(pick, target));
+            return Err(no_slider_refusal(pick, target));
         }
         let word = value.trim();
         pick.effort_patch(word)
@@ -14337,9 +14337,9 @@ mod tests {
     /// What `GET /models` lists in the picker tests: two gateway routes, one that lists five
     /// levels of effort and one that lists none, and the plan's GPT-6 Luna with its fast twin
     /// (five levels) and Sol (six, up to ultra), each with a level of its own
-    /// (`opengrok::levelled_catalogue`).
+    /// (`opengrok::model_fixtures::levelled_catalogue`).
     fn a_levelled_catalogue() -> crate::opengrok::ModelCatalogue {
-        crate::opengrok::levelled_catalogue()
+        crate::opengrok::model_fixtures::levelled_catalogue()
     }
 
     /// Default for new Bots' picker, from the default as given, over a list of two plan models

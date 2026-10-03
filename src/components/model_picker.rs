@@ -1197,9 +1197,10 @@ mod tests {
         BOT_IDS, ModelPicker, NEW_BOTS_IDS, NONE_HINT, PLAN_FALLBACK_IDS, card_detail, none_shows,
         row_id, wheel_rows,
     };
+    use crate::opengrok::model_fixtures::levelled_catalogue;
     use crate::opengrok::{
         InferenceKind, InferenceSource, ModelPick, NewBotDefault, OpenGrokClient, PlanFallback,
-        bot_pick, levelled_catalogue, new_bots_pick, plan_fallback_pick,
+        bot_pick, new_bots_pick, plan_fallback_pick,
     };
     use crate::state::{AppState, PickerFor, ReplySourceRead};
     use serde_json::{Value, json};

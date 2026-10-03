@@ -1085,38 +1085,6 @@ impl ModelPick {
     }
 }
 
-/// What `GET /models` lists in the tests that draw a picker (opengrok-server branch
-/// `model-effort-levels`, shape agreed (not recorded yet)): two gateway routes, `oag/cheap`,
-/// which lists five levels of effort, low to max, and `medium` as its own, and `xai/grok-4.7`,
-/// whose source publishes none; and the plan's GPT-6 Luna, with its fast twin, listing the same
-/// five and `medium`, and Sol, six, up to ultra, and `high`.
-#[cfg(test)]
-pub(crate) fn levelled_catalogue() -> ModelCatalogue {
-    let levels = |words: &[&str]| -> Vec<serde_json::Value> {
-        words
-            .iter()
-            .map(|word| {
-                let name = format!("{}{}", word[..1].to_uppercase(), &word[1..]);
-                serde_json::json!({"value": word, "label": format!("{name} Effort")})
-            })
-            .collect()
-    };
-    let five = levels(&["low", "medium", "high", "xhigh", "max"]);
-    let six = levels(&["low", "medium", "high", "xhigh", "max", "ultra"]);
-    serde_json::from_value(serde_json::json!({
-        "models": [
-            {"id": "oag/cheap", "source": "gateway", "efforts": five, "ownEffort": "medium"},
-            {"id": "xai/grok-4.7", "source": "gateway", "efforts": null, "ownEffort": null},
-            {"id": "gpt-6-luna", "source": "local_proxy", "efforts": five, "ownEffort": "medium"},
-            {"id": "gpt-6-luna--fast", "source": "local_proxy", "efforts": five,
-             "ownEffort": "medium"},
-            {"id": "gpt-5.6-sol", "source": "local_proxy", "efforts": six, "ownEffort": "high"}
-        ],
-        "note": null
-    }))
-    .expect("a list")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

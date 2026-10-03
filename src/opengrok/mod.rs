@@ -11,6 +11,9 @@ mod gen_ui;
 mod inference;
 mod local_exec;
 mod model_choice;
+// The list of models the tests that draw a picker read.
+#[cfg(test)]
+pub(crate) mod model_fixtures;
 mod pending;
 mod relay;
 mod timing;
@@ -46,8 +49,6 @@ pub use local_exec::{
     Enrolment, LocalExecStopped, MachineCredential, enrol_this_machine, serve_local_exec,
     stored_machine_id,
 };
-#[cfg(test)]
-pub(crate) use model_choice::levelled_catalogue;
 pub use model_choice::{
     AccountPlan, ChoiceGroup, EFFORT_NOT_KEPT, FAST_ACCOUNT_PLAN, FAST_DOOR_UNKNOWN, FAST_NO_TWIN,
     FAST_SUFFIX, GATEWAY_GROUP, LIST_ROWS, ListLine, ModelChoice, ModelPick, NEW_BOTS_NONE,
@@ -105,6 +106,6 @@ pub use pending::{
 pub use timing::{TurnTiming, stamp_duration};
 pub use types::{
     Account, AguiMessage, Attachment, Coworker, CoworkerPatch, CoworkerSource, EFFORT_INHERIT,
-    EFFORT_WORDS, EffortLevel, LocalProxyStatus, ModelCatalogue, ModelEntry, ProfileUpdate,
-    ReplyQuote, SentAttachment, ThreadListing, assistant_text_from_sse,
+    EffortLevel, LocalProxyStatus, ModelCatalogue, ModelEntry, ProfileUpdate, ReplyQuote,
+    SentAttachment, ThreadListing, assistant_text_from_sse,
 };

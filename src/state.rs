@@ -37451,7 +37451,7 @@ mod tests {
             Some("GPT-6 Luna".to_string()),
             "no list of models read yet, so no levels to name"
         );
-        state.model_catalogue = crate::opengrok::levelled_catalogue();
+        state.model_catalogue = crate::opengrok::model_fixtures::levelled_catalogue();
         assert_eq!(
             state.new_bots_pick().map(|pick| pick.summary()),
             Some("GPT-6 Luna · High".to_string())

@@ -303,7 +303,7 @@ pub struct NewBotDefault {
     pub source: InferenceKind,
     /// The id it is pinned to.
     pub model: String,
-    /// One of a Bot's effort words (`types::EFFORT_WORDS`); left out or `null`, `inherit`.
+    /// A Bot's effort word: a level of the model's, or `inherit`; left out or `null`, `inherit`.
     #[serde(default = "effort_inherit", deserialize_with = "effort_word")]
     pub effort: String,
 }
@@ -324,7 +324,7 @@ pub struct NewBotDefault {
 pub struct PlanFallback {
     /// The gateway id a Bot on the plan answers on while the relay is off.
     pub model: String,
-    /// One of a Bot's effort words (`types::EFFORT_WORDS`); left out or `null`, `inherit`.
+    /// A Bot's effort word: a level of the model's, or `inherit`; left out or `null`, `inherit`.
     #[serde(default = "effort_inherit", deserialize_with = "effort_word")]
     pub effort: String,
 }

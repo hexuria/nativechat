@@ -74,11 +74,12 @@ pub struct Coworker {
     pub hidden_from_sidebar: bool,
     #[serde(default, alias = "boxId", alias = "box_id")]
     pub box_id: Option<String>,
-    /// How hard it thinks before it answers: one of [`EFFORT_WORDS`], or a word this app has not
-    /// heard of, kept as the server sent it so the settings never show a value the server does
-    /// not hold. Missing is a server from before opengrok-server#271, which keeps no effort and
-    /// sends none on a turn: that reads as `inherit` ([`Self::effort`]), and nothing offers to
-    /// change what that server has nowhere to keep.
+    /// How hard it thinks before it answers, in the server's word: `inherit`, `none`, or a level
+    /// of its model's ([`ModelEntry::efforts`]), kept as the server sent it so the settings never
+    /// show a value the server does not hold. Missing is a server from before
+    /// opengrok-server#271, which keeps no effort and sends none on a turn: that reads as
+    /// `inherit` ([`Self::effort`]), and nothing offers to change what that server has nowhere to
+    /// keep.
     #[serde(default)]
     pub effort: Option<String>,
     /// Who may use this bot: `private`, its owner alone, or `org`, shared with the owner's
@@ -137,18 +138,15 @@ where
     )
 }
 
-/// How hard a coworker thinks before it answers, in the server's words and in its order.
-/// Transcribed from opengrok-server#271, the shape agreed with the server before it landed:
-/// every roster row carries one of these under `effort`, and `PATCH /coworkers/{id}` takes one.
-/// `inherit` is a coworker with none set, whose turns send the gateway no effort, so the model's
-/// route decides; any other word goes to the gateway as the turn's `reasoning_effort`, taken when
-/// the run starts. Some models ignore it, and the server cannot know which.
+/// How hard a coworker thinks before it answers is a word of the server's: every roster row
+/// carries one under `effort`, and `PATCH /coworkers/{id}` takes one (opengrok-server#271, the
+/// shape agreed with the server before it landed). `inherit` is a coworker with none set, whose
+/// turns send the gateway no effort, so the model's route decides; any other word goes to the
+/// gateway as the turn's `reasoning_effort`, taken when the run starts. Some models ignore it,
+/// and the server cannot know which. What a model takes is its own to say: `GET /models` lists
+/// each model's levels ([`ModelEntry::efforts`]), `ultra` among them for a model that has one,
+/// and the picker offers those and no others, so this app keeps no list of the words itself.
 ///
-/// These are the words #271 knew. What a model takes is its own to say: `GET /models` lists each
-/// model's levels ([`ModelEntry::efforts`]), `ultra` among them for a model that has one, and the
-/// picker offers those and no others.
-pub const EFFORT_WORDS: [&str; 7] = ["inherit", "none", "low", "medium", "high", "xhigh", "max"];
-
 /// The effort of a coworker with none set, and of every coworker on a server that keeps none.
 pub const EFFORT_INHERIT: &str = "inherit";
 
@@ -187,11 +185,11 @@ pub struct CoworkerPatch {
     // client keeps that setting on the machine, and NativeChat has nowhere to keep it yet.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hidden_from_sidebar: Option<bool>,
-    /// One of [`EFFORT_WORDS`], sent only when the person changed it: absent leaves the stored
-    /// effort alone, and `inherit` clears it (opengrok-server#271, which reads `null` the same
-    /// way). The server refuses a word it does not know with a 400 and changes nothing, and
-    /// refuses it on a coworker shared with the caller with a 403, as it does every change there
-    /// but the sidebar flag.
+    /// A level of the model's ([`ModelEntry::efforts`]) or `inherit`, sent only when the person
+    /// changed it: absent leaves the stored effort alone, and `inherit` clears it
+    /// (opengrok-server#271, which reads `null` the same way). The server refuses a word it does
+    /// not know with a 400 and changes nothing, and refuses it on a coworker shared with the
+    /// caller with a 403, as it does every change there but the sidebar flag.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
     /// The Bot's own door, sent with the model the model picker put it on, and only to a server
@@ -335,34 +333,27 @@ impl ModelEntry {
     }
 }
 
-/// `efforts` as a row brings it: `[{value, label}]` lowest first, or `null`. A list that is
-/// empty, or has one entry that is not a `value` and a `label`, is none, and never fails the
-/// list of models.
+/// A key of a row that this app reads as far as it can, and as none beyond: whatever the row
+/// holds there that it cannot make anything of is no more than the key missing, and never fails
+/// the list of models.
+fn read_or_none<'de, D, T>(
+    deserializer: D,
+    read: fn(&serde_json::Value) -> Option<T>,
+) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<serde_json::Value>::deserialize(deserializer)?
+        .as_ref()
+        .and_then(read))
+}
+
+/// `efforts` as a row brings it ([`effort_levels`]).
 fn effort_levels_or_none<'de, D>(deserializer: D) -> Result<Option<Vec<EffortLevel>>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    let Some(serde_json::Value::Array(rows)) =
-        Option::<serde_json::Value>::deserialize(deserializer)?
-    else {
-        return Ok(None);
-    };
-    let text = |row: &serde_json::Value, key: &str| {
-        row.get(key)
-            .and_then(serde_json::Value::as_str)
-            .filter(|word| !word.trim().is_empty())
-            .map(str::to_string)
-    };
-    let levels: Option<Vec<EffortLevel>> = rows
-        .iter()
-        .map(|row| {
-            Some(EffortLevel {
-                value: text(row, "value")?,
-                label: text(row, "label")?,
-            })
-        })
-        .collect();
-    Ok(levels.filter(|levels| !levels.is_empty()))
+    read_or_none(deserializer, effort_levels)
 }
 
 /// `ownEffort` as a row brings it: a word, or `null`; anything else is none.
@@ -370,9 +361,28 @@ fn own_effort_or_none<'de, D>(deserializer: D) -> Result<Option<String>, D::Erro
 where
     D: serde::Deserializer<'de>,
 {
-    Ok(Option::<serde_json::Value>::deserialize(deserializer)?
-        .and_then(|raw| raw.as_str().map(str::to_string))
-        .filter(|word| !word.trim().is_empty()))
+    read_or_none(deserializer, |raw| word(raw).map(str::to_string))
+}
+
+/// The levels `efforts` lists: `[{value, label}]` lowest first. A list that is empty, or has one
+/// entry that is not a `value` and a `label`, is none.
+fn effort_levels(raw: &serde_json::Value) -> Option<Vec<EffortLevel>> {
+    let levels: Option<Vec<EffortLevel>> = raw
+        .as_array()?
+        .iter()
+        .map(|row| {
+            Some(EffortLevel {
+                value: word(row.get("value")?)?.to_string(),
+                label: word(row.get("label")?)?.to_string(),
+            })
+        })
+        .collect();
+    levels.filter(|levels| !levels.is_empty())
+}
+
+/// A word: a string with something in it.
+fn word(raw: &serde_json::Value) -> Option<&str> {
+    raw.as_str().filter(|word| !word.trim().is_empty())
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]

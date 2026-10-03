@@ -358,14 +358,14 @@
 //! as the Bot's), `-list`, `-group-{source}`, `-row-{source}-{id}`, `-no-match`, `-note` and
 //! `-error` (the server's words for a refused change, or that nobody knows whether one was kept:
 //! in the popover while open, under the card while shut). Over the list's models,
-//! `settings-new-bots-none` (`None`,
-//! valued `the server's default`, state `selected` while none is set; a click takes the kept
-//! default away). While none is set ⚡ and the slider are dead and say why: a default starts with
-//! a model. Every pick is kept on the account at once, whole, as `PUT /account/inference-source`
-//! `{kind, newBotDefault}` with the kind the server keeps (None sends `null`), one at a time:
-//! every control that sends one is dead while one is out. `settings-new-bots-dismiss` shuts the
-//! popover, as `agent-model-dismiss` shuts the Bot's. All of it is refused off General, saying to
-//! open it with `settings-tab-general`.
+//! `settings-new-bots-none` (`None`, valued `the server's default`, state `selected` while
+//! none is set; a click takes the kept default away). While none is set ⚡ is dead and says
+//! why (a default starts with a model), and the slider is not in the tree: no model, no
+//! levels. Every pick is kept on the account at once, whole, as `PUT
+//! /account/inference-source` `{kind, newBotDefault}` with the kind the server keeps (None
+//! sends `null`), one at a time: every control that sends one is dead while one is out.
+//! `settings-new-bots-dismiss` shuts the popover, as `agent-model-dismiss` shuts the Bot's.
+//! All of it is refused off General, saying to open it with `settings-tab-general`.
 //!
 //! Under it in Default models, `settings-plan-fallback`: the Relay-off fallback, "When Relay is
 //! off, Subscription Bots use", what a Bot on the person's plan answers with while the relay is
