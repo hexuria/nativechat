@@ -20,9 +20,18 @@
 //! it to, so a Mac asked for something its person's subscription may not answer refuses it
 //! without calling opencodex.
 //!
-//! The Mac opens the stream only while the person has switched it on. After the server says
-//! another Mac took over (`replaced`), it stops for good: it does not fight the other Mac for the
-//! stream until it is switched off and on again. After the server refuses this Mac's token it
+//! The relay switch is each computer's own, kept on the server with the computer's row
+//! (`relayEnabled` on `GET /local-exec/daemon`), and the server tells a computer when it is off: its
+//! open stream is sent `{"type":"disabled"}` and closed, and a stream opened while it is off is
+//! refused `409` with `code: "relay_disabled"` before any frame (opengrok-server branch
+//! per-computer-relay at d0a9855: `RelayFrame::Disabled` and `RELAY_IS_OFF` in
+//! `crates/opengrok-wire/src/relay.rs`, `relaying` in `crates/opengrok-server/src/inference.rs`;
+//! not recorded yet in `fixtures/wire/`). Either stops the relay, and it does not reconnect: it
+//! waits, asking for its own row every [`RelayTimings::recheck`], and opens the stream again only
+//! when that row reads on, which the person can have done from any computer, or here
+//! ([`RelayHandle::wake`]). After the server says another stream of this computer took over
+//! (`replaced`), it stops for good: it does not fight the other for the stream until it is
+//! switched off and on again. After the server refuses this Mac's token it
 //! stops too, and knocks no more with a token that was turned away; but it starts again by itself
 //! once this Mac enrols again ([`Enrolment`]). Re-enrolling a Mac retires its old token and ends
 //! the relay stream that token opened, with no `replaced` or any other word on it, and a stream
@@ -40,7 +49,7 @@ use std::time::Duration;
 use futures::{Stream, StreamExt};
 use reqwest::header::ACCEPT;
 use serde_json::Value;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{Notify, mpsc, watch};
 use tokio::task::JoinHandle;
 
 use super::client::OpenGrokClient;
@@ -181,11 +190,14 @@ impl fmt::Debug for RelayTarget {
 /// How long the relay waits. The server pings every fifteen seconds, so three missed pings is a
 /// stream gone quiet, however it looks from here. The wait between attempts doubles after each
 /// one that fails, up to a ceiling, and starts again from the floor once a stream is answering.
+/// A relay the server switched off asks for this computer's own row every `recheck` to see
+/// whether it was switched on again, which can be done from any computer.
 #[derive(Debug, Clone, Copy)]
 pub struct RelayTimings {
     pub quiet: Duration,
     pub first_wait: Duration,
     pub longest_wait: Duration,
+    pub recheck: Duration,
 }
 
 impl Default for RelayTimings {
@@ -194,14 +206,16 @@ impl Default for RelayTimings {
             quiet: Duration::from_secs(45),
             first_wait: Duration::from_secs(1),
             longest_wait: Duration::from_secs(30),
+            recheck: Duration::from_secs(20),
         }
     }
 }
 
-/// Where the relay stands, as Settings → Reply source says it.
+/// Where the relay stands, as this computer's card on Settings → Computer says it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum RelayStatus {
-    /// Not running: switched off, or never started.
+    /// Not running: the server switched this computer's relay off (it waits for its own row to
+    /// read on again), or it never started.
     #[default]
     Off,
     /// Opening the stream, or opening it again after it dropped.
@@ -236,6 +250,11 @@ pub enum RelayFrame {
     },
     /// Another stream took over. The server closes this one.
     Replaced,
+    /// This computer's relay was switched off, by its own switch or the account's (opengrok-server
+    /// branch per-computer-relay at d0a9855: `RelayFrame::Disabled` in
+    /// `crates/opengrok-wire/src/relay.rs`). The server closes the stream after it, and refuses
+    /// the next until the switch is on again.
+    Disabled,
     /// A model call: `request` is an OpenAI `chat/completions` body with `stream: true`.
     Infer {
         request_id: String,
@@ -272,6 +291,7 @@ impl RelayFrame {
                 machine_id: text("machineId").unwrap_or_default(),
             },
             (Some("replaced"), _) => Self::Replaced,
+            (Some("disabled"), _) => Self::Disabled,
             (Some("ping"), _) => Self::Ping,
             // A call with no body still names the call, so it is answered, with why nothing was
             // asked, rather than left to the server's clock.
@@ -328,6 +348,7 @@ pub struct RelayHandle {
     reports: watch::Receiver<RelayReport>,
     target: watch::Sender<RelayTarget>,
     running: Running,
+    woken: Arc<Notify>,
     serving: JoinHandle<()>,
 }
 
@@ -351,6 +372,13 @@ impl RelayHandle {
     /// Call opencodex with another key, or none, from the next call on.
     pub fn rekey(&self, key: Option<Arc<RelayKey>>) {
         self.target.send_modify(|target| target.key = key);
+    }
+
+    /// Tell a relay the server switched off to look at this computer's own row now, rather than at
+    /// its next look: the person has just switched it on here. A relay that is not waiting for
+    /// that has nothing to look for, and the word is kept for the next time it does.
+    pub fn wake(&self) {
+        self.woken.notify_one();
     }
 }
 
@@ -395,6 +423,7 @@ pub fn start_relay(
     let (target_tx, target_rx) = watch::channel(target);
     let (halt, halts) = mpsc::unbounded_channel();
     let running = Running::default();
+    let woken = Arc::new(Notify::new());
     let relay = Arc::new(Relay {
         client,
         target: target_rx,
@@ -402,12 +431,14 @@ pub fn start_relay(
         report,
         running: Arc::clone(&running),
         halt,
+        woken: Arc::clone(&woken),
     });
     let serving = tokio::spawn(serve(relay, enrolment, halts, timings));
     RelayHandle {
         reports,
         target: target_tx,
         running,
+        woken,
         serving,
     }
 }
@@ -435,7 +466,14 @@ struct Relay {
     /// it went with: the stream stops only if it holds that one. An answer to a call off a stream
     /// opened before this Mac enrolled again went with a token the relay no longer holds.
     halt: mpsc::UnboundedSender<MachineCredential>,
+    /// The person switched this computer's relay on here: a relay waiting for its own row to read
+    /// on looks at it now ([`RelayHandle::wake`]).
+    woken: Arc<Notify>,
 }
+
+/// The longest one look at this computer's own row is waited on, while the relay waits to be
+/// switched on again.
+const ROW_LOOK: Duration = Duration::from_secs(30);
 
 /// How one stream ended.
 enum Ended {
@@ -443,10 +481,13 @@ enum Ended {
     Answered,
     /// It never got as far as answering, and why.
     Failed(String),
-    /// Another Mac took over.
+    /// Another stream of this computer took over.
     Replaced,
     /// The server turned the token away.
     TokenRefused,
+    /// The server says this computer's relay is switched off: it sent `disabled` on the stream, or
+    /// refused the stream `409` `relay_disabled`.
+    Disabled,
 }
 
 async fn serve(
@@ -475,6 +516,20 @@ async fn serve(
             Ended::TokenRefused => {
                 relay.set_status(RelayStatus::Error(TOKEN_REFUSED.into()), true);
                 refused = Some(machine);
+                continue;
+            }
+            Ended::Disabled => {
+                // Switched off, here or from another computer: the stream is not opened again to be
+                // refused again. The relay waits for this computer's own row to read on.
+                relay.set_status(RelayStatus::Off, false);
+                if !relay
+                    .wait_until_switched_on(&mut enrolment, timings.recheck)
+                    .await
+                {
+                    return;
+                }
+                wait = timings.first_wait;
+                relay.set_status(RelayStatus::Connecting, false);
                 continue;
             }
             Ended::Answered => {
@@ -540,6 +595,44 @@ impl Relay {
         });
     }
 
+    /// Wait until this computer's own row says its relay is switched on, which is asked of the
+    /// server every `every`, and at once when the person switches it on here ([`RelayHandle::wake`]).
+    /// `true` to open the stream again, and also when this Mac has enrolled again meanwhile: the
+    /// stream opened with the new token is where the server says whether the relay is on. `false`
+    /// once local-exec has stopped with no other credential to give.
+    async fn wait_until_switched_on(&self, enrolment: &mut Enrolment, every: Duration) -> bool {
+        loop {
+            tokio::select! {
+                () = tokio::time::sleep(every) => {}
+                () = self.woken.notified() => {}
+                changed = enrolment.changed() => return changed.is_ok(),
+            }
+            if self.own_row_is_on(enrolment).await {
+                return true;
+            }
+        }
+    }
+
+    /// This computer's row on `GET /local-exec/daemon` reads on: the row of the machine the newest
+    /// credential names, never another computer's, and not a revoked one's. A list that could not be
+    /// read says nothing, and is asked for again at the next look.
+    async fn own_row_is_on(&self, enrolment: &Enrolment) -> bool {
+        let own = enrolment
+            .borrow()
+            .as_ref()
+            .map(|machine| machine.machine_id().to_string());
+        let Some(own) = own else {
+            return false;
+        };
+        let rows = tokio::time::timeout(ROW_LOOK, self.client.list_daemons()).await;
+        match rows {
+            Ok(Ok(rows)) => rows
+                .iter()
+                .any(|row| row.machine_id == own && !row.revoked && row.relay_enabled),
+            Ok(Err(_)) | Err(_) => false,
+        }
+    }
+
     /// One stream, opened with `machine`'s token, read until it ends. The calls it brings are
     /// answered with that token.
     async fn stream_once(
@@ -553,6 +646,7 @@ impl Relay {
         let response = match opened {
             Err(_) => return Ended::Failed(SERVER_QUIET.into()),
             Ok(Err(error)) if token_turned_away(&error) => return Ended::TokenRefused,
+            Ok(Err(error)) if relay_disabled(&error) => return Ended::Disabled,
             Ok(Err(error)) => return Ended::Failed(stream_refusal(&error)),
             Ok(Ok(response)) => response,
         };
@@ -587,6 +681,7 @@ impl Relay {
                     self.set_status(RelayStatus::Answering, false);
                 }
                 RelayFrame::Replaced => return Ended::Replaced,
+                RelayFrame::Disabled => return Ended::Disabled,
                 frame => self.take_frame(frame, machine),
             }
         }
@@ -612,6 +707,7 @@ impl Relay {
             RelayFrame::Cancel { request_id } => self.cancel(&request_id),
             RelayFrame::Ready { .. }
             | RelayFrame::Replaced
+            | RelayFrame::Disabled
             | RelayFrame::Ping
             | RelayFrame::Other => {}
         }
@@ -770,6 +866,17 @@ impl Relay {
 /// until this Mac enrols again with a new one.
 pub(super) fn token_turned_away(error: &OpenGrokError) -> bool {
     error.status == Some(401)
+}
+
+/// The code the server refuses a relay stream with while this computer's relay is switched off
+/// (`RELAY_IS_OFF` and `relaying` in opengrok-server branch per-computer-relay at d0a9855).
+pub(super) const RELAY_DISABLED: &str = "relay_disabled";
+
+/// The server refused the stream because this computer's relay is switched off: a `409` with
+/// `code: "relay_disabled"`, before any frame. The relay stops for it, and waits for its own row to
+/// read on, rather than knocking again to be refused again.
+pub(super) fn relay_disabled(error: &OpenGrokError) -> bool {
+    error.status == Some(409) && error.code() == Some(RELAY_DISABLED)
 }
 
 /// Why the stream did not open, in a sentence, while the relay tries again.
@@ -963,6 +1070,7 @@ mod tests {
             quiet: Duration::from_secs(5),
             first_wait: Duration::from_millis(50),
             longest_wait: Duration::from_millis(200),
+            recheck: Duration::from_millis(100),
         }
     }
 
@@ -995,6 +1103,7 @@ mod tests {
             report,
             running: Running::default(),
             halt,
+            woken: Arc::new(Notify::new()),
         })
     }
 
@@ -1031,6 +1140,10 @@ mod tests {
         assert_eq!(
             RelayFrame::from_value(&json!({"type": "replaced"})),
             RelayFrame::Replaced
+        );
+        assert_eq!(
+            RelayFrame::from_value(&json!({"type": "disabled"})),
+            RelayFrame::Disabled
         );
         assert_eq!(
             RelayFrame::from_value(&infer("req_1", "gpt-5-codex")),
@@ -1519,6 +1632,270 @@ mod tests {
             .count();
         assert_eq!(opened, 1, "no stream is opened after replaced");
         assert_eq!(handle.report().status, RelayStatus::Replaced);
+    }
+
+    /// How many times the relay's stream was opened, with any token.
+    async fn streams_opened(server: &MockServer) -> usize {
+        server
+            .received_requests()
+            .await
+            .expect("the recorder is on")
+            .iter()
+            .filter(|request| request.url.path() == "/inference-relay/requests")
+            .count()
+    }
+
+    /// The account's computers as `GET /local-exec/daemon` lists them (opengrok-server branch
+    /// per-computer-relay at d0a9855): this computer, `mac_1`, with its own switch as given, and
+    /// another one, `mac_2`, which is on.
+    fn computers(own_switch: bool) -> Value {
+        let row = |id: &str, on: bool| {
+            json!({"machineId": id, "label": id, "enrolledAtMs": 1_790_000_000_000_i64,
+                   "revoked": false, "connected": true, "relayEnabled": on, "relaying": false})
+        };
+        json!({"machines": [row("mac_1", own_switch), row("mac_2", true)]})
+    }
+
+    /// The word the server sends a computer whose relay is switched off, on its open stream.
+    fn disabled_stream() -> ResponseTemplate {
+        ResponseTemplate::new(200).set_body_raw(
+            sse(&[
+                json!({"type": "ready", "machineId": "mac_1"}),
+                json!({"type": "disabled"}),
+            ]),
+            "text/event-stream",
+        )
+    }
+
+    /// `disabled` stops the relay, and the stream the server closes after it is not opened again:
+    /// not after the shortest wait, as a stream that dropped is, nor after the longest. It says it
+    /// is off, and says nothing is wrong (opengrok-server branch per-computer-relay at d0a9855).
+    #[tokio::test]
+    async fn a_disabled_frame_stops_the_relay_and_it_does_not_reconnect() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/inference-relay/requests"))
+            .respond_with(disabled_stream())
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/local-exec/daemon"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(computers(false)))
+            .mount(&server)
+            .await;
+        let (_enrolled, enrolment) = enrolled();
+        let handle = start_relay(
+            OpenGrokClient::new(&server.uri()).unwrap(),
+            enrolment,
+            target("http://127.0.0.1:8080", None),
+            quick(),
+        );
+        let mut reports = handle.reports();
+        let off = tokio::time::timeout(
+            Duration::from_secs(10),
+            reports.wait_for(|report| report.status == RelayStatus::Off),
+        )
+        .await
+        .expect("the server's word is heard")
+        .expect("the relay reports")
+        .clone();
+        assert!(!off.halted, "it waits to be switched on, it is not done");
+        // Several times the longest wait between attempts: none is made.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(streams_opened(&server).await, 1, "no stream after disabled");
+        assert_eq!(handle.report().status, RelayStatus::Off);
+    }
+
+    /// A stream opened while the relay is switched off is refused 409 `relay_disabled` before any
+    /// frame, in the contract's words. That stops the retry loop: the relay is not knocking again
+    /// with the wait doubling, and it does not call the refusal an error to try again for.
+    #[tokio::test]
+    async fn a_409_relay_disabled_stops_the_retry_loop() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/inference-relay/requests"))
+            .respond_with(ResponseTemplate::new(409).set_body_json(json!({
+                "error": "Relay is off for this computer. Turn it on in Settings → Computer.",
+                "code": "relay_disabled"
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/local-exec/daemon"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(computers(false)))
+            .mount(&server)
+            .await;
+        let (_enrolled, enrolment) = enrolled();
+        let handle = start_relay(
+            OpenGrokClient::new(&server.uri()).unwrap(),
+            enrolment,
+            target("http://127.0.0.1:8080", None),
+            quick(),
+        );
+        let mut reports = handle.reports();
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            reports.wait_for(|report| report.status == RelayStatus::Off),
+        )
+        .await
+        .expect("the refusal is heard")
+        .expect("the relay reports");
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(streams_opened(&server).await, 1, "refused once, not again");
+        assert_eq!(handle.report().status, RelayStatus::Off, "and no error");
+    }
+
+    /// Any other 409 on the stream is no word of the server's about the switch: it is said as a
+    /// refusal and tried again, as every refusal is.
+    #[tokio::test]
+    async fn any_other_refusal_of_the_stream_is_still_tried_again() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/inference-relay/requests"))
+            .respond_with(ResponseTemplate::new(409).set_body_json(json!({
+                "error": "somebody else's conflict", "code": "something_else"
+            })))
+            .mount(&server)
+            .await;
+        let (_enrolled, enrolment) = enrolled();
+        let handle = start_relay(
+            OpenGrokClient::new(&server.uri()).unwrap(),
+            enrolment,
+            target("http://127.0.0.1:8080", None),
+            quick(),
+        );
+        until("the stream was asked for again", async || {
+            streams_opened(&server).await >= 3
+        })
+        .await;
+        assert!(matches!(handle.report().status, RelayStatus::Error(_)));
+    }
+
+    /// A relay the server switched off opens its stream again once its own row says on, and not
+    /// before: while the row reads off it asks for the row and for nothing else, and another
+    /// computer being on does not start this one. The switch can be turned on from any computer.
+    #[tokio::test]
+    async fn a_switched_off_relay_opens_again_when_its_own_row_reads_on() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/inference-relay/requests"))
+            .respond_with(disabled_stream())
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/inference-relay/requests"))
+            .respond_with(ready_and_ends())
+            .mount(&server)
+            .await;
+        // The row answers as the person last left the switch, which the test moves.
+        struct Switch(Arc<std::sync::atomic::AtomicBool>);
+        impl wiremock::Respond for Switch {
+            fn respond(&self, _: &wiremock::Request) -> ResponseTemplate {
+                let on = self.0.load(std::sync::atomic::Ordering::SeqCst);
+                ResponseTemplate::new(200).set_body_json(computers(on))
+            }
+        }
+        let on = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        Mock::given(method("GET"))
+            .and(path("/local-exec/daemon"))
+            .respond_with(Switch(Arc::clone(&on)))
+            .mount(&server)
+            .await;
+        let (_enrolled, enrolment) = enrolled();
+        let handle = start_relay(
+            OpenGrokClient::new(&server.uri()).unwrap(),
+            enrolment,
+            target("http://127.0.0.1:8080", None),
+            quick(),
+        );
+        let mut reports = handle.reports();
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            reports.wait_for(|report| report.status == RelayStatus::Off),
+        )
+        .await
+        .expect("it is told it is off")
+        .expect("the relay reports");
+        let looked = || async {
+            server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .filter(|request| request.url.path() == "/local-exec/daemon")
+                .count()
+        };
+        until("it looked at its row more than once", async || {
+            looked().await >= 3
+        })
+        .await;
+        assert_eq!(
+            streams_opened(&server).await,
+            1,
+            "another computer is on, and this one is not"
+        );
+
+        on.store(true, std::sync::atomic::Ordering::SeqCst);
+        until("the stream was opened again", async || {
+            streams_opened(&server).await >= 2
+        })
+        .await;
+        let after = handle.report();
+        assert!(
+            !after.halted && !matches!(after.status, RelayStatus::Error(_)),
+            "{after:?}"
+        );
+        drop(handle);
+    }
+
+    /// The person switching the relay on here does not wait for the relay's next look at its row:
+    /// it is told to look now. With the look an hour away, only that can have opened the stream.
+    #[tokio::test]
+    async fn switching_a_relay_on_here_has_it_look_at_its_row_at_once() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/inference-relay/requests"))
+            .respond_with(disabled_stream())
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/inference-relay/requests"))
+            .respond_with(ready_and_ends())
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/local-exec/daemon"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(computers(true)))
+            .mount(&server)
+            .await;
+        let (_enrolled, enrolment) = enrolled();
+        let timings = RelayTimings {
+            recheck: Duration::from_secs(3600),
+            ..quick()
+        };
+        let handle = start_relay(
+            OpenGrokClient::new(&server.uri()).unwrap(),
+            enrolment,
+            target("http://127.0.0.1:8080", None),
+            timings,
+        );
+        let mut reports = handle.reports();
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            reports.wait_for(|report| report.status == RelayStatus::Off),
+        )
+        .await
+        .expect("it is told it is off")
+        .expect("the relay reports");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(streams_opened(&server).await, 1, "it waits for its look");
+        handle.wake();
+        until("the stream was opened again", async || {
+            streams_opened(&server).await >= 2
+        })
+        .await;
     }
 
     /// A stream that drops is opened again after a wait, and one that fails to open is tried

@@ -77,7 +77,9 @@ use super::pending::{
     CUSTOM_NAME as PENDING_CUSTOM, PendingCustom, PendingList, PendingMutation, PendingOp,
     PendingUserMessage,
 };
-use super::relay::{RelayAnswered, RelayFrame, data_frame, stream_refusal, token_turned_away};
+use super::relay::{
+    RelayAnswered, RelayFrame, data_frame, relay_disabled, stream_refusal, token_turned_away,
+};
 use super::timing::{RUN_TIMING_CUSTOM, TURN_TIMELINE_CUSTOM, TurnTiming};
 use super::types::{
     Account, ArtifactListing, Attachment, Coworker, CoworkerSource, EFFORT_INHERIT, ModelCatalogue,
@@ -108,15 +110,19 @@ enum Slot {
     FormResolution,
     /// `code` on a `RUN_ERROR`, beside its sentence.
     RunErrorCode,
+    /// A frame's `type` on the Mac relay's stream (`RelayFrame::from_value`), which is not an
+    /// AG-UI frame: the recorder files each under `relay/<type>/`.
+    RelayType,
 }
 
 impl Slot {
-    const ALL: [Slot; 5] = [
+    const ALL: [Slot; 6] = [
         Slot::AguiType,
         Slot::CustomName,
         Slot::ApprovalReason,
         Slot::FormResolution,
         Slot::RunErrorCode,
+        Slot::RelayType,
     ];
 
     fn field(self) -> &'static str {
@@ -126,9 +132,18 @@ impl Slot {
             Slot::ApprovalReason => "approval reason",
             Slot::FormResolution => "formResolution",
             Slot::RunErrorCode => "RUN_ERROR code",
+            Slot::RelayType => "relay frame type",
         }
     }
 }
+
+/// Every frame `type` the relay reads off the Mac relay's stream (`RelayFrame::from_value`), which
+/// [`relay_frame`] holds to the frames the corpus records, and to the ones read ahead of it
+/// ([`WORDS_NOT_RECORDED_YET`]). [`the_ledger_relay_types_are_read_by_the_relay`] holds it to the
+/// source.
+const RELAY_FRAME_TYPES: &[&str] = &[
+    "ready", "replaced", "disabled", "infer", "models", "cancel", "ping",
+];
 
 /// Every AG-UI `type` this app branches on anywhere (`TurnAssembler::push_event`,
 /// `activity_from_agui`, `command_from_replay_events`, the SSE readers in `client.rs` and
@@ -243,6 +258,12 @@ fn ledger() -> Vec<(Slot, &'static str)> {
         RunErrorCode::ALL
             .iter()
             .map(|code| (Slot::RunErrorCode, code.word())),
+    );
+    // `RelayFrame::from_value` reads a frame off the Mac relay's stream by its `type`.
+    words.extend(
+        RELAY_FRAME_TYPES
+            .iter()
+            .map(|word| (Slot::RelayType, *word)),
     );
     words
 }
@@ -502,7 +523,18 @@ const CLIENT_IGNORES: &[(Slot, &str, &str)] = &[
 /// arm waiting for them in [`check_frame`];
 /// [`every_word_read_ahead_of_its_recording_is_matched_and_not_sent_yet`] fails until it does,
 /// and meanwhile holds that arm to the frames [`frames_read_ahead`] writes in the agreed shape.
-const WORDS_NOT_RECORDED_YET: &[(Slot, &str, &str)] = &[];
+const WORDS_NOT_RECORDED_YET: &[(Slot, &str, &str)] = &[(
+    Slot::RelayType,
+    "disabled",
+    "NOT RECORDED YET. The frame a computer's open relay stream is sent when its relay is switched \
+     off, `{\"type\":\"disabled\"}`, after which the server closes the stream and refuses the next \
+     until the switch is on again (opengrok-server branch per-computer-relay at d0a9855: \
+     `RelayFrame::Disabled` in `crates/opengrok-wire/src/relay.rs`, the per-computer relay \
+     contract the owner approved on 3 Oct 2026). The recorder will file it under \
+     `relay/disabled/` from the server's test \
+     `a_computer_switched_off_is_told_disabled_and_refused_until_it_is_on_again`, which \
+     `examples/wire_corpus.rs` keeps for `/inference-relay/requests`.",
+)];
 
 /// Fixtures this app still reads wrongly, with the words their check fails with and why. The
 /// check has to fail with those words: one that passes means the drift is fixed and the entry
@@ -719,6 +751,19 @@ const REST_FIELDS_NOT_RECORDED_YET: &[(&str, &str, &str)] = &[
          `crates/opengrok-server/src/local_exec.rs`); live, so a row without it reads as not \
          relaying. Brought by the same recording as `relayEnabled`.",
     ),
+    (
+        "GET__inference-relay_requests",
+        "code",
+        "NOT RECORDED YET. The 409 a computer's relay stream is refused with while its relay is \
+         switched off, before any frame: `{error: \"Relay is off for this computer. Turn it on in \
+         Settings → Computer.\", code: \"relay_disabled\"}` (opengrok-server branch \
+         per-computer-relay at d0a9855: `relaying` in `crates/opengrok-server/src/inference.rs`, \
+         `RELAY_IS_OFF` in `crates/opengrok-wire/src/relay.rs`). The relay stops for it and does \
+         not retry. The recorder will bring it from the server's test \
+         `a_computer_switched_off_is_told_disabled_and_refused_until_it_is_on_again`, which \
+         `examples/wire_corpus.rs` keeps for `/inference-relay/requests`; `relay_stream_refused` \
+         reads it meanwhile from a body in the agreed shape.",
+    ),
 ];
 
 // ---- the corpus ----
@@ -748,6 +793,9 @@ struct Emits {
     /// carries it.
     #[serde(skip)]
     run_error_codes: Vec<String>,
+    /// Not the manifest's either: the `type` of each frame the recording keeps under `relay/`.
+    #[serde(skip)]
+    relay_types: Vec<String>,
 }
 
 impl Emits {
@@ -758,6 +806,7 @@ impl Emits {
             Slot::ApprovalReason => &self.approval_reasons,
             Slot::FormResolution => &self.form_resolutions,
             Slot::RunErrorCode => &self.run_error_codes,
+            Slot::RelayType => &self.relay_types,
         }
     }
 }
@@ -809,13 +858,15 @@ impl Corpus {
                 (file, body)
             })
             .collect();
-        let relay = json_files(&root, "relay")
+        let relay: BTreeMap<String, Value> = json_files(&root, "relay")
             .into_iter()
             .map(|file| {
                 let frame = read_json(&root, &file);
                 (file, frame)
             })
             .collect();
+        let types: BTreeSet<&str> = relay.values().map(|frame| str_at(frame, "type")).collect();
+        manifest.emits.relay_types = types.into_iter().map(str::to_string).collect();
         Self {
             root,
             manifest,
@@ -4092,8 +4143,13 @@ fn relay_stream(_: u16, body: &Value) -> Check {
 /// The relay's stream refused (`open_inference_relay` reads the refusal as every other, and the
 /// relay takes it in `stream_once`). A 401 is the server turning this Mac's token away, which
 /// the relay stops for until this Mac enrols again, rather than asking again with a token that
-/// would be turned away again; it says so in its own words, not the server's. Anything else is
-/// said in a sentence while the relay tries again, and is read as every other refusal.
+/// would be turned away again; it says so in its own words, not the server's. A 409 with
+/// `code: "relay_disabled"` is the server saying this computer's relay is switched off (opengrok-server
+/// branch per-computer-relay at d0a9855, ahead of the recording: see
+/// [`REST_FIELDS_NOT_RECORDED_YET`]), which the relay stops for and waits on its own row for,
+/// rather than knocking again to be refused again; that is the server's word and no other 409
+/// is. Anything else is said in a sentence while the relay tries again, and is read as every other
+/// refusal.
 fn relay_stream_refused(status: u16, body: &Value) -> Check {
     let error = OpenGrokClient::refusal(status, &body_text(body));
     let stops = token_turned_away(&error);
@@ -4104,6 +4160,19 @@ fn relay_stream_refused(status: u16, body: &Value) -> Check {
     );
     if stops {
         return Ok(());
+    }
+    let switched_off = status == 409 && opt_str(body, "code") == Some("relay_disabled");
+    must!(
+        relay_disabled(&error) == switched_off,
+        "a {status} on the relay's stream {} the relay waiting for its switch: {body}",
+        if switched_off {
+            "should leave"
+        } else {
+            "should not leave"
+        }
+    );
+    if switched_off {
+        return refusal(status, body);
     }
     must!(
         !stream_refusal(&error).trim().is_empty(),
@@ -4170,6 +4239,7 @@ fn relay_frame(frame: &Value) -> Check {
             machine_id: text("machineId"),
         },
         "replaced" => RelayFrame::Replaced,
+        "disabled" => RelayFrame::Disabled,
         "infer" => RelayFrame::Infer {
             request_id: text("requestId"),
             run_id: text("runId"),
@@ -5160,6 +5230,50 @@ fn a_computers_relay_switch_is_read_as_the_contract_agreed_it() {
             (Some(status), said, Some(code))
         );
     }
+
+    // The 409 a computer's relay stream is refused with while its relay is switched off, in the
+    // contract's words: the relay stops for it and waits for its row, and no other 409 is that.
+    let off = json!({"error": "Relay is off for this computer. Turn it on in Settings → Computer.",
+                     "code": "relay_disabled"});
+    relay_stream_refused(409, &off).unwrap();
+    assert!(relay_disabled(&OpenGrokClient::refusal(
+        409,
+        &off.to_string()
+    )));
+    let other = json!({"error": "somebody else's conflict", "code": "something_else"});
+    relay_stream_refused(409, &other).unwrap();
+    assert!(!relay_disabled(&OpenGrokClient::refusal(
+        409,
+        &other.to_string()
+    )));
+    assert!(
+        !relay_disabled(&OpenGrokClient::refusal(
+            400,
+            &json!({"error": "no", "code": "relay_disabled"}).to_string()
+        )),
+        "the word is a 409's"
+    );
+}
+
+/// [`RELAY_FRAME_TYPES`] is exactly the set of frame types `RelayFrame::from_value` matches on,
+/// found by reading the relay's source for the arms of its one match over a frame's `type`
+/// (`(Some("<type>"), …)`). A type matched there and missing here, or listed here and matched
+/// nowhere, fails until the ledger says the same.
+#[test]
+fn the_ledger_relay_types_are_read_by_the_relay() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/opengrok/relay.rs");
+    let source = std::fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+    let read: BTreeSet<&str> = shipped_lines(&source)
+        .into_iter()
+        .filter_map(|line| line.trim_start().strip_prefix("(Some(\""))
+        .filter_map(|rest| rest.split('"').next())
+        .collect();
+    let listed: BTreeSet<&str> = RELAY_FRAME_TYPES.iter().copied().collect();
+    assert_eq!(
+        read, listed,
+        "the types the relay reads, and the types the ledger lists"
+    );
 }
 
 /// Every type and name the server sends has a fixture, or the manifest lists it as unrecorded:
@@ -5832,7 +5946,19 @@ fn a_coworker_rows_effort_has_a_reading_in_the_ledger() {
 /// holds every entry of [`WORDS_NOT_RECORDED_YET`] to these, so a word added there comes with
 /// its frames here, and leaves with it when the recording brings the real ones.
 #[allow(clippy::type_complexity)]
-const FRAMES_READ_AHEAD: &[(Slot, &str, fn() -> Vec<(Value, bool)>)] = &[];
+const FRAMES_READ_AHEAD: &[(Slot, &str, fn() -> Vec<(Value, bool)>)] =
+    &[(Slot::RelayType, "disabled", disabled_frames)];
+
+/// The frame `disabled`, in the shape agreed (`{"type": "disabled"}`, the one word and nothing
+/// beside it), which the relay's reading takes; and the look-alikes it does not.
+fn disabled_frames() -> Vec<(Value, bool)> {
+    use serde_json::json;
+    vec![
+        (json!({"type": "disabled"}), true),
+        (json!({"type": "disable"}), false),
+        (json!({"type": "Disabled"}), false),
+    ]
+}
 
 /// [`FRAMES_READ_AHEAD`]'s frames for one word, none when it has none.
 fn frames_read_ahead(slot: Slot, word: &str) -> Vec<(Value, bool)> {
@@ -5887,7 +6013,13 @@ fn every_word_read_ahead_of_its_recording_is_matched_and_not_sent_yet() {
             ));
         }
         for (frame, reads) in frames {
-            match (check_frame(&corpus, &frame), reads) {
+            // A frame off the relay's stream is read by the relay's own reader, as the recorded
+            // ones are; any other by the chat's.
+            let verdict = match slot {
+                Slot::RelayType => relay_frame(&frame),
+                _ => check_frame(&corpus, &frame),
+            };
+            match (verdict, reads) {
                 (Err(why), true) => problems.push(format!("{frame}: {why}")),
                 (Ok(()), false) => problems.push(format!("{frame} should not read, and does")),
                 _ => {}
