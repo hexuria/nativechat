@@ -31261,6 +31261,7 @@ mod tests {
                     id: (*id).to_string(),
                     source: None,
                     via: None,
+                    ..Default::default()
                 })
                 .collect(),
             note: note.map(str::to_string),
@@ -31280,6 +31281,7 @@ mod tests {
             id: (*id).to_string(),
             source: Some(source.to_string()),
             via: None,
+            ..Default::default()
         };
         ModelCatalogue {
             models: gateway
@@ -31383,6 +31385,7 @@ mod tests {
                 id: (*id).to_string(),
                 source: Some("local_proxy".into()),
                 via: Some(via.into()),
+                ..Default::default()
             };
             ModelCatalogue {
                 models: here
@@ -37014,6 +37017,7 @@ mod tests {
             id: id.into(),
             source: Some(source.into()),
             via: None,
+            ..Default::default()
         };
         state.model_catalogue = ModelCatalogue {
             models: vec![
@@ -37091,6 +37095,7 @@ mod tests {
                     id: id.clone(),
                     source: Some("gateway".into()),
                     via: None,
+                    ..Default::default()
                 })
                 .collect(),
             note: None,
@@ -37399,6 +37404,7 @@ mod tests {
                 id: "gpt-6-luna".into(),
                 source: Some("local_proxy".into()),
                 via: None,
+                ..Default::default()
             }],
             note: None,
             local_proxy: None,
@@ -37597,11 +37603,13 @@ mod tests {
                     id: "oag/cheap".into(),
                     source: Some("gateway".into()),
                     via: None,
+                    ..Default::default()
                 },
                 ModelEntry {
                     id: "gpt-6-luna".into(),
                     source: Some("local_proxy".into()),
                     via: None,
+                    ..Default::default()
                 },
             ],
             note: None,
@@ -38689,6 +38697,7 @@ mod tests {
             id: id.into(),
             source: source.map(str::to_string),
             via: None,
+            ..Default::default()
         };
         state.model_catalogue = ModelCatalogue {
             models: vec![

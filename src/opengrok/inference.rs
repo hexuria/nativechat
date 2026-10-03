@@ -1107,6 +1107,7 @@ mod tests {
             id: "gpt-6-luna".into(),
             source: Some("local_proxy".into()),
             via: Some("computer".into()),
+            ..Default::default()
         };
         assert_eq!(listed.plan_via(), Some(Via::Mac));
     }

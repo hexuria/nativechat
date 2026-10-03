@@ -965,6 +965,7 @@ mod tests {
             id: id.into(),
             source: Some(source.into()),
             via: via.map(str::to_string),
+            ..Default::default()
         }
     }
 
@@ -1156,6 +1157,7 @@ mod tests {
             id: "odd".into(),
             source: Some("byok".into()),
             via: None,
+            ..Default::default()
         });
         assert_eq!(
             ids(&server_choices(&listed)),

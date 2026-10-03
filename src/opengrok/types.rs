@@ -143,6 +143,10 @@ where
 /// `inherit` is a coworker with none set, whose turns send the gateway no effort, so the model's
 /// route decides; any other word goes to the gateway as the turn's `reasoning_effort`, taken when
 /// the run starts. Some models ignore it, and the server cannot know which.
+///
+/// These are the words #271 knew. What a model takes is its own to say: `GET /models` lists each
+/// model's levels ([`ModelEntry::efforts`]), `ultra` among them for a model that has one, and the
+/// picker offers those and no others.
 pub const EFFORT_WORDS: [&str; 7] = ["inherit", "none", "low", "medium", "high", "xhigh", "max"];
 
 /// The effort of a coworker with none set, and of every coworker on a server that keeps none.
@@ -245,7 +249,21 @@ pub struct ThreadListing {
     pub updated_at_ms: i64,
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+/// One level of effort a model takes, as `GET /models` lists it under `efforts`: the word the
+/// server keeps and a `PATCH /coworkers/{id}` takes (`low`, `medium`, `ultra`), and what the model
+/// calls it, which is a word of the source's own (opencodex says "Low Effort").
+///
+/// Transcribed from opengrok-server branch `model-effort-levels`, shape agreed (not recorded yet,
+/// so no corpus file holds it: `REST_FIELDS_NOT_RECORDED_YET` in `opengrok/conformance.rs`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EffortLevel {
+    pub value: String,
+    pub label: String,
+}
+
+/// A model of `GET /models`. Its `efforts` and `ownEffort` are from opengrok-server branch
+/// `model-effort-levels`, shape agreed (not recorded yet).
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
 pub struct ModelEntry {
     pub id: String,
     /// Which door serves it, `gateway` or `local_proxy` (the inference-source contract agreed
@@ -263,6 +281,17 @@ pub struct ModelEntry {
     /// sent and read through [`Self::plan_via`].
     #[serde(default)]
     pub via: Option<String>,
+    /// The levels of effort the model takes, lowest first: `[{value, label}]`, or `null` when
+    /// the source the model comes from publishes none. The app never works them out for a model
+    /// that lists none, and a list it cannot read whole is none: a slider drawn from a guess
+    /// would offer a stop the server then refuses. Empty is none too.
+    #[serde(default, deserialize_with = "effort_levels_or_none")]
+    pub efforts: Option<Vec<EffortLevel>>,
+    /// The `value` of the level the model runs at when a Bot chooses none, `null` when the
+    /// source publishes none. Read through [`Self::own_level`], which holds it to the levels
+    /// listed.
+    #[serde(default, rename = "ownEffort", deserialize_with = "own_effort_or_none")]
+    pub own_effort: Option<String>,
 }
 
 impl ModelEntry {
@@ -294,6 +323,56 @@ impl ModelEntry {
             Some(word) => super::Via::from_word(word),
         }
     }
+
+    /// The level the model runs at when a Bot chooses none: the one `ownEffort` names, as long
+    /// as the model lists it. A word that is not one of its levels is no level to light.
+    pub fn own_level(&self) -> Option<&EffortLevel> {
+        let own = self.own_effort.as_deref()?;
+        self.efforts
+            .as_ref()?
+            .iter()
+            .find(|level| level.value == own)
+    }
+}
+
+/// `efforts` as a row brings it: `[{value, label}]` lowest first, or `null`. A list that is
+/// empty, or has one entry that is not a `value` and a `label`, is none, and never fails the
+/// list of models.
+fn effort_levels_or_none<'de, D>(deserializer: D) -> Result<Option<Vec<EffortLevel>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let Some(serde_json::Value::Array(rows)) =
+        Option::<serde_json::Value>::deserialize(deserializer)?
+    else {
+        return Ok(None);
+    };
+    let text = |row: &serde_json::Value, key: &str| {
+        row.get(key)
+            .and_then(serde_json::Value::as_str)
+            .filter(|word| !word.trim().is_empty())
+            .map(str::to_string)
+    };
+    let levels: Option<Vec<EffortLevel>> = rows
+        .iter()
+        .map(|row| {
+            Some(EffortLevel {
+                value: text(row, "value")?,
+                label: text(row, "label")?,
+            })
+        })
+        .collect();
+    Ok(levels.filter(|levels| !levels.is_empty()))
+}
+
+/// `ownEffort` as a row brings it: a word, or `null`; anything else is none.
+fn own_effort_or_none<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<serde_json::Value>::deserialize(deserializer)?
+        .and_then(|raw| raw.as_str().map(str::to_string))
+        .filter(|word| !word.trim().is_empty()))
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -758,6 +837,74 @@ mod tests {
                 ("odd", None),
                 ("nulled", Some(InferenceKind::Gateway)),
             ]
+        );
+    }
+
+    /// A model lists the levels of effort it takes, lowest first, and the one it runs at when a
+    /// Bot chooses none (opengrok-server branch `model-effort-levels`, shape agreed (not recorded
+    /// yet)). Both are `null` where the source publishes nothing and then read as none, as when
+    /// the keys are missing; the app never works a model's levels out. A list it cannot read
+    /// whole, an empty one, and an own level the model does not list are none, and never fail
+    /// the list.
+    #[test]
+    fn a_models_levels_of_effort_read_as_sent_and_as_none_where_there_are_none() {
+        let catalogue: ModelCatalogue = serde_json::from_value(serde_json::json!({
+            "models": [
+                {"id": "gpt-6-luna", "source": "local_proxy", "ownEffort": "medium", "efforts": [
+                    {"value": "low", "label": "Low Effort"},
+                    {"value": "medium", "label": "Medium Effort"},
+                    {"value": "max", "label": "Max Effort"}
+                ]},
+                {"id": "oag/cheap", "efforts": null, "ownEffort": null},
+                {"id": "oag/fast"},
+                {"id": "empty", "efforts": [], "ownEffort": "medium"},
+                {"id": "half", "efforts": [{"value": "low"}, {"value": "high", "label": "High"}]},
+                {"id": "blank", "efforts": [{"value": "", "label": "Low"}]},
+                {"id": "odd", "efforts": "low", "ownEffort": 3},
+                {"id": "unlisted", "ownEffort": "ultra", "efforts": [
+                    {"value": "low", "label": "Low"}
+                ]}
+            ],
+            "note": null
+        }))
+        .expect("one entry's levels never fail the list");
+        let read = |id: &str| {
+            catalogue
+                .models
+                .iter()
+                .find(|entry| entry.id == id)
+                .unwrap_or_else(|| panic!("{id} is listed"))
+        };
+        let luna = read("gpt-6-luna");
+        assert_eq!(
+            luna.efforts.as_ref().map(|levels| levels
+                .iter()
+                .map(|l| (l.value.as_str(), l.label.as_str()))
+                .collect::<Vec<_>>()),
+            Some(vec![
+                ("low", "Low Effort"),
+                ("medium", "Medium Effort"),
+                ("max", "Max Effort")
+            ])
+        );
+        assert_eq!(luna.own_effort.as_deref(), Some("medium"));
+        assert_eq!(
+            luna.own_level().map(|level| level.value.as_str()),
+            Some("medium")
+        );
+        for none in ["oag/cheap", "oag/fast", "empty", "half", "blank", "odd"] {
+            let entry = read(none);
+            assert_eq!(entry.efforts, None, "{none}");
+            assert_eq!(entry.own_level(), None, "{none}");
+        }
+        assert_eq!(read("empty").own_effort.as_deref(), Some("medium"));
+        assert_eq!(read("odd").own_effort, None, "not a word");
+        let unlisted = read("unlisted");
+        assert_eq!(unlisted.own_effort.as_deref(), Some("ultra"));
+        assert_eq!(
+            unlisted.own_level(),
+            None,
+            "a level it does not list is none to light"
         );
     }
 

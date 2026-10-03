@@ -104,6 +104,6 @@ pub use pending::{
 pub use timing::{TurnTiming, stamp_duration};
 pub use types::{
     Account, AguiMessage, Attachment, Coworker, CoworkerPatch, CoworkerSource, EFFORT_INHERIT,
-    EFFORT_WORDS, LocalProxyStatus, ModelCatalogue, ModelEntry, ProfileUpdate, ReplyQuote,
-    SentAttachment, ThreadListing, assistant_text_from_sse,
+    EFFORT_WORDS, EffortLevel, LocalProxyStatus, ModelCatalogue, ModelEntry, ProfileUpdate,
+    ReplyQuote, SentAttachment, ThreadListing, assistant_text_from_sse,
 };

@@ -14305,6 +14305,7 @@ mod tests {
                     id: (*id).into(),
                     source: Some("gateway".into()),
                     via: None,
+                    ..Default::default()
                 })
                 .collect(),
             note: None,
@@ -14543,6 +14544,7 @@ mod tests {
                 id: (*id).into(),
                 source: Some((*source).into()),
                 via: None,
+                ..Default::default()
             })
             .collect(),
             note: None,
@@ -15229,6 +15231,7 @@ mod tests {
                     id: (*id).into(),
                     source: Some("gateway".into()),
                     via: None,
+                    ..Default::default()
                 })
                 .collect(),
             note: None,
@@ -15604,6 +15607,7 @@ mod tests {
                     id: format!("oag/route-{at}"),
                     source: Some("gateway".into()),
                     via: None,
+                    ..Default::default()
                 })
                 .collect(),
             note: None,
@@ -15740,6 +15744,7 @@ mod tests {
                 id: "oag/cheap".into(),
                 source: Some("gateway".into()),
                 via: None,
+                ..Default::default()
             }],
             note: Some("the gateway could not be reached: …".into()),
             local_proxy: None,
@@ -15900,6 +15905,7 @@ mod tests {
                 id: "oag/cheap".into(),
                 source: Some("gateway".into()),
                 via: None,
+                ..Default::default()
             }],
             note: None,
             local_proxy: None,
