@@ -29285,6 +29285,7 @@ mod tests {
 
     // ---- The account's events stream (hexuria/nativechat #171, opengrok-server #348) --------
 
+    use super::ThreadReread;
     use crate::opengrok::{AccountEvent, EventsNote, EventsTimings, RoutineChange, RunStartCause};
 
     /// Waits a test can sit through: the stream's own, shortened, with nothing taken off at random.
@@ -29426,6 +29427,18 @@ mod tests {
         })
     }
 
+    /// The read the stream asked for in `thread_id`, as the window holds it. A note is dealt with
+    /// where it is heard, so a test that has not let the window run since can say what became of
+    /// it without waiting, in real time, to see whether a read follows: a machine slow enough to
+    /// outrun the wait fails a test that was right.
+    fn held_read(
+        app: &gpui_kit::Entity<AppState>,
+        cx: &mut gpui_kit::TestAppContext,
+        thread_id: &str,
+    ) -> Option<ThreadReread> {
+        app.read_with(cx, |state, _| state.thread_rereads.get(thread_id).copied())
+    }
+
     fn said(app: &gpui_kit::Entity<AppState>, cx: &mut gpui_kit::TestAppContext) -> Vec<String> {
         app.read_with(cx, |state, _| {
             state.conversations[0]
@@ -29526,6 +29539,12 @@ mod tests {
     /// While this window's own turn streams in the open thread, what the stream says about the
     /// thread waits: a read then could paint over the turn being watched. Once the turn's stream
     /// ends, the thread is read once, and both the turn and the server's are in it.
+    ///
+    /// Nothing here waits for a clock. The server answers the turn at once, and the note is heard
+    /// before the window is let run, so the turn is streaming however quick the answer is: what
+    /// became of the note is read off the window. This test once held the answer back for 700 ms
+    /// and looked at the server after 300, and a runner slow enough to take longer than that
+    /// found the turn over and the thread read, as it should have been.
     #[gpui_kit::test]
     fn notes_while_the_windows_own_turn_streams_wait_for_it_to_end(
         cx: &mut gpui_kit::TestAppContext,
@@ -29549,8 +29568,7 @@ mod tests {
                 .respond_with(
                     wiremock::ResponseTemplate::new(200)
                         .insert_header("content-type", "text/event-stream")
-                        .set_body_string(frames)
-                        .set_delay(Duration::from_millis(700)),
+                        .set_body_string(frames),
                 )
                 .mount(&server)
                 .await;
@@ -29567,11 +29585,17 @@ mod tests {
             state.send_message("Anything new?".into(), cx)
         });
         hear(&app, cx, thread_changed("cw_1"));
-        let_it_settle(cx);
+        assert!(
+            app.read_with(cx, |state, _| state.is_turn_in_flight()),
+            "the turn is streaming"
+        );
         assert_eq!(
-            asked_for(&runtime, &server, "/ag-ui/threads/cw_1"),
-            0,
-            "nothing is read while the turn streams"
+            held_read(&app, cx, "cw_1"),
+            Some(ThreadReread {
+                reading: false,
+                owed: true
+            }),
+            "nothing is read while the turn streams: the note waits for its end"
         );
         wait_for(cx, "the turn ends, and the thread is read", |cx| {
             app.read_with(cx, |state, _| !state.is_turn_in_flight())
@@ -29712,6 +29736,10 @@ mod tests {
     /// never `run.finished`. Nothing waits for one: a read the stream asked for while the window's
     /// own turn streamed, or while it followed a run, goes when that stream or that follow ends
     /// with the run parked.
+    ///
+    /// As in [`notes_while_the_windows_own_turn_streams_wait_for_it_to_end`], the note is heard
+    /// before the window is let run, so the stream and the follow are open whatever the server
+    /// has answered, and nothing waits for a clock to find out what became of it.
     #[gpui_kit::test]
     fn a_run_parked_on_a_card_lets_the_waiting_read_go_with_no_run_finished(
         cx: &mut gpui_kit::TestAppContext,
@@ -29747,8 +29775,7 @@ mod tests {
                 .respond_with(
                     wiremock::ResponseTemplate::new(200)
                         .insert_header("content-type", "text/event-stream")
-                        .set_body_string(parked)
-                        .set_delay(Duration::from_millis(500)),
+                        .set_body_string(parked),
                 )
                 .mount(&server)
                 .await;
@@ -29778,8 +29805,14 @@ mod tests {
             state.send_message("Delete my standup".into(), cx)
         });
         hear(&app, cx, thread_changed("cw_1"));
-        let_it_settle(cx);
-        assert_eq!(asked_for(&runtime, &server, "/ag-ui/threads/cw_1"), 0);
+        assert_eq!(
+            held_read(&app, cx, "cw_1"),
+            Some(ThreadReread {
+                reading: false,
+                owed: true
+            }),
+            "nothing is read while the turn streams: the note waits for its end"
+        );
         wait_for(cx, "the turn parks, and the thread is read", |cx| {
             asked_for(&runtime, &server, "/ag-ui/threads/cw_1") == 1 && rereads_landed(&app, cx)
         });
@@ -29788,11 +29821,13 @@ mod tests {
             state.follow_run("run_park".into(), Some("cw_1".into()), cx)
         });
         hear(&app, cx, thread_changed("cw_1"));
-        let_it_settle(cx);
         assert_eq!(
-            asked_for(&runtime, &server, "/ag-ui/threads/cw_1"),
-            1,
-            "nothing is read while the run is followed"
+            held_read(&app, cx, "cw_1"),
+            Some(ThreadReread {
+                reading: false,
+                owed: true
+            }),
+            "nothing is read while the run is followed: the note waits for the follow's end"
         );
         wait_for(cx, "the followed run parks, and the thread is read", |cx| {
             asked_for(&runtime, &server, "/ag-ui/threads/cw_1") == 2 && rereads_landed(&app, cx)
