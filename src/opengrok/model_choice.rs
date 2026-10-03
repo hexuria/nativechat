@@ -75,9 +75,8 @@ pub const PLAN_FALLBACK_PICK_FIRST: &str =
     "Pick a model first: a Relay-off fallback starts with one.";
 /// What the list says under its rows for a Bot whose own door is the person's plan
 /// ([`ModelPick::routines`]).
-pub const ROUTINES_ON_PLAN: &str = "This Bot's routines won't run while it answers on your own \
-                                    plan: routines run on the server's keys. Pick a Gateway model \
-                                    to run it on a schedule.";
+pub const ROUTINES_ON_PLAN: &str = "This Bot's routines run on your own plan: one that's due \
+                                    while your plan can't answer is skipped.";
 
 /// Whether an id is a model's fast tier.
 pub fn is_fast(id: &str) -> bool {
@@ -477,16 +476,15 @@ pub struct ModelPick {
     /// The line that takes the Subscription group's place on a server without per-Bot doors,
     /// while the account is on the person's plan.
     pub account_plan: Option<AccountPlan>,
-    /// The line that says this Bot's routines won't run ([`ROUTINES_ON_PLAN`]). A routine runs
-    /// on the server's keys, and the person chose their own plan for a Bot whose own door is the
-    /// plan, so the server refuses every routine of such a Bot, in words, before any model call
-    /// and with nothing billed (the owner's decision: `Route::for_routine` in opengrok-server's
-    /// `crates/opengrok-harness/src/local_proxy.rs`, server main d6f640e (#307, after #304), pin
-    /// bf99845, whose recording holds the refusal). It is said for every
-    /// such Bot, whatever it is pinned to and whatever the gateway lists: a pin the gateway has
-    /// is refused as much as one it lacks. A Bot that follows the account (`source: null`), or
-    /// is on the gateway, runs its routines through the gateway on its pin as before
-    /// (opengrok-server #294, `autonomy/mod.rs`), and is told nothing.
+    /// The line that says where this Bot's routines run ([`ROUTINES_ON_PLAN`]). A Bot whose own
+    /// door is the person's plan runs its routines on that plan, as a live turn there would, and
+    /// one due while the plan cannot answer (no computer holds the relay, or the proxy does not
+    /// answer) is skipped, with nothing run and the history saying why (the owner's rule of 3 Oct
+    /// 2026, #334 on main 8e7387f: `routine_route` and `unreachable` in opengrok-server's
+    /// `crates/opengrok-server/src/autonomy/mod.rs`; before it the server refused every routine of
+    /// such a Bot). It is said for every such Bot, whatever it is pinned to. A Bot that follows
+    /// the account (`source: null`), or is on the gateway, runs its routines through the gateway
+    /// on its pin as before (opengrok-server #294), and is told nothing.
     pub routines: Option<String>,
     /// What the card names while there is no model to name: [`NO_MODEL`] for a Bot, and
     /// [`NEW_BOTS_NONE`] for Default for new Bots, where none is the server's own default.
@@ -567,8 +565,8 @@ pub fn bot_pick(
         (!per_bot && door == Some(InferenceKind::LocalProxy)).then_some(AccountPlan {
             model: account_model,
         });
-    // The Bot's own door alone decides: the server refuses the routines of a Bot on its own plan
-    // whatever its pin (opengrok-server #304).
+    // The Bot's own door alone decides: the routines of a Bot on its own plan run on that plan,
+    // whatever its pin (opengrok-server #334).
     let routines =
         (bot_door == Some(InferenceKind::LocalProxy)).then(|| ROUTINES_ON_PLAN.to_string());
     ModelPick {
@@ -1917,19 +1915,18 @@ mod tests {
         );
     }
 
-    /// The server refuses every routine of a Bot whose own door is `local_proxy`, before any
-    /// model call (the owner's decision: opengrok-server main d6f640e (#307, after #304), pin
-    /// bf99845, whose recording holds the refusal as the routine's failed last run, in words and
-    /// with no code). Such a Bot is always told its
-    /// routines won't run: pinned to a plan model the gateway lacks, to one the gateway lists,
-    /// fast tier or not, or to nothing; before the gateway's models are listed, and whatever the
-    /// account's door.
+    /// A Bot whose own door is `local_proxy` runs its routines on the person's plan, and one due
+    /// while the plan cannot answer is skipped (#334 on main 8e7387f, whose recording holds a
+    /// plan Bot's routine run through the Mac and one skipped with no Mac). Such a Bot is always
+    /// told so: pinned to a plan model the gateway lacks, to one the gateway lists, fast tier or
+    /// not, or to nothing; before the gateway's models are listed, and whatever the account's
+    /// door. It is not told its routines won't run: the server no longer refuses them.
     #[test]
-    fn a_bot_on_its_own_plan_is_always_told_its_routines_wont_run() {
+    fn a_bot_on_its_own_plan_is_told_its_routines_run_there_and_may_be_skipped() {
         assert_eq!(
             ROUTINES_ON_PLAN,
-            "This Bot's routines won't run while it answers on your own plan: routines run on \
-             the server's keys. Pick a Gateway model to run it on a schedule."
+            "This Bot's routines run on your own plan: one that's due while your plan can't answer \
+             is skipped."
         );
         let on_plan = account(InferenceKind::LocalProxy, Some("gpt-6-luna"));
         let on_keys = account(InferenceKind::Gateway, None);

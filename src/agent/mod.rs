@@ -279,9 +279,8 @@
 //! plan model, which answers for every Bot there; a line, not a row, which the search leaves or
 //! takes away as it would a row), `agent-model-no-match` ("No model matches", while the search
 //! leaves nothing of a list that has some), `agent-model-routines` (on a Bot whose own door is
-//! the person's plan, whatever it is pinned to: the line saying its routines won't run, since
-//! they run on the server's paid keys and the server refuses every routine of such a Bot
-//! (opengrok-server #304), and to pick a Gateway model to run it on a schedule; a line, not a
+//! the person's plan, whatever it is pinned to: the line saying its routines run on that plan,
+//! and one due while the plan cannot answer is skipped (opengrok-server #334); a line, not a
 //! row) and `agent-model-note` (the server's word on why the list is not fuller).
 //! `agent-model-error` is the server's words for the last change it refused. Every change is
 //! saved on the Bot at once, `source`, `model` and `effort` on `PATCH /coworkers/{id}`

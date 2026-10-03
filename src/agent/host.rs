@@ -5407,8 +5407,8 @@ impl NativeChatHost {
     /// `agent-model-group-{source}` heading ("Subscription", "Gateway") over each group's first
     /// model in view; `agent-model-plan` where a server without per-Bot doors has the account's
     /// plan model answer, `agent-model-no-match` where the search leaves nothing of a list that
-    /// has some, `agent-model-routines` where the Bot's own door is the person's plan and its
-    /// routines won't run, and `agent-model-note`, the server's word on why the list is not
+    /// has some, `agent-model-routines` where the Bot's own door is the person's plan, where its
+    /// routines run, and `agent-model-note`, the server's word on why the list is not
     /// fuller. `agent-model-error`, while open: the server's words for the last change it refused,
     /// or for new Bots that nobody knows whether it was kept.
     fn picker_node(&self, which: PickerFor) -> Option<UiNode> {
@@ -15371,8 +15371,8 @@ mod tests {
             .iter()
             .map(|row| (row.id.as_str(), row.name.as_str(), row.states.as_slice()))
             .collect();
-        // Under the rows, the line saying this Bot's routines won't run: its own door is the
-        // person's plan, and routines run on the server's keys.
+        // Under the rows, the line saying where this Bot's routines run: its own door is the
+        // person's plan, and its routines run there.
         let routines = host
             .model_pick
             .as_ref()
@@ -15783,13 +15783,13 @@ mod tests {
         assert!(host.click("agent-model-plan").is_err(), "a line, not a row");
     }
 
-    /// A Bot on its own plan (opengrok-server #304): while the list shows,
-    /// `agent-model-routines` under its rows says the Bot's routines won't run, as the window
-    /// does. It is a line, not a control. It is there whatever the Bot is pinned to, a model the
-    /// gateway lists included, and there is none for a Bot that follows the account or is on the
-    /// gateway.
+    /// A Bot on its own plan (opengrok-server #304, and #334 for its routines): while the list
+    /// shows, `agent-model-routines` under its rows says the Bot's routines run on that plan and
+    /// are skipped while it cannot answer, as the window does. It is a line, not a control. It is
+    /// there whatever the Bot is pinned to, a model the gateway lists included, and there is none
+    /// for a Bot that follows the account or is on the gateway.
     #[test]
-    fn the_list_says_a_bot_on_its_own_plan_runs_no_routines() {
+    fn the_list_says_where_a_bot_on_its_own_plan_runs_its_routines() {
         let said = crate::opengrok::ROUTINES_ON_PLAN;
         let mut host = host();
         host.model_pick = Some(a_pick(
@@ -15832,7 +15832,7 @@ mod tests {
         assert!(refused.contains("a line, not a control"), "{refused}");
         assert!(host.take_command().is_none());
 
-        // A pin the gateway lists: refused all the same.
+        // A pin the gateway lists: on the plan all the same.
         host.model_pick = Some(a_pick(
             Some(serde_json::json!("local_proxy")),
             "xai/grok-4.7",

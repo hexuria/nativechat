@@ -64,7 +64,8 @@ pub(crate) const PLAN: &str = "agent-model-plan";
 /// In the list: the server's word about why it lists no more, as `GET /models` gives it.
 pub(crate) const NOTE: &str = "agent-model-note";
 /// In the list, on a Bot whose own door is the person's plan, whatever it is pinned to: its
-/// routines, which run on the server's paid keys, won't run (`ModelPick::routines`).
+/// routines run on that plan, and one due while it cannot answer is skipped
+/// (`ModelPick::routines`).
 pub(crate) const ROUTINES: &str = "agent-model-routines";
 /// Under the controls: the server's words for the last change that did not go through.
 pub(crate) const ERROR: &str = "agent-model-error";
@@ -877,8 +878,8 @@ impl Panel {
                                 .child(NO_MODEL_MATCHES),
                         )
                     })
-                    // Under the rows it is about, where a Gateway model to pick instead is in
-                    // view.
+                    // Under the rows it is about, where a Gateway model, whose routines run
+                    // whenever they are due, is in view to pick instead.
                     .when_some(pick.routines.clone(), |this, line| {
                         this.child(
                             div()
