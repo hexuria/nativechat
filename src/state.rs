@@ -34,6 +34,9 @@ use crate::opengrok::{
     reads_as_gateway_unreachable, retry_enqueue, save_login_from_local, serve_local_exec,
     stamp_duration, start_relay, stored_machine_id, tool_standin,
 };
+use crate::opengrok::{
+    AccountEvent, AccountEvents, EventsNote, EventsTimings, SentAttachment, start_account_events,
+};
 use crate::opengrok::{FrameArrivals, keep_call_times};
 use crate::reachability::Reachability;
 use crate::relay_key::RelayKeyStore;
@@ -3109,6 +3112,69 @@ fn reply_from_followed(
 /// reply on disk is final — so a handful is all it takes to find what is missing.
 const RECONCILE_RUNS: usize = 5;
 
+/// A thread as the server has it, with the files its messages carried: the two reads a reconcile
+/// is made of, whether coming back to the thread asked for it or the account's events stream did.
+async fn read_thread(
+    client: &OpenGrokClient,
+    thread_id: &str,
+) -> (
+    Result<ThreadReplay, OpenGrokError>,
+    Result<Vec<SentAttachment>, OpenGrokError>,
+) {
+    let thread = client.replay_thread(thread_id, RECONCILE_RUNS).await;
+    let files = client.sent_attachments(thread_id).await;
+    (thread, files)
+}
+
+/// How many of the runs this app started itself it keeps the ids of, to know the events stream's
+/// notes about them for its own. A turn's notes come while it runs and just after; this is many
+/// turns more than that.
+const OWN_RUNS_KEPT: usize = 64;
+
+/// Where the account's events stream stands, as a driver reads it (`events-stream`). Nothing on
+/// screen says it: the stream is how the window keeps up with the server, not something a person
+/// works (hexuria/nativechat #171, opengrok-server #348).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum EventsStream {
+    /// Nobody is signed in.
+    #[default]
+    Off,
+    /// Being opened, the first time since signing in.
+    Connecting,
+    Connected,
+    /// It dropped, or went quiet, and is being opened again.
+    Reconnecting,
+    /// The server has no events route, being from before opengrok-server #348: the window keeps
+    /// up the way it did before there was one.
+    Unavailable,
+    /// The server stopped knowing who this is. Signing in again starts it again.
+    SignedOut,
+}
+
+impl EventsStream {
+    /// The word a driver reads.
+    pub fn word(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Connecting => "connecting",
+            Self::Connected => "connected",
+            Self::Reconnecting => "reconnecting",
+            Self::Unavailable => "unavailable",
+            Self::SignedOut => "signed-out",
+        }
+    }
+}
+
+/// A re-read of a thread the account's events stream asked for ([`AppState::reread_thread`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ThreadReread {
+    /// One is out.
+    reading: bool,
+    /// Another is owed: asked for while one was out, or while the app's own turn streamed in the
+    /// thread. It goes when the read lands, or when the stream ends.
+    owed: bool,
+}
+
 /// A reply the server has and this thread does not.
 #[derive(Debug, Clone, PartialEq)]
 struct RecoveredReply {
@@ -5398,6 +5464,26 @@ pub struct AppState {
     /// Where the key for this Mac's opencodex is kept: the Keychain, once the app is configured,
     /// and memory before that and in tests.
     relay_keys: Arc<dyn RelayKeyStore>,
+    /// The account's events stream while somebody is signed in (opengrok-server #348): the
+    /// server's word that a thread, a run or a routine changed, which has the app read again what
+    /// it names. Dropping it stops it: signed out, or signed in as somebody else.
+    account_events: Option<AccountEvents>,
+    /// Numbers the starts of the stream, so a note from one stopped since, or a re-read one asked
+    /// for, lands on nothing.
+    account_events_generation: u64,
+    /// How long the stream waits for its pings and between attempts: the server's cadence, or a
+    /// test's.
+    events_timings: EventsTimings,
+    /// Where the stream stands, for a driver (`events-stream`).
+    pub events_stream: EventsStream,
+    /// The re-reads the stream asked for, by thread: one out at a time, and one owed after it.
+    thread_rereads: HashMap<String, ThreadReread>,
+    /// The app's own `POST /ag-ui` streams, and the runs it follows through the replay route,
+    /// still open, by thread: a re-read of the thread waits until the last of them has ended.
+    turn_streams: HashMap<String, usize>,
+    /// The runs this app started itself, newest last ([`OWN_RUNS_KEPT`]): the stream's notes
+    /// about them tell the window nothing it is not already watching.
+    own_runs: VecDeque<String>,
     /// Replies whose run ended because the person's plan could not answer (a `RUN_ERROR`'s
     /// `code`: the relay's, or `plan_unavailable`), by the reply's message id: the thread's last
     /// one offers the turn again on the server's keys ([`Self::send_on_server`]).
@@ -6019,6 +6105,13 @@ impl AppState {
             relay_starting: None,
             relay_generation: 0,
             relay_keys: Arc::new(crate::relay_key::MemoryKeyStore::default()),
+            account_events: None,
+            account_events_generation: 0,
+            events_timings: EventsTimings::default(),
+            events_stream: EventsStream::Off,
+            thread_rereads: HashMap::new(),
+            turn_streams: HashMap::new(),
+            own_runs: VecDeque::new(),
             plan_failures: HashMap::new(),
             coworker_ceiling: None,
             ceiling_generation: 0,
@@ -6159,6 +6252,7 @@ impl AppState {
                         state.refresh_computers(cx);
                         state.refresh_host_egress(cx);
                         state.sync_pending_approvals(cx);
+                        state.start_events_stream(cx);
                     }
                     Err(error) => {
                         state.account = None;
@@ -7135,6 +7229,7 @@ impl AppState {
                         state.refresh_computers(cx);
                         state.refresh_host_egress(cx);
                         state.sync_pending_approvals(cx);
+                        state.start_events_stream(cx);
                     }
                     Err(error) => {
                         state.account = None;
@@ -7227,6 +7322,8 @@ impl AppState {
         // The relay answered for them, and stops with every call it was answering; its switch is
         // their computer's row, and is read again for whoever signs in next.
         self.stop_relay();
+        // So did the account's events stream, and every re-read it asked for.
+        self.stop_events_stream();
         self.plan_failures.clear();
         // And any list of models still being asked for was asked as them, and the plan's models
         // listed were their plan's: the gateway's routes are the deployment's and stay.
@@ -8695,6 +8792,276 @@ impl AppState {
         } else {
             self.turn_inference_source(drained)
         }
+    }
+
+    // ---- The account's events stream (hexuria/nativechat #171, opengrok-server #348) ----------
+
+    /// Hear the account's events stream from now until the person signs out: the server's word
+    /// that a thread, a run or a routine changed, which has the app read again what it names. A
+    /// stream still running for whoever was signed in before stops first.
+    fn start_events_stream(&mut self, cx: &mut Context<Self>) {
+        self.stop_events_stream();
+        let Some(client) = self.opengrok.clone() else {
+            return;
+        };
+        let generation = self.account_events_generation;
+        let (running, mut heard) = start_account_events(client, self.events_timings);
+        self.account_events = Some(running);
+        self.events_stream = EventsStream::Connecting;
+        cx.spawn(async move |this, cx| {
+            while let Some(note) = heard.recv().await {
+                let following = this
+                    .update(cx, |state, cx| state.take_events_note(generation, note, cx))
+                    .unwrap_or(false);
+                if !following {
+                    return;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// Stop hearing the stream: signed out, or about to be signed in as somebody else. A note
+    /// still on its way from it lands on nothing, and so does a re-read it asked for.
+    fn stop_events_stream(&mut self) {
+        self.account_events_generation += 1;
+        self.account_events = None;
+        self.events_stream = EventsStream::Off;
+        self.thread_rereads.clear();
+    }
+
+    /// What the stream said, `false` once it is not this stream's to say.
+    fn take_events_note(
+        &mut self,
+        generation: u64,
+        note: EventsNote,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if generation != self.account_events_generation {
+            return false;
+        }
+        match note {
+            // Open, the first time or again after a drop: nothing says what was missed while it
+            // was not, so what it covers on screen is read again, once.
+            EventsNote::Opened => {
+                self.events_stream = EventsStream::Connected;
+                self.read_everything_again(cx);
+            }
+            EventsNote::Event(event) => self.take_account_event(event, cx),
+            EventsNote::Lost => self.events_stream = EventsStream::Reconnecting,
+            // The session is gone, after its own refresh was tried: the app's way with that takes
+            // over, the banner and signing in again, which starts the stream again.
+            EventsNote::SignedOut(error) => {
+                self.account_events = None;
+                self.events_stream = EventsStream::SignedOut;
+                self.note_failure(&error, cx);
+            }
+            EventsNote::Unavailable => {
+                self.account_events = None;
+                self.events_stream = EventsStream::Unavailable;
+            }
+        }
+        cx.notify();
+        true
+    }
+
+    /// One note off the stream, for what is on screen. A note about another Bot's thread is passed
+    /// over: nothing here marks a thread as having news (the sidebar's line is the thread's last
+    /// message as this app holds it), and that thread is read when it is opened.
+    fn take_account_event(&mut self, event: AccountEvent, cx: &mut Context<Self>) {
+        match event {
+            AccountEvent::ThreadChanged { thread_id, .. } => self.reread_thread(&thread_id, cx),
+            AccountEvent::RunStarted {
+                run_id,
+                thread_id,
+                routine_id,
+                ..
+            } => self.run_moved(&run_id, &thread_id, routine_id.as_deref(), false, cx),
+            AccountEvent::RunFinished {
+                run_id,
+                thread_id,
+                routine_id,
+                ..
+            } => self.run_moved(&run_id, &thread_id, routine_id.as_deref(), true, cx),
+            // The open Bot's list, and its routine's open panel, by the road a Bot's own routine
+            // call takes: a field being typed in keeps what is typed, and a deleted routine's
+            // panel closes. Another Bot's routines are read when it is opened.
+            AccountEvent::RoutineChanged { coworker_id, .. } => {
+                if self.active_coworker_id.as_deref() == Some(coworker_id.as_str()) {
+                    self.routines_changed(cx);
+                }
+            }
+            AccountEvent::Reset => self.read_everything_again(cx),
+        }
+    }
+
+    /// A run began or ended. Its routine's history is read again while that routine's panel is
+    /// open; and the thread it ran in, when that is the open thread and the run is not one of this
+    /// app's own, which it is watching down the stream it started it on. A run that ended while
+    /// the open thread still holds it as its turn, with nothing following it any more, is asked
+    /// after the way coming back to the thread asks after it.
+    fn run_moved(
+        &mut self,
+        run_id: &str,
+        thread_id: &str,
+        routine_id: Option<&str>,
+        ended: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(routine_id) = routine_id
+            && let Some(coworker_id) = self.routine_open_in_pane(routine_id)
+        {
+            self.load_routine_runs(&coworker_id, routine_id, cx);
+        }
+        if self.own_runs.iter().any(|own| own == run_id) {
+            return;
+        }
+        if ended && self.holds_unwatched_turn(thread_id, Some(run_id)) {
+            self.resync_live_turn(thread_id, cx);
+        }
+        self.reread_thread(thread_id, cx);
+    }
+
+    /// Everything the stream covers that is on screen, read again once, on every (re)connect and
+    /// on `reset`: the open thread, and the turn it holds if nothing follows that any more; the
+    /// open Bot's Routines list; and once the list has landed, the open routine's history.
+    fn read_everything_again(&mut self, cx: &mut Context<Self>) {
+        if let Some(thread_id) = self.active_conversation_id.clone() {
+            if self.holds_unwatched_turn(&thread_id, None) {
+                self.resync_live_turn(&thread_id, cx);
+            }
+            self.reread_thread(&thread_id, cx);
+        }
+        self.routines_changed(cx);
+    }
+
+    /// The open Bot, while `routine_id`'s panel is open in the Computer pane: its fields or its
+    /// Run history, which are read together, so the history is current when it is shown.
+    fn routine_open_in_pane(&self, routine_id: &str) -> Option<String> {
+        if self.right_pane != RightPane::Computer {
+            return None;
+        }
+        match &self.computer_view {
+            ComputerView::Editor { id: Some(open) } if open == routine_id => {
+                self.active_coworker_id.clone()
+            }
+            _ => None,
+        }
+    }
+
+    /// The open thread is `thread_id`, and holds a turn (`run_id`'s, if one is named) that
+    /// neither its own stream nor a follow of its run is watching any more.
+    fn holds_unwatched_turn(&self, thread_id: &str, run_id: Option<&str>) -> bool {
+        self.active_conversation_id.as_deref() == Some(thread_id)
+            && !self.turn_streams.contains_key(thread_id)
+            && self
+                .live_turns
+                .get(thread_id)
+                .is_some_and(|turn| run_id.is_none_or(|run| turn.run_id == run))
+    }
+
+    /// Read the open thread again because the stream said it changed, and put what is new into it
+    /// the way coming back to it does ([`Self::take_thread_read`]). Only the open thread: another
+    /// is read when it is opened. Not while the app's own turn streams in it, or a run it follows
+    /// does: the read waits for that to end, and never paints over the turn being watched. And one
+    /// at a time: a note that comes while a read is out asks for one more after it, and a burst of
+    /// notes asks for no more than that.
+    fn reread_thread(&mut self, thread_id: &str, cx: &mut Context<Self>) {
+        if self.active_conversation_id.as_deref() != Some(thread_id) {
+            return;
+        }
+        let Some(client) = self.opengrok.clone() else {
+            return;
+        };
+        let watched = self.turn_streams.contains_key(thread_id);
+        let reread = self
+            .thread_rereads
+            .entry(thread_id.to_string())
+            .or_default();
+        if reread.reading || watched {
+            reread.owed = true;
+            return;
+        }
+        *reread = ThreadReread {
+            reading: true,
+            owed: false,
+        };
+        let generation = self.account_events_generation;
+        let thread_id = thread_id.to_string();
+        cx.spawn(async move |this, cx| {
+            let (thread, files) = read_thread(&client, &thread_id).await;
+            let _ = this.update(cx, |state, cx| {
+                state.settle_thread_reread(generation, &thread_id, thread, files, cx);
+            });
+        })
+        .detach();
+    }
+
+    /// A re-read the stream asked for, landing. One that lands after the app's own turn began
+    /// streaming in the thread is not put over the turn: the thread is read again once the turn's
+    /// stream ends. A re-read owed meanwhile goes now.
+    fn settle_thread_reread(
+        &mut self,
+        generation: u64,
+        thread_id: &str,
+        thread: Result<ThreadReplay, OpenGrokError>,
+        files: Result<Vec<SentAttachment>, OpenGrokError>,
+        cx: &mut Context<Self>,
+    ) {
+        if generation != self.account_events_generation {
+            return;
+        }
+        let owed = self
+            .thread_rereads
+            .remove(thread_id)
+            .is_some_and(|reread| reread.owed);
+        if self.turn_streams.contains_key(thread_id) {
+            self.thread_rereads
+                .entry(thread_id.to_string())
+                .or_default()
+                .owed = true;
+            return;
+        }
+        self.take_thread_read(thread_id, thread, files, cx);
+        cx.notify();
+        if owed {
+            self.reread_thread(thread_id, cx);
+        }
+    }
+
+    /// The app's own turn began streaming in a thread, or it began following a run there.
+    fn turn_stream_began(&mut self, thread_id: &str) {
+        *self.turn_streams.entry(thread_id.to_string()).or_default() += 1;
+    }
+
+    /// That stream, or that follow, ended. Once none is left in the thread, a re-read the stream
+    /// asked for meanwhile goes.
+    fn turn_stream_ended(&mut self, thread_id: &str, cx: &mut Context<Self>) {
+        match self.turn_streams.get_mut(thread_id) {
+            Some(open) if *open > 1 => {
+                *open -= 1;
+                return;
+            }
+            Some(_) => {
+                self.turn_streams.remove(thread_id);
+            }
+            None => return,
+        }
+        if self
+            .thread_rereads
+            .get(thread_id)
+            .is_some_and(|reread| reread.owed && !reread.reading)
+        {
+            self.reread_thread(thread_id, cx);
+        }
+    }
+
+    /// A run this app started, kept so that the stream's notes about it are known for its own.
+    fn note_own_run(&mut self, run_id: &str) {
+        if self.own_runs.len() == OWN_RUNS_KEPT {
+            self.own_runs.pop_front();
+        }
+        self.own_runs.push_back(run_id.to_string());
     }
 
     // ---- The relay: this computer answers for the plan (hexuria/nativechat #156, #292) ---------
@@ -14606,31 +14973,42 @@ impl AppState {
         };
         let conversation_id = conversation_id.to_string();
         cx.spawn(async move |this, cx| {
-            let thread = client.replay_thread(&conversation_id, RECONCILE_RUNS).await;
-            let files = client.sent_attachments(&conversation_id).await;
+            let (thread, files) = read_thread(&client, &conversation_id).await;
             let _ = this.update(cx, |state, cx| {
-                // What the server says each message carried is the answer, message by message;
-                // a thread it cannot list keeps what this session already knows.
-                if let Ok(files) = files {
-                    state.message_files.extend(files_by_message(files));
-                }
-                match thread {
-                    Ok(thread) => {
-                        state.reconciled_threads.insert(conversation_id.clone());
-                        state.hide_withheld_runs(&conversation_id, &thread, cx);
-                        state.apply_thread_replay(&conversation_id, &thread, cx);
-                        let badges = state.overlay_replay_cards(&conversation_id, &thread.runs);
-                        state.persist_replayed_badges(&conversation_id, badges, cx);
-                        state.apply_pending_from_replay(&conversation_id, &thread, cx);
-                    }
-                    Err(_) => {
-                        state.reconciled_threads.remove(&conversation_id);
-                    }
-                }
+                state.take_thread_read(&conversation_id, thread, files, cx);
                 cx.notify();
             });
         })
         .detach();
+    }
+
+    /// A read of a thread landing ([`read_thread`]): what the server has that the thread does
+    /// not is put into it, and what was hidden elsewhere is put out of sight.
+    fn take_thread_read(
+        &mut self,
+        conversation_id: &str,
+        thread: Result<ThreadReplay, OpenGrokError>,
+        files: Result<Vec<SentAttachment>, OpenGrokError>,
+        cx: &mut Context<Self>,
+    ) {
+        // What the server says each message carried is the answer, message by message; a
+        // thread it cannot list keeps what this session already knows.
+        if let Ok(files) = files {
+            self.message_files.extend(files_by_message(files));
+        }
+        match thread {
+            Ok(thread) => {
+                self.reconciled_threads.insert(conversation_id.to_string());
+                self.hide_withheld_runs(conversation_id, &thread, cx);
+                self.apply_thread_replay(conversation_id, &thread, cx);
+                let badges = self.overlay_replay_cards(conversation_id, &thread.runs);
+                self.persist_replayed_badges(conversation_id, badges, cx);
+                self.apply_pending_from_replay(conversation_id, &thread, cx);
+            }
+            Err(_) => {
+                self.reconciled_threads.remove(conversation_id);
+            }
+        }
     }
 
     /// Put out of sight the turns this account hid somewhere else, and tell the server about
@@ -15381,6 +15759,7 @@ impl AppState {
     fn open_turn(&mut self, conversation_id: &str) -> (String, String) {
         let run_id = uuid::Uuid::now_v7().to_string();
         let reply_id = uuid::Uuid::now_v7().to_string();
+        self.note_own_run(&run_id);
         if let Some(conversation) = self
             .conversations
             .iter_mut()
@@ -15455,6 +15834,9 @@ impl AppState {
         let turn_source = self.turn_door(drained.as_ref(), on_server);
 
         let (run_id, reply_id) = self.open_turn(&conversation_id);
+        // The thread is the app's own to paint while the turn streams: a re-read the account's
+        // events ask for meanwhile waits for the stream to end.
+        self.turn_stream_began(&conversation_id);
         if let Some(id) = self.active_coworker_id.clone() {
             self.touch_coworker_activity(&id);
         }
@@ -15845,6 +16227,11 @@ impl AppState {
                     }
                 }
                 cx.notify();
+            });
+            // The turn's stream is over, whatever it came to and whoever settled it: a re-read
+            // the account's events asked for while it ran goes now, after the turn's own ending.
+            let _ = this.update(cx, |state, cx| {
+                state.turn_stream_ended(&conversation_id, cx)
             });
         })
         .detach();
@@ -16400,7 +16787,14 @@ impl AppState {
         let registered = conversation_id
             .as_deref()
             .is_some_and(|id| self.turn_is_unsettled(id, &run_id));
+        // The thread's run is the app's own to paint while it is followed, as a turn's stream is:
+        // a re-read the account's events ask for meanwhile waits until the follow ends.
+        if let Some(id) = conversation_id.as_deref() {
+            self.turn_stream_began(id);
+        }
         cx.spawn(async move |this, cx| {
+            // Somebody else settled the turn, and has said what it came to.
+            let mut settled_elsewhere = false;
             let mut last_len = 0usize;
             let mut last_status = String::new();
             // When each call's end and answer first came back, so the calls this poll saw
@@ -16422,7 +16816,8 @@ impl AppState {
                     // Whoever settled the turn has already ended the responding state and said
                     // what the turn came to, so there is nothing to do on the way out either.
                     if settled {
-                        return;
+                        settled_elsewhere = true;
+                        break;
                     }
                 }
                 match client.replay_run(&run_id).await {
@@ -16634,20 +17029,25 @@ impl AppState {
                 }
                 tokio::time::sleep(Duration::from_millis(300)).await;
             }
-            let _ = this.update(cx, |state, cx| {
-                // This thread's own line, not the app's: a poll that has run out of patience
-                // must not decide that some other bot's turn is over, and must not end this one
-                // while it is stopped at a card waiting for a person.
-                let waiting = is_waiting_on_person(
-                    conversation_id
-                        .as_deref()
-                        .and_then(|id| state.thread_status(id)),
-                );
-                if !waiting {
-                    state.finish_responding(conversation_id.as_deref(), false);
-                }
-                cx.notify();
-            });
+            if !settled_elsewhere {
+                let _ = this.update(cx, |state, cx| {
+                    // This thread's own line, not the app's: a poll that has run out of patience
+                    // must not decide that some other bot's turn is over, and must not end this
+                    // one while it is stopped at a card waiting for a person.
+                    let waiting = is_waiting_on_person(
+                        conversation_id
+                            .as_deref()
+                            .and_then(|id| state.thread_status(id)),
+                    );
+                    if !waiting {
+                        state.finish_responding(conversation_id.as_deref(), false);
+                    }
+                    cx.notify();
+                });
+            }
+            if let Some(id) = conversation_id {
+                let _ = this.update(cx, |state, cx| state.turn_stream_ended(&id, cx));
+            }
         })
         .detach();
     }
@@ -28850,6 +29250,756 @@ mod tests {
             vec![serde_json::from_value(saved).unwrap()],
         );
         assert_eq!(label(&listed[0]), "Every 1 minute");
+    }
+
+    // ---- The account's events stream (hexuria/nativechat #171, opengrok-server #348) --------
+
+    use crate::opengrok::{AccountEvent, EventsNote, EventsTimings, RoutineChange, RunStartCause};
+
+    /// Waits a test can sit through: the stream's own, shortened, with nothing taken off at random.
+    fn quick_events() -> EventsTimings {
+        EventsTimings {
+            quiet: Duration::from_secs(5),
+            first_wait: Duration::from_millis(50),
+            longest_wait: Duration::from_millis(100),
+            jitter: 0.0,
+        }
+    }
+
+    /// What the account's events stream tells the window, as the window's own stream would.
+    fn told(app: &gpui_kit::Entity<AppState>, cx: &mut gpui_kit::TestAppContext, note: EventsNote) {
+        app.update(cx, |state, cx| {
+            let generation = state.account_events_generation;
+            assert!(state.take_events_note(generation, note, cx));
+        });
+    }
+
+    fn hear(
+        app: &gpui_kit::Entity<AppState>,
+        cx: &mut gpui_kit::TestAppContext,
+        event: AccountEvent,
+    ) {
+        told(app, cx, EventsNote::Event(event));
+    }
+
+    fn thread_changed(thread_id: &str) -> AccountEvent {
+        AccountEvent::ThreadChanged {
+            thread_id: thread_id.into(),
+            coworker_id: "cw_1".into(),
+        }
+    }
+
+    /// A while in real time for the window to do what it would: long enough for a read it should
+    /// not send to have reached the server.
+    fn let_it_settle(cx: &mut gpui_kit::TestAppContext) {
+        for _ in 0..30 {
+            cx.run_until_parked();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    /// One run of a thread as `GET /ag-ui/threads/{id}` replays it: the person's message its
+    /// prompt held, then the answer, and its end unless it is still going.
+    fn replayed(
+        run_id: &str,
+        status: &str,
+        started_at_ms: i64,
+        asked: (&str, &str),
+        answer: &str,
+    ) -> serde_json::Value {
+        let mut events = vec![json!({"type": "RUN_STARTED", "runId": run_id, "threadId": "cw_1"})];
+        events.extend(persons_frames(asked.0, asked.1));
+        let said = format!("{run_id}-a");
+        events.extend([
+            json!({"type": "TEXT_MESSAGE_START", "messageId": said, "role": "assistant"}),
+            json!({"type": "TEXT_MESSAGE_CONTENT", "messageId": said, "delta": answer}),
+            json!({"type": "TEXT_MESSAGE_END", "messageId": said}),
+        ]);
+        if status != "running" {
+            events.push(json!({"type": "RUN_FINISHED", "runId": run_id, "threadId": "cw_1"}));
+        }
+        json!({"runId": run_id, "status": status, "startedAtMs": started_at_ms,
+               "updatedAtMs": started_at_ms, "events": events})
+    }
+
+    /// The server answers every read of `thread_id` with `runs`, after `delay`.
+    async fn thread_reads(
+        server: &wiremock::MockServer,
+        thread_id: &str,
+        runs: serde_json::Value,
+        delay: Duration,
+    ) {
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(format!(
+                "/ag-ui/threads/{thread_id}"
+            )))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(json!({"threadId": thread_id, "runs": runs}))
+                    .set_delay(delay),
+            )
+            .mount(server)
+            .await;
+    }
+
+    /// Ada's thread on the server: the turn the window holds, "Hi Ada" answered "Hello." as
+    /// `run_1`, and a turn the window never saw, started by the server, as `run_2`.
+    fn adas_thread_with_a_new_turn() -> serde_json::Value {
+        json!([
+            replayed("run_1", "finished", 1_000, ("m_q1", "Hi Ada"), "Hello."),
+            replayed(
+                "run_2",
+                "finished",
+                2_000,
+                ("m_q2", "Post the standup"),
+                "Posted the standup."
+            ),
+        ])
+    }
+
+    /// A window signed in to `server`, Ada (`cw_1`) open on her thread, holding the turn her
+    /// thread's `run_1` is.
+    fn ada_open(
+        cx: &mut gpui_kit::TestAppContext,
+        runtime: &tokio::runtime::Runtime,
+        server: &wiremock::MockServer,
+    ) -> gpui_kit::Entity<AppState> {
+        use gpui_kit::AppContext as _;
+        let mut state = signed_in_state();
+        state.opengrok = Some(runtime.block_on(client_signed_in_to(server)));
+        with_bot(&mut state, json!("gateway"));
+        state.conversations.push(thread(
+            "cw_1",
+            vec![
+                at(message("m_q1", true, "Hi Ada"), 1_000),
+                from_run("m_r1", "Hello.", "run_1", 1_100),
+            ],
+        ));
+        state.active_conversation_id = Some("cw_1".into());
+        cx.new(|_| state)
+    }
+
+    /// Every re-read the stream asked for has landed, both of its reads. A test that asked for
+    /// one waits for this before it ends: a read still out when the test's runtime is gone has
+    /// nothing to land on.
+    fn rereads_landed(app: &gpui_kit::Entity<AppState>, cx: &mut gpui_kit::TestAppContext) -> bool {
+        app.read_with(cx, |state, _| {
+            state.thread_rereads.values().all(|reread| !reread.reading)
+                && !state.routines_reread_in_flight
+        })
+    }
+
+    fn said(app: &gpui_kit::Entity<AppState>, cx: &mut gpui_kit::TestAppContext) -> Vec<String> {
+        app.read_with(cx, |state, _| {
+            state.conversations[0]
+                .messages
+                .iter()
+                .map(|message| message.content.clone())
+                .collect()
+        })
+    }
+
+    /// A turn the server started in the open thread, which this window did not send (a routine's
+    /// Test run, a Bot's `run_routine`, another device), is in the thread as soon as the account's
+    /// events stream says the thread changed: it is read again once, and the person's message and
+    /// the reply both show, with nobody leaving the thread and coming back (hexuria/nativechat#171,
+    /// bug B). A thread nobody has open is not read: it is read when it is opened.
+    #[gpui_kit::test]
+    fn a_turn_the_server_started_shows_in_the_open_thread_when_the_stream_says_so(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        let runtime = a_runtime_for_the_relay(cx);
+        let _enter = runtime.enter();
+        let server = runtime.block_on(wiremock::MockServer::start());
+        runtime.block_on(thread_reads(
+            &server,
+            "cw_1",
+            adas_thread_with_a_new_turn(),
+            Duration::ZERO,
+        ));
+        let app = ada_open(cx, &runtime, &server);
+        hear(&app, cx, thread_changed("cw_2"));
+        hear(&app, cx, thread_changed("cw_1"));
+        wait_for(cx, "the server's turn is in the open thread", |cx| {
+            said(&app, cx)
+                == [
+                    "Hi Ada",
+                    "Hello.",
+                    "Post the standup",
+                    "Posted the standup.",
+                ]
+        });
+        let_it_settle(cx);
+        assert_eq!(asked_for(&runtime, &server, "/ag-ui/threads/cw_1"), 1);
+        assert_eq!(asked_for(&runtime, &server, "/ag-ui/threads/cw_2"), 0);
+    }
+
+    /// Notes come in bursts (the server sends one at each commit, up to about two a second a
+    /// thread, and a run sends several): the open thread is read once with one read out, and once
+    /// more after it for every note that came meanwhile, never once a note.
+    #[gpui_kit::test]
+    fn a_burst_of_notes_reads_the_open_thread_once_and_once_more_after(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        let runtime = a_runtime_for_the_relay(cx);
+        let _enter = runtime.enter();
+        let server = runtime.block_on(wiremock::MockServer::start());
+        runtime.block_on(thread_reads(
+            &server,
+            "cw_1",
+            adas_thread_with_a_new_turn(),
+            Duration::from_millis(300),
+        ));
+        let app = ada_open(cx, &runtime, &server);
+        for _ in 0..5 {
+            hear(&app, cx, thread_changed("cw_1"));
+        }
+        hear(
+            &app,
+            cx,
+            AccountEvent::RunFinished {
+                run_id: "run_2".into(),
+                thread_id: "cw_1".into(),
+                coworker_id: "cw_1".into(),
+                routine_id: None,
+                state: "finished".into(),
+            },
+        );
+        wait_for(
+            cx,
+            "the thread is read again once the first read lands",
+            |_| asked_for(&runtime, &server, "/ag-ui/threads/cw_1") == 2,
+        );
+        let_it_settle(cx);
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        let_it_settle(cx);
+        assert_eq!(asked_for(&runtime, &server, "/ag-ui/threads/cw_1"), 2);
+        assert_eq!(
+            said(&app, cx),
+            [
+                "Hi Ada",
+                "Hello.",
+                "Post the standup",
+                "Posted the standup."
+            ],
+            "and the turn is in it once"
+        );
+    }
+
+    /// While this window's own turn streams in the open thread, what the stream says about the
+    /// thread waits: a read then could paint over the turn being watched. Once the turn's stream
+    /// ends, the thread is read once, and both the turn and the server's are in it.
+    #[gpui_kit::test]
+    fn notes_while_the_windows_own_turn_streams_wait_for_it_to_end(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        let runtime = a_runtime_for_the_relay(cx);
+        let _enter = runtime.enter();
+        let server = runtime.block_on(wiremock::MockServer::start());
+        let frames: String = [
+            json!({"type": "RUN_STARTED", "threadId": "cw_1", "runId": "run_own"}),
+            json!({"type": "TEXT_MESSAGE_START", "messageId": "m_said", "role": "assistant"}),
+            json!({"type": "TEXT_MESSAGE_CONTENT", "messageId": "m_said", "delta": "Sure."}),
+            json!({"type": "TEXT_MESSAGE_END", "messageId": "m_said"}),
+            json!({"type": "RUN_FINISHED", "threadId": "cw_1", "runId": "run_own"}),
+        ]
+        .iter()
+        .map(|frame| format!("data: {frame}\n\n"))
+        .collect();
+        runtime.block_on(async {
+            wiremock::Mock::given(wiremock::matchers::method("POST"))
+                .and(wiremock::matchers::path("/ag-ui"))
+                .respond_with(
+                    wiremock::ResponseTemplate::new(200)
+                        .insert_header("content-type", "text/event-stream")
+                        .set_body_string(frames)
+                        .set_delay(Duration::from_millis(700)),
+                )
+                .mount(&server)
+                .await;
+            thread_reads(
+                &server,
+                "cw_1",
+                adas_thread_with_a_new_turn(),
+                Duration::ZERO,
+            )
+            .await;
+        });
+        let app = ada_open(cx, &runtime, &server);
+        app.update(cx, |state, cx| {
+            state.send_message("Anything new?".into(), cx)
+        });
+        hear(&app, cx, thread_changed("cw_1"));
+        let_it_settle(cx);
+        assert_eq!(
+            asked_for(&runtime, &server, "/ag-ui/threads/cw_1"),
+            0,
+            "nothing is read while the turn streams"
+        );
+        wait_for(cx, "the turn ends, and the thread is read", |cx| {
+            app.read_with(cx, |state, _| !state.is_turn_in_flight())
+                && asked_for(&runtime, &server, "/ag-ui/threads/cw_1") == 1
+        });
+        wait_for(cx, "the turn's reply and the server's turn", |cx| {
+            let said = said(&app, cx);
+            said.iter().any(|line| line == "Sure.")
+                && said.iter().any(|line| line == "Posted the standup.")
+        });
+        let_it_settle(cx);
+        assert_eq!(asked_for(&runtime, &server, "/ag-ui/threads/cw_1"), 1);
+    }
+
+    /// The stream tells every connection of the account about every run, this window's own among
+    /// them: a run this window started, and watched down the stream it started it on, is no news,
+    /// and reads nothing. Somebody else's run in the open thread does.
+    #[gpui_kit::test]
+    fn the_windows_own_runs_are_no_news(cx: &mut gpui_kit::TestAppContext) {
+        let runtime = a_runtime_for_the_relay(cx);
+        let _enter = runtime.enter();
+        let server = runtime.block_on(wiremock::MockServer::start());
+        runtime.block_on(thread_reads(
+            &server,
+            "cw_1",
+            adas_thread_with_a_new_turn(),
+            Duration::ZERO,
+        ));
+        let app = ada_open(cx, &runtime, &server);
+        app.update(cx, |state, _| state.note_own_run("run_mine"));
+        let run = |run_id: &str, ended: bool| {
+            if ended {
+                AccountEvent::RunFinished {
+                    run_id: run_id.into(),
+                    thread_id: "cw_1".into(),
+                    coworker_id: "cw_1".into(),
+                    routine_id: None,
+                    state: "finished".into(),
+                }
+            } else {
+                AccountEvent::RunStarted {
+                    run_id: run_id.into(),
+                    thread_id: "cw_1".into(),
+                    coworker_id: "cw_1".into(),
+                    routine_id: None,
+                    cause: RunStartCause::Chat,
+                }
+            }
+        };
+        hear(&app, cx, run("run_mine", false));
+        hear(&app, cx, run("run_mine", true));
+        let_it_settle(cx);
+        assert_eq!(asked_for(&runtime, &server, "/ag-ui/threads/cw_1"), 0);
+        hear(&app, cx, run("run_2", true));
+        wait_for(cx, "somebody else's run is read", |_| {
+            asked_for(&runtime, &server, "/ag-ui/threads/cw_1") == 1
+        });
+        wait_for(cx, "and the read lands", |cx| rereads_landed(&app, cx));
+        let_it_settle(cx);
+    }
+
+    /// A turn the open thread still holds, whose run nothing follows any more (its follow gave up
+    /// on a long run), is brought to its end when the stream says the run ended, the way coming
+    /// back to the thread brings it: from the run's own replay.
+    #[gpui_kit::test]
+    fn a_held_turn_whose_run_ends_unwatched_is_brought_to_its_end(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        let runtime = a_runtime_for_the_relay(cx);
+        let _enter = runtime.enter();
+        let server = runtime.block_on(wiremock::MockServer::start());
+        let done = replayed(
+            "run_7",
+            "finished",
+            2_000,
+            ("m_q7", "Check the box"),
+            "All done.",
+        );
+        runtime.block_on(async {
+            wiremock::Mock::given(wiremock::matchers::method("GET"))
+                .and(wiremock::matchers::path("/ag-ui/runs/run_7"))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(done.clone()))
+                .mount(&server)
+                .await;
+            thread_reads(&server, "cw_1", json!([done]), Duration::ZERO).await;
+        });
+        let app = ada_open(cx, &runtime, &server);
+        app.update(cx, |state, _| {
+            let messages = &mut state.conversations[0].messages;
+            messages.push(at(message("m_q7", true, "Check the box"), 1_900));
+            messages.push(from_run("m_live", "Working on it", "run_7", 2_000));
+            state.live_turns.insert(
+                "cw_1".into(),
+                LiveTurn {
+                    run_id: "run_7".into(),
+                    message_id: "m_live".into(),
+                    persisting: false,
+                },
+            );
+        });
+        hear(
+            &app,
+            cx,
+            AccountEvent::RunFinished {
+                run_id: "run_7".into(),
+                thread_id: "cw_1".into(),
+                coworker_id: "cw_1".into(),
+                routine_id: None,
+                state: "finished".into(),
+            },
+        );
+        wait_for(cx, "the held turn reads as it ended", |cx| {
+            said(&app, cx).last().map(String::as_str) == Some("All done.")
+        });
+        assert!(asked_for(&runtime, &server, "/ag-ui/runs/run_7") >= 1);
+        wait_for(cx, "the thread's own read lands", |cx| {
+            rereads_landed(&app, cx)
+        });
+        let_it_settle(cx);
+    }
+
+    /// A run a Bot or the clock starts (or ends) in one of Ada's routines shows in that routine's
+    /// open Run history at once (hexuria/nativechat#171, bug A): the stream's note names the
+    /// routine, and its history is read again while its panel is open. With the panel shut, it is
+    /// read when the panel opens. The routine's thread, not the open one, is not read.
+    #[gpui_kit::test]
+    fn a_run_in_a_routine_whose_panel_is_open_reads_its_history_again(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        let runtime = a_runtime_for_the_relay(cx);
+        let _enter = runtime.enter();
+        let server = runtime.block_on(wiremock::MockServer::start());
+        runtime.block_on(
+            wiremock::Mock::given(wiremock::matchers::method("GET"))
+                .and(wiremock::matchers::path("/schedules/sched_1/runs"))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!([{
+                    "runId": "run_bot", "cause": "bot", "status": "ok",
+                    "startedAtMs": 1_790_000_000_000_i64, "endedAtMs": 1_790_000_001_000_i64,
+                    "by": {"coworkerId": "cw_1", "name": "Ada"}
+                }])))
+                .mount(&server),
+        );
+        let standup = adas_schedule("sched_1", "Standup");
+        let routine = super::routine_from_schedule(
+            serde_json::from_value(standup.clone()).expect("a routine"),
+        );
+        let app = adas_window(cx, &runtime, &server, &[], json!([standup]), vec![routine]);
+        app.update(cx, |state, _| {
+            state.right_pane = super::RightPane::Computer;
+            state.computer_view = super::ComputerView::Editor {
+                id: Some("sched_1".into()),
+            };
+            state.routine_history_open = true;
+        });
+        let run = |ended: bool| {
+            let (run_id, thread_id, coworker_id, routine_id) = (
+                "run_bot".to_string(),
+                "sched_1".to_string(),
+                "cw_1".to_string(),
+                Some("sched_1".to_string()),
+            );
+            if ended {
+                AccountEvent::RunFinished {
+                    run_id,
+                    thread_id,
+                    coworker_id,
+                    routine_id,
+                    state: "finished".into(),
+                }
+            } else {
+                AccountEvent::RunStarted {
+                    run_id,
+                    thread_id,
+                    coworker_id,
+                    routine_id,
+                    cause: RunStartCause::Bot,
+                }
+            }
+        };
+        hear(&app, cx, run(true));
+        wait_for(cx, "the Bot's run is in the open history", |cx| {
+            app.read_with(cx, |state, _| {
+                state.coworker_routines("cw_1").iter().any(|routine| {
+                    routine
+                        .runs
+                        .iter()
+                        .any(|run| run.run_id() == Some("run_bot"))
+                })
+            })
+        });
+        app.update(cx, |state, _| state.right_pane = super::RightPane::Closed);
+        hear(&app, cx, run(false));
+        let_it_settle(cx);
+        assert_eq!(asked_for(&runtime, &server, "/schedules/sched_1/runs"), 1);
+        assert_eq!(asked_for(&runtime, &server, "/ag-ui/threads/sched_1"), 0);
+    }
+
+    /// A routine of the open Bot's made, renamed or deleted anywhere (a Bot of another Bot's, the
+    /// web console, another device) is on the Routines list at once: the stream's note reads the
+    /// list again by the road a Bot's own routine call takes, so a deleted routine's open panel
+    /// closes back to the list, and a field being typed in keeps what is typed. Another Bot's
+    /// routines are read when that Bot is opened.
+    #[gpui_kit::test]
+    fn a_routine_changed_elsewhere_is_on_the_open_bots_list_at_once(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        let runtime = a_runtime_for_the_relay(cx);
+        let _enter = runtime.enter();
+        let server = runtime.block_on(wiremock::MockServer::start());
+        let app = adas_window(
+            cx,
+            &runtime,
+            &server,
+            &[],
+            json!([adas_schedule("sched_new", "Standup")]),
+            Vec::new(),
+        );
+        let changed = |coworker_id: &str, change| AccountEvent::RoutineChanged {
+            routine_id: "sched_new".into(),
+            coworker_id: coworker_id.into(),
+            change,
+        };
+        hear(&app, cx, changed("cw_2", RoutineChange::Created));
+        let_it_settle(cx);
+        assert_eq!(
+            asked_for(&runtime, &server, "/schedules"),
+            0,
+            "another Bot's"
+        );
+        hear(&app, cx, changed("cw_1", RoutineChange::Created));
+        wait_for(cx, "the routine made elsewhere is listed", |cx| {
+            app.read_with(cx, |state, _| {
+                state
+                    .coworker_routines("cw_1")
+                    .iter()
+                    .any(|routine| routine.id == "sched_new" && routine.name == "Standup")
+            })
+        });
+        assert_eq!(asked_for(&runtime, &server, "/schedules"), 1);
+
+        let server = runtime.block_on(wiremock::MockServer::start());
+        let routine = super::routine_from_schedule(
+            serde_json::from_value(adas_schedule("sched_1", "Standup")).expect("a routine"),
+        );
+        let app = adas_window(cx, &runtime, &server, &[], json!([]), vec![routine]);
+        app.update(cx, |state, _| {
+            state.right_pane = super::RightPane::Computer;
+            state.computer_view = super::ComputerView::Editor {
+                id: Some("sched_1".into()),
+            };
+        });
+        hear(
+            &app,
+            cx,
+            AccountEvent::RoutineChanged {
+                routine_id: "sched_1".into(),
+                coworker_id: "cw_1".into(),
+                change: RoutineChange::Deleted,
+            },
+        );
+        wait_for(cx, "the deleted routine's panel closes", |cx| {
+            app.read_with(cx, |state, _| {
+                state.coworker_routines("cw_1").is_empty()
+                    && state.computer_view == super::ComputerView::Overview
+            })
+        });
+    }
+
+    /// Nothing says what the stream missed while it was not open, so every time it opens, and
+    /// whenever the server could not resume it (`reset`), what it covers on screen is read again
+    /// once: the open thread, the open Bot's Routines list, and the open routine's history.
+    #[gpui_kit::test]
+    fn the_stream_opening_and_a_reset_read_what_is_on_screen_again(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        let runtime = a_runtime_for_the_relay(cx);
+        let _enter = runtime.enter();
+        let server = runtime.block_on(wiremock::MockServer::start());
+        runtime.block_on(async {
+            thread_reads(
+                &server,
+                "cw_1",
+                json!([replayed(
+                    "run_1",
+                    "finished",
+                    1_000,
+                    ("m_q1", "Hi Ada"),
+                    "Hello."
+                )]),
+                Duration::ZERO,
+            )
+            .await;
+            wiremock::Mock::given(wiremock::matchers::method("GET"))
+                .and(wiremock::matchers::path("/schedules/sched_1/runs"))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!([])))
+                .mount(&server)
+                .await;
+        });
+        let standup = adas_schedule("sched_1", "Standup");
+        let routine = super::routine_from_schedule(
+            serde_json::from_value(standup.clone()).expect("a routine"),
+        );
+        let app = adas_window(cx, &runtime, &server, &[], json!([standup]), vec![routine]);
+        app.update(cx, |state, _| {
+            state.right_pane = super::RightPane::Computer;
+            state.computer_view = super::ComputerView::Editor {
+                id: Some("sched_1".into()),
+            };
+        });
+        let (runtime, server) = (&runtime, &server);
+        let read = |times: usize| {
+            move |_: &mut gpui_kit::TestAppContext| {
+                [
+                    "/ag-ui/threads/cw_1",
+                    "/schedules",
+                    "/schedules/sched_1/runs",
+                ]
+                .iter()
+                .all(|at| asked_for(runtime, server, at) == times)
+            }
+        };
+        told(&app, cx, EventsNote::Opened);
+        assert_eq!(
+            app.read_with(cx, |state, _| state.events_stream),
+            super::EventsStream::Connected
+        );
+        wait_for(cx, "the thread, the list and the history are read", read(1));
+        hear(&app, cx, AccountEvent::Reset);
+        wait_for(cx, "and read again after a reset", read(2));
+        told(&app, cx, EventsNote::Lost);
+        assert_eq!(
+            app.read_with(cx, |state, _| state.events_stream),
+            super::EventsStream::Reconnecting
+        );
+        wait_for(cx, "the reads land", |cx| rereads_landed(&app, cx));
+        let_it_settle(cx);
+    }
+
+    /// The stream is opened with the session's bearer when somebody signs in, kept open (opened
+    /// again after it drops), and stops when they sign out: nothing knocks on it for an account
+    /// nobody is signed in as.
+    #[gpui_kit::test]
+    fn the_stream_starts_when_somebody_signs_in_and_stops_when_they_sign_out(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        use base64::Engine as _;
+        use gpui_kit::AppContext as _;
+        let runtime = a_runtime_for_the_relay(cx);
+        let _enter = runtime.enter();
+        let server = runtime.block_on(wiremock::MockServer::start());
+        let part = |json: &str| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json);
+        let token = format!(
+            "{}.{}.not-a-signature",
+            part(r#"{"alg":"HS256","typ":"JWT"}"#),
+            part(r#"{"exp":4102444800}"#)
+        );
+        runtime.block_on(async {
+            wiremock::Mock::given(wiremock::matchers::method("POST"))
+                .and(wiremock::matchers::path("/auth/login"))
+                .respond_with(
+                    wiremock::ResponseTemplate::new(200)
+                        .append_header("set-cookie", format!("og_access={token}; Path=/"))
+                        .set_body_json(json!({})),
+                )
+                .mount(&server)
+                .await;
+            wiremock::Mock::given(wiremock::matchers::method("GET"))
+                .and(wiremock::matchers::path("/account"))
+                .respond_with(
+                    wiremock::ResponseTemplate::new(200)
+                        .set_body_json(json!({"id": "acc_1", "email": "ada@example.com"})),
+                )
+                .mount(&server)
+                .await;
+            // A stream that ends as soon as it opens, so a running one is opened again and again.
+            wiremock::Mock::given(wiremock::matchers::method("GET"))
+                .and(wiremock::matchers::path("/ag-ui/events"))
+                .respond_with(
+                    wiremock::ResponseTemplate::new(200).set_body_raw("", "text/event-stream"),
+                )
+                .mount(&server)
+                .await;
+        });
+        let mut state = AppState::new();
+        state.opengrok = Some(OpenGrokClient::new(&server.uri()).expect("a URL"));
+        state.events_timings = quick_events();
+        let app = cx.new(|_| state);
+        let opened = || asked_for(&runtime, &server, "/ag-ui/events");
+        let_it_settle(cx);
+        assert_eq!(opened(), 0, "nobody is signed in");
+        app.update(cx, |state, cx| {
+            state.login("ada@example.com".into(), "pw".into(), cx)
+        });
+        wait_for(cx, "the stream is opened, and opened again", |_| {
+            opened() >= 2
+        });
+        let first = runtime
+            .block_on(server.received_requests())
+            .expect("the recorder is on")
+            .into_iter()
+            .find(|request| request.url.path() == "/ag-ui/events")
+            .expect("the stream");
+        assert_eq!(
+            first.headers.get("authorization").unwrap(),
+            format!("Bearer {token}").as_str()
+        );
+        app.update(cx, |state, cx| state.logout(cx));
+        assert_eq!(
+            app.read_with(cx, |state, _| state.events_stream),
+            super::EventsStream::Off
+        );
+        let_it_settle(cx);
+        let after = opened();
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        let_it_settle(cx);
+        assert_eq!(opened(), after, "not opened again once signed out");
+    }
+
+    /// A stream the server refuses `401` is not knocked on again with the same session: the
+    /// session's refresh is asked first, and when the server refuses that too, the window says the
+    /// session is gone, as any other `401` makes it say, and the stream stops until somebody signs
+    /// in again.
+    #[gpui_kit::test]
+    fn a_stream_refused_after_the_sessions_refresh_asks_for_a_sign_in(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        let runtime = a_runtime_for_the_relay(cx);
+        let _enter = runtime.enter();
+        let server = runtime.block_on(wiremock::MockServer::start());
+        runtime.block_on(async {
+            wiremock::Mock::given(wiremock::matchers::method("GET"))
+                .and(wiremock::matchers::path("/ag-ui/events"))
+                .respond_with(
+                    wiremock::ResponseTemplate::new(401)
+                        .set_body_json(json!({"error": "session expired"})),
+                )
+                .mount(&server)
+                .await;
+            wiremock::Mock::given(wiremock::matchers::method("POST"))
+                .and(wiremock::matchers::path("/auth/refresh"))
+                .respond_with(
+                    wiremock::ResponseTemplate::new(401)
+                        .set_body_json(json!({"error": "session expired"})),
+                )
+                .mount(&server)
+                .await;
+        });
+        let app = ada_open(cx, &runtime, &server);
+        app.update(cx, |state, cx| {
+            state.events_timings = quick_events();
+            state.start_events_stream(cx);
+        });
+        wait_for(cx, "the window says the session is gone", |cx| {
+            app.read_with(cx, |state, _| {
+                state.is_session_expired() && state.events_stream == super::EventsStream::SignedOut
+            })
+        });
+        assert!(
+            asked_for(&runtime, &server, "/auth/refresh") >= 1,
+            "refreshed first"
+        );
+        let opened = asked_for(&runtime, &server, "/ag-ui/events");
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let_it_settle(cx);
+        assert_eq!(asked_for(&runtime, &server, "/ag-ui/events"), opened);
     }
 
     // ---- Stopping a turn --------------------------------------------------------------------
