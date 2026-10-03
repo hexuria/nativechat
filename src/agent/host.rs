@@ -14645,7 +14645,10 @@ mod tests {
 
         // What a refusal said is under the card while the popover is shut.
         host.plan_fallback_picker = PickerView::default();
-        host.plan_fallback_note = Some("planFallback.effort must be one of inherit".into());
+        host.plan_fallback_note = Some(
+            "planFallback.effort must be one of inherit, none, low, medium, high, xhigh, max"
+                .into(),
+        );
         let tree = host.snapshot();
         assert!(
             tree.find(ids::PLAN_FALLBACK)

@@ -10,8 +10,8 @@
 //!
 //! The Relay-off fallback, "When Relay is off, Subscription Bots use", is a Gateway model alone:
 //! the server's paid keys answer instead of the person's plan. It is `planFallback` on the same
-//! setting (opengrok-server relay-off fallback contract, agreed 2026-10-03, not yet built), live
-//! only where the read carries that key, and otherwise coming, as the default for new Bots was
+//! setting (opengrok-server #332 (PR #338 at 66b9f7b), which sends it on every read), live only
+//! where the read carries that key, and otherwise coming, as the default for new Bots was
 //! (`state::RelayOffFallback`).
 //!
 //! Default for new Bots was on Settings → Relay, and came here with its ids,

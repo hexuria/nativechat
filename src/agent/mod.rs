@@ -352,9 +352,9 @@
 //!
 //! Under it in Default models, `settings-plan-fallback`: the Relay-off fallback, "When Relay is
 //! off, Subscription Bots use", what a Bot on the person's plan answers with while the relay is
-//! off (opengrok-server relay-off fallback contract, agreed 2026-10-03, not yet built: the
-//! account's `planFallback`, `{model, effort}` or `null`, on `/account/inference-source`). It is
-//! live only where the server's read carries that key, `null` or not. Otherwise (state
+//! off (opengrok-server #332 (PR #338 at 66b9f7b): the account's `planFallback`, `{model,
+//! effort}` or `null`, on `/account/inference-source`). It is live only where the server's read
+//! carries that key, `null` or not. Otherwise (state
 //! `unavailable`) it holds `settings-plan-fallback-unavailable` ("Coming soon: the server can't
 //! keep a Relay-off fallback yet.") and `settings-plan-fallback-card`, disabled and refused with
 //! why. Live, it is the Bot's card and popover under `settings-plan-fallback-*` as Default for new
@@ -428,8 +428,7 @@
 //! ` ⚡` after it where the model that answered is a fast twin; value = the door, state `via-mac`
 //! on one the person's Mac answered, and `relay-off` on one the server's keys answered because the
 //! relay is off, as the run's frame says in `fallbackFor: "relay_disabled"` (opengrok-server
-//! relay-off fallback contract, agreed 2026-10-03, not yet built)), holding
-//! `reply-source-model-{messageId}` (label = the model
+//! #332 (PR #338 at 66b9f7b))), holding `reply-source-model-{messageId}` (label = the model
 //! the server named, which the badge shows on hover) when it named one. A reply whose run
 //! ended because the person's plan could not answer (a `RUN_ERROR` code: the relay's, where the
 //! Mac could not, or `plan_unavailable`, where the person's own setting left the plan nothing to
@@ -437,7 +436,7 @@
 //! `run-error-send-on-server` (`Send this reply on Server instead`): a click sends the same turn
 //! again on the server's paid keys, this once, as `retry-turn` does for a turn that never left. Under `composer-queued`, a
 //! `queued-waiting-{messageId}` (`Waiting for your Mac`) for each held message the server holds
-//! for the person's Mac (`heldFor: "relay_offline"`). In the bot's settings, while the Bot's
+//! for the person's Mac (`heldFor: "relay_offline"`, never while the relay is switched off). In the bot's settings, while the Bot's
 //! replies go through the person's plan, its own door or the account's that it follows,
 //! `agent-usage-plan` (the Usage card does not count those replies).
 //!

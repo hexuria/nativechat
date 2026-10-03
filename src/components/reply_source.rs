@@ -685,8 +685,8 @@ mod tests {
     }
 
     /// A reply the server's paid keys answered because the relay is off says so on its badge, from
-    /// a frame written as the agreed contract writes it (opengrok-server relay-off fallback
-    /// contract, agreed 2026-10-03, not yet built): `fallbackFor: "relay_disabled"`, read
+    /// the frame as the server writes it (opengrok-server #332 (PR #338 at 66b9f7b), whose
+    /// recording holds it live and in a replay): `fallbackFor: "relay_disabled"`, read
     /// tolerantly. A reason this app has not heard of, one that is no word, and one on a reply the
     /// plan answered add nothing to the badge. The reply's row keeps the reason, so the badge
     /// reads the same when the thread is read back.

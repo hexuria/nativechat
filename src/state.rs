@@ -595,10 +595,11 @@ pub enum DefaultForNewBots {
 /// Settings → General's Relay-off fallback: what a Bot on the person's plan answers with while the
 /// relay is off, a Gateway model and its effort ([`AppState::relay_off_fallback`]).
 ///
-/// It is the account's (opengrok-server relay-off fallback contract, agreed 2026-10-03, not yet
-/// built), read with the reply source, which carries it as `planFallback` on every read from a
-/// server that keeps one, `null` until the person sets one. A server without it sends no such
-/// key, and the section then says the fallback is coming and its card takes no click.
+/// It is the account's (opengrok-server #332 (PR #338 at 66b9f7b): `PlanFallback` in
+/// `crates/opengrok-core/src/inference.rs`), read with the reply source, which carries it as
+/// `planFallback` on every read from a server that keeps one, `null` until the person sets one. A
+/// server without it sends no such key, and the section then says the fallback is coming and its
+/// card takes no click.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum RelayOffFallback {
     /// The server keeps no Relay-off fallback, or the setting has not been read.
@@ -8357,10 +8358,12 @@ impl AppState {
     /// the account keeps its way.
     ///
     /// A server that keeps whether the relay is on, which its read says by carrying
-    /// `relayEnabled` (opengrok-server relay-off fallback contract, agreed 2026-10-03, not yet
-    /// built), is told so in the same body: `relayEnabled: true` beside the way, and off,
-    /// `{kind, relayEnabled: false}` with no way. Any other is sent the way alone, and nothing as
-    /// the switch goes off.
+    /// `relayEnabled` (opengrok-server #332 (PR #338 at 66b9f7b): `InferenceSource::applied` in
+    /// `crates/opengrok-core/src/inference.rs`, where the switch moves no way), is told so in the
+    /// same body: `relayEnabled: true` beside the way, and off, `{kind, relayEnabled: false}` with
+    /// no way. Any other is sent the way alone, and nothing as the switch goes off. A refusal of
+    /// either is a 400 in the server's words, which keeps none of the body, and the words go under
+    /// the switch.
     ///
     /// One change of the account's at a time: while another is with the server this sends
     /// nothing, and what the switch says once that one is answered goes then
@@ -12935,8 +12938,8 @@ impl AppState {
     }
 
     /// The Relay-off fallback, as the account's setting last read says it: kept by a server whose
-    /// read carries `planFallback`, `null` or not (opengrok-server relay-off fallback contract,
-    /// agreed 2026-10-03, not yet built), and not kept by one whose read carries no such key, or
+    /// read carries `planFallback`, `null` or not (opengrok-server #332 (PR #338 at 66b9f7b),
+    /// which sends it on every read), and not kept by one whose read carries no such key, or
     /// before the setting is read.
     pub fn relay_off_fallback(&self) -> RelayOffFallback {
         match self
@@ -13245,9 +13248,8 @@ impl AppState {
 
     /// Begin keeping the Relay-off fallback on the account at once, whole, with the kind the
     /// server keeps sent back as it is: `PUT /account/inference-source` `{kind, planFallback}`
-    /// (opengrok-server relay-off fallback contract, agreed 2026-10-03, not yet built), whole, or
-    /// `null` to take it away. The card shows what the server answers; a refusal is said in its
-    /// words.
+    /// (opengrok-server #332 (PR #338 at 66b9f7b): `PlanFallback::named`), whole, or `null` to
+    /// take it away. The card shows what the server answers; a refusal is said in its words.
     fn begin_plan_fallback_change(
         &mut self,
         fallback: Option<PlanFallback>,
@@ -37363,7 +37365,7 @@ mod tests {
         assert_eq!(state.reply_source.kept, None);
     }
 
-    // ---- The Relay-off fallback: the account's, kept at once (relay-off fallback contract) -----
+    // ---- The Relay-off fallback: the account's, kept at once (opengrok-server #332) ----------
 
     /// A read from a server that keeps a Relay-off fallback, as given, `None` being `null`.
     fn with_plan_fallback(fallback: Option<crate::opengrok::PlanFallback>) -> InferenceSource {
@@ -37412,9 +37414,9 @@ mod tests {
     }
 
     /// The Relay-off fallback is live only where the server's read carries its key, `null` or not
-    /// (opengrok-server relay-off fallback contract, agreed 2026-10-03, not yet built): before the
-    /// setting is read, and from a server whose read has no such key, it is not on the server, it
-    /// has no picker, and nothing of it can be sent. Signing out forgets it with the setting.
+    /// (opengrok-server #332 (PR #338 at 66b9f7b)): before the setting is read, and from a server
+    /// whose read has no such key, it is not on the server, it has no picker, and nothing of it
+    /// can be sent. Signing out forgets it with the setting.
     #[test]
     fn the_relay_off_fallback_is_live_only_where_the_read_carries_its_key() {
         use super::{PickerFor, RelayOffFallback};
@@ -37543,9 +37545,12 @@ mod tests {
             [json!({"kind": "local_proxy", "planFallback": picked})]
         );
 
-        let said = "planFallback.model: \"oag/none\" is not a model this server routes";
+        // The server's words for an effort that is not a Bot's (opengrok-server #332 (PR #338 at
+        // 66b9f7b): `PlanFallback::named`), which keep none of the body.
+        let said =
+            "planFallback.effort must be one of inherit, none, low, medium, high, xhigh, max";
         let send = state
-            .begin_plan_fallback_change(Some(cheap("high")))
+            .begin_plan_fallback_change(Some(cheap("loud")))
             .expect("a change begins");
         assert_eq!(
             state.settle_account_change(
@@ -37560,6 +37565,11 @@ mod tests {
         assert_eq!(
             state.reply_source.change_note(AccountChange::PlanFallback),
             Some(said)
+        );
+        assert_eq!(
+            state.relay_off_fallback(),
+            RelayOffFallback::Kept(Some(cheap("inherit"))),
+            "nothing refused is kept"
         );
     }
 
@@ -37603,8 +37613,8 @@ mod tests {
 
     /// The account's setting as a server that knows the relay answers it: on the plan, its way
     /// `via`, nobody's computer holding the relay, and `relayEnabled` as given, `None` being a
-    /// server that sends no such key, as every server does until it builds the relay-off
-    /// fallback (opengrok-server relay-off fallback contract, agreed 2026-10-03, not yet built).
+    /// server that sends no such key, as every server before opengrok-server #332 (PR #338 at
+    /// 66b9f7b) does.
     fn relay_answer(via: &str, relay_enabled: Option<bool>) -> serde_json::Value {
         let mut body = json!({
             "kind": "local_proxy", "via": via, "baseUrl": "http://127.0.0.1:8080",
@@ -37677,10 +37687,10 @@ mod tests {
         );
     }
 
-    /// A server whose read carries `relayEnabled` (opengrok-server relay-off fallback contract,
-    /// agreed 2026-10-03, not yet built) hears the switch both ways, each in one `PUT` with the
-    /// kind the server keeps: on, `{kind, relayEnabled: true, via: "mac"}`; off,
-    /// `{kind, relayEnabled: false}` and no way, which the account keeps.
+    /// A server whose read carries `relayEnabled` (opengrok-server #332 (PR #338 at 66b9f7b))
+    /// hears the switch both ways, each in one `PUT` with the kind the server keeps: on,
+    /// `{kind, relayEnabled: true, via: "mac"}`; off, `{kind, relayEnabled: false}` and no way,
+    /// which the account keeps.
     #[tokio::test]
     async fn a_server_that_keeps_relay_enabled_hears_the_switch_both_ways() {
         use super::AfterChange;
@@ -37714,6 +37724,105 @@ mod tests {
         }
         assert!(state.reply_source.on_mac(), "off moved no way");
         assert_eq!(puts_sent(&server).await, [on, off]);
+    }
+
+    /// The body of a fixture of the server's recording (opengrok-server #332 (PR #338 at
+    /// 66b9f7b), vendored in `fixtures/wire/`).
+    fn recorded_body(fixture: &str) -> serde_json::Value {
+        let recorded: serde_json::Value = serde_json::from_str(fixture).expect("the recording");
+        recorded["body"].clone()
+    }
+
+    /// The relay switch against the server as it recorded the switch (opengrok-server #332 (PR
+    /// #338 at 66b9f7b)): from its read with the relay on, this computer the account's way and a
+    /// fallback kept, the switch turned off here sends `{kind, relayEnabled: false}` and no way,
+    /// and the server's recorded answer is what the page holds after: the relay off, this
+    /// computer still the account's way, the fallback as it was. Turned on again it says the way
+    /// beside `relayEnabled: true`; refused with a 400 in the server's words (here those it
+    /// writes for the switch's own key), none of it is kept, and the words go under the switch.
+    #[tokio::test]
+    async fn the_relay_switch_reads_the_recorded_server_and_says_its_refusal_under_it() {
+        use super::{AccountChange, AfterChange, RelayOffFallback};
+        let read = recorded_body(include_str!(
+            "../fixtures/wire/rest/GET__account_inference-source/200-the_relay_switch_moves_no_way_and_a_fallback_is_kept_until_cleared.json"
+        ));
+        let switched_off = recorded_body(include_str!(
+            "../fixtures/wire/rest/PUT__account_inference-source/200-a_plan_bots_routine_runs_on_the_fallback_while_the_relay_is_off.json"
+        ));
+        let said = "relayEnabled must be true or false";
+        let off = json!({"kind": "local_proxy", "relayEnabled": false});
+        let on = json!({"kind": "local_proxy", "relayEnabled": true, "via": "mac"});
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .and(wiremock::matchers::path("/account/inference-source"))
+            .and(wiremock::matchers::body_json(off.clone()))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(switched_off))
+            .expect(1)
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .and(wiremock::matchers::path("/account/inference-source"))
+            .and(wiremock::matchers::body_json(on.clone()))
+            .respond_with(
+                wiremock::ResponseTemplate::new(400).set_body_json(json!({ "error": said })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut state = signed_in_state();
+        state.opengrok = Some(client_signed_in_to(&server).await);
+        state.local_exec_machine_id = Some("mac_1".into());
+        read_as(
+            &mut state,
+            serde_json::from_value(read).expect("the recorded setting"),
+        );
+        let fallback = state.relay_off_fallback();
+        assert!(
+            matches!(&fallback, RelayOffFallback::Kept(Some(_))),
+            "{fallback:?}"
+        );
+        state.relay_mac.on = true;
+
+        assert!(state.note_relay_on(false));
+        let send = state
+            .begin_relay_change()
+            .expect("the server keeps the switch");
+        let answer = send.client.set_inference_source(&send.update).await;
+        assert_eq!(
+            state.settle_account_change(send.generation, send.about, answer),
+            Some(AfterChange::ReadModels)
+        );
+        let kept = state
+            .reply_source
+            .kept_source()
+            .expect("the answer")
+            .clone();
+        assert_eq!(kept.relay_enabled, Some(false), "as the server answered");
+        assert!(state.reply_source.on_mac(), "off moved no way");
+        assert_eq!(
+            state.relay_off_fallback(),
+            fallback,
+            "the fallback as it was"
+        );
+
+        assert!(state.note_relay_on(true));
+        let send = state.begin_relay_change().expect("turning it on sends");
+        let answer = send.client.set_inference_source(&send.update).await;
+        assert_eq!(
+            state.settle_account_change(send.generation, send.about, answer),
+            Some(AfterChange::Done)
+        );
+        assert_eq!(
+            state.reply_source.change_note(AccountChange::Relay),
+            Some(said)
+        );
+        assert_eq!(
+            state.reply_source.kept_source(),
+            Some(&kept),
+            "nothing refused is kept"
+        );
+        assert!(state.relay_mac.on, "the switch stays as it was put");
+        assert_eq!(puts_sent(&server).await, [off, on]);
     }
 
     /// The server refusing to point the account at this computer is said under the switch, in its

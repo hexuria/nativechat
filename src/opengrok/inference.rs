@@ -19,15 +19,20 @@
 //! `crates/opengrok-harness/src/local_proxy.rs`, and the door's words and the models a
 //! subscription may answer in `crates/opengrok-core/src/inference.rs`. The conformance ledger
 //! reads the two routes and the CUSTOM frame against the server's recording, vendored in
-//! `fixtures/wire/` from opengrok-server #334, on main 8e7387f (recorded at its branch commit
-//! 426fa0d). These shapes are as they were at main cad36fd (#303, after #298): #306 changed no
+//! `fixtures/wire/` from opengrok-server #332 (PR #338 at 66b9f7b), recorded on main eaaa291
+//! (its MANIFEST.json names 79d711f, the PR's commit it was recorded at). These shapes are as
+//! they were at main cad36fd (#303, after #298): #306 changed no
 //! crate, #304 puts a Bot's own door between a turn's and the account's (`route` in
 //! `crates/opengrok-harness/src/local_proxy.rs`), #308 lets a retry of a queued send's reply
 //! name its own door over the one the send was queued with (`consume_for_turn` in
 //! `crates/opengrok-server/src/agui/pending.rs`), and #322 adds the account's default for new
 //! Bots (`newBotDefault`, in `described` and `apply`). #325 and #316 change where a Bot's message
 //! and a routine's firing are answered (`for_message` there, and `routine_route` in the server's
-//! `crates/opengrok-server/src/autonomy/mod.rs`), and no shape read here.
+//! `crates/opengrok-server/src/autonomy/mod.rs`), and no shape read here. #332 adds the relay's
+//! switch and what answers while it is off (`relayEnabled` and `planFallback`, in `described`,
+//! and in `InferenceSource::applied` in `crates/opengrok-core/src/inference.rs`, which reads a
+//! Save where `apply` did), and says on a reply's frame why the server's keys answered it
+//! (`fallbackFor`, `converse_raw` in `crates/opengrok-harness/src/lib.rs`).
 //!
 //! The relay (opengrok-server #292, built in #298, whose recording holds its words) lifts the
 //! one-machine limit: the server sends a turn's model calls down a stream to the person's
@@ -251,15 +256,17 @@ pub struct InferenceSource {
     #[serde(default, deserialize_with = "keyed")]
     pub new_bot_default: Option<Option<NewBotDefault>>,
     /// Whether the relay is switched on for the account, from a server that keeps it, which sends
-    /// it on every read, `true` until it is told otherwise (opengrok-server relay-off fallback
-    /// contract, agreed 2026-10-03, not yet built). `None` is the key left out, a server before
-    /// it, which is never sent one: the relay switch tells only a server that keeps it.
+    /// it on every read, `true` until it is told otherwise (opengrok-server #332 (PR #338 at
+    /// 66b9f7b): `described` in `crates/opengrok-harness/src/local_proxy.rs`, `relayEnabled` the
+    /// switch's on side). It is the Mac's way's alone: the server's own machine never reads it.
+    /// `None` is the key left out, a server before it, which is never sent one: the relay switch
+    /// tells only a server that keeps it.
     #[serde(default)]
     pub relay_enabled: Option<bool>,
     /// The Relay-off fallback, from a server that keeps one, which sends the key on every read,
-    /// `null` until the person sets one (opengrok-server relay-off fallback contract, agreed
-    /// 2026-10-03, not yet built). `None` is the key left out, a server before it, which keeps no
-    /// such fallback; `Some(None)` is `null`, none set.
+    /// `null` until the person sets one (opengrok-server #332 (PR #338 at 66b9f7b): `described`
+    /// in `crates/opengrok-harness/src/local_proxy.rs`). `None` is the key left out, a server
+    /// before it, which keeps no such fallback; `Some(None)` is `null`, none set.
     #[serde(default, deserialize_with = "keyed")]
     pub plan_fallback: Option<Option<PlanFallback>>,
 }
@@ -303,10 +310,15 @@ pub struct NewBotDefault {
 
 /// What a Bot on the person's plan answers with while the relay is off, the account's Relay-off
 /// fallback: `planFallback: {model, effort} | null` on `GET` and `PUT
-/// /account/inference-source` (opengrok-server relay-off fallback contract, agreed 2026-10-03,
-/// not yet built). Its model is on the server's paid keys, held to what a Bot's gateway pin is
-/// held to, and its effort is one of a Bot's words. Fast is the model's `--fast` id, as
-/// everywhere, not a field.
+/// /account/inference-source` (opengrok-server #332 (PR #338 at 66b9f7b): `PlanFallback` in
+/// `crates/opengrok-core/src/inference.rs`). Its model is on the server's paid keys, held to what
+/// a Bot's gateway pin is held to, and its effort is one of a Bot's words. Fast is the model's
+/// `--fast` id, as everywhere, not a field.
+///
+/// The server refuses a `PUT` of it with a 400 and `{"error"}` in its words, and keeps none of
+/// the body (`PlanFallback::named`): `planFallback must be an object or null`, a blank model
+/// (`planFallback.model: a coworker needs a model to think with`), and an effort that is not a
+/// Bot's (`planFallback.effort must be one of inherit, none, low, medium, high, xhigh, max`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PlanFallback {
@@ -388,10 +400,12 @@ pub struct RelayRead {
 /// "relayEnabled"?, "newBotDefault"?, "planFallback"?}`.
 ///
 /// The server takes no `PUT` without a kind (`apply` in
-/// `crates/opengrok-harness/src/local_proxy.rs`), and this app switches no kind, so `kind` is the
-/// one the server keeps, sent back as it is. Every other field is there only when the app changes
-/// it, and the server reads a field three ways: absent keeps what it has, `null` clears it, and a
-/// value replaces it.
+/// `crates/opengrok-harness/src/local_proxy.rs`, and since opengrok-server #332 (PR #338 at
+/// 66b9f7b) `InferenceSource::applied` in `crates/opengrok-core/src/inference.rs`), and this app
+/// switches no kind, so `kind` is the one the server keeps, sent back as it is. Every other field
+/// is there only when the app changes it, and the server reads a field three ways: absent keeps
+/// what it has, `null` clears it, and a value replaces it. A body it refuses in any part is a 400
+/// in its words, and none of it is kept.
 ///
 /// There is no field here for the plan on the server's own machine (`baseUrl`, `apiKey`,
 /// `localModel`) nor for the relay's own model (`relay.localModel`): the app no longer sets up
@@ -408,9 +422,10 @@ pub struct InferenceSourceUpdate {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub via: Option<Via>,
     /// Whether the relay is switched on, sent by the relay switch in the same body as what else it
-    /// changes, and only to a server whose read carries the key (opengrok-server relay-off fallback
-    /// contract, agreed 2026-10-03, not yet built): `true` with `via: "mac"` as it goes on, and
-    /// `false` with no way as it goes off.
+    /// changes, and only to a server whose read carries the key (opengrok-server #332 (PR #338 at
+    /// 66b9f7b): `InferenceSource::applied`, where `true` or `false` alone is taken and the switch
+    /// moves no way, so the way goes beside it when the app means one): `true` with `via: "mac"`
+    /// as it goes on, and `false` with no way as it goes off.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub relay_enabled: Option<bool>,
     /// Default for new Bots, sent whole when the app changes it, only to a server whose read
@@ -420,19 +435,19 @@ pub struct InferenceSourceUpdate {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub new_bot_default: Option<Option<NewBotDefault>>,
     /// The Relay-off fallback, sent whole when the app changes it, only to a server whose read
-    /// carries the key, and `null` to take it away (opengrok-server relay-off fallback contract,
-    /// agreed 2026-10-03, not yet built): absent keeps it, `null` clears it, and a value replaces
-    /// it whole.
+    /// carries the key, and `null` to take it away (opengrok-server #332 (PR #338 at 66b9f7b):
+    /// `PlanFallback::named`): absent keeps it, `null` clears it, and a value replaces it whole.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub plan_fallback: Option<Option<PlanFallback>>,
 }
 
 /// Why a reply came through the server's paid keys and not the door its Bot asks for, as the
-/// run's `opengrok.inferenceSource` CUSTOM says in `fallbackFor` (opengrok-server relay-off
-/// fallback contract, agreed 2026-10-03, not yet built). The one reason this app knows is
-/// `relay_disabled`: a Bot on the person's plan answered by the account's Relay-off fallback,
-/// because the relay is off. A word this app has not heard of is no reason it can name, and the
-/// badge says only whose keys paid.
+/// run's `opengrok.inferenceSource` CUSTOM says in `fallbackFor` (opengrok-server #332 (PR #338
+/// at 66b9f7b): `converse_raw` in `crates/opengrok-harness/src/lib.rs`, which writes the frame
+/// `{kind: "gateway", model, fallbackFor}` with no way). The one reason this app knows is
+/// `relay_disabled`: a fresh turn by the person's Mac answered by the account's Relay-off
+/// fallback, because the relay is off. A word this app has not heard of is no reason it can name,
+/// and the badge says only whose keys paid.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FallbackFor {
@@ -581,17 +596,20 @@ impl RunErrorCode {
 /// `heldFor` on a queued send's row while the server holds it for the person's Mac: the turn it
 /// names goes through the Mac and no Mac holds the relay (opengrok-server #292: `HELD_FOR` in
 /// `crates/opengrok-server/src/agui/pending.rs`, server main cad36fd (#303, after #298), pin
-/// 47a5d6b). Absent otherwise. The server sends such a send itself, oldest
-/// first, when a Mac opens the relay, so this app never fires one.
+/// 47a5d6b). Absent otherwise, and never while the person switched the relay off (opengrok-server
+/// #332 (PR #338 at 66b9f7b): `InferenceSource::by_mac`), when the send goes to their Relay-off
+/// fallback at once or is refused `plan_unavailable`. The server sends such a send itself, oldest
+/// first, when a Mac opens the relay, so this app never fires one; nor does it hold one of its
+/// own accord: a row is waiting for the Mac only while the server says so.
 pub const HELD_FOR_RELAY_OFFLINE: &str = "relay_offline";
 
 /// Whether "My subscription" may be pointed at a model, by the server's own rule, so the picker
 /// never offers what a Save would be refused for, even should a list ever carry one (a list held
 /// from before, or a server that tags a row `local_proxy` without asking): `subscription_model`
 /// in opengrok-server's `crates/opengrok-core/src/inference.rs`, anchored since #296 and unchanged
-/// in the vendored recording (#334, on main 8e7387f), where a Bot's own plan
+/// in the vendored recording (#332, PR #338 at 66b9f7b), where a Bot's own plan
 /// model is held to it too, as it has been since #304, and so is a default for new Bots on the
-/// plan, since #322.
+/// plan, since #322. A Relay-off fallback is not: it is the server's paid keys' (`PlanFallback`).
 ///
 /// An allowlist, not a denylist: an id it does not recognise is refused, so a provider nobody
 /// has looked at is not offered by being new. With an `openai/` or `xai/` prefix and the `--fast`
@@ -932,11 +950,10 @@ mod tests {
         );
     }
 
-    /// Whether the relay is switched on reads as the agreed contract writes it (opengrok-server
-    /// relay-off fallback contract, agreed 2026-10-03, not yet built), a bool on every read of a
-    /// server that keeps it, and as no key from one before it. A `PUT` carries it only when the
-    /// relay switch sends it: with the relay's way as the switch goes on, and with none as it goes
-    /// off.
+    /// Whether the relay is switched on reads as the server writes it (opengrok-server #332 (PR
+    /// #338 at 66b9f7b)), a bool on every read of a server that keeps it, and as no key from one
+    /// before it. A `PUT` carries it only when the relay switch sends it: with the relay's way as
+    /// the switch goes on, and with none as it goes off, since the switch moves no way there.
     #[test]
     fn whether_the_relay_is_on_reads_and_puts_as_the_contract_writes_it() {
         let read = |relay_enabled: Option<Value>| {
@@ -980,10 +997,10 @@ mod tests {
         );
     }
 
-    /// The Relay-off fallback reads as the agreed contract writes it (opengrok-server relay-off
-    /// fallback contract, agreed 2026-10-03, not yet built): left out by a server that keeps
-    /// none, `null` while none is set, and whole once set, an effort left out or `null` read as
-    /// `inherit`. A `PUT` names it only when the app changes it: whole, or `null` to take it away.
+    /// The Relay-off fallback reads as the server writes it (opengrok-server #332 (PR #338 at
+    /// 66b9f7b)): left out by a server that keeps none, `null` while none is set, and whole once
+    /// set, an effort left out or `null` read as `inherit`. A `PUT` names it only when the app
+    /// changes it: whole, or `null` to take it away.
     #[test]
     fn the_relay_off_fallback_reads_and_puts_as_the_contract_writes_it() {
         let read = |fallback: Option<Value>| {

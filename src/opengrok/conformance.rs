@@ -4,11 +4,11 @@
 //! agree. `fixtures/wire/` is the server's side of that, recorded by the server itself: every
 //! AG-UI frame and REST body its own tests drove, teed off its router by the recorder of
 //! opengrok-server#258 and written out by its `examples/wire_corpus.rs`. It is vendored whole from
-//! the server's `tests/fixtures/wire/` at #334, on main 8e7387f (the server half of #316: a Bot's
-//! routine tools, a routine's own zone, the one-minute floor and skipped runs, after #331). Its
-//! `MANIFEST.json` names 426fa0d, the branch commit it was recorded at, until a restamp names the
-//! main commit. The layout is opengrok-server#255's: `agui/<type>/<slug>.json`, a
-//! CUSTOM under `agui/custom/<name>/`, and `rest/<METHOD>_<route>/<status>-<slug>.json` holding
+//! the server's `tests/fixtures/wire/` at opengrok-server #332 (PR #338 at 66b9f7b, not yet on
+//! main: the relay's switch, the fallback that answers while it is off, and a resumed routine
+//! that never fires at once), recorded on main eaaa291. Its `MANIFEST.json` names 79d711f, the
+//! PR's commit it was recorded at. The layout is opengrok-server#255's: `agui/<type>/<slug>.json`,
+//! a CUSTOM under `agui/custom/<name>/`, and `rest/<METHOD>_<route>/<status>-<slug>.json` holding
 //! `{method, path, status, body}`, one file per distinct shape, named after the first test that
 //! produced it; and since the relay, the frames of its stream under `relay/<type>/<slug>.json`,
 //! which are not AG-UI and which the Mac, not the chat, reads. `MANIFEST.json` names the server
@@ -652,41 +652,7 @@ const MACHINE_TOKEN_ROUTES: &[&str] = &[
 /// written in the agreed shape. The day a recorded body of the route carries the key, the entry
 /// has gone stale and comes off this list, and
 /// [`every_key_asked_ahead_of_its_recording_is_read_and_not_recorded_yet`] fails until it does.
-const REST_FIELDS_NOT_RECORDED_YET: &[(&str, &str, &str)] = &[
-    (
-        "GET__account_inference-source",
-        "relayEnabled",
-        "opengrok-server relay-off fallback contract, agreed 2026-10-03, not yet built: the \
-         account's setting says on every read whether the relay is switched on, a bool, true by \
-         default, and Settings → Relay's switch sends it only where the read carries the key. Its \
-         recording comes with the corpus re-vendored from a main that builds it.",
-    ),
-    (
-        "PUT__account_inference-source",
-        "relayEnabled",
-        "opengrok-server relay-off fallback contract, agreed 2026-10-03, not yet built: the relay \
-         switch sends relayEnabled true with via \"mac\" in one PUT as it goes on, and false with \
-         no via as it goes off, only where the read carries the key, and the answer carries it as \
-         a read does. Its recording comes with the corpus re-vendored from a main that builds it.",
-    ),
-    (
-        "GET__account_inference-source",
-        "planFallback",
-        "opengrok-server relay-off fallback contract, agreed 2026-10-03, not yet built: the \
-         account's setting carries planFallback, {model, effort} or null, on every read, and \
-         Settings → General's Relay-off fallback picker is live only where the read carries the \
-         key. Its recording comes with the corpus re-vendored from a main that builds it.",
-    ),
-    (
-        "PUT__account_inference-source",
-        "planFallback",
-        "opengrok-server relay-off fallback contract, agreed 2026-10-03, not yet built: a PUT \
-         takes planFallback whole, its model held as a gateway pin is and its effort to a Bot's \
-         words, null clears it, and the answer carries it as a read does. The Relay-off fallback \
-         picker sends it at once. Its recording comes with the corpus re-vendored from a main \
-         that builds it.",
-    ),
-];
+const REST_FIELDS_NOT_RECORDED_YET: &[(&str, &str, &str)] = &[];
 
 // ---- the corpus ----
 
@@ -1841,9 +1807,9 @@ fn inference_source_frame(frame: &Value) -> Check {
         source.via == via,
         "the badge should say the way as sent: {source:?} from {value}"
     );
-    // Why the server's keys answered (opengrok-server relay-off fallback contract, agreed
-    // 2026-10-03, not yet built): as sent on the gateway's badge, when it is a reason this app
-    // knows.
+    // Why the server's keys answered (opengrok-server #332 (PR #338 at 66b9f7b): `fallbackFor`,
+    // written by `converse_raw` in `crates/opengrok-harness/src/lib.rs`): as sent on the
+    // gateway's badge, when it is a reason this app knows.
     let fallback_for = opt_str(value, "fallbackFor")
         .and_then(FallbackFor::from_word)
         .filter(|_| source.kind == InferenceKind::Gateway);
@@ -3827,16 +3793,16 @@ fn inference_source(_: u16, body: &Value) -> Check {
             ));
         }
     }
-    // Whether the relay is switched on, from a server that keeps it (opengrok-server relay-off
-    // fallback contract, agreed 2026-10-03, not yet built): read as sent, and as no key from one
-    // before it, which the relay switch then tells nothing.
+    // Whether the relay is switched on, from a server that keeps it (opengrok-server #332 (PR
+    // #338 at 66b9f7b): `described` in the same file, on every read): read as sent, and as no key
+    // from one before it, which the relay switch then tells nothing.
     must!(
         read.relay_enabled == body.get("relayEnabled").and_then(Value::as_bool),
         "whether the relay is on should come through as sent: {read:?} from {body}"
     );
-    // The Relay-off fallback, from a server that keeps one (the same contract): read exactly when
-    // the key is sent, null as none set, and an object field for field, an effort left out as
-    // `inherit`.
+    // The Relay-off fallback, from a server that keeps one (the same PR, on every read too): read
+    // exactly when the key is sent, null as none set, and an object field for field, an effort
+    // left out as `inherit`.
     match (&read.plan_fallback, body.get("planFallback")) {
         (None, None) | (Some(None), Some(Value::Null)) => {}
         (Some(Some(fallback)), Some(raw)) => must!(
@@ -5862,6 +5828,40 @@ fn every_recorded_setting_is_from_a_server_that_knows_the_relay() {
     assert!(read > 0, "the recording holds the account's setting");
 }
 
+/// The server that made the recording keeps the relay's switch and what answers while it is off
+/// (opengrok-server #332 (PR #338 at 66b9f7b): `described` in
+/// `crates/opengrok-harness/src/local_proxy.rs`, which writes `relayEnabled` and `planFallback`
+/// on every read and every Save's answer, `true` and `null` until they are set). So every
+/// recorded setting reads as one from a server that keeps both, which is what has the relay
+/// switch tell it `relayEnabled` and makes the Relay-off fallback's card live; and the recording
+/// holds the switch both ways, each with a fallback set and with none.
+#[test]
+fn every_recorded_setting_keeps_the_relay_switch_and_its_fallback() {
+    let corpus = Corpus::load();
+    let mut seen = BTreeSet::new();
+    for (file, fixture) in &corpus.bodies {
+        let route = file.split('/').nth(1).unwrap_or("");
+        let setting = matches!(
+            route,
+            "GET__account_inference-source" | "PUT__account_inference-source"
+        );
+        if !setting || fixture["status"] != 200 {
+            continue;
+        }
+        let source: InferenceSource = serde_json::from_value(fixture["body"].clone())
+            .unwrap_or_else(|error| panic!("{file}: {error}"));
+        let (Some(on), Some(fallback)) = (source.relay_enabled, &source.plan_fallback) else {
+            panic!("{file}: a server with the switch says it, and its fallback, on every read");
+        };
+        seen.insert((on, fallback.is_some()));
+    }
+    assert_eq!(
+        seen,
+        BTreeSet::from([(false, false), (false, true), (true, false), (true, true)]),
+        "the recording holds the switch both ways, with a fallback and without"
+    );
+}
+
 /// The server that made the recording keeps a door per Bot, and writes it on every coworker row it
 /// answers with, `null` and all (`coworker_row` in opengrok-server's
 /// `crates/opengrok-server/src/agui/routes.rs`, server main d6f640e (#307, after #304), pin
@@ -5871,10 +5871,12 @@ fn every_recorded_setting_is_from_a_server_that_knows_the_relay() {
 /// taken to keep none. A hire whose body names its model answers `null`, a Bot that follows the
 /// account's door until it is given one of its own; since #322 (on main since c0bb6ae: `hire` in
 /// the same file, and `Coworker::born_on`), one hired with no model is born on its hirer's default
-/// for new Bots, door and all. The recording holds a hire of each, and a row on the Bot's own plan.
-/// A row on its other door, `gateway`, is the same shape to the recorder, which keeps one file per
-/// shape, and the recording at #334, on main 8e7387f, keeps none, so that word is read beyond the
-/// recording ([`a_bots_door_is_read_beyond_the_recording`]).
+/// for new Bots, door and all. The recording holds a hire of each, and a row on each door the
+/// server writes: the Bot's own plan, and since opengrok-server #332 (PR #338 at 66b9f7b), whose
+/// sender is put on the gateway as a PATCH so it answers however the relay is set, the gateway's
+/// too. The recorder keeps one file per shape, and both doors are one shape to it, so the
+/// recording vendored before (#334, on main 8e7387f) kept no gateway row, and that word was read
+/// only beyond the recording ([`a_bots_door_is_read_beyond_the_recording`]).
 #[test]
 fn every_recorded_coworker_row_is_from_a_server_that_keeps_a_door_per_bot() {
     let corpus = Corpus::load();
@@ -5910,6 +5912,7 @@ fn every_recorded_coworker_row_is_from_a_server_that_keeps_a_door_per_bot() {
     for door in [
         CoworkerSource::AccountDefault,
         CoworkerSource::Kind(InferenceKind::LocalProxy),
+        CoworkerSource::Kind(InferenceKind::Gateway),
     ] {
         assert!(
             doors.contains(&door),
@@ -5929,10 +5932,10 @@ fn every_recorded_coworker_row_is_from_a_server_that_keeps_a_door_per_bot() {
 }
 
 /// A Bot's door, read beyond the recording, which holds rows with `null` and `local_proxy`, a
-/// hire's and a PATCH's among them, and the PATCH's 400s for a Bot left on the person's plan with
-/// a model the allowlist does not take (opengrok-server main d6f640e (#307, after #304), pin
-/// bf99845): a row on the server's other word, `gateway`, which the recording at #334,
-/// on main 8e7387f, keeps no file of, a row whose door is a word
+/// hire's and a PATCH's among them, a PATCH's on `gateway` (since opengrok-server #332, PR #338
+/// at 66b9f7b), and the PATCH's 400s for a Bot left on the person's plan with a model the
+/// allowlist does not take (opengrok-server main d6f640e (#307, after #304), pin bf99845): a
+/// roster's row on `gateway`, which the recording keeps no roster of, a row whose door is a word
 /// this app has not heard of, and one from a server before per-Bot doors, with no `source` at
 /// all, each read as sent, and a row whose parse lost its door caught; and the 400 for a `source`
 /// that is neither word, which the recorder keeps no file of, having one 400 of that shape
@@ -6242,26 +6245,80 @@ fn a_replys_way_is_read_beyond_the_recording() {
     }
 }
 
-/// The CUSTOM frame's reason for a reply on the server's keys, fed a frame written as the agreed
-/// contract writes it, which no recording holds yet (opengrok-server relay-off fallback contract,
-/// agreed 2026-10-03, not yet built): `fallbackFor: "relay_disabled"` is read as sent, and the
-/// reply's badge says the relay was off.
+/// Every `opengrok.inferenceSource` frame anywhere in `value`, a replay's runs' included.
+fn inference_source_frames<'a>(value: &'a Value, out: &mut Vec<&'a Value>) {
+    match value {
+        Value::Object(object) => {
+            if str_at(value, "type") == "CUSTOM" && str_at(value, "name") == INFERENCE_SOURCE_CUSTOM
+            {
+                out.push(value);
+            }
+            object
+                .values()
+                .for_each(|child| inference_source_frames(child, out));
+        }
+        Value::Array(items) => items
+            .iter()
+            .for_each(|item| inference_source_frames(item, out)),
+        _ => {}
+    }
+}
+
+/// A reply the person's Relay-off fallback answered, as the recording holds it (opengrok-server
+/// #332 (PR #338 at 66b9f7b): a fresh turn by the Mac while the relay is off asks the gateway on
+/// the account's `planFallback`): live, under `agui/custom/opengrok.inferenceSource/`, and
+/// journaled in the replay of a turn by the Mac with the relay off. Its frame names the gateway
+/// and the fallback's model, no way, and why in `fallbackFor: "relay_disabled"`; each is read as
+/// sent, and the reply's badge says the relay was off. A reason this app has not heard of is
+/// still read beyond the recording, as no reason at all.
 #[test]
-fn a_replys_fallback_is_read_beyond_the_recording() {
+fn a_reply_on_the_relay_off_fallback_is_recorded_and_says_so() {
     use serde_json::json;
-    let frame = json!({
-        "type": "CUSTOM", "name": INFERENCE_SOURCE_CUSTOM,
-        "value": {"kind": "gateway", "model": "oag/cheap", "fallbackFor": "relay_disabled"}
-    });
-    inference_source_frame(&frame).unwrap_or_else(|why| panic!("{frame}: {why}"));
-    let assembler = assembled(&[&frame]);
-    let source = assembler
-        .reply_source()
-        .expect("the frame gives the reply its badge");
-    assert_eq!(
-        crate::components::reply_source::badge_words(source),
-        "paid key · relay off"
+    let corpus = Corpus::load();
+    let fell_back = |frames: Vec<&Value>| -> Vec<Value> {
+        frames
+            .into_iter()
+            .filter(|frame| frame["value"].get("fallbackFor").is_some())
+            .cloned()
+            .collect()
+    };
+    let live = fell_back(corpus.customs_named(INFERENCE_SOURCE_CUSTOM).collect());
+    let mut journaled = Vec::new();
+    for fixture in corpus.bodies.values() {
+        inference_source_frames(&fixture["body"], &mut journaled);
+    }
+    let replayed = fell_back(journaled);
+    assert!(
+        !live.is_empty() && !replayed.is_empty(),
+        "the recording holds a reply on the fallback, live and in a replay"
     );
+    for frame in live.iter().chain(&replayed) {
+        let value = &frame["value"];
+        assert_eq!(
+            (
+                str_at(value, "kind"),
+                str_at(value, "fallbackFor"),
+                value.get("via")
+            ),
+            ("gateway", "relay_disabled", None),
+            "{frame}"
+        );
+        inference_source_frame(frame).unwrap_or_else(|why| panic!("{frame}: {why}"));
+        let assembler = assembled(&[frame]);
+        let source = assembler
+            .reply_source()
+            .expect("the frame gives the reply its badge");
+        assert_eq!(
+            crate::components::reply_source::badge_words(source),
+            "paid key · relay off",
+            "{frame}"
+        );
+    }
+    let unheard = json!({
+        "type": "CUSTOM", "name": INFERENCE_SOURCE_CUSTOM,
+        "value": {"kind": "gateway", "model": "oag/cheap", "fallbackFor": "relay_slow"}
+    });
+    inference_source_frame(&unheard).unwrap_or_else(|why| panic!("{unheard}: {why}"));
 }
 
 /// This Mac's answers, read beyond the ones the server's recording holds (a 204, a 401, a 404 and

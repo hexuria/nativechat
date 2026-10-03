@@ -677,12 +677,12 @@ pub fn new_bots_pick(
     }
 }
 
-/// The Relay-off fallback as the same card and popover show it (opengrok-server relay-off
-/// fallback contract, agreed 2026-10-03, not yet built): what a Bot on the person's plan answers
-/// with while the relay is off, `None` while the person has set none. It is on the server's paid
-/// keys, so the list is the Gateway group alone, whatever the plan offers; and like a default for
-/// new Bots, with none set there is no model to tick, nor one to move to its fast twin or give an
-/// effort: the server keeps it whole, and a pick in the list is what starts one.
+/// The Relay-off fallback as the same card and popover show it (opengrok-server #332 (PR #338 at
+/// 66b9f7b): `planFallback`): what a Bot on the person's plan answers with while the relay is
+/// off, `None` while the person has set none. It is on the server's paid keys, so the list is the
+/// Gateway group alone, whatever the plan offers; and like a default for new Bots, with none set
+/// there is no model to tick, nor one to move to its fast twin or give an effort: the server
+/// keeps it whole, and a pick in the list is what starts one.
 pub fn plan_fallback_pick(
     fallback: Option<&PlanFallback>,
     catalogue: &ModelCatalogue,
@@ -1819,10 +1819,9 @@ mod tests {
     }
 
     /// The Relay-off fallback is the Bot's picker over the Gateway group alone (opengrok-server
-    /// relay-off fallback contract, agreed 2026-10-03, not yet built), whatever else the list of
-    /// models holds: it is what a Bot on the plan answers with on the server's paid keys. Set, the
-    /// card names its model and effort, the list ticks its row, and every change makes the whole
-    /// fallback anew. With none set the card says None, ⚡ and the slider are dead and say why,
+    /// #332 (PR #338 at 66b9f7b)), whatever else the list of models holds: it is what a Bot on
+    /// the plan answers with on the server's paid keys. Set, the card names its model and effort,
+    /// the list ticks its row, and every change makes the whole fallback anew. With none set the card says None, ⚡ and the slider are dead and say why,
     /// and a pick starts a whole fallback on the Default effort. The plan's door makes none.
     #[test]
     fn the_relay_off_fallback_is_picked_whole_from_the_gateway_alone() {
