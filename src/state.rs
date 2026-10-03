@@ -5192,6 +5192,16 @@ pub struct AppState {
     pub last_box_shot: Option<ScreenshotSpec>,
     /// Runs while the Computer pane is open; dropped when it closes.
     computer_poll: Option<Task<()>>,
+    /// A status request is out. The poll ticks every two seconds whatever the server's pace,
+    /// and a slow server (seconds per answer while a box is busy) would otherwise have one
+    /// more request piled on it each tick, each slowing the rest. So one at a time, and a
+    /// refresh asked for meanwhile (after a Reset, say) is sent once the answer lands, so
+    /// it never takes an answer that predates it.
+    computer_refresh_in_flight: bool,
+    computer_refresh_again: bool,
+    /// The same for the screen tile; a tick that finds one out just skips, as the next
+    /// tick fetches a newer picture anyway.
+    screen_refresh_in_flight: bool,
     /// One screen window per coworker: Open brings the existing one forward rather than
     /// stacking another.
     #[cfg(target_os = "macos")]
@@ -5756,6 +5766,9 @@ impl AppState {
             computer_asks: HashSet::new(),
             computer_endpoint_missing: false,
             computer_poll: None,
+            computer_refresh_in_flight: false,
+            computer_refresh_again: false,
+            screen_refresh_in_flight: false,
             page: MainPage::Chat,
             lightbox: None,
             recipes: Vec::new(),
@@ -9317,6 +9330,24 @@ impl AppState {
         }));
     }
 
+    /// Whether a status request may go out now. One is out already: this one is kept as
+    /// "again" and goes when that answer lands.
+    fn begin_computer_refresh(&mut self) -> bool {
+        if self.computer_refresh_in_flight {
+            self.computer_refresh_again = true;
+            return false;
+        }
+        self.computer_refresh_in_flight = true;
+        true
+    }
+
+    /// The status request's answer landed. True when another was asked for meanwhile, to
+    /// send now.
+    fn settle_computer_refresh(&mut self) -> bool {
+        self.computer_refresh_in_flight = false;
+        std::mem::take(&mut self.computer_refresh_again)
+    }
+
     pub fn refresh_coworker_computer(&mut self, cx: &mut Context<Self>) {
         let Some(client) = self.opengrok.clone() else {
             return;
@@ -9329,9 +9360,15 @@ impl AppState {
         if self.computer_endpoint_missing {
             return;
         }
+        if !self.begin_computer_refresh() {
+            return;
+        }
         cx.spawn(async move |this, cx| {
             let result = client.coworker_computer(&coworker_id).await;
             let _ = this.update(cx, |state, cx| {
+                if state.settle_computer_refresh() {
+                    state.refresh_coworker_computer(cx);
+                }
                 // A late answer for a bot the person has since left is stale.
                 if state.active_coworker_id.as_deref() != Some(coworker_id.as_str()) {
                     return;
@@ -9396,9 +9433,14 @@ impl AppState {
             }
             return;
         }
+        if self.screen_refresh_in_flight {
+            return;
+        }
+        self.screen_refresh_in_flight = true;
         cx.spawn(async move |this, cx| {
             let result = client.coworker_screen(&coworker_id).await;
             let _ = this.update(cx, |state, cx| {
+                state.screen_refresh_in_flight = false;
                 if state.active_coworker_id.as_deref() != Some(coworker_id.as_str()) {
                     return;
                 }
@@ -27097,6 +27139,34 @@ mod tests {
                 "what was typed goes to the server with it"
             );
         });
+    }
+
+    /// A slow server is asked for the computer's status one request at a time: ticks that come
+    /// while one is out add nothing, and a refresh asked for meanwhile goes once, after the
+    /// answer, so it never takes an answer that predates it. Without this the two-second poll
+    /// piled five requests on a server taking eleven seconds each, slowing them all.
+    #[test]
+    fn the_computers_status_is_asked_one_request_at_a_time() {
+        let mut state = AppState::default();
+        assert!(state.begin_computer_refresh(), "the first goes");
+        assert!(
+            !state.begin_computer_refresh(),
+            "a tick while it is out waits"
+        );
+        assert!(!state.begin_computer_refresh(), "and so does the next");
+        assert!(
+            state.settle_computer_refresh(),
+            "the answer lands, and one more goes for what was asked meanwhile"
+        );
+        assert!(state.begin_computer_refresh(), "that one goes");
+        assert!(
+            !state.settle_computer_refresh(),
+            "nothing was asked while it was out, so nothing follows it"
+        );
+        assert!(
+            state.begin_computer_refresh(),
+            "and the next tick goes again"
+        );
     }
 
     // ---- A routine on a server that cannot do everything with one -------------------------
