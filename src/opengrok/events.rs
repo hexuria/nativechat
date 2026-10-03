@@ -1,6 +1,7 @@
 //! The account's events stream: the server's word, as it happens, that something the app shows
-//! has changed (`GET /ag-ui/events`, opengrok-server #348, contract agreed 2026-10-03, not
-//! recorded yet).
+//! has changed (`GET /ag-ui/events`, opengrok-server #348, shaped from its branch
+//! account-events-stream @ 85ce00c: `Note` in `crates/opengrok-wire/src/events.rs`, `follow` in
+//! `crates/opengrok-events/src/follow.rs`; not recorded yet).
 //!
 //! Before it, the app heard live only about the turns it started itself, down their own
 //! `POST /ag-ui` streams. A run the server started (a routine's clock, a webhook, Test run, a
@@ -13,7 +14,9 @@
 //! Frames are SSE: `id: <n>`, `event: <name>`, `data: <one line of JSON>`, and a `: ping` comment
 //! every fifteen seconds. The stream is opened again after it drops, with the last id it carried
 //! as `Last-Event-ID`, and the server replays what came after it; an id it no longer holds is
-//! answered with `reset` first, which has the app read everything again. The stream is the
+//! answered with `reset` first, which has the app read everything again. Ids only go up, and skip:
+//! the server sends a burst of a thread's notes as its last, so a gap between two ids is no note
+//! lost. The id is kept as the text it came as and handed back, never counted. The stream is the
 //! account's, taken from the session, so it is opened with the bearer every other account route
 //! goes with, and a `401` goes through the session's own refresh before anything else.
 
@@ -56,8 +59,9 @@ pub(crate) const ACCOUNT_EVENT_NAMES: [&str; 5] = [
 /// one, and the stream is opened again rather than read without end.
 const LINE_BYTES: usize = 64 * 1024;
 
-/// One note off the stream, in the agreed shape (opengrok-server #348, contract agreed 2026-10-03,
-/// not recorded yet). Ids only: what changed is read again from its own route.
+/// One note off the stream, in the shape opengrok-server's branch account-events-stream @ 85ce00c
+/// writes it (`Note` in `crates/opengrok-wire/src/events.rs`), not recorded yet. Ids only: what
+/// changed is read again from its own route.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AccountEvent {
     /// Something was written to the thread.
@@ -78,13 +82,15 @@ pub enum AccountEvent {
         routine_id: Option<String>,
         cause: RunStartCause,
     },
-    /// A run ended.
+    /// A run ended for good. A run waiting on a card has not, and the server sends only
+    /// `thread.changed` for it: nothing here waits for this note to end anything.
     RunFinished {
         run_id: String,
         thread_id: String,
         coworker_id: String,
         routine_id: Option<String>,
-        /// How it ended, in the server's word.
+        /// How it ended, in the words a routine's run history uses: `ok`, or `error` (a stop is
+        /// an `error`). Empty where the note said nothing this client reads as a word.
         state: String,
     },
     /// One of the Bot's routines changed. The Bot is the routine's owner.
@@ -98,22 +104,26 @@ pub enum AccountEvent {
     Reset,
 }
 
-/// What started a run, as `run.started` says it.
+/// What started a run, as `run.started` says it: the words a routine's run history uses, so the
+/// app reads one vocabulary (`fired` in opengrok-server's `crates/opengrok-events/src/appended.rs`,
+/// branch account-events-stream @ 85ce00c).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum RunStartCause {
+    /// A routine's clock.
+    Clock,
+    /// A person: a routine's Test run, or a monitor run by hand.
     Manual,
-    /// The routine's clock.
-    Schedule,
-    /// A webhook.
-    Hook,
+    /// A routine's webhook.
+    Webhook,
     /// A Bot, with its `run_routine` tool.
     Bot,
-    /// Test run.
-    Test,
-    /// A message in the thread, this app's own among them.
+    /// A monitor's event.
+    Event,
+    /// Nothing fired it: a message in the thread, this app's own among them.
     Chat,
-    /// A word this client has no name for yet, or none: still a run that began.
+    /// A word this client has no name for yet, or none, or not a word at all: still a run that
+    /// began.
     #[default]
     #[serde(other)]
     Other,
@@ -162,11 +172,11 @@ struct RunNote {
     coworker_id: String,
     #[serde(default)]
     routine_id: Option<String>,
-    /// Read as `Other` when it is missing: the run began whatever started it, and the thread it
-    /// began in is read again either way.
-    #[serde(default)]
+    /// Read as `Other` when it is missing or not a word: the run began whatever started it, and
+    /// the thread it began in is read again either way.
+    #[serde(default, deserialize_with = "word_or_default")]
     cause: RunStartCause,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "word_or_default")]
     state: String,
 }
 
@@ -175,8 +185,22 @@ struct RunNote {
 struct RoutineNote {
     routine_id: String,
     coworker_id: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "word_or_default")]
     change: RoutineChange,
+}
+
+/// A word a note carries, read as its default when it is `null`, or is not a word this client can
+/// read at all: a cause, a state or a change never costs the note, whose ids are what the window
+/// reads by.
+fn word_or_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: DeserializeOwned + Default,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value
+        .and_then(|value| serde_json::from_value(value).ok())
+        .unwrap_or_default())
 }
 
 impl AccountEvent {
@@ -386,6 +410,7 @@ async fn serve(
                         continue;
                     };
                     if let Some(id) = id {
+                        // Kept as it came, never counted: ids skip, and a gap is no note lost.
                         // An empty id is the server taking its place back: the next stream is
                         // opened from nowhere, and starts with `reset`.
                         resume = (!id.is_empty()).then_some(id);
@@ -630,7 +655,7 @@ mod tests {
             })
         );
         let started = json!({"runId": "run_1", "threadId": "sched_1", "coworkerId": "cw_1",
-                             "routineId": "sched_1", "cause": "test"});
+                             "routineId": "sched_1", "cause": "manual"});
         assert_eq!(
             AccountEvent::read(RUN_STARTED, &started.to_string()),
             Ok(AccountEvent::RunStarted {
@@ -638,15 +663,15 @@ mod tests {
                 thread_id: "sched_1".into(),
                 coworker_id: "cw_1".into(),
                 routine_id: Some("sched_1".into()),
-                cause: RunStartCause::Test,
+                cause: RunStartCause::Manual,
             })
         );
         for (word, cause) in [
+            ("clock", RunStartCause::Clock),
             ("manual", RunStartCause::Manual),
-            ("schedule", RunStartCause::Schedule),
-            ("hook", RunStartCause::Hook),
+            ("webhook", RunStartCause::Webhook),
             ("bot", RunStartCause::Bot),
-            ("test", RunStartCause::Test),
+            ("event", RunStartCause::Event),
             ("chat", RunStartCause::Chat),
             ("comet", RunStartCause::Other),
         ] {
@@ -660,7 +685,7 @@ mod tests {
             );
         }
         let finished = json!({"runId": "run_1", "threadId": "cw_1", "coworkerId": "cw_1",
-                              "state": "finished"});
+                              "state": "ok"});
         assert_eq!(
             AccountEvent::read(RUN_FINISHED, &finished.to_string()),
             Ok(AccountEvent::RunFinished {
@@ -668,7 +693,7 @@ mod tests {
                 thread_id: "cw_1".into(),
                 coworker_id: "cw_1".into(),
                 routine_id: None,
-                state: "finished".into(),
+                state: "ok".into(),
             })
         );
         for (word, change) in [
@@ -755,6 +780,61 @@ mod tests {
         );
     }
 
+    /// `run.started` says what started the run in the words a routine's run history uses
+    /// (opengrok-server branch account-events-stream @ 85ce00c, `fired` in
+    /// `crates/opengrok-events/src/appended.rs`): `clock`, `manual`, `webhook` and `bot` for a
+    /// routine, `event` and `manual` for a monitor, `chat` for a run nothing fired. `run.finished`
+    /// says how it ended, `ok` or `error` (`history_word`). A word this client has no name for,
+    /// the first brief's `schedule`, `hook` and `test` among them, and a value that is not a word
+    /// at all, never cost the note: its ids are what the window reads by.
+    #[test]
+    fn a_runs_words_are_the_historys_and_never_cost_the_note() {
+        let cause = |cause: serde_json::Value| {
+            let note = json!({"runId": "r", "threadId": "t", "coworkerId": "c", "cause": cause});
+            match AccountEvent::read(RUN_STARTED, &note.to_string()) {
+                Ok(AccountEvent::RunStarted { cause, .. }) => format!("{cause:?}"),
+                other => panic!("{note}: {other:?}"),
+            }
+        };
+        for (word, read) in [
+            ("clock", "Clock"),
+            ("manual", "Manual"),
+            ("webhook", "Webhook"),
+            ("bot", "Bot"),
+            ("event", "Event"),
+            ("chat", "Chat"),
+            ("schedule", "Other"),
+            ("hook", "Other"),
+            ("test", "Other"),
+            ("comet", "Other"),
+        ] {
+            assert_eq!(cause(json!(word)), read, "{word}");
+        }
+        assert_eq!(cause(json!(7)), "Other", "a cause that is not a word");
+        assert_eq!(cause(serde_json::Value::Null), "Other");
+        let state = |state: serde_json::Value| {
+            let note = json!({"runId": "r", "threadId": "t", "coworkerId": "c", "state": state});
+            match AccountEvent::read(RUN_FINISHED, &note.to_string()) {
+                Ok(AccountEvent::RunFinished { state, .. }) => state,
+                other => panic!("{note}: {other:?}"),
+            }
+        };
+        assert_eq!(state(json!("ok")), "ok");
+        assert_eq!(state(json!("error")), "error", "a stop is an error");
+        assert_eq!(state(json!(7)), "", "a state that is not a word");
+        let change = json!({"routineId": "sched_1", "coworkerId": "cw_1", "change": 7});
+        assert!(
+            matches!(
+                AccountEvent::read(ROUTINE_CHANGED, &change.to_string()),
+                Ok(AccountEvent::RoutineChanged {
+                    change: RoutineChange::Other,
+                    ..
+                })
+            ),
+            "a change that is not a word"
+        );
+    }
+
     /// The stream's lines are split on the bytes: an event cut across chunks, a character cut in
     /// two, CRLF endings, a comment, a field nobody reads and an event of two `data:` lines all
     /// read as the server meant them; a ping is a comment, and an event the stream ended in the
@@ -793,8 +873,10 @@ mod tests {
 
     /// The stream is opened with the session's bearer, asking for an event stream. What it carries
     /// comes out in order, after word that it opened: a note named nothing this app reads, and
-    /// one without its ids, are passed over, and a ping carries nothing. When it ends, the window
-    /// hears it was lost, and it is opened again from the last id it carried.
+    /// one without its ids, are passed over, and a ping carries nothing. Ids only go up, and skip
+    /// (the server sends a burst of a thread's notes as its last): a gap is no note lost, and asks
+    /// for nothing. When the stream ends, the window hears it was lost, and it is opened again
+    /// from the last id it carried.
     #[tokio::test]
     async fn the_stream_is_read_in_order_and_opened_again_from_its_last_id() {
         let server = MockServer::start().await;
@@ -802,11 +884,11 @@ mod tests {
             "{}: ping\n\n{}",
             frames(&[
                 (3, THREAD_CHANGED, thread_changed("cw_1")),
-                (4, "roster.changed", json!({})),
-                (5, THREAD_CHANGED, json!({"coworkerId": "cw_1"})),
+                (9, "roster.changed", json!({})),
+                (12, THREAD_CHANGED, json!({"coworkerId": "cw_1"})),
             ]),
             frames(&[(
-                6,
+                40,
                 ROUTINE_CHANGED,
                 json!({"routineId": "sched_1", "coworkerId": "cw_1", "change": "created"})
             )])
@@ -820,7 +902,7 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/ag-ui/events"))
             .respond_with(stream(frames(&[(
-                7,
+                57,
                 THREAD_CHANGED,
                 thread_changed("cw_2"),
             )])))
@@ -856,9 +938,10 @@ mod tests {
         );
         assert_eq!(
             last_event_id(&opened[1]).as_deref(),
-            Some("6"),
+            Some("40"),
             "the stream is opened again after the last note it carried, read or passed over"
         );
+        assert_eq!(opened.len(), 2, "and only when it ended, never for a gap");
     }
 
     /// A stream opened again from an id the server no longer holds starts with `reset`, whose id is

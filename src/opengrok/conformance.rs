@@ -544,19 +544,23 @@ const WORDS_NOT_RECORDED_YET: &[(Slot, &str, &str)] = &[
     (Slot::AccountEvent, "reset", ACCOUNT_EVENTS_AHEAD),
 ];
 
-/// What brings `thread.changed` into the corpus: as the other notes, in the shape with the `runId`
-/// agreed after them.
-const THREAD_CHANGED_AHEAD: &str = "opengrok-server #348 contract agreed 2026-10-03, with runId \
-     added to thread.changed the same day (the run whose commit made the change, present and \
-     null when no run did; coalesced notes keep the latest, or null where they disagree), not \
-     recorded yet: it comes with the recorder addition for SSE notes, as ACCOUNT_EVENTS_AHEAD \
-     says.";
+/// What brings `thread.changed` into the corpus: as the other notes, in the shape with its
+/// `runId`.
+const THREAD_CHANGED_AHEAD: &str = "shaped from opengrok-server branch account-events-stream @ \
+     85ce00c (#348; Note::ThreadChanged in crates/opengrok-wire/src/events.rs), not recorded \
+     yet: runId is the run whose own commit made the change, present and null when no run's did \
+     (a card settled, a stop, the sweep), and a burst the server merges keeps it only where every \
+     note agrees (coalesced in crates/opengrok-events/src/follow.rs). It comes as \
+     ACCOUNT_EVENTS_AHEAD says.";
 
 /// What brings the account's events stream's notes into the corpus.
-const ACCOUNT_EVENTS_AHEAD: &str = "opengrok-server #348 contract agreed 2026-10-03, not \
-     recorded yet: the notes of the account's events stream, GET /ag-ui/events. They are SSE \
-     events, which the recorder cannot pin by test name any more than AG-UI frames, so they come \
-     with the recorder addition for SSE notes that #348 builds.";
+const ACCOUNT_EVENTS_AHEAD: &str = "shaped from opengrok-server branch account-events-stream @ \
+     85ce00c (#348; Note in crates/opengrok-wire/src/events.rs, written by \
+     crates/opengrok-events/src/appended.rs, reset by follow.rs), not recorded yet: a run's cause \
+     and its end are the run history's words (clock, manual, webhook, bot, event, chat; ok or \
+     error). The branch's recorder keeps each block whole as {id, event, data} under \
+     events/<name>/ and lists the names in the manifest's emits.events (its cb5447b); the owner \
+     records it, and then these come off.";
 
 /// Fixtures this app still reads wrongly, with the words their check fails with and why. The
 /// check has to fail with those words: one that passes means the drift is fixed and the entry
@@ -698,10 +702,11 @@ const REST_NOT_READ: &[(&str, &str, &str)] = &[
 const REST_NOT_RECORDED_YET: &[(&str, &str, &str)] = &[(
     "GET__ag-ui_events",
     "/ag-ui/events",
-    "opengrok-server #348 contract agreed 2026-10-03, not recorded yet: the account's events \
-     stream, opened with the session's bearer and Last-Event-ID. Its refusals come with the \
-     server's own tests of the route, and its notes with the recorder addition for SSE notes \
-     (ACCOUNT_EVENTS_AHEAD).",
+    "shaped from opengrok-server branch account-events-stream @ 85ce00c (#348; account_events in \
+     crates/opengrok-server/src/agui/routes.rs), not recorded yet: the account's events stream, \
+     opened with the session's bearer and Last-Event-ID. Its refusals come with the server's \
+     own tests of the route once the owner records the branch, and its notes as \
+     ACCOUNT_EVENTS_AHEAD says.",
 )];
 
 /// Routes this app asks with this Mac's machine token (`local_exec.rs` `MachineCredential`)
@@ -753,10 +758,12 @@ struct Emits {
     /// Not the manifest's either: the `type` of each frame the recording keeps under `relay/`.
     #[serde(skip)]
     relay_types: Vec<String>,
-    /// The names of the account's events stream's notes the recording keeps, which is none yet:
-    /// they come with the recorder addition for SSE notes (opengrok-server #348), and the words
-    /// read ahead of it wait in [`WORDS_NOT_RECORDED_YET`] until then.
-    #[serde(skip)]
+    /// The names of the account's events stream's notes the server can send, which the manifest
+    /// lists under `emits.events` from the recording of opengrok-server's branch
+    /// account-events-stream (its cb5447b) on, and this corpus's recording does not list yet: the
+    /// words read ahead of it wait in [`WORDS_NOT_RECORDED_YET`] until then, and leave it the day
+    /// the manifest names them.
+    #[serde(default, rename = "events")]
     account_events: Vec<String>,
 }
 
@@ -6139,9 +6146,9 @@ const FRAMES_READ_AHEAD: &[(Slot, &str, fn() -> Vec<(Value, bool)>)] = &[
     (Slot::AccountEvent, "reset", reset_ahead),
 ];
 
-/// A note off the account's events stream as the agreed contract frames it (opengrok-server #348,
-/// contract agreed 2026-10-03, not recorded yet): its `id:`, its `event:` name and its one line of
-/// `data:`, held here as `{"id", "event", "data"}` until the recording keeps the server's own.
+/// A note off the account's events stream as opengrok-server's branch account-events-stream @
+/// 85ce00c frames it (#348, not recorded yet): its `id:`, its `event:` name and its one line of
+/// `data:`, held as `{"id", "event", "data"}`, the shape the branch's recorder keeps a block in.
 fn account_event(id: u64, name: &str, data: Value) -> Value {
     serde_json::json!({"id": id.to_string(), "event": name, "data": data})
 }
@@ -6182,6 +6189,8 @@ fn thread_changed_ahead() -> Vec<(Value, bool)> {
     ]
 }
 
+/// A routine's run says the routine and its cause in the history's words; a monitor's, or a run
+/// nothing fired, names no routine.
 fn run_started_ahead() -> Vec<(Value, bool)> {
     use serde_json::json;
     vec![
@@ -6190,7 +6199,7 @@ fn run_started_ahead() -> Vec<(Value, bool)> {
                 3,
                 "run.started",
                 json!({"runId": "run_1", "threadId": "sched_1", "coworkerId": "cw_1",
-                       "routineId": "sched_1", "cause": "schedule"}),
+                       "routineId": "sched_1", "cause": "clock"}),
             ),
             true,
         ),
@@ -6205,6 +6214,15 @@ fn run_started_ahead() -> Vec<(Value, bool)> {
         ),
         (
             account_event(
+                16,
+                "run.started",
+                json!({"runId": "run_3", "threadId": "mon_1", "coworkerId": "cw_1",
+                       "cause": "event"}),
+            ),
+            true,
+        ),
+        (
+            account_event(
                 5,
                 "run.started",
                 json!({"threadId": "cw_1", "coworkerId": "cw_1", "cause": "chat"}),
@@ -6214,6 +6232,7 @@ fn run_started_ahead() -> Vec<(Value, bool)> {
     ]
 }
 
+/// A run's end in the history's words: `ok`, or `error`, which a stop is too.
 fn run_finished_ahead() -> Vec<(Value, bool)> {
     use serde_json::json;
     vec![
@@ -6222,7 +6241,16 @@ fn run_finished_ahead() -> Vec<(Value, bool)> {
                 6,
                 "run.finished",
                 json!({"runId": "run_1", "threadId": "sched_1", "coworkerId": "cw_1",
-                       "routineId": "sched_1", "state": "finished"}),
+                       "routineId": "sched_1", "state": "ok"}),
+            ),
+            true,
+        ),
+        (
+            account_event(
+                17,
+                "run.finished",
+                json!({"runId": "run_2", "threadId": "cw_1", "coworkerId": "cw_1",
+                       "state": "error"}),
             ),
             true,
         ),
@@ -6230,7 +6258,7 @@ fn run_finished_ahead() -> Vec<(Value, bool)> {
             account_event(
                 7,
                 "run.finished",
-                json!({"runId": "run_1", "coworkerId": "cw_1", "state": "failed"}),
+                json!({"runId": "run_1", "coworkerId": "cw_1", "state": "error"}),
             ),
             false,
         ),
@@ -6268,9 +6296,9 @@ fn reset_ahead() -> Vec<(Value, bool)> {
 }
 
 /// A note off the account's events stream, read by the stream's own reader (`AccountEvent::read`)
-/// as the note it is, with every id the window goes on to read again by as sent: the agreed
-/// contract's words (opengrok-server #348, contract agreed 2026-10-03, not recorded yet), stated
-/// here case by case.
+/// as the note it is, with every id the window goes on to read again by as sent: the words of
+/// opengrok-server's branch account-events-stream @ 85ce00c (#348, not recorded yet), stated here
+/// case by case.
 fn account_event_frame(frame: &Value) -> Check {
     let name = str_at(frame, "event");
     let data = &frame["data"];

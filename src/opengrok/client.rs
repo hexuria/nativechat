@@ -2677,9 +2677,10 @@ impl OpenGrokClient {
     }
 
     /// `GET /ag-ui/events`: the account's events stream, answered with the response as it opens,
-    /// for [`super::events`] to read its notes off as they come (opengrok-server #348, contract
-    /// agreed 2026-10-03, not recorded yet). It goes with the session's bearer, as every account
-    /// route does, and the server takes the account from it. `last_event_id` is the id of the
+    /// for [`super::events`] to read its notes off as they come (opengrok-server #348, shaped from
+    /// its branch account-events-stream @ 85ce00c: `account_events` in
+    /// `crates/opengrok-server/src/agui/routes.rs`; not recorded yet). It goes with the session's
+    /// bearer, which is the one thing the route takes the account from. `last_event_id` is the id of the
     /// last note a stream carried, which the server replays after; one it cannot replay from is
     /// answered with `reset` first.
     ///

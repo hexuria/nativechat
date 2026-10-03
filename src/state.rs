@@ -29496,7 +29496,7 @@ mod tests {
                 thread_id: "cw_1".into(),
                 coworker_id: "cw_1".into(),
                 routine_id: None,
-                state: "finished".into(),
+                state: "ok".into(),
             },
         );
         wait_for(
@@ -29606,7 +29606,7 @@ mod tests {
                     thread_id: "cw_1".into(),
                     coworker_id: "cw_1".into(),
                     routine_id: None,
-                    state: "finished".into(),
+                    state: "ok".into(),
                 }
             } else {
                 AccountEvent::RunStarted {
@@ -29705,6 +29705,98 @@ mod tests {
         let_it_settle(cx);
     }
 
+    /// A run parked on a card has not ended, and the server sends only `thread.changed` for it,
+    /// never `run.finished`. Nothing waits for one: a read the stream asked for while the window's
+    /// own turn streamed, or while it followed a run, goes when that stream or that follow ends
+    /// with the run parked.
+    #[gpui_kit::test]
+    fn a_run_parked_on_a_card_lets_the_waiting_read_go_with_no_run_finished(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        let runtime = a_runtime_for_the_relay(cx);
+        let _enter = runtime.enter();
+        let server = runtime.block_on(wiremock::MockServer::start());
+        let card = |run: &str| {
+            json!({"type": "CUSTOM", "name": "run-awaiting-approval", "threadId": "cw_1",
+                   "runId": run, "callId": format!("call-{run}"), "tool": "delete_routine",
+                   "arguments": {"routine": "sched_1"}, "reason": "policy-approval",
+                   "why": "Delete the routine \"Standup\"? It stops for good.",
+                   "summary": "Delete the routine sched_1"})
+        };
+        let parked: String = [
+            json!({"type": "RUN_STARTED", "threadId": "cw_1", "runId": "run_own"}),
+            card("run_own"),
+        ]
+        .iter()
+        .map(|frame| format!("data: {frame}\n\n"))
+        .collect();
+        let replay = |status: &str| {
+            let mut events = vec![json!({"type": "RUN_STARTED", "runId": "run_park"})];
+            if status == "awaiting-approval" {
+                events.push(card("run_park"));
+            }
+            json!({"runId": "run_park", "status": status,
+                   "startedAtMs": 1_790_000_000_000_i64, "events": events})
+        };
+        runtime.block_on(async {
+            wiremock::Mock::given(wiremock::matchers::method("POST"))
+                .and(wiremock::matchers::path("/ag-ui"))
+                .respond_with(
+                    wiremock::ResponseTemplate::new(200)
+                        .insert_header("content-type", "text/event-stream")
+                        .set_body_string(parked)
+                        .set_delay(Duration::from_millis(500)),
+                )
+                .mount(&server)
+                .await;
+            wiremock::Mock::given(wiremock::matchers::method("GET"))
+                .and(wiremock::matchers::path("/ag-ui/runs/run_park"))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(replay("running")))
+                .up_to_n_times(2)
+                .mount(&server)
+                .await;
+            wiremock::Mock::given(wiremock::matchers::method("GET"))
+                .and(wiremock::matchers::path("/ag-ui/runs/run_park"))
+                .respond_with(
+                    wiremock::ResponseTemplate::new(200).set_body_json(replay("awaiting-approval")),
+                )
+                .mount(&server)
+                .await;
+            thread_reads(
+                &server,
+                "cw_1",
+                adas_thread_with_a_new_turn(),
+                Duration::ZERO,
+            )
+            .await;
+        });
+        let app = ada_open(cx, &runtime, &server);
+        app.update(cx, |state, cx| {
+            state.send_message("Delete my standup".into(), cx)
+        });
+        hear(&app, cx, thread_changed("cw_1"));
+        let_it_settle(cx);
+        assert_eq!(asked_for(&runtime, &server, "/ag-ui/threads/cw_1"), 0);
+        wait_for(cx, "the turn parks, and the thread is read", |cx| {
+            asked_for(&runtime, &server, "/ag-ui/threads/cw_1") == 1 && rereads_landed(&app, cx)
+        });
+
+        app.update(cx, |state, cx| {
+            state.follow_run("run_park".into(), Some("cw_1".into()), cx)
+        });
+        hear(&app, cx, thread_changed("cw_1"));
+        let_it_settle(cx);
+        assert_eq!(
+            asked_for(&runtime, &server, "/ag-ui/threads/cw_1"),
+            1,
+            "nothing is read while the run is followed"
+        );
+        wait_for(cx, "the followed run parks, and the thread is read", |cx| {
+            asked_for(&runtime, &server, "/ag-ui/threads/cw_1") == 2 && rereads_landed(&app, cx)
+        });
+        let_it_settle(cx);
+    }
+
     /// A turn the open thread still holds, whose run nothing follows any more (its follow gave up
     /// on a long run), is brought to its end when the stream says the run ended, the way coming
     /// back to the thread brings it: from the run's own replay.
@@ -29752,7 +29844,7 @@ mod tests {
                 thread_id: "cw_1".into(),
                 coworker_id: "cw_1".into(),
                 routine_id: None,
-                state: "finished".into(),
+                state: "ok".into(),
             },
         );
         wait_for(cx, "the held turn reads as it ended", |cx| {
@@ -29811,7 +29903,7 @@ mod tests {
                     thread_id,
                     coworker_id,
                     routine_id,
-                    state: "finished".into(),
+                    state: "ok".into(),
                 }
             } else {
                 AccountEvent::RunStarted {
