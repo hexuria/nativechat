@@ -1635,7 +1635,8 @@ impl ComputerControls {
 fn recipes_icon(app: Entity<AppState>, theme: &gpui_kit::component::Theme) -> impl IntoElement {
     let color = theme.muted_foreground;
     div()
-        .id("computer-recipes")
+        .id(crate::components::monitor_modal::RECIPES)
+        .debug_selector(|| "computer-recipes".into())
         .size(px(28.))
         .rounded(px(8.))
         .flex()
@@ -1909,9 +1910,9 @@ fn screen_tile(
         })
 }
 
-/// Update / Reset next to this bot's screen. Route traffic for a dedicated
-/// provisioned box is the header icon (`icons/route-traffic.svg`, analogue of
-/// SF Symbol arrow.triangle.swap). Status copy is a tooltip on download.
+/// Update / Reset next to this bot's screen. Route traffic for any provisioned
+/// box, shared or the bot's own, is the header icon (`icons/route-traffic.svg`,
+/// analogue of SF Symbol arrow.triangle.swap). Status copy is a tooltip on download.
 /// `computer-update` / `computer-reset` stay the remasure ids.
 fn box_chrome(
     controls: &ComputerControls,
@@ -1933,12 +1934,9 @@ fn box_chrome(
     };
     let update_app = app.clone();
     let reset_app = app.clone();
-    let show_route = app.read(cx).show_route_traffic_on_bot_pane();
-    let network_policy = app
-        .read(cx)
-        .show_egress_policy_on_bot_pane()
-        .then(|| app.read(cx).egress_policy())
-        .flatten();
+    let network_policy = app.read(cx).egress_policy();
+    let plugins_app = app.clone();
+    let tools_app = app.clone();
     h_flex()
         .id("computer-box-chrome")
         .w_full()
@@ -1949,15 +1947,41 @@ fn box_chrome(
             h_flex()
                 .items_center()
                 .gap(px(2.))
-                .when(show_route, |this| {
-                    this.child(route_traffic_icon(app.clone(), theme, cx))
-                })
-                .when_some(network_policy, |this, current| {
-                    this.child(network_policy_icon(app.clone(), current, theme))
-                })
-                // A task is taught on this screen, so the page that keeps those tasks belongs
-                // next to it: the cake is the way in from where a recipe is born and used.
-                .child(recipes_icon(app.clone(), theme)),
+                .child(recipes_icon(app.clone(), theme))
+                .child(
+                    icon_btn_enabled(
+                        crate::components::monitor_modal::PLUGINS,
+                        "icons/plugins.svg",
+                        app.read(cx).active_coworker_id.is_some(),
+                        move |cx| {
+                            plugins_app.update(cx, |state, cx| {
+                                state.open_monitor_modal(
+                                    crate::components::monitor_modal::MonitorKind::Plugins,
+                                    cx,
+                                )
+                            });
+                        },
+                    )
+                    .tooltip(|window, cx| Tooltip::new("Plugins for this Bot").build(window, cx)),
+                )
+                .child(
+                    icon_btn_enabled(
+                        crate::components::monitor_modal::TOOLS,
+                        "icons/wrench.svg",
+                        app.read(cx).active_coworker_id.is_some(),
+                        move |cx| {
+                            tools_app.update(cx, |state, cx| {
+                                state.open_monitor_modal(
+                                    crate::components::monitor_modal::MonitorKind::Tools,
+                                    cx,
+                                )
+                            });
+                        },
+                    )
+                    .tooltip(|window, cx| Tooltip::new("Tools for this Bot").build(window, cx)),
+                )
+                .child(route_traffic_icon(app.clone(), theme, cx))
+                .child(network_policy_icon(app.clone(), network_policy, theme)),
         )
         .child(
             h_flex()
@@ -1988,32 +2012,58 @@ fn box_chrome(
         )
 }
 
+/// What the reroute icon says on hover. It is the host-wide switch (`PUT /ag-ui/host-settings`
+/// `egressTunnelEnabled`) and not this computer's, so it says that it applies to all the person's
+/// computers; the network rule beside it is the one that is this computer's own.
+pub(crate) fn reroute_tip(routing: bool) -> &'static str {
+    if routing {
+        "Routing traffic through this desktop for all your computers. New connections go out through it. Click to stop."
+    } else {
+        "Traffic goes out on its own. Click to route web traffic from all your computers through this desktop instead."
+    }
+}
+
+/// What the network rule icon says on hover: this computer's answer, and that it is only this
+/// computer's (`PUT /coworkers/{id}/computer/egress-policy`).
+pub(crate) fn network_rule_tip(current: LocalExecMode) -> String {
+    format!(
+        "Use your network from this computer: {}. Click to change. Applies to this computer only.",
+        current.label()
+    )
+}
+
 /// The shield beside Route traffic: how this bot's own computer may use the person's network.
 /// Opens the dialog that picks it; the badge is tinted when the answer is not "ask".
 fn network_policy_icon(
     app: Entity<AppState>,
-    current: LocalExecMode,
+    current: Option<LocalExecMode>,
     theme: &gpui_kit::component::Theme,
 ) -> impl IntoElement {
     let color = match current {
-        LocalExecMode::Ask => theme.muted_foreground,
-        LocalExecMode::Always => theme.primary,
-        LocalExecMode::Never => theme.danger,
+        None | Some(LocalExecMode::Ask) => theme.muted_foreground,
+        Some(LocalExecMode::Always) => theme.primary,
+        Some(LocalExecMode::Never) => theme.danger,
     };
-    let tip = format!("Use your network: {}. Click to change.", current.label());
+    let tip = current
+        .map(network_rule_tip)
+        .unwrap_or_else(|| "This computer has no network rule from the server yet.".into());
     div()
         .id("network-policy")
+        .debug_selector(|| "network-policy".into())
         .size(px(28.))
         .rounded(px(8.))
         .flex()
         .items_center()
         .justify_center()
-        .cursor_pointer()
+        .when(current.is_some(), |this| this.cursor_pointer())
+        .when(current.is_none(), |this| this.opacity(0.5))
         .hover(|s| s.bg(rgb(0x777777).opacity(0.2)))
         .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
         .on_mouse_down(MouseButton::Left, {
             move |_, _, cx| {
-                app.update(cx, |state, cx| state.open_network_policy(cx));
+                if current.is_some() {
+                    app.update(cx, |state, cx| state.open_network_policy(cx));
+                }
             }
         })
         .child(
@@ -2037,13 +2087,10 @@ fn route_traffic_icon(
     } else {
         ("icons/globe.svg", theme.muted_foreground)
     };
-    let tip = if enabled {
-        "Routing traffic through this computer. New connections go out through this desktop. Click to stop."
-    } else {
-        "Traffic goes out on its own. Click to route this Bot's computer's web traffic through this desktop instead."
-    };
+    let tip = reroute_tip(enabled);
     div()
         .id("route-traffic-this-computer")
+        .debug_selector(|| "route-traffic-this-computer".into())
         .size(px(28.))
         .rounded(px(8.))
         .flex()
@@ -2175,6 +2222,7 @@ fn icon_btn_enabled(
 ) -> Stateful<Div> {
     div()
         .id(id)
+        .debug_selector(move || id.into())
         .size(px(28.))
         .rounded(px(8.))
         .flex()
@@ -2803,6 +2851,118 @@ mod tests {
         let controls = ComputerControls::from_state(&state);
         assert_eq!(controls.no_computer, None);
         assert!(controls.present);
+    }
+
+    /// The open bot, whose computer is shared with the person's other bots (and so is theirs, not
+    /// the bot's alone) and has an egress tunnel and a network rule, in the Computer pane's
+    /// overview.
+    fn shared_computer_open() -> AppState {
+        let mut state = AppState::new();
+        state.coworkers = vec![
+            serde_json::from_value(serde_json::json!({ "id": "cw_1", "name": "Ada" }))
+                .expect("a coworker"),
+        ];
+        state.active_coworker_id = Some("cw_1".into());
+        state.coworker_computer = Some(
+            serde_json::from_value(serde_json::json!({
+                "agentId": "cw_1",
+                "state": "running",
+                "boxId": "box_1",
+                "shareScope": "user",
+                "egressPolicy": "ask",
+                "egress_tunnel": { "ready": true }
+            }))
+            .expect("a computer"),
+        );
+        state.right_pane = crate::state::RightPane::Computer;
+        state
+    }
+
+    /// The computer's icons, as the row draws them, by id.
+    fn icon(
+        cx: &mut gpui_kit::VisualTestContext,
+        id: &'static str,
+    ) -> Option<gpui_kit::Bounds<gpui_kit::Pixels>> {
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.debug_bounds(id)
+    }
+
+    /// The agent monitor's row has the reroute and the network rule for every computer, whoever it
+    /// is shared with, and not only for a bot's own (R-A, hexuria/nativechat#175).
+    #[gpui_kit::test]
+    fn a_shared_computer_has_the_reroute_and_the_network_rule_in_the_monitors_row(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        use gpui_kit::AppContext as _;
+        cx.update(gpui_kit::init);
+        let (_, cx) = cx.add_window_view(|window, cx| {
+            let state = cx.new(|_| shared_computer_open());
+            super::ComputerPane::new(window, state, cx)
+        });
+        let route = icon(cx, "route-traffic-this-computer").expect("the reroute is drawn");
+        let rule = icon(cx, "network-policy").expect("the network rule is drawn");
+        let update = icon(cx, "computer-update").expect("update is drawn");
+        assert!(
+            route.right() <= rule.left() && rule.right() <= update.left(),
+            "reroute, network rule, then update: {route:?} {rule:?} {update:?}"
+        );
+    }
+
+    #[gpui_kit::test]
+    fn the_monitor_row_opens_recipes_plugins_and_tools_before_its_computer_controls(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        use gpui_kit::AppContext as _;
+        cx.update(gpui_kit::init);
+        let (_, cx) = cx.add_window_view(|window, cx| {
+            let state = cx.new(|_| shared_computer_open());
+            super::ComputerPane::new(window, state, cx)
+        });
+        let ids = [
+            "computer-recipes",
+            "computer-plugins",
+            "computer-tools",
+            "route-traffic-this-computer",
+            "network-policy",
+            "computer-update",
+            "computer-reset",
+        ];
+        let bounds: Vec<_> = ids
+            .into_iter()
+            .map(|id| icon(cx, id).unwrap_or_else(|| panic!("{id} is drawn")))
+            .collect();
+        for pair in bounds.windows(2) {
+            assert!(
+                pair[0].right() <= pair[1].left(),
+                "the icons follow the approved order: {pair:?}"
+            );
+        }
+    }
+
+    /// The reroute is the host-wide switch, so it says it applies to all the person's computers
+    /// whichever way it is, while the network rule says it is this computer's alone.
+    #[test]
+    fn the_reroute_says_it_applies_to_all_your_computers_and_the_rule_says_it_is_this_ones() {
+        use crate::opengrok::LocalExecMode;
+        for routing in [true, false] {
+            assert!(
+                super::reroute_tip(routing).contains("all your computers"),
+                "{}",
+                super::reroute_tip(routing)
+            );
+        }
+        for mode in [
+            LocalExecMode::Ask,
+            LocalExecMode::Always,
+            LocalExecMode::Never,
+        ] {
+            let tip = super::network_rule_tip(mode);
+            assert!(
+                tip.contains(mode.label()) && tip.contains("this computer only"),
+                "{tip}"
+            );
+            assert!(!tip.contains("all your computers"), "{tip}");
+        }
     }
 
     /// The open bot, with one routine the server has, open in the Computer pane.

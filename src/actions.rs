@@ -71,7 +71,9 @@ actions!(
         /// The question Delete asks about a routine: Escape answers Cancel.
         CancelRoutineDelete,
         /// The Usage modal: Escape shuts it.
-        CloseUsageModal
+        CloseUsageModal,
+        /// Tools and Plugins opened from the Computer pane: Escape shuts either.
+        CloseMonitorModal
     ]
 );
 

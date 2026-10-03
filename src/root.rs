@@ -28,6 +28,7 @@ pub struct RootView {
     /// The Usage modal, for the same reason: it is over the sidebar, the chat and the settings
     /// pane alike.
     usage_modal: Entity<crate::components::usage_modal::UsageModalView>,
+    monitor_modal: Entity<crate::components::monitor_modal::MonitorModalView>,
     circular_viz: Option<Entity<CircularVoiceViz>>,
     pub focus_handle: FocusHandle,
     show_fps: bool,
@@ -62,6 +63,8 @@ impl RootView {
         let usage_modal =
             cx.new(|cx| crate::components::usage_modal::UsageModalView::new(state.clone(), cx));
         let focus_handle = cx.focus_handle();
+        let monitor_modal =
+            cx.new(|cx| crate::components::monitor_modal::MonitorModalView::new(state.clone(), cx));
         // This is the window the pages are drawn in; a coworker's screen window hands its
         // "Recipes" over to it rather than drawing a page of its own.
         state.update(cx, |state, cx| {
@@ -93,6 +96,7 @@ impl RootView {
             lightbox,
             routine_delete,
             usage_modal,
+            monitor_modal,
             circular_viz: None,
             focus_handle,
             // Off: gpui-fps default headline is MAX = 1/mean_draw (how fast a
@@ -319,6 +323,7 @@ impl Render for RootView {
         };
         let routine_delete_open = self.state.read(cx).routine_delete_prompt.is_some();
         let usage_modal_open = self.state.read(cx).usage_modal.is_some();
+        let monitor_modal_open = self.state.read(cx).monitor_modal.is_some();
         if signed_in && !self.was_signed_in {
             click_away(window, &self.focus_handle, cx);
         }
@@ -608,6 +613,9 @@ impl Render for RootView {
             })
             .when(usage_modal_open, |this| {
                 this.child(self.usage_modal.clone())
+            })
+            .when(monitor_modal_open, |this| {
+                this.child(self.monitor_modal.clone())
             })
             // Root overlay layers
             .children(Root::render_dialog_layer(window, cx))

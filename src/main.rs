@@ -148,6 +148,11 @@ fn main() {
                 KeyBinding::new("escape", CancelRoutineDelete, Some("RoutineDelete")),
                 // And so does the Usage modal.
                 KeyBinding::new("escape", CloseUsageModal, Some("UsageModal")),
+                KeyBinding::new(
+                    "escape",
+                    nativechat::actions::CloseMonitorModal,
+                    Some("MonitorModal"),
+                ),
                 KeyBinding::new("tab", PaletteNextTab, Some("CommandPalette")),
                 KeyBinding::new("shift-tab", PalettePrevTab, Some("CommandPalette")),
                 KeyBinding::new("down", PaletteSelectNext, Some("CommandPalette")),

@@ -4915,11 +4915,17 @@ pub enum AppSettingsTab {
     Skills,
 }
 
-/// Where Route traffic chrome belongs for the active bot's box.
+/// Where Settings also shows routing controls for the active Bot's box. The monitor keeps
+/// its icons for every computer (#175), independently of this Settings choice.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RouteTrafficSurface {
+    /// No tunnel on this box: Settings offers no routing controls for it.
     Hidden,
+    /// The agent monitor's row alone: the computer is the bot's own, or its group's.
     BotPane,
+    /// The agent monitor's row, and Settings → Computer as well: the computer is the person's or
+    /// their organization's, shared among bots, so its controls are the person's before they are
+    /// one bot's.
     UserSettings,
 }
 
@@ -5466,6 +5472,9 @@ pub struct AppState {
     pub agent_tools_open: bool,
     /// The Usage modal, while it is open ([`UsageModal`]), which the Usage card's Show opens.
     pub usage_modal: Option<UsageModal>,
+    /// A monitor modal belongs to the Bot that opened it and closes on a Bot change.
+    pub monitor_modal: Option<crate::components::monitor_modal::MonitorModal>,
+    monitor_generation: u64,
     /// Counts the reads the Usage modal asked for, so only the newest answer is shown: a chip
     /// pressed twice, or two in a row, can come back out of order.
     usage_modal_generation: u64,
@@ -6149,6 +6158,8 @@ impl AppState {
             usage_generation: 0,
             agent_tools_open: false,
             usage_modal: None,
+            monitor_modal: None,
+            monitor_generation: 0,
             usage_modal_generation: 0,
             tools_generation: 0,
             connections: AccountConnections::default(),
@@ -6779,9 +6790,9 @@ impl AppState {
         self.host_intends_egress_tunnel() && self.box_egress_tunnel_ready()
     }
 
-    /// Dedicated or group → the Computer pane header (a group's computer is the group's
-    /// own, like a bot's). User or org (or unknown + shared `boxId`) → Settings → Computer
-    /// (an org's is set by its admin; members see it). Unprovisioned → hide.
+    /// Dedicated or group → the agent monitor's row alone (a group's computer is the group's
+    /// own, like a bot's). User or org (or unknown + shared `boxId`) → Settings → Computer as
+    /// well (an org's is set by its admin; members see it). Unprovisioned → hide.
     pub fn route_traffic_surface(&self) -> RouteTrafficSurface {
         if !self.box_egress_provisioned() {
             return RouteTrafficSurface::Hidden;
@@ -6802,8 +6813,10 @@ impl AppState {
         }
     }
 
+    /// The monitor keeps the host-wide reroute visible for every Bot, even while its computer
+    /// has no tunnel. Settings still depends on that computer's provisioning and sharing.
     pub fn show_route_traffic_on_bot_pane(&self) -> bool {
-        self.route_traffic_surface() == RouteTrafficSurface::BotPane
+        self.active_coworker_id.is_some()
     }
 
     pub fn show_route_traffic_in_user_settings(&self) -> bool {
@@ -6827,9 +6840,10 @@ impl AppState {
             == Some(BoxShareScope::Org)
     }
 
-    /// The choice sits where Route traffic sits, and only when there is one to show.
+    /// The network rule is in the row wherever the reroute is, and only when there is one to
+    /// show. It stays this computer's own (`PUT /coworkers/{id}/computer/egress-policy`).
     pub fn show_egress_policy_on_bot_pane(&self) -> bool {
-        self.show_route_traffic_on_bot_pane() && self.egress_policy().is_some()
+        self.active_coworker_id.is_some() && self.egress_policy().is_some()
     }
 
     pub fn show_egress_policy_in_user_settings(&self) -> bool {
@@ -7324,6 +7338,8 @@ impl AppState {
     /// the state, apart from closing the pane and the recipe. Apart so that a test runs what
     /// `logout` runs rather than a copy of it, which no test context here can call whole.
     fn forget_account(&mut self) {
+        self.monitor_modal = None;
+        self.monitor_generation += 1;
         self.account = None;
         self.auth_status = AuthStatus::SignedOut;
         self.saved_login_use.clear();
@@ -8441,6 +8457,130 @@ impl AppState {
     pub fn toggle_agent_tools(&mut self, cx: &mut Context<Self>) {
         self.agent_tools_open = !self.agent_tools_open;
         cx.notify();
+    }
+
+    /// The monitor's Tools and Plugins are read afresh for the Bot that opened them.
+    pub fn open_monitor_modal(
+        &mut self,
+        kind: crate::components::monitor_modal::MonitorKind,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::components::monitor_modal::{MonitorKind, MonitorModal};
+        let Some(coworker_id) = self.active_coworker_id.clone() else {
+            return;
+        };
+        self.monitor_generation += 1;
+        self.monitor_modal = Some(MonitorModal::new(coworker_id, kind));
+        match kind {
+            MonitorKind::Tools => {
+                self.agent_tools_open = true;
+                self.refresh_coworker_tools(cx);
+                self.refresh_coworker_ceiling(cx);
+            }
+            MonitorKind::Plugins => {
+                self.agent_skills_open = true;
+                self.refresh_connections(cx);
+                self.refresh_coworker_skills(cx);
+            }
+        }
+        cx.notify();
+    }
+
+    pub fn close_monitor_modal(&mut self, cx: &mut Context<Self>) {
+        self.monitor_modal = None;
+        self.monitor_generation += 1;
+        cx.notify();
+    }
+
+    pub fn select_monitor_plugin(
+        &mut self,
+        plugin: Option<crate::components::monitor_modal::PluginSelection>,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::components::monitor_modal::{MonitorKind, plugin_exists};
+        if plugin
+            .as_ref()
+            .is_some_and(|plugin| !plugin_exists(self, plugin))
+        {
+            return;
+        }
+        let Some(modal) = self.monitor_modal.as_mut() else {
+            return;
+        };
+        if modal.kind != MonitorKind::Plugins || modal.removing {
+            return;
+        }
+        modal.selected = plugin;
+        modal.confirming = false;
+        modal.error = None;
+        cx.notify();
+    }
+
+    pub fn ask_monitor_remove(&mut self, confirm: bool, cx: &mut Context<Self>) {
+        let Some(modal) = self.monitor_modal.as_mut() else {
+            return;
+        };
+        if modal.selected.is_none() || modal.removing {
+            return;
+        }
+        modal.confirming = confirm;
+        modal.error = None;
+        cx.notify();
+    }
+
+    /// Removing is account-wide, rather than detaching from this Bot. The confirmation says so.
+    pub fn remove_monitor_plugin(&mut self, cx: &mut Context<Self>) {
+        use crate::components::monitor_modal::{PluginSelection, plugin_exists};
+        let Some(modal) = self.monitor_modal.as_ref() else {
+            return;
+        };
+        if !modal.confirming || modal.removing {
+            return;
+        }
+        let Some(plugin) = modal.selected.clone() else {
+            return;
+        };
+        if !plugin_exists(self, &plugin) {
+            return;
+        }
+        if let PluginSelection::Connection(id) = plugin {
+            self.monitor_modal.as_mut().unwrap().confirming = false;
+            self.disconnect_connection(id, cx);
+            return;
+        }
+        let PluginSelection::Skill(id) = plugin else {
+            return;
+        };
+        let Some(client) = self.opengrok.clone() else {
+            return;
+        };
+        self.monitor_modal.as_mut().unwrap().removing = true;
+        let generation = self.monitor_generation;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let answer = client.delete_skill(&id).await;
+            let _ = this.update(cx, |state, cx| {
+                if state.monitor_generation != generation {
+                    return;
+                }
+                let Some(modal) = state.monitor_modal.as_mut() else {
+                    return;
+                };
+                modal.removing = false;
+                modal.confirming = false;
+                match answer {
+                    Ok(()) => {
+                        modal.selected = None;
+                        state.refresh_coworker_skills(cx);
+                        state.refresh_your_skills(cx);
+                        state.refresh_skills(cx);
+                    }
+                    Err(error) => modal.error = Some(error.message),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// Show, on the Usage card: the Usage modal opens over the window on the month, with what the
@@ -10026,7 +10166,10 @@ impl AppState {
         let waiting = self.connections.still_waiting(now);
         let showing = (self.is_app_settings_open
             && self.app_settings_tab == AppSettingsTab::Connections)
-            || self.right_pane == RightPane::Settings;
+            || self.right_pane == RightPane::Settings
+            || self.monitor_modal.as_ref().is_some_and(|modal| {
+                modal.kind == crate::components::monitor_modal::MonitorKind::Plugins
+            });
         waiting || showing
     }
 
@@ -14467,6 +14610,8 @@ impl AppState {
         self.agent_tools_open = false;
         self.agent_skills_open = false;
         self.usage_modal = None;
+        self.monitor_modal = None;
+        self.monitor_generation += 1;
         if self.right_pane == RightPane::Settings {
             self.refresh_coworker_tools(cx);
             self.refresh_coworker_ceiling(cx);
@@ -33244,14 +33389,20 @@ mod tests {
             "egressPolicy": "never"
         })));
         assert_eq!(state.egress_policy(), Some(LocalExecMode::Never));
-        assert!(!state.show_egress_policy_on_bot_pane());
-        assert!(state.show_egress_policy_in_user_settings());
+        assert!(
+            state.show_egress_policy_on_bot_pane(),
+            "the agent monitor has the network rule for every computer, shared or not (#175)"
+        );
+        assert!(
+            state.show_egress_policy_in_user_settings(),
+            "and Settings → Computer keeps its own"
+        );
 
         state.coworker_computer = Some(computer(serde_json::json!({
             "shareScope": "org",
             "egressPolicy": "bypass"
         })));
-        assert!(!state.show_egress_policy_on_bot_pane());
+        assert!(state.show_egress_policy_on_bot_pane());
         assert!(state.show_egress_policy_in_user_settings());
         state.coworker_computer = Some(computer(serde_json::json!({
             "shareScope": "group",
@@ -33298,8 +33449,14 @@ mod tests {
         state.coworker_computer = Some(computer(serde_json::json!({
             "shareScope": "user"
         })));
-        assert!(!state.show_route_traffic_on_bot_pane());
-        assert!(state.show_route_traffic_in_user_settings());
+        assert!(
+            state.show_route_traffic_on_bot_pane(),
+            "the agent monitor has the reroute for every computer, whoever it is shared with (#175)"
+        );
+        assert!(
+            state.show_route_traffic_in_user_settings(),
+            "and Settings → Computer keeps its own"
+        );
 
         state.coworker_computer = Some(computer(serde_json::json!({
             "shareScope": "group",
@@ -33319,15 +33476,31 @@ mod tests {
             RouteTrafficSurface::UserSettings,
             "an org's computer is shared: Settings → Computer"
         );
+        assert!(
+            state.show_route_traffic_on_bot_pane(),
+            "and the agent monitor's, as every computer's is"
+        );
         assert!(state.computer_is_org_shared());
+
+        state.coworker_computer = Some(computer(serde_json::json!({
+            "shareScope": "user",
+            "egress_tunnel": { "ready": false }
+        })));
+        assert!(
+            state.show_route_traffic_on_bot_pane() && !state.show_route_traffic_in_user_settings(),
+            "the monitor keeps the host-wide reroute even while this box has no tunnel"
+        );
 
         state.coworker_computer = Some(computer(serde_json::json!({})));
         state.coworkers = vec![coworker("cw_1", "box_1"), coworker("cw_2", "box_1")];
         assert!(
             state.show_route_traffic_in_user_settings(),
-            "missing shareScope + shared boxId is user-level Settings, not both panes"
+            "missing shareScope + shared boxId is user-level Settings too"
         );
-        assert!(!state.show_route_traffic_on_bot_pane());
+        assert!(
+            state.show_route_traffic_on_bot_pane(),
+            "and still the agent monitor's"
+        );
 
         state.coworkers = vec![coworker("cw_1", "box_1"), coworker("cw_2", "box_2")];
         assert!(
@@ -43276,5 +43449,165 @@ mod tests {
                 .expect("asked"),
             "no row, nothing written"
         );
+    }
+    #[cfg(feature = "agent")]
+    #[gpui_kit::test]
+    fn monitor_controls_send_the_servers_ceiling_loans_skills_and_removal_requests(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        use crate::agent::{Command, NativeChatHost};
+        use crate::components::monitor_modal::{MonitorKind, PluginSelection};
+        use gpui_agent::AgentHost as _;
+        use gpui_agent::protocol::Op;
+        use gpui_kit::AppContext as _;
+        use wiremock::matchers::{body_json, method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        let runtime = a_runtime_for_the_relay(cx);
+        let _enter = runtime.enter();
+        let server = runtime.block_on(wiremock::MockServer::start());
+        let ceiling =
+            |on| json!({"tools":[{"name":"shell", "kind":"builtin", "enabled":on}], "version":1});
+        let skills = |on| {
+            json!({"skills":[
+            {"id":"sk_1", "name":"draft", "scope":"mine", "attached":on, "enabled":true},
+            {"id":"sk_org", "name":"organization", "scope":"org", "attached":true, "enabled":true}], "version":1})
+        };
+        let connection = json!({"id":"conn_1", "connector":"gmail", "owner":{"scope":"user", "id":"acct_1"},
+            "label":"you@example.com", "loans":["cw_1"], "updatedAtMs":1});
+        runtime.block_on(async {
+            for (at, body) in [
+                ("/coworkers/cw_1/tools", json!({"tools":[]})),
+                ("/coworkers/cw_1/ceiling", ceiling(true)),
+                ("/coworkers/cw_1/skills", skills(false)),
+                ("/connections", json!([connection.clone()])),
+                ("/connectors", json!([{"name":"gmail", "label":"Gmail"}])),
+            ] {
+                Mock::given(method("GET"))
+                    .and(path(at))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(body))
+                    .mount(&server)
+                    .await;
+            }
+            Mock::given(method("PUT"))
+                .and(path("/coworkers/cw_1/ceiling"))
+                .and(body_json(json!({"enabled":[], "version":1})))
+                .respond_with(ResponseTemplate::new(200).set_body_json(ceiling(false)))
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("PUT"))
+                .and(path("/coworkers/cw_1/skills"))
+                .and(body_json(
+                    json!({"attached":["sk_1", "sk_org"], "version":1}),
+                ))
+                .respond_with(ResponseTemplate::new(200).set_body_json(skills(true)))
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path("/connections/conn_1/revoke"))
+                .and(body_json(json!({"coworker_id":"cw_1"})))
+                .respond_with(ResponseTemplate::new(200).set_body_json(connection))
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("DELETE"))
+                .and(path("/skills/sk_1"))
+                .respond_with(
+                    ResponseTemplate::new(403).set_body_json(json!({"error":"keep this skill"})),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+        });
+        let mut state = crate::components::monitor_modal::tests::catalog();
+        state.opengrok = Some(OpenGrokClient::new(&server.uri()).unwrap());
+        state.right_pane = super::RightPane::Computer;
+        let app = cx.new(|_| state);
+        let click = |cx: &mut gpui_kit::TestAppContext, target: &str| {
+            let command = app.read_with(cx, |state, _| {
+                let mut host = NativeChatHost::from_app(state);
+                host.dispatch(&Op::click(target)).unwrap();
+                host.take_command().unwrap()
+            });
+            app.update(cx, |state, cx| command.apply(state, cx));
+        };
+        click(cx, "computer-tools");
+        wait_for(cx, "the monitor reads the ceiling", |cx| {
+            app.read_with(cx, |state, _| state.ceiling_reading.is_none())
+        });
+        click(cx, "agent-ceiling-switch-shell");
+        wait_for(cx, "the ceiling switch is answered", |cx| {
+            app.read_with(cx, |state, _| state.ceiling_switch.is_none())
+        });
+        click(cx, "monitor-modal-close");
+        click(cx, "computer-plugins");
+        wait_for(cx, "private skills are read", |cx| {
+            app.read_with(cx, |state, _| state.skills_reading.is_none())
+        });
+        click(cx, "agent-connection-lend-conn_1");
+        wait_for(cx, "the loan is answered", |cx| {
+            app.read_with(cx, |state, _| state.connections.changing.is_empty())
+        });
+        click(cx, "agent-skills-switch-sk_1");
+        wait_for(cx, "the skill switch is answered", |cx| {
+            app.read_with(cx, |state, _| state.skill_switch.is_none())
+        });
+        click(cx, "monitor-skill-detail-sk_1");
+        app.update(cx, |state, cx| {
+            Command::RemoveMonitorPlugin.apply(state, cx)
+        });
+        assert!(
+            !app.read_with(cx, |state, _| state
+                .monitor_modal
+                .as_ref()
+                .unwrap()
+                .removing),
+            "remove cannot skip confirmation"
+        );
+        click(cx, "monitor-plugin-remove");
+        click(cx, "monitor-plugin-remove-confirm");
+        wait_for(cx, "the refusal lands in the detail", |cx| {
+            app.read_with(cx, |state, _| {
+                state.monitor_modal.as_ref().unwrap().error.as_deref() == Some("keep this skill")
+            })
+        });
+        app.update(cx, |state, cx| {
+            state.open_monitor_modal(MonitorKind::Tools, cx)
+        });
+        assert!(app.read_with(cx, |state, _| {
+            state.monitor_modal.as_ref().unwrap().selected.is_none()
+        }));
+        app.update(cx, |state, cx| {
+            state.select_monitor_plugin(Some(PluginSelection::Skill("sk_1".into())), cx)
+        });
+        assert!(
+            app.read_with(cx, |state, _| state
+                .monitor_modal
+                .as_ref()
+                .unwrap()
+                .selected
+                .is_none()),
+            "a Tools modal cannot select plugins"
+        );
+        wait_for(
+            cx,
+            "all modal reads finish before the test runtime shuts down",
+            |cx| {
+                app.read_with(cx, |state, _| {
+                    state.ceiling_reading.is_none()
+                        && !matches!(
+                            state.coworker_tools,
+                            Some((_, crate::state::ToolList::Loading))
+                        )
+                })
+            },
+        );
+        app.update(cx, |state, _| state.forget_account());
+        assert!(
+            app.read_with(cx, |state, _| state.monitor_modal.is_none()),
+            "sign-out closes it"
+        );
+        runtime.block_on(server.verify());
     }
 }

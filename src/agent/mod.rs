@@ -180,7 +180,22 @@
 //! words as the pane shows them, value = the server's code for it, e.g. `provider_error`; a
 //! status that names a box has none, so `assert --exists false` is "a computer was given").
 //! Beside it, only then, `computer-get` (Get a computer: asks the server again; dead while an
-//! ask is with the server). `computer-update`, `computer-reset`.
+//! ask is with the server). The overview row is `computer-recipes`, `computer-plugins`,
+//! `computer-tools`, `route-traffic-this-computer`, `network-policy`, `computer-update`,
+//! `computer-reset`, in that order, for every computer whoever it is shared with (#175, R-A).
+//! `route-traffic-this-computer` (a switch: the host-wide reroute, `PUT /ag-ui/host-settings`, so it
+//! applies to all the person's computers) and `network-policy` (disabled until the server sends
+//! a rule; otherwise this computer's own rule, `PUT /coworkers/{id}/computer/egress-policy`, which opens the dialog that
+//! picks it, `network-policy-close` shutting it).
+//! Tools and Plugins open `monitor-modal`, shut by `monitor-modal-close` or Escape. Tools uses
+//! the existing `agent-ceiling-switch-{name}` controls. Plugins lists the person's connections
+//! (`agent-connection-lend-{id}`) and private skills (`agent-skills-switch-{id}`); each name opens
+//! `monitor-connection-detail-{id}` or `monitor-skill-detail-{id}`. The detail's fields are
+//! `monitor-plugin-source`, `monitor-plugin-transport`, `monitor-plugin-url`, `monitor-plugin-tools`
+//! and `monitor-plugin-accounts`. `monitor-plugin-back` returns to Installed. Remove asks first:
+//! `monitor-plugin-remove`, then `monitor-plugin-remove-confirm` or `monitor-plugin-remove-cancel`.
+//! `monitor-plugin-add-account` is disabled, with "Coming later". Missing connector metadata is
+//! stated as missing, until the server's catalog supplies it (opengrok-server#356).
 //!
 //! Files (#90): `composer-file-{i}` under `composer` (label = the file's name, value `uploading`
 //! / `ready` / `failed`); `message-file-{artId}` on the chat page for each file a message in the
