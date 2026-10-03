@@ -50,6 +50,9 @@ pub(crate) const POP: &str = "agent-model-pop";
 pub(crate) const FAST: &str = "agent-model-fast";
 pub(crate) const RESET: &str = "agent-model-reset";
 pub(crate) const EFFORT: &str = "agent-model-effort";
+/// Under the slider, after a pick that put the effort back on the model's own level: the model
+/// picked has no such level, and the line says so.
+pub(crate) const EFFORT_NOTE: &str = "agent-model-effort-note";
 /// The model's name, which opens the list, and in the list the heading that goes back.
 pub(crate) const OPEN_LIST: &str = "agent-model-open-list";
 /// At the top of the list: the search box, which filters both groups as it is typed in.
@@ -84,6 +87,7 @@ pub(crate) struct PickerIds {
     pub fast: &'static str,
     pub reset: &'static str,
     pub effort: &'static str,
+    pub effort_note: &'static str,
     pub open_list: &'static str,
     pub search: &'static str,
     pub list: &'static str,
@@ -111,6 +115,7 @@ pub(crate) const BOT_IDS: PickerIds = PickerIds {
     fast: FAST,
     reset: RESET,
     effort: EFFORT,
+    effort_note: EFFORT_NOTE,
     open_list: OPEN_LIST,
     search: SEARCH,
     list: LIST,
@@ -135,6 +140,7 @@ pub(crate) const NEW_BOTS_IDS: PickerIds = PickerIds {
     fast: "settings-new-bots-fast",
     reset: "settings-new-bots-reset",
     effort: "settings-new-bots-effort",
+    effort_note: "settings-new-bots-effort-note",
     open_list: "settings-new-bots-open-list",
     search: "settings-new-bots-search",
     list: "settings-new-bots-list",
@@ -160,6 +166,7 @@ pub(crate) const PLAN_FALLBACK_IDS: PickerIds = PickerIds {
     fast: "settings-plan-fallback-fast",
     reset: "settings-plan-fallback-reset",
     effort: "settings-plan-fallback-effort",
+    effort_note: "settings-plan-fallback-effort-note",
     open_list: "settings-plan-fallback-open-list",
     search: "settings-plan-fallback-search",
     list: "settings-plan-fallback-list",
@@ -206,6 +213,7 @@ impl PickerIds {
             self.fast,
             self.reset,
             self.effort,
+            self.effort_note,
             self.open_list,
             self.search,
             self.list,
@@ -296,6 +304,9 @@ struct Snap {
     pick: Option<ModelPick>,
     view: PickerView,
     note: Option<String>,
+    /// The line under the slider about the model the last pick put the effort back on
+    /// ([`PickerView::effort_note_for`]).
+    effort_note: Option<String>,
     catalogue_note: Option<String>,
     /// A change is with the server, and the picker takes none until it answers.
     busy: bool,
@@ -305,8 +316,13 @@ impl Snap {
     fn read(state: &AppState, which: PickerFor) -> Self {
         let mut view = state.picker_view(which).clone();
         view.list_open &= view.open;
+        let pick = state.picker_pick(which);
         Self {
-            pick: state.picker_pick(which),
+            effort_note: pick
+                .as_ref()
+                .and_then(|pick| view.effort_note_for(pick))
+                .map(str::to_string),
+            pick,
             view,
             note: state.picker_note(which).map(str::to_string),
             catalogue_note: state.model_catalogue.note.clone(),
@@ -409,11 +425,13 @@ impl ModelPicker {
                     let SliderEvent::Release(value) = event else {
                         return;
                     };
-                    let stop = value.end().round() as usize;
-                    let which = this.which;
-                    this.state.update(cx, |state, cx| {
-                        state.pick_model_effort_level(which, stop, cx)
-                    });
+                    let stop = value.end().round();
+                    if stop.is_finite() && stop >= 0. {
+                        let which = this.which;
+                        this.state.update(cx, |state, cx| {
+                            state.pick_model_effort_level(which, stop as usize, cx)
+                        });
+                    }
                 })
                 .detach();
                 self.sliders.insert(stops, slider.clone());
@@ -467,6 +485,7 @@ impl Render for ModelPicker {
             pick: pick.clone(),
             list_open: self.snap.view.list_open,
             note: self.snap.note.clone(),
+            effort_note: self.snap.effort_note.clone(),
             catalogue_note: self.snap.catalogue_note.clone(),
             busy: self.snap.busy,
             slider,
@@ -617,6 +636,8 @@ struct Panel {
     pick: ModelPick,
     list_open: bool,
     note: Option<String>,
+    /// The line under the slider about a pick that put the effort back on the model's own level.
+    effort_note: Option<String>,
     catalogue_note: Option<String>,
     /// A change is with the server: every control is drawn dimmed, and takes nothing until it
     /// answers (`AppState::picker_busy`).
@@ -675,7 +696,8 @@ impl Panel {
             .into_any_element()
     }
 
-    /// ⚡, the model's name and ↺, over the slider of the model's levels of effort.
+    /// ⚡, the model's name and ↺, over the slider of the model's levels of effort, and the line
+    /// a pick may have left under it.
     fn controls(&self, app: &Entity<AppState>, theme: &Theme) -> impl IntoElement {
         let which = self.which;
         let ids = ids(which);
@@ -795,6 +817,15 @@ impl Panel {
                 pick.effort_dead.filter(|_| self.slider.is_some()),
                 |this, why| this.child(div().text_xs().text_color(muted).child(why)),
             )
+            .when_some(self.effort_note.clone(), |this, note| {
+                this.child(
+                    div()
+                        .id(ids.effort_note)
+                        .text_xs()
+                        .text_color(muted)
+                        .child(note),
+                )
+            })
     }
 
     /// The slider, over the name of each of the levels the model lists, low to high, and the one
@@ -1381,8 +1412,8 @@ mod tests {
 
     /// Nothing the picker says says "Default" for an effort, in any state of the three pickers:
     /// where no effort was chosen it names the model's own level, and where the model lists no
-    /// levels it names none. The words the window draws are these, the tooltips, and the dead
-    /// card's.
+    /// levels it names none. The words the window draws are these, the tooltips, the line a pick
+    /// leaves, and the dead card's.
     #[test]
     fn no_word_the_picker_draws_says_default() {
         let new_bots = |door: &str, model: &str, effort: &str| {
@@ -1442,6 +1473,13 @@ mod tests {
             said.extend([card_detail(pick), pick.summary(), pick.model_label()]);
             said.extend(pick.levels().iter().map(crate::opengrok::EffortLevel::name));
             said.extend(pick.fast_blocked.map(str::to_string));
+            for (source, id) in [
+                (InferenceKind::LocalProxy, "gpt-6-luna"),
+                (InferenceKind::Gateway, "oag/cheap"),
+                (InferenceKind::Gateway, "xai/grok-4.7"),
+            ] {
+                said.extend(pick.pick_effort_note(source, id));
+            }
         }
         assert!(
             said.iter().any(|words| words == "Medium"),
@@ -1746,5 +1784,91 @@ mod tests {
         draw(cx);
         cx.simulate_mouse_up(reset, MouseButton::Left, Modifiers::none());
         state.read_with(cx, |state, _| assert_eq!(state.auth_error, None));
+    }
+
+    /// A slider that lets go of something that is no stop of the model's saves nothing: not a
+    /// number, one off either end of the slider, or one past the model's last level. The first
+    /// is the one that mattered: a number that is not a number is zero as a stop, and zero is
+    /// the lowest level, so it was saved as Low.
+    #[gpui_kit::test]
+    fn a_slider_release_that_is_no_stop_saves_nothing(cx: &mut gpui_kit::TestAppContext) {
+        use gpui_kit::AppContext as _;
+        use gpui_kit::component::slider::SliderEvent;
+        let runtime = undriven_runtime();
+        let _enter = runtime.enter();
+        let state = cx.new(|_| app("local_proxy", "gpt-6-luna", "inherit"));
+        let (picker, cx) = open_picker(cx, &state, PickerFor::Bot);
+        let slider = picker.update(cx, |picker, _| picker.sliders[&5].clone());
+        let effort = |cx: &mut gpui_kit::VisualTestContext| {
+            state.read_with(cx, |state, _| state.coworkers[0].effort.clone())
+        };
+        for release in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -1., 5., 99.] {
+            slider.update(cx, |_, cx| cx.emit(SliderEvent::Release(release.into())));
+            assert_eq!(effort(cx).as_deref(), Some("inherit"), "{release}");
+        }
+        // A real stop is a pick, so the guard is not a wall.
+        slider.update(cx, |_, cx| cx.emit(SliderEvent::Release(3_f32.into())));
+        assert_eq!(effort(cx).as_deref(), Some("xhigh"));
+        // Whatever the last change began is polled while the runtime is entered, and stays out.
+        cx.run_until_parked();
+    }
+
+    /// Picking a model in the list with the mouse leaves the Bot's effort where it was, as long as
+    /// the model picked lists it: the press that picks began on a row, and no press that began on
+    /// a row is a press on the slider that takes the list's place, wherever in the row it was
+    /// made. Nothing is sent of the effort.
+    #[gpui_kit::test]
+    fn picking_a_model_with_the_mouse_leaves_the_effort_where_it_was(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        use gpui_kit::{AppContext as _, Modifiers, MouseButton, point};
+        let runtime = undriven_runtime();
+        let _enter = runtime.enter();
+        let state = cx.new(|_| app("local_proxy", "gpt-6-luna", "inherit"));
+        let (_, cx) = open_picker(cx, &state, PickerFor::Bot);
+        for effort in ["inherit", "medium", "high"] {
+            for (row, model) in [
+                ("agent-model-row-gateway-oag/cheap", "oag/cheap"),
+                ("agent-model-row-gateway-xai/grok-4.7", "xai/grok-4.7"),
+                ("agent-model-row-local_proxy-gpt-5.6-sol", "gpt-5.6-sol"),
+            ] {
+                // Grok 4.7 lists no levels, so an effort chosen on another model does not go with
+                // the Bot to it: that is the next change's.
+                if effort != "inherit" && model == "xai/grok-4.7" {
+                    continue;
+                }
+                for fraction in [0.05_f32, 0.5, 0.95] {
+                    state.update(cx, |state, cx| {
+                        state.coworkers[0].model = "gpt-6-luna".into();
+                        state.coworkers[0].source =
+                            crate::opengrok::CoworkerSource::Kind(InferenceKind::LocalProxy);
+                        state.coworkers[0].effort = Some(effort.into());
+                        if !state.model_picker.list_open {
+                            state.toggle_picker_list(PickerFor::Bot, cx);
+                        }
+                        cx.notify();
+                    });
+                    draw(cx);
+                    let bounds = cx.debug_bounds(row).expect("the row is in the list");
+                    let at = point(
+                        bounds.left() + bounds.size.width * fraction,
+                        bounds.center().y,
+                    );
+                    cx.simulate_mouse_move(at, None, Modifiers::none());
+                    cx.simulate_mouse_down(at, MouseButton::Left, Modifiers::none());
+                    draw(cx);
+                    cx.simulate_mouse_up(at, MouseButton::Left, Modifiers::none());
+                    draw(cx);
+                    state.read_with(cx, |state, _| {
+                        let bot = &state.coworkers[0];
+                        assert_eq!(bot.model, model, "{row} at {fraction}");
+                        assert_eq!(bot.effort.as_deref(), Some(effort), "{row} at {fraction}");
+                        assert_eq!(state.auth_error, None);
+                    });
+                }
+            }
+        }
+        // Whatever the last change began is polled while the runtime is entered, and stays out.
+        cx.run_until_parked();
     }
 }

@@ -633,6 +633,30 @@ pub struct PickerView {
     /// The first model in the list's window, among those the search leaves: the list shows
     /// `opengrok::LIST_ROWS` from it (`opengrok::list_window`), and the wheel moves it.
     pub list_start: usize,
+    /// What the popover says under the slider after a pick put the effort back on the model's own
+    /// level, because the model picked has no such level of its own to keep it on
+    /// ([`ModelPick::pick_effort_note`]).
+    pub effort_note: Option<EffortNote>,
+}
+
+/// A line the popover says of a pick, and the model it is about.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EffortNote {
+    /// The model the pick put the picker on, by the id its row pins with ⚡ off.
+    pub base_id: String,
+    /// The line: "GPT-6 Luna has no Ultra, so it's on Medium, its own level."
+    pub line: String,
+}
+
+impl PickerView {
+    /// The line the popover shows under its slider for the model now on the card: the pick's
+    /// line while that model is the one on the card. A refused pick leaves the card on the model
+    /// it was on, and the line says nothing then.
+    pub fn effort_note_for(&self, pick: &ModelPick) -> Option<&str> {
+        let note = self.effort_note.as_ref()?;
+        let now = pick.current.as_ref()?;
+        (now.base_id == note.base_id).then_some(note.line.as_str())
+    }
 }
 
 /// A `PUT /account` of this computer's time zone that has begun: what to send, and the sign-in it
@@ -12982,6 +13006,7 @@ impl AppState {
             return;
         }
         self.picker_view_mut(which).open = open;
+        self.picker_view_mut(which).effort_note = None;
         self.shut_picker_list(which);
         if open && which == PickerFor::Bot {
             self.avatar_editor_open = false;
@@ -13083,7 +13108,9 @@ impl AppState {
 
     /// A row of a list picked: the Bot, or the default for new Bots, goes onto its model at once,
     /// with its door, and the popover goes back to its controls, where that model's effort and ⚡
-    /// are.
+    /// are. The pick never changes the effort by itself: it stays where the model lists it, and
+    /// where it does not it goes back to `inherit`, so the slider shows the model's own level,
+    /// and the popover says so in a line ([`ModelPick::pick_patch`]).
     pub fn pick_model(
         &mut self,
         which: PickerFor,
@@ -13091,12 +13118,22 @@ impl AppState {
         base_id: &str,
         cx: &mut Context<Self>,
     ) {
-        let patch = self
-            .picker_pick(which)
+        let pick = self.picker_pick(which);
+        let patch = pick
+            .as_ref()
             .and_then(|pick| pick.pick_patch(source, base_id).ok().flatten());
+        let line = patch
+            .as_ref()
+            .and_then(|_| pick.as_ref()?.pick_effort_note(source, base_id));
         self.shut_picker_list(which);
         match patch {
-            Some(patch) => self.save_picker_change(which, patch, cx),
+            Some(patch) => {
+                self.save_picker_change(which, patch, cx);
+                self.picker_view_mut(which).effort_note = line.map(|line| EffortNote {
+                    base_id: base_id.to_string(),
+                    line,
+                });
+            }
             None => cx.notify(),
         }
     }
@@ -13154,6 +13191,9 @@ impl AppState {
         patch: CoworkerPatch,
         cx: &mut Context<Self>,
     ) {
+        // What was said of the last pick was said of what it left; this change leaves something
+        // else.
+        self.picker_view_mut(which).effort_note = None;
         let send = match which {
             PickerFor::Bot => return self.save_model_pick(patch, cx),
             PickerFor::NewBots => self.begin_new_bots_pick(&patch),
@@ -37530,6 +37570,115 @@ mod tests {
         assert_eq!(state.picker_note(PickerFor::NewBots), Some(said));
         assert!(state.begin_new_bots_change(Some(luna("low"))).is_some());
         assert_eq!(state.picker_note(PickerFor::NewBots), None, "a new change");
+    }
+
+    /// A runtime that nothing drives: a request begun while it is entered never answers, and
+    /// never fails, which is what a test wants of a change it only means to see begin.
+    fn undriven_runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime")
+    }
+
+    /// A pick that puts the effort back on the model's own level says so under the slider, for
+    /// that model, until the next change is sent or the popover opens or shuts; the pick of a
+    /// model that lists the effort says nothing, and the Bot's roster takes the pick, effort and
+    /// all, at once. Ultra is Sol's alone: GPT-6 Luna stops at max.
+    #[gpui_kit::test]
+    fn a_pick_that_puts_the_effort_back_says_so_until_the_next_change(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        use super::PickerFor;
+        use gpui_kit::AppContext as _;
+        let runtime = undriven_runtime();
+        let _enter = runtime.enter();
+        let levels = |ids: &[&str]| -> Vec<serde_json::Value> {
+            let words: &[&str] = if ids.iter().any(|id| id.contains("sol")) {
+                &["low", "medium", "high", "xhigh", "max", "ultra"]
+            } else {
+                &["low", "medium", "high", "xhigh", "max"]
+            };
+            words
+                .iter()
+                .map(|word| {
+                    let name = format!("{}{}", word[..1].to_uppercase(), &word[1..]);
+                    json!({"value": word, "label": format!("{name} Effort")})
+                })
+                .collect()
+        };
+        let mut state = signed_in_state();
+        read_as(
+            &mut state,
+            relay_kept(InferenceKind::Gateway, "loopback", None),
+        );
+        with_bot(&mut state, json!("local_proxy"));
+        state.coworkers[0].model = "gpt-5.6-sol".into();
+        state.coworkers[0].effort = Some("ultra".into());
+        state.model_catalogue = serde_json::from_value(json!({
+            "models": [
+                {"id": "gpt-6-luna", "source": "local_proxy", "ownEffort": "medium",
+                 "efforts": levels(&["gpt-6-luna"])},
+                {"id": "gpt-5.6-sol", "source": "local_proxy", "ownEffort": "high",
+                 "efforts": levels(&["gpt-5.6-sol"])}
+            ],
+            "note": null
+        }))
+        .expect("a list");
+        let app = cx.new(|_| state);
+        app.update(cx, |state, cx| {
+            state.set_picker_open(PickerFor::Bot, true, cx);
+            state.toggle_picker_list(PickerFor::Bot, cx);
+            state.pick_model(PickerFor::Bot, InferenceKind::LocalProxy, "gpt-6-luna", cx);
+            // The roster took the pick at once: the model, and the effort back to `inherit`,
+            // which the slider shows as the model's own level.
+            assert_eq!(state.coworkers[0].model, "gpt-6-luna");
+            assert_eq!(state.coworkers[0].effort.as_deref(), Some("inherit"));
+            let pick = state.model_pick().expect("a Bot is open");
+            assert_eq!(pick.effort_name().as_deref(), Some("Medium"));
+            assert_eq!(
+                state.model_picker.effort_note_for(&pick),
+                Some("GPT-6 Luna has no Ultra, so it's on Medium, its own level.")
+            );
+            assert!(!state.model_picker.list_open, "back to the controls");
+
+            // Moving the slider is a change of its own, and the line is about the last pick.
+            state.pick_model_effort_level(PickerFor::Bot, 2, cx);
+            assert_eq!(state.coworkers[0].effort.as_deref(), Some("high"));
+            assert_eq!(state.model_picker.effort_note, None);
+
+            // A stop past the levels the model lists is none, and sends nothing.
+            state.pick_model_effort_level(PickerFor::Bot, 5, cx);
+            assert_eq!(state.coworkers[0].effort.as_deref(), Some("high"));
+
+            // Sol lists high: the pick keeps it, and nothing is said.
+            state.toggle_picker_list(PickerFor::Bot, cx);
+            state.pick_model(PickerFor::Bot, InferenceKind::LocalProxy, "gpt-5.6-sol", cx);
+            assert_eq!(state.coworkers[0].model, "gpt-5.6-sol");
+            assert_eq!(state.coworkers[0].effort.as_deref(), Some("high"));
+            assert_eq!(state.model_picker.effort_note, None);
+
+            // The line goes as the popover shuts, and is not about another model.
+            state.pick_model_effort_level(PickerFor::Bot, 5, cx);
+            assert_eq!(state.coworkers[0].effort.as_deref(), Some("ultra"));
+            state.toggle_picker_list(PickerFor::Bot, cx);
+            state.pick_model(PickerFor::Bot, InferenceKind::LocalProxy, "gpt-6-luna", cx);
+            assert!(state.model_picker.effort_note.is_some());
+            let pick = state.model_pick().expect("a Bot is open");
+            assert!(state.model_picker.effort_note_for(&pick).is_some());
+            state.coworkers[0].model = "gpt-5.6-sol".into();
+            let pick = state.model_pick().expect("a Bot is open");
+            assert_eq!(
+                state.model_picker.effort_note_for(&pick),
+                None,
+                "a line about a model that is not the one on the card"
+            );
+            state.coworkers[0].model = "gpt-6-luna".into();
+            state.set_picker_open(PickerFor::Bot, false, cx);
+            assert_eq!(state.model_picker.effort_note, None);
+        });
+        // Whatever the last change began is polled while the runtime is entered, and stays out.
+        cx.run_until_parked();
     }
 
     /// None takes the kept default away: one `PUT` of the kind the server keeps and

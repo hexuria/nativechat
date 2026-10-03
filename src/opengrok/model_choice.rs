@@ -479,6 +479,17 @@ fn capitalised(word: &str) -> String {
     })
 }
 
+/// What the popover says after a pick that put the effort back to `inherit`, because the model
+/// picked lists no such level: "GPT-6 Luna has no Ultra, so it's on Medium, its own level." Said
+/// with the model's name as the picker says it, the level the effort was, and the model's own
+/// level, by name; a model that lists levels and none as its own is "on its own level".
+pub fn effort_reset_note(model: &str, had: &str, own: Option<&str>) -> String {
+    match own {
+        Some(own) => format!("{model} has no {had}, so it's on {own}, its own level."),
+        None => format!("{model} has no {had}, so it's on its own level."),
+    }
+}
+
 /// On a server without per-Bot doors, while the account's replies are on the person's plan: the
 /// plan model that answers for every Bot there, whatever each is pinned to.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -924,7 +935,8 @@ impl ModelPick {
     }
 
     /// What a pick of a row sends: its model, fast where ⚡ is on and the row has a twin, and its
-    /// door ([`Self::patch_to`]). A row the list does not offer is refused.
+    /// door ([`Self::patch_to`]), and where the effort cannot stay the effort too
+    /// ([`Self::effort_after_pick`]). A row the list does not offer is refused.
     pub fn pick_patch(
         &self,
         source: InferenceKind,
@@ -936,7 +948,47 @@ impl ModelPick {
                 source.word()
             )
         })?;
-        Ok(self.patch_to(row, row.pin(self.is_fast())))
+        Ok(self
+            .patch_to(row, row.pin(self.is_fast()))
+            .map(|patch| CoworkerPatch {
+                effort: self.effort_after_pick(row),
+                ..patch
+            }))
+    }
+
+    /// What a pick of `row` makes of the effort, when it makes something: a pick never changes
+    /// the effort by itself. A Bot that chose none (`inherit`) stays so, and one that chose a
+    /// level the row lists keeps it. One that chose a level the row does not list goes back to
+    /// `inherit`, which the server always takes, and the slider then shows the model's own
+    /// level; the model that has no levels at all is that too. A server that keeps no effort
+    /// reads every Bot as `inherit`, and is sent none.
+    fn effort_after_pick(&self, row: &ModelChoice) -> Option<String> {
+        let stays = self.effort == EFFORT_INHERIT || row.level(&self.effort).is_some();
+        (!stays).then(|| EFFORT_INHERIT.to_string())
+    }
+
+    /// What the popover says of a pick of `row` that sends the effort back to `inherit`
+    /// ([`Self::pick_patch`]): the model picked has no such level, so it is on its own. Not said
+    /// where nothing was sent, nor of a model that lists no levels at all: it has no slider to
+    /// have moved.
+    pub fn pick_effort_note(&self, source: InferenceKind, base_id: &str) -> Option<String> {
+        let row = self.row(source, base_id)?;
+        self.effort_after_pick(row)?;
+        if row.efforts.is_empty() {
+            return None;
+        }
+        // The level as the model it was chosen on names it, or as the word reads where that
+        // model lists none.
+        let had = self
+            .current
+            .as_ref()
+            .and_then(|now| now.level(&self.effort))
+            .map_or_else(|| capitalised(&self.effort), EffortLevel::name);
+        Some(effort_reset_note(
+            &base_label(&row.base_id),
+            &had,
+            row.own_level().map(EffortLevel::name).as_deref(),
+        ))
     }
 
     /// What ⚡ switched on or off sends: the pin moved to the model's twin or back. Refused, with
@@ -1757,6 +1809,139 @@ mod tests {
         );
     }
 
+    /// Picking a model never changes the effort by itself. An effort the Bot chose that the new
+    /// model lists stays, and so does none chosen (`inherit`). One the new model does not list
+    /// goes back to `inherit`, so the slider shows the model's own level, and the popover says
+    /// so in a line. A model that lists no levels at all sends it back too, and says nothing: it
+    /// has no slider to have moved. A pick that changes nothing sends nothing.
+    #[test]
+    fn picking_a_model_never_changes_the_effort_by_itself() {
+        use InferenceKind::{Gateway, LocalProxy};
+        let sent = |pick: &ModelPick, source, id: &str| {
+            serde_json::to_value(pick.pick_patch(source, id).unwrap()).unwrap()
+        };
+
+        // High is a level Sol lists as well as Luna: the effort stays, and nothing is said.
+        let luna = on_plan("gpt-6-luna", "high");
+        assert_eq!(
+            sent(&luna, LocalProxy, "gpt-5.6-sol"),
+            json!({"model": "gpt-5.6-sol"})
+        );
+        assert_eq!(luna.pick_effort_note(LocalProxy, "gpt-5.6-sol"), None);
+        // None chosen stays none chosen, whatever the model: it is never saved as its own level.
+        let unchosen = on_plan("gpt-5.6-sol", "inherit");
+        assert_eq!(
+            sent(&unchosen, LocalProxy, "gpt-6-luna"),
+            json!({"model": "gpt-6-luna"})
+        );
+        assert_eq!(unchosen.pick_effort_note(LocalProxy, "gpt-6-luna"), None);
+        assert_eq!(
+            sent(&unchosen, Gateway, "xai/grok-4.7"),
+            json!({"model": "xai/grok-4.7", "source": "gateway"})
+        );
+
+        // Ultra is Sol's alone: Luna stops at max, so the effort goes back to `inherit`, and the
+        // line says what the person will see instead.
+        let sol = on_plan("gpt-5.6-sol", "ultra");
+        assert_eq!(
+            sent(&sol, LocalProxy, "gpt-6-luna"),
+            json!({"model": "gpt-6-luna", "effort": "inherit"})
+        );
+        assert_eq!(
+            sol.pick_effort_note(LocalProxy, "gpt-6-luna").as_deref(),
+            Some("GPT-6 Luna has no Ultra, so it's on Medium, its own level.")
+        );
+        assert_eq!(
+            sent(&sol, Gateway, "xai/grok-4.7"),
+            json!({"model": "xai/grok-4.7", "source": "gateway", "effort": "inherit"})
+        );
+        assert_eq!(
+            sol.pick_effort_note(Gateway, "xai/grok-4.7").as_deref(),
+            Some("Grok 4.7 has no Ultra, so it's on Medium, its own level.")
+        );
+        // ⚡ on is no other model: the twin lists what its base does, so Ultra stays on it, and
+        // goes from it as it goes from Sol, to the twin of the model picked.
+        let fast = bot_pick(
+            &bot(
+                Some(json!("local_proxy")),
+                "gpt-5.6-sol--fast",
+                Some("ultra"),
+            ),
+            Some(&account(InferenceKind::Gateway, None)),
+            &catalogue(SERVER),
+            plan(&[
+                "gpt-6-luna",
+                "gpt-6-luna--fast",
+                "gpt-5.6-sol",
+                "gpt-5.6-sol--fast",
+            ]),
+        );
+        assert_eq!(fast.lit(), Some(5));
+        assert_eq!(
+            sent(&fast, LocalProxy, "gpt-6-luna"),
+            json!({"model": "gpt-6-luna--fast", "effort": "inherit"})
+        );
+        assert_eq!(
+            fast.pick_effort_note(LocalProxy, "gpt-6-luna").as_deref(),
+            Some("GPT-6 Luna has no Ultra, so it's on Medium, its own level.")
+        );
+
+        // A model that lists none has no slider, so the effort goes back with nothing said.
+        let mut listed = catalogue(SERVER);
+        listed.models.retain(|entry| entry.id != "oag/cheap");
+        listed.models.push(plain("oag/cheap", "gateway"));
+        let high = bot_pick(
+            &bot(Some(json!("local_proxy")), "gpt-6-luna", Some("high")),
+            Some(&account(InferenceKind::Gateway, None)),
+            &listed,
+            plan(PLAN),
+        );
+        assert_eq!(
+            sent(&high, Gateway, "oag/cheap"),
+            json!({"model": "oag/cheap", "source": "gateway", "effort": "inherit"})
+        );
+        assert_eq!(high.pick_effort_note(Gateway, "oag/cheap"), None);
+        // And back from it: a Bot on a model that lists none, whose stored effort is a level of
+        // the model it moves to, keeps it.
+        let plain_high = bot_pick(
+            &bot(Some(json!("gateway")), "oag/cheap", Some("high")),
+            None,
+            &listed,
+            plan(PLAN),
+        );
+        assert!(!plain_high.has_slider());
+        assert_eq!(
+            serde_json::to_value(plain_high.pick_patch(Gateway, "xai/grok-4.7").unwrap()).unwrap(),
+            json!({"model": "xai/grok-4.7"})
+        );
+
+        // The pick that changes nothing sends nothing, whatever the effort.
+        assert!(sol.pick_patch(LocalProxy, "gpt-5.6-sol").unwrap().is_none());
+        // A level the Bot's own model does not list is named as its word reads.
+        let stale = on_plan("gpt-6-luna", "none");
+        assert_eq!(
+            stale.pick_effort_note(Gateway, "xai/grok-4.7").as_deref(),
+            Some("Grok 4.7 has no None, so it's on Medium, its own level.")
+        );
+        // A model that lists levels and names none of its own as the one it runs at.
+        listed = catalogue(SERVER);
+        for entry in &mut listed.models {
+            if entry.id == "xai/grok-4.7" {
+                entry.own_effort = None;
+            }
+        }
+        let ownless = bot_pick(
+            &bot(Some(json!("local_proxy")), "gpt-5.6-sol", Some("ultra")),
+            Some(&account(InferenceKind::Gateway, None)),
+            &listed,
+            plan(PLAN),
+        );
+        assert_eq!(
+            ownless.pick_effort_note(Gateway, "xai/grok-4.7").as_deref(),
+            Some("Grok 4.7 has no Ultra, so it's on its own level.")
+        );
+    }
+
     /// A Bot's picker, Default for new Bots' and the Relay-off fallback's, each on Sol (auto), a
     /// gateway route that lists six levels, up to ultra, with the effort given. Only the
     /// Gateway's models are the fallback's, so the model that lists ultra is a route.
@@ -1844,6 +2029,58 @@ mod tests {
                 .map(|fallback| fallback.effort),
             Some("inherit".to_string())
         );
+    }
+
+    /// The three pickers take a pick the same way, keeping the effort where the new model lists
+    /// it and putting it back to `inherit`, with the same line, where it does not: the whole of
+    /// what each keeps afterwards.
+    #[test]
+    fn the_three_pickers_take_a_pick_the_same_way() {
+        use InferenceKind::Gateway;
+        let [(_, bot_on), (_, new_bots), (_, fallback)] = three_on_sol("ultra");
+        let line = "Cheap (auto) has no Ultra, so it's on Medium, its own level.";
+        let patch = |pick: &ModelPick| {
+            assert_eq!(
+                pick.pick_effort_note(Gateway, "oag/cheap").as_deref(),
+                Some(line)
+            );
+            pick.pick_patch(Gateway, "oag/cheap")
+                .unwrap()
+                .expect("a change")
+        };
+        let patch_of_bot = patch(&bot_on);
+        assert_eq!(
+            (
+                patch_of_bot.model.as_deref(),
+                patch_of_bot.effort.as_deref()
+            ),
+            (Some("oag/cheap"), Some("inherit"))
+        );
+        assert_eq!(
+            new_bots.new_bots_default(&patch(&new_bots)),
+            Some(NewBotDefault {
+                source: Gateway,
+                model: "oag/cheap".into(),
+                effort: "inherit".into()
+            })
+        );
+        assert_eq!(
+            fallback.plan_fallback(&patch(&fallback)),
+            Some(PlanFallback {
+                model: "oag/cheap".into(),
+                effort: "inherit".into()
+            })
+        );
+        // A model that lists it keeps it: max is a level of Grok 4.7's too.
+        for (name, pick) in three_on_sol("max") {
+            let patch = pick.pick_patch(Gateway, "xai/grok-4.7").unwrap();
+            assert_eq!(patch.and_then(|patch| patch.effort), None, "{name}");
+            assert_eq!(
+                pick.pick_effort_note(Gateway, "xai/grok-4.7"),
+                None,
+                "{name}"
+            );
+        }
     }
 
     /// A Bot on its own plan with a model the list has a twin of: the card names the model, the

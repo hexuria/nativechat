@@ -268,9 +268,12 @@
 //! the model's own levels (`medium`, or `ultra` where the model lists it) and refuses any other
 //! in words that name them, and on a model with no levels it refuses that there is no slider;
 //! it is dead, with why, from a server that keeps no effort, one from before
-//! opengrok-server#271. The model's levels and own level are
-//! `GET /models`' `efforts` and `ownEffort` (opengrok-server branch `model-effort-levels`, shape
-//! agreed (not recorded yet)).
+//! opengrok-server#271. Last, `agent-model-effort-note`, a line, not
+//! a control: after a pick of a model that has no such level as the Bot's effort was on, which
+//! the pick put back on `inherit`, it says `GPT-6 Luna has no Ultra, so it's on Medium, its own
+//! level.`, for as long as that model is on the card and nothing else is changed. The model's
+//! levels and own level are `GET /models`' `efforts` and `ownEffort` (opengrok-server branch
+//! `model-effort-levels`, shape agreed (not recorded yet)).
 //! While the list shows, those give way to `agent-model-open-list` as the heading back (state
 //! `expanded`), `agent-model-search` (the search box at the top of the list, a textbox valued by
 //! what is typed: `set_value` writes it, `type` adds to it, `key` takes Backspace and Enter; it
@@ -351,7 +354,7 @@
 //! is set, valued by its model; states its door's word, `fast`, `expanded`, and `saving` while a
 //! change is with the server), `settings-new-bots-pop`, `-fast`, `-effort` (`set_value` the
 //! value of one of the model's levels; not in the tree while none is set, which is no model and
-//! so no levels), `-reset`, `-open-list`, `-search` (`set_value`, `type`, `key`
+//! so no levels), `-effort-note`, `-reset`, `-open-list`, `-search` (`set_value`, `type`, `key`
 //! as the Bot's), `-list`, `-group-{source}`, `-row-{source}-{id}`, `-no-match`, `-note` and
 //! `-error` (the server's words for a refused change, or that nobody knows whether one was kept:
 //! in the popover while open, under the card while shut). Over the list's models,
@@ -372,9 +375,9 @@
 //! `unavailable`) it holds `settings-plan-fallback-unavailable` ("Coming soon: the server can't
 //! keep a Relay-off fallback yet.") and `settings-plan-fallback-card`, disabled and refused with
 //! why. Live, it is the Bot's card and popover under `settings-plan-fallback-*` as Default for new
-//! Bots' are under `settings-new-bots-*` (`-card`, `-pop`, `-fast`, `-effort`, `-reset`,
-//! `-open-list`, `-search`, `-list`, `-no-match`, `-note`, `-error`), over the Gateway group
-//! alone: `settings-plan-fallback-group-gateway` and its rows,
+//! Bots' are under `settings-new-bots-*` (`-card`, `-pop`, `-fast`, `-effort`, `-effort-note`,
+//! `-reset`, `-open-list`, `-search`, `-list`, `-no-match`, `-note`, `-error`), over the Gateway
+//! group alone: `settings-plan-fallback-group-gateway` and its rows,
 //! `settings-plan-fallback-row-gateway-{id}`, and none of the plan's models. Over them,
 //! `settings-plan-fallback-none` (`None`, valued `no fallback`, state `selected` while none is
 //! set; a click takes the kept fallback away). Every pick is kept on the account at once, whole,

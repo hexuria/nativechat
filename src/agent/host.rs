@@ -5411,7 +5411,9 @@ impl NativeChatHost {
     /// (named by the level it is on, the model's own while the Bot chose none, and valued by the
     /// server's word, `inherit` while none is chosen; dead with why as its own words from a
     /// server that keeps no effort; `set_value` takes one of the model's own levels by its word
-    /// and refuses any other in words that name them); and while it shows its
+    /// and refuses any other in words that name them), and `agent-model-effort-note`, the line a
+    /// pick left when it put the effort back on the model's own level, while the model it is
+    /// about is the one on the card; and while it shows its
     /// list, `agent-model-open-list` as the heading back (state `expanded`) and
     /// `agent-model-search`, the search box (valued by what is typed). `agent-model-list` is
     /// always there, valued by how many models the search leaves and visible while shown, and
@@ -5457,7 +5459,8 @@ impl NativeChatHost {
                 fast = fast.with_value(why);
             }
             // The window's own order: ⚡, the model's name and ↺ in a row, then the slider under
-            // them, which is not there at all where the model lists no levels.
+            // them, which is not there at all where the model lists no levels, and the line a
+            // pick may have left.
             pop = pop
                 .with_child(fast)
                 .with_child(UiNode::button(ids.open_list, pick.model_label()))
@@ -5476,6 +5479,9 @@ impl NativeChatHost {
                     .with_value(pick.effort.clone())
                     .with_enabled(pick.effort_dead.is_none() && !busy),
                 );
+            }
+            if let Some(line) = view.effort_note_for(pick) {
+                pop = pop.with_child(UiNode::status(ids.effort_note, line));
             }
         }
         // What the search leaves: the whole list while nothing is typed, which it always is while
@@ -5853,7 +5859,16 @@ impl NativeChatHost {
         if target == open_list {
             return Ok(PickerCommand::ToggleList.sent_to(which));
         }
-        if [ids.plan, ids.note, ids.routines, ids.error, ids.no_match].contains(&target) {
+        if [
+            ids.plan,
+            ids.note,
+            ids.routines,
+            ids.error,
+            ids.no_match,
+            ids.effort_note,
+        ]
+        .contains(&target)
+        {
             return Err(format!("`{target}` is a line, not a control"));
         }
         if [ids.fast, ids.effort, ids.reset].contains(&target) && list_open {
@@ -15789,6 +15804,59 @@ mod tests {
             let refused = host.set_value(effort, "high").unwrap_err();
             assert!(refused.contains("no model is picked"), "{refused}");
         }
+    }
+
+    /// After a pick that put the effort back on the model's own level the popover says so in a
+    /// line under the slider, `agent-model-effort-note`, which is a line and not a control; it is
+    /// there while the controls show, and only for the model it is about.
+    #[test]
+    fn the_line_a_pick_leaves_is_under_the_slider() {
+        use crate::state::EffortNote;
+        let said = "GPT-6 Luna has no Ultra, so it's on Medium, its own level.";
+        let mut host = host();
+        host.agent_settings_open = true;
+        host.model_pick = Some(a_pick(
+            Some(serde_json::json!("local_proxy")),
+            "gpt-6-luna",
+            "inherit",
+        ));
+        host.model_picker.open = true;
+        assert!(host.snapshot().find("agent-model-effort-note").is_none());
+        host.model_picker.effort_note = Some(EffortNote {
+            base_id: "gpt-6-luna".into(),
+            line: said.into(),
+        });
+        let tree = host.snapshot();
+        let pop = tree.find("agent-model-pop").unwrap();
+        let ids: Vec<&str> = pop.children.iter().map(|node| node.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            [
+                "agent-model-fast",
+                "agent-model-open-list",
+                "agent-model-reset",
+                "agent-model-effort",
+                "agent-model-effort-note",
+                "agent-model-list"
+            ],
+            "in the window's order"
+        );
+        let line = tree.find("agent-model-effort-note").unwrap();
+        assert_eq!((line.role.as_str(), line.name.as_str()), ("status", said));
+        let click = host.click("agent-model-effort-note").unwrap_err();
+        assert!(click.contains("a line, not a control"), "{click}");
+        assert!(is_picker_part("agent-model-effort-note"));
+
+        // The list takes the controls' place, and the line with them.
+        host.model_picker.list_open = true;
+        assert!(host.snapshot().find("agent-model-effort-note").is_none());
+        host.model_picker.list_open = false;
+        // A line about a model that is not the one on the card says nothing.
+        host.model_picker.effort_note = Some(EffortNote {
+            base_id: "gpt-5.6-sol".into(),
+            line: said.into(),
+        });
+        assert!(host.snapshot().find("agent-model-effort-note").is_none());
     }
 
     /// The composer has no chip: a Bot's model is picked on its card in its settings, and
