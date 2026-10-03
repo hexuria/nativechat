@@ -55,11 +55,11 @@ use super::activity::{
 use super::client::{
     AnswerReply, AsyncRunResponse, BotSkillScope, BoxShareScope, ConnectLink, ConnectionOwner,
     ConnectionView, Connector, CoworkerCeiling, CoworkerComputer, CoworkerSkills, CoworkerUsage,
-    DaemonEnrol, DaemonList, LocalExecMode, LocalExecPolicy, OpenGrokClient, QueuedApproval,
-    RecipeDetail, RecipeList, RecipeParameterKind, RecipeRunResult, RunCause, RunReplay,
-    SKIPPED_FIRING, ScheduleKind, ScheduleRow, ScheduleRun, ScheduleRunStarted, ScheduleRunStatus,
-    SkillDetail, SkillSummary, SkillVersion, StopReply, ThreadReplay, ToolListing,
-    host_egress_tunnel_available, host_egress_tunnel_flag,
+    DaemonEnrol, DaemonList, DaemonMachine, LocalExecMode, LocalExecPolicy, OpenGrokClient,
+    QueuedApproval, RecipeDetail, RecipeList, RecipeParameterKind, RecipeRunResult, RunCause,
+    RunReplay, SKIPPED_FIRING, ScheduleKind, ScheduleRow, ScheduleRun, ScheduleRunStarted,
+    ScheduleRunStatus, SkillDetail, SkillSummary, SkillVersion, StopReply, ThreadReplay,
+    ToolListing, host_egress_tunnel_available, host_egress_tunnel_flag,
 };
 use super::credential::{CREDENTIAL_OFFER_SAVE, SaveLoginSpec};
 use super::error::{Failure, Unreachable, reads_as_gateway_unreachable};
@@ -633,7 +633,20 @@ const REST_NOT_READ: &[(&str, &str, &str)] = &[
 ///
 /// Only routes built ahead of a recording are listed. Routes this app asks that no test on the
 /// server drives are a different gap, and not this list's.
-const REST_NOT_RECORDED_YET: &[(&str, &str, &str)] = &[];
+const REST_NOT_RECORDED_YET: &[(&str, &str, &str)] = &[(
+    "PATCH__local-exec_daemon__machine_id_",
+    "/local-exec/daemon/{machine_id}",
+    "NOT RECORDED YET. One computer's own relay switch (opengrok-server branch per-computer-relay \
+     at d0a9855: `switch_relay` in `crates/opengrok-server/src/local_exec.rs`, the per-computer \
+     relay contract the owner approved on 3 Oct 2026): `{relayEnabled}` answers the computer's \
+     row, and is refused 404 `not_found`, 409 `revoked` or 400 `bad_request`, each as `{error, \
+     code}`. The recorder will file it from the server's `against_the_mac_relay.rs` tests \
+     `a_computer_switched_off_is_told_disabled_and_refused_until_it_is_on_again` and \
+     `a_switch_names_only_the_callers_own_computer_and_is_refused_in_words`, which \
+     `examples/wire_corpus.rs` keeps there. Until then `daemon_switched` and the refusals' \
+     reading wait for it, held to the agreed shapes by \
+     `a_computers_relay_switch_is_read_as_the_contract_agreed_it`.",
+)];
 
 /// Routes this app asks with this Mac's machine token (`local_exec.rs` `MachineCredential`)
 /// rather than the person's session, so they never pass through `send_json_within`: a 401 on one
@@ -687,6 +700,24 @@ const REST_FIELDS_NOT_RECORDED_YET: &[(&str, &str, &str)] = &[
          name for a Bot or a setting at `inherit`, and saves nothing by it; a word the model \
          does not list is no level to light. Its fixtures come with the recording after the \
          branch lands: a model entry carrying `ownEffort`.",
+    ),
+    (
+        "GET__local-exec_daemon",
+        "relayEnabled",
+        "NOT RECORDED YET. A computer's own relay switch on its row (opengrok-server branch \
+         per-computer-relay at d0a9855: `row` in `crates/opengrok-server/src/local_exec.rs`), on \
+         for a computer enrolled before it, so a row without it reads on. The recorder will bring \
+         it from the server's test `a_computers_row_says_its_switch_and_whether_it_relays_now`, \
+         which `examples/wire_corpus.rs` keeps for `/local-exec/daemon`. Read meanwhile by \
+         `daemons` from bodies in the agreed shape.",
+    ),
+    (
+        "GET__local-exec_daemon",
+        "relaying",
+        "NOT RECORDED YET. Whether the server holds the computer's relay stream now, on its row \
+         (opengrok-server branch per-computer-relay at d0a9855: `row` in \
+         `crates/opengrok-server/src/local_exec.rs`); live, so a row without it reads as not \
+         relaying. Brought by the same recording as `relayEnabled`.",
     ),
 ];
 
@@ -3508,8 +3539,47 @@ fn daemons(_: u16, body: &Value) -> Check {
                 && Some(machine.connected) == raw.get("connected").and_then(Value::as_bool),
             "a machine came through changed: {machine:?}"
         );
+        relay_switch_comes_through(machine, raw)?;
     }
     Ok(())
+}
+
+/// A computer's own relay switch and whether it relays now, as its row carries them (opengrok-server
+/// branch per-computer-relay at d0a9855, ahead of the recording: see
+/// [`REST_FIELDS_NOT_RECORDED_YET`]): `relayEnabled` as sent, on when the row has none, and
+/// `relaying` as sent, not relaying when the row has none.
+fn relay_switch_comes_through(machine: &DaemonMachine, raw: &Value) -> Check {
+    must!(
+        machine.relay_enabled
+            == raw
+                .get("relayEnabled")
+                .and_then(Value::as_bool)
+                .unwrap_or(true)
+            && machine.relaying
+                == raw
+                    .get("relaying")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+        "a computer's relay switch and whether it relays should come through as sent: {machine:?} \
+         from {raw}"
+    );
+    Ok(())
+}
+
+/// One computer's own relay switch answered (`switch_computer_relay`): the row it left, as
+/// `GET /local-exec/daemon` lists it. THE ROUTE IS NOT IN [`REST_ROUTES`] YET: the corpus does not
+/// record it ([`REST_NOT_RECORDED_YET`]), and the day it does this is its reading there.
+fn daemon_switched(_: u16, body: &Value) -> Check {
+    let machine: DaemonMachine = parse(body)?;
+    must!(
+        !machine.machine_id.is_empty()
+            && machine.machine_id == str_at(body, "machineId")
+            && machine.label == str_at(body, "label")
+            && Some(machine.revoked) == body.get("revoked").and_then(Value::as_bool)
+            && Some(machine.connected) == body.get("connected").and_then(Value::as_bool),
+        "the computer should come through as sent: {machine:?}"
+    );
+    relay_switch_comes_through(&machine, body)
 }
 
 /// An enrol (`enrol_daemon`) answers with the machine's id and the token this Mac keeps to take
@@ -5030,6 +5100,66 @@ fn every_key_asked_ahead_of_its_recording_is_read_and_not_recorded_yet() {
         }
     }
     assert!(problems.is_empty(), "{}", problems.join("\n"));
+}
+
+/// A computer's relay switch, read from bodies written in the shape the server and this app agreed
+/// (opengrok-server branch per-computer-relay at d0a9855), ahead of the recording
+/// ([`REST_NOT_RECORDED_YET`], [`REST_FIELDS_NOT_RECORDED_YET`]): the list's rows with and without
+/// the two keys, a key that is not a boolean refused, and the switch's answer and its three
+/// refusals, each with the code beside the server's sentence.
+#[test]
+fn a_computers_relay_switch_is_read_as_the_contract_agreed_it() {
+    use serde_json::json;
+    let row = |id: &str, on: bool, relaying: bool| {
+        json!({"machineId": id, "label": "Ada's MacBook", "enrolledAtMs": 1_790_000_000_000_i64,
+               "revoked": false, "connected": true, "relayEnabled": on, "relaying": relaying})
+    };
+    let listed = |machines: Value| {
+        read_fixture(
+            "GET__local-exec_daemon",
+            &json!({"method": "GET", "path": "/local-exec/daemon", "status": 200,
+                    "body": {"machines": machines}}),
+        )
+    };
+    let before_the_switch = json!({"machineId": "mac_3", "label": "Old", "enrolledAtMs": 1,
+                                   "revoked": false, "connected": false});
+    listed(json!([
+        row("mac_1", true, true),
+        row("mac_2", false, false),
+        before_the_switch
+    ]))
+    .unwrap();
+    let mut not_a_switch = row("mac_1", true, false);
+    not_a_switch["relayEnabled"] = json!("on");
+    assert!(
+        listed(json!([not_a_switch])).is_err(),
+        "a switch that is not true or false is not read as one"
+    );
+
+    daemon_switched(200, &row("mac_1", false, false)).unwrap();
+    let not_a_switch_either = json!({"machineId": "mac_1", "label": "x", "revoked": false,
+                                     "connected": true, "relayEnabled": "no"});
+    assert!(
+        daemon_switched(200, &not_a_switch_either).is_err(),
+        "an answer whose switch is not true or false is caught"
+    );
+    for (status, said, code) in [
+        (404, "no computer of yours has that id", "not_found"),
+        (
+            409,
+            "this computer was revoked; enrol it again to use it",
+            "revoked",
+        ),
+        (400, "relayEnabled must be true or false", "bad_request"),
+    ] {
+        let body = json!({"error": said, "code": code});
+        refusal(status, &body).unwrap_or_else(|why| panic!("{status}: {why}"));
+        let read = OpenGrokClient::refusal(status, &body.to_string());
+        assert_eq!(
+            (read.status, read.message.as_str(), read.code()),
+            (Some(status), said, Some(code))
+        );
+    }
 }
 
 /// Every type and name the server sends has a fixture, or the manifest lists it as unrecorded:

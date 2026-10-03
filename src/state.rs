@@ -30141,6 +30141,8 @@ mod tests {
             mode: LocalExecMode::Ask,
             this_machine: false,
             online: true,
+            relay_enabled: true,
+            relaying: false,
         };
         state.computers = vec![other.clone()];
         assert_eq!(state.this_mac_id(), None);
@@ -30447,6 +30449,8 @@ mod tests {
             mode: LocalExecMode::Ask,
             this_machine: false,
             online: true,
+            relay_enabled: true,
+            relaying: false,
         };
         state.computers = vec![not_this_mac.clone()];
         assert!(state.this_mac_rules().is_none());
@@ -30494,6 +30498,8 @@ mod tests {
             mode: LocalExecMode::Ask,
             this_machine: true,
             online: true,
+            relay_enabled: true,
+            relaying: false,
         }];
         state.local_rules = Some(LocalRules::listed(
             "mac_here".into(),

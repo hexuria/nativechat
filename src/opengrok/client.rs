@@ -1494,6 +1494,8 @@ impl OpenGrokClient {
                 mode: LocalExecMode::from_stored(&stored),
                 this_machine: false,
                 online: machine.connected,
+                relay_enabled: machine.relay_enabled,
+                relaying: machine.relaying,
             });
         }
         Ok(collapse_computers_by_machine_id(computers))
@@ -1505,6 +1507,31 @@ impl OpenGrokClient {
             .await?;
         let body: DaemonList = Self::json_or_error(response).await?;
         Ok(body.machines)
+    }
+
+    /// `PATCH /local-exec/daemon/{machine_id}` `{relayEnabled}`: one computer's own relay switch,
+    /// answered with its row (opengrok-server branch per-computer-relay at d0a9855: `switch_relay`
+    /// in `crates/opengrok-server/src/local_exec.rs`; not recorded yet in `fixtures/wire/`, see
+    /// `REST_NOT_RECORDED_YET`). It names only the caller's own computers, from any computer of the
+    /// account. The server refuses in `{error, code}`, and nothing is switched: `404 not_found`
+    /// ("no computer of yours has that id", the same for another account's computer as for an id
+    /// nobody enrolled), `409 revoked` ("this computer was revoked; enrol it again to use it") and
+    /// `400 bad_request` ("relayEnabled must be true or false"). Switched off, the computer's open
+    /// relay stream is sent `disabled` and closed (`super::relay`).
+    pub async fn switch_computer_relay(
+        &self,
+        machine_id: &str,
+        on: bool,
+    ) -> Result<DaemonMachine, OpenGrokError> {
+        let path = format!("/local-exec/daemon/{}", path_segment(machine_id));
+        let response = self
+            .send_json(
+                reqwest::Method::PATCH,
+                &path,
+                Some(&json!({ "relayEnabled": on })),
+            )
+            .await?;
+        Self::json_or_error(response).await
     }
 
     pub async fn coworker_computer(
@@ -2915,6 +2942,17 @@ pub(super) struct DaemonList {
     pub(super) machines: Vec<DaemonMachine>,
 }
 
+/// One computer of the account as `GET /local-exec/daemon` lists it, and as
+/// `PATCH /local-exec/daemon/{machine_id}` answers: `{machineId, label, enrolledAtMs, revoked,
+/// connected, relayEnabled, relaying}`.
+///
+/// `relayEnabled` and `relaying` are the per-computer relay contract's (opengrok-server branch
+/// per-computer-relay at d0a9855: `row` in `crates/opengrok-server/src/local_exec.rs`; not recorded
+/// yet in `fixtures/wire/`, see `REST_FIELDS_NOT_RECORDED_YET`). `relayEnabled` is the computer's
+/// own relay switch, on for a computer enrolled before the switch existed, so a row without the key
+/// reads on; `relaying` is whether the server holds the computer's relay stream now, which is live
+/// and not a setting, so a row without it reads as not relaying. `connected` is the reverse-exec
+/// link, as it always was.
 #[derive(Debug, Clone, Deserialize)]
 pub struct DaemonMachine {
     #[serde(rename = "machineId")]
@@ -2925,6 +2963,15 @@ pub struct DaemonMachine {
     pub revoked: bool,
     #[serde(default)]
     pub connected: bool,
+    #[serde(rename = "relayEnabled", default = "relay_on_by_default")]
+    pub relay_enabled: bool,
+    #[serde(default)]
+    pub relaying: bool,
+}
+
+/// A computer's relay switch is on until somebody switches it off.
+fn relay_on_by_default() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3694,6 +3741,10 @@ pub struct ConnectedComputer {
     pub mode: LocalExecMode,
     pub this_machine: bool,
     pub online: bool,
+    /// The computer's own relay switch as the server keeps it ([`DaemonMachine::relay_enabled`]).
+    pub relay_enabled: bool,
+    /// The server holds the computer's relay stream now ([`DaemonMachine::relaying`]).
+    pub relaying: bool,
 }
 
 impl ConnectedComputer {
@@ -9626,6 +9677,174 @@ mod tests {
         assert!(computers[0].online);
     }
 
+    /// A computer's row carries its own relay switch and whether the server holds its relay stream
+    /// now, beside what it always carried (opengrok-server branch per-computer-relay at d0a9855,
+    /// `row` in `crates/opengrok-server/src/local_exec.rs`): every field as the server writes it,
+    /// and a row from a server before the switch, which has neither key, reads as switched on and
+    /// not relaying. The roster carries both on, for each computer's card, and leaves a revoked
+    /// computer out, as it always did: the server refuses to switch one (409 `revoked`), so a card
+    /// for it would have nothing to offer.
+    #[tokio::test]
+    async fn a_computers_row_says_its_relay_switch_and_whether_it_relays_now() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/local-exec/daemon"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "machines": [
+                    {"machineId": "mac_1", "label": "Ada's MacBook", "enrolledAtMs": 1790000000000_i64,
+                     "revoked": false, "connected": true, "relayEnabled": true, "relaying": true},
+                    {"machineId": "mac_2", "label": "Studio", "enrolledAtMs": 1790000000001_i64,
+                     "revoked": false, "connected": false, "relayEnabled": false, "relaying": false},
+                    {"machineId": "mac_3", "label": "Old server's", "revoked": false,
+                     "connected": false},
+                    {"machineId": "mac_4", "label": "Revoked", "enrolledAtMs": 1790000000002_i64,
+                     "revoked": true, "connected": false, "relayEnabled": true, "relaying": false}
+                ]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/local-exec/policy"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"mode": "ask"})))
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+
+        let rows = client.list_daemons().await.unwrap();
+        let said: Vec<(&str, bool, bool)> = rows
+            .iter()
+            .map(|row| (row.machine_id.as_str(), row.relay_enabled, row.relaying))
+            .collect();
+        assert_eq!(
+            said,
+            [
+                ("mac_1", true, true),
+                ("mac_2", false, false),
+                ("mac_3", true, false),
+                ("mac_4", true, false)
+            ],
+            "a row with neither key reads on and not relaying"
+        );
+        assert!(rows[3].revoked, "the list says which are revoked");
+        let said: Vec<(&str, bool, bool)> = said.into_iter().take(3).collect();
+
+        let computers = client.list_computers().await.unwrap();
+        let carried: Vec<(&str, bool, bool)> = computers
+            .iter()
+            .map(|computer| {
+                (
+                    computer.machine_id.as_str(),
+                    computer.relay_enabled,
+                    computer.relaying,
+                )
+            })
+            .collect();
+        assert_eq!(carried, said, "the roster carries them for the cards");
+    }
+
+    /// A computer's relay switch is one PATCH of `{relayEnabled}` to that computer's id, the same
+    /// for any computer of the account, and the server answers the computer's row as it stands
+    /// after: switched off, no longer relaying. Nothing else is in the body.
+    #[tokio::test]
+    async fn a_computers_relay_switch_is_a_patch_of_relay_enabled_and_answers_its_row() {
+        let server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .and(path("/local-exec/daemon/mac_2"))
+            .and(body_json(json!({ "relayEnabled": false })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "machineId": "mac_2", "label": "Studio", "enrolledAtMs": 1790000000001_i64,
+                "revoked": false, "connected": true, "relayEnabled": false, "relaying": false
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path("/local-exec/daemon/mac_2"))
+            .and(body_json(json!({ "relayEnabled": true })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "machineId": "mac_2", "label": "Studio", "enrolledAtMs": 1790000000001_i64,
+                "revoked": false, "connected": true, "relayEnabled": true, "relaying": true
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+
+        let off = client.switch_computer_relay("mac_2", false).await.unwrap();
+        assert_eq!(
+            (off.machine_id.as_str(), off.relay_enabled, off.relaying),
+            ("mac_2", false, false)
+        );
+        let on = client.switch_computer_relay("mac_2", true).await.unwrap();
+        assert_eq!((on.relay_enabled, on.relaying), (true, true));
+    }
+
+    /// What the server refuses a switch with is read as its words and its code, each as the server
+    /// writes them (`switch_relay` at d0a9855): another account's computer and one nobody enrolled
+    /// are the same 404 `not_found`, a revoked one 409 `revoked`, and a body without a true or
+    /// false 400 `bad_request`. An id with a slash in it cannot turn the route into another.
+    #[tokio::test]
+    async fn a_refused_relay_switch_reads_the_servers_words_and_code() {
+        let server = MockServer::start().await;
+        for (id, status, words, code) in [
+            (
+                "mac_theirs",
+                404,
+                "no computer of yours has that id",
+                "not_found",
+            ),
+            (
+                "mac_old",
+                409,
+                "this computer was revoked; enrol it again to use it",
+                "revoked",
+            ),
+            (
+                "mac_odd",
+                400,
+                "relayEnabled must be true or false",
+                "bad_request",
+            ),
+        ] {
+            Mock::given(method("PATCH"))
+                .and(path(format!("/local-exec/daemon/{id}")))
+                .respond_with(
+                    ResponseTemplate::new(status)
+                        .set_body_json(json!({ "error": words, "code": code })),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+            let client = OpenGrokClient::new(&server.uri()).unwrap();
+            let refused = client.switch_computer_relay(id, false).await.unwrap_err();
+            assert_eq!(refused.status, Some(status), "{id}");
+            assert_eq!(refused.message, words, "{id}");
+            assert_eq!(refused.code(), Some(code), "{id}");
+            assert!(refused.written_by_opengrok(), "{id}");
+        }
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        let odd = client
+            .switch_computer_relay("../account", true)
+            .await
+            .unwrap_err();
+        assert!(
+            odd.status.is_some(),
+            "an id that is not a path is a refusal, never another route's answer"
+        );
+        let asked: Vec<String> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|request| request.url.path().to_string())
+            .collect();
+        assert_eq!(
+            asked.last().map(String::as_str),
+            Some("/local-exec/daemon/..%2Faccount"),
+            "{asked:?}"
+        );
+    }
+
     /// Always on the local shell's card posts one rule for the command on it. A rule the server
     /// will not keep comes back as a 422 whose body is the reason, and the reason is what the
     /// card shows (opengrok-server `add_rule` in `crates/opengrok-server/src/local_exec.rs`).
@@ -9782,6 +10001,8 @@ mod tests {
             mode,
             this_machine,
             online,
+            relay_enabled: true,
+            relaying: false,
         }
     }
 
