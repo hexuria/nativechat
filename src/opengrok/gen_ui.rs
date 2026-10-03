@@ -2254,7 +2254,7 @@ fn clip(text: &str, max: usize) -> String {
 }
 
 /// What a secret-looking value reads as on the server's card (opengrok-tools `review.rs`).
-const REDACTED: &str = "«redacted»";
+pub(crate) const REDACTED: &str = "«redacted»";
 
 /// The server's own test for a key-shaped string (opengrok-tools `review.rs`
 /// `looks_like_a_secret`): a known key prefix, or one long run of token characters with no
