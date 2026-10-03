@@ -20,8 +20,8 @@ use crate::opengrok::{
     OpenGrokError, PendingCustom, PendingOp, PendingUserMessage, PendingWrite, PlanFallback,
     ProfileUpdate, QueuedApproval, RecipeDetail, RecipeKind, RecipeParameter, RecipeRun,
     RecipeRunResult, RecipeShareTarget, RecipeStep, RecipeSummary, RelayHandle, RelayKey,
-    RelayReport, RelayStatus, RelayTarget, RelayTimings, ReplyQuote, ReplySource, RunCause,
-    RunErrorCode, RunRecipeResponse, RunReplay, SKILL_BODY_CHARS, SKILL_BUNDLE_FILES,
+    RelayReport, RelayStatus, RelayTarget, RelayTimings, ReplyQuote, ReplySource, RoutineChanges,
+    RunCause, RunErrorCode, RunRecipeResponse, RunReplay, SKILL_BODY_CHARS, SKILL_BUNDLE_FILES,
     SKILL_BUNDLE_LIMIT, SaveLoginSpec, ScheduleEdit, ScheduleKind, ScheduleRow, ScheduleRun,
     ScheduleRunStatus, ScreenshotSpec, SkillDetail, SkillFile, SkillPatch, SkillSource,
     SkillSummary, ThreadListing, ThreadReplay, ThreadRun, ToolCallTracker, TurnAssembler,
@@ -2111,8 +2111,39 @@ pub struct ComputerRelaySwitch {
 struct ComputerRelaySend {
     client: OpenGrokClient,
     machine_id: String,
+    /// The computer's other enrolments, which its card stands for and its switch moves with it
+    /// ([`ConnectedComputer::folded`]).
+    folded: Vec<String>,
     on: bool,
     token: u64,
+}
+
+impl ComputerRelaySend {
+    /// The switch, to the server: the card's own computer first, and once the server has kept
+    /// that, each enrolment folded into the card, the same way. The answer is the card's own
+    /// computer's, and only that decides what the card says: a stale enrolment the server no
+    /// longer knows (404) or that was revoked since the roster was read (409) has nothing left to
+    /// switch, and the person never saw it, so nothing is said of it. A card the server refused
+    /// switches none of them: they only ever go where the card went.
+    async fn switch(&self) -> Result<DaemonMachine, OpenGrokError> {
+        let answer = self
+            .client
+            .switch_computer_relay(&self.machine_id, self.on)
+            .await;
+        if answer.is_ok() {
+            for stale in &self.folded {
+                match self.client.switch_computer_relay(stale, self.on).await {
+                    Err(error) if !matches!(error.status, Some(404 | 409)) => eprintln!(
+                        "NativeChat: an older enrolment of this computer ({stale}) was not \
+                         switched: {}",
+                        error.message
+                    ),
+                    _ => {}
+                }
+            }
+        }
+        answer
+    }
 }
 
 /// What follows a computer's relay switch's answer ([`AppState::settle_computer_relay`]).
@@ -5130,6 +5161,11 @@ pub struct AppState {
     /// can both have one out, and an older page that missed a run must not delete the line a
     /// newer one already settled.
     routine_runs_asked: HashMap<String, u64>,
+    /// A read of the open Bot's routines is out because a Bot changed them in a turn
+    /// ([`Self::routines_changed`]), and whether another change asked for one meanwhile, which
+    /// goes when it lands: one at a time, as the Computer pane's status request is.
+    routines_reread_in_flight: bool,
+    routines_reread_again: bool,
     /// The latest edit started for each routine, kept after it settles. A read of the server's
     /// copy started before it is older than what it saved, and is dropped.
     routine_latest_edit: HashMap<String, u64>,
@@ -5137,6 +5173,11 @@ pub struct AppState {
     /// edit's answer, or a refused edit put back), so the editor's fields follow it. Per routine
     /// because an answer for one must leave another's half-typed fields alone.
     routine_resyncs: HashMap<String, u64>,
+    /// Per routine, bumped whenever a read of the list brings a server copy of it that differs from
+    /// the last one (a Bot changed it in chat): the open editor's fields follow it where the person
+    /// has not typed over them, and keep what they typed where they have
+    /// ([`Self::routine_relist`]).
+    routine_relists: HashMap<String, u64>,
     /// What this server has shown it cannot do with a routine. Forgotten with the client, when
     /// the app is pointed at a server again (`set_config`).
     pub routine_routes_missing: RoutineRoutesMissing,
@@ -5888,8 +5929,11 @@ impl AppState {
             routine_edits: HashMap::new(),
             routine_seq: 0,
             routine_runs_asked: HashMap::new(),
+            routines_reread_in_flight: false,
+            routines_reread_again: false,
             routine_latest_edit: HashMap::new(),
             routine_resyncs: HashMap::new(),
+            routine_relists: HashMap::new(),
             routine_routes_missing: RoutineRoutesMissing::default(),
             routine_unsaved: HashMap::new(),
             routine_history_open: false,
@@ -11962,6 +12006,17 @@ impl AppState {
             .unwrap_or_default()
     }
 
+    /// How many times a read of the list has brought a new server copy of this routine, which the
+    /// editor's fields take only where the person has not typed over them: unlike an answer to
+    /// the person's own edit ([`Self::routine_resync`]), it is news from elsewhere, and what they
+    /// are typing is theirs until they save it.
+    pub fn routine_relist(&self, routine_id: &str) -> u64 {
+        self.routine_relists
+            .get(routine_id)
+            .copied()
+            .unwrap_or_default()
+    }
+
     /// Put back the server's copy of a routine after it refused an edit, so the editor stops
     /// showing words that were never saved. Only this routine, and not over an edit started
     /// since, whether that one is still out or has already landed: this read began before it,
@@ -12174,36 +12229,129 @@ impl AppState {
         cx.spawn(async move |this, cx| {
             let result = client.list_schedules(&coworker_id).await;
             let _ = this.update(cx, |state, cx| {
-                // A late answer for a bot the person has since left is stale.
-                if state.active_coworker_id.as_deref() != Some(coworker_id.as_str()) {
-                    return;
+                if state.take_routines(coworker_id, result) {
+                    cx.notify();
                 }
-                match result {
-                    Ok(rows) => {
-                        // A draft has no trigger, which means it has never been to the server,
-                        // which means no listing can know about it. Somebody is writing it.
-                        let mut routines: Vec<AgentRoutine> = state
-                            .routines
-                            .get(&coworker_id)
-                            .map(|rows| {
-                                rows.iter()
-                                    .filter(|row| row.triggers.is_empty())
-                                    .cloned()
-                                    .collect()
-                            })
-                            .unwrap_or_default();
-                        routines.extend(relisted(
-                            state.routines.get(&coworker_id).map(Vec::as_slice),
-                            rows,
-                        ));
-                        state.routines.insert(coworker_id, routines);
-                    }
-                    Err(error) => state.computer_action_error = Some(routine_trouble(&error)),
-                }
-                cx.notify();
             });
         })
         .detach();
+    }
+
+    /// A read of a Bot's routines landing, and whether it was put on screen: not for a Bot the
+    /// person has since left, whose answer is stale. A routine whose server copy moved since the
+    /// last read (a Bot changed it in chat) tells the open editor so ([`Self::routine_relist`]);
+    /// and one the read no longer lists was deleted elsewhere, so its panel, if open, closes back to
+    /// the list, as the person's own delete closes it.
+    fn take_routines(
+        &mut self,
+        coworker_id: String,
+        result: Result<Vec<ScheduleRow>, OpenGrokError>,
+    ) -> bool {
+        if self.active_coworker_id.as_deref() != Some(coworker_id.as_str()) {
+            return false;
+        }
+        match result {
+            Ok(rows) => {
+                let before = self.routines.remove(&coworker_id).unwrap_or_default();
+                let listed = relisted(Some(before.as_slice()), rows);
+                for routine in &listed {
+                    let moved = before
+                        .iter()
+                        .find(|row| row.id == routine.id)
+                        .is_some_and(|row| row.saved != routine.saved);
+                    if moved {
+                        *self.routine_relists.entry(routine.id.clone()).or_default() += 1;
+                    }
+                }
+                if let ComputerView::Editor { id: Some(open) } = &self.computer_view {
+                    let was_on_the_server = before
+                        .iter()
+                        .any(|row| &row.id == open && row.saved.is_some());
+                    if was_on_the_server && !listed.iter().any(|row| &row.id == open) {
+                        self.routine_unsaved.remove(open);
+                        self.computer_view = ComputerView::Overview;
+                    }
+                }
+                // A draft has no trigger, which means it has never been to the server, which
+                // means no listing can know about it. Somebody is writing it.
+                let mut routines: Vec<AgentRoutine> = before
+                    .into_iter()
+                    .filter(|row| row.triggers.is_empty())
+                    .collect();
+                routines.extend(listed);
+                self.routines.insert(coworker_id, routines);
+            }
+            Err(error) => self.computer_action_error = Some(routine_trouble(&error)),
+        }
+        true
+    }
+
+    /// A Bot made, changed, deleted or ran one of the person's routines in a turn
+    /// ([`RoutineChanges`]), and the server has it already. The open Bot's Routines list is read
+    /// again, and once it lands, the history of the routine open in the Computer pane, so neither
+    /// waits for the person to switch Bots and back. It is the open Bot's list whichever Bot's turn
+    /// it was: a Bot can make a routine for another of its person's Bots.
+    ///
+    /// One read at a time: a change answered while a read is out asks for one more when it lands,
+    /// so the list ends on what the server has after the last of them, and a turn that makes five
+    /// routines sends no five reads to race each other.
+    fn routines_changed(&mut self, cx: &mut Context<Self>) {
+        let (Some(client), Some(coworker_id)) =
+            (self.opengrok.clone(), self.active_coworker_id.clone())
+        else {
+            return;
+        };
+        if !self.begin_routines_reread() {
+            return;
+        }
+        cx.spawn(async move |this, cx| {
+            let result = client.list_schedules(&coworker_id).await;
+            let _ = this.update(cx, |state, cx| {
+                if state.settle_routines_reread() {
+                    state.routines_changed(cx);
+                }
+                if state.take_routines(coworker_id, result) {
+                    state.read_open_routines_history(cx);
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// The history of the routine open in the Computer pane, read again after a read of the list
+    /// that still lists it: a run a Bot started is a line of it. A routine the read no longer lists
+    /// has had its panel closed, and has no history left to ask for.
+    fn read_open_routines_history(&mut self, cx: &mut Context<Self>) {
+        if self.right_pane != RightPane::Computer {
+            return;
+        }
+        if let (
+            Some(coworker_id),
+            ComputerView::Editor {
+                id: Some(routine_id),
+            },
+        ) = (self.active_coworker_id.clone(), self.computer_view.clone())
+        {
+            self.load_routine_runs(&coworker_id, &routine_id, cx);
+        }
+    }
+
+    /// Whether a read of the routines may go out now. One is out already: this one is kept as
+    /// "again", and goes when that answer lands.
+    fn begin_routines_reread(&mut self) -> bool {
+        if self.routines_reread_in_flight {
+            self.routines_reread_again = true;
+            return false;
+        }
+        self.routines_reread_in_flight = true;
+        true
+    }
+
+    /// The read's answer landed. True when another was asked for meanwhile, to send now.
+    fn settle_routines_reread(&mut self) -> bool {
+        self.routines_reread_in_flight = false;
+        std::mem::take(&mut self.routines_reread_again)
     }
 
     /// Put a routine on the server outright: a prompt and a way of firing it, no draft in
@@ -15341,6 +15489,7 @@ impl AppState {
                         );
                     }
                     let mut tracker = ToolCallTracker::default();
+                    let mut routine_changes = RoutineChanges::default();
                     let mut assembler = TurnAssembler::default();
                     let mut last_stream_paint: Option<Instant> = None;
                     let mut last_stream_sig = (0usize, 0u8);
@@ -15359,6 +15508,11 @@ impl AppState {
                             retry_of.as_deref(),
                             turn_source,
                             |event, arrived_at| {
+                                // A routine the Bot made, changed, deleted or ran is the server's
+                                // the moment the call answers, whatever becomes of the turn.
+                                if routine_changes.answered(event) {
+                                    let _ = this.update(cx, |state, cx| state.routines_changed(cx));
+                                }
                                 match tracker.tick(event) {
                                     ActivityTick::Keep => {}
                                     tick => {
@@ -16252,6 +16406,10 @@ impl AppState {
             // When each call's end and answer first came back, so the calls this poll saw
             // happen can say how long they took.
             let mut arrivals = FrameArrivals::default();
+            // The routines the run changed, read off each frame once: every poll brings the run's
+            // frames from its first, and how many have been read is where the next poll goes on.
+            let mut routine_changes = RoutineChanges::default();
+            let mut frames_read = 0usize;
             for _ in 0..400 {
                 if registered {
                     let settled = this
@@ -16270,6 +16428,18 @@ impl AppState {
                 match client.replay_run(&run_id).await {
                     Ok(replay) => {
                         arrivals.note(&replay.events, Instant::now());
+                        let changed = replay
+                            .events
+                            .get(frames_read..)
+                            .unwrap_or_default()
+                            .iter()
+                            .filter(|frame| routine_changes.answered(frame))
+                            .count()
+                            > 0;
+                        frames_read = frames_read.max(replay.events.len());
+                        if changed {
+                            let _ = this.update(cx, |state, cx| state.routines_changed(cx));
+                        }
                         // The status counts as news of its own: the frame that ends a run is
                         // often one the last poll already saw, and a run that stopped holding
                         // its text back has words to show for it even when nothing new arrived.
@@ -20992,10 +21162,12 @@ impl AppState {
 
     /// One computer's relay switch, from its card: `PATCH /local-exec/daemon/{machine_id}
     /// {relayEnabled}`, the computer's own, whichever computer this is (a switch can be moved
-    /// from any of the person's computers, and the server tells the one it moves). The card draws
-    /// the switch where the click asked to take it while the server is asked, and the server's
-    /// answer is the computer's row from then on: a refusal leaves the row as it was, so the switch
-    /// goes back, with the server's words under it ([`Self::computer_relay_note`]).
+    /// from any of the person's computers, and the server tells the one it moves), and the same
+    /// for each enrolment of that computer the roster folds into its card, which has no card to be
+    /// switched from ([`ConnectedComputer::folded`]). The card draws the switch where the click
+    /// asked to take it while the server is asked, and the server's answer for the card's own
+    /// computer is its row from then on: a refusal leaves the row as it was, so the switch goes
+    /// back, with the server's words under it ([`Self::computer_relay_note`]).
     ///
     /// Switched on, this computer's relay looks at its row at once, and the account's way to the
     /// plan is pointed at the relay if it is not that already ([`Self::begin_relay_change`]).
@@ -21006,10 +21178,7 @@ impl AppState {
         };
         cx.notify();
         cx.spawn(async move |this, cx| {
-            let answer = send
-                .client
-                .switch_computer_relay(&send.machine_id, send.on)
-                .await;
+            let answer = send.switch().await;
             let _ = this.update(cx, |state, cx| {
                 match state.settle_computer_relay(&send.machine_id, send.token, answer) {
                     AfterComputerRelay::Dropped | AfterComputerRelay::Refused => {}
@@ -21030,10 +21199,13 @@ impl AppState {
     /// that has moved since, and goes.
     fn begin_computer_relay(&mut self, machine_id: &str, on: bool) -> Option<ComputerRelaySend> {
         let client = self.opengrok.clone()?;
-        if !self.is_signed_in()
-            || self.computer_relay_switches.contains_key(machine_id)
-            || !self.computers.iter().any(|c| c.machine_id == machine_id)
-        {
+        let folded = self
+            .computers
+            .iter()
+            .find(|c| c.machine_id == machine_id)?
+            .folded
+            .clone();
+        if !self.is_signed_in() || self.computer_relay_switches.contains_key(machine_id) {
             return None;
         }
         self.computer_relay_switch_count += 1;
@@ -21051,6 +21223,7 @@ impl AppState {
         Some(ComputerRelaySend {
             client,
             machine_id: machine_id.to_string(),
+            folded,
             on,
             token,
         })
@@ -27838,6 +28011,386 @@ mod tests {
         server
     }
 
+    // ---- A routine a Bot changes in chat is on screen when its call answers ---------------------
+
+    /// One of Ada's routines as `GET /schedules` lists it (opengrok-server #342, as recorded in
+    /// `fixtures/wire/rest/GET__schedules/200-a_bot_runs_a_routine_by_its_id_and_its_history_names_the_bot.json`).
+    fn adas_schedule(id: &str, name: &str) -> serde_json::Value {
+        json!({"id": id, "coworkerId": "cw_1", "name": name, "cron": "0 0 9 * * MON-FRI",
+               "prompt": "post the standup", "kind": "cron", "active": true,
+               "nextDueMs": 1_790_000_000_000_i64,
+               "runLimits": {"maxRounds": null, "maxComputerRounds": null, "maxWallMs": null},
+               "lastRun": null, "tz": "UTC"})
+    }
+
+    /// The frames of one Bot turn that calls `tool` with `arguments`, which answers `ok` with
+    /// `answered`, and says so; as the server streams a builtin's call (the recorded run in
+    /// `fixtures/wire/rest/GET__ag-ui_threads__thread_id_/200-a_bot_runs_a_routine_by_its_id_and_its_history_names_the_bot.json`).
+    fn a_turn_calling(tool: &str, arguments: &str, answered: &str) -> Vec<serde_json::Value> {
+        vec![
+            json!({"type": "RUN_STARTED", "threadId": "cw_1", "runId": "run_turn"}),
+            json!({"type": "TOOL_CALL_START", "toolCallId": "call-routine", "toolCallName": tool}),
+            json!({"type": "TOOL_CALL_ARGS", "toolCallId": "call-routine", "delta": arguments}),
+            json!({"type": "TOOL_CALL_END", "toolCallId": "call-routine"}),
+            json!({"type": "TOOL_CALL_RESULT", "toolCallId": "call-routine", "ok": true,
+                   "content": answered}),
+            json!({"type": "TEXT_MESSAGE_START", "messageId": "m_said", "role": "assistant"}),
+            json!({"type": "TEXT_MESSAGE_CONTENT", "messageId": "m_said", "delta": "Done."}),
+            json!({"type": "TEXT_MESSAGE_END", "messageId": "m_said"}),
+            json!({"type": "RUN_FINISHED", "threadId": "cw_1", "runId": "run_turn"}),
+        ]
+    }
+
+    /// A window signed in to `server` with Ada (`cw_1`) open on her thread, holding `routines` as
+    /// her routines, and `server` answering every turn with `frames` and every read of Ada's
+    /// routines with `listed`.
+    fn adas_window(
+        cx: &mut gpui_kit::TestAppContext,
+        runtime: &tokio::runtime::Runtime,
+        server: &wiremock::MockServer,
+        frames: &[serde_json::Value],
+        listed: serde_json::Value,
+        routines: Vec<super::AgentRoutine>,
+    ) -> gpui_kit::Entity<AppState> {
+        use gpui_kit::AppContext as _;
+        use wiremock::matchers::{method, path, query_param};
+        let stream: String = frames
+            .iter()
+            .map(|frame| format!("data: {frame}\n\n"))
+            .collect();
+        let client = runtime.block_on(async {
+            wiremock::Mock::given(method("POST"))
+                .and(path("/ag-ui"))
+                .respond_with(
+                    wiremock::ResponseTemplate::new(200)
+                        .insert_header("content-type", "text/event-stream")
+                        .set_body_string(stream),
+                )
+                .mount(server)
+                .await;
+            wiremock::Mock::given(method("GET"))
+                .and(path("/schedules"))
+                .and(query_param("coworker", "cw_1"))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(listed))
+                .mount(server)
+                .await;
+            client_signed_in_to(server).await
+        });
+        let mut state = signed_in_state();
+        state.opengrok = Some(client);
+        with_bot(&mut state, json!("gateway"));
+        state.conversations.push(thread("cw_1", Vec::new()));
+        state.active_conversation_id = Some("cw_1".into());
+        state.routines.insert("cw_1".into(), routines);
+        cx.new(|_| state)
+    }
+
+    /// A Bot asked in chat makes a routine with `create_routine` (opengrok-server #316:
+    /// `crates/opengrok-tools/src/routine.rs`), and the server has it the moment the call answers.
+    /// The Routines list is read again then, once, and lists it, with nobody switching Bots and back
+    /// for the list to be read.
+    #[gpui_kit::test]
+    fn a_routine_a_bot_makes_in_a_turn_is_listed_when_its_call_answers(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        let runtime = a_runtime_for_the_relay(cx);
+        let _enter = runtime.enter();
+        let server = runtime.block_on(wiremock::MockServer::start());
+        let frames = a_turn_calling(
+            "create_routine",
+            r#"{"name":"Standup","prompt":"post the standup","when":{"cron":"0 9 * * MON-FRI"}}"#,
+            r#"{"id":"sched_new","name":"Standup"}"#,
+        );
+        let listed = json!([adas_schedule("sched_new", "Standup")]);
+        let app = adas_window(cx, &runtime, &server, &frames, listed, Vec::new());
+        app.update(cx, |state, cx| {
+            state.send_message("Make me a standup routine at 9 on weekdays".into(), cx)
+        });
+        wait_for(cx, "the Bot's new routine is listed", |cx| {
+            app.read_with(cx, |state, _| {
+                state
+                    .coworker_routines("cw_1")
+                    .iter()
+                    .any(|routine| routine.id == "sched_new" && routine.name == "Standup")
+            })
+        });
+        assert_eq!(asked_for(&runtime, &server, "/schedules"), 1);
+    }
+
+    /// A Bot running a routine (`run_routine`, opengrok-server #337, built in #342) starts a run
+    /// the routine's history lists at once. With that routine open in the Computer pane, on its
+    /// history, the list and the history are both read again when the call answers, and the
+    /// history shows the Bot's run.
+    #[gpui_kit::test]
+    fn a_run_a_bot_starts_is_in_the_open_routines_history_when_its_call_answers(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        let runtime = a_runtime_for_the_relay(cx);
+        let _enter = runtime.enter();
+        let server = runtime.block_on(wiremock::MockServer::start());
+        runtime.block_on(
+            wiremock::Mock::given(wiremock::matchers::method("GET"))
+                .and(wiremock::matchers::path("/schedules/sched_1/runs"))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!([{
+                    "runId": "run_bot", "cause": "bot", "status": "ok",
+                    "startedAtMs": 1_790_000_000_000_i64, "endedAtMs": 1_790_000_001_000_i64,
+                    "by": {"coworkerId": "cw_1", "name": "Ada"}
+                }])))
+                .mount(&server),
+        );
+        let frames = a_turn_calling(
+            "run_routine",
+            r#"{"routine":"sched_1"}"#,
+            r#"{"runId":"run_bot","threadId":"sched_1"}"#,
+        );
+        let standup = adas_schedule("sched_1", "Standup");
+        let routine = super::routine_from_schedule(
+            serde_json::from_value(standup.clone()).expect("a routine"),
+        );
+        let app = adas_window(
+            cx,
+            &runtime,
+            &server,
+            &frames,
+            json!([standup]),
+            vec![routine],
+        );
+        app.update(cx, |state, cx| {
+            state.right_pane = super::RightPane::Computer;
+            state.computer_view = super::ComputerView::Editor {
+                id: Some("sched_1".into()),
+            };
+            state.routine_history_open = true;
+            state.send_message("Run my standup now".into(), cx)
+        });
+        wait_for(cx, "the Bot's run is in the history", |cx| {
+            app.read_with(cx, |state, _| {
+                state.coworker_routines("cw_1").iter().any(|routine| {
+                    routine.id == "sched_1"
+                        && routine
+                            .runs
+                            .iter()
+                            .any(|run| run.by.as_deref() == Some("Ada"))
+                })
+            })
+        });
+        assert_eq!(asked_for(&runtime, &server, "/schedules/sched_1/runs"), 1);
+        wait_for(cx, "the list is read again too", |_| {
+            asked_for(&runtime, &server, "/schedules") == 1
+        });
+    }
+
+    /// A delete always asks first (opengrok-server #316), so its call is answered in the run that
+    /// carries on after the person's yes, which this window follows through the replay route
+    /// ([`AppState::follow_run`]). The call's first answer, `waiting for approval`, deleted nothing
+    /// (`ok: false`, opengrok-tools `ToolResult::awaiting`) and the second did: the Routines list
+    /// is read again once, then, and the routine is gone from it; and its panel, open in the
+    /// Computer pane, closes back to the list, as the person's own delete closes it.
+    #[gpui_kit::test]
+    fn a_routine_a_bot_deletes_after_a_yes_leaves_the_list_when_its_call_answers(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        let runtime = a_runtime_for_the_relay(cx);
+        let _enter = runtime.enter();
+        let server = runtime.block_on(wiremock::MockServer::start());
+        let events = json!([
+            {"type": "RUN_STARTED", "threadId": "cw_1", "runId": "run_del"},
+            {"type": "TOOL_CALL_START", "toolCallId": "call-routine",
+             "toolCallName": "delete_routine"},
+            {"type": "TOOL_CALL_ARGS", "toolCallId": "call-routine",
+             "delta": r#"{"routine":"sched_1"}"#},
+            {"type": "TOOL_CALL_END", "toolCallId": "call-routine"},
+            {"type": "TOOL_CALL_RESULT", "toolCallId": "call-routine", "ok": false,
+             "content": "waiting for approval: Delete the routine \"Standup\"? It stops for good."},
+            {"type": "CUSTOM", "name": "run-awaiting-approval", "threadId": "cw_1",
+             "runId": "run_del", "callId": "call-routine", "tool": "delete_routine",
+             "arguments": {"routine": "sched_1"}, "reason": "policy-approval",
+             "why": "Delete the routine \"Standup\"? It stops for good.",
+             "summary": "Delete the routine sched_1"},
+            {"type": "TOOL_CALL_RESULT", "toolCallId": "call-routine", "ok": true,
+             "content": "deleted the routine Standup"},
+            {"type": "RUN_FINISHED", "threadId": "cw_1", "runId": "run_del"}
+        ]);
+        runtime.block_on(
+            wiremock::Mock::given(wiremock::matchers::method("GET"))
+                .and(wiremock::matchers::path("/ag-ui/runs/run_del"))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
+                    "runId": "run_del", "status": "finished",
+                    "startedAtMs": 1_790_000_000_000_i64, "events": events
+                })))
+                .mount(&server),
+        );
+        let routine = super::routine_from_schedule(
+            serde_json::from_value(adas_schedule("sched_1", "Standup")).expect("a routine"),
+        );
+        let app = adas_window(cx, &runtime, &server, &[], json!([]), vec![routine]);
+        app.update(cx, |state, cx| {
+            state.right_pane = super::RightPane::Computer;
+            state.computer_view = super::ComputerView::Editor {
+                id: Some("sched_1".into()),
+            };
+            state.follow_run("run_del".into(), Some("cw_1".into()), cx)
+        });
+        wait_for(cx, "the deleted routine leaves the list", |cx| {
+            app.read_with(cx, |state, _| state.coworker_routines("cw_1").is_empty())
+        });
+        assert_eq!(asked_for(&runtime, &server, "/schedules"), 1);
+        assert_eq!(
+            app.read_with(cx, |state, _| state.computer_view.clone()),
+            super::ComputerView::Overview,
+            "its panel closes back to the list"
+        );
+    }
+
+    /// Ada with her Standup routine open in the Computer pane, drawn in a window, against `server`,
+    /// which answers every turn with `frames`, every read of her routines with `listed`, and every
+    /// read of the routine's history with one run of the Bot's.
+    fn adas_standup_open_in_a_window<'a>(
+        cx: &'a mut gpui_kit::TestAppContext,
+        runtime: &tokio::runtime::Runtime,
+        server: &wiremock::MockServer,
+        frames: &[serde_json::Value],
+        listed: serde_json::Value,
+    ) -> (
+        gpui_kit::Entity<AppState>,
+        gpui_kit::Entity<crate::components::computer::ComputerPane>,
+        &'a mut gpui_kit::VisualTestContext,
+    ) {
+        cx.update(gpui_kit::init);
+        runtime.block_on(
+            wiremock::Mock::given(wiremock::matchers::method("GET"))
+                .and(wiremock::matchers::path("/schedules/sched_1/runs"))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!([{
+                    "runId": "run_bot", "cause": "bot", "status": "ok",
+                    "startedAtMs": 1_790_000_000_000_i64, "endedAtMs": 1_790_000_001_000_i64,
+                    "by": {"coworkerId": "cw_1", "name": "Ada"}
+                }])))
+                .mount(server),
+        );
+        let routine = super::routine_from_schedule(
+            serde_json::from_value(adas_schedule("sched_1", "Standup")).expect("a routine"),
+        );
+        let app = adas_window(cx, runtime, server, frames, listed, vec![routine]);
+        app.update(cx, |state, _| {
+            state.right_pane = super::RightPane::Computer;
+            state.computer_view = super::ComputerView::Editor {
+                id: Some("sched_1".into()),
+            };
+        });
+        let (pane, window) = cx.add_window_view({
+            let app = app.clone();
+            move |window, cx| crate::components::computer::ComputerPane::new(window, app, cx)
+        });
+        window.simulate_resize(gpui_kit::size(gpui_kit::px(320.), gpui_kit::px(2400.)));
+        window.update(|window, cx| window.draw(cx).clear(cx));
+        (app, pane, window)
+    }
+
+    /// The Standup routine as `update_routine` left it on the server: a new name and instruction.
+    fn adas_standup_renamed() -> serde_json::Value {
+        let mut renamed = adas_schedule("sched_1", "Daily standup");
+        renamed["prompt"] = json!("post the standup in #team");
+        renamed
+    }
+
+    /// A Bot renames a routine in chat with `update_routine` (opengrok-server #316:
+    /// `crates/opengrok-tools/src/routine.rs`). When the call answers, the list is read again, once,
+    /// and the routine's row takes the server's new name; its panel, open in the Computer pane with
+    /// nothing typed in it, takes the new name and instruction into its fields.
+    #[gpui_kit::test]
+    fn a_routine_a_bot_renames_takes_its_new_name_on_its_row_and_in_its_open_panel(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        let runtime = a_runtime_for_the_relay(cx);
+        let _enter = runtime.enter();
+        let server = runtime.block_on(wiremock::MockServer::start());
+        let frames = a_turn_calling(
+            "update_routine",
+            r#"{"routine":"sched_1","name":"Daily standup","prompt":"post the standup in #team"}"#,
+            r#"{"id":"sched_1","name":"Daily standup"}"#,
+        );
+        let listed = json!([adas_standup_renamed()]);
+        let (app, pane, window) =
+            adas_standup_open_in_a_window(cx, &runtime, &server, &frames, listed);
+        assert_eq!(
+            pane.read_with(window, |pane, cx| pane.routine_fields(cx)),
+            ("Standup".to_string(), "post the standup".to_string())
+        );
+        app.update(window, |state, cx| {
+            state.send_message("Call my standup routine Daily standup".into(), cx)
+        });
+        wait_for(window, "the row takes the new name", |cx| {
+            app.read_with(cx, |state, _| {
+                state.coworker_routines("cw_1")[0].name == "Daily standup"
+            })
+        });
+        window.update(|window, cx| window.draw(cx).clear(cx));
+        assert_eq!(
+            pane.read_with(window, |pane, cx| pane.routine_fields(cx)),
+            (
+                "Daily standup".to_string(),
+                "post the standup in #team".to_string()
+            ),
+            "the open panel takes the server's copy"
+        );
+        assert_eq!(asked_for(&runtime, &server, "/schedules"), 1);
+        wait_for(window, "the open routine's history is read again", |cx| {
+            app.read_with(cx, |state, _| {
+                !state.coworker_routines("cw_1")[0].runs.is_empty()
+            })
+        });
+    }
+
+    /// The same rename while the person is typing in the panel's Name field: what they typed stays
+    /// in it, for their own Save or the next read to settle, and is never written over; the row in
+    /// the list takes the server's new name, and the Instruction field, which they have not typed
+    /// in, takes the server's new instruction.
+    #[gpui_kit::test]
+    fn a_field_the_person_is_typing_in_keeps_their_words_when_a_bot_changes_the_routine(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        let runtime = a_runtime_for_the_relay(cx);
+        let _enter = runtime.enter();
+        let server = runtime.block_on(wiremock::MockServer::start());
+        let frames = a_turn_calling(
+            "update_routine",
+            r#"{"routine":"sched_1","name":"Daily standup","prompt":"post the standup in #team"}"#,
+            r#"{"id":"sched_1","name":"Daily standup"}"#,
+        );
+        let listed = json!([adas_standup_renamed()]);
+        let (app, pane, window) =
+            adas_standup_open_in_a_window(cx, &runtime, &server, &frames, listed);
+        let name = window.debug_bounds("routine-name").expect("the Name field");
+        window.simulate_mouse_move(name.center(), None, gpui_kit::Modifiers::none());
+        window.simulate_click(name.center(), gpui_kit::Modifiers::none());
+        window.simulate_input(" for the team");
+        let typed = pane.read_with(window, |pane, cx| pane.routine_fields(cx)).0;
+        assert!(
+            typed.contains(" for the team") && typed != "Standup",
+            "typed into the field: {typed:?}"
+        );
+
+        app.update(window, |state, cx| {
+            state.send_message("Call my standup routine Daily standup".into(), cx)
+        });
+        wait_for(window, "the row takes the new name", |cx| {
+            app.read_with(cx, |state, _| {
+                state.coworker_routines("cw_1")[0].name == "Daily standup"
+            })
+        });
+        window.update(|window, cx| window.draw(cx).clear(cx));
+        assert_eq!(
+            pane.read_with(window, |pane, cx| pane.routine_fields(cx)),
+            (typed, "post the standup in #team".to_string()),
+            "the typed name stays; the instruction nobody typed in follows the server"
+        );
+        wait_for(window, "the open routine's history is read again", |cx| {
+            app.read_with(cx, |state, _| {
+                !state.coworker_routines("cw_1")[0].runs.is_empty()
+            })
+        });
+    }
+
     /// A server from before routines kept a history answers `GET /schedules/{id}/runs` with an
     /// empty 404. The history says it cannot show the runs, in place of "No runs yet", and there
     /// is no red line over the editor about a read nobody asked for; nor is it asked again.
@@ -30453,6 +31006,7 @@ mod tests {
             online: true,
             relay_enabled: true,
             relaying: false,
+            folded: Vec::new(),
         };
         state.computers = vec![other.clone()];
         assert_eq!(state.this_mac_id(), None);
@@ -30761,6 +31315,7 @@ mod tests {
             online: true,
             relay_enabled: true,
             relaying: false,
+            folded: Vec::new(),
         };
         state.computers = vec![not_this_mac.clone()];
         assert!(state.this_mac_rules().is_none());
@@ -30810,6 +31365,7 @@ mod tests {
             online: true,
             relay_enabled: true,
             relaying: false,
+            folded: Vec::new(),
         }];
         state.local_rules = Some(LocalRules::listed(
             "mac_here".into(),
@@ -38557,6 +39113,7 @@ mod tests {
             online,
             relay_enabled,
             relaying,
+            folded: Vec::new(),
         }
     }
 
@@ -38628,7 +39185,8 @@ mod tests {
             .expect("a card for the computer")
     }
 
-    /// Send the switch of `machine_id`'s card to `on` against the real client, and settle it.
+    /// Send the switch of `machine_id`'s card to `on` against the real client, as the window sends
+    /// it, and settle it.
     async fn switch_card(
         state: &mut AppState,
         machine_id: &str,
@@ -38637,10 +39195,7 @@ mod tests {
         let send = state
             .begin_computer_relay(machine_id, on)
             .expect("a switch begins");
-        let answer = send
-            .client
-            .switch_computer_relay(&send.machine_id, send.on)
-            .await;
+        let answer = send.switch().await;
         state.settle_computer_relay(machine_id, send.token, answer)
     }
 
@@ -38995,6 +39550,321 @@ mod tests {
             state.begin_computer_relay("mac_2", true).is_none(),
             "nobody is signed in"
         );
+    }
+
+    // ---- This computer's card switches every enrolment the roster folds into it ----------------
+
+    /// The label this computer enrols under, which an earlier run of the app enrolled under too.
+    const THIS_COMPUTERS_LABEL: &str = "NativeChat on uriahs-MacBook-Pro.local";
+
+    /// One enrolment as `GET /local-exec/daemon` lists it (opengrok-server #342 (main 2136ffc):
+    /// `row` in `crates/opengrok-server/src/local_exec.rs`).
+    fn enrolment(
+        machine_id: &str,
+        label: &str,
+        revoked: bool,
+        connected: bool,
+        relay_enabled: bool,
+    ) -> serde_json::Value {
+        json!({"machineId": machine_id, "label": label, "enrolledAtMs": 1_790_000_000_000_i64,
+               "revoked": revoked, "connected": connected, "relayEnabled": relay_enabled,
+               "relaying": false})
+    }
+
+    /// The live roster: this computer, `mac_live`, and two enrolments an earlier run of the app
+    /// left under the same label and never revoked, not connected; every switch `on`.
+    fn this_computer_enrolled_three_times(on: bool) -> Vec<serde_json::Value> {
+        vec![
+            enrolment("mac_live", THIS_COMPUTERS_LABEL, false, true, on),
+            enrolment("mac_old_a", THIS_COMPUTERS_LABEL, false, false, on),
+            enrolment("mac_old_b", THIS_COMPUTERS_LABEL, false, false, on),
+        ]
+    }
+
+    /// A server that keeps each computer's switch where its `PATCH` puts it and answers with the
+    /// computer's row, as `switch_relay` does (opengrok-server #342 (main 2136ffc)).
+    struct SwitchesAsAsked;
+
+    impl wiremock::Respond for SwitchesAsAsked {
+        fn respond(&self, request: &wiremock::Request) -> wiremock::ResponseTemplate {
+            let id = request
+                .url
+                .path()
+                .trim_start_matches("/local-exec/daemon/")
+                .to_string();
+            let body: serde_json::Value =
+                serde_json::from_slice(&request.body).expect("a JSON body");
+            let on = body["relayEnabled"].as_bool().expect("a true or a false");
+            wiremock::ResponseTemplate::new(200).set_body_json(enrolment(
+                &id,
+                THIS_COMPUTERS_LABEL,
+                false,
+                id == "mac_live",
+                on,
+            ))
+        }
+    }
+
+    /// A window signed in on `mac_live` against `server`, which lists `machines` as the account's
+    /// computers and keeps every switch as asked, with the roster read as Settings → Computer reads
+    /// it ([`AppState::refresh_computers`]).
+    fn a_window_reading_the_roster(
+        cx: &mut gpui_kit::TestAppContext,
+        runtime: &tokio::runtime::Runtime,
+        server: &wiremock::MockServer,
+        machines: Vec<serde_json::Value>,
+    ) -> gpui_kit::Entity<AppState> {
+        use gpui_kit::AppContext as _;
+        use wiremock::matchers::{method, path, path_regex};
+        runtime.block_on(async {
+            wiremock::Mock::given(method("GET"))
+                .and(path("/local-exec/daemon"))
+                .respond_with(
+                    wiremock::ResponseTemplate::new(200)
+                        .set_body_json(json!({ "machines": machines })),
+                )
+                .mount(server)
+                .await;
+            wiremock::Mock::given(method("PATCH"))
+                .and(path_regex("^/local-exec/daemon/[^/]+$"))
+                .respond_with(SwitchesAsAsked)
+                .mount(server)
+                .await;
+        });
+        let mut state = signed_in_state();
+        state.opengrok = Some(OpenGrokClient::new(&server.uri()).expect("a URL"));
+        state.local_exec_machine_id = Some("mac_live".into());
+        let app = cx.new(|_| state);
+        app.update(cx, |state, cx| state.refresh_computers(cx));
+        wait_for(cx, "the roster is read", |cx| {
+            app.read_with(cx, |state, _| !state.computers.is_empty())
+        });
+        app
+    }
+
+    /// Move `machine_id`'s card's switch to `on` as a click on it does, and wait for the answer.
+    fn switch_and_wait(
+        cx: &mut gpui_kit::TestAppContext,
+        app: &gpui_kit::Entity<AppState>,
+        machine_id: &str,
+        on: bool,
+    ) {
+        app.update(cx, |state, cx| {
+            state.set_computer_relay(machine_id.to_string(), on, cx)
+        });
+        wait_for(cx, "the switch is answered", |cx| {
+            app.read_with(cx, |state, _| {
+                state.computer_relay_switch(machine_id).is_none()
+            })
+        });
+    }
+
+    /// The `PATCH`es `server` was sent, as (machine id, `relayEnabled`), by machine id.
+    fn switched(
+        runtime: &tokio::runtime::Runtime,
+        server: &wiremock::MockServer,
+    ) -> Vec<(String, bool)> {
+        let mut sent: Vec<(String, bool)> = runtime
+            .block_on(patches_sent(server))
+            .into_iter()
+            .map(|(id, body)| {
+                (
+                    id,
+                    body["relayEnabled"].as_bool().expect("a true or a false"),
+                )
+            })
+            .collect();
+        sent.sort();
+        sent
+    }
+
+    fn each(ids: &[&str], on: bool) -> Vec<(String, bool)> {
+        ids.iter().map(|id| (id.to_string(), on)).collect()
+    }
+
+    /// This computer enrolled three times under one label: two earlier runs of the app left
+    /// enrolments that were never revoked, on and asleep. The roster folds them into this
+    /// computer's one card, so nobody can see them, and while any of them is on the account's relay
+    /// is on with a computer asleep, which refuses a Subscription Bot's turn rather than giving it
+    /// the Relay-off fallback. Switching the card off switches all three off, and the card reads
+    /// off.
+    #[gpui_kit::test]
+    fn switching_this_computers_card_off_switches_off_every_enrolment_folded_into_it(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        let runtime = a_runtime_for_the_relay(cx);
+        let _enter = runtime.enter();
+        let server = runtime.block_on(wiremock::MockServer::start());
+        let app = a_window_reading_the_roster(
+            cx,
+            &runtime,
+            &server,
+            this_computer_enrolled_three_times(true),
+        );
+        app.read_with(cx, |state, _| {
+            let cards = crate::components::computers::cards(state);
+            assert_eq!(cards.len(), 1, "one card for the three: {cards:?}");
+            assert!(cards[0].relay_on && cards[0].this_computer);
+        });
+
+        switch_and_wait(cx, &app, "mac_live", false);
+        assert_eq!(
+            switched(&runtime, &server),
+            each(&["mac_live", "mac_old_a", "mac_old_b"], false)
+        );
+        app.read_with(cx, |state, _| {
+            let card = card_of(state, "mac_live");
+            assert_eq!((card.relay_on, card.note.as_deref()), (false, None));
+        });
+    }
+
+    /// The same three, all off: switching the card on switches all three on, and the card reads
+    /// on.
+    #[gpui_kit::test]
+    fn switching_this_computers_card_on_switches_on_every_enrolment_folded_into_it(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        let runtime = a_runtime_for_the_relay(cx);
+        let _enter = runtime.enter();
+        let server = runtime.block_on(wiremock::MockServer::start());
+        let app = a_window_reading_the_roster(
+            cx,
+            &runtime,
+            &server,
+            this_computer_enrolled_three_times(false),
+        );
+        switch_and_wait(cx, &app, "mac_live", true);
+        assert_eq!(
+            switched(&runtime, &server),
+            each(&["mac_live", "mac_old_a", "mac_old_b"], true)
+        );
+        app.read_with(cx, |state, _| {
+            let card = card_of(state, "mac_live");
+            assert_eq!((card.relay_on, card.note.as_deref()), (true, None));
+        });
+    }
+
+    /// An enrolment of this computer that was revoked is no card's and is switched by none: the
+    /// server refuses to switch one (409 `revoked`), so only the live one and the stale one that
+    /// was never revoked are sent.
+    #[gpui_kit::test]
+    fn a_revoked_enrolment_of_this_computer_is_not_switched(cx: &mut gpui_kit::TestAppContext) {
+        let runtime = a_runtime_for_the_relay(cx);
+        let _enter = runtime.enter();
+        let server = runtime.block_on(wiremock::MockServer::start());
+        let app = a_window_reading_the_roster(
+            cx,
+            &runtime,
+            &server,
+            vec![
+                enrolment("mac_live", THIS_COMPUTERS_LABEL, false, true, true),
+                enrolment("mac_old_a", THIS_COMPUTERS_LABEL, false, false, true),
+                enrolment("mac_revoked", THIS_COMPUTERS_LABEL, true, false, true),
+            ],
+        );
+        switch_and_wait(cx, &app, "mac_live", false);
+        assert_eq!(
+            switched(&runtime, &server),
+            each(&["mac_live", "mac_old_a"], false)
+        );
+    }
+
+    /// Another computer has its own card and its own switch: switching this computer's moves this
+    /// computer's enrolments and leaves the other computer's switch where it was.
+    #[gpui_kit::test]
+    fn another_computers_switch_is_untouched_by_this_computers_card(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        let runtime = a_runtime_for_the_relay(cx);
+        let _enter = runtime.enter();
+        let server = runtime.block_on(wiremock::MockServer::start());
+        let app = a_window_reading_the_roster(
+            cx,
+            &runtime,
+            &server,
+            vec![
+                enrolment("mac_live", THIS_COMPUTERS_LABEL, false, true, true),
+                enrolment("mac_old_a", THIS_COMPUTERS_LABEL, false, false, true),
+                enrolment(
+                    "mac_studio",
+                    "NativeChat on studio.local",
+                    false,
+                    true,
+                    true,
+                ),
+            ],
+        );
+        switch_and_wait(cx, &app, "mac_live", false);
+        assert_eq!(
+            switched(&runtime, &server),
+            each(&["mac_live", "mac_old_a"], false)
+        );
+        app.read_with(cx, |state, _| {
+            assert!(!card_of(state, "mac_live").relay_on);
+            assert!(
+                card_of(state, "mac_studio").relay_on,
+                "the other's stays on"
+            );
+        });
+    }
+
+    /// A stale enrolment the server no longer knows (404 `not_found`), or revoked since the roster
+    /// was read (409 `revoked`), has nothing left to switch: the card's switch is kept all the
+    /// same, and nothing is said of the stale ones under it.
+    #[gpui_kit::test]
+    fn a_stale_enrolment_gone_or_revoked_does_not_fail_this_computers_switch(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        let runtime = a_runtime_for_the_relay(cx);
+        let _enter = runtime.enter();
+        let server = runtime.block_on(wiremock::MockServer::start());
+        runtime.block_on(async {
+            for (id, status, words, code) in [
+                (
+                    "mac_old_a",
+                    404,
+                    "no computer of yours has that id",
+                    "not_found",
+                ),
+                (
+                    "mac_old_b",
+                    409,
+                    "this computer was revoked; enrol it again to use it",
+                    "revoked",
+                ),
+            ] {
+                wiremock::Mock::given(wiremock::matchers::method("PATCH"))
+                    .and(wiremock::matchers::path(format!("/local-exec/daemon/{id}")))
+                    .respond_with(
+                        wiremock::ResponseTemplate::new(status)
+                            .set_body_json(json!({"error": words, "code": code})),
+                    )
+                    .with_priority(1)
+                    .mount(&server)
+                    .await;
+            }
+        });
+        let app = a_window_reading_the_roster(
+            cx,
+            &runtime,
+            &server,
+            this_computer_enrolled_three_times(true),
+        );
+        switch_and_wait(cx, &app, "mac_live", false);
+        assert_eq!(
+            switched(&runtime, &server),
+            each(&["mac_live", "mac_old_a", "mac_old_b"], false),
+            "each was asked"
+        );
+        app.read_with(cx, |state, _| {
+            let card = card_of(state, "mac_live");
+            assert_eq!(
+                (card.relay_on, card.switching, card.note.as_deref()),
+                (false, false, None),
+                "kept, and nothing said"
+            );
+            assert_eq!(state.computer_relay_note("mac_live"), None);
+        });
     }
 
     /// Pointing the account's way at the relay is one change of the account's at a time. A card's

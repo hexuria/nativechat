@@ -32,13 +32,23 @@ pub struct ComputerPane {
     state: Entity<AppState>,
     name_input: Entity<InputState>,
     instruction_input: Entity<TextareaState>,
-    /// The routine the fields were last filled from, and the `routine_resync` they were
-    /// filled at.
-    loaded_editor: Option<(Option<String>, u64)>,
+    /// The routine the fields were last filled from, and what they were filled with.
+    loaded_editor: Option<LoadedEditor>,
     /// The wake editor's typed boxes: the Every number, the hour, the minute and the Cron line.
     wake_boxes: [(WakeBox, Entity<InputState>); 4],
     /// The opening of the wake editor the boxes were last written for, and its `resync` then.
     loaded_wake: Option<(u64, u64)>,
+}
+
+/// What the routine editor's fields were last filled from: the routine, the `routine_resync` and
+/// `routine_relist` they were filled at, and the words each was given, which tell a field the
+/// person has typed in (it no longer reads them) from one they have not.
+struct LoadedEditor {
+    id: Option<String>,
+    resync: u64,
+    relist: u64,
+    name: String,
+    instruction: String,
 }
 
 /// One of the wake editor's typed boxes, empty, saying what goes in it.
@@ -136,13 +146,19 @@ impl ComputerPane {
         // on the next Back or Test run, over what the server just said.
         // Only this routine's: an answer for another one must leave these fields, which may be
         // half-typed, as they are.
-        let resync = id
-            .as_deref()
-            .map_or(0, |rid| self.state.read(cx).routine_resync(rid));
-        if self.loaded_editor.as_ref() == Some(&(id.clone(), resync)) {
+        let (resync, relist) = id.as_deref().map_or((0, 0), |rid| {
+            let state = self.state.read(cx);
+            (state.routine_resync(rid), state.routine_relist(rid))
+        });
+        let this_routine = |loaded: &LoadedEditor| loaded.id == id && loaded.resync == resync;
+        if self
+            .loaded_editor
+            .as_ref()
+            .is_some_and(|loaded| this_routine(loaded) && loaded.relist == relist)
+        {
             return;
         }
-        self.loaded_editor = Some((id.clone(), resync));
+        let loaded = self.loaded_editor.take().filter(this_routine);
         let coworker = self.state.read(cx).active_coworker_id.clone();
         let routine = coworker.as_ref().and_then(|cid| {
             id.as_ref().and_then(|rid| {
@@ -159,11 +175,44 @@ impl ComputerPane {
             .as_ref()
             .map(|r| r.instruction.clone())
             .unwrap_or_default();
-        self.name_input.update(cx, |input, cx| {
-            input.set_value(name, window, cx);
+        // With `loaded` still this routine's, only the server's copy moved under it (a Bot changed
+        // it in chat), and nothing of the person's own was answered: a field takes the new copy
+        // only while it still reads what it was last given. One the person has typed in keeps
+        // their words, for their own Save or the next read to settle; nothing they are typing is
+        // written over.
+        let typed_name = loaded
+            .as_ref()
+            .is_some_and(|loaded| self.name_input.read(cx).value().as_ref() != loaded.name);
+        let typed_instruction = loaded.as_ref().is_some_and(|loaded| {
+            self.instruction_input.read(cx).value().as_ref() != loaded.instruction
         });
-        self.instruction_input.update(cx, |input, cx| {
-            input.set_value(instruction, window, cx);
+        if !typed_name {
+            self.name_input.update(cx, |input, cx| {
+                input.set_value(name.clone(), window, cx);
+            });
+        }
+        if !typed_instruction {
+            self.instruction_input.update(cx, |input, cx| {
+                input.set_value(instruction.clone(), window, cx);
+            });
+        }
+        // What each field was given: the words as the field reads them back, or for a field the
+        // person typed in, the server's copy, against which it counts as typed until it matches.
+        let given = |typed: bool, field: SharedString, server: String| {
+            if typed { server } else { field.to_string() }
+        };
+        let name = given(typed_name, self.name_input.read(cx).value(), name);
+        let instruction = given(
+            typed_instruction,
+            self.instruction_input.read(cx).value(),
+            instruction,
+        );
+        self.loaded_editor = Some(LoadedEditor {
+            id,
+            resync,
+            relist,
+            name,
+            instruction,
         });
     }
 }
@@ -2645,6 +2694,17 @@ fn webhook_details(
                 }),
         )
         .into_any_element()
+}
+
+#[cfg(test)]
+impl ComputerPane {
+    /// The routine panel's Name and Instruction fields, as they read now.
+    pub(crate) fn routine_fields(&self, cx: &App) -> (String, String) {
+        (
+            self.name_input.read(cx).value().to_string(),
+            self.instruction_input.read(cx).value().to_string(),
+        )
+    }
 }
 
 #[cfg(test)]

@@ -313,11 +313,17 @@ const ROUTINE_ID_PREFIX: &str = "sched_";
 
 /// The routine a `run_routine` call is for, by the name the model wrote in its `routine`
 /// argument, kept to one line: `None` when it wrote none, or wrote the routine's id, which
-/// is not a name a person would know it by.
+/// is not a name a person would know it by, or when what it wrote reads `«redacted»`. That is
+/// what a call's step keeps of an id: a `sched_` and a uuid is one long run of key characters,
+/// which the step hides by the approval card's rules (`gen_ui::step_arguments`), and the
+/// placeholder names no routine.
 fn routine_named(arguments: Option<&Value>) -> Option<String> {
     let routine = arguments?.get("routine")?.as_str()?.trim();
     let name = short_command(routine);
-    (!name.is_empty() && !routine.starts_with(ROUTINE_ID_PREFIX)).then_some(name)
+    let named = !name.is_empty()
+        && !routine.starts_with(ROUTINE_ID_PREFIX)
+        && routine != super::gen_ui::REDACTED;
+    named.then_some(name)
 }
 
 /// What a call is doing, in a line: the status strip says it while the call runs, and the call's
@@ -368,7 +374,8 @@ pub(crate) fn describe_tool(name: &str, args: Option<&str>) -> String {
             .unwrap_or_else(|| "Reading a skill".into()),
         // A bot running one of its person's routines (opengrok-server #337, built in #342), by the
         // name the model wrote. The call's own result is `{runId, threadId}`, with no name in it,
-        // and a routine's id says nothing to a person, so one named by its id is "a routine".
+        // and a routine's id says nothing to a person, so one named by its id is "a routine", and
+        // so is one whose id its step keeps as `«redacted»`.
         super::gen_ui::RUN_ROUTINE => routine_named(parsed.as_ref())
             .map(|name| format!("Running the {name} routine"))
             .unwrap_or_else(|| "Running a routine".into()),
@@ -565,6 +572,53 @@ mod tests {
             deed_from_tool("run_routine", None).as_deref(),
             Some("ran a routine")
         );
+    }
+
+    /// A routine named by its id reaches its step row as `«redacted»`: the id is a `sched_` and a
+    /// uuid, one long run of key characters, and the step keeps a call's arguments by the approval
+    /// card's rules, which hide anything shaped like a key (`gen_ui::step_arguments`, after
+    /// opengrok-tools `review.rs` `looks_like_a_secret`). That placeholder is no routine's name: the
+    /// row, the status line and the turn's stand-in say "a routine", as they do for the id itself,
+    /// and never "the «redacted» routine".
+    #[test]
+    fn a_routine_whose_name_was_kept_off_the_step_reads_as_a_routine() {
+        use super::super::gen_ui::{ChatPart, TurnAssembler};
+        for hidden in [
+            r#"{"routine":"«redacted»"}"#,
+            r#"{"routine":" «redacted» "}"#,
+        ] {
+            assert_eq!(
+                describe_tool("run_routine", Some(hidden)),
+                "Running a routine"
+            );
+            assert_eq!(
+                deed_from_tool("run_routine", Some(hidden)).as_deref(),
+                Some("ran a routine")
+            );
+        }
+
+        // The step row of the call the Bot made in the live run, by the routine's id.
+        let mut turn = TurnAssembler::default();
+        for frame in [
+            json!({"type":"TOOL_CALL_START","toolCallId":"c1","toolCallName":"run_routine"}),
+            json!({"type":"TOOL_CALL_ARGS","toolCallId":"c1",
+                   "delta":r#"{"routine":"sched_0199bb4e-0000-7000-8000-000000000005"}"#}),
+            json!({"type":"TOOL_CALL_END","toolCallId":"c1"}),
+            json!({"type":"TOOL_CALL_RESULT","toolCallId":"c1","ok":true,
+                   "content":r#"{"runId":"run_1","threadId":"sched_1"}"#}),
+        ] {
+            turn.push_event(&frame);
+        }
+        let (_, parts) = turn.snapshot();
+        let step = parts
+            .iter()
+            .find_map(|part| match part {
+                ChatPart::Step(step) => Some(step),
+                _ => None,
+            })
+            .expect("the call's step");
+        assert!(step.arguments.contains("«redacted»"), "{}", step.arguments);
+        assert_eq!(step.label(), "Running a routine");
     }
 
     /// The same, from the frames the server sent for one `run_routine` call: the run the server

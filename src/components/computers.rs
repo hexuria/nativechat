@@ -11,10 +11,12 @@
 //! the one the app is running on (by the machine id it stored when it enrolled,
 //! `opengrok::stored_machine_id`), its "Relay your plan" switch, and where the relay stands: it
 //! relays, it does not, or it is on and the computer is asleep. The switch acts at once: it sends
-//! `PATCH /local-exec/daemon/{machine_id} {relayEnabled}` for that computer, drawn where the click
-//! asked to take it while the server is asked, and a refusal goes back to where it was with the
-//! server's words under it (`AppState::set_computer_relay`). There is no ordering of computers: the
-//! server asks the one that opened its relay stream last of those that are on.
+//! `PATCH /local-exec/daemon/{machine_id} {relayEnabled}` for that computer, and for each older
+//! enrolment of it the roster folds into its card under the same label, which has no card of its
+//! own; it is drawn where the click asked to take it while the server is asked, and a refusal goes
+//! back to where it was with the server's words under it (`AppState::set_computer_relay`). There is
+//! no ordering of computers: the server asks the one that opened its relay stream last of those
+//! that are on.
 //!
 //! This computer's card alone also holds what its relay needs of this computer: opencodex's address
 //! and its key, which Save keeps here, the key in its secure storage (the Keychain). The window still
@@ -100,7 +102,10 @@ fn pill_id(machine_id: &str) -> String {
 pub(crate) const RELAY_DETAIL: &str = "settings-relay-detail";
 /// Beside Save: what it will not keep as the card stands.
 pub(crate) const HINT: &str = "settings-reply-source-hint";
-pub(crate) const SAVE: &str = "settings-reply-source-save";
+/// Save, for this computer's opencodex address and key: under the relay's ids beside the fields it
+/// keeps, `settings-relay-addr` and `settings-relay-key`, where a driver looks for it. Settings →
+/// Relay had it as `settings-reply-source-save`.
+pub(crate) const SAVE: &str = "settings-relay-save";
 /// Under Save: a read that failed, and what the Keychain said when it did not keep a key.
 pub(crate) const ERROR: &str = "settings-reply-source-error";
 /// In place of this computer's opencodex fields: asking the server, a server without reply sources,
@@ -765,7 +770,7 @@ mod tests {
 
     /// The ids a driver finds a card's parts by: the card, its switch, its status and its error by
     /// the server's machine id, and what Settings → Relay's page held for this computer under the
-    /// ids it always had.
+    /// ids it always had, but for Save, which is the relay's beside the fields it keeps.
     #[test]
     fn the_cards_ids_are_the_stable_ones() {
         assert_eq!(card_id("mac_1"), "settings-computer-mac_1");
@@ -790,7 +795,7 @@ mod tests {
                 "settings-relay-key-remove",
                 "settings-relay-detail",
                 "settings-relay-unavailable",
-                "settings-reply-source-save",
+                "settings-relay-save",
                 "settings-reply-source-hint",
                 "settings-reply-source-error",
                 "settings-reply-source-unavailable",

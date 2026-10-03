@@ -389,6 +389,10 @@
 //! sends `null`), one change of the account's at a time. `settings-plan-fallback-dismiss` shuts
 //! the popover. All of it is refused off General.
 //!
+//! Under Debug on General, `settings-show-turn-timing` (a switch named `Show turn timing`, checked
+//! and valued `on` while each reply shows the phases of its run, `off` while it does not): a click
+//! flips it, kept on this computer at once. Refused off General.
+//!
 //! Your computers, on Settings → Computer (`settings-tab-computer`; refused while Settings is shut):
 //! one card for each computer the person has enrolled, from `GET /local-exec/daemon`, with its own
 //! Relay your plan switch (opengrok-server #342 (main 2136ffc): each computer has its own switch,
@@ -405,8 +409,10 @@
 //! `settings-computer-{machine}-relay` (a switch named `Relay your plan`, checked while the
 //! computer's relay is on, or where a click is taking it while the server is asked, disabled then;
 //! a click asks for the other way, from any computer's card, as one `PATCH
-//! /local-exec/daemon/{machine}` of `{relayEnabled}`, and is refused with why while its last
-//! switch is with the server; turning one on also points the account's way at the relay, once,
+//! /local-exec/daemon/{machine}` of `{relayEnabled}`, and once that is kept the same for each older
+//! enrolment of the computer that the list folds into its card under the same label (never a
+//! revoked one, and nothing is said of one the server no longer knows), and is refused with why
+//! while its last switch is with the server; turning one on also points the account's way at the relay, once,
 //! when it is not that already, as `PUT /account/inference-source` `{kind, via: "mac"}` with the
 //! kind the server keeps, one change of the account's at a time, and a computer going off moves no
 //! way; nothing this app sends of the account's setting ever carries `relayEnabled`),
@@ -443,8 +449,9 @@
 //! `settings-relay-key-remove` (while a key is kept: `Remove key`, or `Keep key` with state
 //! `picked`), `settings-reply-source-error` (a read that failed, state `trouble`, or what the
 //! Keychain said when it did not keep a key), `settings-reply-source-hint` (what Save waits for: an
-//! opencodex address on this computer) and `settings-reply-source-save` (enabled only while a click
-//! would keep something). Until the setting has been read, on a server without reply sources, or when
+//! opencodex address on this computer) and `settings-relay-save` (Save, named `Save`, enabled only
+//! while a click would keep something; `settings-reply-source-save`, its id on Settings → Relay, is
+//! refused saying where it is now). Until the setting has been read, on a server without reply sources, or when
 //! it could not be read, they are replaced by `settings-reply-source-unavailable`, the line the card
 //! draws (`Asking the server…` while it has state `asking`); from a server without the relay, by
 //! `settings-relay-unavailable` (that this server can't take replies from a computer yet) and the
@@ -458,12 +465,13 @@
 //! `settings-tab-skills`. Default for new Bots is General's, above.
 //!
 //! `reply-source-{messageId}` is the badge of each reply in the open thread that wears one, as the
-//! feed draws it (label `paid key` / `paid key · relay off` / `your plan` / `your plan · Mac`, with
-//! ` ⚡` after it where the model that answered is a fast twin; value = the door, state `via-mac`
-//! on one the person's Mac answered, and `relay-off` on one the server's keys answered because the
-//! relay is off, as the run's frame says in `fallbackFor: "relay_disabled"` (opengrok-server
-//! #332 (PR #338 at 66b9f7b))), holding `reply-source-model-{messageId}` (label = the model
-//! the server named, which the badge shows on hover) when it named one. A reply whose run
+//! feed draws it (label `paid key` / `paid key · relay off` / `your plan` /
+//! `your plan · computer`, with ` ⚡` after it where the model that answered is a fast twin; value
+//! = the door, state `via-mac` (the wire's `via: "mac"`) on one the person's computer answered,
+//! and `relay-off` on one the server's keys answered because the relay is off, as the run's frame
+//! says in `fallbackFor: "relay_disabled"` (opengrok-server #332 (PR #338 at 66b9f7b))), holding
+//! `reply-source-model-{messageId}` (label = the model the server named, which the badge shows on
+//! hover) when it named one. A reply whose run
 //! ended because the person's plan could not answer (a `RUN_ERROR` code: the relay's, where the
 //! Mac could not, or `plan_unavailable`, where the person's own setting left the plan nothing to
 //! answer with) keeps its line, and while it is the open thread's last turn the page holds
@@ -472,8 +480,8 @@
 //! reply whose run ended `relay_disabled`, a Bot's reply to another skipped while the relay is
 //! off with no fallback (opengrok-server #332 (PR #338 at 66b9f7b), only ever in the two Bots'
 //! read-only pair thread), keeps its line and has neither. Under `composer-queued`, a
-//! `queued-waiting-{messageId}` (`Waiting for your Mac`) for each held message the server holds
-//! for the person's Mac (`heldFor: "relay_offline"`, never while the relay is switched off). In the bot's settings, while the Bot's
+//! `queued-waiting-{messageId}` (`Waiting for your computer`) for each held message the server holds
+//! for the person's computer (`heldFor: "relay_offline"`, never while the relay is switched off). In the bot's settings, while the Bot's
 //! replies go through the person's plan, its own door or the account's that it follows,
 //! `agent-usage-plan` (the Usage card does not count those replies).
 //!

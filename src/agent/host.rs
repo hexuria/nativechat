@@ -495,6 +495,8 @@ pub mod ids {
     /// Bots.
     pub const SETTINGS_GENERAL: &str = "settings-tab-general";
     pub const DEFAULT_MODELS: &str = default_models::SECTION;
+    /// Settings → General's Show turn timing switch, under Debug.
+    pub const SHOW_TURN_TIMING: &str = crate::components::app_settings::SHOW_TURN_TIMING;
 
     /// Settings → Computer's "Your computers": one card to each enrolled computer, by the server's
     /// machine id: the card, its Relay your plan switch, where its relay stands, and what became of
@@ -516,8 +518,9 @@ pub mod ids {
     }
 
     /// What this computer's card alone holds of its relay: opencodex's address and key, Save, and
-    /// the lines about them, which were Settings → Relay's and keep their ids.
-    pub const REPLY_SOURCE_SAVE: &str = computers::SAVE;
+    /// the lines about them, which were Settings → Relay's and keep their ids, but for Save, which
+    /// is the relay's now, beside the fields it keeps (`settings-relay-save`).
+    pub const RELAY_SAVE: &str = computers::SAVE;
     pub const REPLY_SOURCE_ERROR: &str = computers::ERROR;
     pub const REPLY_SOURCE_UNAVAILABLE: &str = computers::UNAVAILABLE;
     pub const REPLY_SOURCE_HINT: &str = computers::HINT;
@@ -995,6 +998,8 @@ pub enum Command {
         id: String,
     },
     SetAppSettingsTab(crate::state::AppSettingsTab),
+    /// Settings → General's Show turn timing switch, on or off.
+    SetShowTurnTiming(bool),
     CloseAppSettings,
     /// The Computer pane's routines: open one (or a blank one), give a draft its trigger, ask
     /// for a new webhook key, drop one.
@@ -1291,6 +1296,7 @@ impl Command {
             Self::SkipSaveLogin { form_entry_id } => state.skip_save_login(form_entry_id, cx),
             Self::DeleteSiteLogin { id } => state.delete_site_login(id, cx),
             Self::SetAppSettingsTab(tab) => state.set_app_settings_tab(tab, cx),
+            Self::SetShowTurnTiming(on) => state.set_show_turn_timing(on, cx),
             Self::CloseAppSettings => {
                 if state.is_app_settings_open {
                     state.toggle_app_settings(cx);
@@ -3150,6 +3156,10 @@ fn invoke_arg_str(args: &serde_json::Value, keys: &[&str]) -> Option<String> {
 /// The id Settings → Relay's tab had, which answers nothing now and says where the relay moved.
 const RETIRED_RELAY_TAB: &str = "settings-tab-reply-source";
 
+/// The id this computer's opencodex Save had while it was Settings → Relay's: it answers nothing
+/// now and says where Save is, which is not gone ([`ids::RELAY_SAVE`]).
+const RETIRED_RELAY_SAVE: &str = "settings-reply-source-save";
+
 /// The state on a reply's badge while the door is the person's plan through their computer, so an
 /// assert need not match the words. A driver's word, kept as it was when the app said "Mac".
 const VIA_MAC: &str = "via-mac";
@@ -3421,6 +3431,8 @@ pub struct NativeChatHost {
     reply_source: ReplySourceSnap,
     /// Settings is on General, whose first section is Default models.
     general_tab: bool,
+    /// General's Show turn timing switch: each reply shows the phases of its run.
+    show_turn_timing: bool,
     /// The badges on the open thread's replies, oldest first: (message id, source).
     reply_sources: Vec<(String, crate::opengrok::ReplySource)>,
     pending: Option<Command>,
@@ -3991,6 +4003,7 @@ impl NativeChatHost {
             connections: state.connections.clone(),
             reply_source: ReplySourceSnap::from_state(state),
             general_tab: state.app_settings_tab == AppSettingsTab::General,
+            show_turn_timing: state.show_turn_timing,
             reply_sources: crate::components::chat::reply_badges(state),
             connections_tab: state.app_settings_tab == AppSettingsTab::Connections,
             pending: None,
@@ -4190,8 +4203,8 @@ impl NativeChatHost {
                 );
         }
         if self.queued_sends > 0 {
-            // Each held message the server holds for the person's Mac says so under it, as its
-            // bubble does.
+            // Each held message the server holds for the person's computer says so under it, as
+            // its bubble does.
             let queued = self.waiting_for_mac.iter().fold(
                 UiNode::new(
                     ids::COMPOSER_QUEUED,
@@ -4201,7 +4214,7 @@ impl NativeChatHost {
                 |queued, message_id| {
                     queued.with_child(UiNode::status(
                         ids::queued_waiting(message_id),
-                        crate::components::message::WAITING_FOR_YOUR_MAC,
+                        crate::components::message::WAITING_FOR_YOUR_COMPUTER,
                     ))
                 },
             );
@@ -4509,9 +4522,11 @@ impl NativeChatHost {
                                 settings = settings.with_child(node);
                             }
                         }
-                        // The same for General's Default models.
+                        // The same for General's Default models, and its Show turn timing switch.
                         if self.account_open && self.general_tab {
-                            settings = settings.with_child(self.default_models_node());
+                            settings = settings
+                                .with_child(self.default_models_node())
+                                .with_child(self.show_turn_timing_node());
                         }
                         if self.skills_tab {
                             settings = self.skills_nodes(settings);
@@ -5698,10 +5713,23 @@ impl NativeChatHost {
             nodes.push(UiNode::status(ids::REPLY_SOURCE_HINT, hint));
         }
         nodes.push(
-            UiNode::button(ids::REPLY_SOURCE_SAVE, computers::SAVE_LABEL)
-                .with_enabled(snap.can_save),
+            UiNode::button(ids::RELAY_SAVE, computers::SAVE_LABEL).with_enabled(snap.can_save),
         );
         nodes
+    }
+
+    /// Settings → General's Show turn timing switch, under Debug: `settings-show-turn-timing`
+    /// (named `Show turn timing`), checked and valued `on` while each reply shows the phases of its
+    /// run, `off` while it does not. A click flips it, as the window's does.
+    fn show_turn_timing_node(&self) -> UiNode {
+        let on = self.show_turn_timing;
+        UiNode::new(
+            ids::SHOW_TURN_TIMING,
+            "switch",
+            crate::components::app_settings::SHOW_TURN_TIMING_LABEL,
+        )
+        .with_checked(on)
+        .with_value(if on { "on" } else { "off" })
     }
 
     /// Settings → General's first section as the page draws it: `settings-default-models`
@@ -6259,13 +6287,20 @@ impl NativeChatHost {
             ids::RELAY_KEY,
             ids::RELAY_KEY_REMOVE,
             ids::RELAY_UNAVAILABLE,
-            ids::REPLY_SOURCE_SAVE,
+            ids::RELAY_SAVE,
             ids::REPLY_SOURCE_ERROR,
             ids::REPLY_SOURCE_HINT,
             ids::REPLY_SOURCE_UNAVAILABLE,
         ];
         if ours.contains(&target) {
             return Some(self.opencodex_control(target));
+        }
+        if target == RETIRED_RELAY_SAVE {
+            return Some(Err(format!(
+                "no `{target}` on screen: this computer's Save for its opencodex address and key is \
+                 `{}`, on its card on Settings → Computer",
+                ids::RELAY_SAVE
+            )));
         }
         // Everything else of Settings → Relay is gone with the page: its tab, its section, its
         // card, its switch and its lines, and the plan on the server's own machine that it no
@@ -6316,7 +6351,7 @@ impl NativeChatHost {
         if target == ids::RELAY_ADDR || target == ids::RELAY_KEY {
             return Err(format!("`{target}` is a field: use set_value"));
         }
-        if target == ids::REPLY_SOURCE_SAVE {
+        if target == ids::RELAY_SAVE {
             return if snap.can_save {
                 Ok(Command::SaveReplySource)
             } else if settings.reading.is_some() {
@@ -7283,6 +7318,11 @@ impl NativeChatHost {
             cmd?
         } else if let Some(cmd) = self.computer_card_command(target) {
             cmd?
+        } else if target == ids::SHOW_TURN_TIMING {
+            if let Some(off) = self.off_the_general_page(target) {
+                return Err(off);
+            }
+            Command::SetShowTurnTiming(!self.show_turn_timing)
         } else if let Some(cmd) = self.default_models_command(target) {
             cmd?
         } else if let Some(cmd) = self.model_picker_command(target) {
@@ -10857,7 +10897,7 @@ mod tests {
         assert_eq!(
             tree.find(&ids::queued_waiting("m_1"))
                 .map(|node| node.name.as_str()),
-            Some("Waiting for your Mac")
+            Some("Waiting for your computer")
         );
         assert!(tree.find(&ids::queued_waiting("m_2")).is_none());
     }
@@ -14266,7 +14306,7 @@ mod tests {
         let asking = tree.find(ids::REPLY_SOURCE_UNAVAILABLE).unwrap();
         assert_eq!(asking.name, "Asking the server…");
         assert!(asking.states.contains(&"asking".to_string()));
-        assert!(host.click(ids::REPLY_SOURCE_SAVE).is_err());
+        assert!(host.click(ids::RELAY_SAVE).is_err());
         assert!(host.click(ids::RELAY_KEY_REMOVE).is_err());
 
         // A server without reply sources says so, and there is still nothing to press.
@@ -14275,7 +14315,7 @@ mod tests {
         let said = tree.find(ids::REPLY_SOURCE_UNAVAILABLE).unwrap();
         assert_eq!(said.name, REPLY_SOURCE_NOT_ON_SERVER);
         assert!(!said.states.contains(&"asking".to_string()));
-        let refused = host.click(ids::REPLY_SOURCE_SAVE).unwrap_err();
+        let refused = host.click(ids::RELAY_SAVE).unwrap_err();
         assert!(refused.contains(REPLY_SOURCE_NOT_ON_SERVER), "{refused}");
 
         // A server from before the relay: the line saying so in the fields' place, no Save.
@@ -14289,10 +14329,8 @@ mod tests {
             mine.find(ids::RELAY_UNAVAILABLE).unwrap().name,
             RELAY_NOT_ON_SERVER
         );
-        assert!(
-            tree.find(ids::RELAY_ADDR).is_none() && tree.find(ids::REPLY_SOURCE_SAVE).is_none()
-        );
-        let refused = host.click(ids::REPLY_SOURCE_SAVE).unwrap_err();
+        assert!(tree.find(ids::RELAY_ADDR).is_none() && tree.find(ids::RELAY_SAVE).is_none());
+        let refused = host.click(ids::RELAY_SAVE).unwrap_err();
         assert!(refused.contains(RELAY_NOT_ON_SERVER), "{refused}");
         assert!(
             host.set_value(ids::RELAY_ADDR, "http://127.0.0.1:9090")
@@ -14321,7 +14359,7 @@ mod tests {
                 ids::RELAY_ADDR,
                 ids::RELAY_KEY,
                 ids::RELAY_KEY_REMOVE,
-                ids::REPLY_SOURCE_SAVE
+                ids::RELAY_SAVE
             ],
             "the switch and its status, then what its relay needs: no model of the relay's own, \
              and nothing of the account's way"
@@ -14343,7 +14381,7 @@ mod tests {
         assert!(
             key.states.contains(&"set".to_string()) && key.states.contains(&"typed".to_string())
         );
-        let save = tree.find(ids::REPLY_SOURCE_SAVE).unwrap();
+        let save = tree.find(ids::RELAY_SAVE).unwrap();
         assert_eq!((save.name.as_str(), save.enabled), ("Save", false));
         assert!(tree.ids_are_unique());
 
@@ -14374,7 +14412,7 @@ mod tests {
             host.dispatch(&Op::key(ids::RELAY_ADDR, "backspace"))
                 .is_err()
         );
-        let nothing = host.click(ids::REPLY_SOURCE_SAVE).unwrap_err();
+        let nothing = host.click(ids::RELAY_SAVE).unwrap_err();
         assert!(
             nothing.contains("differs from what this computer keeps"),
             "{nothing}"
@@ -14387,14 +14425,14 @@ mod tests {
             tree.find(ids::REPLY_SOURCE_HINT).unwrap().name,
             crate::state::RELAY_ADDRESS_NOT_HERE
         );
-        let waiting = host.click(ids::REPLY_SOURCE_SAVE).unwrap_err();
+        let waiting = host.click(ids::RELAY_SAVE).unwrap_err();
         assert!(
             waiting.contains(crate::state::RELAY_ADDRESS_NOT_HERE),
             "{waiting}"
         );
         host.reply_source.hint = None;
         host.reply_source.can_save = true;
-        host.click(ids::REPLY_SOURCE_SAVE).unwrap();
+        host.click(ids::RELAY_SAVE).unwrap();
         assert!(matches!(
             host.take_command(),
             Some(Command::SaveReplySource)
@@ -14460,11 +14498,7 @@ mod tests {
         host.computers = vec![a_card("mac_2", false)];
         let tree = host.snapshot();
         assert!(tree.find(ids::RELAY_ADDR).is_none());
-        for id in [
-            ids::RELAY_KEY_REMOVE,
-            ids::REPLY_SOURCE_SAVE,
-            ids::RELAY_ADDR,
-        ] {
+        for id in [ids::RELAY_KEY_REMOVE, ids::RELAY_SAVE, ids::RELAY_ADDR] {
             let refused = host.click(id).unwrap_err();
             assert!(
                 refused.contains("this computer is not among"),
@@ -14476,6 +14510,98 @@ mod tests {
             .unwrap_err();
         assert!(refused.contains("this computer is not among"), "{refused}");
         let _ = ReplySourceRead::Loading;
+    }
+
+    /// This computer's Save for its opencodex address and key is `settings-relay-save`, beside the
+    /// fields it keeps (`settings-relay-addr`, `settings-relay-key`), on this computer's card and
+    /// no other, and a driver clicks it from a snapshot. The id it had while it was Settings →
+    /// Relay's is refused saying where Save is now, not that it is gone.
+    #[test]
+    fn this_computers_opencodex_save_is_clicked_from_a_snapshot() {
+        let mut host = host();
+        host.computers = vec![a_card("mac_1", true), a_card("mac_2", false)];
+        host.account_open = true;
+        host.computer_tab = true;
+        host.reply_source.settings.kept = relay_read("loopback");
+        host.reply_source.unsaved = true;
+        host.reply_source.can_save = true;
+        let tree = host.snapshot();
+        let mine = tree.find(&ids::computer_card("mac_1")).unwrap();
+        let save = mine
+            .find("settings-relay-save")
+            .expect("Save is on this computer's card");
+        assert_eq!(
+            (save.role.as_str(), save.name.as_str(), save.enabled),
+            ("button", "Save", true)
+        );
+        let other = tree.find(&ids::computer_card("mac_2")).unwrap();
+        assert!(other.find("settings-relay-save").is_none());
+        assert!(tree.ids_are_unique());
+        host.click("settings-relay-save")
+            .expect("Save takes a click");
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::SaveReplySource)
+        ));
+
+        let moved = host.click("settings-reply-source-save").unwrap_err();
+        assert!(
+            moved.contains("`settings-relay-save`") && !moved.contains("is gone"),
+            "{moved}"
+        );
+        assert!(host.take_command().is_none());
+    }
+
+    /// Settings → General's Show turn timing switch is on the tree while Settings is open on
+    /// General, as `settings-show-turn-timing` (named `Show turn timing`, checked and valued `on`
+    /// while the phases of each run show, `off` while they do not), and a click from a snapshot
+    /// flips it, as the window's does. Off General it is not on the tree, and a click on it says
+    /// where it is.
+    #[gpui_kit::test]
+    fn the_show_turn_timing_switch_is_clicked_from_a_snapshot(cx: &mut gpui_kit::TestAppContext) {
+        use gpui_kit::AppContext as _;
+        let mut state = AppState::new();
+        state.auth_status = crate::state::AuthStatus::SignedIn;
+        state.account = Some(
+            serde_json::from_value(serde_json::json!({ "id": "acct_1", "email": "a@b.c" }))
+                .unwrap(),
+        );
+        state.coworkers = vec![
+            serde_json::from_value(serde_json::json!({ "id": "cw_1", "name": "Ada" })).unwrap(),
+        ];
+        state.is_app_settings_open = true;
+        state.app_settings_tab = AppSettingsTab::General;
+        let app = cx.new(|_| state);
+        for (was, word, now) in [(false, "off", true), (true, "on", false)] {
+            let mut host = app.read_with(cx, |state, _| NativeChatHost::from_app(state));
+            let tree = host.snapshot();
+            let switch = tree
+                .find("settings-show-turn-timing")
+                .expect("the switch is on the tree");
+            assert_eq!(
+                (
+                    switch.role.as_str(),
+                    switch.name.as_str(),
+                    switch.checked,
+                    switch.value.as_deref()
+                ),
+                ("switch", "Show turn timing", Some(was), Some(word))
+            );
+            host.click("settings-show-turn-timing")
+                .expect("the switch takes a click");
+            let command = host.take_command().expect("the click is a command");
+            app.update(cx, |state, cx| command.apply(state, cx));
+            assert_eq!(app.read_with(cx, |state, _| state.show_turn_timing), now);
+        }
+
+        app.update(cx, |state, _| {
+            state.app_settings_tab = AppSettingsTab::Computer
+        });
+        let mut host = app.read_with(cx, |state, _| NativeChatHost::from_app(state));
+        assert!(host.snapshot().find("settings-show-turn-timing").is_none());
+        let off = host.click("settings-show-turn-timing").unwrap_err();
+        assert!(off.contains(ids::SETTINGS_GENERAL), "{off}");
+        assert!(host.take_command().is_none());
     }
 
     /// The card has nothing of the plan on the server's own machine (its proxy URL, its key and
