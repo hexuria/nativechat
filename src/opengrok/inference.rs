@@ -32,10 +32,9 @@
 //! switch and what answers while it is off (`relayEnabled` and `planFallback`, in `described`,
 //! and in `InferenceSource::applied` in `crates/opengrok-core/src/inference.rs`, which reads a
 //! Save where `apply` did), and says on a reply's frame why the server's keys answered it
-//! (`fallbackFor`, `converse_raw` in `crates/opengrok-harness/src/lib.rs`). The server branch
-//! per-computer-relay at d0a9855 makes the switch each computer's own (`PATCH
-//! /local-exec/daemon/{machine_id}`, `super::client::DaemonMachine`) and the account's
-//! `relayEnabled` is derived from them: read, and never sent again.
+//! (`fallbackFor`, `converse_raw` in `crates/opengrok-harness/src/lib.rs`). #342 makes the switch
+//! each computer's own (`PATCH /local-exec/daemon/{machine_id}`, `super::client::DaemonMachine`)
+//! and the account's `relayEnabled` is derived from them: read, and never sent again.
 //!
 //! The relay (opengrok-server #292, built in #298, whose recording holds its words) lifts the
 //! one-machine limit: the server sends a turn's model calls down a stream to the person's
@@ -261,7 +260,7 @@ pub struct InferenceSource {
     /// Whether the relay is on for the account, from a server that keeps it, which sends it on
     /// every read (opengrok-server #332 (PR #338 at 66b9f7b): `described` in
     /// `crates/opengrok-harness/src/local_proxy.rs`). Since each computer has its own switch
-    /// (opengrok-server branch per-computer-relay at d0a9855) it is DERIVED: true while any
+    /// (opengrok-server #342 (main 2136ffc)) it is DERIVED: true while any
     /// un-revoked computer's own switch is on, false with none, none enrolled included. It is the
     /// Mac's way's alone: the server's own machine never reads it. `None` is the key left out, a
     /// server before it. Read, and never sent: a `PUT` of it switches every one of the person's
@@ -304,9 +303,9 @@ where
 /// chosen model does not list, in words that name the levels it does: `newBotDefault.effort:
 /// gpt-6-luna takes low, medium, high, xhigh or max, not "none"`, and for `ultra`, taken only
 /// where a listing names it, `newBotDefault.effort: no listing of xai/grok-4.6 names "ultra", and
-/// it is taken only where one does` (opengrok-server branch `model-effort-levels`, commit
-/// d632b77: `effort_refused` in `crates/opengrok-server/src/inference.rs`, which `save` asks of
-/// the default on its own source); `inherit` is always taken.
+/// it is taken only where one does` (opengrok-server #342 (main 2136ffc): `effort_refused` in
+/// `crates/opengrok-server/src/inference.rs`, which `save` asks of the default on its own
+/// source); `inherit` is always taken.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NewBotDefault {
@@ -332,10 +331,9 @@ pub struct NewBotDefault {
 /// Bot's (`planFallback.effort must be one of inherit, none, low, medium, high, xhigh, max,
 /// ultra`). So is an effort the model does not list on the gateway, which answers the fallback,
 /// in words that name the levels it does: `planFallback.effort: openai/gpt-6-luna takes low,
-/// medium or high, not "max"` (opengrok-server branch `model-effort-levels`, commit d632b77:
-/// `effort_refused` in `crates/opengrok-server/src/inference.rs`, which `save` asks of the
-/// fallback on the gateway's levels, as `InferenceSource::named_efforts` in
-/// `crates/opengrok-core/src/inference.rs` says).
+/// medium or high, not "max"` (opengrok-server #342 (main 2136ffc): `effort_refused` in
+/// `crates/opengrok-server/src/inference.rs`, which `save` asks of the fallback on the gateway's
+/// levels, as `InferenceSource::named_efforts` in `crates/opengrok-core/src/inference.rs` says).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PlanFallback {
@@ -416,7 +414,7 @@ pub struct RelayRead {
 /// A `PUT /account/inference-source` body, as this app sends one: `{"kind", "via"?,
 /// "newBotDefault"?, "planFallback"?}`. NEVER `relayEnabled`: it is each computer's own switch now
 /// and the account's is read from them, so a `PUT` of it would switch every one of the person's
-/// computers (opengrok-server branch per-computer-relay at d0a9855: `switch_every` in
+/// computers (opengrok-server #342 (main 2136ffc): `switch_every` in
 /// `crates/opengrok-server/src/inference.rs`). There is no field for it here, so no `PUT` can carry
 /// one.
 ///
@@ -967,8 +965,8 @@ mod tests {
 
     /// Whether the relay is on for the account reads as the server writes it (opengrok-server #332
     /// (PR #338 at 66b9f7b)), a bool on every read of a server that keeps it, and as no key from one
-    /// before it; since each computer has its own switch (opengrok-server branch per-computer-relay
-    /// at d0a9855) it is derived from them. It is only ever read: no `PUT` body this app can build
+    /// before it; since each computer has its own switch (opengrok-server #342 (main 2136ffc)) it
+    /// is derived from them. It is only ever read: no `PUT` body this app can build
     /// carries it, with the way as a computer's switch goes on or alone, or with any other field,
     /// and the body names `relayEnabled` nowhere.
     #[test]

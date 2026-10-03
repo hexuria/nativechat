@@ -193,7 +193,7 @@ pub struct CoworkerPatch {
     /// words that name the ones it does (`effort: gpt-6-luna takes low, medium, high, xhigh or
     /// max, not "none"`), and `ultra` where no listing of the model names it (`effort: no
     /// listing of xai/grok-4.6 names "ultra", and it is taken only where one does`):
-    /// opengrok-server branch `model-effort-levels`, commit d632b77, `effort_refused` in
+    /// opengrok-server #342 (main 2136ffc), `effort_refused` in
     /// `crates/opengrok-server/src/inference.rs`, which `repin_coworker` in
     /// `crates/opengrok-server/src/agui/routes.rs` asks. It refuses a word on a coworker shared
     /// with the caller with a 403, as it does every change there but the sidebar flag.
@@ -258,25 +258,23 @@ pub struct ThreadListing {
 /// server keeps and a `PATCH /coworkers/{id}` takes (`low`, `medium`, `ultra`), and what the model
 /// calls it, which is a word of the source's own (opencodex says "Low Effort").
 ///
-/// Transcribed from opengrok-server branch `model-effort-levels` (commit d632b77): `Level` and
-/// `Levels::of` in `crates/opengrok-core/src/catalogue.rs`, which `Model::entry` there writes on
-/// every row `list_models` in `crates/opengrok-server/src/agui/routes.rs` lists. The server sends
-/// a `label` on every level, showing one that was missing or blank as the `value`, and drops an
-/// entry that has no `value`; this app reads a listing the same way, so one odd entry never
-/// takes the slider from a model. The branch's own tests record the shape
-/// (`crates/opengrok-server/tests/against_a_models_own_levels.rs`), but its wire corpus is not
-/// re-recorded, so no corpus file here holds it yet (`REST_FIELDS_NOT_RECORDED_YET` in
-/// `opengrok/conformance.rs`).
+/// Transcribed from opengrok-server #342 (main 2136ffc): `Level` and `Levels::of` in
+/// `crates/opengrok-core/src/catalogue.rs`, which `Model::entry` there writes on every row
+/// `list_models` in `crates/opengrok-server/src/agui/routes.rs` lists. The server sends a `label`
+/// on every level, showing one that was missing or blank as the `value`, and drops an entry that
+/// has no `value`; this app reads a listing the same way, so one odd entry never takes the slider
+/// from a model. The recording holds the shape in `fixtures/wire/rest/GET__models/`, which
+/// `opengrok/conformance.rs` reads (`a_models_levels_are_read_as_the_server_recorded_them`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EffortLevel {
     pub value: String,
     pub label: String,
 }
 
-/// A model of `GET /models`. Its `efforts` and `ownEffort` are from opengrok-server branch
-/// `model-effort-levels` (commit d632b77): `Model::entry` in
-/// `crates/opengrok-core/src/catalogue.rs` writes both on every row, the gateway's and the
-/// person's plan's alike, `null` where the source publishes none ([`EffortLevel`]).
+/// A model of `GET /models`. Its `efforts` and `ownEffort` are from opengrok-server #342 (main
+/// 2136ffc): `Model::entry` in `crates/opengrok-core/src/catalogue.rs` writes both on every row,
+/// the gateway's and the person's plan's alike, `null` where the source publishes none
+/// ([`EffortLevel`]).
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
 pub struct ModelEntry {
     pub id: String,
@@ -871,8 +869,8 @@ mod tests {
     }
 
     /// A model lists the levels of effort it takes, lowest first, and the one it runs at when a
-    /// Bot chooses none (opengrok-server branch `model-effort-levels`, commit d632b77: `Levels::of`
-    /// in `crates/opengrok-core/src/catalogue.rs`). Both are `null` where the source publishes
+    /// Bot chooses none (opengrok-server #342 (main 2136ffc): `Levels::of` in
+    /// `crates/opengrok-core/src/catalogue.rs`). Both are `null` where the source publishes
     /// nothing and then read as none, as when the keys are missing; the app never works a model's
     /// levels out. A level with no label is called by its value, as the server calls it, and an
     /// entry with no value is no level; an empty list, one with no level left, and an own level
@@ -968,7 +966,7 @@ mod tests {
     }
 
     /// The listings opengrok-server's own tests record of `GET /models`, transcribed as they are
-    /// (branch `model-effort-levels`, commit d632b77:
+    /// (opengrok-server #342 (main 2136ffc):
     /// `crates/opengrok-server/tests/against_a_models_own_levels.rs`): the plan's gpt-6-sol with
     /// six levels, up to `ultra`, and gpt-6-luna with five beside a model with none, and the
     /// gateway's route with three beside one with none. Each row carries `points`, `source` and

@@ -4,10 +4,11 @@
 //! agree. `fixtures/wire/` is the server's side of that, recorded by the server itself: every
 //! AG-UI frame and REST body its own tests drove, teed off its router by the recorder of
 //! opengrok-server#258 and written out by its `examples/wire_corpus.rs`. It is vendored whole from
-//! the server's `tests/fixtures/wire/` at opengrok-server #332 (PR #338 at 66b9f7b, not yet on
-//! main: the relay's switch, the fallback that answers while it is off, and a resumed routine
-//! that never fires at once), recorded on main eaaa291. Its `MANIFEST.json` names 79d711f, the
-//! PR's commit it was recorded at. The layout is opengrok-server#255's: `agui/<type>/<slug>.json`,
+//! the server's `tests/fixtures/wire/` at opengrok-server #342 (main 2136ffc: the loopback
+//! screen link (#339), the computer routes' speed (#341), `run_routine` (#337), each model's own
+//! levels of effort and a relay switch for each computer), the tree its integration branch
+//! recorded at 4366ee7 (b8223fd). Its `MANIFEST.json` names b7c1856, the commit it was recorded
+//! at. The layout is opengrok-server#255's: `agui/<type>/<slug>.json`,
 //! a CUSTOM under `agui/custom/<name>/`, and `rest/<METHOD>_<route>/<status>-<slug>.json` holding
 //! `{method, path, status, body}`, one file per distinct shape, named after the first test that
 //! produced it; and since the relay, the frames of its stream under `relay/<type>/<slug>.json`,
@@ -523,23 +524,27 @@ const CLIENT_IGNORES: &[(Slot, &str, &str)] = &[
 /// arm waiting for them in [`check_frame`];
 /// [`every_word_read_ahead_of_its_recording_is_matched_and_not_sent_yet`] fails until it does,
 /// and meanwhile holds that arm to the frames [`frames_read_ahead`] writes in the agreed shape.
-const WORDS_NOT_RECORDED_YET: &[(Slot, &str, &str)] = &[(
-    Slot::RelayType,
-    "disabled",
-    "NOT RECORDED YET. The frame a computer's open relay stream is sent when its relay is switched \
-     off, `{\"type\":\"disabled\"}`, after which the server closes the stream and refuses the next \
-     until the switch is on again (opengrok-server branch per-computer-relay at d0a9855: \
-     `RelayFrame::Disabled` in `crates/opengrok-wire/src/relay.rs`, the per-computer relay \
-     contract the owner approved on 3 Oct 2026). The recorder will file it under \
-     `relay/disabled/` from the server's test \
-     `a_computer_switched_off_is_told_disabled_and_refused_until_it_is_on_again`, which \
-     `examples/wire_corpus.rs` keeps for `/inference-relay/requests`.",
-)];
+const WORDS_NOT_RECORDED_YET: &[(Slot, &str, &str)] = &[];
 
 /// Fixtures this app still reads wrongly, with the words their check fails with and why. The
 /// check has to fail with those words: one that passes means the drift is fixed and the entry
 /// goes, and one that fails some other way is a new problem, not this one.
-const KNOWN_DRIFT: &[(&str, &str, &str)] = &[];
+const KNOWN_DRIFT: &[(&str, &str, &str)] = &[
+    (
+        "rest/GET__schedules__id__runs/200-a_bot_runs_a_routine_by_its_id_and_its_history_names_the_bot.json",
+        "a word this app has no name for",
+        "A run a Bot started (opengrok-server #337, built in #342: `run_routine` in \
+         `crates/opengrok-tools/src/routine.rs`) is a line with `cause: \"bot\"` and `by: \
+         {coworkerId, name}`, which `RunCause` has no name for and reads as `Other`, so the line \
+         says \"Run\" and not who ran it. #337's client half names it.",
+    ),
+    (
+        "rest/GET__schedules__id__runs/200-a_plan_bots_routine_run_by_a_bot_keeps_its_plans_rules.json",
+        "a word this app has no name for",
+        "A firing a Bot's press set off and the server skipped (the plan could not answer) carries \
+         `cause: \"bot\"` and `by` as a run does; see the line above.",
+    ),
+];
 
 /// How a 502, 503 or 504 the server wrote itself fails [`refusal`] when it is not in the shape
 /// that says so.
@@ -652,6 +657,14 @@ const REST_NOT_READ: &[(&str, &str, &str)] = &[
          audit_log). Settings shows each machine's mode and standing rules from GET \
          /local-exec/policy, and no log.",
     ),
+    (
+        "DELETE__local-exec_daemon__machine_id_",
+        "/local-exec/daemon/{machine_id}",
+        "Revokes a computer's daemon token, answering 204 with nothing in it; its row reads \
+         `revoked` from then on (local_exec.rs revoke_daemon). This app lists computers and \
+         switches their relay (PATCH on the same route), enrols this Mac again when its token is \
+         turned away, and has no control that revokes one.",
+    ),
 ];
 
 /// Routes this app asks that the corpus does not record yet: the app was built to a shape agreed
@@ -665,20 +678,7 @@ const REST_NOT_READ: &[(&str, &str, &str)] = &[
 ///
 /// Only routes built ahead of a recording are listed. Routes this app asks that no test on the
 /// server drives are a different gap, and not this list's.
-const REST_NOT_RECORDED_YET: &[(&str, &str, &str)] = &[(
-    "PATCH__local-exec_daemon__machine_id_",
-    "/local-exec/daemon/{machine_id}",
-    "NOT RECORDED YET. One computer's own relay switch (opengrok-server branch per-computer-relay \
-     at d0a9855: `switch_relay` in `crates/opengrok-server/src/local_exec.rs`, the per-computer \
-     relay contract the owner approved on 3 Oct 2026): `{relayEnabled}` answers the computer's \
-     row, and is refused 404 `not_found`, 409 `revoked` or 400 `bad_request`, each as `{error, \
-     code}`. The recorder will file it from the server's `against_the_mac_relay.rs` tests \
-     `a_computer_switched_off_is_told_disabled_and_refused_until_it_is_on_again` and \
-     `a_switch_names_only_the_callers_own_computer_and_is_refused_in_words`, which \
-     `examples/wire_corpus.rs` keeps there. Until then `daemon_switched` and the refusals' \
-     reading wait for it, held to the agreed shapes by \
-     `a_computers_relay_switch_is_read_as_the_contract_agreed_it`.",
-)];
+const REST_NOT_RECORDED_YET: &[(&str, &str, &str)] = &[];
 
 /// Routes this app asks with this Mac's machine token (`local_exec.rs` `MachineCredential`)
 /// rather than the person's session, so they never pass through `send_json_within`: a 401 on one
@@ -697,74 +697,7 @@ const MACHINE_TOKEN_ROUTES: &[&str] = &[
 /// written in the agreed shape. The day a recorded body of the route carries the key, the entry
 /// has gone stale and comes off this list, and
 /// [`every_key_asked_ahead_of_its_recording_is_read_and_not_recorded_yet`] fails until it does.
-const REST_FIELDS_NOT_RECORDED_YET: &[(&str, &str, &str)] = &[
-    (
-        "GET__models",
-        "efforts",
-        "The levels of effort a model takes, `[{value, label}] | null` on every entry, lowest \
-         first, `null` where the source the model comes from publishes none: opengrok-server \
-         branch `model-effort-levels`, commit d632b77, written by `Model::entry` in \
-         `crates/opengrok-core/src/catalogue.rs` for `list_models` in \
-         `crates/opengrok-server/src/agui/routes.rs`. Its own tests record a plan row with six \
-         levels and one with five, and a gateway row, beside rows without \
-         (`crates/opengrok-server/tests/against_a_models_own_levels.rs`), but its wire corpus is \
-         not re-recorded there, so no fixture holds a model entry carrying `efforts` yet. The \
-         server drops an entry with no `value` and shows one with no `label` as its value \
-         (`Levels::of`), and the app reads the same. A fast twin's levels are its base model's: \
-         the app folds the two into one row and reads the base's. The model picker's slider has \
-         exactly these for its stops, and none at all for a model that lists none. \
-         PATCH /coworkers/{id}, `newBotDefault` and `planFallback` (held to the gateway's levels) \
-         refuse an effort the model does not list with a 400 whose words name the listed \
-         levels, and take `inherit` always; `ultra` is taken only where a listing names it, and \
-         is refused in words of its own where none does (`effort_refused` in \
-         `crates/opengrok-server/src/inference.rs`, `refusal` in \
-         `crates/opengrok-core/src/catalogue.rs`). Each is read as its sentence like every \
-         refusal of its route. Its fixtures come with the recording after the branch lands: a \
-         model entry carrying `efforts`.",
-    ),
-    (
-        "GET__models",
-        "ownEffort",
-        "The `value` of the level a model runs at when a Bot chooses none, `null` where the \
-         source publishes none: opengrok-server branch `model-effort-levels`, commit d632b77 \
-         (`Levels::own` in `crates/opengrok-core/src/catalogue.rs`: the row's \
-         `reasoning_effort`, else the entry marked `default`). The picker lights that level by \
-         name for a Bot or a setting at `inherit`, and saves nothing by it; a word the model \
-         does not list is no level to light. Its fixtures come with the recording after the \
-         branch lands: a model entry carrying `ownEffort`.",
-    ),
-    (
-        "GET__local-exec_daemon",
-        "relayEnabled",
-        "NOT RECORDED YET. A computer's own relay switch on its row (opengrok-server branch \
-         per-computer-relay at d0a9855: `row` in `crates/opengrok-server/src/local_exec.rs`), on \
-         for a computer enrolled before it, so a row without it reads on. The recorder will bring \
-         it from the server's test `a_computers_row_says_its_switch_and_whether_it_relays_now`, \
-         which `examples/wire_corpus.rs` keeps for `/local-exec/daemon`. Read meanwhile by \
-         `daemons` from bodies in the agreed shape.",
-    ),
-    (
-        "GET__local-exec_daemon",
-        "relaying",
-        "NOT RECORDED YET. Whether the server holds the computer's relay stream now, on its row \
-         (opengrok-server branch per-computer-relay at d0a9855: `row` in \
-         `crates/opengrok-server/src/local_exec.rs`); live, so a row without it reads as not \
-         relaying. Brought by the same recording as `relayEnabled`.",
-    ),
-    (
-        "GET__inference-relay_requests",
-        "code",
-        "NOT RECORDED YET. The 409 a computer's relay stream is refused with while its relay is \
-         switched off, before any frame: `{error: \"Relay is off for this computer. Turn it on in \
-         Settings → Computer.\", code: \"relay_disabled\"}` (opengrok-server branch \
-         per-computer-relay at d0a9855: `relaying` in `crates/opengrok-server/src/inference.rs`, \
-         `RELAY_IS_OFF` in `crates/opengrok-wire/src/relay.rs`). The relay stops for it and does \
-         not retry. The recorder will bring it from the server's test \
-         `a_computer_switched_off_is_told_disabled_and_refused_until_it_is_on_again`, which \
-         `examples/wire_corpus.rs` keeps for `/inference-relay/requests`; `relay_stream_refused` \
-         reads it meanwhile from a body in the agreed shape.",
-    ),
-];
+const REST_FIELDS_NOT_RECORDED_YET: &[(&str, &str, &str)] = &[];
 
 // ---- the corpus ----
 
@@ -2418,6 +2351,8 @@ const REST_ROUTES: &[(&str, RestCheck)] = &[
     // This Mac, as a machine a coworker may run commands on.
     ("GET__local-exec_daemon", daemons),
     ("POST__local-exec_daemon", enrolled),
+    // One computer's own relay switch (`switch_computer_relay`), answered with its row.
+    ("PATCH__local-exec_daemon__machine_id_", daemon_switched),
     ("GET__local-exec_policy", local_exec_policy),
     ("PUT__local-exec_policy", read_as_done),
     ("POST__local-exec_policy_rule", read_as_done),
@@ -3596,9 +3531,9 @@ fn daemons(_: u16, body: &Value) -> Check {
 }
 
 /// A computer's own relay switch and whether it relays now, as its row carries them (opengrok-server
-/// branch per-computer-relay at d0a9855, ahead of the recording: see
-/// [`REST_FIELDS_NOT_RECORDED_YET`]): `relayEnabled` as sent, on when the row has none, and
-/// `relaying` as sent, not relaying when the row has none.
+/// #342 (main 2136ffc): `row` in `crates/opengrok-server/src/local_exec.rs`, on every row of the
+/// recording): `relayEnabled` as sent, on when the row has none, and `relaying` as sent, not
+/// relaying when the row has none, which only a server from before the switch leaves out.
 fn relay_switch_comes_through(machine: &DaemonMachine, raw: &Value) -> Check {
     must!(
         machine.relay_enabled
@@ -3618,8 +3553,9 @@ fn relay_switch_comes_through(machine: &DaemonMachine, raw: &Value) -> Check {
 }
 
 /// One computer's own relay switch answered (`switch_computer_relay`): the row it left, as
-/// `GET /local-exec/daemon` lists it. THE ROUTE IS NOT IN [`REST_ROUTES`] YET: the corpus does not
-/// record it ([`REST_NOT_RECORDED_YET`]), and the day it does this is its reading there.
+/// `GET /local-exec/daemon` lists it (opengrok-server #342 (main 2136ffc): `switch_relay` in
+/// `crates/opengrok-server/src/local_exec.rs`). Its refusals are read as every other, with the
+/// code beside the server's sentence.
 fn daemon_switched(_: u16, body: &Value) -> Check {
     let machine: DaemonMachine = parse(body)?;
     must!(
@@ -3974,9 +3910,10 @@ fn inference_source(_: u16, body: &Value) -> Check {
             ));
         }
     }
-    // Whether the relay is switched on, from a server that keeps it (opengrok-server #332 (PR
-    // #338 at 66b9f7b): `described` in the same file, on every read): read as sent, and as no key
-    // from one before it, which the relay switch then tells nothing.
+    // Whether the relay is on, from a server that keeps it (opengrok-server #332 (PR #338 at
+    // 66b9f7b), and since #342 (main 2136ffc) derived from the computers' own switches, true while
+    // any un-revoked one is on: `described` in the same file, on every read): read as sent, and as
+    // no key from one before it, which the relay switch then tells nothing.
     must!(
         read.relay_enabled == body.get("relayEnabled").and_then(Value::as_bool),
         "whether the relay is on should come through as sent: {read:?} from {body}"
@@ -4024,13 +3961,13 @@ fn models_listed(_: u16, body: &Value) -> Check {
         );
     }
     // Each model's levels of effort, lowest first, and the one it runs at when a Bot chooses
-    // none: opengrok-server branch `model-effort-levels`, commit d632b77 (`Model::entry` in
-    // `crates/opengrok-core/src/catalogue.rs`), not recorded yet: REST_FIELDS_NOT_RECORDED_YET.
-    // Every recording from before it has neither, which is a model that lists no levels, and a
-    // list that is `null` or empty reads the same. The server drops an entry with no `value` and
-    // shows one with no `label` as its value (`Levels::of`), and so does this app. A key in any
-    // other shape is the server not keeping to what was agreed: the app reads it as none, and it
-    // is caught here, so a slider that goes missing is not missed.
+    // none: opengrok-server #342 (main 2136ffc), `Model::entry` in
+    // `crates/opengrok-core/src/catalogue.rs`, on every entry of the recording. A server from
+    // before it sends neither, which is a model that lists no levels, and a list that is `null`
+    // or empty reads the same. The server drops an entry with no `value` and shows one with no
+    // `label` as its value (`Levels::of`), and so does this app. A key in any other shape is the
+    // server not keeping to what it says: the app reads it as none, and it is caught here, so a
+    // slider that goes missing is not missed.
     fn said<'a>(level: &'a Value, key: &str) -> Option<&'a str> {
         opt_str(level, key).filter(|word| !word.trim().is_empty())
     }
@@ -4145,10 +4082,10 @@ fn relay_stream(_: u16, body: &Value) -> Check {
 /// the relay stops for until this Mac enrols again, rather than asking again with a token that
 /// would be turned away again; it says so in its own words, not the server's. A 409 with
 /// `code: "relay_disabled"` is the server saying this computer's relay is switched off (opengrok-server
-/// branch per-computer-relay at d0a9855, ahead of the recording: see
-/// [`REST_FIELDS_NOT_RECORDED_YET`]), which the relay stops for and waits on its own row for,
-/// rather than knocking again to be refused again; that is the server's word and no other 409
-/// is. Anything else is said in a sentence while the relay tries again, and is read as every other
+/// #342 (main 2136ffc): `relaying` in `crates/opengrok-server/src/inference.rs`, `RELAY_IS_OFF` in
+/// `crates/opengrok-wire/src/relay.rs`, recorded), which the relay stops for and waits on its own
+/// row for, rather than knocking again to be refused again; that is the server's word and no
+/// other 409 is. Anything else is said in a sentence while the relay tries again, and is read as every other
 /// refusal.
 fn relay_stream_refused(status: u16, body: &Value) -> Check {
     let error = OpenGrokClient::refusal(status, &body_text(body));
@@ -4339,6 +4276,19 @@ fn computer(_: u16, body: &Value) -> Check {
                     .unwrap_or(false),
         "the computer came through changed: {status:?}"
     );
+    // An update in flight, or the failure the last one ended in (`update_status` in
+    // opengrok-server's `crates/opengrok-server/src/agui/provision.rs`, on a read and on the
+    // update's own 202): the phase, when it began and its error as sent. `updatedAtMs` is the
+    // server's own clock for an update that has stopped moving, which nothing here reads.
+    if let (Some(update), Some(raw)) = (&status.update, given("update")) {
+        must!(
+            update.phase == str_at(raw, "phase")
+                && Some(update.started_at_ms) == raw.get("startedAtMs").and_then(Value::as_i64)
+                && update.error.as_deref() == opt_str(raw, "error")
+                && update.in_flight() == (str_at(raw, "phase") != "failed"),
+            "an update should come through as sent: {update:?} from {raw}"
+        );
+    }
     let scope = opt_str(body, "shareScope");
     must!(
         status.share_scope == scope.and_then(BoxShareScope::parse)
@@ -4402,10 +4352,18 @@ fn computer(_: u16, body: &Value) -> Check {
 }
 
 /// The coworker's screen right now (`coworker_screen`): the picture a `TOOL_CALL_RESULT` carries,
-/// decoded the same way (`ScreenshotSpec::from_frame`).
+/// decoded the same way (`ScreenshotSpec::from_frame`), and tagged `transcript`, as the server's
+/// `computer_screen` in `crates/opengrok-server/src/agui/routes.rs` tags it: an explicit look at
+/// the screen is a picture a client may keep, where the steps' own shots are `agent`. A coworker
+/// that has no computer is its 404, `this coworker has no computer`, read as every refusal is.
 fn screen(_: u16, body: &Value) -> Check {
     let shot = ScreenshotSpec::from_frame("screen", "", body)
         .ok_or("the screen did not decode as a picture")?;
+    must!(
+        shot.visibility == Some(ImageVisibility::Transcript),
+        "the screen should be tagged transcript, not {:?}",
+        shot.visibility
+    );
     must!(
         Some(u64::from(shot.width)) == body.get("width").and_then(Value::as_u64)
             && Some(u64::from(shot.height)) == body.get("height").and_then(Value::as_u64),
@@ -5172,13 +5130,163 @@ fn every_key_asked_ahead_of_its_recording_is_read_and_not_recorded_yet() {
     assert!(problems.is_empty(), "{}", problems.join("\n"));
 }
 
-/// A computer's relay switch, read from bodies written in the shape the server and this app agreed
-/// (opengrok-server branch per-computer-relay at d0a9855), ahead of the recording
-/// ([`REST_NOT_RECORDED_YET`], [`REST_FIELDS_NOT_RECORDED_YET`]): the list's rows with and without
-/// the two keys, a key that is not a boolean refused, and the switch's answer and its three
-/// refusals, each with the code beside the server's sentence.
+/// The answers the server recorded for `route` (its directory under `rest/`), in file order.
+fn recorded<'a>(corpus: &'a Corpus, route: &str) -> impl Iterator<Item = &'a Value> + use<'a> {
+    let route = route.to_string();
+    corpus
+        .bodies
+        .iter()
+        .filter(move |(file, _)| file.split('/').nth(1) == Some(route.as_str()))
+        .map(|(_, fixture)| fixture)
+}
+
+/// A computer's relay switch as the server recorded it (opengrok-server #342 (main 2136ffc):
+/// `row` and `switch_relay` in `crates/opengrok-server/src/local_exec.rs`): every row of the list
+/// and of the switch's answer carries `relayEnabled` and `relaying` as booleans, with a computer on
+/// and relaying, on and not relaying, and off; the switch's answer is the row it left, off and
+/// not relaying, as the server closes the stream it switches off; its three refusals come with the
+/// code beside the server's sentence, which the client keeps apart; and a stream refused while the
+/// computer's relay is off is the 409 `relay_disabled` in the server's words (`RELAY_IS_OFF` in
+/// `crates/opengrok-wire/src/relay.rs`), which the relay stops for, after the one frame the server
+/// sends the open stream before it closes it, `disabled`.
 #[test]
-fn a_computers_relay_switch_is_read_as_the_contract_agreed_it() {
+fn a_computers_relay_switch_is_read_as_the_server_recorded_it() {
+    let corpus = Corpus::load();
+    let rows = |route: &str| -> Vec<&Value> {
+        recorded(&corpus, route)
+            .filter(|fixture| fixture["status"] == 200)
+            .flat_map(|fixture| match fixture["body"].get("machines") {
+                Some(machines) => machines.as_array().expect("machines").iter().collect(),
+                None => vec![&fixture["body"]],
+            })
+            .collect()
+    };
+    let listed = rows("GET__local-exec_daemon");
+    let switched = rows("PATCH__local-exec_daemon__machine_id_");
+    assert!(
+        !listed.is_empty() && !switched.is_empty(),
+        "the recording holds the list and the switch's answer"
+    );
+    for row in listed.iter().chain(&switched) {
+        assert!(
+            row["relayEnabled"].is_boolean() && row["relaying"].is_boolean(),
+            "every row the server records carries both keys, as booleans: {row}"
+        );
+    }
+    let states: BTreeSet<(bool, bool)> = listed
+        .iter()
+        .map(|row| {
+            (
+                row["relayEnabled"].as_bool().unwrap_or_default(),
+                row["relaying"].as_bool().unwrap_or_default(),
+            )
+        })
+        .collect();
+    for state in [(true, true), (true, false), (false, false)] {
+        assert!(
+            states.contains(&state),
+            "the recording holds a computer with its relay on: {}, and relaying: {}",
+            state.0,
+            state.1
+        );
+    }
+    for row in &switched {
+        let machine: DaemonMachine = serde_json::from_value((*row).clone()).expect("a row");
+        assert_eq!(
+            (machine.relay_enabled, machine.relaying),
+            (false, false),
+            "a switch the server answers is the row it left, off and not relaying: {row}"
+        );
+    }
+
+    let mut refused: BTreeMap<u16, (String, String)> = BTreeMap::new();
+    for fixture in recorded(&corpus, "PATCH__local-exec_daemon__machine_id_") {
+        let status = fixture["status"]
+            .as_u64()
+            .and_then(|s| u16::try_from(s).ok());
+        let status = status.expect("a status");
+        if status == 200 {
+            continue;
+        }
+        let body = &fixture["body"];
+        let error = OpenGrokClient::refusal(status, &body.to_string());
+        assert_eq!(
+            (error.status, error.message.as_str(), error.code()),
+            (
+                Some(status),
+                str_at(body, "error"),
+                Some(str_at(body, "code"))
+            ),
+            "a refused switch reads as the server's sentence beside its code"
+        );
+        refused.insert(
+            status,
+            (
+                str_at(body, "error").to_string(),
+                str_at(body, "code").to_string(),
+            ),
+        );
+    }
+    let said = |status: u16, sentence: &str, code: &str| {
+        (status, (sentence.to_string(), code.to_string()))
+    };
+    assert_eq!(
+        refused,
+        BTreeMap::from([
+            said(400, "relayEnabled must be true or false", "bad_request"),
+            said(404, "no computer of yours has that id", "not_found"),
+            said(
+                409,
+                "this computer was revoked; enrol it again to use it",
+                "revoked"
+            ),
+        ]),
+        "the refusals the recording holds"
+    );
+
+    let off: Vec<&Value> = recorded(&corpus, "GET__inference-relay_requests")
+        .filter(|fixture| fixture["status"] == 409)
+        .collect();
+    assert!(
+        !off.is_empty(),
+        "the recording holds the stream refused while off"
+    );
+    for fixture in off {
+        let body = &fixture["body"];
+        assert_eq!(
+            (str_at(body, "error"), str_at(body, "code")),
+            (
+                "Relay is off for this computer. Turn it on in Settings → Computer.",
+                "relay_disabled"
+            )
+        );
+        assert!(
+            relay_disabled(&OpenGrokClient::refusal(409, &body.to_string())),
+            "the relay stops for it and waits for its row"
+        );
+    }
+    let frames: Vec<&Value> = corpus
+        .relay
+        .iter()
+        .filter(|(file, _)| file.starts_with("relay/disabled/"))
+        .map(|(_, frame)| frame)
+        .collect();
+    assert!(
+        !frames.is_empty(),
+        "the recording holds the frame `disabled`"
+    );
+    for frame in frames {
+        assert_eq!(*frame, serde_json::json!({"type": "disabled"}));
+        assert_eq!(RelayFrame::from_value(frame), RelayFrame::Disabled);
+    }
+}
+
+/// A computer's relay switch, read from bodies beyond the ones the recording holds: a row from a
+/// server before the switch, which sends neither key and reads as on and not relaying, a key that
+/// is not true or false refused, an answer whose switch is not one, and the two 409s and the 400
+/// that are not the relay's own word.
+#[test]
+fn a_computers_relay_switch_is_read_beyond_the_recording() {
     use serde_json::json;
     let row = |id: &str, on: bool, relaying: bool| {
         json!({"machineId": id, "label": "Ada's MacBook", "enrolledAtMs": 1_790_000_000_000_i64,
@@ -5196,50 +5304,29 @@ fn a_computers_relay_switch_is_read_as_the_contract_agreed_it() {
     listed(json!([
         row("mac_1", true, true),
         row("mac_2", false, false),
-        before_the_switch
+        before_the_switch.clone()
     ]))
     .unwrap();
+    let old: DaemonMachine = serde_json::from_value(before_the_switch).expect("a row");
+    assert_eq!(
+        (old.relay_enabled, old.relaying),
+        (true, false),
+        "a computer enrolled before the switch is on, and not relaying"
+    );
     let mut not_a_switch = row("mac_1", true, false);
     not_a_switch["relayEnabled"] = json!("on");
     assert!(
         listed(json!([not_a_switch])).is_err(),
         "a switch that is not true or false is not read as one"
     );
-
-    daemon_switched(200, &row("mac_1", false, false)).unwrap();
     let not_a_switch_either = json!({"machineId": "mac_1", "label": "x", "revoked": false,
                                      "connected": true, "relayEnabled": "no"});
     assert!(
         daemon_switched(200, &not_a_switch_either).is_err(),
         "an answer whose switch is not true or false is caught"
     );
-    for (status, said, code) in [
-        (404, "no computer of yours has that id", "not_found"),
-        (
-            409,
-            "this computer was revoked; enrol it again to use it",
-            "revoked",
-        ),
-        (400, "relayEnabled must be true or false", "bad_request"),
-    ] {
-        let body = json!({"error": said, "code": code});
-        refusal(status, &body).unwrap_or_else(|why| panic!("{status}: {why}"));
-        let read = OpenGrokClient::refusal(status, &body.to_string());
-        assert_eq!(
-            (read.status, read.message.as_str(), read.code()),
-            (Some(status), said, Some(code))
-        );
-    }
 
-    // The 409 a computer's relay stream is refused with while its relay is switched off, in the
-    // contract's words: the relay stops for it and waits for its row, and no other 409 is that.
-    let off = json!({"error": "Relay is off for this computer. Turn it on in Settings → Computer.",
-                     "code": "relay_disabled"});
-    relay_stream_refused(409, &off).unwrap();
-    assert!(relay_disabled(&OpenGrokClient::refusal(
-        409,
-        &off.to_string()
-    )));
+    // No other 409 is the word the relay waits on its row for, and the word is a 409's alone.
     let other = json!({"error": "somebody else's conflict", "code": "something_else"});
     relay_stream_refused(409, &other).unwrap();
     assert!(!relay_disabled(&OpenGrokClient::refusal(
@@ -5875,10 +5962,14 @@ fn a_bots_ceiling_has_a_reading_in_the_ledger() {
     }
 }
 
-/// A coworker row's `effort` (opengrok-server#271) has a reading in the ledger before any
-/// recording carries one. A row without it is today's corpus and reads as inherit; a row with it
-/// comes through as sent, a word this app has not heard of included; an effort that is not a word
-/// is caught; and the patch route's two refusals of an effort read as the server's sentences.
+/// A coworker row's `effort` (opengrok-server#271) has a reading in the ledger beyond what the
+/// recording carries. A row without it is a server from before it and reads as inherit; a row with
+/// it comes through as sent, a word this app has not heard of included; an effort that is not a
+/// word is caught; and the patch route's two refusals of an effort read as the server's
+/// sentences. The recorded 400 for a word the server does not know names every word a Bot takes,
+/// `ultra` the last of them (opengrok-server #342 (main 2136ffc): `Effort::ALL` and its refusal in
+/// `crates/opengrok-core/src/coworker.rs`, the sentence `against_a_coworkers_effort.rs` holds),
+/// and the app shows that sentence as the server wrote it.
 #[test]
 fn a_coworker_rows_effort_has_a_reading_in_the_ledger() {
     let read = |route: &str, status: u16, body: Value| {
@@ -5922,14 +6013,23 @@ fn a_coworker_rows_effort_has_a_reading_in_the_ledger() {
         read(patched, 200, numbered).is_err(),
         "an effort that is not a word"
     );
-    read(
-        patched,
-        400,
-        serde_json::json!({
-            "error": "effort must be one of inherit, none, low, medium, high, xhigh, max, ultra"
-        }),
-    )
-    .unwrap();
+    let corpus = Corpus::load();
+    let unknown: Vec<&str> = recorded(&corpus, patched)
+        .filter(|fixture| fixture["status"] == 400)
+        .map(|fixture| str_at(&fixture["body"], "error"))
+        .filter(|said| said.starts_with("effort must be one of"))
+        .collect();
+    assert_eq!(
+        unknown,
+        ["effort must be one of inherit, none, low, medium, high, xhigh, max, ultra"],
+        "the recorded refusal of a word the server does not know"
+    );
+    let error = OpenGrokClient::refusal(400, &serde_json::json!({"error": unknown[0]}).to_string());
+    assert_eq!(
+        (error.status, error.message.as_str()),
+        (Some(400), unknown[0])
+    );
+    assert_eq!(error.failure(), Failure::Verdict);
     read(
         patched,
         403,
@@ -5946,19 +6046,7 @@ fn a_coworker_rows_effort_has_a_reading_in_the_ledger() {
 /// holds every entry of [`WORDS_NOT_RECORDED_YET`] to these, so a word added there comes with
 /// its frames here, and leaves with it when the recording brings the real ones.
 #[allow(clippy::type_complexity)]
-const FRAMES_READ_AHEAD: &[(Slot, &str, fn() -> Vec<(Value, bool)>)] =
-    &[(Slot::RelayType, "disabled", disabled_frames)];
-
-/// The frame `disabled`, in the shape agreed (`{"type": "disabled"}`, the one word and nothing
-/// beside it), which the relay's reading takes; and the look-alikes it does not.
-fn disabled_frames() -> Vec<(Value, bool)> {
-    use serde_json::json;
-    vec![
-        (json!({"type": "disabled"}), true),
-        (json!({"type": "disable"}), false),
-        (json!({"type": "Disabled"}), false),
-    ]
-}
+const FRAMES_READ_AHEAD: &[(Slot, &str, fn() -> Vec<(Value, bool)>)] = &[];
 
 /// [`FRAMES_READ_AHEAD`]'s frames for one word, none when it has none.
 fn frames_read_ahead(slot: Slot, word: &str) -> Vec<(Value, bool)> {
@@ -6589,12 +6677,73 @@ fn use_skill_reads_as_the_servers_own_tool() {
     assert_eq!(step.shown_arguments().as_deref(), Some(name));
 }
 
+/// A model's levels of effort as the server recorded them (opengrok-server #342 (main 2136ffc):
+/// `Model::entry` in `crates/opengrok-core/src/catalogue.rs`, `list_models` in
+/// `crates/opengrok-server/src/agui/routes.rs`): every entry of every list carries `efforts` and
+/// `ownEffort`, both `null` where the model's source publishes none, and the recording holds the
+/// plan's models with six levels, up to `ultra`, and with five beside one with none, and the
+/// gateway's with three beside one with none. The levels come through lowest first, each named by
+/// the label its source gives it without the word every opencodex label ends with ("Low Effort"
+/// is "Low"), and the level a model runs at is one of them, which is what the slider lights.
+#[test]
+fn a_models_levels_are_read_as_the_server_recorded_them() {
+    let corpus = Corpus::load();
+    let mut shapes: BTreeSet<(String, Vec<String>)> = BTreeSet::new();
+    for fixture in recorded(&corpus, "GET__models").filter(|fixture| fixture["status"] == 200) {
+        let catalogue: ModelCatalogue =
+            serde_json::from_value(fixture["body"].clone()).expect("a list of models");
+        let raw = fixture["body"]["models"].as_array().expect("models");
+        for (entry, raw) in catalogue.models.iter().zip(raw) {
+            assert!(
+                raw.get("efforts").is_some() && raw.get("ownEffort").is_some(),
+                "every entry the server records carries both keys: {raw}"
+            );
+            let levels = entry.efforts.iter().flatten();
+            if let Some(own) = entry.own_effort.as_deref() {
+                assert!(
+                    levels.clone().any(|level| level.value == own),
+                    "a model's own level is one of its levels: {raw}"
+                );
+                assert!(entry.own_level().is_some(), "{raw}");
+            }
+            shapes.insert((
+                entry.source.clone().unwrap_or_default(),
+                levels.map(|level| level.name()).collect(),
+            ));
+        }
+    }
+    let said = |source: &str, levels: &[&str]| {
+        (
+            source.to_string(),
+            levels.iter().map(|level| level.to_string()).collect(),
+        )
+    };
+    for shape in [
+        said(
+            "local_proxy",
+            &["Low", "Medium", "High", "Xhigh", "Max", "Ultra"],
+        ),
+        said("local_proxy", &["Low", "Medium", "High", "Xhigh", "Max"]),
+        said("local_proxy", &[]),
+        said("gateway", &["Low", "Medium", "High"]),
+        said("gateway", &[]),
+    ] {
+        assert!(
+            shapes.contains(&shape),
+            "the recording holds a {} model with the levels {:?}: it holds {shapes:?}",
+            shape.0,
+            shape.1
+        );
+    }
+}
+
 /// `/models`' reading, fed bodies beyond the ones the server's recording holds (it records the
 /// gateway's routes alone and beside the plan's on the server's own machine, opencodex's word on
-/// itself, and no Mac holding the relay): both doors' entries and a plan-only list with
-/// `note: null` as a server from before the relay sends them, opencodex answering and not, a
-/// server from before reply sources, the Mac's own models with a Mac holding the relay, and the
-/// one shape it must not take quietly, a door this app does not know.
+/// itself, no Mac holding the relay, and levels of effort on the plan's models and the gateway's):
+/// both doors' entries and a plan-only list with `note: null` as a server from before the relay
+/// sends them, opencodex answering and not, a server from before reply sources, the Mac's own
+/// models with a Mac holding the relay, a fast twin and an entry that lists no level, and the one
+/// shape it must not take quietly, a door this app does not know.
 #[test]
 fn the_models_list_is_read_beyond_the_recording() {
     use serde_json::json;
@@ -6632,55 +6781,11 @@ fn the_models_list_is_read_beyond_the_recording() {
         "models": [], "note": null,
         "localProxy": {"healthy": false, "relayConnected": false}
     });
-    // With the levels of effort (opengrok-server branch `model-effort-levels`, commit d632b77,
-    // not recorded yet): the listings its own tests record
-    // (`crates/opengrok-server/tests/against_a_models_own_levels.rs`), the plan's models with six
-    // levels, up to `ultra`, and with five beside one with none, and the gateway's route with
-    // three beside one with none; and beyond them a fast twin listing the levels its base does, a
-    // model whose source publishes none (`null`, and empty), and one that lists levels and no
-    // level of its own.
+    // With the levels of effort, beyond what the recording holds (a plan model with six, a plan
+    // model with five and one with none, a gateway model with three and one with none): a fast
+    // twin listing the levels its base does, a model whose source publishes none (`null`, and
+    // empty), and one that lists levels and no level of its own.
     let level = |value: &str, label: &str| json!({"value": value, "label": label});
-    let five = || {
-        json!([
-            level("low", "Low Effort"),
-            level("medium", "Medium Effort"),
-            level("high", "High Effort"),
-            level("xhigh", "Xhigh Effort"),
-            level("max", "Max Effort")
-        ])
-    };
-    let six = || {
-        json!([
-            level("low", "Low Effort"),
-            level("medium", "Medium Effort"),
-            level("high", "High Effort"),
-            level("xhigh", "Xhigh Effort"),
-            level("max", "Max Effort"),
-            level("ultra", "Ultra Effort")
-        ])
-    };
-    let recorded_plan = json!({
-        "models": [
-            {"id": "gpt-6-sol", "points": null, "source": "local_proxy", "via": "loopback",
-             "efforts": six(), "ownEffort": "medium"},
-            {"id": "gpt-6-luna", "points": null, "source": "local_proxy", "via": "loopback",
-             "efforts": five(), "ownEffort": "medium"},
-            {"id": "xai/grok-4.6", "points": null, "source": "local_proxy", "via": "loopback",
-             "efforts": null, "ownEffort": null}
-        ],
-        "note": null
-    });
-    let recorded_gateway = json!({
-        "models": [
-            {"id": "openai/gpt-6-luna", "points": null, "source": "gateway",
-             "efforts": [level("low", "Low Effort"), level("medium", "Medium Effort"),
-                         level("high", "High Effort")],
-             "ownEffort": "medium"},
-            {"id": "xai/grok-4.6", "points": null, "source": "gateway",
-             "efforts": null, "ownEffort": null}
-        ],
-        "note": null
-    });
     let levelled = json!({
         "models": [
             {"id": "gpt-6-luna", "points": null, "source": "local_proxy", "ownEffort": "medium",
@@ -6715,8 +6820,6 @@ fn the_models_list_is_read_beyond_the_recording() {
         &before_reply_sources,
         &relayed,
         &relay_down,
-        &recorded_plan,
-        &recorded_gateway,
         &levelled,
     ] {
         models_listed(200, body).unwrap_or_else(|why| panic!("{body}: {why}"));
@@ -6748,11 +6851,13 @@ fn the_models_list_is_read_beyond_the_recording() {
 /// An effort the model does not list is refused with a 400 in the server's words, which name the
 /// levels it lists, on the three routes that take one: a Bot's PATCH, and `newBotDefault` and
 /// `planFallback` of the account's reply source, the fallback held to the gateway's levels
-/// (opengrok-server branch `model-effort-levels`, commit d632b77: `effort_refused` in
-/// `crates/opengrok-server/src/inference.rs`, whose sentences `against_a_models_own_levels.rs`
-/// records), and `ultra`, which is taken only where a listing of the model names it, in words of
-/// its own where none does. Each is read as its sentence, which is what the picker shows under
-/// its controls; `inherit` is always taken.
+/// (opengrok-server #342 (main 2136ffc): `effort_refused` in
+/// `crates/opengrok-server/src/inference.rs` and `refusal` in
+/// `crates/opengrok-core/src/catalogue.rs`, whose sentences `against_a_models_own_levels.rs`
+/// asserts), and `ultra`, which is taken only where a listing of the model names it, in words of
+/// its own where none does. The recorder files one 400 for a route and shape, and none of these
+/// is the one it kept, so they are read here as fed. Each is read as its sentence, which is what
+/// the picker shows under its controls; `inherit` is always taken.
 #[test]
 fn a_refused_effort_is_read_as_the_servers_sentence_beyond_the_recording() {
     use serde_json::json;

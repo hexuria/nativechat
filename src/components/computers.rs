@@ -1,9 +1,8 @@
 //! Settings → Computer's "Your computers": one card for each computer the person has enrolled,
 //! from `GET /local-exec/daemon`, each with its own Relay your plan switch. The relay is the app on a
 //! computer passing the person's ChatGPT or Grok plan's replies to the server (opengrok-server
-//! #292); since each computer has its own switch (opengrok-server branch per-computer-relay at
-//! d0a9855) the person says which computers do, from any of them, and there is no page of its own
-//! for it any more.
+//! #292); since each computer has its own switch (opengrok-server #342 (main 2136ffc)) the person
+//! says which computers do, from any of them, and there is no page of its own for it any more.
 //!
 //! A computer the server lists as revoked has no card, as the roster has always left it out: the
 //! server refuses to switch one (409 `revoked`), so a dimmed card would have nothing to offer.

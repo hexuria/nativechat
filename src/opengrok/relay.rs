@@ -23,10 +23,10 @@
 //! The relay switch is each computer's own, kept on the server with the computer's row
 //! (`relayEnabled` on `GET /local-exec/daemon`), and the server tells a computer when it is off: its
 //! open stream is sent `{"type":"disabled"}` and closed, and a stream opened while it is off is
-//! refused `409` with `code: "relay_disabled"` before any frame (opengrok-server branch
-//! per-computer-relay at d0a9855: `RelayFrame::Disabled` and `RELAY_IS_OFF` in
-//! `crates/opengrok-wire/src/relay.rs`, `relaying` in `crates/opengrok-server/src/inference.rs`;
-//! not recorded yet in `fixtures/wire/`). Either stops the relay, and it does not reconnect: it
+//! refused `409` with `code: "relay_disabled"` before any frame (opengrok-server #342 (main
+//! 2136ffc): `RelayFrame::Disabled` and `RELAY_IS_OFF` in `crates/opengrok-wire/src/relay.rs`,
+//! `relaying` in `crates/opengrok-server/src/inference.rs`; both recorded in `fixtures/wire/`).
+//! Either stops the relay, and it does not reconnect: it
 //! waits, asking for its own row every [`RelayTimings::recheck`], and opens the stream again only
 //! when that row reads on, which the person can have done from any computer, or here
 //! ([`RelayHandle::wake`]). After the server says another stream of this computer took over
@@ -251,8 +251,8 @@ pub enum RelayFrame {
     /// Another stream took over. The server closes this one.
     Replaced,
     /// This computer's relay was switched off, by its own switch or the account's (opengrok-server
-    /// branch per-computer-relay at d0a9855: `RelayFrame::Disabled` in
-    /// `crates/opengrok-wire/src/relay.rs`). The server closes the stream after it, and refuses
+    /// #342 (main 2136ffc): `RelayFrame::Disabled` in `crates/opengrok-wire/src/relay.rs`, recorded
+    /// as `relay/disabled/`). The server closes the stream after it, and refuses
     /// the next until the switch is on again.
     Disabled,
     /// A model call: `request` is an OpenAI `chat/completions` body with `stream: true`.
@@ -869,7 +869,7 @@ pub(super) fn token_turned_away(error: &OpenGrokError) -> bool {
 }
 
 /// The code the server refuses a relay stream with while this computer's relay is switched off
-/// (`RELAY_IS_OFF` and `relaying` in opengrok-server branch per-computer-relay at d0a9855).
+/// (`RELAY_IS_OFF` and `relaying` in opengrok-server #342 (main 2136ffc)).
 pub(super) const RELAY_DISABLED: &str = "relay_disabled";
 
 /// The server refused the stream because this computer's relay is switched off: a `409` with
@@ -1645,9 +1645,9 @@ mod tests {
             .count()
     }
 
-    /// The account's computers as `GET /local-exec/daemon` lists them (opengrok-server branch
-    /// per-computer-relay at d0a9855): this computer, `mac_1`, with its own switch as given, and
-    /// another one, `mac_2`, which is on.
+    /// The account's computers as `GET /local-exec/daemon` lists them (opengrok-server #342 (main
+    /// 2136ffc)): this computer, `mac_1`, with its own switch as given, and another one, `mac_2`,
+    /// which is on.
     fn computers(own_switch: bool) -> Value {
         let row = |id: &str, on: bool| {
             json!({"machineId": id, "label": id, "enrolledAtMs": 1_790_000_000_000_i64,
@@ -1669,7 +1669,7 @@ mod tests {
 
     /// `disabled` stops the relay, and the stream the server closes after it is not opened again:
     /// not after the shortest wait, as a stream that dropped is, nor after the longest. It says it
-    /// is off, and says nothing is wrong (opengrok-server branch per-computer-relay at d0a9855).
+    /// is off, and says nothing is wrong (opengrok-server #342 (main 2136ffc)).
     #[tokio::test]
     async fn a_disabled_frame_stops_the_relay_and_it_does_not_reconnect() {
         let server = MockServer::start().await;

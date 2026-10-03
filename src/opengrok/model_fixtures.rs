@@ -1,9 +1,10 @@
 //! The list of models the tests that draw a picker read, as `GET /models` gives it: every row with
 //! the levels of effort it takes and the one it runs at (`efforts` and `ownEffort`). In the shape
-//! of opengrok-server branch `model-effort-levels` (commit d632b77): `Model::entry` in
+//! of opengrok-server #342 (main 2136ffc): `Model::entry` in
 //! `crates/opengrok-core/src/catalogue.rs` writes both on every row, and `list_models` in
-//! `crates/opengrok-server/src/agui/routes.rs` lists them. Nothing outside the tests builds a list
-//! of models but by reading what the server sends.
+//! `crates/opengrok-server/src/agui/routes.rs` lists them, as `fixtures/wire/rest/GET__models/`
+//! records. Nothing outside the tests builds a list of models but by reading what the server
+//! sends.
 
 use super::ModelCatalogue;
 

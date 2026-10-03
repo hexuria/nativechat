@@ -14,8 +14,8 @@
 //!
 //! How hard a model can think is the model's to say: `GET /models` lists each model's levels of
 //! effort, lowest first, and the one it runs at when a Bot chooses none (`efforts` and
-//! `ownEffort`, from opengrok-server branch `model-effort-levels`, commit d632b77: `Model::entry`
-//! in `crates/opengrok-core/src/catalogue.rs`). The slider's stops are exactly those levels,
+//! `ownEffort`, from opengrok-server #342 (main 2136ffc): `Model::entry` in
+//! `crates/opengrok-core/src/catalogue.rs`). The slider's stops are exactly those levels,
 //! named as the model names them, and a model that lists none has no slider at all. A Bot, or
 //! a setting, that chose no effort (`inherit`) sits on the model's own level, by name, and that
 //! is only what is shown: nothing is saved until the person moves the slider. This app never
@@ -2695,12 +2695,14 @@ mod tests {
 
     /// While the person has switched the relay off and their plan goes by their computer, a Bot
     /// on its own plan runs its routines on the Relay-off fallback, or with none set every one is
-    /// skipped (opengrok-server #332 (PR #338 at 66b9f7b), whose recording holds a plan Bot's
-    /// routine run on the fallback and one skipped with none), and its list says so, in the words
-    /// of the server's own note for such a routine (`note` in
-    /// `crates/opengrok-tools/src/routine.rs`). Read off the settings the server recorded for
-    /// those two. With the relay on, or the plan on the server's own machine, which never reads
-    /// the switch, they run on the plan as before; and a Bot not on its own plan is told nothing.
+    /// skipped (opengrok-server #332, recorded in PR #342 (integration @ 4366ee7), whose corpus
+    /// holds a plan Bot's routine run on the fallback and one skipped with none), and its list
+    /// says so, in the words of the server's own note for such a routine (`note` in
+    /// `crates/opengrok-tools/src/routine.rs`). Read off the settings the server recorded with
+    /// the relay off and a fallback set, and with none set (`against_bot_messages.rs`: the
+    /// account's setting is the same whichever Bot is answered). With the relay on, or the plan
+    /// on the server's own machine, which never reads the switch, they run on the plan as
+    /// before; and a Bot not on its own plan is told nothing.
     #[test]
     fn a_bot_on_its_own_plan_is_told_where_its_routines_run_while_relay_is_off() {
         assert_eq!(
@@ -2715,10 +2717,10 @@ mod tests {
             serde_json::from_value(recorded["body"].clone()).expect("a setting")
         };
         let on_fallback = recorded(include_str!(
-            "../../fixtures/wire/rest/PUT__account_inference-source/200-a_plan_bots_routine_runs_on_the_fallback_while_the_relay_is_off.json"
+            "../../fixtures/wire/rest/PUT__account_inference-source/200-a_bot_on_its_own_plan_answers_on_the_fallback_while_the_relay_is_off.json"
         ));
         let none_set = recorded(include_str!(
-            "../../fixtures/wire/rest/PUT__account_inference-source/200-a_plan_bots_routine_is_skipped_while_the_relay_is_off_with_no_fallback.json"
+            "../../fixtures/wire/rest/PUT__account_inference-source/200-a_bot_on_its_own_plan_is_skipped_while_the_relay_is_off_with_no_fallback.json"
         ));
         let own = bot(Some(json!("local_proxy")), "gpt-6-luna", Some("medium"));
         let routines = |kept: &InferenceSource, row: &Coworker| {

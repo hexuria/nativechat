@@ -8449,8 +8449,8 @@ impl AppState {
     /// whatever the kind), `mac` being the word every server with the relay reads, whatever this
     /// app calls it. `machine_id` is the computer whose switch asked, which says what became of it.
     ///
-    /// Still needed with each computer's own switch (opengrok-server branch per-computer-relay at
-    /// d0a9855: `resolve` and `route` in `crates/opengrok-core/src/inference.rs` and
+    /// Still needed with each computer's own switch (opengrok-server #342 (main 2136ffc): `resolve`
+    /// in `crates/opengrok-core/src/inference.rs` and `route` in
     /// `crates/opengrok-harness/src/local_proxy.rs`): the relay answers only the turns that ask
     /// through it (`via: "mac"`), and a Bot on the plan that names no way of its own asks by the
     /// account's, which is the server's own machine (`loopback`) until somebody says otherwise. A
@@ -37816,8 +37816,8 @@ mod tests {
     }
 
     /// An effort the model does not list is refused with a 400 whose words name the levels it
-    /// does list (opengrok-server branch `model-effort-levels`, commit d632b77: `effort_refused`
-    /// in `crates/opengrok-server/src/inference.rs`, which `save` there asks of `newBotDefault` on
+    /// does list (opengrok-server #342 (main 2136ffc): `effort_refused` in
+    /// `crates/opengrok-server/src/inference.rs`, which `save` there asks of `newBotDefault` on
     /// its own source and of `planFallback` on the gateway), and nothing is kept. Default for new
     /// Bots' and the Relay-off fallback's pickers each say the words as they are, under their
     /// controls, where they asked; the Bot's is
@@ -38419,8 +38419,8 @@ mod tests {
     /// The account's setting as a server that knows the relay answers it: on the plan, its way
     /// `via`, nobody's computer holding the relay, and `relayEnabled` as given, `None` being a
     /// server that sends no such key, as every server before opengrok-server #332 (PR #338 at
-    /// 66b9f7b) does. From a server with per-computer switches (opengrok-server branch
-    /// per-computer-relay at d0a9855) it is derived, and only ever read.
+    /// 66b9f7b) does. From a server with per-computer switches (opengrok-server #342 (main
+    /// 2136ffc)) it is derived, and only ever read.
     fn relay_answer(via: &str, relay_enabled: Option<bool>) -> serde_json::Value {
         let mut body = json!({
             "kind": "local_proxy", "via": via, "baseUrl": "http://127.0.0.1:8080",
@@ -38454,7 +38454,7 @@ mod tests {
     }
 
     /// A computer's row as `GET /local-exec/daemon` lists it and `PATCH` answers it (opengrok-server
-    /// branch per-computer-relay at d0a9855).
+    /// #342 (main 2136ffc): `row` in `crates/opengrok-server/src/local_exec.rs`).
     fn daemon_row(machine_id: &str, relay_enabled: bool, relaying: bool) -> serde_json::Value {
         json!({"machineId": machine_id, "label": format!("NativeChat on {machine_id}"),
                "enrolledAtMs": 1_790_000_000_000_i64, "revoked": false, "connected": true,
@@ -38544,8 +38544,8 @@ mod tests {
     /// account's way at the relay in the same press, once: one `PUT` of `{kind, via: "mac"}` with
     /// nothing else in it, and the models are read again for the pickers' Subscription group. The
     /// next switch finds the way already the relay's and sends none, and turning one off moves no
-    /// way. (opengrok-server branch per-computer-relay at d0a9855: `resolve` and `route` read
-    /// `via`, and `via: "mac"` with no computer on is "Relay off".)
+    /// way. (opengrok-server #342 (main 2136ffc): `resolve` and `route` read `via`, and
+    /// `via: "mac"` with no computer on is "Relay off".)
     #[tokio::test]
     async fn a_computers_switch_is_its_own_patch_and_on_points_the_account_at_the_relay_once() {
         use super::{AfterChange, AfterComputerRelay};
@@ -38690,7 +38690,8 @@ mod tests {
     /// A refused switch goes back, and the server's words are under that card's switch, in the
     /// server's own sentence beside its code: another account's computer and one nobody enrolled
     /// are the same 404 `not_found`, a revoked one 409 `revoked`, and a body that is not a true or
-    /// false 400 `bad_request` (opengrok-server branch per-computer-relay at d0a9855). The card was
+    /// false 400 `bad_request` (opengrok-server #342 (main 2136ffc): `switch_relay` in
+    /// `crates/opengrok-server/src/local_exec.rs`). The card was
     /// drawn where the click asked while the server was asked, and is drawn from the row, which
     /// nothing refused changed, from then on. A computer the server does not know, or says is
     /// revoked, is a roster gone out of date, and is read again; no other card says anything, and

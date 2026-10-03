@@ -274,9 +274,8 @@
 //! control: after a pick of a model that has no such level as the Bot's effort was on, which
 //! the pick put back on `inherit`, it says `GPT-6 Luna has no Ultra, so it's on Medium, its own
 //! level.`, for as long as that model is on the card and nothing else is changed. The model's
-//! levels and own level are `GET /models`' `efforts` and `ownEffort` (opengrok-server branch
-//! `model-effort-levels`, commit d632b77: `Model::entry` in
-//! `crates/opengrok-core/src/catalogue.rs`).
+//! levels and own level are `GET /models`' `efforts` and `ownEffort` (opengrok-server #342 (main
+//! 2136ffc): `Model::entry` in `crates/opengrok-core/src/catalogue.rs`).
 //! While the list shows, those give way to `agent-model-open-list` as the heading back (state
 //! `expanded`), `agent-model-search` (the search box at the top of the list, a textbox valued by
 //! what is typed: `set_value` writes it, `type` adds to it, `key` takes Backspace and Enter; it
@@ -390,9 +389,8 @@
 //!
 //! Your computers, on Settings → Computer (`settings-tab-computer`; refused while Settings is shut):
 //! one card for each computer the person has enrolled, from `GET /local-exec/daemon`, with its own
-//! Relay your plan switch (the per-computer relay contract, opengrok-server branch per-computer-relay
-//! at d0a9855: each computer has its own switch, and the account's `relayEnabled` is read from them,
-//! never sent). Settings → Relay is gone, with its tab `settings-tab-reply-source`, its section
+//! Relay your plan switch (opengrok-server #342 (main 2136ffc): each computer has its own switch,
+//! and the account's `relayEnabled` is read from them, never sent). Settings → Relay is gone, with its tab `settings-tab-reply-source`, its section
 //! `settings-reply-source`, its card `settings-relay`, `settings-relay-switch`,
 //! `settings-relay-switch-error` and `settings-relay-status`: none is on the tree, and a click on
 //! one of them (or on any other id of `settings-relay-*` or `settings-reply-source-*` that the

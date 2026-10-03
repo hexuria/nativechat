@@ -1510,9 +1510,9 @@ impl OpenGrokClient {
     }
 
     /// `PATCH /local-exec/daemon/{machine_id}` `{relayEnabled}`: one computer's own relay switch,
-    /// answered with its row (opengrok-server branch per-computer-relay at d0a9855: `switch_relay`
-    /// in `crates/opengrok-server/src/local_exec.rs`; not recorded yet in `fixtures/wire/`, see
-    /// `REST_NOT_RECORDED_YET`). It names only the caller's own computers, from any computer of the
+    /// answered with its row (opengrok-server #342 (main 2136ffc): `switch_relay` in
+    /// `crates/opengrok-server/src/local_exec.rs`, recorded in `fixtures/wire/`). It names only the
+    /// caller's own computers, from any computer of the
     /// account. The server refuses in `{error, code}`, and nothing is switched: `404 not_found`
     /// ("no computer of yours has that id", the same for another account's computer as for an id
     /// nobody enrolled), `409 revoked` ("this computer was revoked; enrol it again to use it") and
@@ -2946,9 +2946,9 @@ pub(super) struct DaemonList {
 /// `PATCH /local-exec/daemon/{machine_id}` answers: `{machineId, label, enrolledAtMs, revoked,
 /// connected, relayEnabled, relaying}`.
 ///
-/// `relayEnabled` and `relaying` are the per-computer relay contract's (opengrok-server branch
-/// per-computer-relay at d0a9855: `row` in `crates/opengrok-server/src/local_exec.rs`; not recorded
-/// yet in `fixtures/wire/`, see `REST_FIELDS_NOT_RECORDED_YET`). `relayEnabled` is the computer's
+/// `relayEnabled` and `relaying` are #342's (opengrok-server #342 (main 2136ffc): `row` in
+/// `crates/opengrok-server/src/local_exec.rs`, on every row of the recording in
+/// `fixtures/wire/`). `relayEnabled` is the computer's
 /// own relay switch, on for a computer enrolled before the switch existed, so a row without the key
 /// reads on; `relaying` is whether the server holds the computer's relay stream now, which is live
 /// and not a setting, so a row without it reads as not relaying. `connected` is the reverse-exec
@@ -9675,8 +9675,8 @@ mod tests {
     }
 
     /// A computer's row carries its own relay switch and whether the server holds its relay stream
-    /// now, beside what it always carried (opengrok-server branch per-computer-relay at d0a9855,
-    /// `row` in `crates/opengrok-server/src/local_exec.rs`): every field as the server writes it,
+    /// now, beside what it always carried (opengrok-server #342 (main 2136ffc), `row` in
+    /// `crates/opengrok-server/src/local_exec.rs`): every field as the server writes it,
     /// and a row from a server before the switch, which has neither key, reads as switched on and
     /// not relaying. The roster carries both on, for each computer's card, and leaves a revoked
     /// computer out, as it always did: the server refuses to switch one (409 `revoked`), so a card
@@ -9777,7 +9777,8 @@ mod tests {
     }
 
     /// What the server refuses a switch with is read as its words and its code, each as the server
-    /// writes them (`switch_relay` at d0a9855): another account's computer and one nobody enrolled
+    /// writes them (`switch_relay` in opengrok-server #342 (main 2136ffc)): another account's
+    /// computer and one nobody enrolled
     /// are the same 404 `not_found`, a revoked one 409 `revoked`, and a body without a true or
     /// false 400 `bad_request`. An id with a slash in it cannot turn the route into another.
     #[tokio::test]
