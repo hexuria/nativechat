@@ -309,7 +309,10 @@
 //! `agent-model-open-list` (named by the model; it opens the list) and `agent-model-reset` (↺:
 //! the effort back to `inherit`, so the slider is on the model's own level, and ⚡ off, the model
 //! left alone; live while there is something to put back); then `agent-model-effort`, a slider
-//! whose stops are the levels of effort the model itself lists, low to high, and which is not in
+//! whose stops are the levels of effort the model itself lists, low to high. Its thumb snaps to
+//! those stops during a pointer drag. Its large pill and thumb preview the named effort above
+//! the model; the highest supported stop has a violet gradient and bright flecks, whether named
+//! Max or Ultra. Pointer changes are saved only on release. The slider is not in
 //! the tree at all where the model lists none: it is named by the level it is on (the model's
 //! own while the Bot chose none, and `Effort` where the model names none as its own) and valued
 //! by that level's own word (`medium` while the Bot chose none and the model's own level is
