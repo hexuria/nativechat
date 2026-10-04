@@ -28,6 +28,7 @@
 //! (`agent/host.rs`) says what the window says.
 
 use crate::chrome::INFO_PANE_WIDTH;
+use crate::components::effort_slider::{EffortSlider, effort_colour};
 use crate::components::fields::field_input;
 use crate::opengrok::{
     AccountPlan, CURRENT_TITLE, InferenceKind, LIST_ROWS, ListLine, ModelChoice, ModelPick,
@@ -37,7 +38,7 @@ use crate::opengrok::{
 use crate::state::{AppState, PickerFor, PickerView};
 use gpui_kit::component::input::{InputEvent, InputState};
 use gpui_kit::component::popover::Popover;
-use gpui_kit::component::slider::{Slider, SliderEvent, SliderState};
+use gpui_kit::component::slider::{SliderEvent, SliderState};
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{ActiveTheme, Icon, IconName, Selectable, Theme, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder;
@@ -363,6 +364,8 @@ pub struct ModelPicker {
     /// that changes (a pick saved, a refusal put back, another Bot or model opened), and never
     /// under a drag.
     slider_at: Option<(String, usize, Option<usize>)>,
+    /// The stop under the pointer is shown at once, but is saved only when the person lets go.
+    effort_preview: Option<usize>,
     /// The words of a refusal the slider was last put back for: a refusal of an effort that was
     /// asked of the account leaves the setting as it was, and the thumb back at it.
     refusal_seen: Option<String>,
@@ -409,6 +412,7 @@ impl ModelPicker {
             which,
             sliders: HashMap::new(),
             slider_at: None,
+            effort_preview: None,
             refusal_seen: None,
             search,
             search_focused: false,
@@ -429,6 +433,8 @@ impl ModelPicker {
     ) -> Option<Entity<SliderState>> {
         let stops = pick.levels().len();
         if stops == 0 {
+            self.effort_preview = None;
+            self.slider_at = None;
             return None;
         }
         let slider = match self.sliders.get(&stops) {
@@ -439,18 +445,35 @@ impl ModelPicker {
                 // A drag is a pick once it is let go. Every stop the thumb crosses on the way
                 // would be a save of its own, and saves that cross on the wire can land in either
                 // order.
-                cx.subscribe(&slider, |this, _, event: &SliderEvent, cx| {
-                    let SliderEvent::Release(value) = event else {
-                        return;
-                    };
-                    let stop = value.end().round();
-                    if stop.is_finite() && stop >= 0. {
-                        let which = this.which;
-                        this.state.update(cx, |state, cx| {
-                            state.pick_model_effort_level(which, stop as usize, cx)
-                        });
-                    }
-                })
+                cx.subscribe_in(
+                    &slider,
+                    window,
+                    move |this, slider, event: &SliderEvent, window, cx| {
+                        let (value, released) = match event {
+                            SliderEvent::Change(value) => (*value, false),
+                            SliderEvent::Release(value) => (*value, true),
+                        };
+                        let stop = value.end().round();
+                        if stop.is_finite() && stop >= 0. && stop <= last {
+                            // The kit rounds the value but keeps the raw pointer percentage. Writing
+                            // the rounded value back also projects the thumb onto that stop, including
+                            // a drag that finishes on the already-selected level. set_value emits no
+                            // Change event, so this cannot chase its own correction.
+                            slider.update(cx, |slider, cx| slider.set_value(stop, window, cx));
+                            this.effort_preview = (!released).then_some(stop as usize);
+                            if released {
+                                let which = this.which;
+                                this.state.update(cx, |state, cx| {
+                                    state.pick_model_effort_level(which, stop as usize, cx)
+                                });
+                                // An unchanged selection, or a refused save with the same message as
+                                // before, still returns to the setting's actual stop on the next draw.
+                                this.slider_at = None;
+                            }
+                            cx.notify();
+                        }
+                    },
+                )
                 .detach();
                 self.sliders.insert(stops, slider.clone());
                 slider
@@ -463,6 +486,7 @@ impl ModelPicker {
         self.refusal_seen = refused;
         let at = (pick.bot_id.clone(), stops, pick.lit());
         if put_back || self.slider_at.as_ref() != Some(&at) {
+            self.effort_preview = None;
             // With no level lit the thumb has to sit somewhere: at the lowest stop, and the
             // slider is drawn muted ([`Panel::effort`]). Putting it there is showing it.
             let place = pick.lit().unwrap_or(0) as f32;
@@ -509,6 +533,7 @@ impl Render for ModelPicker {
             catalogue_note: self.snap.catalogue_note.clone(),
             busy: self.snap.busy,
             slider,
+            effort_preview: self.effort_preview,
             search: self.search.clone(),
             query: self.snap.view.search.clone(),
             list_start: self.snap.view.list_start,
@@ -664,6 +689,7 @@ struct Panel {
     busy: bool,
     /// The slider for the model's levels: none where the model lists none.
     slider: Option<Entity<SliderState>>,
+    effort_preview: Option<usize>,
     search: Entity<InputState>,
     /// What is typed in the search box.
     query: String,
@@ -766,6 +792,7 @@ impl Panel {
                 .id(ids.open_list)
                 .debug_selector(move || ids.open_list.to_string())
                 .min_w(px(0.))
+                .max_w_full()
                 .gap(px(4.))
                 .px(px(8.))
                 .py(px(4.))
@@ -817,21 +844,46 @@ impl Panel {
                     }
                 })
         };
-        // ⚡ and ↺ are the same size, and the same spring of space is either side of the model's
-        // name, so it sits in the middle of the row whatever it is called.
+        // Equal-size buttons leave the centre column centred. Constraining its width also lets
+        // a long model name truncate without taking the space between the buttons.
+        let shown_effort = self.effort_preview.or(pick.lit());
+        let name_and_effort = v_flex()
+            .min_w(px(0.))
+            .flex_1()
+            .items_center()
+            .gap(px(1.))
+            .when(self.slider.is_some(), |this| {
+                let label = shown_effort
+                    .and_then(|stop| pick.levels().get(stop))
+                    .map(|level| level.name())
+                    .unwrap_or_else(|| "Choose effort".to_string());
+                let label_id = format!("{}-name", ids.effort);
+                this.child(
+                    div()
+                        .id(SharedString::from(label_id.clone()))
+                        .debug_selector(move || label_id)
+                        .text_sm()
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(
+                            shown_effort
+                                .map(|stop| effort_colour(stop, pick.levels().len(), theme))
+                                .unwrap_or(muted),
+                        )
+                        .child(label),
+                )
+            })
+            .child(open_list);
         let top = h_flex()
             .items_center()
             .gap(px(8.))
             .child(fast_toggle)
-            .child(div().flex_1())
-            .child(open_list)
-            .child(div().flex_1())
+            .child(name_and_effort)
             .child(reset);
         v_flex()
             .gap(px(10.))
             .child(top)
             .when_some(self.slider.clone(), |this, slider| {
-                this.child(self.effort(&slider, theme))
+                this.child(self.effort(&slider))
             })
             .when_some(
                 pick.effort_dead.filter(|_| self.slider.is_some()),
@@ -848,18 +900,15 @@ impl Panel {
             })
     }
 
-    /// The slider, over the name of each of the levels the model lists, low to high, and the one
-    /// the Bot is on lit: its own choice, or the model's own level where it chose none. Where
-    /// there is none to light, no name is, and the slider is muted, so its thumb at the lowest
-    /// stop does not read as Low chosen; it is the person's to move all the same.
-    fn effort(&self, slider: &Entity<SliderState>, theme: &Theme) -> impl IntoElement {
+    /// The pill's dots are the model's own stops. Its current name is above it and previews a
+    /// drag; the setting itself is kept only on release. A model with no own level stays muted
+    /// until a person chooses one, rather than claiming its lowest stop was chosen.
+    fn effort(&self, slider: &Entity<SliderState>) -> impl IntoElement {
         let ids = ids(self.which);
-        let muted = theme.muted_foreground;
-        let lit = self.pick.lit();
+        let lit = self.effort_preview.or(self.pick.lit());
         v_flex()
             .id(ids.effort)
             .debug_selector(move || ids.effort.to_string())
-            .gap(px(4.))
             .child(
                 div()
                     .w_full()
@@ -867,21 +916,14 @@ impl Panel {
                         this.opacity(UNSET_SLIDER_OPACITY)
                             .debug_selector(move || format!("{}-unset", ids.effort))
                     })
-                    .child(Slider::new(slider).disabled(self.pick.effort_dead.is_some())),
-            )
-            .child(
-                h_flex()
-                    .justify_between()
-                    .children(self.pick.levels().iter().enumerate().map(|(stop, level)| {
-                        div()
-                            .text_xs()
-                            .text_color(if lit == Some(stop) {
-                                theme.foreground
-                            } else {
-                                muted
-                            })
-                            .child(level.name())
-                    })),
+                    .when(self.pick.effort_dead.is_some(), |this| this.opacity(0.55))
+                    .child(EffortSlider::new(
+                        slider.clone(),
+                        ids.effort,
+                        self.pick.levels().len(),
+                        lit.is_some(),
+                        self.pick.effort_dead.is_some(),
+                    )),
             )
     }
 
@@ -1843,7 +1885,7 @@ mod tests {
             let slider = cx
                 .debug_bounds("agent-model-effort")
                 .expect("the slider is drawn");
-            // The track is the slider's first 24 pixels, as wide as the slider.
+            // The generous hit area accepts presses at either end as well as on the pill.
             let at = point(
                 slider.left() + slider.size.width * fraction,
                 slider.top() + px(12.),
@@ -1862,6 +1904,112 @@ mod tests {
             });
         }
         // Whatever the last change began is polled while the runtime is entered, and stays out.
+        cx.run_until_parked();
+    }
+
+    /// Returning to the same effort still has to put the thumb on its stop: the widget can
+    /// round the value while retaining the pointer's unsnapped percentage, and no saved-setting
+    /// change then arrives to move it back.
+    #[gpui_kit::test]
+    fn the_effort_thumb_snaps_while_pressed_and_after_an_unchanged_release(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        use gpui_kit::{AppContext as _, Modifiers, MouseButton, point, px};
+        let runtime = undriven_runtime();
+        let _enter = runtime.enter();
+        let state = cx.new(|_| app("local_proxy", "gpt-5.6-sol", "medium"));
+        let (picker, cx) = open_picker(cx, &state, PickerFor::Bot);
+        let slider = picker.update(cx, |picker, _| picker.sliders[&6].clone());
+        let bounds = cx.debug_bounds("agent-model-effort").expect("the slider");
+        let at = point(
+            bounds.left() + bounds.size.width * 0.27,
+            bounds.top() + px(12.),
+        );
+        cx.simulate_mouse_move(at, None, Modifiers::none());
+        cx.simulate_mouse_down(at, MouseButton::Left, Modifiers::none());
+        draw(cx);
+        let assert_snapped = |cx: &mut gpui_kit::VisualTestContext| {
+            slider.read_with(cx, |slider, _| {
+                assert_eq!(slider.value().end(), 1., "Medium is the selected stop");
+                assert!(
+                    (slider.percentage().end - 0.2).abs() < 0.001,
+                    "the thumb sits on Medium, not between stops: {:?}",
+                    slider.percentage()
+                );
+            });
+            state.read_with(cx, |state, _| {
+                assert_eq!(state.coworkers[0].effort.as_deref(), Some("medium"))
+            });
+        };
+        assert_snapped(cx);
+        cx.simulate_mouse_up(at, MouseButton::Left, Modifiers::none());
+        draw(cx);
+        assert_snapped(cx);
+        cx.run_until_parked();
+    }
+
+    /// The enlarged thumb is dragged with real pointer events. The label and brightest fill
+    /// preview the last supported stop while the saved effort waits for release, including a
+    /// model whose highest level is Max rather than Ultra.
+    #[gpui_kit::test]
+    fn dragging_previews_the_models_highest_effort_and_saves_only_on_release(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        use gpui_kit::{AppContext as _, Modifiers, MouseButton, point, px};
+        let runtime = undriven_runtime();
+        let _enter = runtime.enter();
+        let state = cx.new(|_| app("local_proxy", "gpt-5.6-sol", "medium"));
+        let (_, cx) = open_picker(cx, &state, PickerFor::Bot);
+        for (model, highest) in [("gpt-5.6-sol", "ultra"), ("gpt-6-luna", "max")] {
+            state.update(cx, |state, cx| {
+                state.coworkers[0].model = model.into();
+                state.coworkers[0].effort = Some("medium".into());
+                cx.notify();
+            });
+            draw(cx);
+            let track = cx
+                .debug_bounds("agent-model-effort-track")
+                .expect("the pill");
+            let thumb = cx
+                .debug_bounds("agent-model-effort-thumb")
+                .expect("the thumb");
+            assert!(
+                track.size.height >= px(20.),
+                "the pill is large enough to grab"
+            );
+            assert!(thumb.size.width >= px(24.) && thumb.size.height >= px(24.));
+            assert!(cx.debug_bounds("agent-model-effort-glitter").is_none());
+            let start = thumb.center();
+            // The drag ends a little short of the edge, between the final two stops.
+            let end = point(track.left() + track.size.width * 0.96, track.center().y);
+            cx.simulate_mouse_move(start, None, Modifiers::none());
+            cx.simulate_mouse_down(start, MouseButton::Left, Modifiers::none());
+            cx.simulate_mouse_move(end, Some(MouseButton::Left), Modifiers::none());
+            draw(cx);
+            // A second move is delivered to the drag started by the first movement.
+            cx.simulate_mouse_move(end, Some(MouseButton::Left), Modifiers::none());
+            draw(cx);
+            let preview = cx
+                .debug_bounds("agent-model-effort-thumb")
+                .expect("the preview thumb");
+            assert!(
+                (preview.center().x - track.right()).abs() < px(1.),
+                "{model}: snapped to the last stop"
+            );
+            assert!(
+                cx.debug_bounds("agent-model-effort-glitter").is_some(),
+                "{model}: the last stop glows"
+            );
+            state.read_with(cx, |state, _| {
+                assert_eq!(state.coworkers[0].effort.as_deref(), Some("medium"))
+            });
+            cx.simulate_mouse_up(end, MouseButton::Left, Modifiers::none());
+            draw(cx);
+            state.read_with(cx, |state, _| {
+                assert_eq!(state.coworkers[0].effort.as_deref(), Some(highest))
+            });
+            assert!(cx.debug_bounds("agent-model-effort-glitter").is_some());
+        }
         cx.run_until_parked();
     }
 
