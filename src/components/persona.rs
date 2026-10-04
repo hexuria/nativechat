@@ -1,5 +1,5 @@
 use crate::chrome::{AVATAR_PX, persona_shape_path, resolve_persona_color, resolve_persona_shape};
-use gpui_kit::component::Icon;
+use gpui_kit::component::{ActiveTheme, Icon};
 use gpui_kit::*;
 
 const HALO_PAD: f32 = 8.0;
@@ -10,7 +10,8 @@ pub struct PersonaMark {
     shape: Option<SharedString>,
     color: Option<SharedString>,
     size: Pixels,
-    dark: bool,
+    /// `None` follows the window's theme; a caller sets it only to force one.
+    dark: Option<bool>,
     lit: bool,
     group: Option<SharedString>,
 }
@@ -22,7 +23,7 @@ impl PersonaMark {
             shape: None,
             color: None,
             size: px(AVATAR_PX),
-            dark: true,
+            dark: None,
             lit: false,
             group: None,
         }
@@ -44,7 +45,7 @@ impl PersonaMark {
     }
 
     pub fn dark(mut self, dark: bool) -> Self {
-        self.dark = dark;
+        self.dark = Some(dark);
         self
     }
 
@@ -60,7 +61,7 @@ impl PersonaMark {
 }
 
 impl RenderOnce for PersonaMark {
-    fn render(self, _window: &mut Window, _cx: &mut App) -> impl IntoElement {
+    fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
         let shape = resolve_persona_shape(
             self.agent_id.as_ref(),
             self.shape.as_ref().map(|s| s.as_ref()),
@@ -69,7 +70,8 @@ impl RenderOnce for PersonaMark {
             self.agent_id.as_ref(),
             self.color.as_ref().map(|s| s.as_ref()),
         );
-        let fill = if self.dark { color.dark } else { color.light };
+        let dark = self.dark.unwrap_or_else(|| cx.theme().is_dark());
+        let fill = if dark { color.dark } else { color.light };
         let path = persona_shape_path(shape);
         let halo = px(f32::from(self.size) + HALO_PAD);
         let group = self
