@@ -328,13 +328,17 @@
 //! 2136ffc): `Model::entry` in `crates/opengrok-core/src/catalogue.rs`).
 //! While the list shows, those give way to `agent-model-open-list` as the heading back (state
 //! `expanded`), `agent-model-search` (the search box at the top of the list, a textbox valued by
-//! what is typed: `set_value` writes it, `type` adds to it, `key` takes Backspace and Enter; it
-//! filters both groups at once, whatever the case, by a model's name and by its raw id, and the
-//! list opens with it empty) and `agent-model-list` (always in the tree, valued by how many
+//! what is typed: `set_value` writes it, `type` adds to it, `key` takes Backspace, Up, Down,
+//! Tab, Space and Enter; arrows and Tab move its active option, and Enter picks it; Ctrl+P and
+//! Ctrl+N are the other previous/next keys; it filters both groups at once, whatever the case, by
+//! a model's name and its raw id, and the list opens with it empty) and `agent-model-list`
+//! (always in the tree, valued by how many
 //! models the search leaves, all of them while nothing is typed). The list holds what its window
 //! draws: at most five models at a time, an `agent-model-row-{source}-{id}` each, by its door's
 //! wire word and the id a pick pins with ⚡ off (valued by its door's word, state `selected` on
-//! the one that answers and `fast` where the list holds its fast twin; a click puts the Bot on
+//! the one that answers, `active` on the temporary keyboard highlight and `fast` where the list
+//! holds its fast twin; the active highlight is separate from the saved-model checkmark; a click
+//! puts the Bot on
 //! it, fast where ⚡ is on and it has a twin, and goes back to the controls), with an
 //! `agent-model-group-{source}` heading over each group's first model in view, which is not one
 //! of the five: `agent-model-group-local_proxy` is "Subscription", the person's own plan, and

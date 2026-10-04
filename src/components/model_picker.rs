@@ -35,7 +35,7 @@ use crate::opengrok::{
     NEW_BOTS_NONE, NO_MODEL, SUBSCRIPTION_GROUP, base_label, group_title, last_window_start,
     list_window, row_count,
 };
-use crate::state::{AppState, PickerFor, PickerView};
+use crate::state::{AppState, PickerActiveOption, PickerFor, PickerView};
 use gpui_kit::component::input::{InputEvent, InputState};
 use gpui_kit::component::popover::Popover;
 use gpui_kit::component::slider::{SliderEvent, SliderState};
@@ -47,20 +47,44 @@ use std::cell::Cell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
-gpui_kit::actions!(nativechat, [InsertModelSearchSpace]);
+gpui_kit::actions!(
+    nativechat,
+    [
+        InsertModelSearchSpace,
+        MoveModelSearchPrevious,
+        MoveModelSearchNext,
+        SelectModelSearchActive,
+    ]
+);
 
 /// The search field's child context: a more specific Space binding lets it enter text without
 /// reaching the popover's own Space-to-confirm binding.
 const SEARCH_KEY_CONTEXT: &str = "ModelPickerSearch";
+/// A search input is nested in both this picker context and gpui-base's Input context. These
+/// bindings target that descendant so they take precedence over the field's caret and focus keys.
+const SEARCH_INPUT_CONTEXT: &str = "ModelPickerSearch > Input";
 
 /// Bind Space to insertion while the model search field owns focus. The generic popover binds
 /// Space to confirming its trigger, which is useful everywhere except a field that accepts text.
 pub fn init(cx: &mut App) {
-    cx.bind_keys([KeyBinding::new(
-        "space",
-        InsertModelSearchSpace,
-        Some(SEARCH_KEY_CONTEXT),
-    )]);
+    cx.bind_keys([
+        KeyBinding::new("space", InsertModelSearchSpace, Some(SEARCH_KEY_CONTEXT)),
+        KeyBinding::new("up", MoveModelSearchPrevious, Some(SEARCH_INPUT_CONTEXT)),
+        KeyBinding::new("down", MoveModelSearchNext, Some(SEARCH_INPUT_CONTEXT)),
+        KeyBinding::new(
+            "ctrl-p",
+            MoveModelSearchPrevious,
+            Some(SEARCH_INPUT_CONTEXT),
+        ),
+        KeyBinding::new("ctrl-n", MoveModelSearchNext, Some(SEARCH_INPUT_CONTEXT)),
+        KeyBinding::new("tab", MoveModelSearchNext, Some(SEARCH_INPUT_CONTEXT)),
+        KeyBinding::new(
+            "shift-tab",
+            MoveModelSearchPrevious,
+            Some(SEARCH_INPUT_CONTEXT),
+        ),
+        KeyBinding::new("enter", SelectModelSearchActive, Some(SEARCH_INPUT_CONTEXT)),
+    ]);
 }
 
 /// The card in the Bot's settings, which opens the popover.
@@ -325,11 +349,33 @@ pub(crate) fn card_detail(pick: &ModelPick) -> String {
 /// words, None or what is said beside it, as a model's row shows while the search holds its name,
 /// and so whenever nothing is typed.
 pub(crate) fn none_shows(query: &str, hint: &str) -> bool {
-    let query = query.trim().to_lowercase();
-    query.is_empty()
-        || [NEW_BOTS_NONE, hint]
-            .iter()
-            .any(|words| words.to_lowercase().contains(&query))
+    crate::state::picker_none_matches(query, hint)
+}
+
+/// The list's selectable rows, in their display order. Current is its own option above the
+/// groups even though that same model also appears in its group; None is an option where the
+/// picker offers it; headings and the account-plan notice are never options.
+pub(crate) fn selectable_options(
+    which: PickerFor,
+    pick: &ModelPick,
+    query: &str,
+) -> Vec<PickerActiveOption> {
+    crate::state::picker_active_options(which, pick, query, ids(which).none_hint)
+}
+
+/// The one row to paint as the temporary keyboard highlight. An unset or stale active key means
+/// the first selectable option, so opening and filtering both start at the top immediately.
+pub(crate) fn active_option(
+    which: PickerFor,
+    pick: &ModelPick,
+    view: &PickerView,
+) -> Option<PickerActiveOption> {
+    let options = selectable_options(which, pick, &view.search);
+    view.active
+        .as_ref()
+        .filter(|active| options.contains(active))
+        .cloned()
+        .or_else(|| options.first().cloned())
 }
 
 /// What the picker draws, read off the state whenever it changes, so a notify about anything
@@ -543,6 +589,7 @@ impl Render for ModelPicker {
         let panel = Panel {
             which,
             pick: pick.clone(),
+            active: active_option(which, &pick, &self.snap.view),
             list_open: self.snap.view.list_open,
             note: self.snap.note.clone(),
             effort_note: self.snap.effort_note.clone(),
@@ -695,6 +742,8 @@ fn card(
 struct Panel {
     which: PickerFor,
     pick: ModelPick,
+    /// The temporary keyboard highlight; the checkmark still comes from the saved pick.
+    active: Option<PickerActiveOption>,
     list_open: bool,
     note: Option<String>,
     /// The line under the slider about a pick that put the effort back on the model's own level.
@@ -959,6 +1008,38 @@ impl Panel {
         let none = ids.none.filter(|_| none_shows(&self.query, ids.none_hint));
         let total = row_count(&groups);
         let search = self.search.clone();
+        let options = selectable_options(which, pick, &self.query);
+        let none_hint = ids.none_hint;
+        let active = self
+            .active
+            .as_ref()
+            .filter(|active| options.contains(active))
+            .cloned()
+            .or_else(|| options.first().cloned());
+        let move_previous = {
+            let app = app.clone();
+            move |cx: &mut App| {
+                app.update(cx, |state, cx| {
+                    state.move_picker_active(which, none_hint, -1, cx)
+                });
+            }
+        };
+        let move_next = {
+            let app = app.clone();
+            move |cx: &mut App| {
+                app.update(cx, |state, cx| {
+                    state.move_picker_active(which, none_hint, 1, cx)
+                });
+            }
+        };
+        let select_active = {
+            let app = app.clone();
+            move |cx: &mut App| {
+                app.update(cx, |state, cx| {
+                    state.select_picker_active(which, none_hint, cx)
+                });
+            }
+        };
         // A list with nothing in it is the server's to explain, whatever is typed; a search that
         // leaves nothing of a list that has some is the search's.
         let offers_nothing = pick.groups.is_empty() && pick.account_plan.is_none();
@@ -1007,6 +1088,9 @@ impl Panel {
                     .on_action(move |_: &InsertModelSearchSpace, window, cx| {
                         search.update(cx, |input, cx| input.insert(" ", window, cx));
                     })
+                    .on_action(move |_: &MoveModelSearchPrevious, _, cx| move_previous(cx))
+                    .on_action(move |_: &MoveModelSearchNext, _, cx| move_next(cx))
+                    .on_action(move |_: &SelectModelSearchActive, _, cx| select_active(cx))
                     .child(field_input(&self.search).cleanable(true)),
             )
             .child(
@@ -1026,7 +1110,13 @@ impl Panel {
                                     false,
                                     theme,
                                 ))
-                                .child(self.row(row, ids.current_row_id(), app.clone(), theme)),
+                                .child(self.row(
+                                    row,
+                                    ids.current_row_id(),
+                                    app.clone(),
+                                    theme,
+                                    active == Some(PickerActiveOption::Current),
+                                )),
                         )
                     })
                     .when_some(none, |this, id| {
@@ -1034,6 +1124,7 @@ impl Panel {
                             which,
                             id,
                             pick.model.is_none(),
+                            active == Some(PickerActiveOption::None),
                             app.clone(),
                             theme,
                         ))
@@ -1042,7 +1133,7 @@ impl Panel {
                         this.child(account_plan(ids.plan, &plan, theme))
                     })
                     .when(total > 0, |this| {
-                        this.child(self.window(&groups, total, app, theme))
+                        this.child(self.window(&groups, total, app, theme, active.as_ref()))
                     })
                     .when(offers_nothing, |this| {
                         this.child(
@@ -1096,6 +1187,7 @@ impl Panel {
         total: usize,
         app: &Entity<AppState>,
         theme: &Theme,
+        active: Option<&PickerActiveOption>,
     ) -> impl IntoElement {
         let start = self.list_start.min(last_window_start(total));
         let lines = list_window(groups, start);
@@ -1112,14 +1204,21 @@ impl Panel {
                         theme,
                     )
                     .into_any_element(),
-                    ListLine::Row(row) => self
-                        .row(
+                    ListLine::Row(row) => {
+                        let is_active = active
+                            == Some(&PickerActiveOption::Model {
+                                source: row.source,
+                                base_id: row.base_id.clone(),
+                            });
+                        self.row(
                             row,
                             ids(self.which).row_id(row.source, &row.base_id),
                             app.clone(),
                             theme,
+                            is_active,
                         )
-                        .into_any_element(),
+                        .into_any_element()
+                    }
                 }
             }))
             .when(total > LIST_ROWS, |this| {
@@ -1144,6 +1243,7 @@ impl Panel {
         id: String,
         app: Entity<AppState>,
         theme: &Theme,
+        active: bool,
     ) -> impl IntoElement {
         let which = self.which;
         let current = self.pick.is_current(row);
@@ -1160,6 +1260,7 @@ impl Panel {
             .items_center()
             .cursor_pointer()
             .hover(|style| style.bg(rgb(0x777777).opacity(0.12)))
+            .when(active, |this| this.bg(theme.secondary))
             .on_mouse_down(MouseButton::Left, move |_, _, cx| {
                 cx.stop_propagation();
                 app.update(cx, |state, cx| {
@@ -1213,6 +1314,7 @@ fn none_row(
     which: PickerFor,
     id: &'static str,
     current: bool,
+    active: bool,
     app: Entity<AppState>,
     theme: &Theme,
 ) -> impl IntoElement {
@@ -1226,6 +1328,7 @@ fn none_row(
         .items_center()
         .cursor_pointer()
         .hover(|style| style.bg(rgb(0x777777).opacity(0.12)))
+        .when(active, |this| this.bg(theme.secondary))
         .on_mouse_down(MouseButton::Left, move |_, _, cx| {
             cx.stop_propagation();
             app.update(cx, |state, cx| match which {
@@ -1320,15 +1423,15 @@ fn account_plan(id: &'static str, plan: &AccountPlan, theme: &Theme) -> impl Int
 mod tests {
     // Item by item rather than a glob: `use super::*` would drag in gpui_kit's own `test`.
     use super::{
-        BOT_IDS, ModelPicker, NEW_BOTS_IDS, NONE_HINT, PLAN_FALLBACK_IDS, card_detail, none_shows,
-        row_id, wheel_rows,
+        BOT_IDS, ModelPicker, NEW_BOTS_IDS, NONE_HINT, PLAN_FALLBACK_IDS, active_option,
+        card_detail, none_shows, row_id, selectable_options, wheel_rows,
     };
     use crate::opengrok::model_fixtures::{levelled_catalogue, levelled_catalogue_without_own};
     use crate::opengrok::{
-        InferenceKind, InferenceSource, ModelPick, NewBotDefault, OpenGrokClient, PlanFallback,
-        bot_pick, new_bots_pick, plan_fallback_pick,
+        InferenceKind, InferenceSource, LIST_ROWS, ModelPick, NewBotDefault, OpenGrokClient,
+        PlanFallback, bot_pick, new_bots_pick, plan_fallback_pick,
     };
-    use crate::state::{AppState, PickerFor, ReplySourceRead};
+    use crate::state::{AppState, PickerActiveOption, PickerFor, ReplySourceRead};
     use serde_json::{Value, json};
 
     /// The account, on the server's keys, as the picker tests read it.
@@ -1376,6 +1479,33 @@ mod tests {
         app.active_coworker_id = Some("cw_1".into());
         app.reply_source.kept = Some(ReplySourceRead::Read(account()));
         app.model_catalogue = levelled_catalogue();
+        app
+    }
+
+    /// Both account pickers offer their None row, which starts with no saved setting.
+    fn app_with_none_pickers() -> AppState {
+        let mut app = app("local_proxy", "gpt-6-luna", "medium");
+        let mut account = account();
+        account.new_bot_default = Some(None);
+        account.plan_fallback = Some(None);
+        app.reply_source.kept = Some(ReplySourceRead::Read(account));
+        app
+    }
+
+    /// The long list paints enough gateway rows to exercise the keyboard's five-model window.
+    fn app_with_many_models() -> AppState {
+        let mut app = app("local_proxy", "gpt-6-luna", "medium");
+        for at in 0..4 {
+            app.model_catalogue.models.push(
+                serde_json::from_value(json!({
+                    "id": format!("oag/navigation-{at}"),
+                    "source": "gateway",
+                    "efforts": null,
+                    "ownEffort": null
+                }))
+                .expect("an extra gateway model"),
+            );
+        }
         app
     }
 
@@ -1699,6 +1829,298 @@ mod tests {
         picker.read_with(cx, |picker, cx| {
             assert_eq!(picker.search.read(cx).value().as_ref(), "glm 5");
         });
+    }
+
+    /// Real keystrokes move one temporary highlight through the list, keep the search field in
+    /// focus, reset to the first filtered row, and scroll an active model into the five-row view.
+    #[gpui_kit::test]
+    fn keyboard_navigation_keeps_one_active_option_visible_and_resets_after_filtering(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        use gpui_kit::AppContext as _;
+        let runtime = undriven_runtime();
+        let _enter = runtime.enter();
+        let state = cx.new(|_| app_with_many_models());
+        let (picker, cx) = open_picker(cx, &state, PickerFor::Bot);
+        state.update(cx, |state, cx| state.toggle_picker_list(PickerFor::Bot, cx));
+        draw(cx);
+
+        let first_model = state.read_with(cx, |state, _| {
+            let pick = state.model_pick().expect("Ada has a pick");
+            let groups = pick.search("");
+            let first = &groups[0].rows[0];
+            PickerActiveOption::Model {
+                source: first.source,
+                base_id: first.base_id.clone(),
+            }
+        });
+        state.read_with(cx, |state, _| {
+            let pick = state.model_pick().expect("Ada has a pick");
+            assert_eq!(
+                active_option(PickerFor::Bot, &pick, &state.model_picker),
+                Some(PickerActiveOption::Current),
+                "the pinned Current row is the first selectable option"
+            );
+        });
+
+        // The grouped copy of the current model has its own temporary highlight. Up/Down, Ctrl+P/N
+        // and Tab/Shift+Tab all follow the same option order without moving the caret out of search.
+        cx.simulate_keystrokes("down");
+        draw(cx);
+        assert_eq!(
+            state.read_with(cx, |state, _| state.model_picker.active.clone()),
+            Some(first_model.clone())
+        );
+        cx.simulate_keystrokes("up");
+        draw(cx);
+        assert_eq!(
+            state.read_with(cx, |state, _| state.model_picker.active.clone()),
+            Some(PickerActiveOption::Current)
+        );
+        cx.simulate_keystrokes("ctrl-n");
+        draw(cx);
+        assert_eq!(
+            state.read_with(cx, |state, _| state.model_picker.active.clone()),
+            Some(first_model.clone())
+        );
+        state.read_with(cx, |state, _| {
+            assert_eq!(
+                state.coworkers[0].model, "gpt-6-luna",
+                "the checkmark is saved state"
+            );
+        });
+        cx.simulate_keystrokes("ctrl-p");
+        draw(cx);
+        assert_eq!(
+            state.read_with(cx, |state, _| state.model_picker.active.clone()),
+            Some(PickerActiveOption::Current)
+        );
+        cx.simulate_keystrokes("tab");
+        draw(cx);
+        assert_eq!(
+            state.read_with(cx, |state, _| state.model_picker.active.clone()),
+            Some(first_model.clone())
+        );
+        cx.simulate_keystrokes("shift-tab");
+        draw(cx);
+        assert_eq!(
+            state.read_with(cx, |state, _| state.model_picker.active.clone()),
+            Some(PickerActiveOption::Current)
+        );
+
+        // The next typed key still lands in search. Filtering clears the stored highlight, so
+        // the first matching selectable row becomes active.
+        cx.simulate_keystrokes("g");
+        draw(cx);
+        picker.read_with(cx, |picker, cx| {
+            assert_eq!(picker.search.read(cx).value().as_ref(), "g");
+        });
+        let filtered_first = state.read_with(cx, |state, _| {
+            let pick = state.model_pick().expect("Ada has a pick");
+            let options = selectable_options(PickerFor::Bot, &pick, &state.model_picker.search);
+            assert!(!options.is_empty());
+            assert_eq!(
+                state.model_picker.active, None,
+                "typing resets the stored highlight"
+            );
+            active_option(PickerFor::Bot, &pick, &state.model_picker)
+        });
+        assert_eq!(
+            state.read_with(cx, |state, _| state
+                .model_picker
+                .search
+                .as_str()
+                .to_string()),
+            "g"
+        );
+        assert_eq!(
+            filtered_first,
+            state.read_with(cx, |state, _| {
+                let pick = state.model_pick().expect("Ada has a pick");
+                selectable_options(PickerFor::Bot, &pick, &state.model_picker.search)
+                    .first()
+                    .cloned()
+            })
+        );
+        state.update(cx, |state, cx| {
+            state.set_picker_search(PickerFor::Bot, String::new(), cx)
+        });
+        draw(cx);
+
+        // From Current, exactly one Down per model reaches the end. The window follows the
+        // highlighted row; an extra Down clamps at the end, and Up returns through the same rows.
+        let (total, last_model) = state.read_with(cx, |state, _| {
+            let pick = state.model_pick().expect("Ada has a pick");
+            let groups = pick.search("");
+            let total = crate::opengrok::row_count(&groups);
+            assert!(
+                total > LIST_ROWS,
+                "the fixture has more than five model rows"
+            );
+            let row = groups
+                .iter()
+                .flat_map(|group| &group.rows)
+                .last()
+                .expect("the fixture has a last row");
+            (
+                total,
+                PickerActiveOption::Model {
+                    source: row.source,
+                    base_id: row.base_id.clone(),
+                },
+            )
+        });
+        let down = vec!["down"; total].join(" ");
+        cx.simulate_keystrokes(&down);
+        draw(cx);
+        state.read_with(cx, |state, _| {
+            assert_eq!(state.model_picker.active, Some(last_model.clone()));
+            assert_eq!(
+                state.model_picker.list_start,
+                crate::opengrok::last_window_start(total)
+            );
+        });
+        cx.simulate_keystrokes("down");
+        draw(cx);
+        assert_eq!(
+            state.read_with(cx, |state, _| state.model_picker.active.clone()),
+            Some(last_model)
+        );
+        let up = vec!["up"; total + 2].join(" ");
+        cx.simulate_keystrokes(&up);
+        draw(cx);
+        state.read_with(cx, |state, _| {
+            assert_eq!(state.model_picker.active, Some(PickerActiveOption::Current));
+            assert_eq!(state.model_picker.list_start, 0);
+        });
+    }
+
+    /// Down then Enter in one key batch picks the row Down just activated. Typing a new filter
+    /// and pressing Enter before another draw also picks the first matching row; no-match Enter
+    /// leaves the list open and sends no model change.
+    #[gpui_kit::test]
+    fn enter_uses_the_live_highlight_and_does_nothing_without_matches(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        use gpui_kit::AppContext as _;
+        let runtime = undriven_runtime();
+        let _enter = runtime.enter();
+        let state = cx.new(|_| app("local_proxy", "gpt-6-luna", "medium"));
+        let (_, cx) = open_picker(cx, &state, PickerFor::Bot);
+        state.update(cx, |state, cx| state.toggle_picker_list(PickerFor::Bot, cx));
+        draw(cx);
+        let expected = state.read_with(cx, |state, _| {
+            let options = selectable_options(
+                PickerFor::Bot,
+                &state.model_pick().expect("Ada has a pick"),
+                "",
+            );
+            assert!(options.len() > 2);
+            options[2].clone()
+        });
+        let PickerActiveOption::Model { source, base_id } = expected else {
+            panic!("the third option is the second grouped model");
+        };
+        cx.simulate_keystrokes("down down enter");
+        draw(cx);
+        state.read_with(cx, |state, _| {
+            assert!(
+                !state.model_picker.list_open,
+                "Enter takes the highlighted row"
+            );
+            assert_eq!(
+                state.coworkers[0].source,
+                crate::opengrok::CoworkerSource::Kind(source)
+            );
+            assert_eq!(state.coworkers[0].model, base_id);
+        });
+
+        state.update(cx, |state, cx| state.toggle_picker_list(PickerFor::Bot, cx));
+        draw(cx);
+        cx.simulate_keystrokes("l u n a enter");
+        draw(cx);
+        state.read_with(cx, |state, _| {
+            assert!(
+                !state.model_picker.list_open,
+                "the fresh filtered option was picked"
+            );
+            assert_eq!(state.coworkers[0].model, "gpt-6-luna");
+        });
+
+        state.update(cx, |state, cx| state.toggle_picker_list(PickerFor::Bot, cx));
+        state.update(cx, |state, cx| {
+            state.set_picker_search(PickerFor::Bot, "no-model-can-match-this".into(), cx)
+        });
+        draw(cx);
+        state.read_with(cx, |state, _| {
+            let pick = state.model_pick().expect("Ada has a pick");
+            assert!(
+                selectable_options(PickerFor::Bot, &pick, &state.model_picker.search).is_empty()
+            );
+            assert_eq!(
+                active_option(PickerFor::Bot, &pick, &state.model_picker),
+                None
+            );
+        });
+        cx.simulate_keystrokes("enter");
+        draw(cx);
+        state.read_with(cx, |state, _| {
+            assert!(
+                state.model_picker.list_open,
+                "no active row means no selection"
+            );
+            assert_eq!(state.coworkers[0].model, "gpt-6-luna");
+            assert_eq!(state.auth_error, None);
+        });
+    }
+
+    /// New Bots and Relay-off fallback expose None as their first keyboard option. Tab and
+    /// Shift+Tab move across None and model rows, and Enter takes the existing None path.
+    #[gpui_kit::test]
+    fn none_is_keyboard_selectable_in_both_account_pickers(cx: &mut gpui_kit::TestAppContext) {
+        use gpui_kit::AppContext as _;
+        let runtime = undriven_runtime();
+        let _enter = runtime.enter();
+        for which in [PickerFor::NewBots, PickerFor::PlanFallback] {
+            let state = cx.new(|_| app_with_none_pickers());
+            let (_, cx) = open_picker(cx, &state, which);
+            state.update(cx, |state, cx| state.toggle_picker_list(which, cx));
+            draw(cx);
+            state.read_with(cx, |state, _| {
+                let pick = state
+                    .picker_pick(which)
+                    .expect("the account picker is kept");
+                assert_eq!(
+                    active_option(which, &pick, state.picker_view(which)),
+                    Some(PickerActiveOption::None)
+                );
+            });
+            cx.simulate_keystrokes("tab");
+            draw(cx);
+            state.read_with(cx, |state, _| {
+                assert!(matches!(
+                    state.picker_view(which).active,
+                    Some(PickerActiveOption::Model { .. })
+                ));
+            });
+            cx.simulate_keystrokes("shift-tab enter");
+            draw(cx);
+            state.read_with(cx, |state, _| {
+                assert!(!state.picker_view(which).list_open);
+                match which {
+                    PickerFor::NewBots => assert!(matches!(
+                        state.default_for_new_bots(),
+                        crate::state::DefaultForNewBots::Kept(None)
+                    )),
+                    PickerFor::PlanFallback => assert!(matches!(
+                        state.relay_off_fallback(),
+                        crate::state::RelayOffFallback::Kept(None)
+                    )),
+                    PickerFor::Bot => unreachable!(),
+                }
+            });
+        }
+        cx.run_until_parked();
     }
 
     /// The model's name sits in the middle of the popover's top row, between ⚡ and ↺, whatever it

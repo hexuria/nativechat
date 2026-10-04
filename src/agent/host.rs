@@ -5832,7 +5832,8 @@ impl NativeChatHost {
     /// holds while shown `settings-new-bots-none` (new Bots only: `None`, valued
     /// `the server's default`, `selected` while none is set) and the window the list draws: at
     /// most five models, an `agent-model-row-{source}-{id}` each (valued by its door's word,
-    /// `selected` on the one that answers, `fast` where it has a fast version), with an
+    /// `selected` on the one that answers, `active` on the temporary keyboard highlight, and
+    /// `fast` where it has a fast version), with an
     /// `agent-model-group-{source}` heading ("Subscription", "Gateway") over each group's first
     /// model in view, and over them all, while nothing is typed and a model answers, that model
     /// pinned under an `agent-model-group-current` heading as an `agent-model-row-current`;
@@ -5844,10 +5845,11 @@ impl NativeChatHost {
     /// or for new Bots that nobody knows whether it was kept.
     fn picker_node(&self, which: PickerFor) -> Option<UiNode> {
         use crate::opengrok::{ListLine, group_title, list_window, row_count};
-        use model_picker::{MODELS_TITLE, NO_MODEL_MATCHES, SEARCH_PLACEHOLDER};
+        use model_picker::{MODELS_TITLE, NO_MODEL_MATCHES, SEARCH_PLACEHOLDER, active_option};
         let ids = model_picker::ids(which);
         let (pick, view, note, busy) = self.picker_snap(which);
         let pick = pick?;
+        let active = active_option(which, pick, view);
         let open = view.open;
         let list_open = open && view.list_open;
         let mut trigger = UiNode::button(ids.card, pick.summary())
@@ -5926,6 +5928,9 @@ impl NativeChatHost {
                     .with_value(row.source.word())
                     .with_enabled(!busy);
                 item.states.push("selected".into());
+                if active == Some(crate::state::PickerActiveOption::Current) {
+                    item.states.push("active".into());
+                }
                 if row.has_fast {
                     item.states.push("fast".into());
                 }
@@ -5940,6 +5945,9 @@ impl NativeChatHost {
                     .with_enabled(!busy);
                 if pick.model.is_none() {
                     row.states.push("selected".into());
+                }
+                if active == Some(crate::state::PickerActiveOption::None) {
+                    row.states.push("active".into());
                 }
                 list = list.with_child(row);
             }
@@ -5968,6 +5976,14 @@ impl NativeChatHost {
                         .with_enabled(!busy);
                         if pick.is_current(row) {
                             item.states.push("selected".into());
+                        }
+                        if active
+                            == Some(crate::state::PickerActiveOption::Model {
+                                source: row.source,
+                                base_id: row.base_id.clone(),
+                            })
+                        {
+                            item.states.push("active".into());
                         }
                         if row.has_fast {
                             item.states.push("fast".into());
@@ -8039,16 +8055,22 @@ impl NativeChatHost {
             if let Some(closed) = self.picker_search_closed(which, target) {
                 return Err(closed);
             }
-            return match key_token(key)?.as_str() {
+            let token = key_token(key)?;
+            return match token.as_str() {
                 "backspace" => {
                     let mut query = self.picker_snap(which).1.search.clone();
                     query.pop();
                     self.set_picker_search(which, target, &query)
                 }
-                // The list filters as the text changes; Enter has nothing left to do.
-                "enter" => Ok(DispatchResult::empty()),
+                // These reach the real focused input: arrows and Tab move the temporary option
+                // highlight, Enter takes it, and Space remains ordinary search text.
+                "enter" | "up" | "down" | "tab" | "space" => self.plan(ComposePlan {
+                    focus_composer: false,
+                    release_caret: false,
+                    keys: vec![token],
+                }),
                 other => Err(format!(
-                    "unhandled key `{other}` on `{target}` (Enter, Backspace)"
+                    "unhandled key `{other}` on `{target}` (Enter, Backspace, Up, Down, Tab, Space)"
                 )),
             };
         }
@@ -15686,7 +15708,10 @@ mod tests {
         assert_eq!(
             rows,
             [
-                ("settings-new-bots-none", &["selected".to_string()][..]),
+                (
+                    "settings-new-bots-none",
+                    &["selected".to_string(), "active".to_string()][..]
+                ),
                 ("settings-new-bots-group-local_proxy", &[][..]),
                 (
                     "settings-new-bots-row-local_proxy-gpt-6-luna",
@@ -16420,7 +16445,11 @@ mod tests {
                 (
                     "agent-model-row-current",
                     "GPT-6 Luna",
-                    &["selected".to_string(), "fast".to_string()][..]
+                    &[
+                        "selected".to_string(),
+                        "active".to_string(),
+                        "fast".to_string(),
+                    ][..]
                 ),
                 ("agent-model-group-local_proxy", "Subscription", &[][..]),
                 (
@@ -16433,6 +16462,22 @@ mod tests {
                 ("agent-model-row-gateway-xai/grok-4.7", "Grok 4.7", &[][..]),
                 ("agent-model-routines", routines.as_str(), &[][..]),
             ]
+        );
+        host.model_picker.active = Some(crate::state::PickerActiveOption::Model {
+            source: crate::opengrok::InferenceKind::LocalProxy,
+            base_id: "gpt-6-luna".into(),
+        });
+        let tree = host.snapshot();
+        assert_eq!(
+            tree.find("agent-model-row-current").unwrap().states,
+            ["selected", "fast"],
+            "the pinned row keeps its saved checkmark while the grouped duplicate is active"
+        );
+        assert_eq!(
+            tree.find("agent-model-row-local_proxy-gpt-6-luna")
+                .unwrap()
+                .states,
+            ["selected", "active", "fast"]
         );
         assert!(
             tree.find("agent-model-fast").is_none(),
@@ -16469,6 +16514,31 @@ mod tests {
             host.take_command(),
             Some(Command::SetModelFast(false))
         ));
+    }
+
+    #[test]
+    fn model_search_key_op_sends_navigation_to_the_focused_field() {
+        let mut host = host();
+        host.agent_settings_open = true;
+        host.model_pick = Some(a_pick(
+            Some(serde_json::json!("local_proxy")),
+            "gpt-6-luna",
+            "medium",
+        ));
+        host.model_picker.open = true;
+        host.model_picker.list_open = true;
+        for (asked, token) in [
+            ("Up", "up"),
+            ("Down", "down"),
+            ("Tab", "tab"),
+            ("Enter", "enter"),
+            ("Space", "space"),
+        ] {
+            let plan = keys(&mut host, Op::key(model_picker::BOT_IDS.search, asked));
+            assert_eq!(plan.keys, [token], "{asked}");
+            assert!(!plan.focus_composer, "{asked} stays in the picker search");
+            assert!(!plan.release_caret, "{asked} keeps the search caret");
+        }
     }
 
     /// The open Bot's picker on Cheap (auto), a gateway route that lists five levels of effort and
@@ -17526,8 +17596,8 @@ mod tests {
 
     /// The list on the tree pins the model that answers over its groups, as the window does: a
     /// heading and a row of their own ids ahead of everything else, the row named, valued,
-    /// `selected` and `fast` as its row among the groups is, and a click on it picks the model it
-    /// is. A search takes both away, and so does a Bot no model answers.
+    /// `selected`, `active` and `fast` as its row among the groups is, and a click on it picks the
+    /// model it is. A search takes both away, and so does a Bot no model answers.
     #[test]
     fn the_list_pins_the_model_that_answers_and_a_driver_clicks_it() {
         use crate::opengrok::InferenceKind;
@@ -17564,7 +17634,7 @@ mod tests {
         );
         let pinned = tree.find("agent-model-row-current").unwrap();
         assert_eq!(pinned.value.as_deref(), Some("local_proxy"));
-        assert_eq!(pinned.states, ["selected", "fast"]);
+        assert_eq!(pinned.states, ["selected", "active", "fast"]);
         assert!(pinned.enabled);
         host.click("agent-model-row-current").unwrap();
         assert!(matches!(
