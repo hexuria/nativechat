@@ -47,6 +47,22 @@ use std::cell::Cell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
+gpui_kit::actions!(nativechat, [InsertModelSearchSpace]);
+
+/// The search field's child context: a more specific Space binding lets it enter text without
+/// reaching the popover's own Space-to-confirm binding.
+const SEARCH_KEY_CONTEXT: &str = "ModelPickerSearch";
+
+/// Bind Space to insertion while the model search field owns focus. The generic popover binds
+/// Space to confirming its trigger, which is useful everywhere except a field that accepts text.
+pub fn init(cx: &mut App) {
+    cx.bind_keys([KeyBinding::new(
+        "space",
+        InsertModelSearchSpace,
+        Some(SEARCH_KEY_CONTEXT),
+    )]);
+}
+
 /// The card in the Bot's settings, which opens the popover.
 pub(crate) const CARD: &str = "agent-model-card";
 /// The popover, and each of its parts.
@@ -942,6 +958,7 @@ impl Panel {
         let plan = pick.plan_line(&self.query).cloned();
         let none = ids.none.filter(|_| none_shows(&self.query, ids.none_hint));
         let total = row_count(&groups);
+        let search = self.search.clone();
         // A list with nothing in it is the server's to explain, whatever is typed; a search that
         // leaves nothing of a list that has some is the search's.
         let offers_nothing = pick.groups.is_empty() && pick.account_plan.is_none();
@@ -984,6 +1001,12 @@ impl Panel {
             .child(
                 div()
                     .id(ids.search)
+                    .key_context(SEARCH_KEY_CONTEXT)
+                    // The more specific binding consumes Space before the popover can interpret
+                    // it as Confirm; insert it through the input state at the current caret.
+                    .on_action(move |_: &InsertModelSearchSpace, window, cx| {
+                        search.update(cx, |input, cx| input.insert(" ", window, cx));
+                    })
                     .child(field_input(&self.search).cleanable(true)),
             )
             .child(
@@ -1610,6 +1633,7 @@ mod tests {
     ) {
         use gpui_kit::{px, size};
         cx.update(gpui_kit::init);
+        cx.update(super::init);
         let (picker, cx) = cx.add_window_view({
             let state = state.clone();
             move |window, cx| ModelPicker::new(window, state, which, cx)
@@ -1623,6 +1647,58 @@ mod tests {
     /// The window drawn afresh.
     fn draw(cx: &mut gpui_kit::VisualTestContext) {
         cx.update(|window, cx| window.draw(cx).clear(cx));
+    }
+
+    /// A space in a multi-word model name is search text. The popover's Space-to-confirm binding
+    /// must not mistake the search field's ordinary Space press for confirmation of its trigger.
+    #[gpui_kit::test]
+    fn typing_a_space_in_model_search_does_not_dismiss_the_picker(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        use gpui_kit::AppContext as _;
+        let runtime = undriven_runtime();
+        let _enter = runtime.enter();
+        let state = cx.new(|_| app("local_proxy", "gpt-6-luna", "medium"));
+        let (picker, cx) = open_picker(cx, &state, PickerFor::Bot);
+        state.update(cx, |state, cx| state.toggle_picker_list(PickerFor::Bot, cx));
+        draw(cx);
+
+        // Send actual GPUI key events into the focused search field. In particular, `space` is
+        // the key token whose Popover binding currently bubbles to the trigger.
+        cx.simulate_keystrokes("g l m space");
+        draw(cx);
+
+        state.read_with(cx, |state, _| {
+            assert!(
+                state.model_picker.open,
+                "the picker stays open while searching"
+            );
+            assert!(state.model_picker.list_open, "the model list stays open");
+            assert_eq!(
+                state.model_picker.search, "glm ",
+                "the space is search text"
+            );
+        });
+        assert!(
+            cx.debug_bounds("agent-model-pop").is_some(),
+            "the popover stays drawn after a Space key event"
+        );
+        picker.read_with(cx, |picker, cx| {
+            assert_eq!(picker.search.read(cx).value().as_ref(), "glm ");
+        });
+
+        cx.simulate_keystrokes("5");
+        draw(cx);
+        state.read_with(cx, |state, _| {
+            assert!(
+                state.model_picker.open,
+                "typing continues in the same search"
+            );
+            assert_eq!(state.model_picker.search, "glm 5");
+        });
+        picker.read_with(cx, |picker, cx| {
+            assert_eq!(picker.search.read(cx).value().as_ref(), "glm 5");
+        });
     }
 
     /// The model's name sits in the middle of the popover's top row, between ⚡ and ↺, whatever it
