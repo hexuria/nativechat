@@ -639,6 +639,55 @@ pub enum PickerFor {
     PlanFallback,
 }
 
+/// A temporary keyboard highlight in a picker's list. `Current` and the matching model under its
+/// group are separate rows, even though either one picks the same saved model.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PickerActiveOption {
+    Current,
+    None,
+    Model {
+        source: InferenceKind,
+        base_id: String,
+    },
+}
+
+/// The selectable rows in the order they appear. Pinned Current and its matching grouped row are
+/// distinct options; the account-plan line and group headings are omitted because neither can be
+/// picked.
+pub(crate) fn picker_active_options(
+    which: PickerFor,
+    pick: &ModelPick,
+    query: &str,
+    none_hint: &str,
+) -> Vec<PickerActiveOption> {
+    let mut options = Vec::new();
+    if pick.pinned(query).is_some() {
+        options.push(PickerActiveOption::Current);
+    }
+    if which != PickerFor::Bot && picker_none_matches(query, none_hint) {
+        options.push(PickerActiveOption::None);
+    }
+    options.extend(
+        pick.search(query)
+            .into_iter()
+            .flat_map(|group| group.rows)
+            .map(|row| PickerActiveOption::Model {
+                source: row.source,
+                base_id: row.base_id,
+            }),
+    );
+    options
+}
+
+/// Whether the search leaves the None row or its hint.
+pub(crate) fn picker_none_matches(query: &str, hint: &str) -> bool {
+    let query = query.trim().to_lowercase();
+    query.is_empty()
+        || [crate::opengrok::NEW_BOTS_NONE, hint]
+            .iter()
+            .any(|words| words.to_lowercase().contains(&query))
+}
+
 /// Where a picker's popover is.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PickerView {
@@ -653,6 +702,9 @@ pub struct PickerView {
     /// The first model in the list's window, among those the search leaves: the list shows
     /// `opengrok::LIST_ROWS` from it (`opengrok::list_window`), and the wheel moves it.
     pub list_start: usize,
+    /// The temporary keyboard highlight, independent of the row that has a saved checkmark.
+    /// `None` means the first selectable row is active; an empty filtered list has no active row.
+    pub active: Option<PickerActiveOption>,
     /// What the popover says under the slider after a pick put the effort back on the model's own
     /// level, because the model picked has no such level of its own to keep it on
     /// ([`ModelPick::pick_effort_note`]).
@@ -13922,6 +13974,7 @@ impl AppState {
             view.list_open = true;
             view.search.clear();
             view.list_start = 0;
+            view.active = None;
         }
         true
     }
@@ -13933,6 +13986,7 @@ impl AppState {
         view.list_open = false;
         view.search.clear();
         view.list_start = 0;
+        view.active = None;
     }
 
     /// What a list's search box holds now. The list shows only the models it leaves, from the
@@ -13952,6 +14006,7 @@ impl AppState {
         }
         view.search = query;
         view.list_start = 0;
+        view.active = None;
         true
     }
 
@@ -13982,6 +14037,106 @@ impl AppState {
         let moved = start != view.list_start;
         view.list_start = start;
         moved
+    }
+
+    /// Move the temporary list highlight through the rows the view can actually select. The
+    /// rows are resolved from the current picker in display order, so Current and its duplicate
+    /// under a group can each be highlighted without changing the saved-model checkmark.
+    pub fn move_picker_active(
+        &mut self,
+        which: PickerFor,
+        none_hint: &str,
+        rows: isize,
+        cx: &mut Context<Self>,
+    ) {
+        let view = self.picker_view(which);
+        if !view.open || !view.list_open {
+            return;
+        }
+        let search = view.search.clone();
+        let Some(pick) = self.picker_pick(which) else {
+            return;
+        };
+        let options = picker_active_options(which, &pick, &search, none_hint);
+        if options.is_empty() {
+            return;
+        }
+        let current = view
+            .active
+            .as_ref()
+            .and_then(|active| options.iter().position(|option| option == active))
+            .unwrap_or(0);
+        let next = current.saturating_add_signed(rows).min(options.len() - 1);
+        let active = options[next].clone();
+        let start = view.list_start;
+        let groups = pick.search(&search);
+        let total = crate::opengrok::row_count(&groups);
+        let list_start = match &active {
+            PickerActiveOption::Model { source, base_id } => {
+                let position = groups
+                    .iter()
+                    .flat_map(|group| &group.rows)
+                    .position(|row| row.source == *source && row.base_id == *base_id);
+                position.map_or(start, |position| {
+                    let start = if position < start {
+                        position
+                    } else if position >= start + crate::opengrok::LIST_ROWS {
+                        position + 1 - crate::opengrok::LIST_ROWS
+                    } else {
+                        start
+                    };
+                    start.min(crate::opengrok::last_window_start(total))
+                })
+            }
+            PickerActiveOption::Current | PickerActiveOption::None => start,
+        };
+        let view = self.picker_view_mut(which);
+        if view.active.as_ref() == Some(&active) && view.list_start == list_start {
+            return;
+        }
+        view.active = Some(active);
+        view.list_start = list_start;
+        cx.notify();
+    }
+
+    /// Select the current temporary highlight. The active row is resolved from the live picker
+    /// state here, at key dispatch time, so a Down followed immediately by Enter uses the row
+    /// Down just highlighted even before another frame has painted.
+    pub fn select_picker_active(
+        &mut self,
+        which: PickerFor,
+        none_hint: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let view = self.picker_view(which);
+        if !view.open || !view.list_open {
+            return;
+        }
+        let search = view.search.clone();
+        let stored_active = view.active.clone();
+        let Some(pick) = self.picker_pick(which) else {
+            return;
+        };
+        let options = picker_active_options(which, &pick, &search, none_hint);
+        let active = stored_active
+            .filter(|active| options.contains(active))
+            .or_else(|| options.first().cloned());
+        match active {
+            Some(PickerActiveOption::Current) => {
+                if let Some(current) = pick.current {
+                    self.pick_model(which, current.source, &current.base_id, cx);
+                }
+            }
+            Some(PickerActiveOption::None) => match which {
+                PickerFor::NewBots => self.clear_new_bots_default(cx),
+                PickerFor::PlanFallback => self.clear_plan_fallback(cx),
+                PickerFor::Bot => {}
+            },
+            Some(PickerActiveOption::Model { source, base_id }) => {
+                self.pick_model(which, source, &base_id, cx);
+            }
+            None => {}
+        }
     }
 
     /// A row of a list picked: the Bot, or the default for new Bots, goes onto its model at once,
