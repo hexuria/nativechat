@@ -82,14 +82,36 @@ impl RenderOnce for EffortSlider {
         let glitter_id = format!("{}-glitter", self.id);
         let thumb_id = format!("{}-thumb", self.id);
         let track_id = format!("{}-track", self.id);
+        let pill_id = format!("{}-pill", self.id);
+        // The indicator records the thumb centres, inset by half a thumb at each end. Painting
+        // around that range keeps the endpoint dots inside the rounded caps instead of on the
+        // pill's outer edges, while pointer positions still map to the same effort stops.
+        let pill = div()
+            .debug_selector(move || pill_id)
+            .absolute()
+            .left(px(-THUMB_SIZE / 2.))
+            .right(px(-THUMB_SIZE / 2.))
+            .top_0()
+            .h_full()
+            .rounded_full()
+            .bg(theme.muted_foreground.opacity(0.26))
+            .when(strongest, |this| {
+                this.shadow(vec![BoxShadow {
+                    color: rgb(0x9c69f6).opacity(0.28).into(),
+                    offset: point(px(0.), px(0.)),
+                    blur_radius: px(10.),
+                    spread_radius: px(1.),
+                    inset: false,
+                }])
+            });
         let filled = div()
             .id(SharedString::from(fill_id.clone()))
             .debug_selector(move || fill_id)
             .absolute()
-            .left_0()
+            .left(px(-THUMB_SIZE / 2.))
+            .right(relative(1. - progress))
             .top_0()
             .h_full()
-            .w(relative(progress))
             .rounded_full()
             .overflow_hidden()
             .child(
@@ -178,21 +200,14 @@ impl RenderOnce for EffortSlider {
                             .mx(px(THUMB_SIZE / 2.))
                             .h(px(TRACK_HEIGHT))
                             .rounded_full()
-                            .bg(theme.muted_foreground.opacity(0.26))
-                            .when(strongest, |this| {
-                                this.shadow(vec![BoxShadow {
-                                    color: rgb(0x9c69f6).opacity(0.28).into(),
-                                    offset: point(px(0.), px(0.)),
-                                    blur_radius: px(10.),
-                                    spread_radius: px(1.),
-                                    inset: false,
-                                }])
-                            })
-                            .child(filled)
+                            .child(pill)
+                            .when(progress > 0., |this| this.child(filled))
                             .children((0..self.stops).map(|stop| {
                                 let fraction =
                                     stop as f32 / self.stops.saturating_sub(1).max(1) as f32;
+                                let stop_id = format!("{}-stop-{stop}", self.id);
                                 div()
+                                    .debug_selector(move || stop_id)
                                     .absolute()
                                     .left(relative(fraction))
                                     .top(px(TRACK_HEIGHT / 2. - 1.5))
@@ -224,5 +239,78 @@ impl RenderOnce for EffortSlider {
                             ),
                     ),
             )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::EffortSlider;
+    use gpui_kit::component::slider::SliderState;
+    use gpui_kit::{
+        AppContext as _, Context, Entity, IntoElement, ParentElement, Render, Styled,
+        TestAppContext, Window, div, px,
+    };
+
+    struct SliderWindow {
+        slider: Entity<SliderState>,
+    }
+
+    impl Render for SliderWindow {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().p(px(20.)).w(px(320.)).child(EffortSlider::new(
+                self.slider.clone(),
+                "effort-test",
+                6,
+                true,
+                false,
+            ))
+        }
+    }
+
+    /// Endpoint dots are thumb centres inside the rounded pill, not flecks protruding from
+    /// the painted ends. The same alignment holds for the four intervening stops.
+    #[gpui_kit::test]
+    fn each_dot_is_under_its_thumb_and_the_endpoint_dots_are_inside_the_pill(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(gpui_kit::init);
+        let (view, cx) = cx.add_window_view(|_, cx| SliderWindow {
+            slider: cx.new(|_| SliderState::new().min(0.).max(5.).step(1.)),
+        });
+        let slider = view.read_with(cx, |view, _| view.slider.clone());
+        for (stop, selector) in [
+            "effort-test-stop-0",
+            "effort-test-stop-1",
+            "effort-test-stop-2",
+            "effort-test-stop-3",
+            "effort-test-stop-4",
+            "effort-test-stop-5",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            cx.update(|window, cx| {
+                slider.update(cx, |slider, cx| slider.set_value(stop as f32, window, cx));
+                window.draw(cx).clear(cx);
+            });
+            let dot = cx.debug_bounds(selector).expect("the stop");
+            let thumb = cx.debug_bounds("effort-test-thumb").expect("the thumb");
+            let pill = cx
+                .debug_bounds("effort-test-pill")
+                .expect("the painted pill");
+            assert!((dot.center().x - thumb.center().x).abs() < px(0.5));
+            assert!((dot.center().y - thumb.center().y).abs() < px(0.5));
+            if stop == 0 {
+                assert!(
+                    (dot.center().x - pill.left() - thumb.size.width / 2.).abs() < px(0.5),
+                    "the lowest dot belongs at the thumb's centre inside the pill: {dot:?}, {pill:?}, {thumb:?}"
+                );
+            } else if stop == 5 {
+                assert!(
+                    (pill.right() - dot.center().x - thumb.size.width / 2.).abs() < px(0.5),
+                    "the highest dot belongs at the thumb's centre inside the pill: {dot:?}, {pill:?}, {thumb:?}"
+                );
+            }
+        }
     }
 }
