@@ -1546,10 +1546,19 @@ impl OpenGrokClient {
         Self::json_or_error(response).await
     }
 
-    /// `GET /coworkers/{id}/usage` — what the bot used this month, per model (#138). The
-    /// server's default window is the month, which is what the Usage card shows.
-    pub async fn coworker_usage(&self, coworker_id: &str) -> Result<CoworkerUsage, OpenGrokError> {
-        let path = format!("/coworkers/{}/usage", path_segment(coworker_id));
+    /// `GET /coworkers/{id}/usage?window=` — what the bot used in `window`, per model (#138). The
+    /// Usage card asks for the month, the server's own default, and the Usage modal for any of
+    /// its chips' windows.
+    pub async fn coworker_usage(
+        &self,
+        coworker_id: &str,
+        window: UsageWindow,
+    ) -> Result<CoworkerUsage, OpenGrokError> {
+        let path = format!(
+            "/coworkers/{}/usage?window={}",
+            path_segment(coworker_id),
+            window.word()
+        );
         let response = self
             .send_json::<()>(reqwest::Method::GET, &path, None)
             .await?;
@@ -2676,6 +2685,66 @@ impl OpenGrokClient {
         Ok(response)
     }
 
+    /// `GET /ag-ui/events`: the account's events stream, answered with the response as it opens,
+    /// for [`super::events`] to read its notes off as they come (opengrok-server #348, shaped from
+    /// its branch account-events-stream @ 85ce00c: `account_events` in
+    /// `crates/opengrok-server/src/agui/routes.rs`; not recorded yet). It goes with the session's
+    /// bearer, which is the one thing the route takes the account from. `last_event_id` is the id of the
+    /// last note a stream carried, which the server replays after; one it cannot replay from is
+    /// answered with `reset` first.
+    ///
+    /// A `401` is the session's to answer, as on every other route: its refresh is tried once and
+    /// the stream asked again with what it brought, and a second `401` is the session gone. A
+    /// refresh that never reached the server says nothing about the session, so it is handed back
+    /// as it is, for the stream to try again after a wait like any other drop.
+    pub async fn open_account_events(
+        &self,
+        last_event_id: Option<&str>,
+    ) -> Result<reqwest::Response, OpenGrokError> {
+        let url = self.url("/ag-ui/events")?;
+        self.ensure_fresh_token("/ag-ui/events").await;
+        // An id that cannot go in a header is not resumed from; the server starts the stream
+        // over with `reset`, which reads everything again.
+        let resume = last_event_id.and_then(|id| HeaderValue::from_str(id).ok());
+        let open = |token: Option<String>| {
+            let mut request = self
+                .http
+                .get(url.clone())
+                .header(ACCEPT, "text/event-stream")
+                .header(CACHE_CONTROL, "no-cache");
+            if let Some(id) = resume.clone() {
+                request = request.header("Last-Event-ID", id);
+            }
+            if let Some(token) = token {
+                request = request.bearer_auth(token);
+            }
+            request
+        };
+        let mut response = open(self.access_token())
+            .send()
+            .await
+            .map_err(|e| OpenGrokError::transport(&e))?;
+        if response.status() == StatusCode::UNAUTHORIZED {
+            match self.refresh_after_unauthorized().await {
+                Ok(()) => {
+                    response = open(self.access_token())
+                        .send()
+                        .await
+                        .map_err(|e| OpenGrokError::transport(&e))?;
+                }
+                Err(error) if error.status.is_none() => return Err(error),
+                Err(_) => {}
+            }
+            if response.status() == StatusCode::UNAUTHORIZED {
+                return Err(Self::signed_out_error(response).await);
+            }
+        }
+        if !response.status().is_success() {
+            return Err(Self::read_error(response).await);
+        }
+        Ok(response)
+    }
+
     /// `POST /inference-relay/responses/{requestId}`: this Mac's answer to one call off the relay
     /// stream, with its machine token (the same contract). opencodex's stream goes as
     /// `text/event-stream`, uploaded as it arrives rather than gathered first; its model list, and
@@ -3075,6 +3144,44 @@ pub(crate) fn upload_filename(name: &str) -> String {
         "file".to_string()
     } else {
         clean
+    }
+}
+
+/// A window `GET /coworkers/{id}/usage?window=` can be asked for, as the Usage modal's chips offer
+/// them: the last day, the last week, or the month, which is what the server reads when none is
+/// named. The server also reads `5h`, which nothing here asks for.
+///
+/// Transcribed from opengrok-server `crates/opengrok-server/src/points.rs` (`WINDOWS`, `usage_for`)
+/// and its route, `get_usage` in `crates/opengrok-server/src/agui/routes.rs`: any other word is a
+/// 400, `'x' is not a window; one of 5h, 24h, 7d, month`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum UsageWindow {
+    Day,
+    Week,
+    #[default]
+    Month,
+}
+
+impl UsageWindow {
+    /// The chips, in the order they are drawn.
+    pub const ALL: [UsageWindow; 3] = [Self::Day, Self::Week, Self::Month];
+
+    /// The server's word for it: the `window` of the request, and of the answer.
+    pub fn word(self) -> &'static str {
+        match self {
+            Self::Day => "24h",
+            Self::Week => "7d",
+            Self::Month => "month",
+        }
+    }
+
+    /// What its chip says.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Day => "24h",
+            Self::Week => "7d",
+            Self::Month => "Month",
+        }
     }
 }
 
@@ -8115,7 +8222,10 @@ mod tests {
             .mount(&server)
             .await;
         let client = OpenGrokClient::new(&server.uri()).unwrap();
-        let used = client.coworker_usage("cw_1").await.unwrap();
+        let used = client
+            .coworker_usage("cw_1", UsageWindow::Month)
+            .await
+            .unwrap();
         assert!(used.metered);
         assert_eq!(used.models[0].model_id, "oag/cheap");
         assert_eq!(used.totals.requests, Some(2));
@@ -8134,13 +8244,56 @@ mod tests {
             (Some(5), Some(3))
         );
         assert_eq!(used.totals.cost_usd.as_deref(), Some("2.000000"));
-        let unmetered = client.coworker_usage("cw_2").await.unwrap();
+        let unmetered = client
+            .coworker_usage("cw_2", UsageWindow::Month)
+            .await
+            .unwrap();
         assert!(!unmetered.metered && unmetered.models.is_empty());
         assert_eq!(unmetered.totals.requests, None);
         assert_eq!(
             unmetered.note.as_deref(),
             Some("this coworker's key cannot serve")
         );
+    }
+
+    /// The Usage modal's chips each ask for their own window, in the server's word for it
+    /// (opengrok-server `points::WINDOWS`), and the answer names the window it is for.
+    #[tokio::test]
+    async fn a_bots_usage_is_asked_for_in_the_window_a_chip_names() {
+        use wiremock::matchers::query_param;
+        let server = MockServer::start().await;
+        for window in UsageWindow::ALL {
+            Mock::given(method("GET"))
+                .and(path("/coworkers/cw_1/usage"))
+                .and(query_param("window", window.word()))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "metered": true, "note": null, "seat": "api", "keyPrefix": "oag_live_x",
+                    "window": window.word(), "models": [],
+                    "totals": {"requests": 0, "inputTokens": 0, "outputTokens": 0,
+                        "cacheReadTokens": 0, "cacheWriteTokens": 0, "costUsd": "0.000000",
+                        "listUsd": "0.000000", "points": 0}
+                })))
+                .mount(&server)
+                .await;
+        }
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        let words: Vec<(&str, String)> = {
+            let mut asked = Vec::new();
+            for window in UsageWindow::ALL {
+                let used = client.coworker_usage("cw_1", window).await.unwrap();
+                asked.push((window.label(), used.window));
+            }
+            asked
+        };
+        assert_eq!(
+            words,
+            [
+                ("24h", "24h".to_string()),
+                ("7d", "7d".to_string()),
+                ("Month", "month".to_string())
+            ]
+        );
+        assert_eq!(UsageWindow::default(), UsageWindow::Month);
     }
 
     /// The recorded answer (opengrok-server wire corpus,

@@ -7,6 +7,7 @@ mod client;
 mod conformance;
 mod credential;
 mod error;
+mod events;
 mod gen_ui;
 mod inference;
 mod local_exec;
@@ -50,12 +51,12 @@ pub use local_exec::{
     stored_machine_id,
 };
 pub use model_choice::{
-    AccountPlan, ChoiceGroup, EFFORT_NOT_KEPT, FAST_ACCOUNT_PLAN, FAST_DOOR_UNKNOWN, FAST_NO_TWIN,
-    FAST_SUFFIX, GATEWAY_GROUP, LIST_ROWS, ListLine, ModelChoice, ModelPick, NEW_BOTS_NONE,
-    NEW_BOTS_PICK_FIRST, NEW_BOTS_PICK_ID, NO_MODEL, PLAN_FALLBACK_PICK_FIRST, ROUTINES_ON_PLAN,
-    SUBSCRIPTION_GROUP, base_label, bot_pick, group_title, is_fast, last_window_start, list_window,
-    model_label, new_bots_pick, plan_choices, plan_fallback_pick, row_count, server_choices,
-    window_opening_on, without_fast,
+    AccountPlan, CURRENT_TITLE, ChoiceGroup, EFFORT_NOT_KEPT, FAST_ACCOUNT_PLAN, FAST_DOOR_UNKNOWN,
+    FAST_NO_TWIN, FAST_SUFFIX, GATEWAY_GROUP, LIST_ROWS, ListLine, ModelChoice, ModelPick,
+    NEW_BOTS_NONE, NEW_BOTS_PICK_FIRST, NEW_BOTS_PICK_ID, NO_MODEL, PLAN_FALLBACK_PICK_FIRST,
+    ROUTINES_ON_PLAN, SUBSCRIPTION_GROUP, base_label, bot_pick, group_title, is_fast,
+    last_window_start, list_window, model_label, new_bots_pick, plan_choices, plan_fallback_pick,
+    row_count, server_choices, without_fast,
 };
 pub use relay::{
     OpencodexAddress, RelayHandle, RelayKey, RelayReport, RelayStatus, RelayTarget, RelayTimings,
@@ -94,11 +95,16 @@ pub use client::{
     RunRecipeResponse, RunReplay, SKILL_BODY_CHARS, SKILL_BUNDLE_FILES, SKILL_BUNDLE_LIMIT,
     ScheduleEdit, ScheduleKind, ScheduleRow, ScheduleRun, ScheduleRunStatus, SiteLoginSave,
     SiteLoginUpdate, SkillDetail, SkillFile, SkillPatch, SkillSource, SkillSummary, SkillVersion,
-    StopReply, ThreadReplay, ThreadRun, TurnRecipe, UpdateStatus, UsageTotals, WebhookInfo,
-    collapse_computer_roster, collapse_computers_by_machine_id, env_egress_tunnel_enabled,
-    host_egress_tunnel_available, host_egress_tunnel_enabled, host_egress_tunnel_flag, thin_tape,
+    StopReply, ThreadReplay, ThreadRun, TurnRecipe, UpdateStatus, UsageTotals, UsageWindow,
+    WebhookInfo, collapse_computer_roster, collapse_computers_by_machine_id,
+    env_egress_tunnel_enabled, host_egress_tunnel_available, host_egress_tunnel_enabled,
+    host_egress_tunnel_flag, thin_tape,
 };
 pub use error::{Failure, OpenGrokError, Unreachable, reads_as_gateway_unreachable, retry_enqueue};
+pub use events::{
+    AccountEvent, AccountEvents, EventsNote, EventsTimings, RoutineChange, RunStartCause,
+    start_account_events,
+};
 pub use pending::{
     CUSTOM_NAME, PAYLOAD_V, PendingCustom, PendingList, PendingMutation, PendingOp,
     PendingUserMessage, PendingWrite,

@@ -23,7 +23,7 @@ const ROUTINE_LINE_TOP: f32 = TITLE_BAR_H - 6.;
 
 /// The chat's floating bar ends in a row of icon buttons, the computer's and the pane toggle:
 /// each this wide, this far apart, and `HEADER_PX` in from the window's right edge.
-const BUTTON_PX: f32 = 28.;
+pub(crate) const BUTTON_PX: f32 = 28.;
 const BUTTON_GAP: f32 = 8.;
 
 /// How much of the right end of a pane's header row the chat's floating bar keeps for its two
@@ -950,8 +950,9 @@ mod tests {
         }
 
         /// Beside the chat the title bar's two buttons float over the right end of the pane's
-        /// header row. A routine's four icons in that row stop short of them, so each is pressed
-        /// as itself: Delete asks about the routine, where the pane toggle over it shut the pane.
+        /// header row. A routine's four icons are on the Active switch's row under it, clear of
+        /// them, so each is pressed as itself: Delete asks about the routine, where a pane toggle
+        /// over it would shut the pane.
         #[gpui_kit::test]
         fn a_routines_icons_beside_the_chat_are_clear_of_the_title_bars_buttons(
             cx: &mut TestAppContext,
@@ -980,7 +981,7 @@ mod tests {
             ] {
                 let bounds = cx
                     .debug_bounds(icon)
-                    .unwrap_or_else(|| panic!("no {icon} in the routine's header"));
+                    .unwrap_or_else(|| panic!("no {icon} in the routine's panel"));
                 for (button, over) in &buttons {
                     assert!(!bounds.intersects(over), "{icon} is under {button}");
                 }
@@ -1000,6 +1001,62 @@ mod tests {
                 );
                 assert_eq!(state.right_pane, RightPane::Computer, "the pane stays open");
             });
+        }
+
+        /// A routine's four icons are drawn as the window's own toggles are: the same button, and
+        /// the same glyph in it, so that the two rows of icons read as one family.
+        #[gpui_kit::test]
+        fn a_routines_icons_are_the_size_of_the_windows_toggles(cx: &mut TestAppContext) {
+            use super::super::BUTTON_PX;
+            use crate::chrome::CONTROL_ICON_PX;
+
+            let (view, cx) = chat_page(cx, 1200.);
+            view.update(cx, |page, cx| {
+                page.app.update(cx, |state, cx| {
+                    state.right_pane = RightPane::Computer;
+                    state.computer_view = ComputerView::Editor {
+                        id: Some("sch_1".into()),
+                    };
+                    cx.notify();
+                });
+            });
+            let toggles = ["header-monitor", "header-right-sidebar"].map(|button| {
+                let bounds = cx
+                    .debug_bounds(button)
+                    .unwrap_or_else(|| panic!("no {button} in the title bar"));
+                (button, bounds)
+            });
+            for (button, bounds) in &toggles {
+                assert_eq!(
+                    bounds.size,
+                    size(px(BUTTON_PX), px(BUTTON_PX)),
+                    "{button} is the size BUTTON_PX says"
+                );
+            }
+            for icon in [
+                "routine-history-toggle",
+                "routine-open-thread",
+                "routine-run-now",
+                "routine-delete",
+            ] {
+                let bounds = cx
+                    .debug_bounds(icon)
+                    .unwrap_or_else(|| panic!("no {icon} in the routine's panel"));
+                for (button, toggle) in &toggles {
+                    assert_eq!(
+                        bounds.size, toggle.size,
+                        "{icon} is not the size of {button}"
+                    );
+                }
+                let glyph = cx
+                    .debug_bounds(Box::leak(format!("{icon}-glyph").into_boxed_str()))
+                    .unwrap_or_else(|| panic!("no glyph in {icon}"));
+                assert_eq!(
+                    glyph.size,
+                    size(px(CONTROL_ICON_PX), px(CONTROL_ICON_PX)),
+                    "the glyph in {icon} is not the size of the toggles' own"
+                );
+            }
         }
     }
 }

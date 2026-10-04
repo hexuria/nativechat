@@ -4,17 +4,18 @@
 //! agree. `fixtures/wire/` is the server's side of that, recorded by the server itself: every
 //! AG-UI frame and REST body its own tests drove, teed off its router by the recorder of
 //! opengrok-server#258 and written out by its `examples/wire_corpus.rs`. It is vendored whole from
-//! the server's `tests/fixtures/wire/` at opengrok-server #342 (main 2136ffc: the loopback
-//! screen link (#339), the computer routes' speed (#341), `run_routine` (#337), each model's own
-//! levels of effort and a relay switch for each computer), the tree its integration branch
-//! recorded at 4366ee7 (b8223fd). Its `MANIFEST.json` names b7c1856, the commit it was recorded
-//! at. The layout is opengrok-server#255's: `agui/<type>/<slug>.json`,
+//! the server's `tests/fixtures/wire/` at opengrok-server #351 (recorded at 9a2b011, git tree
+//! a0ef80f): the account events stream (#348) on main 725e1b5, which carries #349, a Bot's routine
+//! tools seeing and acting on its own routines alone. Its `MANIFEST.json` names 85ce00c, the commit
+//! it was recorded on. The layout is opengrok-server#255's: `agui/<type>/<slug>.json`,
 //! a CUSTOM under `agui/custom/<name>/`, and `rest/<METHOD>_<route>/<status>-<slug>.json` holding
 //! `{method, path, status, body}`, one file per distinct shape, named after the first test that
-//! produced it; and since the relay, the frames of its stream under `relay/<type>/<slug>.json`,
-//! which are not AG-UI and which the Mac, not the chat, reads. `MANIFEST.json` names the server
-//! commit, the test behind every file, and every `type`, CUSTOM `name`, approval `reason` and
-//! `formResolution` word the server's code can send. Ids and clocks the tests mint at run time
+//! produced it; since the relay, the frames of its stream under `relay/<type>/<slug>.json`,
+//! which are not AG-UI and which the Mac, not the chat, reads; and since the account events
+//! stream, its blocks under `events/<name>/<slug>.json`, each kept whole as `{id, event, data}`
+//! with a placeholder id. `MANIFEST.json` names the server commit, the test behind every file,
+//! and every `type`, CUSTOM `name`, approval `reason`, `formResolution` word and events stream
+//! note name the server's code can send. Ids and clocks the tests mint at run time
 //! are placeholders in the server's own formats, and secrets read `«redacted»`.
 //!
 //! A newer recording is taken by copying the server's `tests/fixtures/wire/` over this one
@@ -64,6 +65,7 @@ use super::client::{
 };
 use super::credential::{CREDENTIAL_OFFER_SAVE, SaveLoginSpec};
 use super::error::{Failure, Unreachable, reads_as_gateway_unreachable};
+use super::events::{ACCOUNT_EVENT_NAMES, AccountEvent, Refused, blocks_of, when_refused};
 use super::gen_ui::{
     BAR_CHART_NAMES, ChatPart, EGRESS_TUNNEL_ASK_REASON, FORM_NAMES, REVIEW_AN_ACTION_REASONS,
     RUN_AWAITING_APPROVAL, ScreenshotSpec, StepSpec, TurnAssembler, UI_CUSTOM_NAME, USE_SKILL,
@@ -114,16 +116,20 @@ enum Slot {
     /// A frame's `type` on the Mac relay's stream (`RelayFrame::from_value`), which is not an
     /// AG-UI frame: the recorder files each under `relay/<type>/`.
     RelayType,
+    /// A note's `event:` name on the account's events stream (`AccountEvent::read`, opengrok-server
+    /// #348), which is neither AG-UI nor the relay's.
+    AccountEvent,
 }
 
 impl Slot {
-    const ALL: [Slot; 6] = [
+    const ALL: [Slot; 7] = [
         Slot::AguiType,
         Slot::CustomName,
         Slot::ApprovalReason,
         Slot::FormResolution,
         Slot::RunErrorCode,
         Slot::RelayType,
+        Slot::AccountEvent,
     ];
 
     fn field(self) -> &'static str {
@@ -134,6 +140,7 @@ impl Slot {
             Slot::FormResolution => "formResolution",
             Slot::RunErrorCode => "RUN_ERROR code",
             Slot::RelayType => "relay frame type",
+            Slot::AccountEvent => "account event",
         }
     }
 }
@@ -265,6 +272,12 @@ fn ledger() -> Vec<(Slot, &'static str)> {
         RELAY_FRAME_TYPES
             .iter()
             .map(|word| (Slot::RelayType, *word)),
+    );
+    // `AccountEvent::read` reads a note off the account's events stream by its `event:` name.
+    words.extend(
+        ACCOUNT_EVENT_NAMES
+            .iter()
+            .map(|word| (Slot::AccountEvent, *word)),
     );
     words
 }
@@ -714,6 +727,11 @@ struct Emits {
     /// Not the manifest's either: the `type` of each frame the recording keeps under `relay/`.
     #[serde(skip)]
     relay_types: Vec<String>,
+    /// The names of the account's events stream's notes the server can send, as the manifest lists
+    /// them under `emits.events` (opengrok-server #351, recorded at 9a2b011). A recording from
+    /// before the stream has none.
+    #[serde(default, rename = "events")]
+    account_events: Vec<String>,
 }
 
 impl Emits {
@@ -725,6 +743,7 @@ impl Emits {
             Slot::FormResolution => &self.form_resolutions,
             Slot::RunErrorCode => &self.run_error_codes,
             Slot::RelayType => &self.relay_types,
+            Slot::AccountEvent => &self.account_events,
         }
     }
 }
@@ -744,6 +763,9 @@ struct Corpus {
     bodies: BTreeMap<String, Value>,
     /// Every frame off the Mac relay's stream, by its path under the corpus root.
     relay: BTreeMap<String, Value>,
+    /// Every block off the account's events stream, `{id, event, data}`, by its path under the
+    /// corpus root.
+    events: BTreeMap<String, Value>,
 }
 
 impl Corpus {
@@ -785,12 +807,20 @@ impl Corpus {
             .collect();
         let types: BTreeSet<&str> = relay.values().map(|frame| str_at(frame, "type")).collect();
         manifest.emits.relay_types = types.into_iter().map(str::to_string).collect();
+        let events = json_files(&root, "events")
+            .into_iter()
+            .map(|file| {
+                let block = read_json(&root, &file);
+                (file, block)
+            })
+            .collect();
         Self {
             root,
             manifest,
             frames,
             bodies,
             relay,
+            events,
         }
     }
 
@@ -2380,6 +2410,8 @@ const REST_ROUTES: &[(&str, RestCheck)] = &[
     ("GET__account_inference-source", inference_source),
     ("PUT__account_inference-source", inference_source),
     ("GET__models", models_listed),
+    // The account's events stream (#348), a stream of SSE blocks.
+    ("GET__ag-ui_events", account_events_stream),
     // This Mac as the person's relay, asked with its machine token.
     ("GET__inference-relay_requests", relay_stream),
     ("POST__inference-relay_responses__request_id_", relay_answer),
@@ -2401,6 +2433,7 @@ const REFUSALS: &[(&str, RestCheck)] = &[
     ("POST__recipes__id__run", run_refused),
     ("POST__schedules__id__run", schedule_run_refused),
     ("POST__skills_from-tape", tape_refused),
+    ("GET__ag-ui_events", account_events_refused),
     ("GET__inference-relay_requests", relay_stream_refused),
     (
         "POST__inference-relay_responses__request_id_",
@@ -4062,6 +4095,42 @@ fn relay_stream(_: u16, body: &Value) -> Check {
     frames.iter().try_for_each(relay_frame)
 }
 
+/// The account's events stream answered (opengrok-server #351, recorded at 9a2b011): its notes as
+/// SSE blocks, read off the body by the stream's own reader (`events::blocks_of`), each as the
+/// note it is ([`account_event_frame`]); a ping is a comment, and carries nothing.
+fn account_events_stream(_: u16, body: &Value) -> Check {
+    let stream = body
+        .as_str()
+        .ok_or("the events stream is its blocks, not a JSON body")?;
+    for (id, name, data) in blocks_of(stream) {
+        let data: Value = serde_json::from_str(&data)
+            .map_err(|error| format!("a block's data is one line of JSON: {error}"))?;
+        account_event_frame(&serde_json::json!({"id": id, "event": name, "data": data}))?;
+    }
+    Ok(())
+}
+
+/// The account's events stream refused (`open_account_events` reads the refusal as every other,
+/// and the stream takes it by `events::when_refused`). A `401` is read before this, as the session
+/// gone ([`signed_out`]). A route the server does not have, an empty `404` or a `405`, is a server
+/// from before the stream, which stops it; anything else, as the `503` of a store the server could
+/// not read, is tried again after a wait, and is read as every other refusal.
+fn account_events_refused(status: u16, body: &Value) -> Check {
+    let error = OpenGrokClient::refusal(status, &body_text(body));
+    let no_route = status == 405 || (status == 404 && body_text(body).trim().is_empty());
+    let expected = if no_route {
+        Refused::NoStream
+    } else {
+        Refused::TryAgain
+    };
+    let taken = when_refused(&error);
+    must!(
+        taken == expected,
+        "a {status} on the events stream should be {expected:?}, not {taken:?}"
+    );
+    refusal(status, body)
+}
+
 /// The relay's stream refused (`open_inference_relay` reads the refusal as every other, and the
 /// relay takes it in `stream_once`). A 401 is the server turning this Mac's token away, which
 /// the relay stops for until this Mac enrols again, rather than asking again with a token that
@@ -4758,6 +4827,7 @@ fn the_manifest_names_every_fixture_and_every_fixture_is_in_it() {
         .keys()
         .chain(corpus.bodies.keys())
         .chain(corpus.relay.keys())
+        .chain(corpus.events.keys())
         .map(String::as_str)
         .collect();
     let listed: BTreeSet<&str> = manifest
@@ -4794,8 +4864,9 @@ fn the_manifest_names_every_fixture_and_every_fixture_is_in_it() {
 }
 
 /// #255's layout: a frame sits under its own `type`, a CUSTOM under its `name`, a frame off the
-/// Mac relay's stream under its own `type` in `relay/`, and a body under its method and route
-/// with its status in the file name.
+/// Mac relay's stream under its own `type` in `relay/`, a block off the account's events stream
+/// under its own `event` in `events/`, kept whole as `{id, event, data}`, and a body under its
+/// method and route with its status in the file name.
 #[test]
 fn every_fixture_sits_where_its_layout_says() {
     let corpus = Corpus::load();
@@ -4815,6 +4886,17 @@ fn every_fixture_sits_where_its_layout_says() {
         let expected = format!("relay/{}/", str_at(frame, "type"));
         if !file.starts_with(&expected) {
             problems.push(format!("{file} belongs under {expected}"));
+        }
+    }
+    for (file, block) in &corpus.events {
+        let expected = format!("events/{}/", str_at(block, "event"));
+        if !file.starts_with(&expected)
+            || str_at(block, "id").is_empty()
+            || !block["data"].is_object()
+        {
+            problems.push(format!(
+                "{file} is not {{id, event, data}} filed under {expected}"
+            ));
         }
     }
     for (file, fixture) in &corpus.bodies {
@@ -5417,6 +5499,15 @@ fn every_type_and_name_the_server_sends_has_a_fixture() {
     }
     for name in &emits.custom_names {
         if corpus.customs_named(name).next().is_none() && !corpus.manifest.unrecorded.contains(name)
+        {
+            missing.push(name.as_str());
+        }
+    }
+    // Every note of the account's events stream, under the directory its block is filed in.
+    for name in &emits.account_events {
+        let filed = format!("events/{name}/");
+        if !corpus.events.keys().any(|file| file.starts_with(&filed))
+            && !corpus.manifest.unrecorded.contains(name)
         {
             missing.push(name.as_str());
         }
@@ -6088,6 +6179,285 @@ fn a_coworker_rows_effort_has_a_reading_in_the_ledger() {
 #[allow(clippy::type_complexity)]
 const FRAMES_READ_AHEAD: &[(Slot, &str, fn() -> Vec<(Value, bool)>)] = &[];
 
+/// A note off the account's events stream as the recording keeps one (opengrok-server #351,
+/// recorded at 9a2b011): its `id:`, its `event:` name and its one line of `data:`, held whole as
+/// `{"id", "event", "data"}`.
+fn account_event(id: u64, name: &str, data: Value) -> Value {
+    serde_json::json!({"id": id.to_string(), "event": name, "data": data})
+}
+
+/// `thread.changed` names the run whose commit made the change, and `null` when none did; a note
+/// without the field is read as `null` too, for safety.
+fn thread_changed_notes() -> Vec<(Value, bool)> {
+    use serde_json::json;
+    vec![
+        (
+            account_event(
+                1,
+                "thread.changed",
+                json!({"threadId": "cw_1", "coworkerId": "cw_1", "runId": "run_1"}),
+            ),
+            true,
+        ),
+        (
+            account_event(
+                2,
+                "thread.changed",
+                json!({"threadId": "cw_1", "coworkerId": "cw_1", "runId": null}),
+            ),
+            true,
+        ),
+        (
+            account_event(
+                14,
+                "thread.changed",
+                json!({"threadId": "cw_1", "coworkerId": "cw_1"}),
+            ),
+            true,
+        ),
+        (
+            account_event(15, "thread.changed", json!({"coworkerId": "cw_1"})),
+            false,
+        ),
+    ]
+}
+
+/// A routine's run says the routine and its cause in the history's words; a monitor's, or a run
+/// nothing fired, names no routine.
+fn run_started_notes() -> Vec<(Value, bool)> {
+    use serde_json::json;
+    vec![
+        (
+            account_event(
+                3,
+                "run.started",
+                json!({"runId": "run_1", "threadId": "sched_1", "coworkerId": "cw_1",
+                       "routineId": "sched_1", "cause": "clock"}),
+            ),
+            true,
+        ),
+        (
+            account_event(
+                4,
+                "run.started",
+                json!({"runId": "run_2", "threadId": "cw_1", "coworkerId": "cw_1",
+                       "cause": "chat"}),
+            ),
+            true,
+        ),
+        (
+            account_event(
+                16,
+                "run.started",
+                json!({"runId": "run_3", "threadId": "mon_1", "coworkerId": "cw_1",
+                       "cause": "event"}),
+            ),
+            true,
+        ),
+        (
+            account_event(
+                5,
+                "run.started",
+                json!({"threadId": "cw_1", "coworkerId": "cw_1", "cause": "chat"}),
+            ),
+            false,
+        ),
+    ]
+}
+
+/// A run's end in the history's words: `ok`, or `error`, which a stop is too.
+fn run_finished_notes() -> Vec<(Value, bool)> {
+    use serde_json::json;
+    vec![
+        (
+            account_event(
+                6,
+                "run.finished",
+                json!({"runId": "run_1", "threadId": "sched_1", "coworkerId": "cw_1",
+                       "routineId": "sched_1", "state": "ok"}),
+            ),
+            true,
+        ),
+        (
+            account_event(
+                17,
+                "run.finished",
+                json!({"runId": "run_2", "threadId": "cw_1", "coworkerId": "cw_1",
+                       "state": "error"}),
+            ),
+            true,
+        ),
+        (
+            account_event(
+                7,
+                "run.finished",
+                json!({"runId": "run_1", "coworkerId": "cw_1", "state": "error"}),
+            ),
+            false,
+        ),
+    ]
+}
+
+fn routine_changed_notes() -> Vec<(Value, bool)> {
+    use serde_json::json;
+    let changed = |id: u64, change: &str| {
+        account_event(
+            id,
+            "routine.changed",
+            json!({"routineId": "sched_1", "coworkerId": "cw_1", "change": change}),
+        )
+    };
+    vec![
+        (changed(8, "created"), true),
+        (changed(9, "updated"), true),
+        (changed(10, "deleted"), true),
+        (changed(11, "paused"), true),
+        (changed(12, "resumed"), true),
+        (
+            account_event(
+                13,
+                "routine.changed",
+                json!({"coworkerId": "cw_1", "change": "deleted"}),
+            ),
+            false,
+        ),
+    ]
+}
+
+fn reset_notes() -> Vec<(Value, bool)> {
+    vec![(account_event(97, "reset", serde_json::json!({})), true)]
+}
+
+/// The account's events stream's notes beyond the five blocks the recording keeps, in its shapes
+/// (opengrok-server #351, recorded at 9a2b011), each with whether the stream's reader takes it: a
+/// note from before `runId`, a monitor's run and a run's error, every change to a routine, and a
+/// note without an id it needs, which it passes over.
+#[test]
+fn account_events_are_read_beyond_the_recording() {
+    let mut problems = Vec::new();
+    for (note, reads) in [
+        thread_changed_notes(),
+        run_started_notes(),
+        run_finished_notes(),
+        routine_changed_notes(),
+        reset_notes(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        match (account_event_frame(&note), reads) {
+            (Err(why), true) => problems.push(format!("{note}: {why}")),
+            (Ok(()), false) => problems.push(format!("{note} should not read, and does")),
+            _ => {}
+        }
+    }
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
+}
+
+/// Every block of the account's events stream the server recorded goes through the stream's own
+/// reader, and comes out as the note it is, with every id the window reads again by as sent.
+#[test]
+fn every_account_event_the_server_sends_is_read_as_intended() {
+    let corpus = Corpus::load();
+    let names: BTreeSet<&str> = corpus
+        .events
+        .values()
+        .map(|block| str_at(block, "event"))
+        .collect();
+    assert_eq!(
+        names,
+        ACCOUNT_EVENT_NAMES.into_iter().collect(),
+        "the recording holds a block of every note this app reads"
+    );
+    let problems = verdicts(corpus.events.iter(), |_, block| account_event_frame(block));
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
+}
+
+/// The account's events stream's route as the server recorded it (opengrok-server #351,
+/// recorded at 9a2b011): a stream nobody signed in asks for is refused `401` in the server's
+/// words, which the stream reads as the session gone and stops for, after the session's own
+/// refresh; and a store the server could not read is a `503` in its words, which the stream
+/// opens again after a wait, as after any drop.
+#[test]
+fn the_events_streams_refusals_are_read_as_the_server_recorded_them() {
+    let corpus = Corpus::load();
+    let mut statuses = BTreeSet::new();
+    for fixture in recorded(&corpus, "GET__ag-ui_events") {
+        let status = fixture["status"]
+            .as_u64()
+            .and_then(|status| u16::try_from(status).ok())
+            .expect("a status");
+        statuses.insert(status);
+        let body = &fixture["body"];
+        let (sentence, _) = said_by(body);
+        let (error, taken) = if status == 401 {
+            let error = OpenGrokClient::signed_out_refusal(&body_text(body));
+            (error, Refused::SessionGone)
+        } else {
+            let error = OpenGrokClient::refusal(status, &body_text(body));
+            (error, Refused::TryAgain)
+        };
+        assert_eq!(when_refused(&error), taken, "{status}: {body}");
+        assert_eq!(error.message, sentence, "{status}: the server's own words");
+    }
+    assert_eq!(
+        statuses,
+        BTreeSet::from([401, 503]),
+        "the refusals the recording holds"
+    );
+}
+
+/// A note off the account's events stream, read by the stream's own reader (`AccountEvent::read`)
+/// as the note it is, with every id the window goes on to read again by as sent: the words of
+/// opengrok-server #351 (recorded at 9a2b011), stated here case by case.
+fn account_event_frame(frame: &Value) -> Check {
+    let name = str_at(frame, "event");
+    let data = &frame["data"];
+    let text = |key: &str| str_at(data, key).to_string();
+    let routine_id = opt_str(data, "routineId").map(str::to_string);
+    let word = |key: &str| data.get(key).cloned().unwrap_or(Value::Null);
+    let expected = match name {
+        "thread.changed" => AccountEvent::ThreadChanged {
+            thread_id: text("threadId"),
+            coworker_id: text("coworkerId"),
+            run_id: opt_str(data, "runId").map(str::to_string),
+        },
+        "run.started" => AccountEvent::RunStarted {
+            run_id: text("runId"),
+            thread_id: text("threadId"),
+            coworker_id: text("coworkerId"),
+            routine_id,
+            cause: serde_json::from_value(word("cause")).unwrap_or_default(),
+        },
+        "run.finished" => AccountEvent::RunFinished {
+            run_id: text("runId"),
+            thread_id: text("threadId"),
+            coworker_id: text("coworkerId"),
+            routine_id,
+            state: text("state"),
+        },
+        "routine.changed" => AccountEvent::RoutineChanged {
+            routine_id: text("routineId"),
+            coworker_id: text("coworkerId"),
+            change: serde_json::from_value(word("change")).unwrap_or_default(),
+        },
+        "reset" => AccountEvent::Reset,
+        other => {
+            return Err(format!(
+                "no check for an account event named {other:?}: say here what the window does \
+                 with one"
+            ));
+        }
+    };
+    let read = AccountEvent::read(name, &data.to_string())
+        .map_err(|unread| format!("the stream passes it over as {unread:?}"))?;
+    must!(
+        read == expected,
+        "the stream should read {expected:?}, not {read:?}"
+    );
+    Ok(())
+}
+
 /// [`FRAMES_READ_AHEAD`]'s frames for one word, none when it has none.
 fn frames_read_ahead(slot: Slot, word: &str) -> Vec<(Value, bool)> {
     FRAMES_READ_AHEAD
@@ -6142,9 +6512,11 @@ fn every_word_read_ahead_of_its_recording_is_matched_and_not_sent_yet() {
         }
         for (frame, reads) in frames {
             // A frame off the relay's stream is read by the relay's own reader, as the recorded
-            // ones are; any other by the chat's.
+            // ones are, and a note off the account's events stream by that stream's; any other
+            // by the chat's.
             let verdict = match slot {
                 Slot::RelayType => relay_frame(&frame),
+                Slot::AccountEvent => account_event_frame(&frame),
                 _ => check_frame(&corpus, &frame),
             };
             match (verdict, reads) {

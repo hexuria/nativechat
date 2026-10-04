@@ -5,7 +5,10 @@
 //! model names them: a model that lists none has no slider, and nothing in its place. A Bot that
 //! chose no effort sits on the model's own level, lit by name, and nothing says "Default". The
 //! list is a combobox: a search box over the models grouped by door, Subscription (the person's
-//! own plan) and Gateway (the server's paid keys), five at a time, which the wheel scrolls.
+//! own plan) and Gateway (the server's paid keys), five at a time, which the wheel scrolls. It
+//! opens at the top, so the first five Subscription models show, with the model that answers
+//! pinned above them under "Current", ticked, and not counted among the five; a search takes the
+//! pinned row away.
 //!
 //! The card is the only place a Bot's model is picked. The composer has no chip for it: the model
 //! is the Bot's setting, changed where the Bot's other settings are, and every turn goes through
@@ -27,9 +30,9 @@
 use crate::chrome::INFO_PANE_WIDTH;
 use crate::components::fields::field_input;
 use crate::opengrok::{
-    AccountPlan, InferenceKind, LIST_ROWS, ListLine, ModelChoice, ModelPick, NEW_BOTS_NONE,
-    NO_MODEL, SUBSCRIPTION_GROUP, base_label, group_title, last_window_start, list_window,
-    row_count,
+    AccountPlan, CURRENT_TITLE, InferenceKind, LIST_ROWS, ListLine, ModelChoice, ModelPick,
+    NEW_BOTS_NONE, NO_MODEL, SUBSCRIPTION_GROUP, base_label, group_title, last_window_start,
+    list_window, row_count,
 };
 use crate::state::{AppState, PickerFor, PickerView};
 use gpui_kit::component::input::{InputEvent, InputState};
@@ -201,6 +204,18 @@ impl PickerIds {
     /// A group's heading in the list, by its door's wire word.
     pub(crate) fn group_id(&self, source: InferenceKind) -> String {
         format!("{}{}", self.group, source.word())
+    }
+
+    /// The heading over the model the list pins above its groups ([`ModelPick::pinned`]). It is a
+    /// heading like the groups', so it is named like them, by a word no door has.
+    pub(crate) fn current_heading_id(&self) -> String {
+        format!("{}current", self.group)
+    }
+
+    /// The pinned model's row. Its own id, and not the id of the same model's row in its group,
+    /// because both can be in view at once and a driver names one of them.
+    pub(crate) fn current_row_id(&self) -> String {
+        format!("{}current", self.row)
     }
 
     /// Whether `target` is one of these ids: the card, a part of the popover, or a heading or a
@@ -873,8 +888,9 @@ impl Panel {
     /// The models, grouped by door, under a heading that goes back to the controls and a search
     /// box that filters both groups at once. At most [`LIST_ROWS`] models are in view, each group's
     /// heading over its first model in view and not counted among them; the wheel scrolls the
-    /// rest into view anywhere over the list. Default for new Bots' list has None over its models,
-    /// not counted among them either.
+    /// rest into view anywhere over the list. Over them all, while nothing is typed, the model
+    /// that answers is pinned under "Current" ([`ModelPick::pinned`]), and not counted among them
+    /// either, nor is Default for new Bots' None, which comes after it.
     fn list(&self, app: &Entity<AppState>, theme: &Theme) -> impl IntoElement {
         let which = self.which;
         let ids = ids(which);
@@ -933,6 +949,21 @@ impl Panel {
                     .id(ids.list)
                     .gap(px(10.))
                     .on_scroll_wheel(wheel)
+                    // The model that answers, pinned above the groups under its own heading and
+                    // not one of the window's models ([`ModelPick::pinned`]).
+                    .when_some(pick.pinned(&self.query), |this, row| {
+                        this.child(
+                            v_flex()
+                                .gap(px(2.))
+                                .child(heading(
+                                    ids.current_heading_id(),
+                                    CURRENT_TITLE,
+                                    false,
+                                    theme,
+                                ))
+                                .child(self.row(row, ids.current_row_id(), app.clone(), theme)),
+                        )
+                    })
                     .when_some(none, |this, id| {
                         this.child(none_row(
                             which,
@@ -1006,12 +1037,25 @@ impl Panel {
         v_flex()
             .relative()
             .gap(px(2.))
-            .children(lines.into_iter().enumerate().map(|(at, line)| match line {
-                // A heading under another group's rows stands off from them.
-                ListLine::Heading(source) => {
-                    group_heading(self.which, source, at > 0, theme).into_any_element()
+            .children(lines.into_iter().enumerate().map(|(at, line)| {
+                match line {
+                    // A heading under another group's rows stands off from them.
+                    ListLine::Heading(source) => heading(
+                        ids(self.which).group_id(source),
+                        group_title(source),
+                        at > 0,
+                        theme,
+                    )
+                    .into_any_element(),
+                    ListLine::Row(row) => self
+                        .row(
+                            row,
+                            ids(self.which).row_id(row.source, &row.base_id),
+                            app.clone(),
+                            theme,
+                        )
+                        .into_any_element(),
                 }
-                ListLine::Row(row) => self.row(row, app.clone(), theme).into_any_element(),
             }))
             .when(total > LIST_ROWS, |this| {
                 this.child(
@@ -1027,14 +1071,19 @@ impl Panel {
             })
     }
 
-    /// One model: a click puts the Bot, or the default for new Bots, on it, fast where ⚡ is on
-    /// and it has a fast version.
-    fn row(&self, row: &ModelChoice, app: Entity<AppState>, theme: &Theme) -> impl IntoElement {
+    /// One model, under the element id `id`: a click puts the Bot, or the default for new Bots,
+    /// on it, fast where ⚡ is on and it has a fast version.
+    fn row(
+        &self,
+        row: &ModelChoice,
+        id: String,
+        app: Entity<AppState>,
+        theme: &Theme,
+    ) -> impl IntoElement {
         let which = self.which;
         let current = self.pick.is_current(row);
         let source = row.source;
         let base_id = row.base_id.clone();
-        let id = ids(which).row_id(row.source, &row.base_id);
         h_flex()
             .id(SharedString::from(id.clone()))
             .debug_selector(move || id)
@@ -1079,20 +1128,17 @@ impl Panel {
     }
 }
 
-/// A group's heading, over the first of its models in the window.
-fn group_heading(
-    which: PickerFor,
-    source: InferenceKind,
-    stand_off: bool,
-    theme: &Theme,
-) -> impl IntoElement {
+/// A heading in the list, under the element id `id`: a group's, over the first of its models in
+/// the window, or the pinned model's ([`CURRENT_TITLE`]).
+fn heading(id: String, title: &'static str, stand_off: bool, theme: &Theme) -> impl IntoElement {
     div()
-        .id(SharedString::from(ids(which).group_id(source)))
+        .id(SharedString::from(id.clone()))
+        .debug_selector(move || id)
         .when(stand_off, |this| this.mt(px(8.)))
         .px(px(8.))
         .text_xs()
         .text_color(theme.muted_foreground)
-        .child(group_title(source))
+        .child(title)
 }
 
 /// None, the first row of Default for new Bots' list and of the Relay-off fallback's: none kept,
@@ -1944,6 +1990,67 @@ mod tests {
             }
         }
         // Whatever the last change began is polled while the runtime is entered, and stays out.
+        cx.run_until_parked();
+    }
+
+    /// The list opens with the model that answers pinned over its groups under "Current", ticked,
+    /// and the groups from their top, whatever their length: the pinned row is above the first
+    /// group's heading and the first group's first row is in view. A search takes the pinned row
+    /// away, a Bot no model answers has none, and Default for new Bots has none while none is set.
+    #[gpui_kit::test]
+    fn the_list_pins_the_model_that_answers_over_its_groups(cx: &mut gpui_kit::TestAppContext) {
+        use gpui_kit::AppContext as _;
+        let runtime = undriven_runtime();
+        let _enter = runtime.enter();
+        let state = cx.new(|_| app("gateway", "xai/grok-4.7", "inherit"));
+        let (_, cx) = open_picker(cx, &state, PickerFor::Bot);
+        state.update(cx, |state, cx| state.toggle_picker_list(PickerFor::Bot, cx));
+        draw(cx);
+        let heading = cx
+            .debug_bounds("agent-model-group-current")
+            .expect("the Current heading is drawn");
+        let pinned = cx
+            .debug_bounds("agent-model-row-current")
+            .expect("the model that answers is pinned");
+        let first_group = cx.debug_bounds("agent-model-group-local_proxy").expect(
+            "the list starts at the first group, though the model that answers is below it",
+        );
+        let first_row = cx
+            .debug_bounds("agent-model-row-local_proxy-gpt-6-luna")
+            .expect("and at its first row");
+        assert!(heading.bottom() <= pinned.top(), "{heading:?} {pinned:?}");
+        assert!(
+            pinned.bottom() <= first_group.top(),
+            "{pinned:?} {first_group:?}"
+        );
+        assert!(first_group.bottom() <= first_row.top());
+        assert_eq!(
+            state.read_with(cx, |state, _| state.model_picker.list_start),
+            0
+        );
+
+        // A search takes the pinned row away and leaves the model among what it finds.
+        state.update(cx, |state, cx| {
+            state.set_picker_search(PickerFor::Bot, "grok".into(), cx)
+        });
+        draw(cx);
+        assert!(cx.debug_bounds("agent-model-row-current").is_none());
+        assert!(cx.debug_bounds("agent-model-group-current").is_none());
+        assert!(
+            cx.debug_bounds("agent-model-row-gateway-xai/grok-4.7")
+                .is_some()
+        );
+
+        // A Bot on a model the list does not hold has nothing to pin.
+        state.update(cx, |state, cx| {
+            state.coworkers[0].model = "oag/not-listed".into();
+            state.set_picker_search(PickerFor::Bot, String::new(), cx);
+            cx.notify();
+        });
+        draw(cx);
+        assert!(cx.debug_bounds("agent-model-group-local_proxy").is_some());
+        assert!(cx.debug_bounds("agent-model-row-current").is_none());
+        assert!(cx.debug_bounds("agent-model-group-current").is_none());
         cx.run_until_parked();
     }
 }
