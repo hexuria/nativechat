@@ -374,9 +374,10 @@ pub fn render_approval(spec: &ApprovalSpec, app: Option<Entity<AppState>>, cx: &
 /// asks about this Mac's policy rather than one call, so neither changes.
 ///
 /// The routine tools (opengrok-server #316) touch no computer, which the server's surface for
-/// them says nonetheless, so each asks about the person's routines. A delete always asks first,
-/// and its `why` is the server's own question naming the routine as it is stored ("Delete the
-/// routine "Weekly report"? It stops for good."): that question is the card's title
+/// them says nonetheless, so each asks about routines: the Bot's own, which since #349 are the
+/// only ones its routine tools see or touch (recorded in #351 at 9a2b011). A delete always asks
+/// first, and its `why` is the server's own question naming the routine as it is stored ("Delete
+/// the routine "Weekly report"? It stops for good."): that question is the card's title
 /// ([`routine_question`]).
 pub(crate) fn approval_title(spec: &ApprovalSpec, bot: &str, review: bool) -> String {
     if review {
@@ -392,7 +393,7 @@ pub(crate) fn approval_title(spec: &ApprovalSpec, bot: &str, review: bool) -> St
         "shell" => format!("Allow {bot} to run a command on its computer?"),
         "read_file" => format!("Allow {bot} to read a file on its computer?"),
         "write_file" => format!("Allow {bot} to write a file on its computer?"),
-        LIST_ROUTINES => format!("Allow {bot} to see your routines?"),
+        LIST_ROUTINES => format!("Allow {bot} to see its routines?"),
         CREATE_ROUTINE => format!("Allow {bot} to make a routine?"),
         UPDATE_ROUTINE => format!("Allow {bot} to change a routine?"),
         DELETE_ROUTINE => format!("Allow {bot} to delete a routine?"),
@@ -948,9 +949,10 @@ mod tests {
         let list = card(LIST_ROUTINES, json!({}), "policy-approval", "");
         assert_eq!(
             approval_title(&list, "Hex", false),
-            "Allow Hex to see your routines?"
+            "Allow Hex to see its routines?",
+            "a Bot's routine tools see its own routines alone (opengrok-server #349)"
         );
-        assert_eq!(card_lines(&list, false), vec!["List your routines"]);
+        assert_eq!(card_lines(&list, false), vec!["List this Bot's routines"]);
     }
 
     /// A review card keeps its own title whatever the call is, and the local shell's card asks
