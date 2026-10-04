@@ -2100,10 +2100,11 @@ pub fn approval_summary(tool: &str, arguments: &Value) -> String {
             "Read the skill \"{}\"",
             clip(string_arg(arguments, "name").unwrap_or("(unnamed)"), 80)
         ),
-        // The routine tools (#316, the same `summary_for` at #334, on main 8e7387f): a routine by
-        // its id, never by a name the call wrote, since a delete's card names the routine as stored
-        // in its `why`; a create by its `when` as the call wrote it, as JSON.
-        LIST_ROUTINES => "List your routines".to_string(),
+        // The routine tools (#316, the same `summary_for` at #334, on main 8e7387f, and a list of
+        // the Bot's own routines since #349, `cards.rs` at 9a2b011): a routine by its id, never by
+        // a name the call wrote, since a delete's card names the routine as stored in its `why`; a
+        // create by its `when` as the call wrote it, as JSON.
+        LIST_ROUTINES => "List this Bot's routines".to_string(),
         CREATE_ROUTINE => format!(
             "Make a routine that wakes at {}",
             clip(

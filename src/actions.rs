@@ -69,7 +69,11 @@ actions!(
         LightboxPrev,
         LightboxNext,
         /// The question Delete asks about a routine: Escape answers Cancel.
-        CancelRoutineDelete
+        CancelRoutineDelete,
+        /// The Usage modal: Escape shuts it.
+        CloseUsageModal,
+        /// Tools and Plugins opened from the Computer pane: Escape shuts either.
+        CloseMonitorModal
     ]
 );
 

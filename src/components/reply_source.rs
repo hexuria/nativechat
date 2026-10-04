@@ -30,8 +30,9 @@ pub(crate) fn badge_model_id(message_id: &str) -> String {
     format!("reply-source-model-{message_id}")
 }
 
-/// In a Bot's Usage card while its replies go through the person's own plan: a turn there is not
-/// metered and carries no gateway key, so the server's usage report never counts it.
+/// In a Bot's Usage card while its replies go through the person's own plan, and always in the
+/// Usage modal (`usage_modal`): a turn there is not metered and carries no gateway key, so the
+/// server's usage report never counts it.
 pub(crate) const PLAN_USAGE_NOTE: &str = "Replies on your own subscription aren't counted here.";
 
 /// What a reply's badge reads when the server's paid keys answered a Bot on the person's plan

@@ -23,6 +23,7 @@ use crate::components::skills::{
     NEVER_UPDATED, NOT_YET_RECORDING, NOT_YET_WITH_BOT, NOTHING_WRITTEN_YET, empty_line,
     short_relative_time, skill_matches, waiting_to_be_read,
 };
+use crate::components::usage_modal;
 use crate::opengrok::{
     BoxHandoffResolution, ChatPart, ChoiceCard, ComputerHandoffStatus, CoworkerPatch,
     LocalExecResolution, RecipeKind, RecipeSummary, ScreenshotSpec, UserFormDismissMode,
@@ -42,7 +43,9 @@ use crate::state::{
 };
 
 pub mod ids {
-    use crate::components::{computers, connections, default_models, model_picker, reply_source};
+    use crate::components::{
+        computers, connections, default_models, model_picker, reply_source, usage_modal,
+    };
     use crate::opengrok::InferenceKind;
     use crate::state::RuleKind;
 
@@ -82,6 +85,10 @@ pub mod ids {
     /// toward older messages, however small, makes it `detached`, and nothing but the person
     /// makes it `following` again.
     pub const TRANSCRIPT: &str = "transcript";
+    /// Where the account's events stream stands (hexuria/nativechat #171): value `connecting`,
+    /// `connected`, `reconnecting`, `unavailable` (a server without the stream) or `signed-out`.
+    /// Never visible: nothing on screen says it, and it is in the tree for a driver to wait on.
+    pub const EVENTS_STREAM: &str = "events-stream";
     pub const LIGHTBOX: &str = "lightbox";
     pub const PAGE_LOGIN: &str = "page-login";
     pub const LOGIN_EMAIL: &str = "login-email";
@@ -111,7 +118,6 @@ pub mod ids {
     /// On a routine's thread: how many bubbles are labelled as its instruction (value).
     pub const CHAT_ROUTINE_INSTRUCTIONS: &str = "chat-routine-instructions";
     pub const AGENT_SETTINGS: &str = "agent-settings";
-    pub const AGENT_SAVE: &str = "agent-save";
     /// The one control that opens a blank routine, whichever of its two shapes the Computer
     /// pane is drawing: the "Create routine" card when the bot has none, the `+` when it has.
     pub const ROUTINE_NEW: &str = "routine-new";
@@ -142,15 +148,11 @@ pub mod ids {
     pub const ROUTINE_WAKE_AM: &str = "routine-wake-am";
     pub const ROUTINE_WAKE_PM: &str = "routine-wake-pm";
 
-    /// One of the open routine's wakes (label = what sets it off, in words), and its ✎ and 🗑.
+    /// One of the open routine's wakes (label = what sets it off, in words; value = what hovering
+    /// its line says, the zone its times are in where that is not this computer's and when it next
+    /// runs), and its ✎ and 🗑.
     pub fn routine_wake(at: usize) -> String {
         format!("routine-wake-{at}")
-    }
-
-    /// Under a schedule's wake, the zone its times are in (label = the IANA name), only where
-    /// that is not this computer's zone.
-    pub fn routine_wake_zone(at: usize) -> String {
-        format!("routine-wake-{at}-zone")
     }
 
     pub fn routine_wake_edit(at: usize) -> String {
@@ -210,6 +212,11 @@ pub mod ids {
     pub const COMPUTER_ERROR: &str = "computer-error";
     /// Get a computer, beside that reason: asks the server again, and is dead while it is asked.
     pub const COMPUTER_GET: &str = "computer-get";
+    pub const COMPUTER_RECIPES: &str = crate::components::monitor_modal::RECIPES;
+    pub const COMPUTER_TOOLS: &str = crate::components::monitor_modal::TOOLS;
+    pub const COMPUTER_PLUGINS: &str = crate::components::monitor_modal::PLUGINS;
+    pub const MONITOR_MODAL: &str = crate::components::monitor_modal::MODAL;
+    pub const MONITOR_CLOSE: &str = crate::components::monitor_modal::CLOSE;
     /// The newest coworker reply's steps (value = how many), in the tree only while it has
     /// any, and its Thought rows (value = how many), only while it has any.
     pub const REPLY_STEPS: &str = "reply-steps";
@@ -526,6 +533,13 @@ pub mod ids {
     pub const REPLY_SOURCE_HINT: &str = computers::HINT;
     /// In a Bot's Usage card, while its replies go through the person's own plan.
     pub const AGENT_USAGE_PLAN: &str = reply_source::BOT_USAGE_PLAN;
+    /// Show, on the Usage card, which opens the Usage modal.
+    pub const AGENT_USAGE_SHOW: &str = "agent-usage-show";
+    pub const USAGE_MODAL: &str = usage_modal::MODAL;
+    pub const USAGE_CLOSE: &str = usage_modal::CLOSE;
+    pub const USAGE_STATUS: &str = usage_modal::STATUS;
+    pub const USAGE_TOTAL: &str = usage_modal::TOTAL;
+    pub const USAGE_NOTE: &str = usage_modal::NOTE;
 
     /// The Bot's model picker: the Model card in the Bot's settings, the one place a Bot's model
     /// is picked. The parts of the popover it opens are `model_picker`'s own ids, all under
@@ -587,6 +601,16 @@ pub mod ids {
     /// The model a reply's badge names on hover, under the badge.
     pub fn reply_badge_model(message_id: &str) -> String {
         reply_source::badge_model_id(message_id)
+    }
+
+    /// A chip of the Usage modal, by the server's word for its window.
+    pub fn usage_window(window: crate::opengrok::UsageWindow) -> String {
+        usage_modal::window_id(window)
+    }
+
+    /// A model's row in the Usage modal, by its place.
+    pub fn usage_row(at: usize) -> String {
+        usage_modal::row_id(at)
     }
 
     /// One connected service on Settings → Connections, by the server's connection id.
@@ -949,14 +973,22 @@ pub enum Command {
         message_id: String,
     },
     ToggleAgentTools,
-    ToggleAgentUsage,
+    /// Show, on the Usage card: the Usage modal opens.
+    OpenUsageModal,
+    /// ✕ on the Usage modal.
+    CloseUsageModal,
+    OpenMonitorModal(crate::components::monitor_modal::MonitorKind),
+    CloseMonitorModal,
+    SelectMonitorPlugin(Option<crate::components::monitor_modal::PluginSelection>),
+    AskMonitorRemove(bool),
+    RemoveMonitorPlugin,
+    /// A chip of the Usage modal.
+    SetUsageWindow(crate::opengrok::UsageWindow),
     /// A switch on the Tools card: one row of the open Bot's ceiling on or off, sent at once.
     SetCeilingTool {
         name: String,
         enabled: bool,
     },
-    /// The bot settings' Save.
-    SaveAgentSettings,
     ToggleAgentSkills,
     /// A switch on the Skills card: one skill attached to the open Bot or detached from it, by
     /// the skill's id, sent at once.
@@ -1265,9 +1297,15 @@ impl Command {
             }
             Self::ChoiceDismiss { message_id } => state.dismiss_choice(message_id, cx),
             Self::ToggleAgentTools => state.toggle_agent_tools(cx),
-            Self::ToggleAgentUsage => state.toggle_agent_usage(cx),
+            Self::OpenUsageModal => state.open_usage_modal(cx),
+            Self::CloseUsageModal => state.close_usage_modal(cx),
+            Self::OpenMonitorModal(kind) => state.open_monitor_modal(kind, cx),
+            Self::CloseMonitorModal => state.close_monitor_modal(cx),
+            Self::SelectMonitorPlugin(plugin) => state.select_monitor_plugin(plugin, cx),
+            Self::AskMonitorRemove(confirm) => state.ask_monitor_remove(confirm, cx),
+            Self::RemoveMonitorPlugin => state.remove_monitor_plugin(cx),
+            Self::SetUsageWindow(window) => state.set_usage_window(window, cx),
             Self::SetCeilingTool { name, enabled } => state.switch_ceiling_tool(name, enabled, cx),
-            Self::SaveAgentSettings => state.request_agent_save(cx),
             Self::ToggleAgentSkills => state.toggle_agent_skills(cx),
             Self::SetBotSkill { skill_id, attached } => {
                 state.switch_bot_skill(skill_id, attached, cx)
@@ -1877,9 +1915,10 @@ struct RoutineSnap {
     unsaved: Vec<(&'static str, String)>,
     /// Its wakes, in order: what sets each off in words, and whether it is a webhook.
     wakes: Vec<(String, bool)>,
-    /// The zone its times are in, where that is not this computer's
-    /// ([`crate::state::RoutineZone::note`]).
-    zone: Option<String>,
+    /// What hovering each wake's line says, by its place in `wakes`: the zone its times are in,
+    /// where that is not this computer's, and when it next runs
+    /// ([`crate::state::RoutineZone::wake_hint`]). Where there is none the line says nothing.
+    wake_hints: Vec<Option<String>>,
 }
 
 /// One line of a routine's Run history as the driver sees it.
@@ -2466,6 +2505,8 @@ fn computer_handoff_node(handoff: &ComputerHandoffSnap) -> UiNode {
 /// worth asserting on: the cron line the server keeps, or the URL it minted.
 fn routine_snap(routine: &crate::state::AgentRoutine, state: &AppState) -> RoutineSnap {
     let on_the_server = routine.saved.is_some();
+    let zone = state.routine_zone(routine);
+    let now = chrono::Utc::now();
     let mut snap = RoutineSnap {
         id: routine.id.clone(),
         name: if routine.name.trim().is_empty() {
@@ -2517,7 +2558,11 @@ fn routine_snap(routine: &crate::state::AgentRoutine, state: &AppState) -> Routi
                 )
             })
             .collect(),
-        zone: state.routine_zone(routine).note().map(str::to_string),
+        wake_hints: routine
+            .triggers
+            .iter()
+            .map(|trigger| zone.wake_hint(trigger, now))
+            .collect(),
     };
     match routine.triggers.first() {
         Some(crate::state::RoutineTrigger::Schedule { spec, .. }) => {
@@ -2534,9 +2579,9 @@ fn routine_snap(routine: &crate::state::AgentRoutine, state: &AppState) -> Routi
     snap
 }
 
-/// The open routine's four header icons, as the panel draws them: each enabled while it can
-/// act, with the reason as the value of one that cannot.
-fn routine_header_nodes(routine: &RoutineSnap, history_open: bool) -> Vec<UiNode> {
+/// The open routine's four icons, as the panel draws them on the Active switch's row: each
+/// enabled while it can act, with the reason as the value of one that cannot.
+fn routine_icon_nodes(routine: &RoutineSnap, history_open: bool) -> Vec<UiNode> {
     let on_the_server = routine.kind != "draft";
     let mut history = UiNode::button(
         ids::ROUTINE_HISTORY_TOGGLE,
@@ -2571,7 +2616,8 @@ fn routine_header_nodes(routine: &RoutineSnap, history_open: bool) -> Vec<UiNode
 
 /// "When to run" on the open routine: +, a node per wake with its ✎ and 🗑, and the wake editor
 /// while it is open, each enabled while a click would act and with the reason as the value of
-/// one that would not.
+/// one that would not. A wake's own value is what hovering its line says, its zone and its next
+/// run, which the window shows only as that tooltip.
 fn routine_wake_nodes(
     open: &RoutineSnap,
     editor: Option<&(crate::state::WakeEditor, crate::state::WakeStatus)>,
@@ -2597,8 +2643,8 @@ fn routine_wake_nodes(
                     .with_enabled(false)
                     .with_value(LAST_WAKE_STAYS),
             );
-        if let Some(zone) = open.zone.as_ref().filter(|_| !*webhook) {
-            wake = wake.with_child(UiNode::status(ids::routine_wake_zone(at), zone.clone()));
+        if let Some(hint) = open.wake_hints.get(at).cloned().flatten() {
+            wake = wake.with_value(hint);
         }
         nodes.push(wake);
     }
@@ -3248,7 +3294,12 @@ pub struct NativeChatHost {
     /// Messages the open thread is holding until it is idle.
     queued_sends: usize,
     agent_settings_open: bool,
-    /// The open bot's tools as its settings list them, and whether the card is open to them.
+    /// The Bot's settings draw the Connections card. They do not (hexuria/nativechat#174: it opens
+    /// from the agent monitor, #175), so the app never sets this, and the card's node and its
+    /// switches are in the tree only for a host that does, as the monitor's tests will.
+    agent_connections_card: bool,
+    /// The open Bot's tools while the monitor's Tools modal draws them. These cards remain
+    /// absent from Bot settings (hexuria/nativechat#174, #175).
     agent_tools: Option<crate::state::ToolList>,
     /// The open Bot's ceiling as its Tools card draws it: see [`AppState::ceiling_card`].
     agent_ceiling: Option<CeilingCard>,
@@ -3257,11 +3308,17 @@ pub struct NativeChatHost {
     agent_skills_open: bool,
     /// The open bot's usage this month, as its settings' Usage card shows it (#138).
     agent_usage: Option<crate::state::UsageReport>,
-    agent_usage_open: bool,
+    /// The Usage modal, while it is open.
+    usage_modal: Option<crate::state::UsageModal>,
+    monitor_modal: Option<crate::components::monitor_modal::MonitorModal>,
+    monitor_plugins: Vec<crate::components::monitor_modal::PluginRow>,
+    monitor_detail: Option<crate::components::monitor_modal::PluginDetail>,
+    monitor_status: Vec<String>,
     agent_tools_open: bool,
     avatar_editor_open: bool,
     approvals: Vec<ApprovalSnap>,
     computer_open: bool,
+    computer_overview: bool,
     /// The coworker's computer as the pane sees it: "<state>; screen: yes|no",
     /// "endpoint missing", or "unknown".
     computer_status: String,
@@ -3286,6 +3343,8 @@ pub struct NativeChatHost {
     /// screen and are opposite in the one way that matters, which is what makes them go away.
     /// A driver that could not tell them apart is a driver that would have passed the bug.
     signed_out: Option<String>,
+    /// Where the account's events stream stands, as its word (`EventsStream::word`).
+    events_stream: &'static str,
     /// The open thread's last turn did not go through, and the feed is offering it again.
     can_retry_turn: bool,
     /// The open thread's last turn is one the person's plan could not answer, and the feed offers
@@ -3510,16 +3569,43 @@ impl NativeChatHost {
             turn_in_flight: state.is_turn_in_flight(),
             queued_sends: state.queued_send_count(),
             agent_settings_open: state.is_agent_settings_open(),
+            // The monitor owns Tools and Plugins (#175). Only the modal that draws a card
+            // publishes its state; Bot settings keeps none of these cards (#174).
+            agent_connections_card: false,
             agent_tools: state
-                .coworker_tools
+                .monitor_modal
                 .as_ref()
-                .filter(|(owner, _)| state.active_coworker_id.as_deref() == Some(owner.as_str()))
-                .map(|(_, list)| list.clone()),
-            agent_ceiling: state.ceiling_card(),
-            agent_skills: state.skills_card(),
+                .filter(|modal| modal.kind == crate::components::monitor_modal::MonitorKind::Tools)
+                .and_then(|_| {
+                    state
+                        .coworker_tools
+                        .as_ref()
+                        .filter(|(id, _)| state.active_coworker_id.as_deref() == Some(id.as_str()))
+                        .map(|(_, tools)| tools.clone())
+                }),
+            agent_ceiling: state
+                .monitor_modal
+                .as_ref()
+                .filter(|modal| modal.kind == crate::components::monitor_modal::MonitorKind::Tools)
+                .and_then(|_| state.ceiling_card()),
+            agent_skills: state
+                .monitor_modal
+                .as_ref()
+                .filter(|modal| {
+                    modal.kind == crate::components::monitor_modal::MonitorKind::Plugins
+                })
+                .and_then(|_| state.skills_card()),
             agent_skills_open: state.agent_skills_open,
             agent_tools_open: state.agent_tools_open,
-            agent_usage_open: state.agent_usage_open,
+            usage_modal: state.usage_modal.clone(),
+            monitor_modal: state.monitor_modal.clone(),
+            monitor_plugins: crate::components::monitor_modal::plugin_rows(state),
+            monitor_detail: state
+                .monitor_modal
+                .as_ref()
+                .and_then(|modal| modal.selected.as_ref())
+                .and_then(|plugin| crate::components::monitor_modal::plugin_detail(state, plugin)),
+            monitor_status: crate::components::monitor_modal::plugin_status(state),
             agent_usage: state
                 .coworker_usage
                 .as_ref()
@@ -3545,6 +3631,7 @@ impl NativeChatHost {
                 })
                 .collect(),
             computer_open: state.right_pane == crate::state::RightPane::Computer,
+            computer_overview: matches!(state.computer_view, crate::state::ComputerView::Overview),
             computer_confirm: state.computer_confirm.map(|action| match action {
                 crate::state::ComputerAction::Update => "Update this computer?".to_string(),
                 crate::state::ComputerAction::Reset => "Reset this computer?".to_string(),
@@ -3584,6 +3671,7 @@ impl NativeChatHost {
             signed_out: state
                 .session_banner()
                 .map(|(title, detail)| format!("{title} — {detail}")),
+            events_stream: state.events_stream.word(),
             can_retry_turn: state.retryable_turn().is_some(),
             can_send_on_server: state.plan_failed_turn().is_some(),
             waiting_for_mac: state.sends_waiting_for_mac(),
@@ -4246,6 +4334,12 @@ impl NativeChatHost {
                     .with_child(UiNode::button(ids::ROUTINE_DELETE_CONFIRM, "Delete")),
             );
         }
+        if let Some(modal) = self.monitor_modal_node() {
+            page = page.with_child(modal);
+        }
+        if let Some(modal) = self.usage_modal_node() {
+            page = page.with_child(modal);
+        }
         for approval in &self.approvals {
             let id = format!("approval-{}", approval.call_id);
             let mut card = UiNode::new(id.clone(), "dialog", approval.title.clone())
@@ -4302,6 +4396,33 @@ impl NativeChatHost {
                 .with_enabled(!self.computer_asking),
             );
         }
+        if self.computer_open && self.computer_overview {
+            computer = computer
+                .with_child(UiNode::button(ids::COMPUTER_RECIPES, "Recipes"))
+                .with_child(UiNode::button(
+                    ids::COMPUTER_PLUGINS,
+                    "Plugins for this Bot",
+                ))
+                .with_child(UiNode::button(ids::COMPUTER_TOOLS, "Tools for this Bot"))
+                .with_child(
+                    UiNode::new(
+                        "route-traffic-this-computer",
+                        "switch",
+                        "Route traffic for all your computers",
+                    )
+                    .with_enabled(self.route_traffic_on_bot_pane),
+                )
+                .with_child(
+                    UiNode::button(
+                        "network-policy",
+                        self.egress_policy.map_or_else(
+                            || "No network rule from the server yet".into(),
+                            |mode| format!("Use your network from this computer: {}", mode.label()),
+                        ),
+                    )
+                    .with_enabled(self.egress_policy.is_some()),
+                );
+        }
         computer = computer
             .with_child(UiNode::button(
                 "computer-update",
@@ -4311,19 +4432,6 @@ impl NativeChatHost {
                 "computer-reset",
                 self.computer_reset_label.clone(),
             ));
-        if self.computer_open && self.route_traffic_on_bot_pane {
-            computer = computer.with_child(UiNode::new(
-                "route-traffic-this-computer",
-                "switch",
-                "Route traffic through this computer",
-            ));
-            if let Some(current) = self.egress_policy {
-                computer = computer.with_child(UiNode::button(
-                    "network-policy",
-                    format!("Use your network: {}", current.label()),
-                ));
-            }
-        }
         if self.network_policy_open
             && let Some(current) = self.egress_policy
         {
@@ -4337,7 +4445,7 @@ impl NativeChatHost {
             computer = computer.with_child(UiNode::status(ids::ROUTINE_ERROR, line.clone()));
         }
         if let Some(open) = self.open_routine() {
-            for node in routine_header_nodes(open, self.routine_history_open) {
+            for node in routine_icon_nodes(open, self.routine_history_open) {
                 computer = computer.with_child(node);
             }
             for node in routine_wake_nodes(open, self.routine_wake_editor.as_ref()) {
@@ -4402,6 +4510,7 @@ impl NativeChatHost {
         for node in self.signed_out_nodes() {
             page = page.with_child(node);
         }
+        page = page.with_child(self.events_stream_node());
         if self.can_retry_turn {
             page = page.with_child(UiNode::button("retry-turn", "Try again"));
         }
@@ -4430,46 +4539,35 @@ impl NativeChatHost {
         if let Some(card) = self.picker_node(PickerFor::Bot) {
             settings = settings.with_child(card);
         }
-        if self.agent_tools.is_some() || self.agent_ceiling.is_some() {
+        if self.monitor_modal.is_none()
+            && (self.agent_tools.is_some() || self.agent_ceiling.is_some())
+        {
             settings = settings.with_child(agent_tools_node(&ToolsCardSnap {
                 tools: self.agent_tools.as_ref(),
                 ceiling: self.agent_ceiling.as_ref(),
                 open: self.agent_tools_open,
             }));
         }
-        if let Some(card) = &self.agent_skills {
+        if self.monitor_modal.is_none()
+            && let Some(card) = &self.agent_skills
+        {
             settings = settings.with_child(agent_skills_node(card, self.agent_skills_open));
         }
         if let Some(usage) = &self.agent_usage {
-            // `agent-usage` (value = the card's second line), with `agent-usage-toggle` while
-            // there are models to show and one `agent-usage-model-{i}` per model the server
-            // reported, label = that model's line, visible while the card is open (#138).
+            // `agent-usage` (value = the card's second line), with `agent-usage-show` while there
+            // are models to show, which opens the Usage modal (hexuria/nativechat#174).
             let mut node = UiNode::new("agent-usage", "status", "Usage")
                 .with_value(crate::components::agent_settings::usage_summary(usage));
-            if let crate::state::UsageReport::Read(read) = usage
-                && !read.models.is_empty()
-            {
-                node = node.with_child(UiNode::button(
-                    "agent-usage-toggle",
-                    if self.agent_usage_open {
-                        "Hide"
-                    } else {
-                        "Show"
-                    },
-                ));
-                for (i, model) in read.models.iter().enumerate() {
-                    node = node.with_child(
-                        UiNode::listitem(
-                            format!("agent-usage-model-{i}"),
-                            crate::components::agent_settings::model_line(model),
-                        )
-                        .with_visible(self.agent_usage_open),
-                    );
-                }
+            if matches!(
+                crate::components::agent_settings::usage_body(usage),
+                crate::components::agent_settings::UsageBody::Rows { .. }
+            ) {
+                node = node.with_child(UiNode::button(ids::AGENT_USAGE_SHOW, "Show"));
             }
             settings = settings.with_child(node);
         }
         if self.agent_settings_open
+            && self.agent_connections_card
             && let Some(bot) = self.sessions.iter().find(|session| session.active)
         {
             settings = settings.with_child(self.agent_connections_node(&bot.id));
@@ -4482,11 +4580,11 @@ impl NativeChatHost {
                 reply_source::PLAN_USAGE_NOTE,
             ));
         }
-        // The pane's red line over Save, where a refused Save says why in the server's words.
+        // The pane's red line under the fields, where a refused save says why in the server's
+        // words.
         if let Some(error) = &self.auth_error {
             settings = settings.with_child(UiNode::status("agent-settings-error", error.clone()));
         }
-        settings = settings.with_child(UiNode::button(ids::AGENT_SAVE, "Save"));
 
         UiTree {
             app: "nativechat".into(),
@@ -4753,6 +4851,15 @@ impl NativeChatHost {
         // it is plainly not the reconnect pill, which is the confusion that made the bug.
         node.states.push("signed-out".to_string());
         vec![node, UiNode::button("signed-out-sign-in", "Sign in again")]
+    }
+
+    /// Where the account's events stream stands, for a driver to wait on: `connected` before
+    /// checking that a run the server starts shows by itself. Not visible, since nothing on screen
+    /// says it.
+    fn events_stream_node(&self) -> UiNode {
+        UiNode::status(ids::EVENTS_STREAM, "Account events")
+            .with_value(self.events_stream)
+            .with_visible(false)
     }
 
     /// A task taught on a coworker's screen while it is being written up as a skill, and what
@@ -5220,6 +5327,297 @@ impl NativeChatHost {
         nodes
     }
 
+    /// The Usage modal as the window draws it, while it is open: `usage-modal` (a dialog named
+    /// `Usage`, valued by the server's word for the window it is on) holding `usage-close`,
+    /// the three chips `usage-window-24h`, `usage-window-7d` and `usage-window-month` (state
+    /// `selected` on the one it is on), then either a `usage-row-{i}` for each model that answered
+    /// a request (named by the model, valued `12 requests · $0.40`) and `usage-total` (`Total
+    /// (paid keys)`, valued by the paid keys' charges, which a model on the person's own
+    /// subscription adds nothing to), or `usage-status` where there are none to list (asking, the
+    /// server's words, or `No requests in this window.`), and `usage-note`, that replies on the
+    /// person's own subscription are not counted here.
+    fn monitor_modal_node(&self) -> Option<UiNode> {
+        use crate::components::monitor_modal as monitor;
+        let modal = self.monitor_modal.as_ref()?;
+        let mut node = UiNode::dialog(ids::MONITOR_MODAL, modal.kind.title())
+            .with_child(UiNode::button(ids::MONITOR_CLOSE, "Close"));
+        match modal.kind {
+            monitor::MonitorKind::Tools => {
+                node = node.with_child(agent_tools_node(&ToolsCardSnap {
+                    tools: self.agent_tools.as_ref(),
+                    ceiling: self.agent_ceiling.as_ref(),
+                    open: self.agent_tools_open,
+                }));
+            }
+            monitor::MonitorKind::Plugins => {
+                if modal.selected.is_some() {
+                    node = node.with_child(
+                        UiNode::button(monitor::BACK, "Installed").with_enabled(!modal.removing),
+                    );
+                    if let Some(detail) = &self.monitor_detail {
+                        let mut fields = UiNode::dialog(monitor::DETAIL, detail.title.clone());
+                        for (label, value) in &detail.fields {
+                            fields = fields.with_child(
+                                UiNode::status(
+                                    format!("monitor-plugin-{}", label.to_lowercase()),
+                                    *label,
+                                )
+                                .with_value(value.clone()),
+                            );
+                        }
+                        if detail.connection {
+                            fields = fields.with_child(
+                                UiNode::button(monitor::ADD_ACCOUNT, "Add another account")
+                                    .with_enabled(false)
+                                    .with_value("Coming later"),
+                            );
+                        }
+                        if let Some(error) = modal.error.as_ref().or(detail.error.as_ref()) {
+                            fields = fields
+                                .with_child(UiNode::status("monitor-plugin-error", error.clone()));
+                        }
+                        let live = detail.can_remove && !modal.removing;
+                        if modal.confirming {
+                            fields = fields
+                                .with_child(UiNode::status(
+                                    "monitor-plugin-remove-question",
+                                    detail.question.clone(),
+                                ))
+                                .with_child(
+                                    UiNode::button(monitor::REMOVE_NO, "Cancel")
+                                        .with_enabled(!modal.removing),
+                                )
+                                .with_child(
+                                    UiNode::button(monitor::REMOVE_YES, "Remove")
+                                        .with_enabled(live),
+                                );
+                        } else {
+                            fields = fields.with_child(
+                                UiNode::button(monitor::REMOVE, "Remove").with_enabled(live),
+                            );
+                        }
+                        node = node.with_child(fields);
+                    } else {
+                        node = node.with_child(UiNode::status(
+                            monitor::DETAIL,
+                            "This plugin is no longer installed.",
+                        ));
+                    }
+                } else {
+                    node = node.with_child(UiNode::status(
+                        monitor::STATUS,
+                        self.monitor_status.join("\n"),
+                    ));
+                    for row in &self.monitor_plugins {
+                        node = node
+                            .with_child(
+                                UiNode::button(row.selection.detail_id(), row.title.clone())
+                                    .with_value(row.subtitle.clone()),
+                            )
+                            .with_child(
+                                UiNode::new(row.selection.switch_id(), "switch", row.title.clone())
+                                    .with_checked(row.on)
+                                    .with_enabled(row.live),
+                            );
+                    }
+                    node = node.with_child(UiNode::status(
+                        connections::AGENT_NOTE,
+                        connections::LEND_NOTE,
+                    ));
+                }
+            }
+        }
+        Some(node)
+    }
+
+    /// Modal controls use the same catalog as the window. No private skill or account can be
+    /// addressed while its row is absent, or through a dialog for a different Bot.
+    fn monitor_command(&self, target: &str) -> Option<Result<Command, String>> {
+        use crate::components::monitor_modal as monitor;
+        if target == ids::COMPUTER_TOOLS || target == ids::COMPUTER_PLUGINS {
+            return Some(
+                if !self.computer_open
+                    || !self.computer_overview
+                    || !self.sessions.iter().any(|bot| bot.active)
+                {
+                    Err("open a Bot's Computer pane first".into())
+                } else {
+                    Ok(Command::OpenMonitorModal(
+                        if target == ids::COMPUTER_TOOLS {
+                            monitor::MonitorKind::Tools
+                        } else {
+                            monitor::MonitorKind::Plugins
+                        },
+                    ))
+                },
+            );
+        }
+        let shaped = target == ids::MONITOR_CLOSE
+            || target.starts_with("monitor-")
+            || (self
+                .monitor_modal
+                .as_ref()
+                .is_some_and(|modal| modal.kind == monitor::MonitorKind::Plugins)
+                && (target.starts_with("agent-skills-switch-")
+                    || target.starts_with("agent-connection-lend-")));
+        if !shaped {
+            return None;
+        }
+        let Some(modal) = &self.monitor_modal else {
+            return Some(Err("the monitor modal is closed".into()));
+        };
+        if !self
+            .sessions
+            .iter()
+            .any(|bot| bot.active && bot.id == modal.coworker_id)
+        {
+            return Some(Err("the modal belongs to another Bot".into()));
+        }
+        if target == ids::MONITOR_CLOSE {
+            return Some(Ok(Command::CloseMonitorModal));
+        }
+        if modal.kind != monitor::MonitorKind::Plugins {
+            return Some(Err("open Plugins first".into()));
+        }
+        if target == monitor::ADD_ACCOUNT {
+            return Some(Err("Coming later".into()));
+        }
+        if target == monitor::BACK && modal.selected.is_some() && !modal.removing {
+            return Some(Ok(Command::SelectMonitorPlugin(None)));
+        }
+        if modal.selected.is_none() {
+            if let Some(row) = self
+                .monitor_plugins
+                .iter()
+                .find(|row| row.selection.detail_id() == target)
+            {
+                return Some(Ok(Command::SelectMonitorPlugin(Some(
+                    row.selection.clone(),
+                ))));
+            }
+            if let Some(row) = self
+                .monitor_plugins
+                .iter()
+                .find(|row| row.selection.switch_id() == target)
+            {
+                return Some(if !row.live {
+                    Err("this switch is waiting on the server or unavailable".into())
+                } else {
+                    Ok(match &row.selection {
+                        monitor::PluginSelection::Connection(id) => Command::SetConnectionLent {
+                            connection_id: id.clone(),
+                            lent: !row.on,
+                        },
+                        monitor::PluginSelection::Skill(id) => Command::SetBotSkill {
+                            skill_id: id.clone(),
+                            attached: !row.on,
+                        },
+                    })
+                });
+            }
+        } else if let Some(detail) = &self.monitor_detail {
+            if target == monitor::REMOVE
+                && !modal.confirming
+                && detail.can_remove
+                && !modal.removing
+            {
+                return Some(Ok(Command::AskMonitorRemove(true)));
+            }
+            if modal.confirming && !modal.removing {
+                if target == monitor::REMOVE_NO {
+                    return Some(Ok(Command::AskMonitorRemove(false)));
+                }
+                if target == monitor::REMOVE_YES && detail.can_remove {
+                    return Some(Ok(Command::RemoveMonitorPlugin));
+                }
+            }
+        }
+        Some(Err(format!(
+            "`{target}` is not a live control in the Plugins modal"
+        )))
+    }
+
+    fn usage_modal_node(&self) -> Option<UiNode> {
+        use crate::components::agent_settings::{UsageBody, usage_body};
+        let open = self.usage_modal.as_ref()?;
+        let body = usage_body(&open.report);
+        let mut node = UiNode::dialog(ids::USAGE_MODAL, usage_modal::TITLE)
+            .with_value(open.window.word())
+            .with_child(UiNode::button(ids::USAGE_CLOSE, "Close"));
+        for window in crate::opengrok::UsageWindow::ALL {
+            let mut chip = UiNode::button(ids::usage_window(window), window.label());
+            if open.window == window {
+                chip.states.push("selected".into());
+            }
+            node = node.with_child(chip);
+        }
+        match &body {
+            UsageBody::Rows { rows, total } => {
+                for (at, row) in rows.iter().enumerate() {
+                    node = node.with_child(
+                        UiNode::listitem(ids::usage_row(at), row.model.clone())
+                            .with_value(row.detail()),
+                    );
+                }
+                node = node.with_child(
+                    UiNode::listitem(ids::USAGE_TOTAL, usage_modal::TOTAL_LABEL)
+                        .with_value(total.clone()),
+                );
+            }
+            other => {
+                if let Some(words) = usage_modal::status_words(other) {
+                    node = node.with_child(UiNode::status(ids::USAGE_STATUS, words));
+                }
+            }
+        }
+        Some(node.with_child(UiNode::status(
+            ids::USAGE_NOTE,
+            reply_source::PLAN_USAGE_NOTE,
+        )))
+    }
+
+    /// A click on one of the Usage modal's controls, or `None` for a target that is not one: ✕ and
+    /// the chips, which are refused while the modal is shut, the chip it is on already is refused,
+    /// and its lines are no control.
+    fn usage_modal_command(&self, target: &str) -> Option<Result<Command, String>> {
+        let windows = crate::opengrok::UsageWindow::ALL;
+        let named = [
+            ids::USAGE_MODAL,
+            ids::USAGE_CLOSE,
+            ids::USAGE_STATUS,
+            ids::USAGE_TOTAL,
+            ids::USAGE_NOTE,
+        ]
+        .contains(&target)
+            || target.starts_with("usage-row-")
+            || windows
+                .iter()
+                .any(|window| target == ids::usage_window(*window));
+        if !named {
+            return None;
+        }
+        let Some(open) = &self.usage_modal else {
+            return Some(Err(format!(
+                "`{target}` is in the Usage modal, which is not open: Show on the Usage card \
+                 opens it"
+            )));
+        };
+        Some(if target == ids::USAGE_CLOSE {
+            Ok(Command::CloseUsageModal)
+        } else if let Some(window) = windows
+            .into_iter()
+            .find(|window| target == ids::usage_window(*window))
+        {
+            if open.window == window {
+                Err(format!("`{target}` is the window the modal is already on"))
+            } else {
+                Ok(Command::SetUsageWindow(window))
+            }
+        } else {
+            Err(format!("`{target}` is a line, not a control"))
+        })
+    }
+
     /// The open bot's Connections card (#2): its second line, a switch per connection of the
     /// person's own (named by its label, valued by its service, `checked` while it shows as lent
     /// to this bot, dead and `changing` while a change to it is with the server), why a lend or
@@ -5334,10 +5732,10 @@ impl NativeChatHost {
                 .sessions
                 .iter()
                 .find(|session| session.active)
-                .filter(|_| self.agent_settings_open);
+                .filter(|_| self.agent_settings_open && self.agent_connections_card);
             return Some(match bot {
                 None => Err(format!(
-                    "`{target}` is on a bot's settings, which are closed"
+                    "`{target}` is on a bot's Connections card, which is not on screen"
                 )),
                 Some(_) if connections.is_changing(&row.id) => busy(&row.label),
                 Some(bot) => Ok(Command::SetConnectionLent {
@@ -5436,7 +5834,9 @@ impl NativeChatHost {
     /// most five models, an `agent-model-row-{source}-{id}` each (valued by its door's word,
     /// `selected` on the one that answers, `fast` where it has a fast version), with an
     /// `agent-model-group-{source}` heading ("Subscription", "Gateway") over each group's first
-    /// model in view; `agent-model-plan` where a server without per-Bot doors has the account's
+    /// model in view, and over them all, while nothing is typed and a model answers, that model
+    /// pinned under an `agent-model-group-current` heading as an `agent-model-row-current`;
+    /// `agent-model-plan` where a server without per-Bot doors has the account's
     /// plan model answer, `agent-model-no-match` where the search leaves nothing of a list that
     /// has some, `agent-model-routines` where the Bot's own door is the person's plan, where its
     /// routines run, and `agent-model-note`, the server's word on why the list is not
@@ -5514,6 +5914,23 @@ impl NativeChatHost {
             pop = pop.with_child(back).with_child(
                 UiNode::textbox(ids.search, SEARCH_PLACEHOLDER).with_value(view.search.clone()),
             );
+            // The model that answers, pinned over the groups under its own heading while nothing
+            // is typed, and not one of the window's models.
+            if let Some(row) = pick.pinned(&view.search) {
+                list = list.with_child(UiNode::new(
+                    ids.current_heading_id(),
+                    "heading",
+                    crate::opengrok::CURRENT_TITLE,
+                ));
+                let mut item = UiNode::listitem(ids.current_row_id(), row.label.clone())
+                    .with_value(row.source.word())
+                    .with_enabled(!busy);
+                item.states.push("selected".into());
+                if row.has_fast {
+                    item.states.push("fast".into());
+                }
+                list = list.with_child(item);
+            }
             let none = ids
                 .none
                 .filter(|_| model_picker::none_shows(&view.search, ids.none_hint));
@@ -5976,8 +6393,22 @@ impl NativeChatHost {
                 Ok(Command::ClearNewBotsDefault)
             };
         }
+        if target == ids.current_row_id() {
+            return match pick.pinned(query) {
+                None => Err(format!(
+                    "`{target}` is not on screen: the list pins the model that answers only while \
+                     nothing is typed in `{search}`, and only while one answers"
+                )),
+                Some(_) if busy => dead(),
+                Some(row) => Ok(PickerCommand::Pick {
+                    source: row.source,
+                    base_id: row.base_id.clone(),
+                }
+                .sent_to(which)),
+            };
+        }
         if target.starts_with(ids.group) {
-            return Err(format!("`{target}` is a group's heading, not a model"));
+            return Err(format!("`{target}` is a heading, not a model"));
         }
         use crate::opengrok::{LIST_ROWS, ListLine, list_window};
         let rest = target.strip_prefix(ids.row).unwrap_or(target);
@@ -7021,9 +7452,13 @@ impl NativeChatHost {
     /// server's 403), and never to switch back on a plugin the server no longer loads. Each of
     /// those says which it was, and a card with no switches says why it has none.
     fn ceiling_command(&self, target: &str) -> Result<Command, String> {
-        if !self.agent_settings_open {
+        if !self.agent_settings_open
+            && !self.monitor_modal.as_ref().is_some_and(|modal| {
+                modal.kind == crate::components::monitor_modal::MonitorKind::Tools
+            })
+        {
             return Err(format!(
-                "`{target}` is in the bot's settings, which are closed"
+                "`{target}` is in the bot's settings, which are closed; open the Tools modal"
             ));
         }
         let Some(name) = ids::ceiling_switch_row(target) else {
@@ -7150,7 +7585,14 @@ impl NativeChatHost {
     }
 
     fn click(&mut self, target: &str) -> Result<DispatchResult, String> {
-        let cmd = if target == ids::NAV_NEW_CHAT || target == "create-first-bot" {
+        let cmd = if let Some(cmd) = self.monitor_command(target) {
+            cmd?
+        } else if target == ids::COMPUTER_RECIPES {
+            if !self.computer_open || !self.computer_overview {
+                return Err("the Computer pane is closed".into());
+            }
+            Command::OpenRecipes
+        } else if target == ids::NAV_NEW_CHAT || target == "create-first-bot" {
             Command::NewChat
         } else if target == ids::HEADER_LEFT_SIDEBAR {
             if !self.sidebar_hidden {
@@ -7182,7 +7624,11 @@ impl NativeChatHost {
         } else if target == ids::HEADER_SETTINGS || target == ids::AGENT_SETTINGS {
             Command::ToggleAgentSettings
         } else if target == "agent-tools-toggle" {
-            if !self.agent_settings_open {
+            if !self.agent_settings_open
+                && !self.monitor_modal.as_ref().is_some_and(|modal| {
+                    modal.kind == crate::components::monitor_modal::MonitorKind::Tools
+                })
+            {
                 return Err(
                     "`agent-tools-toggle` is in the bot's settings, which are closed".into(),
                 );
@@ -7209,24 +7655,23 @@ impl NativeChatHost {
             Command::ToggleAgentSkills
         } else if target.starts_with(ids::AGENT_SKILLS) {
             self.skills_command(target)?
-        } else if target == "agent-usage-toggle" {
+        } else if target == ids::AGENT_USAGE_SHOW {
             if !self.agent_settings_open {
+                return Err("`agent-usage-show` is in the bot's settings, which are closed".into());
+            }
+            if !matches!(
+                self.agent_usage
+                    .as_ref()
+                    .map(crate::components::agent_settings::usage_body),
+                Some(crate::components::agent_settings::UsageBody::Rows { .. })
+            ) {
                 return Err(
-                    "`agent-usage-toggle` is in the bot's settings, which are closed".into(),
+                    "`agent-usage-show` is only there while the server reported models".into(),
                 );
             }
-            if !matches!(&self.agent_usage, Some(crate::state::UsageReport::Read(read)) if !read.models.is_empty())
-            {
-                return Err(
-                    "`agent-usage-toggle` is only there while the server reported models".into(),
-                );
-            }
-            Command::ToggleAgentUsage
-        } else if target == ids::AGENT_SAVE {
-            if !self.agent_settings_open {
-                return Err("`agent-save` is in the bot's settings, which are closed".into());
-            }
-            Command::SaveAgentSettings
+            Command::OpenUsageModal
+        } else if let Some(cmd) = self.usage_modal_command(target) {
+            cmd?
         } else if target == "agent-model-dismiss" {
             Command::SetModelPicker(false)
         } else if target == "avatar-trigger" || target == "avatar-editor-dismiss" {
@@ -7437,7 +7882,7 @@ impl NativeChatHost {
         ]
         .contains(&target)
         {
-            self.routine_header_command(target)?
+            self.routine_icon_command(target)?
         } else if let Some(why) = self.skipped_line_refusal(target) {
             return Err(why);
         } else if let Some(cmd) = self.routine_command(target) {
@@ -8286,12 +8731,12 @@ impl NativeChatHost {
         Ok(DispatchResult::empty())
     }
 
-    /// One of the open routine's header icons, refused when no routine is open or when the icon
-    /// is dead, in the words its tooltip says it in.
-    fn routine_header_command(&self, target: &str) -> Result<Command, String> {
+    /// One of the open routine's four icons, refused when no routine is open or when the icon is
+    /// dead, in the words its tooltip says it in.
+    fn routine_icon_command(&self, target: &str) -> Result<Command, String> {
         let open = self
             .open_routine()
-            .ok_or_else(|| format!("`{target}` is in a routine's header, and none is open"))?;
+            .ok_or_else(|| format!("`{target}` is on a routine's panel, and none is open"))?;
         let routine_id = open.id.clone();
         let on_the_server = open.kind != "draft";
         Ok(match target {
@@ -8536,7 +8981,7 @@ mod tests {
                 "webhook" => vec![("When a webhook fires".into(), true)],
                 _ => Vec::new(),
             },
-            zone: None,
+            wake_hints: Vec::new(),
         }
     }
 
@@ -8780,12 +9225,12 @@ mod tests {
         ));
     }
 
-    /// The open routine's header carries its four icons, each acting on that routine: the
-    /// history toggle says which view it leads to and is `selected` while the history shows, and
-    /// Open in thread and Run it now are dead on a draft, Run it now also where the server cannot
-    /// run a routine on demand, each refused with its reason. With no routine open there are none.
+    /// The open routine's four icons each act on that routine: the history toggle says which
+    /// view it leads to and is `selected` while the history shows, and Open in thread and Run it
+    /// now are dead on a draft, Run it now also where the server cannot run a routine on demand,
+    /// each refused with its reason. With no routine open there are none.
     #[test]
-    fn the_open_routines_header_icons_act_on_it() {
+    fn the_open_routines_icons_act_on_it() {
         let mut host = host();
         host.computer_open = true;
         host.routines = vec![routine("sch_1", "cron"), routine("draft-1", "draft")];
@@ -8890,37 +9335,46 @@ mod tests {
         ));
     }
 
-    /// A routine whose times are in another zone than this computer's names it under its wake
-    /// and under what the wake editor picked (opengrok-server #316: the server reads the line in
-    /// the routine's zone); in this computer's own zone nothing is named, nor on a webhook, which
-    /// has no times. The editor leaves the next run unsaid in a zone it cannot read the line in,
-    /// and says it in UTC, which it can.
+    /// A routine whose times are in another zone than this computer's names it on its wake line
+    /// as what hovering the line says, the wake's value, and not as a node of its own beside the
+    /// line, which the window no longer draws; and under what the wake editor picked
+    /// (opengrok-server #316: the server reads the line in the routine's zone). In this
+    /// computer's own zone nothing is named, nor on a webhook, which has no times. The editor
+    /// leaves the next run unsaid in a zone it cannot read the line in, and says it in UTC, which
+    /// it can.
     #[test]
     fn a_routines_zone_is_named_where_it_is_not_this_computers() {
         use crate::state::{RoutineZone, ScheduleSpec, WakeEditor, WakeTab};
         let mut host = host();
         host.computer_open = true;
         let mut away = routine("sch_1", "cron");
-        away.zone = Some("Europe/London".into());
-        let mut hook = routine("sch_2", "webhook");
-        hook.zone = Some("Europe/London".into());
+        away.wake_hints = vec![Some("Europe/London".into())];
+        let hook = routine("sch_2", "webhook");
         host.routines = vec![away, hook, routine("sch_3", "cron")];
         host.routine_editor = Some("sch_1".into());
         let tree = host.snapshot();
+        assert!(
+            tree.find("routine-wake-0-zone").is_none(),
+            "the window draws no zone beside the line"
+        );
         assert_eq!(
-            tree.find(&ids::routine_wake_zone(0))
-                .expect("the zone under the wake")
-                .name,
-            "Europe/London"
+            tree.find(&ids::routine_wake(0))
+                .expect("the wake")
+                .value
+                .as_deref(),
+            Some("Europe/London"),
+            "what hovering the line says"
         );
         host.routine_editor = Some("sch_2".into());
-        assert!(
-            host.snapshot().find(&ids::routine_wake_zone(0)).is_none(),
+        assert_eq!(
+            host.snapshot().find(&ids::routine_wake(0)).unwrap().value,
+            None,
             "a webhook has no times"
         );
         host.routine_editor = Some("sch_3".into());
-        assert!(
-            host.snapshot().find(&ids::routine_wake_zone(0)).is_none(),
+        assert_eq!(
+            host.snapshot().find(&ids::routine_wake(0)).unwrap().value,
+            None,
             "this computer's own zone"
         );
 
@@ -8968,6 +9422,44 @@ mod tests {
         assert!(
             tree.find(ids::ROUTINE_WAKE_NEXT).is_some(),
             "this computer's own"
+        );
+    }
+
+    /// What hovering a wake's line says is worked out from the routine and its zone when the
+    /// tree is taken, the same words the window's tooltip gives: a schedule in a zone this
+    /// computer is not in names it, and a webhook has nothing to say.
+    #[test]
+    fn a_wake_lines_hover_is_taken_from_the_routine_and_its_zone() {
+        use crate::state::{AgentRoutine, AppState, RoutineTrigger, ScheduleSpec};
+        let routine = AgentRoutine {
+            id: "sch_1".into(),
+            name: "Say hello".into(),
+            instruction: "Say hello to the team".into(),
+            active: true,
+            triggers: vec![
+                RoutineTrigger::Schedule {
+                    id: "sch_1".into(),
+                    spec: ScheduleSpec::from_cron("0 9 * * *"),
+                },
+                RoutineTrigger::Webhook {
+                    id: "sch_1".into(),
+                    url: "https://og.example/hooks/sch_1".into(),
+                    key: "og_live_abc".into(),
+                    header: "x-og-key".into(),
+                },
+            ],
+            runs: Vec::new(),
+            saved: Some(crate::opengrok::ScheduleEdit {
+                name: None,
+                prompt: None,
+                cron: None,
+            }),
+            tz: Some("Pacific/Chatham".into()),
+        };
+        let snap = routine_snap(&routine, &AppState::new());
+        assert_eq!(
+            snap.wake_hints,
+            vec![Some("Pacific/Chatham".to_string()), None]
         );
     }
 
@@ -10428,6 +10920,7 @@ mod tests {
         NativeChatHost {
             ready: true,
             signed_in: true,
+            computer_overview: true,
             sessions: vec![SessionSnap {
                 id: "bot-1".into(),
                 title: "Ada".into(),
@@ -10759,6 +11252,42 @@ mod tests {
             host.snapshot().find("reconnect-banner").is_none(),
             "`assert --exists false` is how a driver says the app reconnected"
         );
+    }
+
+    /// Where the account's events stream stands is in the tree, as its word, for a driver to wait
+    /// on before checking that a run the server starts shows by itself; and it is never on screen,
+    /// since nothing a person sees says it (hexuria/nativechat #171).
+    #[test]
+    fn a_driver_reads_where_the_events_stream_stands_and_it_is_never_on_screen() {
+        use crate::state::EventsStream;
+        let mut state = AppState::new();
+        state.auth_status = crate::state::AuthStatus::SignedIn;
+        state.account = Some(
+            serde_json::from_value(serde_json::json!({ "id": "acct_1", "email": "a@b.c" }))
+                .unwrap(),
+        );
+        state.coworkers = vec![
+            serde_json::from_value(
+                serde_json::json!({ "id": "cw_1", "name": "Ada", "source": null }),
+            )
+            .unwrap(),
+        ];
+        state.active_coworker_id = Some("cw_1".into());
+        for (stream, word) in [
+            (EventsStream::Connecting, "connecting"),
+            (EventsStream::Connected, "connected"),
+            (EventsStream::Reconnecting, "reconnecting"),
+            (EventsStream::Unavailable, "unavailable"),
+            (EventsStream::SignedOut, "signed-out"),
+        ] {
+            state.events_stream = stream;
+            let tree = NativeChatHost::from_app(&state).snapshot();
+            let node = tree
+                .find(ids::EVENTS_STREAM)
+                .unwrap_or_else(|| panic!("{word}: in the tree"));
+            assert_eq!(node.value.as_deref(), Some(word));
+            assert!(!node.visible, "{word}: nothing on screen says it");
+        }
     }
 
     /// While the open Bot's replies go through the person's own plan, the Usage card says it
@@ -11966,7 +12495,10 @@ mod tests {
         host.route_traffic_on_bot_pane = false;
         host.route_traffic_in_user_settings = false;
         assert!(host.snapshot().find("egress-policy-menu").is_none());
-        assert!(host.snapshot().find("network-policy").is_none());
+        assert!(
+            host.snapshot().find("network-policy").is_some(),
+            "the monitor keeps its own network-rule icon"
+        );
         host.route_traffic_in_user_settings = true;
         let tree = host.snapshot();
         let menu = tree
@@ -11982,28 +12514,25 @@ mod tests {
     }
 
     #[test]
-    fn unprovisioned_hides_route_traffic() {
+    fn the_monitor_keeps_reroute_and_an_unavailable_network_rule_before_provisioning() {
         let mut host = host();
         host.computer_open = true;
-        host.account_open = true;
-        host.computer_tab = true;
-        assert!(
-            host.snapshot()
-                .find("route-traffic-this-computer")
-                .is_none()
-        );
+        let tree = host.snapshot();
+        assert!(tree.find("route-traffic-this-computer").is_some());
+        assert!(!tree.find("network-policy").unwrap().enabled);
+        assert!(host.dispatch(&Op::click("network-policy")).is_err());
     }
 
     #[test]
-    fn user_scope_route_traffic_is_settings_computer_not_bot_pane() {
+    fn a_shared_computers_reroute_remains_on_the_monitor_and_in_settings() {
         let mut host = host();
         host.computer_open = true;
+        host.route_traffic_on_bot_pane = true;
         host.route_traffic_in_user_settings = true;
         assert!(
             host.snapshot()
                 .find("route-traffic-this-computer")
-                .is_none(),
-            "shared/user-scope Route traffic must not duplicate on every bot pane"
+                .is_some()
         );
         host.account_open = true;
         host.computer_tab = true;
@@ -13570,62 +14099,249 @@ mod tests {
         );
     }
 
-    /// The Usage card is on the tree with what the server said the bot used (#138).
-    #[test]
-    fn a_bots_usage_is_on_the_tree() {
-        use crate::opengrok::{CoworkerUsage, ModelUsage, UsageTotals};
-        let mut host = host();
-        host.agent_settings_open = true;
-        host.agent_usage = Some(crate::state::UsageReport::Read(CoworkerUsage {
+    /// A metered bot's usage for `window`: three models answered, one of them on the person's own
+    /// subscription, which the server prices at nothing, and a fourth was asked and answered none.
+    fn a_usage_read(window: &str) -> crate::state::UsageReport {
+        use crate::opengrok::{CoworkerUsage, ModelUsage};
+        let model = |id: &str, requests: i64, cost: &str| ModelUsage {
+            model_id: id.into(),
+            requests,
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            cost_usd: cost.into(),
+        };
+        crate::state::UsageReport::Read(CoworkerUsage {
             metered: true,
             note: None,
-            window: "month".into(),
-            models: vec![ModelUsage {
-                model_id: "oag/cheap".into(),
-                requests: 2,
-                input_tokens: 20,
-                output_tokens: 10,
-                cache_read_tokens: 0,
-                cache_write_tokens: 0,
-                cost_usd: "2.000000".into(),
-            }],
-            totals: UsageTotals {
-                requests: Some(2),
-                input_tokens: Some(20),
-                output_tokens: Some(10),
-                cache_read_tokens: Some(0),
-                cache_write_tokens: Some(0),
-                cost_usd: Some("2.000000".into()),
-            },
-        }));
+            window: window.into(),
+            models: vec![
+                model("oag/cheap", 12, "0.400000"),
+                model("gpt-6-luna", 5, "0.000000"),
+                model("xai/grok-4.7", 1, "0.020000"),
+                model("oag/lost", 0, "9.990000"),
+            ],
+            totals: Default::default(),
+        })
+    }
+
+    /// The Usage card is on the tree with what the paid keys charged this month and across how
+    /// many models, and Show, which opens the modal, where there are models to show (#138,
+    /// hexuria/nativechat#174): nothing of the old inline list is left.
+    #[test]
+    fn a_bots_usage_card_is_on_the_tree_and_show_opens_the_modal() {
+        let mut host = host();
+        host.agent_settings_open = true;
+        host.agent_usage = Some(a_usage_read("month"));
         let tree = host.snapshot();
         assert_eq!(
             tree.find("agent-usage").unwrap().value.as_deref(),
-            Some("2 requests this month · 30 tokens · $2.00")
+            Some("$0.42 this month · 3 models")
         );
-        let row = tree.find("agent-usage-model-0").unwrap();
-        assert_eq!(row.name, "oag/cheap · 2 requests · 30 tokens · $2.00");
-        assert!(
-            !row.visible,
-            "closed card: the model lines are not on screen"
-        );
-        host.dispatch(&Op::click("agent-usage-toggle")).unwrap();
-        assert!(matches!(
-            host.take_command(),
-            Some(Command::ToggleAgentUsage)
-        ));
-        host.agent_usage_open = true;
-        assert!(host.snapshot().find("agent-usage-model-0").unwrap().visible);
+        let show = tree.find("agent-usage-show").unwrap();
+        assert_eq!((show.role.as_str(), show.name.as_str()), ("button", "Show"));
+        assert!(tree.find("agent-usage-toggle").is_none());
+        assert!(tree.find("agent-usage-model-0").is_none());
+        host.dispatch(&Op::click("agent-usage-show")).unwrap();
+        assert!(matches!(host.take_command(), Some(Command::OpenUsageModal)));
 
-        // With the settings closed, the toggle is not on screen to click.
+        // With the settings closed, Show is not on screen to click.
         host.agent_settings_open = false;
-        assert!(host.dispatch(&Op::click("agent-usage-toggle")).is_err());
+        assert!(host.dispatch(&Op::click("agent-usage-show")).is_err());
         host.agent_settings_open = true;
 
-        // No models, nothing to open: the toggle is not there to click.
-        host.agent_usage = Some(crate::state::UsageReport::Loading);
-        assert!(host.snapshot().find("agent-usage-toggle").is_none());
-        assert!(host.dispatch(&Op::click("agent-usage-toggle")).is_err());
+        // No models, nothing to show: Show is not there to click.
+        for usage in [
+            crate::state::UsageReport::Loading,
+            crate::state::UsageReport::Unavailable(
+                "Only this bot's owner can see its usage.".into(),
+            ),
+        ] {
+            host.agent_usage = Some(usage);
+            assert!(host.snapshot().find("agent-usage-show").is_none());
+            assert!(host.dispatch(&Op::click("agent-usage-show")).is_err());
+        }
+    }
+
+    /// The Usage modal is on the tree while it is open: the window's chips, one the modal is on;
+    /// a row for each model that answered, with its requests and cost; the total of the paid keys'
+    /// charges; and the note that the person's own subscription is not counted. A chip asks for its
+    /// window, ✕ shuts the modal, a line is no control, and with the modal shut none of it is
+    /// there.
+    #[test]
+    fn the_usage_modal_is_on_the_tree_and_a_driver_works_its_chips() {
+        use crate::opengrok::UsageWindow::{Day, Month, Week};
+        let mut host = host();
+        host.agent_settings_open = true;
+        host.usage_modal = Some(crate::state::UsageModal {
+            coworker_id: "bot-1".into(),
+            window: Week,
+            report: a_usage_read("7d"),
+        });
+        let tree = host.snapshot();
+        let modal = tree.find("usage-modal").unwrap();
+        assert_eq!(
+            (
+                modal.role.as_str(),
+                modal.name.as_str(),
+                modal.value.as_deref()
+            ),
+            ("dialog", "Usage", Some("7d"))
+        );
+        let shown: Vec<(&str, &str, Option<&str>, &[String])> = modal
+            .children
+            .iter()
+            .map(|node| {
+                (
+                    node.id.as_str(),
+                    node.name.as_str(),
+                    node.value.as_deref(),
+                    node.states.as_slice(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            shown,
+            [
+                ("usage-close", "Close", None, &[][..]),
+                ("usage-window-24h", "24h", None, &[][..]),
+                ("usage-window-7d", "7d", None, &["selected".to_string()][..]),
+                ("usage-window-month", "Month", None, &[][..]),
+                (
+                    "usage-row-0",
+                    "oag/cheap",
+                    Some("12 requests · $0.40"),
+                    &[][..]
+                ),
+                (
+                    "usage-row-1",
+                    "gpt-6-luna",
+                    Some("5 requests · $0.00"),
+                    &[][..]
+                ),
+                (
+                    "usage-row-2",
+                    "xai/grok-4.7",
+                    Some("1 request · $0.02"),
+                    &[][..]
+                ),
+                ("usage-total", "Total (paid keys)", Some("$0.42"), &[][..]),
+                (
+                    "usage-note",
+                    "Replies on your own subscription aren't counted here.",
+                    None,
+                    &[][..]
+                ),
+            ]
+        );
+        assert!(
+            tree.find("usage-status").is_none(),
+            "there are rows to say it"
+        );
+
+        host.click("usage-window-24h").unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::SetUsageWindow(Day))
+        ));
+        host.click("usage-window-month").unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::SetUsageWindow(Month))
+        ));
+        let already = host.click("usage-window-7d").unwrap_err();
+        assert!(already.contains("already"), "{already}");
+        host.click("usage-close").unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::CloseUsageModal)
+        ));
+        for line in ["usage-row-0", "usage-total", "usage-note", "usage-modal"] {
+            let refused = host.click(line).unwrap_err();
+            assert!(
+                refused.contains("not a control") || refused.contains("line"),
+                "{refused}"
+            );
+        }
+        assert!(host.take_command().is_none());
+
+        // Asking, a refusal and an empty window say so where the rows would be, with no total.
+        for (report, words) in [
+            (crate::state::UsageReport::Loading, "Asking the server…"),
+            (
+                crate::state::UsageReport::Unavailable(
+                    "Sign in again to see this bot's usage.".into(),
+                ),
+                "Sign in again to see this bot's usage.",
+            ),
+        ] {
+            host.usage_modal.as_mut().unwrap().report = report;
+            let tree = host.snapshot();
+            assert_eq!(tree.find("usage-status").unwrap().name, words);
+            assert!(tree.find("usage-total").is_none() && tree.find("usage-row-0").is_none());
+        }
+        let crate::state::UsageReport::Read(mut idle) = a_usage_read("24h") else {
+            unreachable!()
+        };
+        idle.models.clear();
+        host.usage_modal.as_mut().unwrap().report = crate::state::UsageReport::Read(idle);
+        assert_eq!(
+            host.snapshot().find("usage-status").unwrap().name,
+            "No requests in this window."
+        );
+
+        // Shut, none of it is on the tree, and none of it can be clicked.
+        host.usage_modal = None;
+        let tree = host.snapshot();
+        for id in [
+            "usage-modal",
+            "usage-close",
+            "usage-window-7d",
+            "usage-note",
+        ] {
+            assert!(tree.find(id).is_none(), "`{id}`");
+        }
+        let shut = host.click("usage-close").unwrap_err();
+        assert!(shut.contains("not open"), "{shut}");
+        assert!(host.click("usage-window-24h").is_err());
+    }
+
+    /// From the app: the modal the state holds is the one on the tree.
+    #[test]
+    fn the_usage_modal_on_the_tree_is_the_apps() {
+        let mut state = AppState::new();
+        state.auth_status = crate::state::AuthStatus::SignedIn;
+        state.account = Some(
+            serde_json::from_value(serde_json::json!({ "id": "acct_1", "email": "a@b.c" }))
+                .unwrap(),
+        );
+        state.coworkers = vec![
+            serde_json::from_value(serde_json::json!({ "id": "cw_1", "name": "Ada" })).unwrap(),
+        ];
+        state.active_coworker_id = Some("cw_1".into());
+        assert!(
+            NativeChatHost::from_app(&state)
+                .snapshot()
+                .find("usage-modal")
+                .is_none()
+        );
+        state.usage_modal = Some(crate::state::UsageModal {
+            coworker_id: "cw_1".into(),
+            window: crate::opengrok::UsageWindow::Month,
+            report: a_usage_read("month"),
+        });
+        let tree = NativeChatHost::from_app(&state).snapshot();
+        assert_eq!(
+            tree.find("usage-total").unwrap().value.as_deref(),
+            Some("$0.42")
+        );
+        assert!(
+            tree.find("usage-window-month")
+                .unwrap()
+                .states
+                .contains(&"selected".to_string())
+        );
     }
 
     /// One of the person's own connections, as `GET /connections` lists it.
@@ -13897,6 +14613,13 @@ mod tests {
         assert!(host.click(&ids::connection_lend("conn_1")).is_err());
 
         host.agent_settings_open = true;
+        assert!(
+            host.snapshot().find(ids::AGENT_CONNECTIONS).is_none(),
+            "the app's settings draw no such card (#174), so none is on the tree until a host says \
+             the monitor does"
+        );
+        assert!(host.click(&ids::connection_lend("conn_1")).is_err());
+        host.agent_connections_card = true;
         let tree = host.snapshot();
         assert_eq!(
             tree.find(ids::AGENT_CONNECTIONS).unwrap().value.as_deref(),
@@ -13992,7 +14715,10 @@ mod tests {
         state.is_app_settings_open = true;
         state.app_settings_tab = AppSettingsTab::Connections;
         state.right_pane = crate::state::RightPane::Settings;
-        let host = NativeChatHost::from_app(&state);
+        let mut host = NativeChatHost::from_app(&state);
+        // The Bot's settings draw no Connections card (#174), so the card is named only for a
+        // host that is told one is on screen.
+        host.agent_connections_card = true;
         let tree = host.snapshot();
         assert_eq!(
             tree.find(ids::AGENT_CONNECTIONS).unwrap().value.as_deref(),
@@ -14008,22 +14734,16 @@ mod tests {
         );
     }
 
-    /// Save is on the tree and pressed by way of the app, since the fields it sends are the
-    /// pane's; a refused Save is on the tree in the server's words, where the pane shows it.
+    /// The Bot's settings have no Save: Name, Label and Description save as they are left, so
+    /// there is no control for it on the tree and a click on the old id is refused; a refused
+    /// change is on the tree in the server's words, where the pane shows it.
     #[test]
-    fn a_driver_saves_the_bots_settings_and_reads_a_refusal() {
+    fn the_bots_settings_have_no_save_and_a_driver_reads_a_refusal() {
         let mut host = host();
-        assert!(
-            host.dispatch(&Op::click(ids::AGENT_SAVE)).is_err(),
-            "the settings are closed"
-        );
         host.agent_settings_open = true;
-        assert!(host.snapshot().find(ids::AGENT_SAVE).is_some());
-        host.dispatch(&Op::click(ids::AGENT_SAVE)).unwrap();
-        assert!(matches!(
-            host.take_command(),
-            Some(Command::SaveAgentSettings)
-        ));
+        assert!(host.snapshot().find("agent-save").is_none());
+        assert!(host.dispatch(&Op::click("agent-save")).is_err());
+        assert!(host.take_command().is_none());
 
         assert!(host.snapshot().find("agent-settings-error").is_none());
         let said = "effort must be one of inherit, none, low, medium, high, xhigh, max, ultra";
@@ -15696,6 +16416,12 @@ mod tests {
         assert_eq!(
             rows,
             [
+                ("agent-model-group-current", "Current", &[][..]),
+                (
+                    "agent-model-row-current",
+                    "GPT-6 Luna",
+                    &["selected".to_string(), "fast".to_string()][..]
+                ),
                 ("agent-model-group-local_proxy", "Subscription", &[][..]),
                 (
                     "agent-model-row-local_proxy-gpt-6-luna",
@@ -16446,6 +17172,8 @@ mod tests {
         assert_eq!(
             ids_in_list(&host),
             [
+                "agent-model-group-current",
+                "agent-model-row-current",
                 "agent-model-group-local_proxy",
                 "agent-model-row-local_proxy-gpt-6-luna",
                 "agent-model-row-local_proxy-gpt-5.6-sol",
@@ -16453,7 +17181,8 @@ mod tests {
                 "agent-model-group-gateway",
                 "agent-model-row-gateway-oag/route-0",
                 "agent-model-row-gateway-oag/route-1",
-            ]
+            ],
+            "the model that answers pinned over the five the window shows from the top"
         );
         let out = host
             .click("agent-model-row-gateway-oag/route-5")
@@ -16463,11 +17192,14 @@ mod tests {
         let heading = host.click("agent-model-group-gateway").unwrap_err();
         assert!(heading.contains("heading"), "{heading}");
 
-        // Scrolled to the end: the Gateway group's heading over its first model in view.
+        // Scrolled to the end: the Gateway group's heading over its first model in view, under
+        // the pinned model, which does not scroll.
         host.model_picker.list_start = 4;
         assert_eq!(
             ids_in_list(&host),
             [
+                "agent-model-group-current",
+                "agent-model-row-current",
                 "agent-model-group-gateway",
                 "agent-model-row-gateway-oag/route-1",
                 "agent-model-row-gateway-oag/route-2",
@@ -16622,6 +17354,8 @@ mod tests {
         assert_eq!(
             ids_in_list,
             [
+                "agent-model-group-current",
+                "agent-model-row-current",
                 "agent-model-group-local_proxy",
                 "agent-model-row-local_proxy-gpt-6-luna",
                 "agent-model-group-gateway",
@@ -16734,6 +17468,142 @@ mod tests {
         let tree = NativeChatHost::from_app(&state).snapshot();
         assert!(tree.find("agent-model-row-gateway-oag/cheap").is_none());
         assert!(tree.find("agent-model-no-match").is_some());
+    }
+
+    /// From the app: the Bot's settings draw no Tools, Skills or Connections card
+    /// (hexuria/nativechat#174: Tools and Connections open from the agent monitor, #175, and
+    /// Skills from its Plugins modal), so the tree names none of them and a click on one of their
+    /// controls is refused, though what they are drawn from is read. The Model and Usage cards
+    /// are still there.
+    #[test]
+    fn the_bots_settings_on_the_tree_hold_no_tools_skills_or_connections_card() {
+        use crate::state::{BotSkills, RightPane, ToolList};
+        let mut state = AppState::new();
+        state.auth_status = crate::state::AuthStatus::SignedIn;
+        state.account = Some(
+            serde_json::from_value(serde_json::json!({ "id": "acct_1", "email": "a@b.c" }))
+                .unwrap(),
+        );
+        state.coworkers = vec![
+            serde_json::from_value(serde_json::json!({
+                "id": "cw_1", "name": "Ada", "model": "oag/cheap", "effort": "low",
+                "source": "gateway"
+            }))
+            .unwrap(),
+        ];
+        state.active_coworker_id = Some("cw_1".into());
+        state.right_pane = RightPane::Settings;
+        state.coworker_tools = Some((
+            "cw_1".into(),
+            ToolList::Listed(vec![crate::opengrok::CoworkerTool {
+                name: "shell".into(),
+                description: "Run a command.".into(),
+                kind: "builtin".into(),
+            }]),
+        ));
+        state.coworker_skills = Some(("cw_1".into(), BotSkills::Loading));
+        state.agent_tools_open = true;
+        let mut host = NativeChatHost::from_app(&state);
+        let tree = host.snapshot();
+        assert!(tree.find(ids::AGENT_SETTINGS).unwrap().visible);
+        assert!(tree.find(ids::AGENT_MODEL_CARD).is_some());
+        for id in [
+            "agent-tools",
+            "agent-tools-toggle",
+            ids::AGENT_CEILING,
+            ids::AGENT_SKILLS,
+            ids::AGENT_CONNECTIONS,
+        ] {
+            assert!(
+                tree.find(id).is_none(),
+                "`{id}` is not in the Bot's settings"
+            );
+        }
+        for id in ["agent-tools-toggle", ids::AGENT_SKILLS_TOGGLE] {
+            assert!(host.click(id).is_err(), "`{id}` is not on screen");
+        }
+    }
+
+    /// The list on the tree pins the model that answers over its groups, as the window does: a
+    /// heading and a row of their own ids ahead of everything else, the row named, valued,
+    /// `selected` and `fast` as its row among the groups is, and a click on it picks the model it
+    /// is. A search takes both away, and so does a Bot no model answers.
+    #[test]
+    fn the_list_pins_the_model_that_answers_and_a_driver_clicks_it() {
+        use crate::opengrok::InferenceKind;
+        let mut host = host();
+        host.agent_settings_open = true;
+        host.model_picker.open = true;
+        host.model_picker.list_open = true;
+        host.model_pick = Some(a_pick(
+            Some(serde_json::json!("local_proxy")),
+            "gpt-6-luna--fast",
+            "medium",
+        ));
+        let tree = host.snapshot();
+        let list = tree.find("agent-model-list").unwrap();
+        let head: Vec<(&str, &str, &str)> = list
+            .children
+            .iter()
+            .take(4)
+            .map(|node| (node.id.as_str(), node.role.as_str(), node.name.as_str()))
+            .collect();
+        assert_eq!(
+            head,
+            [
+                ("agent-model-group-current", "heading", "Current"),
+                ("agent-model-row-current", "listitem", "GPT-6 Luna"),
+                ("agent-model-group-local_proxy", "heading", "Subscription"),
+                (
+                    "agent-model-row-local_proxy-gpt-6-luna",
+                    "listitem",
+                    "GPT-6 Luna"
+                ),
+            ],
+            "pinned over the groups, whose first row is in view as well"
+        );
+        let pinned = tree.find("agent-model-row-current").unwrap();
+        assert_eq!(pinned.value.as_deref(), Some("local_proxy"));
+        assert_eq!(pinned.states, ["selected", "fast"]);
+        assert!(pinned.enabled);
+        host.click("agent-model-row-current").unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::PickModel { source: InferenceKind::LocalProxy, base_id })
+                if base_id == "gpt-6-luna"
+        ));
+        assert!(
+            host.click("agent-model-group-current")
+                .unwrap_err()
+                .contains("heading"),
+            "a heading is no model"
+        );
+
+        // A search takes it away, and clicking it is refused with the reason.
+        host.model_picker.search = "luna".into();
+        let tree = host.snapshot();
+        assert!(tree.find("agent-model-row-current").is_none());
+        assert!(tree.find("agent-model-group-current").is_none());
+        let refused = host.click("agent-model-row-current").unwrap_err();
+        assert!(refused.contains("nothing is typed"), "{refused}");
+        assert!(
+            host.snapshot()
+                .find("agent-model-row-local_proxy-gpt-6-luna")
+                .is_some(),
+            "the model is in the search's list all the same"
+        );
+
+        // No model answers: nothing to pin.
+        host.model_picker.search = String::new();
+        host.model_pick = Some(a_pick(
+            Some(serde_json::json!("gateway")),
+            "oag/not-listed",
+            "medium",
+        ));
+        let tree = host.snapshot();
+        assert!(tree.find("agent-model-row-current").is_none());
+        assert!(tree.find("agent-model-group-current").is_none());
+        assert!(host.click("agent-model-row-current").is_err());
     }
 
     /// A bot's skills as the server gives them (opengrok-server#270): the owner's `triage`
@@ -17147,6 +18017,98 @@ mod tests {
         assert_eq!(
             switched(&mut host, "agent-ceiling-switch-shell"),
             ("shell".into(), false)
+        );
+    }
+    #[test]
+    fn the_monitor_driver_opens_tools_and_switches_the_ceiling_without_bot_settings() {
+        use crate::components::monitor_modal::{MonitorKind, MonitorModal};
+        let mut state = crate::components::monitor_modal::tests::catalog();
+        state.right_pane = crate::state::RightPane::Computer;
+        let mut host = NativeChatHost::from_app(&state);
+        host.dispatch(&Op::click(ids::COMPUTER_TOOLS)).unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::OpenMonitorModal(MonitorKind::Tools))
+        ));
+        state.monitor_modal = Some(MonitorModal::new("cw_1".into(), MonitorKind::Tools));
+        state.agent_tools_open = true;
+        let mut host = NativeChatHost::from_app(&state);
+        assert!(host.snapshot().find("monitor-modal").is_some());
+        assert!(!host.agent_settings_open);
+        host.dispatch(&Op::click("agent-ceiling-switch-shell"))
+            .unwrap();
+        assert!(
+            matches!(host.take_command(), Some(Command::SetCeilingTool {name, enabled:false}) if name == "shell")
+        );
+        host.dispatch(&Op::click(ids::MONITOR_CLOSE)).unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::CloseMonitorModal)
+        ));
+    }
+
+    #[test]
+    fn the_monitor_driver_lends_connections_attaches_private_skills_and_requires_remove_confirmation()
+     {
+        use crate::components::monitor_modal::{MonitorKind, MonitorModal, PluginSelection};
+        let mut state = crate::components::monitor_modal::tests::catalog();
+        state.monitor_modal = Some(MonitorModal::new("cw_1".into(), MonitorKind::Plugins));
+        let mut host = NativeChatHost::from_app(&state);
+        let tree = host.snapshot();
+        assert!(tree.find("agent-connection-lend-conn_1").unwrap().checked == Some(true));
+        assert!(tree.find("agent-skills-switch-sk_1").is_some());
+        assert!(tree.find("agent-skills-switch-sk_org").is_none());
+        host.dispatch(&Op::click("agent-connection-lend-conn_1"))
+            .unwrap();
+        assert!(
+            matches!(host.take_command(), Some(Command::SetConnectionLent {connection_id, lent:false}) if connection_id == "conn_1")
+        );
+        host.dispatch(&Op::click("agent-skills-switch-sk_1"))
+            .unwrap();
+        assert!(
+            matches!(host.take_command(), Some(Command::SetBotSkill {skill_id, attached:true}) if skill_id == "sk_1")
+        );
+        host.dispatch(&Op::click("monitor-connection-detail-conn_1"))
+            .unwrap();
+        assert!(
+            matches!(host.take_command(), Some(Command::SelectMonitorPlugin(Some(PluginSelection::Connection(id)))) if id == "conn_1")
+        );
+        state.monitor_modal.as_mut().unwrap().selected =
+            Some(PluginSelection::Connection("conn_1".into()));
+        let mut host = NativeChatHost::from_app(&state);
+        assert!(
+            !host
+                .snapshot()
+                .find("monitor-plugin-add-account")
+                .unwrap()
+                .enabled
+        );
+        assert!(
+            host.dispatch(&Op::click("monitor-plugin-add-account"))
+                .is_err()
+        );
+        assert!(
+            host.dispatch(&Op::click("monitor-plugin-remove-confirm"))
+                .is_err()
+        );
+        host.dispatch(&Op::click("monitor-plugin-remove")).unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::AskMonitorRemove(true))
+        ));
+        state.monitor_modal.as_mut().unwrap().confirming = true;
+        let mut host = NativeChatHost::from_app(&state);
+        host.dispatch(&Op::click("monitor-plugin-remove-confirm"))
+            .unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::RemoveMonitorPlugin)
+        ));
+        host.sessions.iter_mut().for_each(|bot| bot.active = false);
+        assert!(
+            host.dispatch(&Op::click("monitor-plugin-remove-confirm"))
+                .is_err(),
+            "another Bot cannot inherit the old modal"
         );
     }
 }

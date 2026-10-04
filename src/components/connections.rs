@@ -528,8 +528,10 @@ pub(crate) fn connections_page(app: Entity<AppState>, cx: &App) -> impl IntoElem
 }
 
 /// A Bot's Connections card: each of the person's connections with a switch, lent to this Bot
-/// or not, and what lending does and does not do yet.
-pub(crate) fn agent_card(app: Entity<AppState>, coworker_id: &str, cx: &App) -> impl IntoElement {
+/// or not, and what lending does and does not do yet. The Bot's settings drew it under Skills
+/// until Connections moved to the agent monitor's Plugins modal (hexuria/nativechat#174, #175),
+/// which mounts it from here.
+pub fn agent_card(app: Entity<AppState>, coworker_id: &str, cx: &App) -> impl IntoElement {
     let theme = cx.theme();
     let muted = theme.muted_foreground;
     let danger = theme.danger;
@@ -592,6 +594,7 @@ pub(crate) fn agent_card(app: Entity<AppState>, coworker_id: &str, cx: &App) -> 
         .collect();
     div()
         .id(AGENT_CARD)
+        .debug_selector(|| AGENT_CARD.into())
         .mb(px(16.))
         .px(px(14.))
         .py(px(12.))

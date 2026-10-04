@@ -23,6 +23,10 @@
 //! the very bottom, a drag of the scrollbar to its end, Jump to latest, or a message of their
 //! own. No op scrolls it: gpui-agent has no scroll op and this host no scroll invoke, so a live
 //! check scrolls with the trackpad or the wheel and asserts the value),
+//! `events-stream` (never visible, nothing on screen says it: where the account's events stream
+//! stands, value `connecting` / `connected` / `reconnecting` / `unavailable`, from a server before
+//! opengrok-server #348, / `signed-out`; while it is `connected`, a run the server starts shows in
+//! the open thread and the open routine's Run history by itself, hexuria/nativechat #171),
 //! `image-thumb-{n}`, `lightbox`, `user-form-{key}`, `user-form-field-{key}-{id}`,
 //! `user-form-continue-{key}`, `user-form-dismiss-{key}`, `user-form-screen-{key}`,
 //! `user-form-pill-{key}`, `computer-handoff-{key}`,
@@ -105,19 +109,25 @@
 //! value = the server's sentence for why, e.g. "Skipped: your computer was off, so your plan
 //! couldn't answer", state `skipped`; it started no run, so a click is refused and opens nothing),
 //! `routine-{id}-delete`.
-//! While a routine is open in the Computer pane, its header's four icons are under
-//! `computer-pane`, each acting on that routine: `routine-history-toggle` (label `Run history`, or
-//! `Back to the routine` with state `selected` while the panel shows the Run history alone in
-//! place of the routine's fields), `routine-open-thread`, `routine-run-now` and `routine-delete`;
-//! one that cannot act is disabled, with the reason as its value, and a click on it is refused.
+//! While a routine is open in the Computer pane, its four icons are under `computer-pane`, each
+//! acting on that routine. The window draws them at the right of the Active switch's row, the
+//! size of `header-monitor` and `header-right-sidebar`, and not in the title row above, which
+//! keeps only the back control, the title and the window's toggles: `routine-history-toggle`
+//! (label `Run history`, or `Back to the routine` with state `selected` while the panel shows the
+//! Run history alone in place of the routine's fields), `routine-open-thread`, `routine-run-now`
+//! and `routine-delete`; one that cannot act is disabled, with the reason as its value, and a
+//! click on it is refused.
 //! "When to run" on the open routine, under `computer-pane`: `routine-wake-add` (+, disabled
 //! while the routine has its one wake, the server's limit until opengrok-server#315, with the
 //! reason as its value), `routine-wake-{i}` (a wake: label = what sets it off, in words, times on
-//! the routine's own clock, in the zone the server reads its line in, opengrok-server #316)
-//! holding `routine-wake-edit-{i}` (opens the wake editor on it; disabled on a schedule where the
-//! server cannot change a routine), `routine-wake-delete-{i}` (disabled: a routine keeps its only
-//! wake) and, on a schedule whose zone is not this computer's, `routine-wake-{i}-zone` (label =
-//! the IANA zone). While the wake editor is open, `routine-wake-editor`
+//! the routine's own clock, in the zone the server reads its line in, opengrok-server #316; value
+//! = what hovering the line says, which is all the window shows of its zone: the IANA zone where
+//! it is not this computer's, then when it next runs in the person's own time, where the line can
+//! be read in that zone, this computer's own or UTC, e.g. `UTC · Next run: Sun 4 Oct at 4:00 PM
+//! your time`; no value on a webhook, or where there is nothing to say) holding
+//! `routine-wake-edit-{i}` (opens the wake editor on it; disabled on a schedule where the server
+//! cannot change a routine) and `routine-wake-delete-{i}` (disabled: a routine keeps its only
+//! wake). While the wake editor is open, `routine-wake-editor`
 //! (value = the open tab's word) holds `routine-wake-tab-every|daily|weekly|monthly|webhook|cron`
 //! (state `selected` on the open one; disabled where the routine's kind rules it out, since a
 //! schedule never becomes a webhook nor a webhook a schedule) and the open tab's controls: on
@@ -170,7 +180,22 @@
 //! words as the pane shows them, value = the server's code for it, e.g. `provider_error`; a
 //! status that names a box has none, so `assert --exists false` is "a computer was given").
 //! Beside it, only then, `computer-get` (Get a computer: asks the server again; dead while an
-//! ask is with the server). `computer-update`, `computer-reset`.
+//! ask is with the server). The overview row is `computer-recipes`, `computer-plugins`,
+//! `computer-tools`, `route-traffic-this-computer`, `network-policy`, `computer-update`,
+//! `computer-reset`, in that order, for every computer whoever it is shared with (#175, R-A).
+//! `route-traffic-this-computer` (a switch: the host-wide reroute, `PUT /ag-ui/host-settings`, so it
+//! applies to all the person's computers) and `network-policy` (disabled until the server sends
+//! a rule; otherwise this computer's own rule, `PUT /coworkers/{id}/computer/egress-policy`, which opens the dialog that
+//! picks it, `network-policy-close` shutting it).
+//! Tools and Plugins open `monitor-modal`, shut by `monitor-modal-close` or Escape. Tools uses
+//! the existing `agent-ceiling-switch-{name}` controls. Plugins lists the person's connections
+//! (`agent-connection-lend-{id}`) and private skills (`agent-skills-switch-{id}`); each name opens
+//! `monitor-connection-detail-{id}` or `monitor-skill-detail-{id}`. The detail's fields are
+//! `monitor-plugin-source`, `monitor-plugin-transport`, `monitor-plugin-url`, `monitor-plugin-tools`
+//! and `monitor-plugin-accounts`. `monitor-plugin-back` returns to Installed. Remove asks first:
+//! `monitor-plugin-remove`, then `monitor-plugin-remove-confirm` or `monitor-plugin-remove-cancel`.
+//! `monitor-plugin-add-account` is disabled, with "Coming later". Missing connector metadata is
+//! stated as missing, until the server's catalog supplies it (opengrok-server#356).
 //!
 //! Files (#90): `composer-file-{i}` under `composer` (label = the file's name, value `uploading`
 //! / `ready` / `failed`); `message-file-{artId}` on the chat page for each file a message in the
@@ -194,11 +219,30 @@
 //! takes it; a letter aimed at any other card is refused. A card the bot followed with another
 //! card is `not-answered`: only the newest card asks.
 //!
-//! In the bot's settings: `agent-usage` (value = the Usage card's line: what the server says the
-//! bot used this month, or why it cannot say), `agent-usage-toggle` (Show / Hide, only while the
-//! server reported models), and `agent-usage-model-{i}` per model, visible while open (#138).
+//! In the bot's settings: `agent-usage` (value = the Usage card's line: what the paid keys
+//! charged for what the bot used this month and across how many models, as `$0.42 this month · 3
+//! models`, or why the app cannot say) and `agent-usage-show` (`Show`, only while the server
+//! reported models some of which answered a request), which opens the Usage modal (#138,
+//! hexuria/nativechat#174).
 //!
-//! In the bot's settings: `agent-tools` (value = the Tools card's first line, what the server's
+//! The Usage modal, over the whole window while it is open: `usage-modal` (a dialog named `Usage`,
+//! valued by the server's word for the window it is on, `24h`, `7d` or `month`), holding
+//! `usage-close` (✕), the chips `usage-window-24h`, `usage-window-7d` and `usage-window-month`
+//! (buttons named `24h`, `7d` and `Month`, state `selected` on the window it is on; a click asks
+//! the server for that window, `GET /coworkers/{id}/usage?window=`, and the modal says it is
+//! asking until it is answered; the one it is on is refused), then one `usage-row-{i}` per model
+//! that answered a request in the window (named by the model, valued `12 requests · $0.40`, and
+//! `$0.00` on the person's own subscription, which the server prices at nothing) and
+//! `usage-total` (`Total (paid keys)`, valued by what the paid keys charged for them, which a
+//! model priced at nothing adds nothing to); where there are no rows, `usage-status` says why
+//! (`Asking the server…`, the server's words, or `No requests in this window.`), with no total;
+//! and `usage-note` (`Replies on your own subscription aren't counted here.`). Escape, ✕ and a
+//! press beside the modal shut it; Show opens it on `month`, with what the card read on show at
+//! once.
+//!
+//! The Tools card, which the bot's settings no longer draw (hexuria/nativechat#174: it opens from
+//! the agent monitor, #175, so the app's tree holds none of these ids until it does):
+//! `agent-tools` (value = the Tools card's first line, what the server's
 //! `GET /coworkers/{id}/tools` says the bot is offered on its next turn: `2 built in · 1 from
 //! plugins`, `Asking the server…`, or why there is no list), `agent-ceiling` (value = `3 of 8
 //! allowed`, or why there are no switches; in the tree once the server has answered), and
@@ -225,7 +269,8 @@
 //! read (a server without the route, a Bot this person does not own), the card lists what the
 //! next turn is offered instead, read-only: `agent-tool-{name}` (value `builtin` / `plugin`).
 //!
-//! In the bot's settings, below Tools: `agent-skills` (value = the Skills card's line: `2
+//! The Skills card, likewise (it moves to the monitor's Plugins modal): `agent-skills` (value =
+//! the Skills card's line: `2
 //! attached · 1 switched off`, `None attached`, `Asking the server…`, or why there are no
 //! switches, as "Only this Bot's owner can change its skills."), and `agent-skills-toggle` (Show
 //! / Hide, only while there are skills to show). Visible while the card is open: the card's own
@@ -290,9 +335,16 @@
 //! it, fast where ⚡ is on and it has a twin, and goes back to the controls), with an
 //! `agent-model-group-{source}` heading over each group's first model in view, which is not one
 //! of the five: `agent-model-group-local_proxy` is "Subscription", the person's own plan, and
-//! `agent-model-group-gateway` is "Gateway", the server's paid keys. The window opens with the
-//! model that answers in view, and the wheel scrolls it; a model out of view, or one the search
-//! leaves out, is refused, and the search box brings it into view. Then `agent-model-plan` (on a
+//! `agent-model-group-gateway` is "Gateway", the server's paid keys. The window opens at the top,
+//! so the first five models of the first group show, and the wheel scrolls it; a model out of
+//! view, or one the search leaves out, is refused, and the search box brings it into view. Over
+//! the window, while nothing is typed and a model answers, the list pins that model under an
+//! `agent-model-group-current` heading ("Current"), as an `agent-model-row-current` (named,
+//! valued, `selected` and `fast` as its row in the window is, which may be in view too; a click
+//! on it picks the model it already is, and goes back to the controls); it is not one of the
+//! five, and a search takes both away, as does a list with no model answering. The three pickers
+//! pin the same way, under their own ids (`settings-new-bots-row-current`,
+//! `settings-plan-fallback-group-current`, and so on). Then `agent-model-plan` (on a
 //! server whose rows carry no `source`, while the account is on the person's plan: the account's
 //! plan model, which answers for every Bot there; a line, not a row, which the search leaves or
 //! takes away as it would a row), `agent-model-no-match` ("No model matches", while the search
@@ -309,8 +361,12 @@
 //! `model.picker.open` and `model.picker.close` work the popover, and a click on
 //! `agent-model-dismiss` shuts it.
 //!
-//! In the bot's settings: `agent-settings-error` is the pane's red line over Save: a refused Save
-//! or pick, in the server's words.
+//! In the bot's settings: `agent-settings-error` is the pane's red line under the Description: a
+//! refused save or pick, in the server's words. There is no Save: Name, Label and Description
+//! save as they are left (or on Enter, in the two single-line ones), each alone and only if it
+//! changed, on `PATCH /coworkers/{id}` (`name`, `title`, `role`), with "Saved" beside the field's
+//! heading for a moment; a refusal keeps the words in the field. The fields have no ids of their
+//! own.
 //!
 //! Connections (#2), a connection named by the server's id and a service by the name
 //! `GET /connectors` lists it under. Only the person's own connections are on either surface: a
@@ -335,7 +391,7 @@
 //! `settings-connectors-error` in its place. A click on a Connect opens the person's browser, as
 //! a person's does, once the server answers and only if the page is still on screen.
 //!
-//! In the bot's settings: `agent-connections` (value = the card's second line: `1 of 2 lent to
+//! The Connections card, likewise: `agent-connections` (value = the card's second line: `1 of 2 lent to
 //! this Bot`, `Asking the server…`, or why there is nothing to count), and per connection
 //! `agent-connection-lend-{id}` (a switch, label = its label, value = its service, checked while
 //! it shows as lent to this bot; a click asks for the other way; dead and `changing` while a

@@ -7,20 +7,78 @@ use crate::components::model_picker::ModelPicker;
 use crate::components::persona::PersonaMark;
 use crate::components::title_bar::window_drag;
 use crate::opengrok::{
-    BotSkillRow, BotSkillScope, CeilingRow, CoworkerPatch, CoworkerTool, USER_MACHINE_SHELL,
+    BotSkillRow, BotSkillScope, CeilingRow, Coworker, CoworkerPatch, CoworkerTool,
+    USER_MACHINE_SHELL,
 };
 use crate::state::{
     AppState, BotSkills, CeilingBlock, CeilingCard, CeilingSwitch, PickerFor, SkillSwitch,
     SkillsBlock, SkillsCard, ToolCeiling, ToolList, UsageReport,
 };
-use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::input::{Input, InputState, Textarea, TextareaState};
+use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
 use gpui_kit::component::popover::Popover;
-use gpui_kit::component::{ActiveTheme, Disableable, Icon, IconName, Selectable, v_flex};
+use gpui_kit::component::{ActiveTheme, Icon, Selectable, v_flex};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 
 const PANE_INNER: f32 = INFO_PANE_WIDTH - 32.0;
+
+/// How long a field says "Saved" once the server has taken what was typed in it: long enough to
+/// be seen, short enough to be gone before the person wonders what it is still doing there.
+const SAVED_FOR: std::time::Duration = std::time::Duration::from_millis(1800);
+
+/// One of the Bot's profile fields, which save as the person leaves them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProfileField {
+    Name,
+    Label,
+    Description,
+}
+
+impl ProfileField {
+    /// The element id of the word a save leaves beside the field.
+    fn saved_id(self) -> &'static str {
+        match self {
+            Self::Name => "agent-name-saved",
+            Self::Label => "agent-label-saved",
+            Self::Description => "agent-role-saved",
+        }
+    }
+}
+
+/// What leaving `field` holding `text` asks the server: that field alone, and only where it holds
+/// something other than what the server last said of the Bot, so a field passed through
+/// unchanged sends nothing, and one that changed is not sent along with the words of another that
+/// is still being refused. Trimmed, as the server trims a name and a role.
+///
+/// The model, its door and the effort are the picker's, saved the moment they are picked; sent
+/// back with a field, what the pane last read would undo a pick made since on the card or from
+/// another Mac.
+fn profile_patch(field: ProfileField, text: &str, bot: &Coworker) -> Option<CoworkerPatch> {
+    let text = text.trim();
+    let stored = match field {
+        ProfileField::Name => bot.name.as_str(),
+        ProfileField::Label => bot.title.as_deref().unwrap_or_default(),
+        ProfileField::Description => bot.role.as_deref().unwrap_or_default(),
+    };
+    if text == stored.trim() {
+        return None;
+    }
+    let words = Some(text.to_string());
+    Some(match field {
+        ProfileField::Name => CoworkerPatch {
+            name: words,
+            ..Default::default()
+        },
+        ProfileField::Label => CoworkerPatch {
+            title: words,
+            ..Default::default()
+        },
+        ProfileField::Description => CoworkerPatch {
+            role: words,
+            ..Default::default()
+        },
+    })
+}
 
 #[derive(IntoElement)]
 struct AvatarEditorTrigger {
@@ -59,9 +117,11 @@ pub struct AgentSettings {
     /// Bot's model is picked: every change is saved on the Bot at once, and none waits for Save.
     model_card: Entity<ModelPicker>,
     synced_id: Option<String>,
-    /// The profile is with the server. The Save button is out of the person's hands until the
-    /// answer comes back, whichever way it goes.
-    saving: bool,
+    /// The field that says "Saved" beside its heading, until its tick takes the word away.
+    saved: Option<ProfileField>,
+    /// The tick that takes it away. Held rather than detached, so a second save drops the first
+    /// one's tick instead of letting it clear the newer word.
+    saved_tick: Option<Task<()>>,
     auto_review_open: bool,
     auto_review_mode: AutoReviewMode,
 }
@@ -84,17 +144,25 @@ impl AgentSettings {
             state
         });
         let model_card = cx.new(|cx| ModelPicker::new(window, state.clone(), PickerFor::Bot, cx));
-        cx.observe(&state, |this, state, cx| {
-            // A driver's Save, which comes by way of the app because the button and the fields
-            // it sends are this pane's. Only for the bot the fields were filled for: a switch the
-            // pane has not drawn yet leaves them holding the last bot's words, and those must
-            // not be saved onto this one.
-            if state.update(cx, |state, _| state.take_agent_save_request())
-                && this.synced_id == state.read(cx).active_coworker_id
-            {
-                this.commit_profile(cx);
+        cx.observe(&state, |_, _, cx| cx.notify()).detach();
+        // There is no Save button: leaving a field is the save, and so is Enter in a single-line
+        // one. Saving on every keystroke would be a request per letter.
+        for (field, input) in [
+            (ProfileField::Name, &name_input),
+            (ProfileField::Label, &label_input),
+        ] {
+            cx.subscribe(input, move |this, _, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::Blur | InputEvent::PressEnter { .. }) {
+                    this.commit_profile(field, cx);
+                }
+            })
+            .detach();
+        }
+        // Enter in the Description is a new line, so only leaving it saves it.
+        cx.subscribe(&role_input, |this, _, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::Blur) {
+                this.commit_profile(ProfileField::Description, cx);
             }
-            cx.notify();
         })
         .detach();
         Self {
@@ -104,7 +172,8 @@ impl AgentSettings {
             role_input,
             model_card,
             synced_id: None,
-            saving: false,
+            saved: None,
+            saved_tick: None,
             auto_review_open: false,
             auto_review_mode: AutoReviewMode::Inherit,
         }
@@ -124,6 +193,8 @@ impl AgentSettings {
             return;
         }
         self.synced_id = id;
+        self.saved = None;
+        self.saved_tick = None;
         let coworker = match coworker {
             Some(c) => c,
             None => return,
@@ -139,43 +210,64 @@ impl AgentSettings {
         });
     }
 
-    fn commit_profile(&mut self, cx: &mut Context<Self>) {
-        // A second Save while the first is still out would send the same profile twice and,
-        // with the two answers arriving in any order, settle the roster on whichever landed
-        // last. The button is inert while it spins, and this is the same rule for a Save that
-        // arrives by any other road.
-        if self.saving {
-            return;
-        }
-        // The words in the fields. The model, its door and the effort are the picker's, saved
-        // the moment they are picked; sent back with every Save, what the pane last read would
-        // undo a pick made since on the card or from another Mac.
-        let patch = CoworkerPatch {
-            name: Some(self.name_input.read(cx).value().to_string()),
-            title: Some(self.label_input.read(cx).value().to_string()),
-            role: Some(self.role_input.read(cx).value().to_string()),
-            ..Default::default()
+    /// `field` was left, or Enter was pressed in it: what it holds goes to the server, if it is
+    /// not what the server last said. The roster takes the change at once, so a field left again
+    /// with nothing new in it is what it already says and sends nothing, and a refusal puts the
+    /// roster back to what the server keeps, with its words on the pane's red line and the text
+    /// still in the field.
+    fn commit_profile(&mut self, field: ProfileField, cx: &mut Context<Self>) {
+        let text = match field {
+            ProfileField::Name => self.name_input.read(cx).value().to_string(),
+            ProfileField::Label => self.label_input.read(cx).value().to_string(),
+            ProfileField::Description => self.role_input.read(cx).value().to_string(),
         };
-        self.saving = true;
+        // Only for the bot the fields were filled for: a switch the pane has not drawn yet leaves
+        // them holding the last bot's words, and those must not be saved onto this one.
+        let patch = {
+            let state = self.state.read(cx);
+            state
+                .active_coworker_id
+                .as_ref()
+                .filter(|id| self.synced_id.as_ref() == Some(*id))
+                .and_then(|id| state.coworkers.iter().find(|bot| &bot.id == id))
+                .and_then(|bot| profile_patch(field, &text, bot))
+        };
+        let Some(patch) = patch else {
+            return;
+        };
         let settings = cx.entity().downgrade();
+        let bot = self.synced_id.clone();
         self.state.update(cx, |state, cx| {
             state.patch_active_agent_then(
                 patch,
                 Some(Box::new(move |error, cx| {
-                    let _ = settings.update(cx, |settings, cx| {
-                        settings.saving = false;
-                        // The roster now holds what the server stored rather than what was
-                        // typed. The fields have to say the same thing, or a name the server
-                        // never took would go on sitting in the field as though it had.
-                        if error.is_none() {
-                            settings.synced_id = None;
-                        }
-                        cx.notify();
-                    });
+                    // An answer that lands after the person has gone to another Bot is about the
+                    // last one, and the field it would say Saved beside is now that Bot's.
+                    if error.is_none() {
+                        let _ = settings.update(cx, |settings, cx| {
+                            if settings.synced_id == bot {
+                                settings.say_saved(field, cx);
+                            }
+                        });
+                    }
                 })),
                 cx,
             );
         });
+    }
+
+    /// The server took what was typed in `field`: it says "Saved" beside its heading for a
+    /// moment.
+    fn say_saved(&mut self, field: ProfileField, cx: &mut Context<Self>) {
+        self.saved = Some(field);
+        self.saved_tick = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(SAVED_FOR).await;
+            let _ = this.update(cx, |this, cx| {
+                this.saved = None;
+                this.saved_tick = None;
+                cx.notify();
+            });
+        }));
         cx.notify();
     }
 }
@@ -189,6 +281,21 @@ fn heading(label: &'static str, color: Hsla) -> Div {
         .text_xs()
         .text_color(color)
         .child(label)
+}
+
+/// A field's heading, with "Saved" at its far end while `flash` names the element it is drawn
+/// as: what the pane says of a save, which is all it says, since the fields save themselves.
+fn field_heading(label: &'static str, flash: Option<&'static str>, color: Hsla) -> Div {
+    heading(label, color)
+        .justify_between()
+        .when_some(flash, |this, id| {
+            this.child(
+                div()
+                    .id(id)
+                    .debug_selector(move || id.into())
+                    .child("Saved"),
+            )
+        })
 }
 
 fn settings_input(state: &Entity<InputState>) -> Input {
@@ -291,42 +398,7 @@ impl Render for AgentSettings {
             )
         };
         let on_plan = self.state.read(cx).replies_on_plan();
-        let saving = self.saving;
-        let usage_open = self.state.read(cx).agent_usage_open;
         let auto_review_open = self.auto_review_open;
-        let tools_open = self.state.read(cx).agent_tools_open;
-        let tools = {
-            let state = self.state.read(cx);
-            state
-                .coworker_tools
-                .as_ref()
-                .filter(|(owner, _)| state.active_coworker_id.as_deref() == Some(owner.as_str()))
-                .map(|(_, list)| list.clone())
-        };
-        let ceiling = self.state.read(cx).ceiling_card();
-        let tools_line = tools.as_ref().map(tools_summary);
-        let allowed_line = ceiling
-            .as_ref()
-            .and_then(|card| ceiling_line(&card.ceiling, card.pending.as_ref()));
-        let (ceiling_rows, card_lines) = ceiling
-            .as_ref()
-            .map(|card| (shown_ceiling_rows(card), ceiling_card_lines(card)))
-            .unwrap_or_default();
-        let has_switches = !ceiling_rows.is_empty();
-        let offered = offered_without_switches(ceiling.as_ref(), tools.as_ref()).to_vec();
-        let has_list = !offered.is_empty();
-        let danger = theme.danger;
-        let skills_open = self.state.read(cx).agent_skills_open;
-        let skills = self.state.read(cx).skills_card();
-        let skills_line = skills
-            .as_ref()
-            .map(|card| skills_summary(&card.skills, card.pending.as_ref()));
-        let (skill_rows, skill_lines) = skills
-            .as_ref()
-            .map(|card| (shown_skill_rows(card), skills_card_lines(card)))
-            .unwrap_or_default();
-        let has_skill_rows = !skill_rows.is_empty();
-        let skills_shared = skills.as_ref().is_some_and(|card| card.shared);
         let usage = {
             let state = self.state.read(cx);
             state
@@ -338,25 +410,11 @@ impl Render for AgentSettings {
         let usage_line = usage
             .as_ref()
             .map_or_else(|| "Asking the server…".to_string(), usage_summary);
-        let usage_rows: Vec<String> = match &usage {
-            Some(UsageReport::Read(read)) if usage_open => {
-                read.models.iter().map(model_line).collect()
-            }
-            _ => Vec::new(),
-        };
+        // Only a list of models has anything to show: the modal's rows.
+        let usage_has_rows = matches!(usage.as_ref().map(usage_body), Some(UsageBody::Rows { .. }));
         let auto_review_mode = self.auto_review_mode;
         let has_custom = shape.is_some() || color.is_some();
         let app = self.state.clone();
-        // The person's connections, each lendable to this bot (#2).
-        let connections_card = self
-            .state
-            .read(cx)
-            .active_coworker_id
-            .clone()
-            .map(|coworker_id| {
-                crate::components::connections::agent_card(app.clone(), &coworker_id, cx)
-                    .into_any_element()
-            });
         let chat_page = self.state.read(cx).page == crate::state::MainPage::Chat;
 
         v_flex()
@@ -388,6 +446,7 @@ impl Render for AgentSettings {
             .child(
                 div()
                     .id("avatar-trigger-row")
+                    .debug_selector(|| "avatar-trigger-row".into())
                     .w_full()
                     .h(px(76.))
                     .min_h(px(76.))
@@ -447,24 +506,42 @@ impl Render for AgentSettings {
                             .id("agent-settings-stack")
                             .w_full()
                             .px(px(16.))
-                            .child(heading("Name", muted))
+                            .child(field_heading(
+                                "Name",
+                                (self.saved == Some(ProfileField::Name))
+                                    .then_some(ProfileField::Name.saved_id()),
+                                muted,
+                            ))
                             .child(
                                 div()
                                     .id("agent-settings-name")
+                                    .debug_selector(|| "agent-settings-name".into())
                                     .w_full()
                                     .child(settings_input(&self.name_input)),
                             )
-                            .child(heading("Label (optional)", muted))
+                            .child(field_heading(
+                                "Label (optional)",
+                                (self.saved == Some(ProfileField::Label))
+                                    .then_some(ProfileField::Label.saved_id()),
+                                muted,
+                            ))
                             .child(
                                 div()
                                     .id("agent-label")
+                                    .debug_selector(|| "agent-label".into())
                                     .w_full()
                                     .child(settings_input(&self.label_input)),
                             )
-                            .child(heading("Description", muted))
+                            .child(field_heading(
+                                "Description",
+                                (self.saved == Some(ProfileField::Description))
+                                    .then_some(ProfileField::Description.saved_id()),
+                                muted,
+                            ))
                             .child(
                                 div()
                                     .id("agent-role")
+                                    .debug_selector(|| "agent-role".into())
                                     .w_full()
                                     .child(
                                         Textarea::new(&self.role_input)
@@ -476,10 +553,26 @@ impl Render for AgentSettings {
                                             .bg(theme.input_background()),
                                     ),
                             )
+                                    // A refusal, in the server's words, under the fields it is
+                                    // about; what was typed stays in them (the pane's one line
+                                    // for it, which a save, a pick or any other change that is
+                                    // refused leaves).
+                                    .when_some(error, |this, message| {
+                                        this.child(
+                                            div()
+                                                .id("agent-settings-error")
+                                                .debug_selector(|| "agent-settings-error".into())
+                                                .pt(px(6.))
+                                                .text_sm()
+                                                .text_color(theme.danger)
+                                                .child(message),
+                                        )
+                                    })
                                     .child(
                                         div().pt(px(12.)).child(
                                             card(card_fill)
                                                 .id("agent-notifications")
+                                                .debug_selector(|| "agent-notifications".into())
                                                 .child(
                                                     div()
                                                         .flex()
@@ -530,6 +623,7 @@ impl Render for AgentSettings {
                                     .child(
                                         div()
                                             .id("agent-usage")
+                                            .debug_selector(|| "agent-usage".into())
                                             .mt(px(14.))
                                             .px(px(14.))
                                             .py(px(12.))
@@ -556,32 +650,36 @@ impl Render for AgentSettings {
                                                                     .child(usage_line),
                                                             ),
                                                     )
-                                                    // Only a list of models has anything to open to.
-                                                    .when(
-                                                        matches!(usage, Some(UsageReport::Read(ref read)) if !read.models.is_empty()),
-                                                        |this| {
-                                                            this.child(
-                                                                div()
-                                                                    .id("agent-usage-toggle")
-                                                                    .px(px(11.))
-                                                                    .py(px(5.))
-                                                                    .rounded(px(8.))
-                                                                    .border_1()
-                                                                    .border_color(
-                                                                        rgb(0x7f7f7f).opacity(0.4),
-                                                                    )
-                                                                    .text_xs()
-                                                                    .cursor_pointer()
-                                                                    .on_mouse_down(MouseButton::Left, {
-                                                                        let app = app.clone();
-                                                                        move |_, _, cx| {
-                                                                            app.update(cx, |state, cx| state.toggle_agent_usage(cx));
-                                                                        }
-                                                                    })
-                                                                    .child(if usage_open { "Hide" } else { "Show" }),
-                                                            )
-                                                        },
-                                                    ),
+                                                    .when(usage_has_rows, |this| {
+                                                        this.child(
+                                                            div()
+                                                                .id("agent-usage-show")
+                                                                .debug_selector(|| {
+                                                                    "agent-usage-show".into()
+                                                                })
+                                                                .px(px(11.))
+                                                                .py(px(5.))
+                                                                .rounded(px(8.))
+                                                                .border_1()
+                                                                .border_color(
+                                                                    rgb(0x7f7f7f).opacity(0.4),
+                                                                )
+                                                                .text_xs()
+                                                                .cursor_pointer()
+                                                                // The Usage modal, over the whole
+                                                                // window, and not the card opened
+                                                                // out in the pane.
+                                                                .on_mouse_down(MouseButton::Left, {
+                                                                    let app = app.clone();
+                                                                    move |_, _, cx| {
+                                                                        app.update(cx, |state, cx| {
+                                                                            state.open_usage_modal(cx)
+                                                                        });
+                                                                    }
+                                                                })
+                                                                .child("Show"),
+                                                        )
+                                                    }),
                                             )
                                             // A turn on the person's own plan is not metered and
                                             // carries no gateway key, so the report above never
@@ -596,25 +694,11 @@ impl Render for AgentSettings {
                                                         .child(crate::components::reply_source::PLAN_USAGE_NOTE),
                                                 )
                                             })
-                                            // Under the header row, as the Tools card's list is, so
-                                            // the Hide button stays beside the card's own line.
-                                            .when(!usage_rows.is_empty(), |this| {
-                                                this.child(
-                                                    v_flex().pt(px(8.)).gap(px(4.)).children(
-                                                        usage_rows.into_iter().enumerate().map(|(i, line)| {
-                                                            div()
-                                                                .id(SharedString::from(format!("agent-usage-model-{i}")))
-                                                                .text_xs()
-                                                                .text_color(muted)
-                                                                .child(line)
-                                                        }),
-                                                    ),
-                                                )
-                                            }),
                                     )
                                     .child(
                                         div()
                                             .id("agent-auto-review")
+                                            .debug_selector(|| "agent-auto-review".into())
                                             .mt(px(14.))
                                             .mb(px(16.))
                                             .px(px(14.))
@@ -656,185 +740,6 @@ impl Render for AgentSettings {
                                                 this.child(self.auto_review_body(auto_review_mode, cx))
                                             }),
                                     )
-                                    .when(tools.is_some() || ceiling.is_some(), |this| {
-                                        this.child(
-                                            div()
-                                                .id("agent-tools")
-                                                .mb(px(16.))
-                                                .px(px(14.))
-                                                .py(px(12.))
-                                                .rounded(px(10.))
-                                                .border_1()
-                                                .border_color(theme.border)
-                                                .child(
-                                                    div()
-                                                        .flex()
-                                                        .items_center()
-                                                        .justify_between()
-                                                        .gap(px(10.))
-                                                        .child(
-                                                            v_flex()
-                                                                .min_w(px(0.))
-                                                                .gap(px(2.))
-                                                                .child(div().text_sm().child("Tools"))
-                                                                // What the next turn is offered, as
-                                                                // the server lists it: the switches
-                                                                // below are one of what decides that,
-                                                                // not the whole of it.
-                                                                .when_some(tools_line, |this, line| {
-                                                                    this.child(
-                                                                        div()
-                                                                            .text_xs()
-                                                                            .text_color(muted)
-                                                                            .child(line),
-                                                                    )
-                                                                })
-                                                                .when_some(allowed_line, |this, line| {
-                                                                    this.child(
-                                                                        div()
-                                                                            .id("agent-ceiling")
-                                                                            .text_xs()
-                                                                            .text_color(muted)
-                                                                            .child(line),
-                                                                    )
-                                                                }),
-                                                        )
-                                                        .when(
-                                                            has_switches || has_list,
-                                                            |this| {
-                                                                this.child(
-                                                                    div()
-                                                                        .id("agent-tools-toggle")
-                                                                        .px(px(11.))
-                                                                        .py(px(5.))
-                                                                        .rounded(px(8.))
-                                                                        .border_1()
-                                                                        .border_color(
-                                                                            rgb(0x7f7f7f).opacity(0.4),
-                                                                        )
-                                                                        .text_xs()
-                                                                        .cursor_pointer()
-                                                                        .on_mouse_down(
-                                                                            MouseButton::Left,
-                                                                            {
-                                                                                let app = app.clone();
-                                                                                move |_, _, cx| {
-                                                                                    app.update(cx, |state, cx| state.toggle_agent_tools(cx));
-                                                                                }
-                                                                            },
-                                                                        )
-                                                                        .child(if tools_open { "Hide" } else { "Show" }),
-                                                                )
-                                                            },
-                                                        ),
-                                                )
-                                                .when(tools_open && has_switches, |this| {
-                                                    this.child(ceiling_body(
-                                                        app.clone(),
-                                                        ceiling_rows,
-                                                        card_lines,
-                                                        muted,
-                                                        danger,
-                                                    ))
-                                                })
-                                                .when(tools_open && has_list, |this| {
-                                                    this.child(tools_body(&offered, muted))
-                                                }),
-                                        )
-                                    })
-                                    // Below Tools: what the Bot is told about on every turn,
-                                    // beside what it may do (opengrok-server#270).
-                                    .when_some(skills_line, |this, line| {
-                                        this.child(
-                                            div()
-                                                .id("agent-skills")
-                                                .mb(px(16.))
-                                                .px(px(14.))
-                                                .py(px(12.))
-                                                .rounded(px(10.))
-                                                .border_1()
-                                                .border_color(theme.border)
-                                                .child(
-                                                    div()
-                                                        .flex()
-                                                        .items_center()
-                                                        .justify_between()
-                                                        .gap(px(10.))
-                                                        .child(
-                                                            v_flex()
-                                                                .min_w(px(0.))
-                                                                .gap(px(2.))
-                                                                .child(div().text_sm().child("Skills"))
-                                                                .child(
-                                                                    div()
-                                                                        .text_xs()
-                                                                        .text_color(muted)
-                                                                        .child(line),
-                                                                ),
-                                                        )
-                                                        .when(has_skill_rows, |this| {
-                                                            this.child(
-                                                                div()
-                                                                    .id("agent-skills-toggle")
-                                                                    .px(px(11.))
-                                                                    .py(px(5.))
-                                                                    .rounded(px(8.))
-                                                                    .border_1()
-                                                                    .border_color(
-                                                                        rgb(0x7f7f7f).opacity(0.4),
-                                                                    )
-                                                                    .text_xs()
-                                                                    .cursor_pointer()
-                                                                    .on_mouse_down(MouseButton::Left, {
-                                                                        let app = app.clone();
-                                                                        move |_, _, cx| {
-                                                                            app.update(cx, |state, cx| state.toggle_agent_skills(cx));
-                                                                        }
-                                                                    })
-                                                                    .child(if skills_open { "Hide" } else { "Show" }),
-                                                            )
-                                                        }),
-                                                )
-                                                .when(skills_open && has_skill_rows, |this| {
-                                                    this.child(skills_body(
-                                                        app.clone(),
-                                                        skill_rows,
-                                                        skill_lines,
-                                                        skills_shared,
-                                                        muted,
-                                                        danger,
-                                                    ))
-                                                }),
-                                        )
-                                    })
-                                    .when_some(connections_card, |this, card| this.child(card))
-                                    .when_some(error, |this, message| {
-                                        this.child(
-                                            div()
-                                                .id("agent-settings-error")
-                                                .text_sm()
-                                                .text_color(theme.danger)
-                                                .child(message),
-                                        )
-                                    })
-                                    .child(
-                                        div().id("agent-save").pt(px(8.)).child(
-                                            Button::new("agent-save-btn")
-                                                .label("Save")
-                                                .primary()
-                                                // The icon slot is what the button spins, so
-                                                // the spinner only appears while there is
-                                                // something to wait for.
-                                                .when(saving, |this| {
-                                                    this.icon(IconName::Loader)
-                                                })
-                                                .loading(saving)
-                                                .disabled(saving)
-                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.commit_profile(cx);
-                                                })),
-                                        ),
-                                    ),
                     ),
             )
     }
@@ -1067,47 +972,127 @@ impl AgentSettings {
     }
 }
 
-/// The Usage card's second line: what the bot used this month, or why the app cannot say.
-pub(crate) fn usage_summary(report: &UsageReport) -> String {
+/// What the Usage modal shows of a report, one thing at a time. The card's summary line
+/// ([`usage_summary`]) is read off the same, so the two never disagree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum UsageBody {
+    /// The server is being asked.
+    Asking,
+    /// The server would not say, or does not measure this bot, in words that stand on their own.
+    Said(String),
+    /// A window in which no model answered a request.
+    Empty,
+    /// The models that answered, in the server's order, and what the paid keys charged for all
+    /// of them.
+    Rows { rows: Vec<UsageRow>, total: String },
+}
+
+/// One model the window used, as the modal lists it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct UsageRow {
+    pub model: String,
+    /// "12 requests".
+    pub requests: String,
+    /// What the paid keys charged for them: "$0.40", or "$0.00" on the person's own
+    /// subscription, which the server prices at nothing.
+    pub cost: String,
+}
+
+impl UsageRow {
+    /// What stands beside the model: its requests and what the paid keys charged for them,
+    /// "12 requests · $0.40".
+    pub(crate) fn detail(&self) -> String {
+        format!("{} · {}", self.requests, self.cost)
+    }
+}
+
+/// The models a report lists: those that answered a request in its window. A model the gateway
+/// reports with no request has nothing to list, nor to add up.
+pub(crate) fn used_models(
+    usage: &crate::opengrok::CoworkerUsage,
+) -> Vec<&crate::opengrok::ModelUsage> {
+    usage
+        .models
+        .iter()
+        .filter(|model| model.requests > 0)
+        .collect()
+}
+
+/// What a report says for the Usage modal, and for the card's line over it.
+pub(crate) fn usage_body(report: &UsageReport) -> UsageBody {
     match report {
-        UsageReport::Loading => "Asking the server…".to_string(),
-        UsageReport::Unavailable(why) => why.clone(),
+        UsageReport::Loading => UsageBody::Asking,
+        UsageReport::Unavailable(why) => UsageBody::Said(why.clone()),
         // A note means the numbers are not a measurement: the bot is not metered, or it is and
         // the gateway could not be asked, which the server answers with zero totals. Either way
-        // the note is what the card says, never "No requests". The note is a clause ("this
-        // coworker has no key of its own yet, …"); on the card it stands as its own line, so it
-        // starts with a capital.
-        UsageReport::Read(usage) if usage.note.is_some() || !usage.metered => usage
-            .note
-            .as_deref()
-            .map_or_else(|| "This bot's use is not measured.".to_string(), sentence),
-        // The gateway leaves attempts that were paid for but lost out of `requests`, so a month
-        // of none can still have models to show; only a month with nothing at all is "No".
-        UsageReport::Read(usage) => match usage.totals.requests.unwrap_or(0) {
-            0 if usage.models.is_empty() => "No requests this month".to_string(),
-            requests => {
-                let totals = &usage.totals;
-                let tokens = [
-                    totals.input_tokens,
-                    totals.output_tokens,
-                    totals.cache_read_tokens,
-                    totals.cache_write_tokens,
-                ]
-                .into_iter()
-                .flatten()
-                .fold(0i64, i64::saturating_add);
-                let mut line = format!(
-                    "{} this month · {} tokens",
-                    plural(requests, "request"),
-                    grouped(tokens)
-                );
-                if let Some(cost) = usage.totals.cost_usd.as_deref().and_then(dollars) {
-                    line.push_str(&format!(" · {cost}"));
-                }
-                line
+        // the note is what is said, never "No requests". The note is a clause ("this coworker has
+        // no key of its own yet, …"); it stands as its own line, so it starts with a capital.
+        UsageReport::Read(usage) if usage.note.is_some() || !usage.metered => UsageBody::Said(
+            usage
+                .note
+                .as_deref()
+                .map_or_else(|| "This bot's use is not measured.".to_string(), sentence),
+        ),
+        UsageReport::Read(usage) => {
+            let used = used_models(usage);
+            if used.is_empty() {
+                return UsageBody::Empty;
             }
-        },
+            // The paid keys' charge for the models listed, which a model on the person's own
+            // subscription adds nothing to: the server prices it at nothing.
+            let paid: i64 = used
+                .iter()
+                .filter_map(|model| millionths(&model.cost_usd))
+                .filter(|cost| *cost > 0)
+                .fold(0, i64::saturating_add);
+            UsageBody::Rows {
+                rows: used
+                    .iter()
+                    .map(|model| UsageRow {
+                        model: model.model_id.clone(),
+                        requests: plural(model.requests, "request"),
+                        cost: dollars(&model.cost_usd).unwrap_or_default(),
+                    })
+                    .collect(),
+                total: dollars(&format!("{}.{:06}", paid / 1_000_000, paid % 1_000_000))
+                    .unwrap_or_default(),
+            }
+        }
     }
+}
+
+/// The Usage card's second line: what the paid keys charged for what the bot used this month, and
+/// across how many models, or why the app cannot say.
+pub(crate) fn usage_summary(report: &UsageReport) -> String {
+    match usage_body(report) {
+        UsageBody::Asking => "Asking the server…".to_string(),
+        UsageBody::Said(words) => words,
+        UsageBody::Empty => "No requests this month".to_string(),
+        UsageBody::Rows { rows, total } => {
+            format!(
+                "{total} this month · {}",
+                plural(rows.len() as i64, "model")
+            )
+        }
+    }
+}
+
+/// The server's six-decimal dollars in millionths, whole: `"0.400000"` is 400000. `None` for what
+/// is not a plain decimal.
+fn millionths(six: &str) -> Option<i64> {
+    let (whole, fraction) = six.trim().split_once('.').unwrap_or((six.trim(), ""));
+    if whole.is_empty()
+        || !whole.bytes().all(|b| b.is_ascii_digit())
+        || !fraction.bytes().all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    let fraction: i64 = format!("{fraction:0<6}")[..6].parse().ok()?;
+    whole
+        .parse::<i64>()
+        .ok()?
+        .checked_mul(1_000_000)?
+        .checked_add(fraction)
 }
 
 /// `text` with its first letter capitalised.
@@ -1116,26 +1101,6 @@ pub(crate) fn sentence(text: &str) -> String {
     chars.next().map_or_else(String::new, |first| {
         first.to_uppercase().chain(chars).collect()
     })
-}
-
-/// One model's line once the card is open.
-pub(crate) fn model_line(model: &crate::opengrok::ModelUsage) -> String {
-    let mut line = format!(
-        "{} · {} · {} tokens",
-        model.model_id,
-        plural(model.requests, "request"),
-        grouped(
-            model
-                .input_tokens
-                .saturating_add(model.output_tokens)
-                .saturating_add(model.cache_read_tokens)
-                .saturating_add(model.cache_write_tokens)
-        )
-    );
-    if let Some(cost) = dollars(&model.cost_usd) {
-        line.push_str(&format!(" · {cost}"));
-    }
-    line
 }
 
 fn plural(n: i64, word: &str) -> String {
@@ -1891,12 +1856,203 @@ fn skill_row(
         })
 }
 
+/// The Tools card: what the next turn is offered, and behind its Show button the Bot's tool
+/// switches. The Bot's settings drew it between Auto-review and Skills until Tools moved to the
+/// agent monitor (hexuria/nativechat#174, #175); this is the card as it was, built from what the
+/// state holds, for the monitor to mount. `None` while neither the tools nor the ceiling have
+/// been asked for.
+pub fn tools_card(
+    app: Entity<AppState>,
+    theme: &gpui_kit::component::Theme,
+    cx: &App,
+) -> Option<AnyElement> {
+    let state = app.read(cx);
+    let tools = state
+        .coworker_tools
+        .as_ref()
+        .filter(|(owner, _)| state.active_coworker_id.as_deref() == Some(owner.as_str()))
+        .map(|(_, list)| list.clone());
+    let ceiling = state.ceiling_card();
+    if tools.is_none() && ceiling.is_none() {
+        return None;
+    }
+    let tools_open = state.agent_tools_open;
+    let muted = theme.muted_foreground;
+    let danger = theme.danger;
+    let tools_line = tools.as_ref().map(tools_summary);
+    let allowed_line = ceiling
+        .as_ref()
+        .and_then(|card| ceiling_line(&card.ceiling, card.pending.as_ref()));
+    let (ceiling_rows, card_lines) = ceiling
+        .as_ref()
+        .map(|card| (shown_ceiling_rows(card), ceiling_card_lines(card)))
+        .unwrap_or_default();
+    let has_switches = !ceiling_rows.is_empty();
+    let offered = offered_without_switches(ceiling.as_ref(), tools.as_ref()).to_vec();
+    let has_list = !offered.is_empty();
+    Some(
+        div()
+            .id("agent-tools")
+            .debug_selector(|| "agent-tools".into())
+            .mb(px(16.))
+            .px(px(14.))
+            .py(px(12.))
+            .rounded(px(10.))
+            .border_1()
+            .border_color(theme.border)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(10.))
+                    .child(
+                        v_flex()
+                            .min_w(px(0.))
+                            .gap(px(2.))
+                            .child(div().text_sm().child("Tools"))
+                            // What the next turn is offered, as
+                            // the server lists it: the switches
+                            // below are one of what decides that,
+                            // not the whole of it.
+                            .when_some(tools_line, |this, line| {
+                                this.child(div().text_xs().text_color(muted).child(line))
+                            })
+                            .when_some(allowed_line, |this, line| {
+                                this.child(
+                                    div()
+                                        .id("agent-ceiling")
+                                        .text_xs()
+                                        .text_color(muted)
+                                        .child(line),
+                                )
+                            }),
+                    )
+                    .when(has_switches || has_list, |this| {
+                        this.child(
+                            div()
+                                .id("agent-tools-toggle")
+                                .px(px(11.))
+                                .py(px(5.))
+                                .rounded(px(8.))
+                                .border_1()
+                                .border_color(rgb(0x7f7f7f).opacity(0.4))
+                                .text_xs()
+                                .cursor_pointer()
+                                .on_mouse_down(MouseButton::Left, {
+                                    let app = app.clone();
+                                    move |_, _, cx| {
+                                        app.update(cx, |state, cx| state.toggle_agent_tools(cx));
+                                    }
+                                })
+                                .child(if tools_open { "Hide" } else { "Show" }),
+                        )
+                    }),
+            )
+            .when(tools_open && has_switches, |this| {
+                this.child(ceiling_body(
+                    app.clone(),
+                    ceiling_rows,
+                    card_lines,
+                    muted,
+                    danger,
+                ))
+            })
+            .when(tools_open && has_list, |this| {
+                this.child(tools_body(&offered, muted))
+            })
+            .into_any_element(),
+    )
+}
+
+/// The Skills card: what the Bot is told about on every turn, beside what it may do
+/// (opengrok-server#270), and behind its Show button a switch for each skill. The Bot's settings
+/// drew it below Tools until Skills moved to the agent monitor's Plugins modal
+/// (hexuria/nativechat#174, #175); this is the card as it was, built from what the state holds,
+/// for the modal to mount. `None` while the Bot's skills have not been asked for.
+pub fn skills_card(
+    app: Entity<AppState>,
+    theme: &gpui_kit::component::Theme,
+    cx: &App,
+) -> Option<AnyElement> {
+    let state = app.read(cx);
+    let skills_open = state.agent_skills_open;
+    let skills = state.skills_card();
+    let line = skills
+        .as_ref()
+        .map(|card| skills_summary(&card.skills, card.pending.as_ref()))?;
+    let muted = theme.muted_foreground;
+    let danger = theme.danger;
+    let (skill_rows, skill_lines) = skills
+        .as_ref()
+        .map(|card| (shown_skill_rows(card), skills_card_lines(card)))
+        .unwrap_or_default();
+    let has_skill_rows = !skill_rows.is_empty();
+    let skills_shared = skills.as_ref().is_some_and(|card| card.shared);
+    Some(
+        div()
+            .id("agent-skills")
+            .debug_selector(|| "agent-skills".into())
+            .mb(px(16.))
+            .px(px(14.))
+            .py(px(12.))
+            .rounded(px(10.))
+            .border_1()
+            .border_color(theme.border)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(10.))
+                    .child(
+                        v_flex()
+                            .min_w(px(0.))
+                            .gap(px(2.))
+                            .child(div().text_sm().child("Skills"))
+                            .child(div().text_xs().text_color(muted).child(line)),
+                    )
+                    .when(has_skill_rows, |this| {
+                        this.child(
+                            div()
+                                .id("agent-skills-toggle")
+                                .px(px(11.))
+                                .py(px(5.))
+                                .rounded(px(8.))
+                                .border_1()
+                                .border_color(rgb(0x7f7f7f).opacity(0.4))
+                                .text_xs()
+                                .cursor_pointer()
+                                .on_mouse_down(MouseButton::Left, {
+                                    let app = app.clone();
+                                    move |_, _, cx| {
+                                        app.update(cx, |state, cx| state.toggle_agent_skills(cx));
+                                    }
+                                })
+                                .child(if skills_open { "Hide" } else { "Show" }),
+                        )
+                    }),
+            )
+            .when(skills_open && has_skill_rows, |this| {
+                this.child(skills_body(
+                    app.clone(),
+                    skill_rows,
+                    skill_lines,
+                    skills_shared,
+                    muted,
+                    danger,
+                ))
+            })
+            .into_any_element(),
+    )
+}
+
 #[cfg(test)]
 mod tools_tests {
     use super::{
         CeilingCardLine, NO_LONGER_ON_THE_SERVER, NO_MAC_RUNS_COMMANDS, NOT_AVAILABLE_NOW,
-        NOTHING_TO_SWITCH, ceiling_card_lines, ceiling_line, connector_note, first_line_of,
-        model_line, shown_ceiling_rows, tools_summary, usage_summary,
+        NOTHING_TO_SWITCH, UsageBody, UsageRow, ceiling_card_lines, ceiling_line, connector_note,
+        first_line_of, shown_ceiling_rows, tools_summary, usage_body, usage_summary, used_models,
     };
     use crate::opengrok::{CeilingRow, CoworkerTool};
     use crate::state::{
@@ -1949,15 +2105,18 @@ mod tools_tests {
     /// The routine tools are one row of the ceiling, a builtin the server labels for people
     /// (opengrok-server #316, recorded at #334, on main 8e7387f: `{name: "routines", kind:
     /// "builtin", label: "Routines"}`), and it is headed by that label; its switch is still known
-    /// by its name. A builtin with no label is headed by its wire name, as before.
+    /// by its name. Its line is the server's description as #349 words it, a Bot's own routines
+    /// (`ROW_DESCRIPTION`, recorded in opengrok-server #351 at 9a2b011). A builtin with no label is
+    /// headed by its wire name, as before.
     #[test]
     fn a_builtin_the_server_labels_is_headed_by_its_label() {
         let card = CeilingCard {
             ceiling: ToolCeiling::Read(CeilingRead {
                 rows: rows(serde_json::json!([
                     {"name": "routines", "kind": "builtin", "enabled": true, "label": "Routines",
-                        "description": "List, make, edit and delete your routines when you ask \
-                                        in chat. Deleting one always asks you first."},
+                        "description": "List, make, edit, delete and run this Bot's routines \
+                                        when you ask in chat. Deleting one always asks you \
+                                        first."},
                     {"name": "message_bot", "kind": "builtin", "enabled": true}
                 ])),
                 version: Some(1),
@@ -1979,8 +2138,8 @@ mod tools_tests {
         );
         assert_eq!(
             shown[0].first_line,
-            "List, make, edit and delete your routines when you ask in chat. Deleting one \
-             always asks you first."
+            "List, make, edit, delete and run this Bot's routines when you ask in chat. \
+             Deleting one always asks you first."
         );
     }
 
@@ -2248,106 +2407,93 @@ mod tools_tests {
         );
     }
 
-    /// The Usage card says what the server says the bot used, and never "no usage" for a bot that
-    /// used some, nor for one the server does not measure (#138).
-    #[test]
-    fn the_usage_card_says_what_the_server_measured() {
-        use crate::opengrok::{CoworkerUsage, ModelUsage};
-        use crate::state::UsageReport;
-        let used = CoworkerUsage {
+    /// A model as the gateway reports it for a window.
+    fn model(id: &str, requests: i64, cost: &str) -> crate::opengrok::ModelUsage {
+        crate::opengrok::ModelUsage {
+            model_id: id.into(),
+            requests,
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            cost_usd: cost.into(),
+        }
+    }
+
+    /// A metered bot's answer for `window`, with `models`.
+    fn answer(
+        window: &str,
+        models: Vec<crate::opengrok::ModelUsage>,
+    ) -> crate::opengrok::CoworkerUsage {
+        crate::opengrok::CoworkerUsage {
             metered: true,
             note: None,
-            window: "month".into(),
-            models: vec![ModelUsage {
-                model_id: "oag/cheap".into(),
-                requests: 1234,
-                input_tokens: 20000,
-                output_tokens: 1000,
-                cache_read_tokens: 500,
-                cache_write_tokens: 0,
-                cost_usd: "2.000000".into(),
-            }],
-            totals: crate::opengrok::UsageTotals {
-                requests: Some(1234),
-                input_tokens: Some(20000),
-                output_tokens: Some(1000),
-                cache_read_tokens: Some(500),
-                cache_write_tokens: Some(0),
-                cost_usd: Some("2.000000".into()),
-            },
-        };
-        assert_eq!(
-            usage_summary(&UsageReport::Read(used.clone())),
-            "1,234 requests this month · 21,500 tokens · $2.00"
+            window: window.into(),
+            models,
+            totals: Default::default(),
+        }
+    }
+
+    /// The Usage card says what the paid keys charged this month and across how many models, and
+    /// never "no usage" for a bot that used some, nor for one the server does not measure (#138).
+    #[test]
+    fn the_usage_card_says_what_the_paid_keys_charged_and_across_how_many_models() {
+        use crate::state::UsageReport;
+        // Three models answered: two on paid keys, one on the person's own subscription, which the
+        // server prices at nothing. A fourth was asked and answered nothing, and is neither
+        // counted nor added up, whatever the gateway put against it.
+        let month = answer(
+            "month",
+            vec![
+                model("oag/cheap", 12, "0.400000"),
+                model("gpt-6-luna", 5, "0.000000"),
+                model("xai/grok-4.7", 1, "0.020000"),
+                model("oag/lost", 0, "9.990000"),
+            ],
         );
         assert_eq!(
-            model_line(&used.models[0]),
-            "oag/cheap · 1,234 requests · 21,500 tokens · $2.00"
+            usage_summary(&UsageReport::Read(month.clone())),
+            "$0.42 this month · 3 models"
         );
-        let one = ModelUsage {
-            requests: 1,
-            input_tokens: 900,
-            output_tokens: 1,
-            cache_read_tokens: 0,
-            cost_usd: "0.004000".into(),
-            ..used.models[0].clone()
-        };
+        let one = answer("month", vec![model("oag/cheap", 1234, "2.000000")]);
         assert_eq!(
-            model_line(&one),
-            "oag/cheap · 1 request · 901 tokens · under $0.01"
+            usage_summary(&UsageReport::Read(one)),
+            "$2.00 this month · 1 model"
         );
-        let idle = CoworkerUsage {
-            models: Vec::new(),
-            totals: crate::opengrok::UsageTotals {
-                requests: Some(0),
-                ..Default::default()
-            },
-            ..used.clone()
-        };
+        // Subscription alone: used, and not charged.
+        let plan = answer("month", vec![model("gpt-6-luna", 5, "0.000000")]);
         assert_eq!(
-            usage_summary(&UsageReport::Read(idle.clone())),
-            "No requests this month",
-            "a fresh bot with real zeros and no note"
+            usage_summary(&UsageReport::Read(plan)),
+            "$0.00 this month · 1 model"
         );
-        // Every attempt paid for but lost: no requests counted, yet a model with tokens and cost.
-        let lost = CoworkerUsage {
-            models: vec![ModelUsage {
-                requests: 0,
-                ..used.models[0].clone()
-            }],
-            totals: crate::opengrok::UsageTotals {
-                requests: Some(0),
-                ..used.totals.clone()
-            },
-            ..used.clone()
-        };
-        assert_eq!(
-            usage_summary(&UsageReport::Read(lost)),
-            "0 requests this month · 21,500 tokens · $2.00"
-        );
+        // Nothing answered: every model unused, or none listed.
+        for models in [Vec::new(), vec![model("oag/lost", 0, "9.990000")]] {
+            assert_eq!(
+                usage_summary(&UsageReport::Read(answer("month", models))),
+                "No requests this month",
+                "a fresh bot with real zeros and no note"
+            );
+        }
         // Metered, but the gateway could not be asked: the server sends zero totals with a
         // note, and those zeros are not a measurement.
-        let unread = CoworkerUsage {
+        let unread = crate::opengrok::CoworkerUsage {
             note: Some("the gateway could not be asked: timed out".into()),
-            ..idle
+            ..answer("month", Vec::new())
         };
         assert_eq!(
             usage_summary(&UsageReport::Read(unread)),
             "The gateway could not be asked: timed out"
         );
-        let unmetered = CoworkerUsage {
+        let unmetered = crate::opengrok::CoworkerUsage {
             metered: false,
             note: Some("this coworker's key cannot serve".into()),
-            models: Vec::new(),
-            totals: Default::default(),
-            ..used
+            ..answer("month", Vec::new())
         };
         assert_eq!(
             usage_summary(&UsageReport::Read(unmetered.clone())),
             "This coworker's key cannot serve"
         );
-        let unexplained = CoworkerUsage {
-            metered: false,
+        let unexplained = crate::opengrok::CoworkerUsage {
             note: None,
             ..unmetered
         };
@@ -2361,6 +2507,96 @@ mod tools_tests {
                 "Only this bot's owner can see its usage.".into()
             )),
             "Only this bot's owner can see its usage."
+        );
+    }
+
+    /// The Usage modal lists only the models that answered a request, each with its requests and
+    /// what the paid keys charged for them, and totals the paid keys' charges: a model priced at
+    /// nothing (the person's own subscription) is listed and adds nothing. A window with nothing in
+    /// it says so, and so does a bot the server does not measure, in the server's words.
+    #[test]
+    fn the_usage_modal_lists_the_models_used_and_totals_the_paid_keys() {
+        use crate::state::UsageReport;
+        let week = answer(
+            "7d",
+            vec![
+                model("oag/cheap", 12, "0.400000"),
+                model("oag/lost", 0, "9.990000"),
+                model("gpt-6-luna", 5, "0.000000"),
+                model("xai/grok-4.7", 1, "0.020000"),
+                model("oag/tiny", 3, "0.004000"),
+            ],
+        );
+        assert_eq!(
+            used_models(&week)
+                .iter()
+                .map(|model| model.model_id.as_str())
+                .collect::<Vec<_>>(),
+            ["oag/cheap", "gpt-6-luna", "xai/grok-4.7", "oag/tiny"],
+            "those that answered, in the server's order"
+        );
+        let row = |model: &str, requests: &str, cost: &str| UsageRow {
+            model: model.into(),
+            requests: requests.into(),
+            cost: cost.into(),
+        };
+        assert_eq!(
+            usage_body(&UsageReport::Read(week)),
+            UsageBody::Rows {
+                rows: vec![
+                    row("oag/cheap", "12 requests", "$0.40"),
+                    row("gpt-6-luna", "5 requests", "$0.00"),
+                    row("xai/grok-4.7", "1 request", "$0.02"),
+                    row("oag/tiny", "3 requests", "under $0.01"),
+                ],
+                // 0.40 + 0.02 + 0.004, to the cent
+                total: "$0.42".into(),
+            }
+        );
+        // Sums of cents too small to read alone still read, and a thousand requests are grouped.
+        let small = answer(
+            "24h",
+            vec![
+                model("oag/a", 1500, "0.003000"),
+                model("oag/b", 2, "0.003000"),
+            ],
+        );
+        assert_eq!(
+            usage_body(&UsageReport::Read(small)),
+            UsageBody::Rows {
+                rows: vec![
+                    row("oag/a", "1,500 requests", "under $0.01"),
+                    row("oag/b", "2 requests", "under $0.01"),
+                ],
+                total: "$0.01".into(),
+            }
+        );
+        assert_eq!(
+            usage_body(&UsageReport::Read(answer("24h", Vec::new()))),
+            UsageBody::Empty
+        );
+        assert_eq!(
+            usage_body(&UsageReport::Read(answer(
+                "24h",
+                vec![model("oag/lost", 0, "1.000000")]
+            ))),
+            UsageBody::Empty
+        );
+        assert_eq!(usage_body(&UsageReport::Loading), UsageBody::Asking);
+        assert_eq!(
+            usage_body(&UsageReport::Unavailable(
+                "Sign in again to see this bot's usage.".into()
+            )),
+            UsageBody::Said("Sign in again to see this bot's usage.".into())
+        );
+        let unmetered = crate::opengrok::CoworkerUsage {
+            metered: false,
+            note: Some("this coworker has no key of its own yet, so it is not metered".into()),
+            ..answer("7d", Vec::new())
+        };
+        assert_eq!(
+            usage_body(&UsageReport::Read(unmetered)),
+            UsageBody::Said("This coworker has no key of its own yet, so it is not metered".into())
         );
     }
 
@@ -2604,5 +2840,475 @@ mod skills_tests {
             )],
             "said once"
         );
+    }
+}
+
+#[cfg(test)]
+mod pane_tests {
+    use super::{AgentSettings, ProfileField, SAVED_FOR, profile_patch};
+    use crate::chrome::INFO_PANE_WIDTH;
+    use crate::opengrok::{Coworker, CoworkerPatch, CoworkerTool, OpenGrokClient};
+    use crate::state::{AppState, BotSkills, ToolList};
+    use gpui_kit::component::input::{InputEvent, InputState};
+    use gpui_kit::{Entity, VisualTestContext};
+    use serde_json::{Value, json};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// Ada's row as the server last said it.
+    fn ada() -> Value {
+        json!({
+            "id": "cw_1", "name": "Ada", "title": "Research", "role": "Reads papers",
+            "model": "oag/cheap", "effort": "low", "source": "gateway"
+        })
+    }
+
+    /// Ada's settings pane in a window of its own, tall enough to draw all of it, with what the
+    /// Tools and Skills cards were drawn from already read, so a card the pane still draws is
+    /// there to be found, and `client` for a server to talk to.
+    fn open_pane(
+        cx: &mut gpui_kit::TestAppContext,
+        client: Option<OpenGrokClient>,
+    ) -> (
+        Entity<AppState>,
+        Entity<AgentSettings>,
+        &mut VisualTestContext,
+    ) {
+        use gpui_kit::{AppContext as _, px, size};
+        cx.update(gpui_kit::init);
+        let mut app = AppState::new();
+        app.opengrok = client;
+        app.coworkers = vec![serde_json::from_value(ada()).expect("a row")];
+        app.active_coworker_id = Some("cw_1".into());
+        app.coworker_tools = Some((
+            "cw_1".into(),
+            ToolList::Listed(vec![CoworkerTool {
+                name: "shell".into(),
+                description: "Run a command.".into(),
+                kind: "builtin".into(),
+            }]),
+        ));
+        app.coworker_skills = Some(("cw_1".into(), BotSkills::Loading));
+        let state = cx.new(|_| app);
+        let (pane, cx) = cx.add_window_view({
+            let state = state.clone();
+            move |window, cx| AgentSettings::new(window, state, cx)
+        });
+        cx.simulate_resize(size(px(INFO_PANE_WIDTH), px(3000.)));
+        // A window that is not the active one is never told a field lost the caret.
+        cx.update(|window, _| window.activate_window());
+        draw(cx);
+        (state, pane, cx)
+    }
+
+    fn draw(cx: &mut VisualTestContext) {
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+    }
+
+    /// A server that answers a change to Ada with `answer`, on a runtime that runs while the test
+    /// waits, since the answer lands from its threads.
+    fn server_answering(
+        cx: &mut gpui_kit::TestAppContext,
+        answer: ResponseTemplate,
+    ) -> (tokio::runtime::Runtime, MockServer) {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("a runtime");
+        cx.executor().allow_parking();
+        let server = runtime.block_on(MockServer::start());
+        runtime.block_on(
+            Mock::given(method("PATCH"))
+                .and(path("/coworkers/cw_1"))
+                .respond_with(answer)
+                .mount(&server),
+        );
+        (runtime, server)
+    }
+
+    /// What the server was asked to change, in the order it was asked.
+    fn changes_asked(runtime: &tokio::runtime::Runtime, server: &MockServer) -> Vec<Value> {
+        runtime
+            .block_on(server.received_requests())
+            .expect("the recorder is on")
+            .iter()
+            .filter(|request| request.method.as_str() == "PATCH")
+            .map(|request| serde_json::from_slice(&request.body).expect("a JSON body"))
+            .collect()
+    }
+
+    /// Let what is waiting on the window run, with the runtime entered, for a few milliseconds of
+    /// real time: the server's answers land from the runtime's threads. Entered afresh each time,
+    /// because a request polled with the runtime not entered panics, and what asks the recorder
+    /// what it was sent (`block_on`) leaves the thread without it.
+    fn settle(cx: &mut VisualTestContext, runtime: &tokio::runtime::Runtime) {
+        let _enter = runtime.enter();
+        cx.run_until_parked();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+
+    /// Wait, in real time, for what the runtime's threads do.
+    fn wait_for(
+        cx: &mut VisualTestContext,
+        runtime: &tokio::runtime::Runtime,
+        what: &str,
+        mut done: impl FnMut(&mut VisualTestContext) -> bool,
+    ) {
+        let mut waited = 0;
+        while !done(cx) {
+            assert!(waited < 2000, "{what}");
+            settle(cx, runtime);
+            waited += 1;
+        }
+    }
+
+    /// The person puts the caret in `field`, types `words` and moves it to `elsewhere`, which is
+    /// how a field is left. Each step is let settle, because a field is told it was left when the
+    /// window's effects run.
+    fn type_and_leave(
+        cx: &mut VisualTestContext,
+        runtime: &tokio::runtime::Runtime,
+        field: &Entity<InputState>,
+        words: &str,
+        elsewhere: &Entity<InputState>,
+    ) {
+        cx.update(|window, cx| field.update(cx, |input, cx| input.focus(window, cx)));
+        draw(cx);
+        settle(cx, runtime);
+        cx.update(|window, cx| {
+            field.update(cx, |input, cx| {
+                input.set_value(words.to_string(), window, cx)
+            })
+        });
+        draw(cx);
+        cx.update(|window, cx| elsewhere.update(cx, |input, cx| input.focus(window, cx)));
+        draw(cx);
+        settle(cx, runtime);
+    }
+
+    /// A Bot's settings read top to bottom: its avatar, Name, Label, Description, Notifications,
+    /// Model, Usage and Auto-review, in that order (the owner's design, hexuria/nativechat#174),
+    /// and there is no Save at the end of them.
+    #[gpui_kit::test]
+    fn the_pane_reads_top_to_bottom_in_the_owners_order(cx: &mut gpui_kit::TestAppContext) {
+        let (_, _, cx) = open_pane(cx, None);
+        let order = [
+            "avatar-trigger-row",
+            "agent-settings-name",
+            "agent-label",
+            "agent-role",
+            "agent-notifications",
+            "agent-model-card",
+            "agent-usage",
+            "agent-auto-review",
+        ];
+        let tops: Vec<_> = order
+            .iter()
+            .map(|id| {
+                cx.debug_bounds(id)
+                    .unwrap_or_else(|| panic!("`{id}` is drawn"))
+                    .top()
+            })
+            .collect();
+        assert!(tops.windows(2).all(|pair| pair[0] < pair[1]), "{tops:?}");
+        assert!(
+            cx.debug_bounds("agent-save").is_none(),
+            "the fields save themselves"
+        );
+    }
+
+    /// The Tools, Skills and Connections cards are not in the pane: Tools and Connections open
+    /// from the agent monitor (#175) and Skills from its Plugins modal, so the pane draws none of
+    /// them, though what they are drawn from is read.
+    #[gpui_kit::test]
+    fn the_pane_draws_no_tools_skills_or_connections_card(cx: &mut gpui_kit::TestAppContext) {
+        let (_, _, cx) = open_pane(cx, None);
+        for id in ["agent-tools", "agent-skills", "agent-connections"] {
+            assert!(
+                cx.debug_bounds(id).is_none(),
+                "`{id}` is not the settings pane's any more"
+            );
+        }
+    }
+
+    /// Leaving a field asks the server for that field alone, and only where it holds something
+    /// other than what the server last said of the Bot, with the spaces around it left off, as
+    /// the server leaves them off a name and a role.
+    #[test]
+    fn leaving_a_field_asks_for_that_field_alone_and_only_if_it_changed() {
+        use ProfileField::{Description, Label, Name};
+        let bot: Coworker = serde_json::from_value(ada()).expect("a row");
+        for (field, text) in [
+            (Name, "Ada"),
+            (Name, "  Ada "),
+            (Label, "Research"),
+            (Description, "Reads papers\n"),
+        ] {
+            assert_eq!(profile_patch(field, text, &bot), None, "{field:?} {text:?}");
+        }
+        let alone = |patch: CoworkerPatch| patch;
+        assert_eq!(
+            profile_patch(Name, " Grace ", &bot),
+            Some(alone(CoworkerPatch {
+                name: Some("Grace".into()),
+                ..Default::default()
+            }))
+        );
+        assert_eq!(
+            profile_patch(Label, "Maths", &bot),
+            Some(CoworkerPatch {
+                title: Some("Maths".into()),
+                ..Default::default()
+            })
+        );
+        assert_eq!(
+            profile_patch(Description, "Reads papers\nand books", &bot),
+            Some(CoworkerPatch {
+                role: Some("Reads papers\nand books".into()),
+                ..Default::default()
+            })
+        );
+        // A field cleared is asked for blank, which clears it; a Bot that has none and a field
+        // that is empty are the same.
+        assert_eq!(
+            profile_patch(Label, "", &bot).and_then(|patch| patch.title),
+            Some(String::new())
+        );
+        let bare: Coworker =
+            serde_json::from_value(json!({"id": "cw_1", "name": "Ada", "model": "oag/cheap"}))
+                .expect("a row");
+        assert_eq!(profile_patch(Label, "", &bare), None);
+        assert_eq!(profile_patch(Description, "  ", &bare), None);
+    }
+
+    /// A field left holding new words saves them, and only them, and says Saved beside it for a
+    /// moment; the other fields say nothing. (A test waits for the answer to what it began: the
+    /// window is torn down after the test, and a request still in flight is then polled with the
+    /// runtime no longer entered.)
+    #[gpui_kit::test]
+    fn a_field_left_holding_new_words_is_saved_alone_and_says_saved(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        let (runtime, server) = server_answering(
+            cx,
+            ResponseTemplate::new(200).set_body_json(json!({
+                "id": "cw_1", "name": "Grace", "title": "Research", "role": "Reads papers",
+                "model": "oag/cheap", "effort": "low", "source": "gateway"
+            })),
+        );
+        let _enter = runtime.enter();
+        let client = OpenGrokClient::new(&server.uri()).expect("a URL");
+        let (state, pane, cx) = open_pane(cx, Some(client));
+        let (name, label) = pane.read_with(cx, |pane, _| {
+            (pane.name_input.clone(), pane.label_input.clone())
+        });
+        type_and_leave(cx, &runtime, &name, "Grace", &label);
+        wait_for(cx, &runtime, "the change reaches the server", |_| {
+            !changes_asked(&runtime, &server).is_empty()
+        });
+        assert_eq!(changes_asked(&runtime, &server), [json!({"name": "Grace"})]);
+        wait_for(cx, &runtime, "the pane says Saved", |cx| {
+            pane.read_with(cx, |pane, _| pane.saved == Some(ProfileField::Name))
+        });
+        draw(cx);
+        assert!(cx.debug_bounds("agent-name-saved").is_some());
+        assert!(cx.debug_bounds("agent-label-saved").is_none());
+        assert!(cx.debug_bounds("agent-role-saved").is_none());
+        assert_eq!(
+            state.read_with(cx, |state, _| state.coworkers[0].name.clone()),
+            "Grace"
+        );
+        // It is a flash: it goes by itself.
+        cx.executor().advance_clock(SAVED_FOR);
+        cx.run_until_parked();
+        draw(cx);
+        assert!(cx.debug_bounds("agent-name-saved").is_none());
+    }
+
+    /// A field left as it was, with or without spaces about it, sends nothing and says nothing.
+    #[gpui_kit::test]
+    fn a_field_left_as_it_was_sends_nothing(cx: &mut gpui_kit::TestAppContext) {
+        let (runtime, server) =
+            server_answering(cx, ResponseTemplate::new(200).set_body_json(ada()));
+        let _enter = runtime.enter();
+        let client = OpenGrokClient::new(&server.uri()).expect("a URL");
+        let (_, pane, cx) = open_pane(cx, Some(client));
+        let (name, label) = pane.read_with(cx, |pane, _| {
+            (pane.name_input.clone(), pane.label_input.clone())
+        });
+        type_and_leave(cx, &runtime, &name, " Ada ", &label);
+        type_and_leave(cx, &runtime, &label, "Research", &name);
+        for _ in 0..20 {
+            settle(cx, &runtime);
+        }
+        assert_eq!(changes_asked(&runtime, &server), Vec::<Value>::new());
+        assert_eq!(pane.read_with(cx, |pane, _| pane.saved), None);
+    }
+
+    /// Enter in a single-line field saves it, with the caret still there; Enter in the
+    /// Description is a new line in it, and saves nothing.
+    #[gpui_kit::test]
+    fn enter_saves_a_single_line_field_and_not_the_description(cx: &mut gpui_kit::TestAppContext) {
+        let (runtime, server) =
+            server_answering(cx, ResponseTemplate::new(200).set_body_json(ada()));
+        let _enter = runtime.enter();
+        let client = OpenGrokClient::new(&server.uri()).expect("a URL");
+        let (_, pane, cx) = open_pane(cx, Some(client));
+        let (label, role) = pane.read_with(cx, |pane, _| {
+            (pane.label_input.clone(), pane.role_input.clone())
+        });
+        let enter = InputEvent::PressEnter {
+            secondary: false,
+            shift: false,
+        };
+        cx.update(|window, cx| {
+            label.update(cx, |input, cx| {
+                input.set_value("Maths".to_string(), window, cx)
+            });
+            role.update(cx, |input, cx| {
+                input.set_value("Reads papers\nand books".to_string(), window, cx)
+            });
+        });
+        role.update(cx, |_, cx| cx.emit(enter.clone()));
+        for _ in 0..20 {
+            settle(cx, &runtime);
+        }
+        assert_eq!(
+            changes_asked(&runtime, &server),
+            Vec::<Value>::new(),
+            "Enter in the Description saved nothing"
+        );
+        label.update(cx, |_, cx| cx.emit(enter));
+        wait_for(cx, &runtime, "Enter in the Label saves it", |cx| {
+            pane.read_with(cx, |pane, _| pane.saved == Some(ProfileField::Label))
+        });
+        assert_eq!(
+            changes_asked(&runtime, &server),
+            [json!({"title": "Maths"})]
+        );
+    }
+
+    /// The Description saves when it is left, and the other fields stay out of it.
+    #[gpui_kit::test]
+    fn the_description_saves_when_it_is_left(cx: &mut gpui_kit::TestAppContext) {
+        let (runtime, server) =
+            server_answering(cx, ResponseTemplate::new(200).set_body_json(ada()));
+        let _enter = runtime.enter();
+        let client = OpenGrokClient::new(&server.uri()).expect("a URL");
+        let (_, pane, cx) = open_pane(cx, Some(client));
+        let (name, role) = pane.read_with(cx, |pane, _| {
+            (pane.name_input.clone(), pane.role_input.clone())
+        });
+        cx.update(|window, cx| {
+            role.update(cx, |input, cx| input.focus(window, cx));
+        });
+        draw(cx);
+        settle(cx, &runtime);
+        cx.update(|window, cx| {
+            role.update(cx, |input, cx| {
+                input.set_value("Reads papers\nand books".to_string(), window, cx)
+            });
+            name.update(cx, |input, cx| input.focus(window, cx));
+        });
+        draw(cx);
+        wait_for(cx, &runtime, "leaving the Description saves it", |cx| {
+            pane.read_with(cx, |pane, _| pane.saved == Some(ProfileField::Description))
+        });
+        assert_eq!(
+            changes_asked(&runtime, &server),
+            [json!({"role": "Reads papers\nand books"})]
+        );
+    }
+
+    /// The Usage card has Show only once the server has said the bot used some models, and Show
+    /// opens the Usage modal, on the month, over the window: it does not open the card out in the
+    /// pane.
+    #[gpui_kit::test]
+    fn show_on_the_usage_card_opens_the_usage_modal(cx: &mut gpui_kit::TestAppContext) {
+        use crate::opengrok::{CoworkerUsage, ModelUsage, UsageWindow};
+        use crate::state::UsageReport;
+        use gpui_kit::{Modifiers, MouseButton};
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime");
+        let _enter = runtime.enter();
+        let client = OpenGrokClient::new("http://127.0.0.1:9").expect("a URL");
+        let (state, _, cx) = open_pane(cx, Some(client));
+        assert!(
+            cx.debug_bounds("agent-usage-show").is_none(),
+            "nothing read, nothing to show"
+        );
+        state.update(cx, |state, cx| {
+            state.coworker_usage = Some((
+                "cw_1".into(),
+                UsageReport::Read(CoworkerUsage {
+                    metered: true,
+                    note: None,
+                    window: "month".into(),
+                    models: vec![ModelUsage {
+                        model_id: "oag/cheap".into(),
+                        requests: 12,
+                        input_tokens: 0,
+                        output_tokens: 0,
+                        cache_read_tokens: 0,
+                        cache_write_tokens: 0,
+                        cost_usd: "0.400000".into(),
+                    }],
+                    totals: Default::default(),
+                }),
+            ));
+            cx.notify();
+        });
+        draw(cx);
+        let at = cx
+            .debug_bounds("agent-usage-show")
+            .expect("Show is drawn once there are models")
+            .center();
+        cx.simulate_mouse_move(at, None, Modifiers::none());
+        cx.simulate_mouse_down(at, MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_up(at, MouseButton::Left, Modifiers::none());
+        draw(cx);
+        assert_eq!(
+            state.read_with(cx, |state, _| state
+                .usage_modal
+                .as_ref()
+                .map(|modal| (modal.coworker_id.clone(), modal.window))),
+            Some(("cw_1".to_string(), UsageWindow::Month))
+        );
+    }
+
+    /// A refusal shows the server's words on the pane's red line, keeps what was typed in the
+    /// field, and says nothing of being saved; the roster is back to what the server keeps.
+    #[gpui_kit::test]
+    fn a_refusal_shows_the_servers_words_and_keeps_the_text(cx: &mut gpui_kit::TestAppContext) {
+        let words = "name: a coworker needs a name to answer to";
+        let (runtime, server) =
+            server_answering(cx, ResponseTemplate::new(400).set_body_string(words));
+        let _enter = runtime.enter();
+        let client = OpenGrokClient::new(&server.uri()).expect("a URL");
+        let (state, pane, cx) = open_pane(cx, Some(client));
+        let (name, label) = pane.read_with(cx, |pane, _| {
+            (pane.name_input.clone(), pane.label_input.clone())
+        });
+        type_and_leave(cx, &runtime, &name, "", &label);
+        wait_for(cx, &runtime, "the server's words are on the pane", |cx| {
+            state.read_with(cx, |state, _| state.auth_error.is_some())
+        });
+        assert_eq!(
+            state.read_with(cx, |state, _| state.auth_error.clone()),
+            Some(words.to_string())
+        );
+        draw(cx);
+        assert!(cx.debug_bounds("agent-settings-error").is_some());
+        assert_eq!(name.read_with(cx, |input, _| input.value().to_string()), "");
+        assert_eq!(
+            state.read_with(cx, |state, _| state.coworkers[0].name.clone()),
+            "Ada",
+            "the roster is what the server keeps"
+        );
+        assert_eq!(pane.read_with(cx, |pane, _| pane.saved), None);
+        assert!(cx.debug_bounds("agent-name-saved").is_none());
     }
 }

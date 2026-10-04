@@ -57,6 +57,8 @@ const API_SUFFIX: &str = "@api";
 /// (`local_proxy`), and the server's paid keys, through its gateway.
 pub const SUBSCRIPTION_GROUP: &str = "Subscription";
 pub const GATEWAY_GROUP: &str = "Gateway";
+/// The heading over the one row the list pins above its groups ([`ModelPick::pinned`]).
+pub const CURRENT_TITLE: &str = "Current";
 
 /// Why ⚡ is dead: the list holds no fast twin of the model, or does not hold the model at all.
 pub const FAST_NO_TWIN: &str = "The server lists no fast version of this model.";
@@ -258,15 +260,6 @@ pub fn list_window(groups: &[ChoiceGroup], start: usize) -> Vec<ListLine<'_>> {
         }
     }
     lines
-}
-
-/// Where the window starts as the list opens, among `rows` models, with the one at `selected`
-/// ticked: with that model in view, as near the window's middle as the list allows, and at the
-/// top where none is ticked.
-pub fn window_opening_on(rows: usize, selected: Option<usize>) -> usize {
-    selected
-        .map_or(0, |at| at.saturating_sub(LIST_ROWS / 2))
-        .min(last_window_start(rows))
 }
 
 /// The rows a list of ids makes, in the list's order: a model and its fast twin are one row, at
@@ -910,11 +903,15 @@ impl ModelPick {
         })
     }
 
-    /// Where the list's window starts as it opens, before anything is typed: with the model that
-    /// answers in view ([`window_opening_on`]).
-    pub fn opening_window_start(&self) -> usize {
-        let selected = self.rows().position(|row| self.is_current(row));
-        window_opening_on(self.rows().count(), selected)
+    /// The row the list pins above its groups, under a "Current" heading ([`CURRENT_TITLE`]): the
+    /// model that answers, ticked, wherever it is among them. The list opens at the top of its
+    /// groups, so the first [`LIST_ROWS`] models of the first group show and this one is not
+    /// scrolled to; it is one more row than the window holds, and no window counts it. A search
+    /// leaves it out, even where the search holds it: what is typed is a look through the list,
+    /// and the model that answers is among what it finds when it holds it. Nothing is pinned while
+    /// no model answers.
+    pub fn pinned(&self, query: &str) -> Option<&ModelChoice> {
+        self.current.as_ref().filter(|_| query.trim().is_empty())
     }
 
     /// Whether the list ticks this row.
@@ -1515,37 +1512,88 @@ mod tests {
         assert!(list_window(&[], 0).is_empty());
     }
 
-    /// The list opens with the model that answers in view, as near the window's middle as the
-    /// list allows, and at the top where none answers.
-    #[test]
-    fn the_list_opens_with_the_ticked_model_in_view() {
-        assert_eq!(window_opening_on(10, None), 0);
-        assert_eq!(window_opening_on(10, Some(0)), 0);
-        assert_eq!(window_opening_on(10, Some(1)), 0);
-        assert_eq!(window_opening_on(10, Some(4)), 2, "in the middle");
-        assert_eq!(
-            window_opening_on(10, Some(9)),
-            5,
-            "at the bottom of the last"
-        );
-        assert_eq!(window_opening_on(4, Some(3)), 0, "all in view");
-
-        // A Bot on the eighth of nine gateway models opens on a window that holds it.
-        let ids: Vec<String> = (0..9).map(|at| format!("oag/route-{at}")).collect();
-        let listed: Vec<&str> = ids.iter().map(String::as_str).collect();
-        let pinned = bot(Some(json!("gateway")), "oag/route-7", Some("medium"));
-        let pick = bot_pick(&pinned, None, &catalogue(&listed), plan(PLAN));
-        let start = pick.opening_window_start();
-        assert_eq!(start, 4);
-        let groups = pick.search("");
-        let in_view: Vec<&str> = list_window(&groups, start)
+    /// The models of `groups` in view from the `start`th, by id, headings left out.
+    fn in_view(groups: &[ChoiceGroup], start: usize) -> Vec<String> {
+        list_window(groups, start)
             .into_iter()
             .filter_map(|line| match line {
-                ListLine::Row(row) => Some(row.base_id.as_str()),
+                ListLine::Row(row) => Some(row.base_id.clone()),
                 ListLine::Heading(_) => None,
             })
-            .collect();
-        assert!(in_view.contains(&"oag/route-7"), "{in_view:?}");
+            .collect()
+    }
+
+    /// The list opens at the top of its groups, so the first five Subscription models show, and
+    /// the model that answers is not scrolled to but pinned above them, under a "Current" heading
+    /// of its own that no window counts. Searching leaves it out, as it leaves out any model the
+    /// search does not hold; with no model answering there is nothing to pin. The three pickers
+    /// are one list, and pin the same way.
+    #[test]
+    fn the_list_opens_at_the_top_with_the_model_that_answers_pinned_above_it() {
+        const SEVEN_ON_THE_PLAN: &[&str] = &[
+            "gpt-6-luna",
+            "gpt-6-luna--fast",
+            "gpt-5.6-sol",
+            "gpt-6-sol",
+            "gpt-5-codex",
+            "gpt-5-mini",
+            "gpt-5-nano",
+            "gpt-5-pro",
+        ];
+        let account = account(InferenceKind::Gateway, None);
+        let listed = catalogue(&["oag/cheap", "xai/grok-4.7", "oag/sol"]);
+        // A Bot on a model near the bottom of the Gateway group, below seven Subscription models.
+        let on_sol = bot(Some(json!("gateway")), "oag/sol", Some("medium"));
+        let pick = bot_pick(&on_sol, Some(&account), &listed, plan(SEVEN_ON_THE_PLAN));
+        assert_eq!(
+            pick.pinned("").map(|row| row.base_id.as_str()),
+            Some("oag/sol")
+        );
+        assert_eq!(
+            pick.pinned("  ").map(|row| row.base_id.as_str()),
+            Some("oag/sol"),
+            "spaces are no search"
+        );
+        let groups = pick.search("");
+        assert_eq!(row_count(&groups), 10, "seven on the plan, three on keys");
+        assert_eq!(
+            in_view(&groups, 0),
+            [
+                "gpt-6-luna",
+                "gpt-5.6-sol",
+                "gpt-6-sol",
+                "gpt-5-codex",
+                "gpt-5-mini"
+            ],
+            "the first five Subscription models, the pinned one counted among none of them"
+        );
+        assert_eq!(in_view(&groups, 0).len(), LIST_ROWS);
+        // A search is the list of what it holds, from the top, and the pinned row goes while it
+        // is typed, even where the search holds it.
+        assert_eq!(pick.pinned("sol"), None);
+        assert_eq!(pick.pinned("oag/sol"), None);
+        assert_eq!(pick.pinned("zzz"), None);
+
+        // None answers: the Bot's model is one the list does not hold.
+        let off_the_list = bot(Some(json!("gateway")), "oag/gone", Some("medium"));
+        let pick = bot_pick(&off_the_list, Some(&account), &listed, plan(PLAN));
+        assert_eq!(pick.pinned(""), None);
+
+        // Default for new Bots and the Relay-off fallback pin theirs, and pin nothing while none
+        // is set.
+        let [_, (_, new_bots), (_, fallback)] = three_on_sol("medium");
+        for (name, pick) in [("new Bots", &new_bots), ("fallback", &fallback)] {
+            assert_eq!(
+                pick.pinned("").map(|row| row.base_id.as_str()),
+                Some("oag/sol"),
+                "{name}"
+            );
+            assert_eq!(pick.pinned("sol"), None, "{name}");
+        }
+        let unset = new_bots_pick(None, Some(&account), &listed, plan(PLAN));
+        let no_fallback = plan_fallback_pick(None, &listed);
+        assert_eq!(unset.pinned(""), None);
+        assert_eq!(no_fallback.pinned(""), None);
     }
 
     /// On a server without per-Bot doors the account's plan line stands where the Subscription
