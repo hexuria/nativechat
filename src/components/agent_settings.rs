@@ -413,8 +413,7 @@ impl Render for AgentSettings {
                                 mark: PersonaMark::new(id.clone())
                                     .shape(shape.clone())
                                     .color(color.clone())
-                                    .size(px(AVATAR_TRIGGER_PX))
-                                    .dark(true),
+                                    .size(px(AVATAR_TRIGGER_PX)),
                             })
                             .content({
                                 let app = app.clone();
@@ -1003,7 +1002,18 @@ fn avatar_editor_panel(
                                         .opacity(if selected { 1. } else { 0. })
                                         .group_hover(group, |s| s.opacity(1.)),
                                 )
-                                .child(div().size(px(24.)).rounded_full().bg(rgb(candidate.swatch)))
+                                .child(div().size(px(24.)).rounded_full().bg(rgb(
+                                    // Black is the one ink that flips with the theme, so its swatch must too.
+                                    if candidate.id == "black" {
+                                        if dark {
+                                            candidate.dark
+                                        } else {
+                                            candidate.light
+                                        }
+                                    } else {
+                                        candidate.swatch
+                                    },
+                                )))
                         })),
                 ),
         )
