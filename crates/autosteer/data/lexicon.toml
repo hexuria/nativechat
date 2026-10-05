@@ -1,0 +1,84 @@
+# Closed control vocabulary for the autosteer pack (spec §6.1 / delivery-advisor-spec §4.2).
+# Ordinary words are not listed: this is not a spell checker.
+guards = ["top", "op", "can", "halted"]
+repair = { mode = "typos", penalty_per_edit = 150 }
+
+[[entries]]
+term = "stop"
+tag = "interrupt"
+
+[[entries]]
+term = "cancel"
+tag = "interrupt"
+
+[[entries]]
+term = "kill"
+tag = "interrupt"
+
+[[entries]]
+term = "abort"
+tag = "interrupt"
+
+[[entries]]
+term = "halt"
+tag = "interrupt"
+
+[[entries]]
+term = "never mind"
+tag = "interrupt"
+
+[[entries]]
+term = "forget it"
+tag = "interrupt"
+
+[[entries]]
+term = "instead"
+tag = "steer"
+
+[[entries]]
+term = "actually"
+tag = "steer"
+
+[[entries]]
+term = "wait no"
+tag = "steer"
+
+[[entries]]
+term = "rather"
+tag = "steer"
+
+[[entries]]
+term = "change to"
+tag = "steer"
+
+[[entries]]
+term = "switch to"
+tag = "steer"
+
+[[entries]]
+term = "also"
+tag = "queue"
+
+[[entries]]
+term = "after that"
+tag = "queue"
+
+[[entries]]
+term = "afterwards"
+tag = "queue"
+
+[[entries]]
+term = "next"
+tag = "queue"
+
+[[entries]]
+term = "then"
+tag = "queue"
+
+[[entries]]
+term = "and add"
+tag = "queue"
+
+[[entries]]
+term = "when you're done"
+tag = "queue"

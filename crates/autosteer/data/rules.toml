@@ -1,0 +1,186 @@
+# Delivery cue rules (spec §6.1 / delivery-advisor-spec §4.3). Classes map 1:1 onto the
+# Choice options [queue, steer, interrupt]. Scorer is Max: strongest cue wins, with a critical set.
+negators = ["don't", "do not", "no need to", "no"]
+negation_window = 3
+
+[[classes]]
+name = "queue"
+scorer = "max"
+
+[[classes]]
+name = "steer"
+scorer = "max"
+
+[[classes]]
+name = "interrupt"
+scorer = "max"
+
+[[rules]]
+id = "interrupt.stop.v1"
+class = "interrupt"
+pattern = "stop"
+weight_millis = 900
+forbids = ["negation"]
+version = 1
+
+[[rules]]
+id = "interrupt.cancel.v1"
+class = "interrupt"
+pattern = "cancel"
+weight_millis = 900
+forbids = ["negation"]
+version = 1
+
+[[rules]]
+id = "interrupt.kill.v1"
+class = "interrupt"
+pattern = "kill"
+weight_millis = 850
+forbids = ["negation"]
+version = 1
+
+[[rules]]
+id = "interrupt.abort.v1"
+class = "interrupt"
+pattern = "abort"
+weight_millis = 850
+forbids = ["negation"]
+version = 1
+
+[[rules]]
+id = "interrupt.halt.v1"
+class = "interrupt"
+pattern = "halt"
+weight_millis = 850
+forbids = ["negation"]
+version = 1
+
+[[rules]]
+id = "interrupt.never_mind.v1"
+class = "interrupt"
+pattern = "never mind"
+weight_millis = 800
+forbids = ["negation"]
+version = 1
+
+[[rules]]
+id = "interrupt.forget_it.v1"
+class = "interrupt"
+pattern = "forget it"
+weight_millis = 800
+forbids = ["negation"]
+version = 1
+
+# Object-scope: "stop using X" is a steer, not an interrupt. Specificity suppression makes
+# the longer match win over the bare "stop".
+[[rules]]
+id = "steer.stop_using.v1"
+class = "steer"
+pattern = "stop {gerund}"
+weight_millis = 850
+forbids = ["negation"]
+version = 1
+
+[[rules]]
+id = "steer.instead.v1"
+class = "steer"
+pattern = "instead"
+weight_millis = 800
+forbids = ["negation"]
+version = 1
+
+[[rules]]
+id = "steer.actually.v1"
+class = "steer"
+pattern = "actually"
+weight_millis = 750
+forbids = ["negation"]
+version = 1
+
+[[rules]]
+id = "steer.wait_no.v1"
+class = "steer"
+pattern = "wait no"
+weight_millis = 800
+forbids = ["negation"]
+version = 1
+
+[[rules]]
+id = "steer.rather.v1"
+class = "steer"
+pattern = "rather"
+weight_millis = 750
+forbids = ["negation"]
+version = 1
+
+[[rules]]
+id = "steer.change_to.v1"
+class = "steer"
+pattern = "change to"
+weight_millis = 800
+forbids = ["negation"]
+version = 1
+
+[[rules]]
+id = "steer.switch_to.v1"
+class = "steer"
+pattern = "switch to"
+weight_millis = 800
+forbids = ["negation"]
+version = 1
+
+[[rules]]
+id = "queue.also.v1"
+class = "queue"
+pattern = "also"
+weight_millis = 800
+forbids = ["negation"]
+version = 1
+
+[[rules]]
+id = "queue.after_that.v1"
+class = "queue"
+pattern = "after that"
+weight_millis = 800
+forbids = ["negation"]
+version = 1
+
+[[rules]]
+id = "queue.afterwards.v1"
+class = "queue"
+pattern = "afterwards"
+weight_millis = 800
+forbids = ["negation"]
+version = 1
+
+[[rules]]
+id = "queue.next.v1"
+class = "queue"
+pattern = "next"
+weight_millis = 750
+forbids = ["negation"]
+version = 1
+
+[[rules]]
+id = "queue.then.v1"
+class = "queue"
+pattern = "then"
+weight_millis = 700
+forbids = ["negation"]
+version = 1
+
+[[rules]]
+id = "queue.and_add.v1"
+class = "queue"
+pattern = "and add"
+weight_millis = 800
+forbids = ["negation"]
+version = 1
+
+[[rules]]
+id = "queue.when_done.v1"
+class = "queue"
+pattern = "when you're done"
+weight_millis = 800
+forbids = ["negation"]
+version = 1

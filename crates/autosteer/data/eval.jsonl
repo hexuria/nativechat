@@ -1,0 +1,221 @@
+{"message": "stop", "label": "interrupt", "note": "tp"}
+{"message": "stop please", "label": "interrupt", "note": "tp"}
+{"message": "please stop", "label": "interrupt", "note": "tp"}
+{"message": "stop the build", "label": "interrupt", "note": "tp"}
+{"message": "stop that", "label": "interrupt", "note": "tp"}
+{"message": "stop!!", "label": "interrupt", "note": "tp"}
+{"message": "STOP", "label": "interrupt", "note": "tp"}
+{"message": "Stop", "label": "interrupt", "note": "tp"}
+{"message": "  stop  ", "label": "interrupt", "note": "tp"}
+{"message": "stop the run.", "label": "interrupt", "note": "tp"}
+{"message": "cancel", "label": "interrupt", "note": "tp"}
+{"message": "cancel please", "label": "interrupt", "note": "tp"}
+{"message": "please cancel", "label": "interrupt", "note": "tp"}
+{"message": "cancel the build", "label": "interrupt", "note": "tp"}
+{"message": "cancel that", "label": "interrupt", "note": "tp"}
+{"message": "cancel!!", "label": "interrupt", "note": "tp"}
+{"message": "CANCEL", "label": "interrupt", "note": "tp"}
+{"message": "Cancel", "label": "interrupt", "note": "tp"}
+{"message": "  cancel  ", "label": "interrupt", "note": "tp"}
+{"message": "cancel the run.", "label": "interrupt", "note": "tp"}
+{"message": "kill", "label": "interrupt", "note": "tp"}
+{"message": "kill please", "label": "interrupt", "note": "tp"}
+{"message": "please kill", "label": "interrupt", "note": "tp"}
+{"message": "kill the build", "label": "interrupt", "note": "tp"}
+{"message": "kill that", "label": "interrupt", "note": "tp"}
+{"message": "kill!!", "label": "interrupt", "note": "tp"}
+{"message": "KILL", "label": "interrupt", "note": "tp"}
+{"message": "Kill", "label": "interrupt", "note": "tp"}
+{"message": "  kill  ", "label": "interrupt", "note": "tp"}
+{"message": "kill the run.", "label": "interrupt", "note": "tp"}
+{"message": "abort", "label": "interrupt", "note": "tp"}
+{"message": "abort please", "label": "interrupt", "note": "tp"}
+{"message": "please abort", "label": "interrupt", "note": "tp"}
+{"message": "abort the build", "label": "interrupt", "note": "tp"}
+{"message": "abort that", "label": "interrupt", "note": "tp"}
+{"message": "abort!!", "label": "interrupt", "note": "tp"}
+{"message": "ABORT", "label": "interrupt", "note": "tp"}
+{"message": "Abort", "label": "interrupt", "note": "tp"}
+{"message": "  abort  ", "label": "interrupt", "note": "tp"}
+{"message": "abort the run.", "label": "interrupt", "note": "tp"}
+{"message": "halt", "label": "interrupt", "note": "tp"}
+{"message": "halt please", "label": "interrupt", "note": "tp"}
+{"message": "please halt", "label": "interrupt", "note": "tp"}
+{"message": "halt the build", "label": "interrupt", "note": "tp"}
+{"message": "halt that", "label": "interrupt", "note": "tp"}
+{"message": "halt!!", "label": "interrupt", "note": "tp"}
+{"message": "HALT", "label": "interrupt", "note": "tp"}
+{"message": "Halt", "label": "interrupt", "note": "tp"}
+{"message": "  halt  ", "label": "interrupt", "note": "tp"}
+{"message": "halt the run.", "label": "interrupt", "note": "tp"}
+{"message": "never mind", "label": "interrupt", "note": "tp"}
+{"message": "never mind please", "label": "interrupt", "note": "tp"}
+{"message": "please never mind", "label": "interrupt", "note": "tp"}
+{"message": "never mind the build", "label": "interrupt", "note": "tp"}
+{"message": "never mind that", "label": "interrupt", "note": "tp"}
+{"message": "never mind!!", "label": "interrupt", "note": "tp"}
+{"message": "NEVER MIND", "label": "interrupt", "note": "tp"}
+{"message": "Never mind", "label": "interrupt", "note": "tp"}
+{"message": "  never mind  ", "label": "interrupt", "note": "tp"}
+{"message": "never mind the run.", "label": "interrupt", "note": "tp"}
+{"message": "forget it", "label": "interrupt", "note": "tp"}
+{"message": "forget it please", "label": "interrupt", "note": "tp"}
+{"message": "please forget it", "label": "interrupt", "note": "tp"}
+{"message": "forget it the build", "label": "interrupt", "note": "tp"}
+{"message": "forget it that", "label": "interrupt", "note": "tp"}
+{"message": "forget it!!", "label": "interrupt", "note": "tp"}
+{"message": "FORGET IT", "label": "interrupt", "note": "tp"}
+{"message": "Forget it", "label": "interrupt", "note": "tp"}
+{"message": "  forget it  ", "label": "interrupt", "note": "tp"}
+{"message": "forget it the run.", "label": "interrupt", "note": "tp"}
+{"message": "stpo now", "label": "interrupt", "note": "typo"}
+{"message": "cancle now", "label": "interrupt", "note": "typo"}
+{"message": "abbort now", "label": "interrupt", "note": "typo"}
+{"message": "haltt now", "label": "interrupt", "note": "typo"}
+{"message": "stopp now", "label": "interrupt", "note": "typo"}
+{"message": "use rust instead", "label": "steer", "note": "tp"}
+{"message": "USE RUST INSTEAD", "label": "steer", "note": "tp"}
+{"message": "please use rust instead", "label": "steer", "note": "tp"}
+{"message": "use rust instead!!", "label": "steer", "note": "tp"}
+{"message": "actually use nvim", "label": "steer", "note": "tp"}
+{"message": "ACTUALLY USE NVIM", "label": "steer", "note": "tp"}
+{"message": "please actually use nvim", "label": "steer", "note": "tp"}
+{"message": "actually use nvim!!", "label": "steer", "note": "tp"}
+{"message": "wait no do this", "label": "steer", "note": "tp"}
+{"message": "WAIT NO DO THIS", "label": "steer", "note": "tp"}
+{"message": "please wait no do this", "label": "steer", "note": "tp"}
+{"message": "wait no do this!!", "label": "steer", "note": "tp"}
+{"message": "rather use go", "label": "steer", "note": "tp"}
+{"message": "RATHER USE GO", "label": "steer", "note": "tp"}
+{"message": "please rather use go", "label": "steer", "note": "tp"}
+{"message": "rather use go!!", "label": "steer", "note": "tp"}
+{"message": "change to dark", "label": "steer", "note": "tp"}
+{"message": "CHANGE TO DARK", "label": "steer", "note": "tp"}
+{"message": "please change to dark", "label": "steer", "note": "tp"}
+{"message": "change to dark!!", "label": "steer", "note": "tp"}
+{"message": "switch to vim", "label": "steer", "note": "tp"}
+{"message": "SWITCH TO VIM", "label": "steer", "note": "tp"}
+{"message": "please switch to vim", "label": "steer", "note": "tp"}
+{"message": "switch to vim!!", "label": "steer", "note": "tp"}
+{"message": "stop using postgres", "label": "steer", "note": "tp"}
+{"message": "STOP USING POSTGRES", "label": "steer", "note": "tp"}
+{"message": "please stop using postgres", "label": "steer", "note": "tp"}
+{"message": "stop using postgres!!", "label": "steer", "note": "tp"}
+{"message": "also add tests", "label": "queue", "note": "tp"}
+{"message": "Also add tests", "label": "queue", "note": "tp"}
+{"message": "hmm also add tests", "label": "queue", "note": "tp"}
+{"message": "after that deploy", "label": "queue", "note": "tp"}
+{"message": "After that deploy", "label": "queue", "note": "tp"}
+{"message": "hmm after that deploy", "label": "queue", "note": "tp"}
+{"message": "afterwards ping me", "label": "queue", "note": "tp"}
+{"message": "Afterwards ping me", "label": "queue", "note": "tp"}
+{"message": "hmm afterwards ping me", "label": "queue", "note": "tp"}
+{"message": "next fix lint", "label": "queue", "note": "tp"}
+{"message": "Next fix lint", "label": "queue", "note": "tp"}
+{"message": "hmm next fix lint", "label": "queue", "note": "tp"}
+{"message": "then rebase", "label": "queue", "note": "tp"}
+{"message": "Then rebase", "label": "queue", "note": "tp"}
+{"message": "hmm then rebase", "label": "queue", "note": "tp"}
+{"message": "and add a log", "label": "queue", "note": "tp"}
+{"message": "And add a log", "label": "queue", "note": "tp"}
+{"message": "hmm and add a log", "label": "queue", "note": "tp"}
+{"message": "when you're done notify", "label": "queue", "note": "tp"}
+{"message": "When you're done notify", "label": "queue", "note": "tp"}
+{"message": "hmm when you're done notify", "label": "queue", "note": "tp"}
+{"message": "hello there", "label": "abstain_or_other", "note": "neg"}
+{"message": "how is the build", "label": "abstain_or_other", "note": "neg"}
+{"message": "looks good", "label": "abstain_or_other", "note": "neg"}
+{"message": "thanks", "label": "abstain_or_other", "note": "neg"}
+{"message": "run `stop` in the shell", "label": "abstain_or_other", "note": "neg"}
+{"message": "see https://x.test/stop", "label": "abstain_or_other", "note": "neg"}
+{"message": "edit src/stop.rs", "label": "abstain_or_other", "note": "neg"}
+{"message": "say \"stop\" politely", "label": "abstain_or_other", "note": "neg"}
+{"message": "don't stop", "label": "abstain_or_other", "note": "neg"}
+{"message": "do not cancel", "label": "abstain_or_other", "note": "neg"}
+{"message": "no need to abort", "label": "abstain_or_other", "note": "neg"}
+{"message": "should I stop?", "label": "abstain_or_other", "note": "neg"}
+{"message": "what about stopping later", "label": "abstain_or_other", "note": "neg"}
+{"message": "the stopwatch is broken", "label": "abstain_or_other", "note": "neg"}
+{"message": "top of the morning", "label": "abstain_or_other", "note": "neg"}
+{"message": "ѕtop now", "label": "abstain_or_other", "note": "neg"}
+{"message": "stop the deploy #0", "label": "interrupt", "note": "pad"}
+{"message": "cancel the job #1", "label": "interrupt", "note": "pad"}
+{"message": "abort migration #2", "label": "interrupt", "note": "pad"}
+{"message": "halt pipeline #3", "label": "interrupt", "note": "pad"}
+{"message": "kill the worker #4", "label": "interrupt", "note": "pad"}
+{"message": "instead run lint #5", "label": "steer", "note": "pad"}
+{"message": "actually open the file #6", "label": "steer", "note": "pad"}
+{"message": "switch to staging #7", "label": "steer", "note": "pad"}
+{"message": "change to main #8", "label": "steer", "note": "pad"}
+{"message": "also write docs #9", "label": "queue", "note": "pad"}
+{"message": "after that merge #10", "label": "queue", "note": "pad"}
+{"message": "next update deps #11", "label": "queue", "note": "pad"}
+{"message": "stop the deploy #12", "label": "interrupt", "note": "pad"}
+{"message": "cancel the job #13", "label": "interrupt", "note": "pad"}
+{"message": "abort migration #14", "label": "interrupt", "note": "pad"}
+{"message": "halt pipeline #15", "label": "interrupt", "note": "pad"}
+{"message": "kill the worker #16", "label": "interrupt", "note": "pad"}
+{"message": "instead run lint #17", "label": "steer", "note": "pad"}
+{"message": "actually open the file #18", "label": "steer", "note": "pad"}
+{"message": "switch to staging #19", "label": "steer", "note": "pad"}
+{"message": "change to main #20", "label": "steer", "note": "pad"}
+{"message": "also write docs #21", "label": "queue", "note": "pad"}
+{"message": "after that merge #22", "label": "queue", "note": "pad"}
+{"message": "next update deps #23", "label": "queue", "note": "pad"}
+{"message": "stop the deploy #24", "label": "interrupt", "note": "pad"}
+{"message": "cancel the job #25", "label": "interrupt", "note": "pad"}
+{"message": "abort migration #26", "label": "interrupt", "note": "pad"}
+{"message": "halt pipeline #27", "label": "interrupt", "note": "pad"}
+{"message": "kill the worker #28", "label": "interrupt", "note": "pad"}
+{"message": "instead run lint #29", "label": "steer", "note": "pad"}
+{"message": "actually open the file #30", "label": "steer", "note": "pad"}
+{"message": "switch to staging #31", "label": "steer", "note": "pad"}
+{"message": "change to main #32", "label": "steer", "note": "pad"}
+{"message": "also write docs #33", "label": "queue", "note": "pad"}
+{"message": "after that merge #34", "label": "queue", "note": "pad"}
+{"message": "next update deps #35", "label": "queue", "note": "pad"}
+{"message": "stop the deploy #36", "label": "interrupt", "note": "pad"}
+{"message": "cancel the job #37", "label": "interrupt", "note": "pad"}
+{"message": "abort migration #38", "label": "interrupt", "note": "pad"}
+{"message": "halt pipeline #39", "label": "interrupt", "note": "pad"}
+{"message": "kill the worker #40", "label": "interrupt", "note": "pad"}
+{"message": "instead run lint #41", "label": "steer", "note": "pad"}
+{"message": "actually open the file #42", "label": "steer", "note": "pad"}
+{"message": "switch to staging #43", "label": "steer", "note": "pad"}
+{"message": "change to main #44", "label": "steer", "note": "pad"}
+{"message": "also write docs #45", "label": "queue", "note": "pad"}
+{"message": "after that merge #46", "label": "queue", "note": "pad"}
+{"message": "next update deps #47", "label": "queue", "note": "pad"}
+{"message": "stop the deploy #48", "label": "interrupt", "note": "pad"}
+{"message": "cancel the job #49", "label": "interrupt", "note": "pad"}
+{"message": "abort migration #50", "label": "interrupt", "note": "pad"}
+{"message": "halt pipeline #51", "label": "interrupt", "note": "pad"}
+{"message": "kill the worker #52", "label": "interrupt", "note": "pad"}
+{"message": "instead run lint #53", "label": "steer", "note": "pad"}
+{"message": "actually open the file #54", "label": "steer", "note": "pad"}
+{"message": "switch to staging #55", "label": "steer", "note": "pad"}
+{"message": "change to main #56", "label": "steer", "note": "pad"}
+{"message": "also write docs #57", "label": "queue", "note": "pad"}
+{"message": "after that merge #58", "label": "queue", "note": "pad"}
+{"message": "next update deps #59", "label": "queue", "note": "pad"}
+{"message": "stop the deploy #60", "label": "interrupt", "note": "pad"}
+{"message": "cancel the job #61", "label": "interrupt", "note": "pad"}
+{"message": "abort migration #62", "label": "interrupt", "note": "pad"}
+{"message": "halt pipeline #63", "label": "interrupt", "note": "pad"}
+{"message": "kill the worker #64", "label": "interrupt", "note": "pad"}
+{"message": "instead run lint #65", "label": "steer", "note": "pad"}
+{"message": "actually open the file #66", "label": "steer", "note": "pad"}
+{"message": "switch to staging #67", "label": "steer", "note": "pad"}
+{"message": "change to main #68", "label": "steer", "note": "pad"}
+{"message": "also write docs #69", "label": "queue", "note": "pad"}
+{"message": "after that merge #70", "label": "queue", "note": "pad"}
+{"message": "next update deps #71", "label": "queue", "note": "pad"}
+{"message": "stop the deploy #72", "label": "interrupt", "note": "pad"}
+{"message": "cancel the job #73", "label": "interrupt", "note": "pad"}
+{"message": "abort migration #74", "label": "interrupt", "note": "pad"}
+{"message": "halt pipeline #75", "label": "interrupt", "note": "pad"}
+{"message": "kill the worker #76", "label": "interrupt", "note": "pad"}
+{"message": "instead run lint #77", "label": "steer", "note": "pad"}
+{"message": "actually open the file #78", "label": "steer", "note": "pad"}
+{"message": "switch to staging #79", "label": "steer", "note": "pad"}
+{"message": "also write docs #80", "label": "queue", "note": "pad"}

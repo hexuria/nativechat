@@ -1,5 +1,5 @@
 [workspace]
-members = ["."]
+members = [".", "crates/autosteer"]
 resolver = "2"
 
 # GPUI layout/paint in opt-level 0 is several times slower than release.

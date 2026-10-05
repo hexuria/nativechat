@@ -1,0 +1,60 @@
+[package]
+name = "nativechat-autosteer"
+description = "NativeChat autosteer: queue / steer / interrupt delivery advice for a composer message, decided by the PUA engine (pua-rules RuleClassifier) over NativeChat-owned data."
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+license = "MIT"
+publish = false
+
+# The engine is pinned by git rev (no PUA tag exists yet). Bump deliberately: a PUA change that
+# alters output changes `DataVersion`, and the golden journal below must be regenerated in the
+# same PR (`cargo run -p nativechat-autosteer --example write_golden`).
+[dependencies]
+pua-core = { git = "https://github.com/hexuria/pua", rev = "e1635f12908deda99308f03222c4265043e0e749", features = ["serde"] }
+pua-text = { git = "https://github.com/hexuria/pua", rev = "e1635f12908deda99308f03222c4265043e0e749" }
+pua-lexicon = { git = "https://github.com/hexuria/pua", rev = "e1635f12908deda99308f03222c4265043e0e749", features = ["serde"] }
+pua-rules = { git = "https://github.com/hexuria/pua", rev = "e1635f12908deda99308f03222c4265043e0e749", features = ["serde"] }
+pua-explain = { git = "https://github.com/hexuria/pua", rev = "e1635f12908deda99308f03222c4265043e0e749" }
+serde = { version = "1.0", default-features = false, features = ["std", "derive"] }
+serde_json = { version = "1.0", default-features = false, features = ["std"] }
+toml = { version = "1.0", default-features = false, features = ["parse", "serde"] }
+
+[dev-dependencies]
+proptest = { version = "1.9", default-features = false, features = ["std", "bit-set"] }
+unicode-normalization = { version = "0.1", default-features = false, features = ["std"] }
+
+[[example]]
+name = "replay"
+path = "examples/replay.rs"
+
+[[example]]
+name = "write_golden"
+path = "examples/write_golden.rs"
+
+[[example]]
+name = "eval"
+path = "examples/eval.rs"
+
+# Same bar as the engine: the decision path is integer-only and never unwraps.
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+unreachable_pub = "warn"
+unused_qualifications = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+float_arithmetic = "deny"
+float_cmp = "deny"
+dbg_macro = "deny"
+todo = "deny"
+print_stdout = "warn"
+print_stderr = "warn"
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+similar_names = "allow"
+too_many_lines = "allow"
