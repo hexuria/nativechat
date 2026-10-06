@@ -113,6 +113,19 @@ pub enum ConnectionChange {
     /// Take it back from this Bot.
     Revoke(String),
     Disconnect,
+    /// Call the account this (opengrok-server #359), so two accounts of one service can be told
+    /// apart.
+    Rename(String),
+}
+
+/// Which account each of the person's Bots uses for each service, as far as the app knows it
+/// (opengrok-server #359): what a plugin's picker shows, and what the removal question names.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PinList {
+    Loading,
+    Listed(Vec<crate::opengrok::ConnectionPin>),
+    /// The server would not list them, in its words or the app's.
+    Unavailable(String),
 }
 
 /// The start of the line beside a Bot's switch when the server refuses a lend or a revoke, before
@@ -183,6 +196,25 @@ pub struct AccountConnections {
     /// the service from every Bot it is lent to and needs a browser sign-in to undo, so the row
     /// asks first, naming the Bots that would lose it. One at a time.
     pub confirming_disconnect: Option<String>,
+    /// What `GET /connections/pins` last said: which account each Bot uses for each service
+    /// (opengrok-server #359). `None` until it has been asked since sign-in.
+    pub pins: Option<PinList>,
+    /// The pick of an account that is with the server, by the Bot and the service: the account
+    /// asked for, or `None` for Ask each time. One at a time for each Bot and service: the
+    /// picker is dead until the server has answered, so two answers never land out of order.
+    pub picking: HashMap<(String, String), Option<String>>,
+    /// Why the last pick did not go through, by the Bot and the service: under that Bot's picker
+    /// until something is picked there again.
+    pub not_picked: HashMap<(String, String), String>,
+    /// Why the last rename of an account did not go through, by the connection's id: under its
+    /// row until it is renamed again, or the server stops listing it.
+    pub not_renamed: HashMap<String, String>,
+    /// The account whose Reconnect is asking for its sign-in page, beside [`Self::opening`],
+    /// which names its service.
+    pub reconnecting: Option<String>,
+    /// Why the last Reconnect did not open the browser: the account, by its connection id, and
+    /// why.
+    pub reconnect_refused: Option<(String, String)>,
 }
 
 impl AccountConnections {
@@ -302,7 +334,61 @@ impl AccountConnections {
             .collect()
     }
 
-    /// Put a lend's or a revoke's answer in the list, as the server wrote the row.
+    /// What an account is called on screen: what the server last said, or, while a rename is
+    /// with the server, the label asked for. A refusal takes the ask away, and the server's
+    /// label is what shows again.
+    pub fn shown_label(&self, row: &crate::opengrok::ConnectionView) -> String {
+        match self.changing.get(&row.id) {
+            Some(ConnectionChange::Rename(label)) => label.clone(),
+            _ => row.label.clone(),
+        }
+    }
+
+    /// The Bots the server last said use this account by pick, in its order. They ask each time
+    /// once it is removed, since the server drops every pin that named it.
+    pub fn pinned_bots(&self, connection_id: &str) -> Vec<String> {
+        match &self.pins {
+            Some(PinList::Listed(pins)) => pins
+                .iter()
+                .filter(|pin| pin.connection_id == connection_id)
+                .map(|pin| pin.coworker_id.clone())
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// The account a Bot shows as picked for a service, `None` inside for Ask each time: what the
+    /// server last said, or, while a pick is with the server, what was asked. `None` while the
+    /// pins have not been read, when the picker can say nothing true about either.
+    pub fn shown_pick(&self, coworker_id: &str, connector: &str) -> Option<Option<String>> {
+        let Some(PinList::Listed(pins)) = &self.pins else {
+            return None;
+        };
+        let key = (coworker_id.to_string(), connector.to_string());
+        if let Some(asked) = self.picking.get(&key) {
+            return Some(asked.clone());
+        }
+        Some(
+            pins.iter()
+                .find(|pin| pin.coworker_id == coworker_id && pin.connector == connector)
+                .map(|pin| pin.connection_id.clone()),
+        )
+    }
+
+    /// Whether a pick for this Bot and service is with the server.
+    pub fn is_picking(&self, coworker_id: &str, connector: &str) -> bool {
+        self.picking
+            .contains_key(&(coworker_id.to_string(), connector.to_string()))
+    }
+
+    /// Why the last pick for this Bot and service did not go through.
+    pub fn pick_refusal(&self, coworker_id: &str, connector: &str) -> Option<&str> {
+        self.not_picked
+            .get(&(coworker_id.to_string(), connector.to_string()))
+            .map(String::as_str)
+    }
+
+    /// Put a change's answer in the list, as the server wrote the row.
     fn put_row(&mut self, answered: crate::opengrok::ConnectionView) {
         if let Some(ConnectionList::Listed(rows)) = &mut self.list
             && let Some(row) = rows.iter_mut().find(|row| row.id == answered.id)
@@ -319,6 +405,19 @@ impl AccountConnections {
         self.not_disconnected.remove(id);
         self.not_changed.retain(|(about, _), _| about != id);
         self.not_changed_asked.retain(|(about, _), _| about != id);
+        self.not_renamed.remove(id);
+        if self
+            .reconnect_refused
+            .as_ref()
+            .is_some_and(|(about, _)| about == id)
+        {
+            self.reconnect_refused = None;
+        }
+        // The server drops every pin that named it, so the Bots it was picked for ask each time
+        // from now on; the read of the pins that follows says the same.
+        if let Some(PinList::Listed(pins)) = &mut self.pins {
+            pins.retain(|pin| pin.connection_id != id);
+        }
         if self.confirming_disconnect.as_deref() == Some(id) {
             self.confirming_disconnect = None;
         }
@@ -1525,7 +1624,8 @@ impl Message {
                 | ChatPart::UserForm(_)
                 | ChatPart::SaveLogin(_)
                 | ChatPart::Step(_)
-                | ChatPart::Reasoning(_) => true,
+                | ChatPart::Reasoning(_)
+                | ChatPart::PluginNeeds(_) => true,
             })
     }
 
@@ -1541,7 +1641,8 @@ impl Message {
                 | ChatPart::UserForm(_)
                 | ChatPart::SaveLogin(_)
                 | ChatPart::Step(_)
-                | ChatPart::Reasoning(_) => false,
+                | ChatPart::Reasoning(_)
+                | ChatPart::PluginNeeds(_) => false,
             })
     }
 
@@ -1628,9 +1729,12 @@ fn saved_parts(parts: &[ChatPart]) -> Vec<MessagePart> {
                     height: spec.height,
                 });
             }
-            ChatPart::Approval(_) | ChatPart::UserForm(_) | ChatPart::SaveLogin(_) => {
-                break_paragraph(&mut words)
-            }
+            // A needs card is answered by sending the message again, and a run that asked no
+            // model leaves nothing on the server to read it back from: it is this session's.
+            ChatPart::Approval(_)
+            | ChatPart::UserForm(_)
+            | ChatPart::SaveLogin(_)
+            | ChatPart::PluginNeeds(_) => break_paragraph(&mut words),
             ChatPart::Ui(spec) => {
                 close_text_run(&mut words, &mut saved);
                 saved.push(MessagePart::Ui {
@@ -3054,6 +3158,7 @@ fn stream_part_sig(parts: &[ChatPart]) -> (usize, u8) {
             ChatPart::SaveLogin(_) => 16,
             ChatPart::Step(_) => 32,
             ChatPart::Reasoning(_) => 64,
+            ChatPart::PluginNeeds(_) => 128,
         }
     });
     let settled = parts
@@ -4962,8 +5067,6 @@ pub enum AppSettingsTab {
     Computer,
     Updates,
     Logins,
-    /// The services the person has signed in to for their Bots, and the ones on offer (#2).
-    Connections,
     Skills,
 }
 
@@ -5210,7 +5313,12 @@ pub struct AppState {
     pub more_menu_open: bool,
     /// The composer's "+" picker: what it can offer, what is picked, and what each entry is.
     /// Tools named for the next message. They show as chips beside the composer's "+".
-    pub picked_tools: Vec<PickedTool>,
+    /// The accounts a "Which account?" card picked, by plugin then service, for the turn its
+    /// answer sends next and only that turn (`pluginAccounts`, [`crate::opengrok::TurnTags`]).
+    pub next_turn_accounts:
+        std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
+    /// The reply rows whose "Which account?" card has Remember on.
+    pub plugin_needs_remember: HashSet<String>,
     /// The recipe the next message runs, once one has been picked with `/`. While it is set the
     /// composer is in recipe mode: `@` offers this recipe's parameters instead of the bot's
     /// tools, because a turn that is already a recipe run has no use for a tool roster.
@@ -5527,6 +5635,8 @@ pub struct AppState {
     /// A monitor modal belongs to the Bot that opened it and closes on a Bot change.
     pub monitor_modal: Option<crate::components::monitor_modal::MonitorModal>,
     monitor_generation: u64,
+    /// The plugin marketplace: catalog, installs, details and unfinished sign-ins (#184/#185).
+    pub plugin_market: PluginMarket,
     /// Counts the reads the Usage modal asked for, so only the newest answer is shown: a chip
     /// pressed twice, or two in a row, can come back out of order.
     usage_modal_generation: u64,
@@ -5547,6 +5657,9 @@ pub struct AppState {
     /// Connect it was asked for. The service's name cannot tell that ask from another for the
     /// same service, or from one an account that has since signed out made.
     connect_asks: u64,
+    /// Counts the reads of the pins (opengrok-server #359), so only the newest answer is shown,
+    /// and none from before a sign-out.
+    pins_generation: u64,
     /// Where the server keeps this account's replies paid from, and the unsaved changes to this
     /// computer's half of the relay on its card in Settings → Computer. A Bot that has picked no
     /// door of its own follows the kind the server keeps, which nothing here switches.
@@ -5775,7 +5888,7 @@ pub struct AppState {
     /// What the OPEN SKILL's fetch said when it was refused, shown on its pane.
     pub skill_error: Option<String>,
     /// What the CREATE said when it was refused — the server's own sentence, including the one
-    /// naming the 8000-character cap on a body. Shown in the sheet, over the fields it is about.
+    /// naming the cap on a body. Shown in the sheet, over the fields it is about.
     pub skill_add_error: Option<String>,
     /// Bumped per refresh, so a late answer for an earlier scope is dropped.
     skills_epoch: u64,
@@ -5883,39 +5996,6 @@ pub struct SourceTtsState {
     pub message_id: Option<String>,
     pub is_paused: bool,
     pub is_loading: bool,
-}
-
-/// A tool the person named for the next message, by typing `@` in the composer.
-///
-/// The kind travels with it. The chip row used to decide Tools from Apps by matching the name
-/// against a hardcoded list, which only worked while the names came from one hardcoded menu;
-/// a real tool's name comes from the server and matches nothing.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PickedTool {
-    /// What the server calls it: `shell`, or a plugin's qualified `plugin.server.tool`.
-    pub id: String,
-    /// What the chip reads.
-    pub label: String,
-    pub kind: PickedKind,
-}
-
-/// Which group a chip sits in. A bare name is one of the server's built-in tools; a qualified
-/// one belongs to a plugin, which is what the person means by an app.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PickedKind {
-    Tool,
-    App,
-}
-
-impl PickedKind {
-    /// Read the kind off the name, the same rule the server's tool listing uses.
-    pub fn of(id: &str) -> Self {
-        if id.contains('.') {
-            Self::App
-        } else {
-            Self::Tool
-        }
-    }
 }
 
 /// The skill the next message is sent with, picked with `/` in the composer.
@@ -6076,7 +6156,8 @@ impl AppState {
             is_sidebar_open: true,
             voice_status: VoiceStatus::Ready,
             more_menu_open: false,
-            picked_tools: Vec::new(),
+            next_turn_accounts: Default::default(),
+            plugin_needs_remember: HashSet::new(),
             active_recipe: None,
             active_skill: None,
             composer_files: Vec::new(),
@@ -6211,6 +6292,7 @@ impl AppState {
             agent_tools_open: false,
             usage_modal: None,
             monitor_modal: None,
+            plugin_market: PluginMarket::default(),
             monitor_generation: 0,
             usage_modal_generation: 0,
             tools_generation: 0,
@@ -6218,6 +6300,7 @@ impl AppState {
             connections_generation: 0,
             connectors_generation: 0,
             connect_asks: 0,
+            pins_generation: 0,
             reply_source: ReplySourceSettings::default(),
             reply_source_generation: 0,
             models_generation: 0,
@@ -7392,6 +7475,11 @@ impl AppState {
     fn forget_account(&mut self) {
         self.monitor_modal = None;
         self.monitor_generation += 1;
+        // Nothing read for the account that signed out answers for the next one.
+        self.plugin_market = PluginMarket {
+            generation: self.plugin_market.generation + 1,
+            ..PluginMarket::default()
+        };
         self.account = None;
         self.auth_status = AuthStatus::SignedOut;
         self.saved_login_use.clear();
@@ -7431,6 +7519,7 @@ impl AppState {
         self.connections_generation += 1;
         self.connectors_generation += 1;
         self.connect_asks += 1;
+        self.pins_generation += 1;
         // So was the reply source, its default for new Bots, and whatever read or change of it
         // is still out.
         self.reply_source = ReplySourceSettings::default();
@@ -8529,11 +8618,8 @@ impl AppState {
                 self.refresh_coworker_tools(cx);
                 self.refresh_coworker_ceiling(cx);
             }
-            MonitorKind::Plugins => {
-                self.agent_skills_open = true;
-                self.refresh_connections(cx);
-                self.refresh_coworker_skills(cx);
-            }
+            // Plugins is the marketplace (#184), wherever it is opened from.
+            MonitorKind::Plugins => return self.open_plugin_market(cx),
         }
         cx.notify();
     }
@@ -8565,6 +8651,7 @@ impl AppState {
         modal.selected = plugin;
         modal.confirming = false;
         modal.error = None;
+        modal.renaming = None;
         cx.notify();
     }
 
@@ -8580,6 +8667,130 @@ impl AppState {
         cx.notify();
     }
 
+    /// One of the accounts a plugin's detail lists: one of the person's own, of the service the
+    /// detail is open on. `None` for any other, and while no such detail is open.
+    fn account_in_detail(&self, connection_id: &str) -> Option<&crate::opengrok::ConnectionView> {
+        use crate::components::monitor_modal::{MonitorKind, PluginSelection};
+        let modal = self
+            .monitor_modal
+            .as_ref()
+            .filter(|modal| modal.kind == MonitorKind::Plugins)?;
+        let own = self.connections.own_rows();
+        let service = match modal.selected.as_ref()? {
+            PluginSelection::Connection(open) => {
+                own.iter().find(|row| &row.id == open)?.connector.clone()
+            }
+            PluginSelection::Service(connector) => connector.clone(),
+            // An installed plugin's detail lists the pasted accounts the install holds, and only
+            // those: two installs naming one service each have their own.
+            PluginSelection::Plugin(name) => {
+                let install = self.plugin_market.installation(name)?;
+                let bound = install
+                    .accounts
+                    .iter()
+                    .find(|a| a.connection_id == connection_id)?;
+                bound.connector.clone()
+            }
+            PluginSelection::Skill(_) => return None,
+        };
+        own.into_iter()
+            .find(|row| row.id == connection_id && row.connector == service)
+    }
+
+    /// Rename, on an account in a plugin's detail: its label becomes a field holding it, where
+    /// Enter saves and Escape puts the label back. One account at a time, only one with nothing
+    /// with the server.
+    pub fn start_account_rename(&mut self, connection_id: String, cx: &mut Context<Self>) {
+        // A sign-in still waiting is renamed through the same field: the account takes the label
+        // when it connects.
+        if let Some(label) = self
+            .attempt_in_detail(&connection_id)
+            .map(|a| a.label.clone())
+        {
+            if let Some(modal) = self.monitor_modal.as_mut().filter(|modal| !modal.removing) {
+                modal.renaming = Some((connection_id, label));
+                cx.notify();
+            }
+            return;
+        }
+        let Some(label) = self
+            .account_in_detail(&connection_id)
+            .filter(|row| !self.connections.is_changing(&row.id))
+            .map(|row| self.connections.shown_label(row))
+        else {
+            return;
+        };
+        let Some(modal) = self.monitor_modal.as_mut().filter(|modal| !modal.removing) else {
+            return;
+        };
+        modal.renaming = Some((connection_id, label));
+        cx.notify();
+    }
+
+    /// What the open rename field holds, as typed.
+    pub fn set_account_rename(&mut self, text: String, cx: &mut Context<Self>) {
+        if let Some((_, typed)) = self
+            .monitor_modal
+            .as_mut()
+            .and_then(|modal| modal.renaming.as_mut())
+            && *typed != text
+        {
+            *typed = text;
+            cx.notify();
+        }
+    }
+
+    /// Escape, in an account's rename field: the field closes, and nothing is sent.
+    pub fn cancel_account_rename(&mut self, cx: &mut Context<Self>) {
+        if let Some(modal) = self.monitor_modal.as_mut()
+            && modal.renaming.take().is_some()
+        {
+            cx.notify();
+        }
+    }
+
+    /// Enter, in an account's rename field: the label typed goes to the server
+    /// (opengrok-server #359), unless it is the label the account has already. The field closes
+    /// either way, and while the server has it the row shows the label asked for
+    /// ([`AccountConnections::shown_label`]); a refusal is said under the row in the server's
+    /// words, an empty label or one past 80 characters among them, and the server's label shows
+    /// again.
+    pub fn save_account_rename(&mut self, cx: &mut Context<Self>) {
+        let Some((connection_id, typed)) = self
+            .monitor_modal
+            .as_mut()
+            .and_then(|modal| modal.renaming.take())
+        else {
+            return;
+        };
+        cx.notify();
+        let label = typed.trim().to_string();
+        if self.attempt_in_detail(&connection_id).is_some() {
+            self.save_attempt_rename(connection_id, label, cx);
+            return;
+        }
+        let Some(row) = self.account_in_detail(&connection_id) else {
+            return;
+        };
+        if row.label == label {
+            return;
+        }
+        self.change_connection(connection_id, ConnectionChange::Rename(label), cx);
+    }
+
+    /// A sign-in still waiting, of the service a detail is open on. `None` for any other.
+    fn attempt_in_detail(&self, attempt_id: &str) -> Option<&crate::opengrok::ConnectionAttempt> {
+        use crate::components::monitor_modal::PluginSelection;
+        let modal = self.monitor_modal.as_ref()?;
+        let Some(PluginSelection::Service(connector)) = &modal.selected else {
+            return None;
+        };
+        self.plugin_market
+            .attempts_for(connector)
+            .into_iter()
+            .find(|attempt| attempt.id == attempt_id)
+    }
+
     /// Removing is account-wide, rather than detaching from this Bot. The confirmation says so.
     pub fn remove_monitor_plugin(&mut self, cx: &mut Context<Self>) {
         use crate::components::monitor_modal::{PluginSelection, plugin_exists};
@@ -8587,6 +8798,16 @@ impl AppState {
             return;
         };
         if !modal.confirming || modal.removing {
+            return;
+        }
+        // One account of a service's, asked from its row: disconnected, and its Bots ask again.
+        if let Some(id) = modal.removal.clone() {
+            if self.account_in_detail(&id).is_some() {
+                let modal = self.monitor_modal.as_mut().unwrap();
+                modal.confirming = false;
+                modal.removal = None;
+                self.disconnect_connection(id, cx);
+            }
             return;
         }
         let Some(plugin) = modal.selected.clone() else {
@@ -9776,12 +9997,209 @@ impl AppState {
         }
     }
 
-    /// Ask the server for the person's connections and for the services it can connect: each
-    /// time Settings → Connections or a bot's settings open, and on Refresh. What was listed
-    /// stays on screen while it is asked again.
+    /// Ask the server for the person's connections, for the services it can connect and for
+    /// which account each Bot uses: each time Settings → Connections, a bot's settings or the
+    /// monitor's Plugins open, and on Refresh. What was listed stays on screen while it is asked
+    /// again.
     pub fn refresh_connections(&mut self, cx: &mut Context<Self>) {
         self.read_connections(cx);
         self.read_connectors(cx);
+        self.read_pins(cx);
+    }
+
+    /// Ask the server which account each Bot uses for each service (opengrok-server #359): with
+    /// the connections, and again after every pick and every Disconnect, since the server drops
+    /// the pins that named a connection it disconnects.
+    fn read_pins(&mut self, cx: &mut Context<Self>) {
+        let Some(client) = self.opengrok.clone() else {
+            return;
+        };
+        let generation = self.begin_pins_read();
+        cx.spawn(async move |this, cx| {
+            let listed = client.list_connection_pins().await;
+            let _ = this.update(cx, |state, cx| {
+                if state.settle_pins(generation, listed) {
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Begin a read of the pins, which overtakes every read begun before it. What was listed
+    /// stays on screen while it is asked again.
+    fn begin_pins_read(&mut self) -> u64 {
+        if !matches!(self.connections.pins, Some(PinList::Listed(_))) {
+            self.connections.pins = Some(PinList::Loading);
+        }
+        self.pins_generation += 1;
+        self.pins_generation
+    }
+
+    /// Put a read of the pins on screen, unless a newer read has begun or the person has signed
+    /// out since. `false` when it was dropped and nothing was touched.
+    fn settle_pins(
+        &mut self,
+        generation: u64,
+        listed: Result<Vec<crate::opengrok::ConnectionPin>, OpenGrokError>,
+    ) -> bool {
+        if self.pins_generation != generation {
+            return false;
+        }
+        self.connections.pins = Some(match listed {
+            Ok(pins) => PinList::Listed(pins),
+            Err(error) => PinList::Unavailable(rules_refusal(
+                "Which account each Bot uses could not be read",
+                &error,
+            )),
+        });
+        true
+    }
+
+    /// A pick on a plugin's picker: the open Bot uses this account for the service, or, for
+    /// `None`, Ask each time (opengrok-server #359). The picker shows what was asked while the
+    /// server has it and the server's word once it answers; a refusal puts back what the server
+    /// says, with its sentence under the picker. The pins are read again whatever it said.
+    pub fn pick_account(
+        &mut self,
+        connector: String,
+        connection_id: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let (Some(client), Some(coworker_id)) =
+            (self.opengrok.clone(), self.active_coworker_id.clone())
+        else {
+            return;
+        };
+        if !self.begin_pick(&coworker_id, &connector, connection_id.clone()) {
+            return;
+        }
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let answer = match &connection_id {
+                Some(id) => client.pin_connection(&coworker_id, &connector, id).await,
+                None => client
+                    .unpin_connection(&coworker_id, &connector)
+                    .await
+                    .map(|()| None),
+            };
+            let _ = this.update(cx, |state, cx| {
+                if state.settle_pick(&coworker_id, &connector, &connection_id, answer) {
+                    state.read_pins(cx);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Mark a pick as with the server. `false` while the pins are not read, while another pick
+    /// for this Bot and service is out, for an account that is not one of the person's own of
+    /// this service, and for what the picker shows already, which would change nothing.
+    fn begin_pick(&mut self, coworker_id: &str, connector: &str, pick: Option<String>) -> bool {
+        let connections = &mut self.connections;
+        let shown = connections.shown_pick(coworker_id, connector);
+        let unknown_account = pick.as_ref().is_some_and(|id| {
+            !connections
+                .own_rows()
+                .iter()
+                .any(|row| &row.id == id && row.connector == connector)
+        });
+        if connections.is_picking(coworker_id, connector)
+            || shown.is_none_or(|shown| shown == pick)
+            || unknown_account
+        {
+            return false;
+        }
+        let key = (coworker_id.to_string(), connector.to_string());
+        // Picked again, the line about the last pick goes.
+        connections.not_picked.remove(&key);
+        connections.picking.insert(key, pick);
+        true
+    }
+
+    /// What the server said to a pick. `false` when it is not the pick that was waiting (the
+    /// person signed out meanwhile), and nothing was touched. Taken, the pins hold it as the
+    /// server wrote it, or as asked when the answer had no pin in it, until the read that
+    /// follows says what they are; refused, the server's words go under the picker, and the
+    /// picker shows what the server last said.
+    fn settle_pick(
+        &mut self,
+        coworker_id: &str,
+        connector: &str,
+        asked: &Option<String>,
+        answer: Result<Option<crate::opengrok::ConnectionPin>, OpenGrokError>,
+    ) -> bool {
+        let key = (coworker_id.to_string(), connector.to_string());
+        if self.connections.picking.get(&key) != Some(asked) {
+            return false;
+        }
+        let connections = &mut self.connections;
+        connections.picking.remove(&key);
+        match answer {
+            Ok(pin) => {
+                if let Some(PinList::Listed(pins)) = &mut connections.pins {
+                    pins.retain(|kept| {
+                        !(kept.coworker_id == coworker_id && kept.connector == connector)
+                    });
+                    let pin = pin
+                        .filter(|pin| pin.coworker_id == coworker_id && pin.connector == connector)
+                        .or_else(|| {
+                            asked
+                                .clone()
+                                .map(|connection_id| crate::opengrok::ConnectionPin {
+                                    coworker_id: coworker_id.to_string(),
+                                    connector: connector.to_string(),
+                                    connection_id,
+                                })
+                        });
+                    pins.extend(pin);
+                }
+            }
+            Err(error) => {
+                connections
+                    .not_picked
+                    .insert(key, rules_refusal(NOT_CHANGED, &error));
+            }
+        }
+        true
+    }
+
+    /// Reconnect, on an account in a plugin's detail: ask the server for that account's sign-in
+    /// page and open it in the person's browser, as Connect does, so the same account is signed
+    /// in again rather than another added (opengrok-server #359). Only an account signed in to
+    /// through such a page has one to go back to ([`crate::opengrok::ConnectionKind::Oauth`]),
+    /// and one sign-in page is asked for at a time.
+    pub fn reconnect_connection(&mut self, connection_id: String, cx: &mut Context<Self>) {
+        let Some(connector) = self
+            .connections
+            .own_rows()
+            .into_iter()
+            .find(|row| {
+                row.id == connection_id
+                    && row.kind == crate::opengrok::ConnectionKind::Oauth
+                    && !self.connections.is_changing(&row.id)
+            })
+            .map(|row| row.connector.clone())
+        else {
+            return;
+        };
+        let Some((client, ask)) = self.begin_connect(&connector) else {
+            return;
+        };
+        self.connections.reconnecting = Some(connection_id.clone());
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let link = client.reconnect_link(&connection_id, None).await;
+            let _ = this.update(cx, |state, cx| {
+                if let Some(url) = state.settle_connect_link(ask, &connector, link, Instant::now())
+                {
+                    cx.open_url(&url);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn read_connections(&mut self, cx: &mut Context<Self>) {
@@ -9860,6 +10278,14 @@ impl AppState {
                 // person's takes its lines along.
                 connections.not_disconnected.retain(|id, _| own(id));
                 connections.not_changed.retain(|(id, _), _| own(id));
+                connections.not_renamed.retain(|id, _| own(id));
+                if connections
+                    .reconnect_refused
+                    .as_ref()
+                    .is_some_and(|(id, _)| !own(id))
+                {
+                    connections.reconnect_refused = None;
+                }
                 // A change the server took after all, its answer lost, is a refusal no longer: the
                 // read shows the loan as it was asked.
                 let asked = &connections.not_changed_asked;
@@ -9942,6 +10368,22 @@ impl AppState {
         self.change_connection(connection_id, change, cx);
     }
 
+    /// A row of an account's Bots list: that Bot may use the account, or no longer.
+    pub fn set_connection_lent_to(
+        &mut self,
+        connection_id: String,
+        coworker_id: String,
+        lent: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let change = if lent {
+            ConnectionChange::Lend(coworker_id)
+        } else {
+            ConnectionChange::Revoke(coworker_id)
+        };
+        self.change_connection(connection_id, change, cx);
+    }
+
     /// Settings → Connections' Disconnect. The row stays, dimmed, until the server has said the
     /// connection is gone, and every loan goes with it.
     pub fn disconnect_connection(&mut self, connection_id: String, cx: &mut Context<Self>) {
@@ -9990,11 +10432,19 @@ impl AppState {
                     .disconnect_connection(&connection_id)
                     .await
                     .map(|()| None),
+                ConnectionChange::Rename(label) => {
+                    client.rename_connection(&connection_id, label).await
+                }
             };
             let _ = this.update(cx, |state, cx| {
                 if let Some(read) = state.settle_connection_change(&connection_id, &change, answer)
                 {
                     Self::send_connections_read(read, cx);
+                    // The server drops every pin that named a connection it disconnects
+                    // (opengrok-server #359), and the pins are read again to say so.
+                    if change == ConnectionChange::Disconnect {
+                        state.read_pins(cx);
+                    }
                 }
                 cx.notify();
             });
@@ -10025,6 +10475,9 @@ impl AppState {
                     .not_changed
                     .remove(&(connection_id.to_string(), coworker.clone()));
             }
+            ConnectionChange::Rename(_) => {
+                connections.not_renamed.remove(connection_id);
+            }
         }
         connections
             .changing
@@ -10036,13 +10489,14 @@ impl AppState {
     /// said, for the caller to send. `None` when the change is not the one the connection was
     /// waiting on (the person signed out meanwhile), and nothing was touched.
     ///
-    /// A lend's or a revoke's row goes into the list as the server wrote it. A 2xx with no row
-    /// in it is the change taken all the same: it is never shown as a refusal, and never taken
-    /// for the connection gone, and the read says what the row is now. A Disconnect the server
-    /// took takes the row, and so does a 404 or a 409 to one, which is the server saying the
-    /// connection is already gone: what the person asked for. Anything else the server refused
-    /// is said where it was asked, in the server's words: under the row for a Disconnect, and
-    /// beside that Bot's switch for a lend or a revoke ([`NOT_CHANGED`]).
+    /// A lend's, a revoke's or a rename's row goes into the list as the server wrote it. A 2xx
+    /// with no row in it is the change taken all the same: it is never shown as a refusal, and
+    /// never taken for the connection gone, and the read says what the row is now. A Disconnect
+    /// the server took takes the row, and so does a 404 or a 409 to one, which is the server
+    /// saying the connection is already gone: what the person asked for. Anything else the
+    /// server refused is said where it was asked, in the server's words: under the row for a
+    /// Disconnect or a rename, and beside that Bot's switch for a lend or a revoke
+    /// ([`NOT_CHANGED`]).
     ///
     /// The read overtakes any read still out, which may have been taken before the change, and
     /// is what the list shows from then on. Without it, a list left asking by a Refresh that was
@@ -10082,13 +10536,21 @@ impl AppState {
                     .not_changed
                     .insert(key, rules_refusal(NOT_CHANGED, &error));
             }
+            (ConnectionChange::Rename(_), Err(error)) => {
+                connections.not_renamed.insert(
+                    connection_id.to_string(),
+                    rules_refusal("Not renamed", &error),
+                );
+            }
         }
         self.begin_connections_read()
     }
 
-    /// Settings → Connections' Connect: ask the server for the service's sign-in page and open it
-    /// in the person's browser (#269). The browser comes back to the server, never to the app, so
-    /// the list is read again when the person comes back to the window, or on Refresh.
+    /// Settings → Connections' Connect, and Add another account in a plugin's detail: ask the
+    /// server for the service's sign-in page and open it in the person's browser (#269). Since
+    /// opengrok-server #359 the sign-in always adds an account beside any the person has. The
+    /// browser comes back to the server, never to the app, so the list is read again when the
+    /// person comes back to the window, or on Refresh.
     pub fn connect_service(&mut self, connector: String, cx: &mut Context<Self>) {
         let Some((client, ask)) = self.begin_connect(&connector) else {
             return;
@@ -10101,6 +10563,8 @@ impl AppState {
                 {
                     cx.open_url(&url);
                 }
+                // The server started a sign-in it now lists as waiting (#359): show it.
+                state.reread_market_accounts(cx);
                 cx.notify();
             });
         })
@@ -10118,17 +10582,28 @@ impl AppState {
         self.connect_asks += 1;
         self.connections.opening = Some(connector.to_string());
         self.connections.connect_refused = None;
+        self.connections.reconnect_refused = None;
+        self.connections.reconnecting = None;
         Some((client, self.connect_asks))
     }
 
+    /// Whether a page that asks for sign-in pages is on screen for the person: the Plugins
+    /// marketplace for the open Bot, whose details add and reconnect accounts.
+    fn sign_in_on_screen(&self) -> bool {
+        self.monitor_modal.as_ref().is_some_and(|modal| {
+            modal.kind == crate::components::monitor_modal::MonitorKind::Plugins
+                && self.active_coworker_id.as_deref() == Some(modal.coworker_id.as_str())
+        })
+    }
+
     /// What the server said when asked for a sign-in page: the page to open, or why there is
-    /// none, which is kept to show beside the service.
+    /// none, which is kept to show beside the service, or beside the account for a Reconnect.
     ///
-    /// Only for the Connect this ask was, and only while Settings → Connections is on screen.
-    /// The ask's number tells it from any other, among them one for the same service by an
-    /// account that has signed out since; and a browser opening for a page the person has left
-    /// is a sign-in they did not ask for now. `None` for either, with nothing kept, and whenever
-    /// there is nothing to open.
+    /// Only for the Connect or Reconnect this ask was, and only while a page that asks for them
+    /// is on screen ([`Self::sign_in_on_screen`]). The ask's number tells it from any other,
+    /// among them one for the same service by an account that has signed out since; and a
+    /// browser opening for a page the person has left is a sign-in they did not ask for now.
+    /// `None` for either, with nothing kept, and whenever there is nothing to open.
     fn settle_connect_link(
         &mut self,
         ask: u64,
@@ -10140,7 +10615,8 @@ impl AppState {
             return None;
         }
         self.connections.opening = None;
-        if !(self.is_app_settings_open && self.app_settings_tab == AppSettingsTab::Connections) {
+        let reconnecting = self.connections.reconnecting.take();
+        if !self.sign_in_on_screen() {
             return None;
         }
         match link {
@@ -10152,10 +10628,20 @@ impl AppState {
             }
             Err(error) => {
                 let label = self.connections.connector_label(connector);
-                self.connections.connect_refused = Some((
-                    connector.to_string(),
-                    rules_refusal(&format!("{label} could not be connected"), &error),
-                ));
+                match reconnecting {
+                    Some(account) => {
+                        self.connections.reconnect_refused = Some((
+                            account,
+                            rules_refusal(&format!("{label} could not be reconnected"), &error),
+                        ));
+                    }
+                    None => {
+                        self.connections.connect_refused = Some((
+                            connector.to_string(),
+                            rules_refusal(&format!("{label} could not be connected"), &error),
+                        ));
+                    }
+                }
                 None
             }
         }
@@ -10167,6 +10653,8 @@ impl AppState {
     /// connections list is on screen, so someone who signed in and came back later than the wait
     /// still finds it without pressing Refresh.
     pub fn window_activated(&mut self, cx: &mut Context<Self>) {
+        // A sign-in finishes in the browser: what still needs auth is asked again on return.
+        self.reread_market_accounts(cx);
         let reads = self.reads_on_activation(Instant::now());
         if reads.connections {
             self.read_connections(cx);
@@ -10212,13 +10700,10 @@ impl AppState {
     }
 
     /// Whether coming back to the window asks for the person's connections again: a sign-in is
-    /// still waited on, or Settings → Connections or a Bot's settings (with its Connections
-    /// card) is showing.
+    /// still waited on, or Plugins or a Bot's settings (with its Connections card) is showing.
     fn rereads_connections_on_activation(&mut self, now: Instant) -> bool {
         let waiting = self.connections.still_waiting(now);
-        let showing = (self.is_app_settings_open
-            && self.app_settings_tab == AppSettingsTab::Connections)
-            || self.right_pane == RightPane::Settings
+        let showing = self.right_pane == RightPane::Settings
             || self.monitor_modal.as_ref().is_some_and(|modal| {
                 modal.kind == crate::components::monitor_modal::MonitorKind::Plugins
             });
@@ -13456,33 +13941,6 @@ impl AppState {
         cx.notify();
     }
 
-    /// Pick one of the composer's capabilities. The picked ones show as chips beside the field.
-    /// Name a tool for the next message. Naming the same one twice is one chip, not two.
-    pub fn pick_tool(&mut self, id: String, label: String, cx: &mut Context<Self>) {
-        if self.picked_tools.iter().any(|picked| picked.id == id) {
-            return;
-        }
-        let kind = PickedKind::of(&id);
-        self.picked_tools.push(PickedTool { id, label, kind });
-        cx.notify();
-    }
-
-    /// Take a named tool back.
-    pub fn unpick_tool(&mut self, id: &str, cx: &mut Context<Self>) {
-        if let Some(index) = self.picked_tools.iter().position(|picked| picked.id == id) {
-            self.picked_tools.remove(index);
-            cx.notify();
-        }
-    }
-
-    /// The names to send with the next message, in the order they were named.
-    pub fn picked_tool_ids(&self) -> Vec<String> {
-        self.picked_tools
-            .iter()
-            .map(|picked| picked.id.clone())
-            .collect()
-    }
-
     /// Put a recipe or a workflow on the next message, from the list the composer picked it out
     /// of. An id the list does not hold leaves the draft as it was, and says so, so the composer
     /// knows whether it has something to show.
@@ -15000,9 +15458,6 @@ impl AppState {
         if self.is_app_settings_open && self.app_settings_tab == AppSettingsTab::Skills {
             self.refresh_skills(cx);
         }
-        if self.is_app_settings_open && self.app_settings_tab == AppSettingsTab::Connections {
-            self.refresh_connections(cx);
-        }
         self.reply_source_page_moved(cx);
         // A routine's thread is somewhere a person can go back to, while it is still one of
         // this bot's routines' threads and this bot is the one open. Anything else lands on the
@@ -16260,6 +16715,27 @@ impl AppState {
         (run_id, reply_id)
     }
 
+    /// The tags in `text` a turn sends: installed plugins as `mentionedPlugins`, built-in tools as
+    /// `preferTools` ([`crate::opengrok::TurnTags`]). A plugin the list has not loaded yet is not
+    /// a tag the app can tell from a word, and goes as a word.
+    fn turn_tags(&self, text: &str) -> crate::opengrok::TurnTags {
+        use crate::components::chat_input::{BUILTIN_TOOLS, tags_in};
+        let installs = self
+            .plugin_market
+            .installations
+            .as_ref()
+            .and_then(Loaded::ready);
+        let installed = |name: &str| {
+            installs.is_some_and(|installs| installs.iter().any(|install| install.name == name))
+        };
+        let builtin = |name: &str| BUILTIN_TOOLS.iter().any(|(tool, ..)| *tool == name);
+        crate::opengrok::TurnTags {
+            plugins: tags_in(text, installed),
+            tools: tags_in(text, builtin),
+            ..Default::default()
+        }
+    }
+
     /// `recipe` and `skill` are what the message was typed with. `stop_first` is a run this turn
     /// replaces: it is stopped on the wire before the turn is posted. `drained` is the hold this
     /// turn is firing, when it came off `queued_sends`. `retry_of` is the run of the failed reply
@@ -16299,6 +16775,11 @@ impl AppState {
         // The Bot's door as the turn leaves, or for a held send the one it had when the message
         // was sent, or the server's keys for a turn sent again on them: see `turn_door`.
         let turn_source = self.turn_door(drained.as_ref(), on_server);
+        // What the person's own words tagged, read off the message this turn answers, so a
+        // queued send, a retry and Send on Server carry the tags it was typed with.
+        let said = history.iter().rev().find(|message| message.role == "user");
+        let mut tags = self.turn_tags(said.map_or("", |message| message.content.as_str()));
+        tags.accounts = std::mem::take(&mut self.next_turn_accounts);
 
         let (run_id, reply_id) = self.open_turn(&conversation_id);
         // The thread is the app's own to paint while the turn streams: a re-read the account's
@@ -16346,16 +16827,13 @@ impl AppState {
                     // run's own frame: kept here so the row is told once, when it arrives.
                     let mut told_source: Option<ReplySource> = None;
                     let result = client
-                        .run_turn(
-                            &id,
-                            &conversation_id,
-                            &run_id,
+                        .run_turn_tagged(
+                            (&id, &conversation_id, &run_id),
                             &history,
-                            recipe.as_ref(),
-                            skill.as_deref(),
-                            pending_id.as_deref(),
-                            retry_of.as_deref(),
+                            (recipe.as_ref(), skill.as_deref()),
+                            (pending_id.as_deref(), retry_of.as_deref()),
                             turn_source,
+                            &tags,
                             |event, arrived_at| {
                                 // A routine the Bot made, changed, deleted or ran is the server's
                                 // the moment the call answers, whatever becomes of the turn.
@@ -16566,6 +17044,13 @@ impl AppState {
                             Ok(text) if !text.is_empty() => message.content = text.clone(),
                             // Parked on a permission card or a user-form: the turn is not over yet.
                             Ok(_) if waiting_approval || waiting_user_form => {}
+                            // A tagged plugin's needs card is the whole answer (#360): it says
+                            // what to do, and "returned no text" over it would read as a fault.
+                            Ok(_)
+                                if message
+                                    .parts
+                                    .iter()
+                                    .any(|part| matches!(part, ChatPart::PluginNeeds(_))) => {}
                             Ok(_) => {
                                 message.content = tool_standin(&deeds)
                                     .unwrap_or_else(|| EMPTY_TURN_NOTE.to_string())
@@ -21947,9 +22432,6 @@ impl AppState {
             if self.app_settings_tab == AppSettingsTab::Skills {
                 self.refresh_skills(cx);
             }
-            if self.app_settings_tab == AppSettingsTab::Connections {
-                self.refresh_connections(cx);
-            }
         }
         self.reply_source_page_moved(cx);
         self.record_nav();
@@ -21971,11 +22453,6 @@ impl AppState {
             // is when it is asked for.
             if tab == AppSettingsTab::Skills {
                 self.refresh_skills(cx);
-            }
-            // The connections are the server's, and whatever was last read may be a sign-in in
-            // the browser out of date.
-            if tab == AppSettingsTab::Connections {
-                self.refresh_connections(cx);
             }
             self.reply_source_page_moved(cx);
             cx.notify();
@@ -22422,9 +22899,6 @@ impl AppState {
         if tab == AppSettingsTab::Computer {
             self.refresh_computers(cx);
         }
-        if tab == AppSettingsTab::Connections {
-            self.refresh_connections(cx);
-        }
         self.reply_source_page_moved(cx);
         self.record_nav();
         cx.notify();
@@ -22784,6 +23258,9 @@ fn policy_not_kept(
 /// then the server's own reason when it refused and gave one as a line of plain text (see
 /// [`plain_reason`]). A server out of reach or a session that has gone is already said by the
 /// reconnect pill and the signed-out banner, and here it is only that it did not happen.
+mod plugin_market;
+pub use plugin_market::{Loaded, PluginMarket, TokenForm, sign_in_key};
+
 fn rules_refusal(what: &str, error: &OpenGrokError) -> String {
     let reason = (error.failure() == Failure::Verdict)
         .then(|| plain_reason(&error.message))
@@ -24772,15 +25249,6 @@ mod tests {
         assert_eq!(routine("@daily").triggers[0].label(), "@daily");
     }
 
-    #[test]
-    fn a_picked_tool_knows_whether_it_is_a_tool_or_an_app() {
-        // The chip row used to read the kind off a hardcoded list of menu names. A real tool's
-        // name comes from the server, so the rule is the one the server itself uses: a
-        // qualified name belongs to a plugin, which is what a person means by an app.
-        assert_eq!(PickedKind::of("shell"), PickedKind::Tool);
-        assert_eq!(PickedKind::of("run_recipe"), PickedKind::Tool);
-        assert_eq!(PickedKind::of("gmail.api.send"), PickedKind::App);
-    }
     /// Picking a workflow from `/` puts it on the draft the way a recipe goes, and the draft
     /// keeps the one thing that differs: what it is called. Everything else — the declaration,
     /// the defaults standing in their fields, what the turn carries — is the same machinery,
@@ -25143,18 +25611,17 @@ mod tests {
     use super::{
         ActiveRecipe, ActivityTick, AfterRefusal, AppState, BotActivity, ChatMessage, ChatPart,
         ChoiceCard, Conversation, DatabaseService, EMPTY_TURN_NOTE, LiveTurn, Message,
-        ModelCatalogue, PickedKind, REPLY_QUOTE_CHARS, RUN_ERROR_PREFIX, RecipeSummary,
-        RecoveredQuestion, RecoveredReply, RouteTrafficSurface, STOP_UNSENT_NOTE,
-        STOPPED_TURN_NOTE, SaveStamp, SkillScope, SkillSummary, TURN_SIGNED_OUT_NOTE,
-        TURN_UNREACHED_NOTE, TaughtSkill, ThreadRun, TurnAssembler, TurnEnding,
-        WAITING_APPROVAL_STATUS, WAITING_FOR_YOU_STATUS, agui_messages, apply_catalogue,
-        apply_reload, apply_timing, bot_status_line, bubble_for_run, choice_card_in, clock_label,
-        graft_questions, graft_reply, hide_messages_of_runs, is_status_line, is_tool_standin,
-        is_unsent_turn_note, keep_reply, mark_enabled, missing_questions, missing_replies,
-        overlay_server_cards, parse_sql_time, reads_as_gateway_unreachable, replayed_ending,
-        reply_from_replay, reply_to_keep, restored_message, restored_parts, saved_parts,
-        spec_from_queued, stamp_run_finished, stream_paint_due, stream_part_sig,
-        streaming_message_mut, turn_ending, unheard_hidden_runs,
+        ModelCatalogue, REPLY_QUOTE_CHARS, RUN_ERROR_PREFIX, RecipeSummary, RecoveredQuestion,
+        RecoveredReply, RouteTrafficSurface, STOP_UNSENT_NOTE, STOPPED_TURN_NOTE, SaveStamp,
+        SkillScope, SkillSummary, TURN_SIGNED_OUT_NOTE, TURN_UNREACHED_NOTE, TaughtSkill,
+        ThreadRun, TurnAssembler, TurnEnding, WAITING_APPROVAL_STATUS, WAITING_FOR_YOU_STATUS,
+        agui_messages, apply_catalogue, apply_reload, apply_timing, bot_status_line,
+        bubble_for_run, choice_card_in, clock_label, graft_questions, graft_reply,
+        hide_messages_of_runs, is_status_line, is_tool_standin, is_unsent_turn_note, keep_reply,
+        mark_enabled, missing_questions, missing_replies, overlay_server_cards, parse_sql_time,
+        reads_as_gateway_unreachable, replayed_ending, reply_from_replay, reply_to_keep,
+        restored_message, restored_parts, saved_parts, spec_from_queued, stamp_run_finished,
+        stream_paint_due, stream_part_sig, streaming_message_mut, turn_ending, unheard_hidden_runs,
     };
     // `CredentialRequestResolution` went with the broker this branch deleted; everything
     // else main's tests reach for is still here.
@@ -25935,6 +26402,7 @@ mod tests {
                 ChatPart::SaveLogin(spec) => {
                     format!("save-login {} {}", spec.origin, spec.username)
                 }
+                ChatPart::PluginNeeds(spec) => format!("plugin-needs {:?}", spec.needs),
                 ChatPart::Step(step) => format!(
                     "step {} {} {} {:?} {:?}",
                     step.call_id, step.tool, step.arguments, step.result, step.ok
@@ -34935,6 +35403,7 @@ mod tests {
             loans: loans.iter().map(|lent| lent.to_string()).collect(),
             updated_at_ms: 1,
             expires_at_ms: None,
+            kind: crate::opengrok::ConnectionKind::Oauth,
         }
     }
 
@@ -35002,6 +35471,7 @@ mod tests {
         crate::opengrok::Connector {
             name: "gmail".into(),
             label: "Gmail".into(),
+            plugin: None,
         }
     }
 
@@ -35295,6 +35765,7 @@ mod tests {
         let service = |name: &str| crate::opengrok::Connector {
             name: name.into(),
             label: String::new(),
+            plugin: None,
         };
         state.connections.connectors = Some(ConnectorList::Listed(vec![
             gmail(),
@@ -35311,73 +35782,6 @@ mod tests {
             offered,
             ["github", "weather"],
             "a service connected in another scope is still the person's to connect"
-        );
-    }
-
-    /// Each service the person is sent to their browser for is waited on by itself: it stops
-    /// being waited on once the list has it as the person's own, or once its wait runs out, and
-    /// coming back to the window reads the list again only while one is still waited on.
-    #[test]
-    fn each_browser_sign_in_is_waited_on_until_it_is_listed_or_runs_out() {
-        let mut state = listed(Vec::new());
-        state.is_app_settings_open = true;
-        state.app_settings_tab = AppSettingsTab::Connections;
-        let start = Instant::now();
-        let later = start + Duration::from_secs(5 * 60);
-        for (service, at) in [("gmail", start), ("github", later)] {
-            let (_, ask) = state.begin_connect(service).expect("a Connect");
-            assert!(
-                state
-                    .settle_connect_link(ask, service, Ok("https://example.com/".into()), at)
-                    .is_some()
-            );
-        }
-        assert!(state.connections.is_waiting("gmail", start));
-        assert!(state.connections.is_waiting("github", start));
-        assert!(state.connections.still_waiting(later));
-
-        // A github connection that is a bot's own is not the person's sign-in coming back.
-        let mut bots = connection("conn_2", "github", &[]);
-        bots.owner = crate::opengrok::ConnectionOwner::Bot("cw_1".into());
-        let read = state.begin_connections_read().expect("a read").generation;
-        assert!(state.settle_connections(read, Ok(vec![connection("conn_1", "gmail", &[]), bots])));
-        assert!(!state.connections.is_waiting("gmail", start));
-        assert!(state.connections.is_waiting("github", start));
-
-        // Gmail's ten minutes would be up by now; github's are not.
-        let gmail_over = start + BROWSER_WAIT + Duration::from_secs(1);
-        assert!(state.connections.still_waiting(gmail_over));
-        assert!(state.connections.is_waiting("github", gmail_over));
-        let all_over = later + BROWSER_WAIT + Duration::from_secs(1);
-        assert!(!state.connections.is_waiting("github", all_over));
-        assert!(!state.connections.still_waiting(all_over));
-        assert!(state.connections.waiting.is_empty());
-    }
-
-    /// Coming back to the window reads the connections again while a sign-in is waited on, and
-    /// also, once the wait is over, whenever a connections list is on screen: someone who signed
-    /// in and came back after the ten minutes still finds the new connection.
-    #[test]
-    fn coming_back_to_the_window_reads_the_connections_while_they_are_on_screen() {
-        let mut state = listed(vec![]);
-        let now = Instant::now();
-        assert!(
-            !state.rereads_connections_on_activation(now),
-            "nothing waited on and nothing on screen"
-        );
-        state.is_app_settings_open = true;
-        state.app_settings_tab = AppSettingsTab::Connections;
-        assert!(
-            state.rereads_connections_on_activation(now),
-            "Settings → Connections is on screen, after any wait"
-        );
-        state.app_settings_tab = AppSettingsTab::Logins;
-        assert!(!state.rereads_connections_on_activation(now));
-        state.is_app_settings_open = false;
-        state.right_pane = super::RightPane::Settings;
-        assert!(
-            state.rereads_connections_on_activation(now),
-            "a Bot's settings, with its Connections card, is on screen"
         );
     }
 
@@ -35471,15 +35875,87 @@ mod tests {
         assert_eq!(lines(&state), (false, false));
     }
 
-    /// Connect opens the page the server gave, only for the ask it was and only while Settings
-    /// → Connections is on screen, and waits for the browser; a refusal is said beside the
+    /// The Plugins marketplace open for the open Bot: where accounts are signed in to now.
+    fn open_plugins(state: &mut AppState) {
+        state.active_coworker_id = Some("cw_1".into());
+        state.monitor_modal = Some(crate::components::monitor_modal::MonitorModal::new(
+            "cw_1".into(),
+            crate::components::monitor_modal::MonitorKind::Plugins,
+        ));
+    }
+
+    /// Each service the person is sent to their browser for is waited on by itself: it stops
+    /// being waited on once the list has it as the person's own, or once its wait runs out, and
+    /// coming back to the window reads the list again only while one is still waited on.
+    #[test]
+    fn each_browser_sign_in_is_waited_on_until_it_is_listed_or_runs_out() {
+        let mut state = listed(Vec::new());
+        open_plugins(&mut state);
+        let start = Instant::now();
+        let later = start + Duration::from_secs(5 * 60);
+        for (service, at) in [("gmail", start), ("github", later)] {
+            let (_, ask) = state.begin_connect(service).expect("a Connect");
+            assert!(
+                state
+                    .settle_connect_link(ask, service, Ok("https://example.com/".into()), at)
+                    .is_some()
+            );
+        }
+        assert!(state.connections.is_waiting("gmail", start));
+        assert!(state.connections.is_waiting("github", start));
+        assert!(state.connections.still_waiting(later));
+
+        // A github connection that is a bot's own is not the person's sign-in coming back.
+        let mut bots = connection("conn_2", "github", &[]);
+        bots.owner = crate::opengrok::ConnectionOwner::Bot("cw_1".into());
+        let read = state.begin_connections_read().expect("a read").generation;
+        assert!(state.settle_connections(read, Ok(vec![connection("conn_1", "gmail", &[]), bots])));
+        assert!(!state.connections.is_waiting("gmail", start));
+        assert!(state.connections.is_waiting("github", start));
+
+        // Gmail's ten minutes would be up by now; github's are not.
+        let gmail_over = start + BROWSER_WAIT + Duration::from_secs(1);
+        assert!(state.connections.still_waiting(gmail_over));
+        assert!(state.connections.is_waiting("github", gmail_over));
+        let all_over = later + BROWSER_WAIT + Duration::from_secs(1);
+        assert!(!state.connections.is_waiting("github", all_over));
+        assert!(!state.connections.still_waiting(all_over));
+        assert!(state.connections.waiting.is_empty());
+    }
+
+    /// Coming back to the window reads the connections again while a sign-in is waited on, and
+    /// also, once the wait is over, whenever a connections list is on screen: someone who signed
+    /// in and came back after the ten minutes still finds the new connection.
+    #[test]
+    fn coming_back_to_the_window_reads_the_connections_while_they_are_on_screen() {
+        let mut state = listed(vec![]);
+        let now = Instant::now();
+        assert!(
+            !state.rereads_connections_on_activation(now),
+            "nothing waited on and nothing on screen"
+        );
+        open_plugins(&mut state);
+        assert!(
+            state.rereads_connections_on_activation(now),
+            "Plugins is on screen, after any wait"
+        );
+        state.monitor_modal = None;
+        assert!(!state.rereads_connections_on_activation(now));
+        state.right_pane = super::RightPane::Settings;
+        assert!(
+            state.rereads_connections_on_activation(now),
+            "a Bot's settings, with its Connections card, is on screen"
+        );
+    }
+
+    /// Connect opens the page the server gave, only for the ask it was and only while Plugins is on
+    /// screen, and waits for the browser; a refusal is said beside the
     /// service, by its label, in the server's words.
     #[test]
     fn a_connect_opens_only_the_page_its_own_ask_was_given() {
         let mut state = listed(Vec::new());
         state.connections.connectors = Some(ConnectorList::Listed(vec![gmail()]));
-        state.is_app_settings_open = true;
-        state.app_settings_tab = AppSettingsTab::Connections;
+        open_plugins(&mut state);
         let now = Instant::now();
         let url = || Ok("https://accounts.google.com/o".to_string());
 
@@ -35520,14 +35996,14 @@ mod tests {
         // alive again.
         state.connections.waiting.clear();
         let (_, ask) = state.begin_connect("gmail").expect("a Connect");
-        state.is_app_settings_open = false;
+        state.monitor_modal = None;
         assert_eq!(state.settle_connect_link(ask, "gmail", url(), now), None);
         assert_eq!(state.connections.opening, None);
         assert!(!state.connections.is_waiting("gmail", now));
     }
 
     /// A Connect asked for by an account that has since signed out is not opened: not when the
-    /// next account is on Settings → Connections asking nothing, and not when it has asked for
+    /// next account has Plugins open asking nothing, and not when it has asked for
     /// the same service, where the ask's number tells the two apart and the service's name
     /// cannot. Signing out is `logout`'s own `forget_account`, not a copy of it.
     #[test]
@@ -35543,11 +36019,9 @@ mod tests {
                     .expect("an account"),
             );
             state.auth_status = AuthStatus::SignedIn;
-            state.is_app_settings_open = true;
-            state.app_settings_tab = AppSettingsTab::Connections;
+            open_plugins(state);
         };
-        state.is_app_settings_open = true;
-        state.app_settings_tab = AppSettingsTab::Connections;
+        open_plugins(&mut state);
 
         let (_, theirs) = state.begin_connect("gmail").expect("a Connect");
         sign_out_and_in(&mut state);
@@ -39519,6 +39993,62 @@ mod tests {
 
     /// The open thread `cw_1`: a message that was queued, and the reply of `run_queued`, the run
     /// that fired it, which ended in `ending`.
+    /// The installs `GET /plugins/installations` answered with in the recording: `demo`, with
+    /// two pasted accounts.
+    fn recorded_installs() -> Vec<crate::opengrok::PluginInstallation> {
+        let recorded: serde_json::Value = serde_json::from_str(include_str!(
+            "../fixtures/wire/rest/GET__plugins_installations/200-a_second_pasted_account_is_added_beside_the_first_and_each_bot_uses_its_own.json"
+        ))
+        .unwrap();
+        serde_json::from_value(recorded["body"].clone()).unwrap()
+    }
+
+    /// What a turn carries is what its words tagged, read off them when it leaves: an installed
+    /// plugin, a built-in tool. A plugin nobody installed is a word, and so is an address.
+    #[test]
+    fn a_turn_carries_what_its_words_tagged() {
+        let mut state = signed_in_state();
+        let said = "@demo triage this with @shell, mail me@demo.com, ask @nope";
+        assert!(
+            state.turn_tags(said).plugins.is_empty(),
+            "no installs loaded yet"
+        );
+        state.plugin_market.installations = Some(crate::state::Loaded::Ready(recorded_installs()));
+        let tags = state.turn_tags(said);
+        assert_eq!(tags.plugins, ["demo"]);
+        assert_eq!(tags.tools, ["shell"]);
+    }
+
+    /// `@` lists a plugin once: its own account is the plugin's row, not a "Connected app" beside
+    /// it, which showed Cloudflare twice (6 Oct 2026). A service signed in to that is no plugin's
+    /// is still an app.
+    #[test]
+    fn a_plugins_own_account_is_not_listed_again_as_an_app() {
+        use crate::components::chat_input::sources::ToolSource;
+        let mut state = signed_in_state();
+        state.plugin_market.installations = Some(crate::state::Loaded::Ready(recorded_installs()));
+        let recorded: serde_json::Value = serde_json::from_str(include_str!(
+            "../fixtures/wire/rest/GET__connections/200-a_plugin_account_is_signed_in_at_its_own_server_refreshed_and_used_by_its_bot.json"
+        ))
+        .unwrap();
+        let mut rows: Vec<crate::opengrok::ConnectionView> =
+            serde_json::from_value(recorded["body"].clone()).unwrap();
+        assert!(
+            rows.iter()
+                .any(|row| row.kind == crate::opengrok::ConnectionKind::Mcp)
+        );
+        let mut gmail = rows[0].clone();
+        gmail.id = "conn_gmail".into();
+        gmail.connector = "gmail".into();
+        gmail.kind = crate::opengrok::ConnectionKind::Oauth;
+        rows.push(gmail);
+        state.connections.list = Some(ConnectionList::Listed(rows));
+        let source = ToolSource::of(&state);
+        assert_eq!(source.plugins.len(), 1);
+        let apps: Vec<&str> = source.apps.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(apps, ["gmail"]);
+    }
+
     fn a_queued_messages_reply(ending: &str) -> AppState {
         let mut state = signed_in_state();
         state.conversations.push(thread(
@@ -43607,6 +44137,481 @@ mod tests {
     }
     #[cfg(feature = "agent")]
     #[gpui_kit::test]
+    fn a_plugin_that_signs_people_in_adds_accounts_at_its_own_provider(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        use crate::agent::NativeChatHost;
+        use crate::components::marketplace::{self, AccountAction, AccountStatus};
+        use crate::components::monitor_modal::PluginSelection;
+        use gpui_agent::AgentHost as _;
+        use gpui_agent::protocol::Op;
+        use gpui_kit::AppContext as _;
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, ResponseTemplate};
+        const REV: &str = "0123456789abcdef0123456789abcdef01234567";
+        let runtime = a_runtime_for_the_relay(cx);
+        let _enter = runtime.enter();
+        let server = runtime.block_on(wiremock::MockServer::start());
+        let install = json!({"name": "cloudflare", "registry": "xai-org/plugin-marketplace",
+            "registryRevision": REV, "repository": "cloudflare/skills", "revision": REV,
+            "installedAtMs": 1, "bundle": {"manifest": {"name": "cloudflare"}, "parts": []},
+            "connectors": ["cloudflare"], "accounts": [{"connector": "cloudflare", "connectionId": "conn_mcp_1"}]});
+        let mcp_account = json!({"id": "conn_mcp_1", "connector": "cloudflare",
+            "owner": {"scope": "user", "id": "acct_1"}, "label": "Cloudflare", "loans": [],
+            "updatedAtMs": 1, "kind": "mcp"});
+        let waiting = json!([{"id": "attempt_9", "connector": "cloudflare", "label": "Cloudflare 2",
+            "coworkerId": null, "status": "pending", "error": null, "updatedAtMs": 2, "plugin": "cloudflare"}]);
+        runtime.block_on(async {
+            for (at, body) in [
+                ("/plugins/catalog", json!({"registry": "xai-org/plugin-marketplace", "revision": REV, "plugins": []})),
+                ("/plugins/installations", json!([install])),
+                ("/connections", json!([mcp_account])),
+                ("/connectors", json!([])),
+                ("/connections/pins", json!([])),
+                ("/coworkers/cw_1/tools", json!({"tools": []})),
+                ("/coworkers/cw_1/ceiling", json!({"tools": [], "version": 1})),
+                ("/coworkers/cw_1/skills", json!({"skills": [], "version": 1})),
+                ("/plugins/installations/cloudflare/connectors/cloudflare/sign-in", json!({"method": "oauth"})),
+            ] {
+                Mock::given(method("GET")).and(path(at))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(body))
+                    .mount(&server).await;
+            }
+            // Nothing waits until Add starts a sign-in; then the server lists it.
+            Mock::given(method("GET")).and(path("/connections/attempts"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+                .up_to_n_times(1).mount(&server).await;
+            Mock::given(method("GET")).and(path("/connections/attempts"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(waiting))
+                .mount(&server).await;
+            let page = json!({"url": "https://dash.cloudflare.com/oauth2/auth?state=x", "expiresAtMs": 1});
+            Mock::given(method("GET")).and(path("/plugins/installations/cloudflare/connectors/cloudflare/authorize"))
+                .and(query_param("format", "json"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(page))
+                .expect(2).mount(&server).await;
+        });
+        let mut state = crate::components::monitor_modal::tests::catalog();
+        state.connections.list = None;
+        state.connections.connectors = None;
+        state.opengrok = Some(OpenGrokClient::new(&server.uri()).unwrap());
+        let app = cx.new(|_| state);
+        let drive = |cx: &mut gpui_kit::TestAppContext, target: &str| {
+            let command = app.read_with(cx, |state, _| {
+                let mut host = NativeChatHost::from_app(state);
+                host.dispatch(&Op::click(target)).unwrap();
+                host.take_command()
+            });
+            if let Some(command) = command {
+                app.update(cx, |state, cx| command.apply(state, cx));
+            }
+        };
+        let settled = |cx: &mut gpui_kit::TestAppContext| {
+            app.read_with(cx, |state, _| {
+                state.plugin_market.in_flight == 0
+                    && !matches!(
+                        state.connections.list,
+                        Some(super::ConnectionList::Loading) | None
+                    )
+                    && !matches!(state.connections.pins, Some(super::PinList::Loading))
+                    && !matches!(
+                        state.coworker_tools,
+                        Some((_, crate::state::ToolList::Loading))
+                    )
+                    && state.ceiling_reading.is_none()
+                    && state.skills_reading.is_none()
+            })
+        };
+        drive(cx, "footer-plugins");
+        wait_for(cx, "the marketplace is read", settled);
+        app.update(cx, |state, cx| {
+            state.open_market_detail(PluginSelection::Plugin("cloudflare".into()), cx)
+        });
+        wait_for(cx, "how it adds an account is read", settled);
+        let card = |cx: &mut gpui_kit::TestAppContext| {
+            app.read_with(cx, |state, _| {
+                marketplace::detail(state, &PluginSelection::Plugin("cloudflare".into()))
+                    .unwrap()
+                    .accounts[0]
+                    .clone()
+            })
+        };
+        let first = card(cx);
+        assert!(
+            !first.pasted,
+            "it signs people in itself: Add opens its page, not a token field"
+        );
+        assert!(first.can_add);
+        assert_eq!(
+            first.lines[0].action.as_ref().unwrap().1,
+            AccountAction::PluginReconnect
+        );
+
+        // Add asks the server for the provider's page; the sign-in then waits as Needs Auth.
+        drive(cx, "market-add-account-cloudflare");
+        wait_for(
+            cx,
+            "the page is asked for and the sign-ins read again",
+            settled,
+        );
+        let after = card(cx);
+        let line = after.lines.iter().find(|l| l.id == "attempt_9").unwrap();
+        assert_eq!(line.status, AccountStatus::NeedsAuth(None));
+        assert_eq!(line.label, "Cloudflare 2");
+        assert_eq!(line.action.as_ref().unwrap().1, AccountAction::Reopen);
+        assert!(
+            app.read_with(cx, |state, _| state.plugin_market.token.is_none()),
+            "no token field"
+        );
+
+        // Reconnect on the MCP account asks for its page again, by its id.
+        drive(cx, "monitor-account-reconnect-conn_mcp_1");
+        wait_for(cx, "the reconnect page is asked for", settled);
+        runtime.block_on(server.verify());
+    }
+
+    #[cfg(feature = "agent")]
+    #[gpui_kit::test]
+    fn the_marketplace_groups_by_category_searches_by_keyboard_and_installs_only_on_add(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        use crate::agent::NativeChatHost;
+        use crate::components::marketplace::{self, RowAction};
+        use crate::components::monitor_modal::{MarketPage, PluginSelection};
+        use gpui_agent::AgentHost as _;
+        use gpui_agent::protocol::Op;
+        use gpui_kit::AppContext as _;
+        use wiremock::matchers::{body_json, method, path, query_param};
+        use wiremock::{Mock, ResponseTemplate};
+        const REV: &str = "0123456789abcdef0123456789abcdef01234567";
+        let runtime = a_runtime_for_the_relay(cx);
+        let _enter = runtime.enter();
+        let server = runtime.block_on(wiremock::MockServer::start());
+        let entry = |name: &str, category: Option<&str>| {
+            json!({"name": name, "description": format!("{name} does things"), "category": category,
+                   "repository": "fixture/plugins", "revision": REV, "path": name, "unavailableReason": null})
+        };
+        let mut plugins: Vec<serde_json::Value> = ["alpha", "bravo", "charlie", "delta", "echo"]
+            .iter()
+            .map(|n| entry(n, Some("development")))
+            .collect();
+        plugins.push(entry("golf", Some("database")));
+        plugins.push(entry("hotel", None));
+        let install = |name: &str| {
+            json!({"name": name, "registry": "fixture/plugins", "registryRevision": REV,
+                   "repository": "fixture/plugins", "revision": REV, "installedAtMs": 1,
+                   "bundle": {"manifest": {"name": name, "description": "Installed before"}, "parts": []},
+                   "connectors": [], "accounts": []})
+        };
+        runtime.block_on(async {
+            for (at, body) in [
+                ("/plugins/catalog", json!({"registry":"fixture/plugins", "revision": REV, "plugins": plugins})),
+                ("/connections", json!([])),
+                ("/connectors", json!([{"name":"gmail", "label":"Gmail"}])),
+                ("/connections/pins", json!([])),
+                ("/connections/attempts", json!([{"id":"attempt_1", "connector":"gmail", "label":"Gmail",
+                    "coworkerId": null, "status":"failed", "error":"the provider did not connect: access_denied",
+                    "updatedAtMs": 1}])),
+                ("/coworkers/cw_1/tools", json!({"tools":[]})),
+                ("/coworkers/cw_1/ceiling", json!({"tools":[], "version":1})),
+                ("/coworkers/cw_1/skills", json!({"skills":[], "version":1})),
+            ] {
+                Mock::given(method("GET"))
+                    .and(path(at))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(body))
+                    .mount(&server)
+                    .await;
+            }
+            Mock::given(method("GET"))
+                .and(path("/plugins/catalog/bravo"))
+                .and(query_param("revision", REV))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "entry": entry("bravo", Some("development")), "registryRevision": REV,
+                    "parts": [{"kind":"skill", "name":"review", "supported":true, "reason":null},
+                              {"kind":"mcp", "name":"bravo", "supported":true, "reason":null},
+                              {"kind":"hooks", "name":"hooks", "supported":false, "reason":"hooks never run here"}],
+                    "connectors": ["bravo"]})))
+                .mount(&server)
+                .await;
+            // Installed before: one the marketplace no longer lists. After Add, bravo too.
+            Mock::given(method("GET"))
+                .and(path("/plugins/installations"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!([install("legacy-tool")])))
+                .up_to_n_times(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/plugins/installations"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!([install("legacy-tool"), install("bravo")])))
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path("/plugins/installations"))
+                .and(body_json(json!({"name":"bravo", "registryRevision": REV})))
+                .respond_with(ResponseTemplate::new(201).set_body_json(json!({"name":"bravo"})))
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/connections/attempts/attempt_1/reopen"))
+                .and(query_param("format", "json"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(
+                    json!({"url":"https://accounts.example.com/authorize?state=x", "expiresAtMs": 1}),
+                ))
+                .expect(1)
+                .mount(&server)
+                .await;
+        });
+        let mut state = crate::components::monitor_modal::tests::catalog();
+        state.connections.list = None;
+        state.connections.connectors = None;
+        state.opengrok = Some(OpenGrokClient::new(&server.uri()).unwrap());
+        let app = cx.new(|_| state);
+        let drive = |cx: &mut gpui_kit::TestAppContext, op: Op| {
+            let command = app.read_with(cx, |state, _| {
+                let mut host = NativeChatHost::from_app(state);
+                host.dispatch(&op).unwrap();
+                host.take_command()
+            });
+            if let Some(command) = command {
+                app.update(cx, |state, cx| command.apply(state, cx));
+            }
+        };
+        // No Computer is needed: the sidebar's Plugins opens it.
+        drive(cx, Op::click("footer-plugins"));
+        wait_for(
+            cx,
+            "the marketplace, installs and sign-ins are read",
+            |cx| {
+                app.read_with(cx, |state, _| {
+                    let m = &state.plugin_market;
+                    matches!(m.catalog, Some(super::Loaded::Ready(_)))
+                        && matches!(m.installations, Some(super::Loaded::Ready(_)))
+                        && matches!(m.attempts, Some(super::Loaded::Ready(_)))
+                        && matches!(
+                            state.connections.connectors,
+                            Some(super::ConnectorList::Listed(_))
+                        )
+                })
+            },
+        );
+        let sections = app.read_with(cx, |state, _| marketplace::sections(state));
+        let titles: Vec<_> = sections.iter().map(|s| s.title.as_str()).collect();
+        assert_eq!(titles, ["Apps", "Development", "Database", "More plugins"]);
+        assert_eq!(sections[1].rows.len(), marketplace::PER_SECTION);
+        assert_eq!(sections[1].view_all.as_deref(), Some("development"));
+        assert_eq!(
+            sections[0].rows[0].action,
+            RowAction::Add { live: true },
+            "no Gmail account yet"
+        );
+
+        // View all opens the whole category.
+        drive(cx, Op::click("market-view-all-development"));
+        let category = app.read_with(cx, |state, _| marketplace::sections(state));
+        assert_eq!(category.len(), 1);
+        assert_eq!(category[0].rows.len(), 5);
+
+        // Installed lists what the marketplace no longer does, too.
+        drive(cx, Op::click("market-installed"));
+        let installed = app.read_with(cx, |state, _| marketplace::visible_rows(state));
+        assert_eq!(installed.len(), 1);
+        assert_eq!(
+            installed[0].selection,
+            PluginSelection::Plugin("legacy-tool".into())
+        );
+        assert_eq!(installed[0].action, RowAction::Added);
+        drive(cx, Op::click("market-back"));
+        assert_eq!(
+            app.read_with(cx, |state, _| state
+                .monitor_modal
+                .as_ref()
+                .unwrap()
+                .page
+                .clone()),
+            MarketPage::Browse
+        );
+
+        // Search filters; Up and Down move through the results and stop at the ends.
+        drive(
+            cx,
+            Op::SetValue {
+                target: "market-search".into(),
+                value: "ch".into(),
+            },
+        );
+        let found: Vec<_> = app.read_with(cx, |state, _| {
+            marketplace::visible_rows(state)
+                .into_iter()
+                .map(|r| r.title)
+                .collect()
+        });
+        assert_eq!(found, ["charlie", "echo"]);
+        let highlight = |cx: &mut gpui_kit::TestAppContext| {
+            app.read_with(cx, |state, _| {
+                state.monitor_modal.as_ref().unwrap().highlight
+            })
+        };
+        drive(cx, Op::key("market-search", "Up"));
+        assert_eq!(highlight(cx), 0, "stops at the first");
+        drive(cx, Op::key("market-search", "Down"));
+        assert_eq!(highlight(cx), 1);
+        drive(cx, Op::key("market-search", "Down"));
+        assert_eq!(highlight(cx), 1, "stops at the last");
+        drive(cx, Op::key("market-search", "Up"));
+        assert_eq!(highlight(cx), 0);
+
+        // Nothing matches: the highlight stays put and Enter opens nothing.
+        drive(
+            cx,
+            Op::SetValue {
+                target: "market-search".into(),
+                value: "zzz".into(),
+            },
+        );
+        assert!(app.read_with(cx, |state, _| marketplace::sections(state).is_empty()));
+        drive(cx, Op::key("market-search", "Down"));
+        drive(cx, Op::key("market-search", "Enter"));
+        assert!(app.read_with(cx, |state, _| {
+            state.monitor_modal.as_ref().unwrap().selected.is_none()
+        }));
+
+        // Enter opens the highlighted plugin's detail, and installs nothing.
+        drive(
+            cx,
+            Op::SetValue {
+                target: "market-search".into(),
+                value: "bravo".into(),
+            },
+        );
+        drive(cx, Op::key("market-search", "Enter"));
+        assert_eq!(
+            app.read_with(cx, |state, _| state
+                .monitor_modal
+                .as_ref()
+                .unwrap()
+                .selected
+                .clone()),
+            Some(PluginSelection::Plugin("bravo".into()))
+        );
+        assert!(app.read_with(cx, |state, _| state.plugin_market.changing.is_none()));
+        wait_for(cx, "the pinned bundle's parts are read", |cx| {
+            app.read_with(cx, |state, _| {
+                matches!(
+                    state.plugin_market.details.get("bravo"),
+                    Some(super::Loaded::Ready(_))
+                )
+            })
+        });
+        let detail = app.read_with(cx, |state, _| {
+            marketplace::detail(state, &PluginSelection::Plugin("bravo".into())).unwrap()
+        });
+        assert_eq!(detail.skills, ["review"]);
+        assert_eq!(detail.servers, ["bravo"]);
+        assert_eq!(detail.apps, ["bravo"]);
+        assert_eq!(detail.unsupported.len(), 1);
+        assert!(detail.accounts.is_empty(), "accounts come with the install");
+        assert_eq!(
+            detail.action,
+            Some(marketplace::DetailAction::Add { live: true })
+        );
+        assert!(
+            detail
+                .source
+                .unwrap()
+                .1
+                .starts_with("https://github.com/fixture/plugins/tree/")
+        );
+
+        // Add installs at the commit the marketplace was read at; Uninstall only once it has.
+        drive(cx, Op::click("market-detail-action"));
+        assert_eq!(
+            app.read_with(cx, |state, _| marketplace::detail(
+                state,
+                &PluginSelection::Plugin("bravo".into())
+            )
+            .unwrap()
+            .action),
+            Some(marketplace::DetailAction::Adding)
+        );
+        wait_for(
+            cx,
+            "the install is answered and the installs read again",
+            |cx| {
+                app.read_with(cx, |state, _| {
+                    state.plugin_market.changing.is_none()
+                        && state.plugin_market.installation("bravo").is_some()
+                })
+            },
+        );
+        assert_eq!(
+            app.read_with(cx, |state, _| marketplace::detail(
+                state,
+                &PluginSelection::Plugin("bravo".into())
+            )
+            .unwrap()
+            .action),
+            Some(marketplace::DetailAction::Uninstall { live: true })
+        );
+
+        // A refused sign-in needs auth, says why, and Reopen asks for THAT sign-in's page.
+        drive(cx, Op::click("monitor-plugin-back"));
+        drive(
+            cx,
+            Op::SetValue {
+                target: "market-search".into(),
+                value: "".into(),
+            },
+        );
+        drive(cx, Op::click("market-service-gmail"));
+        let gmail = app.read_with(cx, |state, _| {
+            marketplace::detail(state, &PluginSelection::Service("gmail".into())).unwrap()
+        });
+        let line = &gmail.accounts[0].lines[0];
+        assert_eq!(line.id, "attempt_1");
+        assert_eq!(
+            line.status,
+            marketplace::AccountStatus::NeedsAuth(Some(
+                "the provider did not connect: access_denied".into()
+            ))
+        );
+        drive(cx, Op::click("market-reopen-attempt_1"));
+        wait_for(cx, "the reopen is answered", |cx| {
+            app.read_with(cx, |state, _| {
+                state.plugin_market.attempt_changing.is_none()
+            })
+        });
+        wait_for(
+            cx,
+            "every read finishes before the runtime shuts down",
+            |cx| {
+                app.read_with(cx, |state, _| {
+                    state.plugin_market.in_flight == 0
+                        && !state
+                            .plugin_market
+                            .details
+                            .values()
+                            .any(|d| matches!(d, super::Loaded::Loading))
+                        && !matches!(
+                            state.coworker_tools,
+                            Some((_, crate::state::ToolList::Loading))
+                        )
+                        && !matches!(state.connections.list, Some(super::ConnectionList::Loading))
+                        && !matches!(state.connections.pins, Some(super::PinList::Loading))
+                        && !matches!(
+                            state.connections.connectors,
+                            Some(super::ConnectorList::Loading)
+                        )
+                        && state.connections.opening.is_none()
+                        && state.ceiling_reading.is_none()
+                        && state.skills_reading.is_none()
+                })
+            },
+        );
+        runtime.block_on(server.verify());
+    }
+
+    #[cfg(feature = "agent")]
+    #[gpui_kit::test]
     fn monitor_controls_send_the_servers_ceiling_loans_skills_and_removal_requests(
         cx: &mut gpui_kit::TestAppContext,
     ) {
@@ -43700,10 +44705,24 @@ mod tests {
         wait_for(cx, "private skills are read", |cx| {
             app.read_with(cx, |state, _| state.skills_reading.is_none())
         });
-        click(cx, "agent-connection-lend-conn_1");
+        wait_for(cx, "the services are read", |cx| {
+            app.read_with(cx, |state, _| {
+                matches!(
+                    state.connections.connectors,
+                    Some(super::ConnectorList::Listed(_))
+                )
+            })
+        });
+        // The loan is switched in the service's detail, and private skills from Installed.
+        click(cx, "market-service-gmail");
+        click(cx, "market-account-bots-conn_1");
+        click(cx, "market-bot-cw_1");
         wait_for(cx, "the loan is answered", |cx| {
             app.read_with(cx, |state, _| state.connections.changing.is_empty())
         });
+        click(cx, "market-bots-back");
+        click(cx, "monitor-plugin-back");
+        click(cx, "market-installed");
         click(cx, "agent-skills-switch-sk_1");
         wait_for(cx, "the skill switch is answered", |cx| {
             app.read_with(cx, |state, _| state.skill_switch.is_none())

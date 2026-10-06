@@ -975,12 +975,53 @@ impl OpenGrokClient {
         pending_id: Option<&str>,
         retry_of: Option<&str>,
         inference_source: Option<TurnSource>,
+        on_event: F,
+    ) -> Result<String, OpenGrokError>
+    where
+        F: FnMut(&serde_json::Value, std::time::Instant),
+    {
+        let ids = (pending_id, retry_of);
+        let tags = TurnTags::default();
+        self.run_turn_tagged(
+            (coworker_id, thread_id, run_id),
+            messages,
+            (recipe, skill),
+            ids,
+            inference_source,
+            &tags,
+            on_event,
+        )
+        .await
+    }
+
+    /// [`Self::run_turn`] with what the message tagged (`@cloudflare`, `@shell`) and the account a
+    /// "Which account?" card picked for it ([`TurnTags`]).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn run_turn_tagged<F>(
+        &self,
+        (coworker_id, thread_id, run_id): (&str, &str, &str),
+        messages: &[AguiMessage],
+        (recipe, skill): (Option<&TurnRecipe>, Option<&str>),
+        (pending_id, retry_of): (Option<&str>, Option<&str>),
+        inference_source: Option<TurnSource>,
+        tags: &TurnTags,
         mut on_event: F,
     ) -> Result<String, OpenGrokError>
     where
         F: FnMut(&serde_json::Value, std::time::Instant),
     {
         let mut forwarded = json!({ "coworkerId": coworker_id });
+        // Each key only when there is something in it, so an untagged turn is the turn that was
+        // sent before tags existed, byte for byte.
+        if !tags.plugins.is_empty() {
+            forwarded["mentionedPlugins"] = json!(tags.plugins);
+        }
+        if !tags.accounts.is_empty() {
+            forwarded["pluginAccounts"] = json!(tags.accounts);
+        }
+        if !tags.tools.is_empty() {
+            forwarded["preferTools"] = json!(tags.tools);
+        }
         if let Some(source) = inference_source {
             forwarded["inferenceSource"] = source.to_value();
         }
@@ -1622,7 +1663,7 @@ impl OpenGrokClient {
                 None,
             )
             .await?;
-        Self::changed_connection(response).await
+        Self::changed_row(response).await
     }
 
     /// `POST /connections/{id}/revoke` — take a connection back from a Bot; the same body and the
@@ -1642,12 +1683,107 @@ impl OpenGrokClient {
                 None,
             )
             .await?;
-        Self::changed_connection(response).await
+        Self::changed_row(response).await
+    }
+
+    /// `PATCH /connections/{id}` with `{"label"}` — what the person calls one of their accounts,
+    /// so two accounts of one service can be told apart, answered with the connection as
+    /// `GET /connections` lists it (opengrok-server #359 (agreed shape; branch
+    /// gol/service-accounts)). A label that is empty or longer than 80 characters is refused with
+    /// 422 and the server's sentence, and nothing changes. As with a lend, `None` is a 2xx whose
+    /// body is not that row: the change was taken, and the caller reads the list again.
+    pub async fn rename_connection(
+        &self,
+        connection_id: &str,
+        label: &str,
+    ) -> Result<Option<ConnectionView>, OpenGrokError> {
+        let path = format!("/connections/{}", path_segment(connection_id));
+        let response = self
+            .send_json_within(
+                reqwest::Method::PATCH,
+                &path,
+                Some(&json!({ "label": label })),
+                Some(CONNECTIONS_TIMEOUT),
+                None,
+            )
+            .await?;
+        Self::changed_row(response).await
+    }
+
+    /// `GET /connections/pins` — which of the person's accounts each of their Bots uses for each
+    /// service (opengrok-server #359 (agreed shape; branch gol/service-accounts)). Always an
+    /// array. A Bot with no row for a service has no account picked for it, and asks each time.
+    pub async fn list_connection_pins(&self) -> Result<Vec<ConnectionPin>, OpenGrokError> {
+        let response = self
+            .send_json_within::<()>(
+                reqwest::Method::GET,
+                "/connections/pins",
+                None,
+                Some(CONNECTIONS_TIMEOUT),
+                None,
+            )
+            .await?;
+        Self::json_or_error(response).await
+    }
+
+    /// `PUT /coworkers/{id}/pins/{connector}` with `{"connectionId"}` — the Bot uses this account
+    /// for the service, answered with the pin as the list has it (opengrok-server #359 (agreed
+    /// shape; branch gol/service-accounts)). An account the server will not pin for this Bot and
+    /// service is refused with 422 and its sentence, which the picker shows. `None` is a 2xx
+    /// whose body is not a pin: taken all the same, and the caller reads the pins again.
+    pub async fn pin_connection(
+        &self,
+        coworker_id: &str,
+        connector: &str,
+        connection_id: &str,
+    ) -> Result<Option<ConnectionPin>, OpenGrokError> {
+        let path = format!(
+            "/coworkers/{}/pins/{}",
+            path_segment(coworker_id),
+            path_segment(connector)
+        );
+        let response = self
+            .send_json_within(
+                reqwest::Method::PUT,
+                &path,
+                Some(&json!({ "connectionId": connection_id })),
+                Some(CONNECTIONS_TIMEOUT),
+                None,
+            )
+            .await?;
+        Self::changed_row(response).await
+    }
+
+    /// `DELETE /coworkers/{id}/pins/{connector}` — Ask each time: the Bot has no account picked
+    /// for the service any more. The server answers 204 with no body (opengrok-server #359
+    /// (agreed shape; branch gol/service-accounts)), and any 2xx is the pin gone.
+    pub async fn unpin_connection(
+        &self,
+        coworker_id: &str,
+        connector: &str,
+    ) -> Result<(), OpenGrokError> {
+        let path = format!(
+            "/coworkers/{}/pins/{}",
+            path_segment(coworker_id),
+            path_segment(connector)
+        );
+        let response = self
+            .send_json_within::<()>(
+                reqwest::Method::DELETE,
+                &path,
+                None,
+                Some(CONNECTIONS_TIMEOUT),
+                None,
+            )
+            .await?;
+        Self::empty_or_error(response).await
     }
 
     /// `DELETE /connections/{id}` — disconnect it, and every loan goes with it. The server
     /// answers 204 with no body: a disconnected connection is not listed, so there is no row left
     /// to answer with (opengrok-server#267). Any 2xx is the connection gone, whatever its body.
+    /// Since opengrok-server #359 (agreed shape; branch gol/service-accounts) the server drops
+    /// every pin that named it as well, and those Bots ask each time again.
     pub async fn disconnect_connection(&self, connection_id: &str) -> Result<(), OpenGrokError> {
         let path = format!("/connections/{}", path_segment(connection_id));
         let response = self
@@ -1662,12 +1798,275 @@ impl OpenGrokClient {
         Self::empty_or_error(response).await
     }
 
-    /// A lend's or a revoke's answer: the connection's row when the body is one, `None` for any
-    /// other 2xx, and the server's refusal otherwise. A 2xx is the change taken, and a body that
-    /// is empty, unreadable or cut short does not undo that.
-    async fn changed_connection(
+    /// `GET /plugins/catalog` — the plugin marketplace this server reads (xai-org/plugin-marketplace),
+    /// at the registry commit it reads now (opengrok-server `crates/opengrok-plugin-api/src/lib.rs`,
+    /// #356/#366). The app never reads the registry itself: what the server will install is the
+    /// server's to say, and each entry says why when it will not (`unavailableReason`).
+    pub async fn plugin_catalog(&self) -> Result<PluginCatalog, OpenGrokError> {
+        let response = self
+            .send_json_within::<()>(
+                reqwest::Method::GET,
+                "/plugins/catalog",
+                None,
+                Some(PLUGINS_TIMEOUT),
+                None,
+            )
+            .await?;
+        Self::json_or_error(response).await
+    }
+
+    /// `GET /plugins/catalog/{name}?revision=` — what one plugin brings, read from its pinned bundle
+    /// before anything is installed: its parts (skills, MCP servers, and anything this server will
+    /// not run, with why) and the services its accounts are for (`connectors`). Pinned to the
+    /// registry commit the marketplace was read at, so the detail is of the plugin Add installs.
+    pub async fn plugin_detail(
+        &self,
+        name: &str,
+        revision: &str,
+    ) -> Result<PluginDetail, OpenGrokError> {
+        let mut path = format!("/plugins/catalog/{}?revision=", path_segment(name));
+        path.extend(url::form_urlencoded::byte_serialize(revision.as_bytes()));
+        let response = self
+            .send_json_within::<()>(
+                reqwest::Method::GET,
+                &path,
+                None,
+                Some(PLUGINS_TIMEOUT),
+                None,
+            )
+            .await?;
+        Self::json_or_error(response).await
+    }
+
+    /// `GET /plugins/installations` — the person's installed plugins, each pinned to the commit it
+    /// was installed at, whether or not the marketplace still lists it.
+    pub async fn plugin_installations(&self) -> Result<Vec<PluginInstallation>, OpenGrokError> {
+        let response = self
+            .send_json_within::<()>(
+                reqwest::Method::GET,
+                "/plugins/installations",
+                None,
+                Some(PLUGINS_TIMEOUT),
+                None,
+            )
+            .await?;
+        Self::json_or_error(response).await
+    }
+
+    /// `POST /plugins/installations` with `{"name","registryRevision"}` — install the plugin at the
+    /// registry commit the person was looking at, never "whatever is newest": a 409 is one already
+    /// installed, a 422 a plugin this server will not take, each with the server's sentence. Any 2xx
+    /// is installed; the caller reads the installations again rather than trust a reply's shape.
+    pub async fn install_plugin(
+        &self,
+        name: &str,
+        registry_revision: &str,
+    ) -> Result<(), OpenGrokError> {
+        let response = self
+            .send_json_within(
+                reqwest::Method::POST,
+                "/plugins/installations",
+                Some(&json!({ "name": name, "registryRevision": registry_revision })),
+                Some(PLUGINS_TIMEOUT),
+                None,
+            )
+            .await?;
+        Self::empty_or_error(response).await
+    }
+
+    /// `DELETE /plugins/installations/{name}` — uninstall it. Its pasted accounts go with it, and
+    /// the Bots switch it off. 204 with no body; any 2xx is gone.
+    pub async fn uninstall_plugin(&self, name: &str) -> Result<(), OpenGrokError> {
+        let path = format!("/plugins/installations/{}", path_segment(name));
+        let response = self
+            .send_json_within::<()>(
+                reqwest::Method::DELETE,
+                &path,
+                None,
+                Some(PLUGINS_TIMEOUT),
+                None,
+            )
+            .await?;
+        Self::empty_or_error(response).await
+    }
+
+    /// `POST /plugins/installations/{name}/credentials/{connector}` with `{"token"}` — add another
+    /// pasted account for an installed plugin's service, always beside any it has (opengrok-server
+    /// #359, `add_credential` in `crates/opengrok-plugin-api/src/lib.rs`; uncommitted on
+    /// gol/service-accounts). Answered 201 `{"connectionId"}`, the new account's id. The token goes
+    /// to the server and nowhere else: the app keeps no copy.
+    pub async fn add_plugin_token(
+        &self,
+        name: &str,
+        connector: &str,
+        token: &str,
+    ) -> Result<String, OpenGrokError> {
+        let path = format!(
+            "/plugins/installations/{}/credentials/{}",
+            path_segment(name),
+            path_segment(connector)
+        );
+        let response = self
+            .send_json_within(
+                reqwest::Method::POST,
+                &path,
+                Some(&json!({ "token": token })),
+                Some(CONNECTIONS_TIMEOUT),
+                None,
+            )
+            .await?;
+        let added: AddedToken = Self::json_or_error(response).await?;
+        Ok(added.connection_id)
+    }
+
+    /// `PUT /plugins/installations/{name}/credentials/{connector}` with `{"token","connectionId"}`
+    /// — a new token for THAT pasted account, the Reconnect of a token account (same provenance as
+    /// [`Self::add_plugin_token`]). 204; a 404 is no such account of this install's.
+    pub async fn replace_plugin_token(
+        &self,
+        name: &str,
+        connector: &str,
+        connection_id: &str,
+        token: &str,
+    ) -> Result<(), OpenGrokError> {
+        let path = format!(
+            "/plugins/installations/{}/credentials/{}",
+            path_segment(name),
+            path_segment(connector)
+        );
+        let response = self
+            .send_json_within(
+                reqwest::Method::PUT,
+                &path,
+                Some(&json!({ "token": token, "connectionId": connection_id })),
+                Some(CONNECTIONS_TIMEOUT),
+                None,
+            )
+            .await?;
+        Self::empty_or_error(response).await
+    }
+
+    /// `GET /plugins/installations/{name}/connectors/{connector}/sign-in` — how an account of an
+    /// installed plugin's service is added: `"oauth"` when its server signs people in itself, so
+    /// Add opens the provider's page, and `"token"` when a token is pasted (opengrok-server #364,
+    /// `method` in `crates/opengrok-server/src/connections/plugin_signin.rs`; uncommitted on
+    /// gol/service-accounts).
+    pub async fn plugin_sign_in_method(
+        &self,
+        name: &str,
+        connector: &str,
+    ) -> Result<String, OpenGrokError> {
+        let path = format!(
+            "/plugins/installations/{}/connectors/{}/sign-in",
+            path_segment(name),
+            path_segment(connector)
+        );
+        let response = self
+            .send_json_within::<()>(
+                reqwest::Method::GET,
+                &path,
+                None,
+                Some(PLUGINS_TIMEOUT),
+                None,
+            )
+            .await?;
+        let method: SignInMethod = Self::json_or_error(response).await?;
+        Ok(method.method)
+    }
+
+    /// `GET /plugins/installations/{name}/connectors/{connector}/authorize?format=json` — the
+    /// provider's consent page for a new account of an installed plugin's service, or with
+    /// `connection_id` for that MCP account again (same provenance as
+    /// [`Self::plugin_sign_in_method`]). Answered and checked as [`Self::connect_link`] is; the
+    /// server starts a sign-in it lists as waiting until the provider sends the person back.
+    pub async fn plugin_authorize_link(
+        &self,
+        name: &str,
+        connector: &str,
+        connection_id: Option<&str>,
+    ) -> Result<String, OpenGrokError> {
+        let mut path = format!(
+            "/plugins/installations/{}/connectors/{}/authorize?format=json",
+            path_segment(name),
+            path_segment(connector)
+        );
+        if let Some(id) = connection_id {
+            path.push_str("&connection_id=");
+            path.extend(url::form_urlencoded::byte_serialize(id.as_bytes()));
+        }
+        self.sign_in_link(&path).await
+    }
+
+    /// `GET /connections/attempts` — the person's sign-ins that have not finished: an account they
+    /// asked to add that the service has not connected yet, or refused (opengrok-server #359,
+    /// `list_attempts` in `crates/opengrok-server/src/connections/routes.rs`; uncommitted on
+    /// gol/service-accounts). What the app shows as Needs Auth. Always an array.
+    pub async fn connection_attempts(&self) -> Result<Vec<ConnectionAttempt>, OpenGrokError> {
+        let response = self
+            .send_json_within::<()>(
+                reqwest::Method::GET,
+                "/connections/attempts",
+                None,
+                Some(CONNECTIONS_TIMEOUT),
+                None,
+            )
+            .await?;
+        Self::json_or_error(response).await
+    }
+
+    /// `GET /connections/attempts/{id}/reopen?format=json` — the sign-in page for THAT unfinished
+    /// sign-in, so finishing it adds the account the person saw waiting, under its label, and no
+    /// second row appears. Answered and checked as [`Self::connect_link`] is.
+    pub async fn reopen_link(&self, attempt_id: &str) -> Result<String, OpenGrokError> {
+        let path = format!(
+            "/connections/attempts/{}/reopen?format=json",
+            path_segment(attempt_id)
+        );
+        self.sign_in_link(&path).await
+    }
+
+    /// `PATCH /connections/attempts/{id}` with `{"label"}` — rename a sign-in before it finishes,
+    /// by the rule an account is renamed by (422 with the server's sentence for an empty or
+    /// too-long label). `None` is a 2xx whose body is not that row.
+    pub async fn rename_attempt(
+        &self,
+        attempt_id: &str,
+        label: &str,
+    ) -> Result<Option<ConnectionAttempt>, OpenGrokError> {
+        let path = format!("/connections/attempts/{}", path_segment(attempt_id));
+        let response = self
+            .send_json_within(
+                reqwest::Method::PATCH,
+                &path,
+                Some(&json!({ "label": label })),
+                Some(CONNECTIONS_TIMEOUT),
+                None,
+            )
+            .await?;
+        Self::changed_row(response).await
+    }
+
+    /// `DELETE /connections/attempts/{id}` — give up on a sign-in. 204.
+    pub async fn dismiss_attempt(&self, attempt_id: &str) -> Result<(), OpenGrokError> {
+        let path = format!("/connections/attempts/{}", path_segment(attempt_id));
+        let response = self
+            .send_json_within::<()>(
+                reqwest::Method::DELETE,
+                &path,
+                None,
+                Some(CONNECTIONS_TIMEOUT),
+                None,
+            )
+            .await?;
+        Self::empty_or_error(response).await
+    }
+
+    /// A lend's, a revoke's, a rename's or a pin's answer: the row when the body is one, `None`
+    /// for any other 2xx, and the server's refusal otherwise. A 2xx is the change taken, and a
+    /// body that is empty, unreadable or cut short does not undo that.
+    async fn changed_row<T: serde::de::DeserializeOwned>(
         response: reqwest::Response,
-    ) -> Result<Option<ConnectionView>, OpenGrokError> {
+    ) -> Result<Option<T>, OpenGrokError> {
         if !response.status().is_success() {
             return Err(Self::read_error(response).await);
         }
@@ -1694,7 +2093,9 @@ impl OpenGrokClient {
     /// person's browser (opengrok-server#269, as agreed). The route wants the bearer, which a
     /// browser cannot send, so the app asks for the page and opens it; the browser comes back to
     /// the server's callback, never to the app, and no token ever reaches the app. `coworker_id`
-    /// makes the connection that Bot's own rather than the person's.
+    /// makes the connection that Bot's own rather than the person's. Since opengrok-server #359
+    /// (agreed shape; branch gol/service-accounts) a sign-in through it always adds an account,
+    /// beside any the person has of the service already, rather than replacing one.
     ///
     /// Only a web address is handed back, and only as it was read: the address the check passed
     /// is the address opened. The system opens a file or another program for any other kind of
@@ -1713,10 +2114,36 @@ impl OpenGrokClient {
             path.push_str("&coworker_id=");
             path.extend(url::form_urlencoded::byte_serialize(coworker_id.as_bytes()));
         }
+        self.sign_in_link(&path).await
+    }
+
+    /// `GET /connections/{id}/reconnect?format=json` — the sign-in page for one of the person's
+    /// accounts, to sign that same account in again rather than add another (opengrok-server
+    /// #359 (agreed shape; branch gol/service-accounts)). Answered in [`ConnectLink`]'s shape, as
+    /// [`Self::connect_link`] is, and checked the same way before anything opens. `coworker_id`
+    /// names the Bot whose own account it is, as it does for a Connect.
+    pub async fn reconnect_link(
+        &self,
+        connection_id: &str,
+        coworker_id: Option<&str>,
+    ) -> Result<String, OpenGrokError> {
+        let mut path = format!(
+            "/connections/{}/reconnect?format=json",
+            path_segment(connection_id)
+        );
+        if let Some(coworker_id) = coworker_id {
+            path.push_str("&coworker_id=");
+            path.extend(url::form_urlencoded::byte_serialize(coworker_id.as_bytes()));
+        }
+        self.sign_in_link(&path).await
+    }
+
+    /// Ask for a sign-in page at `path` and hand back its address, only if it is a web address.
+    async fn sign_in_link(&self, path: &str) -> Result<String, OpenGrokError> {
         let response = self
             .send_json_within::<()>(
                 reqwest::Method::GET,
-                &path,
+                path,
                 None,
                 Some(CONNECTIONS_TIMEOUT),
                 None,
@@ -2250,7 +2677,7 @@ impl OpenGrokClient {
     /// it and reads the name and the description out of the frontmatter when the fields here are
     /// blank, so a skill's file and its row cannot come to disagree about what it is called.
     ///
-    /// The 8000-character cap on the body is the server's, and so is the sentence naming it: the
+    /// The cap on the body is the server's, and so is the sentence naming it: the
     /// refusal comes back as the server's own words and goes to the person unchanged, rather
     /// than through a second copy of the number here that would have to be kept in step.
     pub async fn create_skill(&self, new: &NewSkill) -> Result<SkillDetail, OpenGrokError> {
@@ -3320,6 +3747,11 @@ impl From<OwnerOnTheWire> for ConnectionOwner {
 /// snake_case, and has never had a row to write). The list is an array, empty when nothing is
 /// connected, of the caller's own connections that are still connected: a disconnected one is
 /// not listed. Today that is only the caller's `user`-scope rows.
+///
+/// Since opengrok-server #359 (agreed shape; branch gol/service-accounts) several rows can share
+/// a connector, one for each account of the service, each with a label the person can tell
+/// apart and change (the server starts them as "GitHub", "GitHub 2"…), and each row says how it
+/// was signed in to (`kind`).
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ConnectionView {
@@ -3337,11 +3769,207 @@ pub struct ConnectionView {
     /// not one that already has.
     #[serde(default)]
     pub expires_at_ms: Option<i64>,
+    #[serde(default)]
+    pub kind: ConnectionKind,
 }
 
+/// How an account was signed in to, which decides whether Reconnect has a page to send the
+/// person back to: `"oauth"` through the service's own sign-in page, `"token"` with a key the
+/// server was given, which has none.
+///
+/// opengrok-server #359 (agreed shape; branch gol/service-accounts). A server from before it
+/// sends no kind, and that reads as `oauth`: the service's sign-in page
+/// (`/connections/{connector}/authorize`) is the only way this app has offered to connect. A kind
+/// from later reads as [`Self::Other`] rather than failing the whole list.
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ConnectionKind {
+    #[default]
+    Oauth,
+    Token,
+    /// Signed in to at an installed plugin's own MCP server (opengrok-server #364,
+    /// `ConnectionKind::Mcp` in `crates/opengrok-core/src/connection.rs`; uncommitted on
+    /// gol/service-accounts). Reconnect signs in there again.
+    Mcp,
+    #[serde(other)]
+    Other,
+}
+
+/// Which of the person's accounts a Bot uses for a service: one row of `GET /connections/pins`,
+/// and what `PUT /coworkers/{id}/pins/{connector}` answers with. A Bot with no pin for a service
+/// has none picked, and asks each time.
+///
+/// opengrok-server #359 (agreed shape; branch gol/service-accounts): camelCase,
+/// `{"coworkerId", "connector", "connectionId"}`, at most one for each Bot and service.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ConnectionPin {
+    pub coworker_id: String,
+    /// The service, by the name a connection's `connector` says.
+    pub connector: String,
+    pub connection_id: String,
+}
+
+/// The plugin marketplace as `GET /plugins/catalog` answers it: the registry, the commit it was
+/// read at, and its entries. Transcribed from `Catalog` and `Entry` in opengrok-server
+/// `crates/opengrok-integrations/src/registry.rs` (#356/#366; `category` added on
+/// gol/service-accounts, uncommitted, from the marketplace's own `category`).
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginCatalog {
+    pub registry: String,
+    pub revision: String,
+    pub plugins: Vec<CatalogEntry>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CatalogEntry {
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    /// The marketplace's own grouping (`development`, `database`…). `None` is an entry the
+    /// marketplace did not file anywhere, never one this app guessed at.
+    #[serde(default)]
+    pub category: Option<String>,
+    /// The marketplace's `homepage` for it, a web address, when it lists one.
+    #[serde(default)]
+    pub homepage: Option<String>,
+    /// `owner/repo` of the plugin's source, and the commit it is pinned to.
+    pub repository: String,
+    pub revision: String,
+    pub path: String,
+    /// Why this server will not install it, when it will not.
+    #[serde(default)]
+    pub unavailable_reason: Option<String>,
+}
+
+/// One part of a plugin bundle (`Part` in opengrok-server `crates/opengrok-plugins/src/bundle.rs`):
+/// `kind` is `skill`, `mcp`, `hooks`…, and an unsupported part says why it will not run here.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginPart {
+    pub kind: String,
+    pub name: String,
+    pub supported: bool,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+/// `GET /plugins/catalog/{name}` (`detail` in opengrok-server
+/// `crates/opengrok-plugin-api/src/lib.rs`): the entry, the registry commit, the bundle's parts and
+/// the services its accounts are for.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginDetail {
+    pub entry: CatalogEntry,
+    pub registry_revision: String,
+    pub parts: Vec<PluginPart>,
+    #[serde(default)]
+    pub connectors: Vec<String>,
+    /// The bundle's own `plugin.json`: who made it, its version and site.
+    #[serde(default)]
+    pub manifest: Option<PluginManifest>,
+}
+
+/// One installed plugin as `GET /plugins/installations` lists it (`Installation` in
+/// opengrok-server `crates/opengrok-integrations/src/installed.rs`, plus `connectors` added by
+/// `list` in `crates/opengrok-plugin-api/src/lib.rs` on gol/service-accounts, uncommitted). Only
+/// what the app shows is read of the bundle: its manifest and parts; the skill bodies and server
+/// configs stay the server's business.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginInstallation {
+    pub name: String,
+    pub registry: String,
+    pub registry_revision: String,
+    pub repository: String,
+    pub revision: String,
+    pub installed_at_ms: i64,
+    pub bundle: InstalledBundle,
+    #[serde(default)]
+    pub connectors: Vec<String>,
+    /// The pasted accounts this install holds (`accounts`, added by `list` on gol/service-accounts):
+    /// a token account is one install's, which `GET /connections` alone cannot say.
+    #[serde(default)]
+    pub accounts: Vec<InstalledAccount>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct InstalledAccount {
+    pub connector: String,
+    pub connection_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct InstalledBundle {
+    pub manifest: PluginManifest,
+    #[serde(default)]
+    pub parts: Vec<PluginPart>,
+}
+
+/// `Manifest` in opengrok-server `crates/opengrok-plugins/src/lib.rs`, the fields a person reads.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct PluginManifest {
+    pub name: String,
+    #[serde(default)]
+    pub version: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub author: Option<PluginAuthor>,
+    #[serde(default)]
+    pub homepage: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct PluginAuthor {
+    pub name: String,
+}
+
+/// How an installed plugin's service adds an account: `{"method": "oauth" | "token"}`.
+#[derive(Debug, Deserialize)]
+struct SignInMethod {
+    method: String,
+}
+
+/// What adding a pasted account answers: the new account's id.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AddedToken {
+    pub(crate) connection_id: String,
+}
+
+/// A sign-in that has not finished, as `GET /connections/attempts` lists it (`Attempt` in
+/// opengrok-server `crates/opengrok-integrations/src/attempts.rs`, #359, uncommitted on
+/// gol/service-accounts). `status` is `pending` while the person may still be at the service (or
+/// closed the window, which nothing reports) and `failed` once the service refused, with `error`.
+/// Either is an account that still needs auth; neither is ever shown as connected.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ConnectionAttempt {
+    pub id: String,
+    pub connector: String,
+    pub label: String,
+    #[serde(default)]
+    pub coworker_id: Option<String>,
+    pub status: String,
+    #[serde(default)]
+    pub error: Option<String>,
+    pub updated_at_ms: i64,
+    /// The installed plugin an MCP sign-in is for (#364); absent for a configured service's.
+    #[serde(default)]
+    pub plugin: Option<String>,
+}
+
+/// How long a marketplace read, an install or an uninstall is given. The server reads the
+/// registry from GitHub (bounded there too), so this is longer than a connection route's.
+pub const PLUGINS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// How long each connection route is given: [`OpenGrokClient::list_connections`], a lend, a
-/// revoke, a disconnect, [`OpenGrokClient::list_connectors`] and
-/// [`OpenGrokClient::connect_link`].
+/// revoke, a rename, a disconnect, the pins and their changes, [`OpenGrokClient::list_connectors`],
+/// [`OpenGrokClient::connect_link`] and [`OpenGrokClient::reconnect_link`].
 ///
 /// Each is a read or a write of a few rows on the server, and while one is out, its control is
 /// dead: a switch or a Disconnect until its change is answered, and every Connect while a
@@ -3368,10 +3996,16 @@ pub struct Connector {
     pub name: String,
     #[serde(default)]
     pub label: String,
+    /// The installed plugin whose service this is (#359), when it is one: its accounts are that
+    /// plugin's pasted tokens, listed in the plugin's own detail rather than as an app.
+    #[serde(default)]
+    pub plugin: Option<String>,
 }
 
 /// What `GET /connections/{connector}/authorize?format=json` answers (opengrok-server#269, as
 /// agreed): the service's own sign-in page, for the app to open in the person's browser.
+/// `GET /connections/{id}/reconnect?format=json` answers in the same shape (opengrok-server #359
+/// (agreed shape; branch gol/service-accounts)).
 #[derive(Debug, Deserialize)]
 pub(crate) struct ConnectLink {
     pub(crate) url: String,
@@ -4532,6 +5166,25 @@ fn value_text(value: &Value) -> Option<String> {
     }
 }
 
+/// What a message tagged, as its turn carries it in `forwardedProps`.
+///
+/// - `plugins`: installed plugins tagged `@name`, as `mentionedPlugins`. A tag GIVES the Bot that
+///   plugin for this turn even where it is switched off, when the Bot is the person's own; before
+///   any model call the server answers with a card when one needs an install, an account, or a
+///   choice between accounts (opengrok-server `mentioned_plugins_from` and `turn::needs` in
+///   `crates/opengrok-server/src/agui/routes.rs` and `crates/opengrok-integrations/src/turn.rs`,
+///   #359/#360, gol/service-accounts).
+/// - `accounts`: the account a "Which account?" card picked, by plugin then service, as
+///   `pluginAccounts`: `{"cloudflare": {"cloudflare": "conn_…"}}`. For this turn only.
+/// - `tools`: built-in tools tagged `@shell`, as `preferTools`: a preference the server names to
+///   the model, never a restriction (`preferred_tools_from`, same file).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TurnTags {
+    pub plugins: Vec<String>,
+    pub accounts: std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
+    pub tools: Vec<String>,
+}
+
 /// The recipe a turn runs, and what its parameters were filled in with.
 ///
 /// It travels in `forwardedProps` beside the coworker and never in the message: a parameter
@@ -5248,8 +5901,10 @@ pub const SKILL_FROM_TAPE_TIMEOUT: std::time::Duration = std::time::Duration::fr
 ///
 /// The server owns this limit and words its own refusal when a body is over it, naming both the
 /// cap and what arrived. The copy here is not a second check — nothing refuses a body on it —
-/// it is so that a file far too big to be read at all can be named for what it is not.
-pub const SKILL_BODY_CHARS: usize = 8000;
+/// it is so that a file far too big to be read at all can be named for what it is not. 64 KiB,
+/// as `MAX_SKILL_BODY_CHARS` in opengrok-server `crates/opengrok-plugins/src/skill.rs` (raised
+/// from 8000 on gol/service-accounts, uncommitted, to admit published skills).
+pub const SKILL_BODY_CHARS: usize = 64 * 1024;
 
 /// The most a skill's supporting files may weigh once decoded, and how many there may be.
 ///
@@ -6973,6 +7628,71 @@ mod tests {
     /// The turn's body is a contract with the server, which reads `forwardedProps` for the
     /// recipe and validates the values against the same declaration the composer read. Both
     /// sides are written apart, so the shape is asserted here rather than agreed in passing.
+    /// A tagged message's turn carries its tags where the server reads them: plugins as
+    /// `mentionedPlugins`, a card's pick as `pluginAccounts`, tools as `preferTools`
+    /// (opengrok-server `mentioned_plugins_from`, `plugin_accounts_from`, `preferred_tools_from`
+    /// in `crates/opengrok-server/src/agui/routes.rs`, gol/service-accounts). The words are sent
+    /// as they were typed.
+    #[tokio::test]
+    async fn a_tagged_turn_carries_its_plugins_pick_and_tools_in_forwarded_props() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/ag-ui"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string("data: {\"type\":\"RUN_FINISHED\",\"runId\":\"r\"}\n\n"),
+            )
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        put_cookie(&client, &live_session());
+        let message = AguiMessage {
+            id: "u1".into(),
+            role: "user".into(),
+            content: "@cloudflare list my zones with @shell".into(),
+            tool_call_id: None,
+            reply_to: None,
+            attachments: Vec::new(),
+        };
+        let tags = TurnTags {
+            plugins: vec!["cloudflare".into()],
+            accounts: [(
+                "cloudflare".to_string(),
+                [("cloudflare".to_string(), "conn_2".to_string())].into(),
+            )]
+            .into(),
+            tools: vec!["shell".into()],
+        };
+        client
+            .run_turn_tagged(
+                ("cw_1", "thread_1", "run_1"),
+                &[message],
+                (None, None),
+                (None, None),
+                None,
+                &tags,
+                |_, _| {},
+            )
+            .await
+            .unwrap();
+        let requests = server.received_requests().await.expect("the turn was sent");
+        let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(
+            body["forwardedProps"],
+            json!({
+                "coworkerId": "cw_1",
+                "mentionedPlugins": ["cloudflare"],
+                "pluginAccounts": {"cloudflare": {"cloudflare": "conn_2"}},
+                "preferTools": ["shell"],
+            })
+        );
+        assert_eq!(
+            body["messages"][0]["content"],
+            "@cloudflare list my zones with @shell"
+        );
+    }
+
     #[tokio::test]
     async fn a_turn_carries_the_active_recipe_and_its_values_in_forwarded_props() {
         let server = MockServer::start().await;
@@ -8439,6 +9159,7 @@ mod tests {
                 loans: vec!["cw_1".into()],
                 updated_at_ms: 1_790_000_000_000,
                 expires_at_ms: None,
+                kind: crate::opengrok::ConnectionKind::Oauth,
             })
         );
         let revoked = client.revoke_connection("conn_1", "cw_1").await.unwrap();
@@ -8589,6 +9310,14 @@ mod tests {
             client.disconnect_connection("conn_1").await,
             client.list_connectors().await.map(drop),
             client.connect_link("gmail", None).await.map(drop),
+            client.reconnect_link("conn_1", None).await.map(drop),
+            client.rename_connection("conn_1", "Work").await.map(drop),
+            client.list_connection_pins().await.map(drop),
+            client
+                .pin_connection("cw_1", "github", "conn_1")
+                .await
+                .map(drop),
+            client.unpin_connection("cw_1", "github").await,
         ];
         for (at, answer) in answers.into_iter().enumerate() {
             let error = answer.expect_err("a route with no deadline waited for the answer");
@@ -8622,11 +9351,13 @@ mod tests {
             vec![
                 Connector {
                     name: "gmail".into(),
-                    label: "Gmail".into()
+                    label: "Gmail".into(),
+                    plugin: None
                 },
                 Connector {
                     name: "github".into(),
-                    label: String::new()
+                    label: String::new(),
+                    plugin: None
                 },
             ]
         );
@@ -8737,6 +9468,266 @@ mod tests {
         assert_eq!(
             client.connect_link("gmail", None).await.unwrap(),
             "https://accounts.google.com/o/oauth2/v2/auth?state=s"
+        );
+    }
+
+    /// Several accounts of one service are several rows, each saying how it was signed in to
+    /// (opengrok-server #359, agreed shape; branch gol/service-accounts). A row with no kind is
+    /// from a server before it, whose only way in was the sign-in page, and a kind from later
+    /// does not fail the list.
+    #[tokio::test]
+    async fn accounts_of_one_service_are_rows_of_their_own_with_their_kind() {
+        let server = MockServer::start().await;
+        let account = |id: &str, label: &str, kind: Value| {
+            let mut row = connection_row(id, &[]);
+            row["connector"] = json!("github");
+            row["label"] = json!(label);
+            if !kind.is_null() {
+                row["kind"] = kind;
+            }
+            row
+        };
+        Mock::given(method("GET"))
+            .and(path("/connections"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+                account("conn_1", "GitHub", json!("oauth")),
+                account("conn_2", "GitHub 2", json!("token")),
+                account("conn_3", "GitHub 3", Value::Null),
+                account("conn_4", "GitHub 4", json!("passkey")),
+            ])))
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        let listed = client.list_connections().await.unwrap();
+        let read: Vec<(&str, ConnectionKind)> = listed
+            .iter()
+            .map(|row| (row.label.as_str(), row.kind))
+            .collect();
+        assert_eq!(
+            read,
+            [
+                ("GitHub", ConnectionKind::Oauth),
+                ("GitHub 2", ConnectionKind::Token),
+                ("GitHub 3", ConnectionKind::Oauth),
+                ("GitHub 4", ConnectionKind::Other),
+            ]
+        );
+    }
+
+    /// Reconnect asks for one account's sign-in page with the bearer, in the shape Connect is
+    /// answered in, and only a web address comes back (opengrok-server #359, agreed shape; branch
+    /// gol/service-accounts).
+    #[tokio::test]
+    async fn a_reconnect_link_is_asked_for_one_account_and_checked_like_a_connect() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/connections/conn_1/reconnect"))
+            .and(wiremock::matchers::query_param("format", "json"))
+            .and(wiremock::matchers::query_param_is_missing("coworker_id"))
+            .and(wiremock::matchers::header_exists("authorization"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "url": "https://github.com/login/oauth/authorize?state=s", "expiresAtMs": 1
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/connections/conn_1/reconnect"))
+            .and(wiremock::matchers::query_param("coworker_id", "cw 1"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({ "url": "https://example.com/a" })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/connections/conn_2/reconnect"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({ "url": "file:///Applications/Calculator.app" })),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/connections/conn_3/reconnect"))
+            .respond_with(ResponseTemplate::new(422).set_body_json(
+                json!({ "error": "a token account has no sign-in page to go back to" }),
+            ))
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        put_cookie(&client, &live_session());
+        assert_eq!(
+            client.reconnect_link("conn_1", None).await.unwrap(),
+            "https://github.com/login/oauth/authorize?state=s"
+        );
+        assert_eq!(
+            client.reconnect_link("conn_1", Some("cw 1")).await.unwrap(),
+            "https://example.com/a"
+        );
+        assert!(client.reconnect_link("conn_2", None).await.is_err());
+        let refused = client.reconnect_link("conn_3", None).await.unwrap_err();
+        assert_eq!(
+            (refused.status, refused.message.as_str(), refused.failure()),
+            (
+                Some(422),
+                "a token account has no sign-in page to go back to",
+                Failure::Verdict
+            )
+        );
+    }
+
+    /// A rename sends only the label and reads back the row; a label the server will not take is
+    /// its 422 in its words (opengrok-server #359, agreed shape; branch gol/service-accounts).
+    #[tokio::test]
+    async fn a_rename_sends_the_label_and_a_refusal_is_the_servers_sentence() {
+        let server = MockServer::start().await;
+        let mut renamed = connection_row("conn_1", &["cw_1"]);
+        renamed["label"] = json!("Work mail");
+        Mock::given(method("PATCH"))
+            .and(path("/connections/conn_1"))
+            .and(body_json(json!({ "label": "Work mail" })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(renamed))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path("/connections/conn_1"))
+            .and(body_json(json!({ "label": "" })))
+            .respond_with(
+                ResponseTemplate::new(422)
+                    .set_body_json(json!({ "error": "a label is between 1 and 80 characters" })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path("/connections/conn_2"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        let row = client
+            .rename_connection("conn_1", "Work mail")
+            .await
+            .unwrap()
+            .expect("the row");
+        assert_eq!(
+            (row.id.as_str(), row.label.as_str()),
+            ("conn_1", "Work mail")
+        );
+        let refused = client.rename_connection("conn_1", "").await.unwrap_err();
+        assert_eq!(
+            (refused.status, refused.message.as_str(), refused.failure()),
+            (
+                Some(422),
+                "a label is between 1 and 80 characters",
+                Failure::Verdict
+            )
+        );
+        assert_eq!(
+            client.rename_connection("conn_2", "Home").await.unwrap(),
+            None,
+            "a 2xx with no row is the rename taken"
+        );
+    }
+
+    /// The pins are a list of which account each Bot uses for each service; picking one is a PUT
+    /// naming the account, answered with the pin, and Ask each time is a DELETE answered 204
+    /// (opengrok-server #359, agreed shape; branch gol/service-accounts).
+    #[tokio::test]
+    async fn pins_are_read_picked_and_taken_away_in_the_agreed_shape() {
+        let server = MockServer::start().await;
+        let pin = json!({ "coworkerId": "cw_1", "connector": "github", "connectionId": "conn_2" });
+        Mock::given(method("GET"))
+            .and(path("/connections/pins"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([pin.clone()])))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/coworkers/cw_1/pins/github"))
+            .and(body_json(json!({ "connectionId": "conn_2" })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(pin))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path("/coworkers/cw_1/pins/github"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        let expected = ConnectionPin {
+            coworker_id: "cw_1".into(),
+            connector: "github".into(),
+            connection_id: "conn_2".into(),
+        };
+        assert_eq!(
+            client.list_connection_pins().await.unwrap(),
+            vec![expected.clone()]
+        );
+        assert_eq!(
+            client
+                .pin_connection("cw_1", "github", "conn_2")
+                .await
+                .unwrap(),
+            Some(expected)
+        );
+        client.unpin_connection("cw_1", "github").await.unwrap();
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/connections/pins"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        assert!(
+            client.list_connection_pins().await.unwrap().is_empty(),
+            "no pins is every Bot asking each time"
+        );
+    }
+
+    /// An account the server will not pin is its 422 in its words, which the picker shows, and so
+    /// is a refused Ask each time (opengrok-server #359, agreed shape; branch
+    /// gol/service-accounts).
+    #[tokio::test]
+    async fn a_refused_pin_is_the_servers_sentence() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/coworkers/cw_1/pins/github"))
+            .respond_with(
+                ResponseTemplate::new(422)
+                    .set_body_json(json!({ "error": "conn_9 is not one of your github accounts" })),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path("/coworkers/cw_9/pins/github"))
+            .respond_with(
+                ResponseTemplate::new(404).set_body_json(json!({ "error": "no such coworker" })),
+            )
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        let refused = client
+            .pin_connection("cw_1", "github", "conn_9")
+            .await
+            .unwrap_err();
+        assert_eq!(
+            (refused.status, refused.message.as_str(), refused.failure()),
+            (
+                Some(422),
+                "conn_9 is not one of your github accounts",
+                Failure::Verdict
+            )
+        );
+        let refused = client.unpin_connection("cw_9", "github").await.unwrap_err();
+        assert_eq!(
+            (refused.status, refused.message.as_str()),
+            (Some(404), "no such coworker")
         );
     }
 

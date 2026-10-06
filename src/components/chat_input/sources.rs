@@ -58,6 +58,9 @@ pub enum ComposerPick {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TokenKind {
     Tool,
+    /// One of the person's installed plugins, tagged `@name` in the message: the turn carries it
+    /// as `mentionedPlugins`, which gives the Bot that plugin for that message (#359).
+    Plugin,
     /// A taped sequence the box replays exactly. It was called a skill here until the four
     /// words were settled, which left the one noun standing for two very different prices.
     Recipe,
@@ -99,12 +102,95 @@ pub enum AppCommand {
     Groups,
 }
 
-/// The tools a bot has. Hardcoded to the server's built-ins for now; a later change swaps
-/// [`ToolSource::rows`] for the list the server actually reports, and the plugins-and-connectors
-/// notice for the plugins it finds.
-pub struct ToolSource;
+/// The names a message tags with `@`, of the ones `known` takes, each once and in the order they
+/// come. A tag starts the message or follows a space or an opening bracket, and ends where a name
+/// can no longer go on: `me@cloudflare.com` tags nothing, `@cloudflare,` tags cloudflare. The
+/// composer's chip reads `@name` in the message, so a tag survives a draft, a queued send and a
+/// retry as the words do, and one typed by hand counts the same.
+pub fn tags_in(text: &str, known: impl Fn(&str) -> bool) -> Vec<String> {
+    let mut tags: Vec<String> = Vec::new();
+    let mut before: Option<char> = None;
+    for (at, c) in text.char_indices() {
+        let starts = before.is_none_or(|b| b.is_whitespace() || "([{\"'".contains(b));
+        before = Some(c);
+        if c != '@' || !starts {
+            continue;
+        }
+        let rest = &text[at + 1..];
+        let end = rest
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_'))
+            .unwrap_or(rest.len());
+        let name = rest[..end].to_ascii_lowercase();
+        // A dot with more name after it is an address or a file, not a tag.
+        let after = &rest[end..];
+        let dotted =
+            after.starts_with('.') && after[1..].starts_with(|c: char| c.is_ascii_alphanumeric());
+        if !name.is_empty() && !dotted && known(&name) && !tags.contains(&name) {
+            tags.push(name);
+        }
+    }
+    tags
+}
+
+/// What `@` offers: the server's built-in tools, then each of the person's installed plugins once,
+/// then the services they signed in to that are no plugin's (#184, #359). Picking one puts `@name`
+/// in the message, where it means something: a plugin's tag gives the open Bot that plugin for that
+/// message, switched on or not, and asks the person first if it still needs an account; a tool's
+/// tag is a preference the server names to the model.
+///
+/// ONE ROW PER THING. A plugin's own account is the plugin's, not an app beside it: listed again
+/// as a "Connected app", Cloudflare showed twice, and the second row did nothing (6 Oct 2026). And
+/// no row says "off": a tag is how a Bot with the switch off uses it.
+pub struct ToolSource {
+    /// `(name, what it does, needs an account first)`.
+    pub plugins: Vec<(String, String, bool)>,
+    pub apps: Vec<(String, String)>,
+}
 
 impl ToolSource {
+    /// The plugins and apps of `state`.
+    pub fn of(state: &crate::state::AppState) -> Self {
+        let installs = state
+            .plugin_market
+            .installations
+            .as_ref()
+            .and_then(crate::state::Loaded::ready);
+        let plugins = installs
+            .map(|installs| {
+                installs
+                    .iter()
+                    .map(|install| {
+                        let about = install
+                            .bundle
+                            .manifest
+                            .description
+                            .clone()
+                            .unwrap_or_default();
+                        // An install whose services have no account yet: its tag asks for one.
+                        let accountless =
+                            !install.connectors.is_empty() && install.accounts.is_empty();
+                        (install.name.clone(), about, accountless)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut apps: Vec<(String, String)> = Vec::new();
+        for row in state.connections.own_rows() {
+            // A plugin's own account (a pasted key or a sign-in at its server) is the plugin's row.
+            let plugins_own = matches!(
+                row.kind,
+                crate::opengrok::ConnectionKind::Token | crate::opengrok::ConnectionKind::Mcp
+            );
+            if !plugins_own && !apps.iter().any(|(name, _)| *name == row.connector) {
+                apps.push((
+                    row.connector.clone(),
+                    state.connections.connector_label(&row.connector),
+                ));
+            }
+        }
+        Self { plugins, apps }
+    }
+
     pub fn rows(&self) -> Vec<(ComposerPanelRow, ComposerPick)> {
         let mut rows: Vec<(ComposerPanelRow, ComposerPick)> = BUILTIN_TOOLS
             .iter()
@@ -120,22 +206,61 @@ impl ToolSource {
                 )
             })
             .collect();
-        rows.push((
-            ComposerPanelRow::new(
-                "tool:plugins",
-                "icons/plugins.svg",
-                "Plugins and connectors",
-                "Not listed yet — only the bot's built-in tools are here",
-            )
-            .note(),
-            ComposerPick::Nothing,
-        ));
+        for (name, about, accountless) in &self.plugins {
+            let line = if *accountless {
+                "Needs an account — you'll be asked to add one".to_string()
+            } else {
+                about.clone()
+            };
+            rows.push((
+                ComposerPanelRow::new(
+                    format!("plugin:{name}"),
+                    "icons/plugins.svg",
+                    name.clone(),
+                    line,
+                )
+                .label("Plugin"),
+                ComposerPick::Token {
+                    kind: TokenKind::Plugin,
+                    id: name.clone(),
+                    text: format!("@{name}"),
+                },
+            ));
+        }
+        for (name, label) in &self.apps {
+            rows.push((
+                ComposerPanelRow::new(
+                    format!("app:{name}"),
+                    "icons/plugins.svg",
+                    label.clone(),
+                    "Connected app",
+                )
+                .label("Connector"),
+                ComposerPick::Token {
+                    kind: TokenKind::Tool,
+                    id: name.clone(),
+                    text: format!("@{name}"),
+                },
+            ));
+        }
+        if self.plugins.is_empty() && self.apps.is_empty() {
+            rows.push((
+                ComposerPanelRow::new(
+                    "tool:plugins",
+                    "icons/plugins.svg",
+                    "Plugins and connectors",
+                    "None yet — add them from Plugins in the sidebar",
+                )
+                .note(),
+                ComposerPick::Nothing,
+            ));
+        }
         rows
     }
 }
 
 /// The server's built-in tools: what each is called, its icon, and one line on what it does.
-const BUILTIN_TOOLS: &[(&str, &str, &str)] = &[
+pub const BUILTIN_TOOLS: &[(&str, &str, &str)] = &[
     (
         "shell",
         "icons/wrench.svg",
@@ -653,7 +778,7 @@ const APP_COMMANDS: &[(&str, &str, &str, &str, AppCommand)] = &[
 mod tests {
     use super::{
         ComposerPanelRow, ComposerPick, ParameterSource, SkillLibrary, SlashSource, TokenKind,
-        ToolSource, ValueSource,
+        ToolSource, ValueSource, tags_in,
     };
     use crate::opengrok::{RecipeParameter, RecipeSummary, SkillSummary};
     use crate::state::ActiveRecipe;
@@ -821,7 +946,11 @@ mod tests {
 
     #[test]
     fn a_tool_becomes_an_at_chip_and_the_notice_becomes_nothing() {
-        let rows = ToolSource.rows();
+        let rows = ToolSource {
+            plugins: Vec::new(),
+            apps: Vec::new(),
+        }
+        .rows();
         let shell = rows
             .iter()
             .find(|(row, _)| row.id == "tool:shell")
@@ -837,6 +966,18 @@ mod tests {
         let notice = rows.last().expect("the plugins notice closes the list");
         assert_eq!(notice.1, ComposerPick::Nothing);
         assert!(!notice.0.selectable);
+        // Installed plugins and connected apps are offered (each plugin's row:
+        // `each_plugin_is_one_row_and_none_is_off`).
+        let rows = ToolSource {
+            plugins: vec![("cloudflare".into(), "Build on Cloudflare".into(), false)],
+            apps: vec![("gmail".into(), "Gmail".into())],
+        }
+        .rows();
+        assert!(rows.iter().any(|(row, _)| row.id == "app:gmail"));
+        assert!(
+            rows.iter().all(|(row, _)| row.id != "tool:plugins"),
+            "no notice once there are some"
+        );
     }
 
     #[test]
@@ -1295,5 +1436,56 @@ mod tests {
         let first_action = kinds.iter().position(|kind| *kind == "action").unwrap();
         let last_recipe = kinds.iter().rposition(|kind| *kind == "recipe").unwrap();
         assert!(last_recipe < first_skill && first_skill < first_action);
+    }
+
+    /// A tag is `@name` where a word starts, ended where a name cannot go on; an address, a file,
+    /// a name nobody installed, and a second tag of the same name tag nothing more.
+    #[test]
+    fn tags_are_names_where_a_word_starts_and_nowhere_else() {
+        let known = |name: &str| ["cloudflare", "shell", "my-tool"].contains(&name);
+        let said = "@Cloudflare, list zones (@shell) for me@cloudflare.com, see @cloudflare.yaml, \
+                    @nope, @my-tool and @cloudflare again";
+        assert_eq!(tags_in(said, known), ["cloudflare", "shell", "my-tool"]);
+        assert!(tags_in("mail me@cloudflare", known).is_empty());
+        assert_eq!(tags_in("@cloudflare.", known), ["cloudflare"]);
+    }
+
+    /// One row per installed plugin, picked as a plugin tag; one still without an account says it
+    /// will be asked for, and none says it is off (#359).
+    #[test]
+    fn each_plugin_is_one_row_and_none_is_off() {
+        let source = ToolSource {
+            plugins: vec![
+                ("cloudflare".into(), "Cloudflare's API".into(), false),
+                ("linear".into(), "Issues".into(), true),
+            ],
+            apps: vec![("gmail".into(), "Gmail".into())],
+        };
+        let rows = source.rows();
+        let plugin = |name: &str| {
+            rows.iter()
+                .filter(|(row, _)| row.id.as_ref() == format!("plugin:{name}"))
+                .collect::<Vec<_>>()
+        };
+        let cloudflare = plugin("cloudflare");
+        assert_eq!(cloudflare.len(), 1);
+        assert_eq!(
+            cloudflare[0].1,
+            ComposerPick::Token {
+                kind: TokenKind::Plugin,
+                id: "cloudflare".into(),
+                text: "@cloudflare".into()
+            }
+        );
+        assert!(
+            plugin("linear")[0]
+                .0
+                .description
+                .contains("Needs an account")
+        );
+        assert!(
+            rows.iter()
+                .all(|(row, _)| !row.description.contains("Off for"))
+        );
     }
 }

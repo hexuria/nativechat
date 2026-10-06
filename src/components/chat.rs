@@ -393,6 +393,7 @@ struct ChatRow {
     screenshots: Vec<ScreenshotSpec>,
     user_form: Option<UserFormSpec>,
     save_login: Option<SaveLoginSpec>,
+    plugin_needs: Option<crate::opengrok::PluginNeedsSpec>,
     /// A step, a stretch of steps, or a thought. Its `content` stays
     /// empty: none of it is words, so find, copy and read aloud pass it by.
     run: Option<RunRow>,
@@ -441,6 +442,7 @@ impl ChatRow {
             screenshots: Vec::new(),
             user_form: None,
             save_login: None,
+            plugin_needs: None,
             run: None,
             source_badge: None,
         }
@@ -787,6 +789,14 @@ fn snapshot_rows(state: &AppState) -> Arc<Vec<ChatRow>> {
                     rows.push(ChatRow {
                         save_login: Some(spec),
                         ..ChatRow::slot(format!("{}-save-login-{ui_n}", msg.id), msg.id.clone())
+                    });
+                    ui_n += 1;
+                }
+                ChatPart::PluginNeeds(spec) => {
+                    flush_text(&mut rows, &mut text_buf, &mut text_n);
+                    rows.push(ChatRow {
+                        plugin_needs: Some(spec),
+                        ..ChatRow::slot(format!("{}-plugin-needs-{ui_n}", msg.id), msg.id.clone())
                     });
                     ui_n += 1;
                 }
@@ -1651,6 +1661,23 @@ impl Render for ChatTranscript {
                                         Some(app_state.clone()),
                                         cx,
                                     )))
+                                    .into_any_element();
+                            }
+                            if let Some(spec) = &row.plugin_needs {
+                                return div()
+                                    .id(ElementId::Name(row.id.clone().into()))
+                                    .w_full()
+                                    .flex()
+                                    .justify_start()
+                                    .py(px(6.))
+                                    .child(div().w_full().max_w(px(560.)).child(
+                                        crate::components::plugin_needs::render_plugin_needs(
+                                            spec,
+                                            &row.source_id,
+                                            app_state.clone(),
+                                            cx,
+                                        ),
+                                    ))
                                     .into_any_element();
                             }
                             if let Some(spec) = &row.save_login {

@@ -15,7 +15,7 @@ use crate::components::chat_input::sources::{
 };
 use crate::components::composer_panel::ComposerPanelRow;
 use crate::components::computers::{self, ComputerCard};
-use crate::components::connections::{self, ConnectOffer};
+use crate::components::connections;
 use crate::components::default_models;
 use crate::components::model_picker;
 use crate::components::reply_source;
@@ -37,9 +37,9 @@ use crate::opengrok::{
 };
 use crate::site_login::{SiteLoginRecord, grouped_logins, login_title};
 use crate::state::{
-    ActiveRecipe, AfterRefusal, AppSettingsTab, AppState, BotSkills, CeilingCard, ConnectionList,
-    LocalRuleRow, LocalRules, PickerFor, PickerView, RuleKind, SWITCH_IN_FLIGHT, SkillScope,
-    SkillsCard, TaughtSkill, ToolCeiling, ToolList, WRITING_A_LESSON,
+    ActiveRecipe, AfterRefusal, AppSettingsTab, AppState, BotSkills, CeilingCard, LocalRuleRow,
+    LocalRules, PickerFor, PickerView, RuleKind, SWITCH_IN_FLIGHT, SkillScope, SkillsCard,
+    TaughtSkill, ToolCeiling, ToolList, WRITING_A_LESSON,
 };
 
 pub mod ids {
@@ -58,6 +58,8 @@ pub mod ids {
     pub const NAV_LIBRARY: &str = "nav-library";
     pub const NAV_PROJECTS: &str = "nav-projects";
     pub const NAV_RECIPES: &str = "nav-recipes";
+    /// The sidebar's Plugins: the marketplace for the open Bot (#184).
+    pub const FOOTER_PLUGINS: &str = "footer-plugins";
     pub const PAGE_RECIPES: &str = "page-recipes";
     pub const NAV_TOGGLE: &str = "nav-toggle-sidebar";
     pub const FOOTER_THEME: &str = "footer-theme";
@@ -485,16 +487,8 @@ pub mod ids {
         format!("settings-local-rule-error-{}-{n}", kind.word())
     }
 
-    // Connections (#2). Each is the id the window's own element carries, from the module that
-    // draws it, so the control a driver presses is the control a person presses.
-    pub const SETTINGS_CONNECTIONS: &str = connections::SETTINGS_TAB;
-    pub const CONNECTIONS_REFRESH: &str = connections::REFRESH;
-    pub const CONNECTIONS: &str = connections::LIST;
-    pub const CONNECTIONS_EMPTY: &str = connections::LIST_EMPTY;
-    pub const CONNECTIONS_ERROR: &str = connections::LIST_ERROR;
-    pub const CONNECTORS: &str = connections::OFFERED;
-    pub const CONNECTORS_EMPTY: &str = connections::OFFERED_EMPTY;
-    pub const CONNECTORS_ERROR: &str = connections::OFFERED_ERROR;
+    // A Bot's Connections card. Each is the id the window's own element carries, from the module
+    // that draws it, so the control a driver presses is the control a person presses.
     pub const AGENT_CONNECTIONS: &str = connections::AGENT_CARD;
     pub const AGENT_CONNECTIONS_NOTE: &str = connections::AGENT_NOTE;
 
@@ -611,28 +605,6 @@ pub mod ids {
     /// A model's row in the Usage modal, by its place.
     pub fn usage_row(at: usize) -> String {
         usage_modal::row_id(at)
-    }
-
-    /// One connected service on Settings → Connections, by the server's connection id.
-    pub fn connection(id: &str) -> String {
-        connections::row_id(id)
-    }
-
-    pub fn connection_disconnect(id: &str) -> String {
-        connections::disconnect_id(id)
-    }
-
-    pub fn connection_error(id: &str) -> String {
-        connections::row_error_id(id)
-    }
-
-    /// Connect, for a service on offer, by the name the server lists it under.
-    pub fn connect(connector: &str) -> String {
-        connections::connect_id(connector)
-    }
-
-    pub fn connect_error(connector: &str) -> String {
-        connections::connect_error_id(connector)
     }
 
     /// A connection's switch on the open bot's Connections card.
@@ -780,6 +752,100 @@ pub struct RedactedSecret(pub String);
 impl std::fmt::Debug for RedactedSecret {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("<redacted>")
+    }
+}
+
+/// The token form as a driver may see it: whose it is, how much is typed, never what.
+#[derive(Debug, Clone)]
+pub struct MarketTokenSnap {
+    plugin: String,
+    connector: String,
+    typed_chars: usize,
+    saving: bool,
+    refusal: Option<String>,
+}
+
+/// What a marketplace control does, as the window's own control does it.
+#[derive(Debug, Clone)]
+pub enum MarketCommand {
+    Open,
+    Page(crate::components::monitor_modal::MarketPage),
+    OpenDetail(crate::components::monitor_modal::PluginSelection),
+    CloseDetail,
+    Install(String),
+    AskUninstall(bool),
+    Uninstall,
+    StartToken {
+        plugin: String,
+        connector: String,
+        replacing: Option<String>,
+    },
+    SetToken(String),
+    SaveToken,
+    CancelToken,
+    Reopen(String),
+    Dismiss(String),
+    AskAccountRemove(Option<String>),
+    ToggleTools,
+    SetQuery(String),
+    Bots(Option<String>),
+    BotsQuery(String),
+    /// Authorize or Reconnect at an installed plugin's own provider (#364).
+    Authorize {
+        plugin: String,
+        connector: String,
+        connection_id: Option<String>,
+    },
+    LendTo {
+        connection_id: String,
+        coworker_id: String,
+        lent: bool,
+    },
+    Move(isize),
+    OpenHighlight,
+    /// Not now, on the "Use it in this Bot?" prompt (#359).
+    DeclineUse(String),
+}
+
+impl MarketCommand {
+    fn apply(self, state: &mut AppState, cx: &mut gpui_kit::Context<AppState>) {
+        match self {
+            Self::Open => state.open_plugin_market(cx),
+            Self::Page(page) => state.set_market_page(page, cx),
+            Self::OpenDetail(selection) => state.open_market_detail(selection, cx),
+            Self::CloseDetail => state.close_market_detail(cx),
+            Self::Install(name) => state.install_market_plugin(name, cx),
+            Self::DeclineUse(name) => state.decline_use_prompt(name, cx),
+            Self::AskUninstall(confirm) => state.ask_market_uninstall(confirm, cx),
+            Self::Uninstall => state.uninstall_market_plugin(cx),
+            Self::StartToken {
+                plugin,
+                connector,
+                replacing,
+            } => state.start_market_token(plugin, connector, replacing, cx),
+            Self::SetToken(typed) => state.set_market_token(typed, cx),
+            Self::SaveToken => state.save_market_token(cx),
+            Self::CancelToken => state.cancel_market_token(cx),
+            Self::Reopen(id) => state.reopen_attempt(id, cx),
+            Self::Dismiss(id) => state.dismiss_attempt(id, cx),
+            Self::AskAccountRemove(id) => state.ask_account_remove(id, cx),
+            Self::ToggleTools => state.toggle_market_tools(cx),
+            Self::SetQuery(query) => state.set_market_query(query, cx),
+            Self::Bots(id) => state.open_account_bots(id, cx),
+            Self::Authorize {
+                plugin,
+                connector,
+                connection_id,
+            } => state.authorize_plugin(plugin, connector, connection_id, cx),
+            Self::BotsQuery(query) => state.set_bots_query(query, cx),
+            Self::LendTo {
+                connection_id,
+                coworker_id,
+                lent,
+            } => state.set_connection_lent_to(connection_id, coworker_id, lent, cx),
+            Self::Move(by) => state.move_market_highlight(by, cx),
+            Self::OpenHighlight => state.open_market_highlight(cx),
+        }
     }
 }
 
@@ -982,6 +1048,8 @@ pub enum Command {
     SelectMonitorPlugin(Option<crate::components::monitor_modal::PluginSelection>),
     AskMonitorRemove(bool),
     RemoveMonitorPlugin,
+    /// One of the marketplace's controls (#184).
+    Market(MarketCommand),
     /// A chip of the Usage modal.
     SetUsageWindow(crate::opengrok::UsageWindow),
     /// A switch on the Tools card: one row of the open Bot's ceiling on or off, sent at once.
@@ -1025,6 +1093,20 @@ pub enum Command {
     },
     SkipSaveLogin {
         form_entry_id: String,
+    },
+    /// Use, on a "Which account?" card: `(plugin, connector, account)` (#360).
+    ChoosePluginAccount {
+        message_id: String,
+        pick: (String, String, String),
+    },
+    ToggleNeedsRemember {
+        message_id: String,
+    },
+    OpenPluginDetail {
+        plugin: String,
+    },
+    ResendAfterNeeds {
+        message_id: String,
     },
     DeleteSiteLogin {
         id: String,
@@ -1129,6 +1211,15 @@ pub enum Command {
     AskDisconnect(String),
     /// No, on that question.
     KeepConnection,
+    PickAccount {
+        connector: String,
+        connection_id: Option<String>,
+    },
+    ReconnectAccount(String),
+    RenameAccount(String),
+    SetAccountLabel(String),
+    SaveAccountLabel,
+    CancelAccountLabel,
     /// The open bot's Connections switch: lend it the connection, or take it back.
     SetConnectionLent {
         connection_id: String,
@@ -1304,6 +1395,7 @@ impl Command {
             Self::SelectMonitorPlugin(plugin) => state.select_monitor_plugin(plugin, cx),
             Self::AskMonitorRemove(confirm) => state.ask_monitor_remove(confirm, cx),
             Self::RemoveMonitorPlugin => state.remove_monitor_plugin(cx),
+            Self::Market(command) => command.apply(state, cx),
             Self::SetUsageWindow(window) => state.set_usage_window(window, cx),
             Self::SetCeilingTool { name, enabled } => state.switch_ceiling_tool(name, enabled, cx),
             Self::ToggleAgentSkills => state.toggle_agent_skills(cx),
@@ -1332,6 +1424,12 @@ impl Command {
             }
             Self::SaveLogin { form_entry_id } => state.save_offered_login(form_entry_id, cx),
             Self::SkipSaveLogin { form_entry_id } => state.skip_save_login(form_entry_id, cx),
+            Self::ChoosePluginAccount { message_id, pick } => {
+                state.choose_plugin_account(message_id, pick, cx)
+            }
+            Self::ToggleNeedsRemember { message_id } => state.toggle_needs_remember(message_id, cx),
+            Self::OpenPluginDetail { plugin } => state.open_plugin_detail(plugin, cx),
+            Self::ResendAfterNeeds { message_id } => state.resend_after_needs(message_id, cx),
             Self::DeleteSiteLogin { id } => state.delete_site_login(id, cx),
             Self::SetAppSettingsTab(tab) => state.set_app_settings_tab(tab, cx),
             Self::SetShowTurnTiming(on) => state.set_show_turn_timing(on, cx),
@@ -1433,6 +1531,15 @@ impl Command {
             Self::DisconnectConnection(id) => state.disconnect_connection(id, cx),
             Self::AskDisconnect(id) => state.ask_to_disconnect(id, cx),
             Self::KeepConnection => state.keep_connection(cx),
+            Self::PickAccount {
+                connector,
+                connection_id,
+            } => state.pick_account(connector, connection_id, cx),
+            Self::ReconnectAccount(id) => state.reconnect_connection(id, cx),
+            Self::RenameAccount(id) => state.start_account_rename(id, cx),
+            Self::SetAccountLabel(text) => state.set_account_rename(text, cx),
+            Self::SaveAccountLabel => state.save_account_rename(cx),
+            Self::CancelAccountLabel => state.cancel_account_rename(cx),
             Self::SetConnectionLent {
                 connection_id,
                 lent,
@@ -1703,6 +1810,7 @@ fn panel_rows(
     recipes: &[RecipeSummary],
     skills: &SkillLibrary<'_>,
     active: Option<&ActiveRecipe>,
+    tools: &ToolSource,
 ) -> Vec<PanelRow> {
     let rows = match mode {
         // The "+" list is the composer's own two fixed rows rather than a source, so they are
@@ -1713,7 +1821,7 @@ fn panel_rows(
                 PanelRow::fixed("composer-teach", "Teach a task"),
             ];
         }
-        PanelMode::Tools => ToolSource.rows(),
+        PanelMode::Tools => tools.rows(),
         PanelMode::Slash => SlashSource.rows(recipes, skills),
         PanelMode::Parameters => match active {
             Some(recipe) => ParameterSource.rows(recipe),
@@ -2108,6 +2216,15 @@ impl Default for ComputerHandoffSnap {
             status: ComputerHandoffStatus::ActionNeeded,
         }
     }
+}
+
+/// A needs card in the open thread (#360), with what a click on it may do now.
+#[derive(Clone)]
+struct PluginNeedsSnap {
+    message_id: String,
+    spec: crate::opengrok::PluginNeedsSpec,
+    answerable: bool,
+    remember: bool,
 }
 
 #[derive(Clone, Default)]
@@ -2904,6 +3021,63 @@ fn routine_node(routine: &RoutineSnap) -> UiNode {
     node.with_child(UiNode::button(ids::routine_delete(&routine.id), "Delete"))
 }
 
+/// `plugin-needs-<message>`: a dialog per needs card, holding for each account to choose
+/// `plugin-needs-use-<message>-<account>` (named by its label, valued by how it was added),
+/// `plugin-needs-remember-<message>` (a switch), `plugin-needs-open-<message>-<plugin>` for an
+/// install or a missing account, and `plugin-needs-again-<message>`. Each control is disabled
+/// once the card is no longer the thread's last row.
+fn plugin_needs_node(card: &PluginNeedsSnap) -> UiNode {
+    use crate::components::plugin_needs as ids;
+    use crate::opengrok::PluginNeedKind;
+    let mut node = UiNode::dialog(ids::card_id(&card.message_id), "Plugin needs");
+    let mut chooses = false;
+    for need in &card.spec.needs {
+        match &need.kind {
+            PluginNeedKind::Choose(accounts) => {
+                chooses = true;
+                for (id, label, kind) in accounts {
+                    node = node.with_child(
+                        UiNode::button(ids::use_id(&card.message_id, id), label.clone())
+                            .with_value(kind.clone())
+                            .with_enabled(card.answerable),
+                    );
+                }
+            }
+            PluginNeedKind::Account | PluginNeedKind::Install => {
+                let label = if need.kind == PluginNeedKind::Install {
+                    "Open in Plugins"
+                } else {
+                    "Add account"
+                };
+                node = node.with_child(
+                    UiNode::button(ids::open_id(&card.message_id, &need.plugin), label)
+                        .with_value(need.plugin.clone()),
+                );
+            }
+        }
+    }
+    if chooses {
+        node = node.with_child(
+            UiNode::new(ids::remember_id(&card.message_id), "switch", "Remember")
+                .with_checked(card.remember)
+                .with_enabled(card.answerable),
+        );
+    }
+    let again = card.spec.send_again
+        && card
+            .spec
+            .needs
+            .iter()
+            .any(|need| !matches!(need.kind, PluginNeedKind::Choose(_)));
+    if again {
+        node = node.with_child(
+            UiNode::button(ids::again_id(&card.message_id), "Send again")
+                .with_enabled(card.answerable),
+        );
+    }
+    node
+}
+
 fn save_login_node(offer: &SaveLoginSnap) -> UiNode {
     UiNode::dialog(
         save_login_card_id(&offer.form_entry_id),
@@ -3314,6 +3488,16 @@ pub struct NativeChatHost {
     monitor_plugins: Vec<crate::components::monitor_modal::PluginRow>,
     monitor_detail: Option<crate::components::monitor_modal::PluginDetail>,
     monitor_status: Vec<String>,
+    /// The marketplace as the window draws it (#184): its sections, the open detail, why it
+    /// cannot show everything, how many things are installed, and the token form's state (never
+    /// the token typed).
+    market_sections: Vec<crate::components::marketplace::Section>,
+    market_detail: Option<crate::components::marketplace::MarketDetail>,
+    market_status: Vec<String>,
+    market_installed: usize,
+    market_token: Option<MarketTokenSnap>,
+    /// An account's Bots list, filtered as the window filters it, while one is open.
+    market_bots: Vec<crate::components::marketplace::BotRow>,
     agent_tools_open: bool,
     avatar_editor_open: bool,
     approvals: Vec<ApprovalSnap>,
@@ -3427,6 +3611,7 @@ pub struct NativeChatHost {
     /// Open the screen → Grok Computer chrome (Take over / I'm done / Skip).
     computer_handoffs: Vec<ComputerHandoffSnap>,
     save_logins: Vec<SaveLoginSnap>,
+    plugin_needs: Vec<PluginNeedsSnap>,
     site_logins: Vec<SiteLoginSnap>,
     logins_tab: bool,
     /// What the last Add / Import / sync said on Settings → Logins.
@@ -3484,7 +3669,6 @@ pub struct NativeChatHost {
     /// open bot's Connections card draw them (#2). Bot names come from `sessions`, which is the
     /// roster while signed in.
     connections: crate::state::AccountConnections,
-    connections_tab: bool,
     /// This computer's relay fields on Settings → Computer, and General's two kept settings, as
     /// the window draws them, without the typed key.
     reply_source: ReplySourceSnap,
@@ -3606,6 +3790,31 @@ impl NativeChatHost {
                 .and_then(|modal| modal.selected.as_ref())
                 .and_then(|plugin| crate::components::monitor_modal::plugin_detail(state, plugin)),
             monitor_status: crate::components::monitor_modal::plugin_status(state),
+            market_sections: crate::components::marketplace::sections(state),
+            market_detail: state
+                .monitor_modal
+                .as_ref()
+                .and_then(|modal| modal.selected.as_ref())
+                .and_then(|selection| crate::components::marketplace::detail(state, selection)),
+            market_status: crate::components::marketplace::status_lines(state),
+            market_installed: crate::components::marketplace::installed_count(state),
+            market_bots: state
+                .monitor_modal
+                .as_ref()
+                .and_then(|modal| modal.bots_for.as_ref().map(|id| (id, &modal.bots_query)))
+                .map(|(id, query)| crate::components::marketplace::bot_rows(state, id, query))
+                .unwrap_or_default(),
+            market_token: state
+                .plugin_market
+                .token
+                .as_ref()
+                .map(|form| MarketTokenSnap {
+                    plugin: form.plugin.clone(),
+                    connector: form.connector.clone(),
+                    typed_chars: form.typed.chars().count(),
+                    saving: form.saving,
+                    refusal: form.refusal.clone(),
+                }),
             agent_usage: state
                 .coworker_usage
                 .as_ref()
@@ -3864,6 +4073,7 @@ impl NativeChatHost {
                             error: state.your_skills_error.as_deref(),
                         },
                         state.active_recipe.as_ref(),
+                        &ToolSource::of(state),
                     )
                 })
                 .unwrap_or_default(),
@@ -4003,6 +4213,29 @@ impl NativeChatHost {
                         .collect()
                 })
                 .unwrap_or_default(),
+            plugin_needs: state
+                .conversations
+                .iter()
+                .find(|conversation| {
+                    Some(&conversation.id) == state.active_conversation_id.as_ref()
+                })
+                .map(|conversation| {
+                    let mut cards = Vec::new();
+                    for message in conversation.messages.iter().filter(|m| !m.hidden) {
+                        for part in &message.parts {
+                            if let ChatPart::PluginNeeds(spec) = part {
+                                cards.push(PluginNeedsSnap {
+                                    message_id: message.id.clone(),
+                                    spec: spec.clone(),
+                                    answerable: state.plugin_needs_answerable(&message.id),
+                                    remember: state.plugin_needs_remember.contains(&message.id),
+                                });
+                            }
+                        }
+                    }
+                    cards
+                })
+                .unwrap_or_default(),
             site_logins: state
                 .site_logins
                 .iter()
@@ -4093,7 +4326,6 @@ impl NativeChatHost {
             general_tab: state.app_settings_tab == AppSettingsTab::General,
             show_turn_timing: state.show_turn_timing,
             reply_sources: crate::components::chat::reply_badges(state),
-            connections_tab: state.app_settings_tab == AppSettingsTab::Connections,
             pending: None,
             compose: None,
         }
@@ -4192,6 +4424,10 @@ impl NativeChatHost {
                 .with_child(UiNode::button(ids::NAV_LIBRARY, "Library"))
                 .with_child(UiNode::button(ids::NAV_PROJECTS, "Projects"))
                 .with_child(UiNode::button(ids::NAV_RECIPES, "Recipes"))
+                .with_child(
+                    UiNode::button(ids::FOOTER_PLUGINS, "Plugins")
+                        .with_enabled(self.sessions.iter().any(|bot| bot.active)),
+                )
                 .with_child(UiNode::scroll(ids::SIDEBAR_LIST, "Chats").with_child(
                     UiNode::list("sidebar-sessions", "Sessions").with_children(sessions),
                 ))
@@ -4377,6 +4613,9 @@ impl NativeChatHost {
         }
         for offer in &self.save_logins {
             page = page.with_child(save_login_node(offer));
+        }
+        for card in &self.plugin_needs {
+            page = page.with_child(plugin_needs_node(card));
         }
         let mut status = UiNode::new("computer-status", "status", self.computer_status.clone());
         if let Some((line, code)) = &self.computer_error {
@@ -4608,17 +4847,9 @@ impl NativeChatHost {
                             .with_child(UiNode::button("settings-tab-computer", "Computer"))
                             .with_child(UiNode::button("settings-tab-updates", "Updates"))
                             .with_child(UiNode::button("settings-tab-logins", "Logins"))
-                            .with_child(UiNode::button(ids::SETTINGS_CONNECTIONS, "Connections"))
                             .with_child(UiNode::button(ids::SETTINGS_SKILLS, "Skills"));
                         if self.logins_tab {
                             settings = self.logins_nodes(settings);
-                        }
-                        // Only while the dialog is open on Connections, as with this Mac's rules
-                        // below: a closed dialog's children are still found by id.
-                        if self.account_open && self.connections_tab {
-                            for node in self.connections_nodes() {
-                                settings = settings.with_child(node);
-                            }
                         }
                         // The same for General's Default models, and its Show turn timing switch.
                         if self.account_open && self.general_tab {
@@ -5117,6 +5348,7 @@ impl NativeChatHost {
         for (i, (kind, label)) in self.composer_chips.iter().enumerate() {
             let kind = match kind {
                 crate::components::chat_input::TokenKind::Tool => "tool",
+                crate::components::chat_input::TokenKind::Plugin => "plugin",
                 crate::components::chat_input::TokenKind::Recipe => "recipe",
                 crate::components::chat_input::TokenKind::Workflow => "workflow",
                 crate::components::chat_input::TokenKind::Skill => "skill",
@@ -5201,6 +5433,53 @@ impl NativeChatHost {
         None
     }
 
+    fn plugin_needs_command(&self, target: &str) -> Option<Result<Command, String>> {
+        use crate::components::plugin_needs as ids;
+        use crate::opengrok::PluginNeedKind;
+        for card in &self.plugin_needs {
+            let message_id = card.message_id.clone();
+            let closed = || Err("this card is no longer the thread's last turn".to_string());
+            if target == ids::remember_id(&message_id) {
+                return Some(if card.answerable {
+                    Ok(Command::ToggleNeedsRemember { message_id })
+                } else {
+                    closed()
+                });
+            }
+            if target == ids::again_id(&message_id) {
+                return Some(if card.answerable {
+                    Ok(Command::ResendAfterNeeds { message_id })
+                } else {
+                    closed()
+                });
+            }
+            for need in &card.spec.needs {
+                if target == ids::open_id(&message_id, &need.plugin) {
+                    return Some(Ok(Command::OpenPluginDetail {
+                        plugin: need.plugin.clone(),
+                    }));
+                }
+                if let PluginNeedKind::Choose(accounts) = &need.kind {
+                    for (id, _, _) in accounts {
+                        if target == ids::use_id(&message_id, id) {
+                            let connector = need
+                                .connector
+                                .clone()
+                                .unwrap_or_else(|| need.plugin.clone());
+                            let pick = (need.plugin.clone(), connector, id.clone());
+                            return Some(if card.answerable {
+                                Ok(Command::ChoosePluginAccount { message_id, pick })
+                            } else {
+                                closed()
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
     fn save_login_command(&self, target: &str) -> Option<Command> {
         for offer in &self.save_logins {
             if target == save_login_save_id(&offer.form_entry_id) {
@@ -5217,116 +5496,6 @@ impl NativeChatHost {
         None
     }
 
-    /// A Bot's name by its id, from the roster (`sessions` is the roster while signed in).
-    fn bot_name(&self, coworker_id: &str) -> Option<String> {
-        self.sessions
-            .iter()
-            .find(|session| session.id == coworker_id)
-            .map(|session| session.title.clone())
-    }
-
-    /// Settings → Connections as the page draws it (#2): Refresh; each of the person's own
-    /// connections, named by its label, valued by the line under it (the service and who it is
-    /// lent to), with its Disconnect and why its last Disconnect did not go through; and a
-    /// Connect for each service on offer that is not connected. A list still being asked for has
-    /// no node at all, so a driver waits for `settings-connections` or one of the lines that
-    /// stand in for it.
-    fn connections_nodes(&self) -> Vec<UiNode> {
-        let connections = &self.connections;
-        let own = connections.own_rows();
-        let mut nodes = vec![UiNode::button(ids::CONNECTIONS_REFRESH, "Refresh")];
-        match &connections.list {
-            None | Some(ConnectionList::Loading) => {}
-            Some(ConnectionList::Unavailable(why)) => {
-                nodes.push(UiNode::status(ids::CONNECTIONS_ERROR, why.clone()));
-            }
-            Some(ConnectionList::Listed(_)) if own.is_empty() => {
-                nodes.push(UiNode::status(
-                    ids::CONNECTIONS_EMPTY,
-                    connections::NOTHING_CONNECTED,
-                ));
-            }
-            Some(ConnectionList::Listed(_)) => {
-                let mut list =
-                    UiNode::list(ids::CONNECTIONS, "Connected").with_value(own.len().to_string());
-                for row in own {
-                    let changing = connections.is_changing(&row.id);
-                    let mut node = UiNode::listitem(ids::connection(&row.id), row.label.clone())
-                        .with_value(connections::row_detail(connections, row, |id| {
-                            self.bot_name(id)
-                        }));
-                    if changing {
-                        node.states.push("changing".into());
-                    }
-                    if connections.is_confirming_disconnect(&row.id) {
-                        // Asked first: the question, and its Yes and No, in place of Disconnect.
-                        node = node
-                            .with_child(UiNode::status(
-                                connections::confirm_question_id(&row.id),
-                                connections::confirm_question(connections, row, |id| {
-                                    self.bot_name(id)
-                                }),
-                            ))
-                            .with_child(UiNode::button(
-                                connections::confirm_yes_id(&row.id),
-                                "Yes, disconnect",
-                            ))
-                            .with_child(UiNode::button(connections::confirm_no_id(&row.id), "No"));
-                    } else {
-                        node = node.with_child(
-                            UiNode::button(
-                                ids::connection_disconnect(&row.id),
-                                connections::disconnect_label(connections, &row.id),
-                            )
-                            .with_enabled(!changing),
-                        );
-                    }
-                    if let Some(why) = connections.disconnect_refusal(&row.id) {
-                        node = node.with_child(UiNode::status(ids::connection_error(&row.id), why));
-                    }
-                    list = list.with_child(node);
-                }
-                nodes.push(list);
-            }
-        }
-        match connections::connect_offer(connections) {
-            ConnectOffer::Asking | ConnectOffer::Unknown => {}
-            ConnectOffer::Unavailable(why) => {
-                nodes.push(UiNode::status(ids::CONNECTORS_ERROR, why));
-            }
-            ConnectOffer::Nothing(line) => nodes.push(UiNode::status(ids::CONNECTORS_EMPTY, line)),
-            ConnectOffer::Offered(open) => {
-                let mut list = UiNode::list(ids::CONNECTORS, "Connect a service")
-                    .with_value(open.len().to_string());
-                for connector in open {
-                    let name = connector.name.as_str();
-                    let mut button = UiNode::button(
-                        ids::connect(name),
-                        connections::connect_label(connections, connector),
-                    )
-                    .with_enabled(connections.opening.is_none());
-                    if connections.opening.as_deref() == Some(name) {
-                        button.states.push("opening".into());
-                    }
-                    if connections.is_waiting(name, std::time::Instant::now()) {
-                        button.states.push("waiting".into());
-                    }
-                    list = list.with_child(button);
-                    if let Some((_, why)) = connections
-                        .connect_refused
-                        .as_ref()
-                        .filter(|(refused, _)| refused == name)
-                    {
-                        list =
-                            list.with_child(UiNode::status(ids::connect_error(name), why.clone()));
-                    }
-                }
-                nodes.push(list);
-            }
-        }
-        nodes
-    }
-
     /// The Usage modal as the window draws it, while it is open: `usage-modal` (a dialog named
     /// `Usage`, valued by the server's word for the window it is on) holding `usage-close`,
     /// the three chips `usage-window-24h`, `usage-window-7d` and `usage-window-month` (state
@@ -5336,9 +5505,680 @@ impl NativeChatHost {
     /// subscription adds nothing to), or `usage-status` where there are none to list (asking, the
     /// server's words, or `No requests in this window.`), and `usage-note`, that replies on the
     /// person's own subscription are not counted here.
+    /// The marketplace is open, rather than one of the older connection or skill details.
+    fn market_mode(&self) -> bool {
+        use crate::components::monitor_modal::{MonitorKind, PluginSelection};
+        self.monitor_modal.as_ref().is_some_and(|modal| {
+            modal.kind == MonitorKind::Plugins
+                && !matches!(
+                    modal.selected,
+                    Some(PluginSelection::Connection(_) | PluginSelection::Skill(_))
+                )
+        })
+    }
+
+    /// The marketplace as the window draws it: the same sections, rows, detail and controls, each
+    /// by the stable id the window gives it.
+    fn market_node(&self, modal: &crate::components::monitor_modal::MonitorModal) -> UiNode {
+        use crate::components::marketplace::{
+            self as market, AccountAction, AccountStatus, DetailAction, RowAction,
+        };
+        use crate::components::monitor_modal::{self as monitor, MarketPage};
+        let title = match (&modal.selected, &modal.page) {
+            (Some(_), _) => "Plugin".to_string(),
+            (None, MarketPage::Browse) => "Marketplace".to_string(),
+            (None, MarketPage::Installed) => "Installed".to_string(),
+            (None, MarketPage::Category(c)) => market::category_title(c),
+        };
+        let mut node = UiNode::dialog(ids::MONITOR_MODAL, title)
+            .with_child(UiNode::button(ids::MONITOR_CLOSE, "Close"));
+        let Some(selection) = &modal.selected else {
+            if modal.page != MarketPage::Browse {
+                node = node.with_child(UiNode::button(market::BACK, "Marketplace"));
+            }
+            if modal.page != MarketPage::Installed {
+                node = node.with_child(
+                    UiNode::button(
+                        market::INSTALLED,
+                        format!("{} installed", self.market_installed),
+                    )
+                    .with_value(self.market_installed.to_string()),
+                );
+            }
+            node = node.with_child(
+                UiNode::textbox(market::SEARCH, "Search plugins").with_value(modal.query.clone()),
+            );
+            if !self.market_status.is_empty() {
+                node = node.with_child(UiNode::status(
+                    market::STATUS,
+                    self.market_status.join("\n"),
+                ));
+            }
+            let mut index = 0usize;
+            for section in &self.market_sections {
+                let mut group = UiNode::list(section.id.clone(), section.title.clone());
+                for row in &section.rows {
+                    let mut item = UiNode::listitem(row.selection.detail_id(), row.title.clone())
+                        .with_value(row.description.clone());
+                    if index == modal.highlight {
+                        item.states.push("selected".into());
+                    }
+                    index += 1;
+                    let (label, live) = match &row.action {
+                        RowAction::Add { live } => ("Add", *live),
+                        RowAction::Adding => ("Adding…", false),
+                        RowAction::Added => ("Added", false),
+                        RowAction::Unavailable => ("Unavailable", false),
+                    };
+                    group = group.with_child(item).with_child(
+                        UiNode::button(market::add_id(&row.selection), label).with_enabled(live),
+                    );
+                }
+                if let Some(category) = &section.view_all {
+                    group =
+                        group.with_child(UiNode::button(market::view_all_id(category), "View all"));
+                }
+                node = node.with_child(group);
+            }
+            if modal.page == MarketPage::Installed && modal.query.trim().is_empty() {
+                for row in self
+                    .monitor_plugins
+                    .iter()
+                    .filter(|row| matches!(row.selection, monitor::PluginSelection::Skill(_)))
+                {
+                    node = node
+                        .with_child(
+                            UiNode::button(row.selection.detail_id(), row.title.clone())
+                                .with_value(row.subtitle.clone()),
+                        )
+                        .with_child(
+                            UiNode::new(row.selection.switch_id(), "switch", row.title.clone())
+                                .with_checked(row.on)
+                                .with_enabled(row.live),
+                        );
+                }
+            }
+            if self.market_sections.is_empty() && self.market_status.is_empty() {
+                node = node.with_child(UiNode::status(market::EMPTY, "Nothing to show"));
+            }
+            return node;
+        };
+        if modal.bots_for.is_some() {
+            node = node
+                .with_child(UiNode::button(market::BOTS_BACK, "Back"))
+                .with_child(
+                    UiNode::textbox(market::BOTS_SEARCH, "Filter Bots")
+                        .with_value(modal.bots_query.clone()),
+                );
+            for row in &self.market_bots {
+                node = node.with_child(
+                    UiNode::button(market::bot_row_id(&row.id), row.name.clone())
+                        .with_value(if row.on { "Allowed" } else { "Allow" })
+                        .with_checked(row.on)
+                        .with_enabled(row.live),
+                );
+            }
+            return node;
+        }
+        node = node.with_child(UiNode::button(monitor::BACK, "Back").with_enabled(!modal.removing));
+        let Some(detail) = &self.market_detail else {
+            return node.with_child(UiNode::status(
+                market::DETAIL,
+                "This plugin is no longer listed or installed.",
+            ));
+        };
+        let mut body = UiNode::dialog(market::DETAIL, detail.title.clone())
+            .with_value(detail.description.clone());
+        if let Some((repository, url)) = &detail.source {
+            body = body.with_child(
+                UiNode::button(market::SOURCE, format!("View Source {repository}"))
+                    .with_value(url.clone()),
+            );
+        }
+        if let Some(action) = &detail.action {
+            let (label, live) = match action {
+                DetailAction::Add { live } => ("Add", *live),
+                DetailAction::Adding => ("Adding…", false),
+                DetailAction::Uninstall { live } => ("Uninstall", *live && !modal.confirming),
+                DetailAction::Uninstalling => ("Uninstalling…", false),
+                DetailAction::Unavailable(_) => ("Unavailable", false),
+            };
+            body = body.with_child(UiNode::button(market::DETAIL_ACTION, label).with_enabled(live));
+            if let DetailAction::Unavailable(why) = action {
+                body = body.with_child(UiNode::status(market::DETAIL_REFUSAL, why.clone()));
+            }
+        }
+        if let Some(why) = &detail.refusal {
+            body = body.with_child(UiNode::status(market::DETAIL_REFUSAL, why.clone()));
+        }
+        if let Some(question) = &detail.question {
+            let account = modal.removal.is_some();
+            body = body
+                .with_child(UiNode::status(
+                    "monitor-plugin-remove-question",
+                    question.clone(),
+                ))
+                .with_child(
+                    UiNode::button(
+                        if account {
+                            market::REMOVE_YES
+                        } else {
+                            market::UNINSTALL_YES
+                        },
+                        if account { "Remove" } else { "Uninstall" },
+                    )
+                    .with_enabled(!modal.removing),
+                )
+                .with_child(UiNode::button(
+                    if account {
+                        market::REMOVE_NO
+                    } else {
+                        market::UNINSTALL_NO
+                    },
+                    "Cancel",
+                ));
+        }
+        for card in &detail.accounts {
+            let mut group = UiNode::list(
+                format!("market-accounts-{}", card.connector),
+                card.title.clone(),
+            );
+            for line in &card.lines {
+                let status = match &line.status {
+                    AccountStatus::Connected => "Connected".to_string(),
+                    AccountStatus::NeedsAuth(None) => "Needs Auth".to_string(),
+                    AccountStatus::NeedsAuth(Some(why)) => format!("Needs Auth: {why}"),
+                };
+                group = group
+                    .with_child(
+                        UiNode::listitem(monitor::account_id(&line.id), line.label.clone())
+                            .with_value(status),
+                    )
+                    .with_child(
+                        UiNode::button(monitor::rename_id(&line.id), "Rename")
+                            .with_enabled(line.can_rename),
+                    );
+                if let Some(text) = &line.renaming {
+                    group = group
+                        .with_child(
+                            UiNode::textbox(monitor::rename_field_id(&line.id), "Account label")
+                                .with_value(text.clone()),
+                        )
+                        .with_child(UiNode::button("monitor-account-save", "Save"))
+                        .with_child(UiNode::button("monitor-account-cancel", "Cancel"));
+                }
+                if let Some((text, action, live)) = &line.action {
+                    let id = match action {
+                        AccountAction::Reconnect => monitor::reconnect_id(&line.id),
+                        AccountAction::Reopen => market::reopen_id(&line.id),
+                        AccountAction::ReplaceToken => market::replace_token_id(&line.id),
+                        AccountAction::PluginReconnect => monitor::reconnect_id(&line.id),
+                    };
+                    group = group.with_child(UiNode::button(id, text.clone()).with_enabled(*live));
+                }
+                let waiting = matches!(line.status, AccountStatus::NeedsAuth(_));
+                group = group.with_child(
+                    UiNode::button(
+                        if waiting {
+                            market::dismiss_id(&line.id)
+                        } else {
+                            market::remove_account_id(&line.id)
+                        },
+                        "Remove",
+                    )
+                    .with_enabled(line.removable),
+                );
+                if let Some((count, live)) = line.lent {
+                    group = group.with_child(
+                        UiNode::button(market::bots_id(&line.id), format!("{count} Bots"))
+                            .with_enabled(live),
+                    );
+                }
+                if let Some(note) = &line.note {
+                    group = group.with_child(UiNode::status(
+                        monitor::account_note_id(&line.id),
+                        note.clone(),
+                    ));
+                }
+            }
+            let plugin = match selection {
+                monitor::PluginSelection::Plugin(name) => Some(name.as_str()),
+                _ => None,
+            };
+            if let Some(form) = self
+                .market_token
+                .as_ref()
+                .filter(|f| f.connector == card.connector && Some(f.plugin.as_str()) == plugin)
+            {
+                group = group
+                    .with_child(
+                        UiNode::textbox(market::TOKEN_FIELD, "Paste a token")
+                            .with_value("•".repeat(form.typed_chars)),
+                    )
+                    .with_child(
+                        UiNode::button(market::TOKEN_SAVE, "Save")
+                            .with_enabled(!form.saving && form.typed_chars > 0),
+                    )
+                    .with_child(
+                        UiNode::button(market::TOKEN_CANCEL, "Cancel").with_enabled(!form.saving),
+                    );
+                if let Some(why) = &form.refusal {
+                    group = group.with_child(UiNode::status(market::TOKEN_REFUSAL, why.clone()));
+                }
+            }
+            group = group.with_child(
+                UiNode::button(
+                    market::add_account_id(&card.connector),
+                    "Add Another Account",
+                )
+                .with_enabled(card.can_add && self.market_token.is_none()),
+            );
+            if let Some(why) = &card.add_refusal {
+                group = group.with_child(UiNode::status(monitor::ADD_ACCOUNT_ERROR, why.clone()));
+            }
+            if card
+                .lines
+                .iter()
+                .any(|l| l.status == AccountStatus::Connected)
+            {
+                for line in card
+                    .lines
+                    .iter()
+                    .filter(|l| l.status == AccountStatus::Connected)
+                {
+                    group = group.with_child(UiNode::button(
+                        monitor::pick_id(&line.id),
+                        line.label.clone(),
+                    ));
+                }
+                group = group.with_child(UiNode::button(monitor::PICK_ASK, monitor::ASK_EACH_TIME));
+            }
+            body = body.with_child(group);
+        }
+        if let Some(status) = &detail.parts_status {
+            body = body.with_child(UiNode::status("market-parts-status", status.clone()));
+        } else if matches!(selection, monitor::PluginSelection::Plugin(_)) {
+            let mut tools = UiNode::button(
+                market::TOOLS,
+                format!("Tools: {} servers", detail.servers.len()),
+            );
+            if modal.tools_open {
+                tools.states.push("expanded".into());
+            }
+            body = body.with_child(tools);
+            if let (Some((on, live, _)), monitor::PluginSelection::Plugin(name)) =
+                (&detail.bot_switch, selection)
+            {
+                body = body.with_child(
+                    UiNode::new(
+                        monitor::plugin_switch_id(name),
+                        "switch",
+                        format!("Use {name}"),
+                    )
+                    .with_checked(*on)
+                    .with_enabled(*live),
+                );
+            }
+            if let (true, monitor::PluginSelection::Plugin(name)) = (detail.use_prompt, selection) {
+                body = body.with_child(
+                    UiNode::dialog(
+                        format!("market-use-prompt-{name}"),
+                        format!("Use {} in this Bot?", detail.title),
+                    )
+                    .with_child(UiNode::button(
+                        format!("market-use-prompt-on-{name}"),
+                        "Turn on",
+                    ))
+                    .with_child(UiNode::button(
+                        format!("market-use-prompt-not-now-{name}"),
+                        "Not now",
+                    )),
+                );
+            }
+            if modal.tools_open {
+                for server in &detail.servers {
+                    body = body.with_child(UiNode::status(
+                        format!("market-server-{server}"),
+                        format!("{server} · MCP server"),
+                    ));
+                }
+                for tool in &detail.tools {
+                    body = body
+                        .with_child(UiNode::status(format!("market-tool-{tool}"), tool.clone()));
+                }
+                if let Some(status) = &detail.tools_status {
+                    body = body.with_child(UiNode::status("market-tools-status", status.clone()));
+                }
+            }
+        }
+        for skill in &detail.skills {
+            body = body.with_child(
+                UiNode::status(format!("market-skill-{skill}"), skill.clone()).with_value("Skill"),
+            );
+        }
+        for app in &detail.apps {
+            body = body.with_child(
+                UiNode::status(format!("market-app-{app}"), app.clone()).with_value("Connector"),
+            );
+        }
+        for (name, why) in &detail.unsupported {
+            body = body.with_child(
+                UiNode::status(format!("market-unsupported-{name}"), name.clone())
+                    .with_value(why.clone()),
+            );
+        }
+        for (label, value) in &detail.info {
+            body = body.with_child(
+                UiNode::status(
+                    format!("market-info-{}", label.to_lowercase().replace(' ', "-")),
+                    *label,
+                )
+                .with_value(value.clone()),
+            );
+        }
+        node.with_child(body)
+    }
+
+    /// A click on a marketplace control, `None` for a target that is not one.
+    fn market_command(&self, target: &str) -> Option<Result<Command, String>> {
+        use crate::components::marketplace::{
+            self as market, AccountAction, AccountStatus, DetailAction, RowAction,
+        };
+        use crate::components::monitor_modal::{self as monitor, MarketPage, PluginSelection};
+        if !self.market_mode() {
+            return None;
+        }
+        let modal = self.monitor_modal.as_ref()?;
+        let m = |command| Some(Ok(Command::Market(command)));
+        if modal.selected.is_none() {
+            if target == market::BACK && modal.page != MarketPage::Browse {
+                return m(MarketCommand::Page(MarketPage::Browse));
+            }
+            if target == market::INSTALLED && modal.page != MarketPage::Installed {
+                return m(MarketCommand::Page(MarketPage::Installed));
+            }
+            for section in &self.market_sections {
+                if let Some(category) = &section.view_all
+                    && target == market::view_all_id(category)
+                {
+                    return m(MarketCommand::Page(MarketPage::Category(category.clone())));
+                }
+                for row in &section.rows {
+                    if target == row.selection.detail_id() {
+                        return m(MarketCommand::OpenDetail(row.selection.clone()));
+                    }
+                    if target == market::add_id(&row.selection) {
+                        return Some(match (&row.action, &row.selection) {
+                            (RowAction::Add { live: true }, PluginSelection::Plugin(name)) => {
+                                Ok(Command::Market(MarketCommand::Install(name.clone())))
+                            }
+                            (RowAction::Add { live: true }, PluginSelection::Service(name)) => {
+                                Ok(Command::ConnectService(name.clone()))
+                            }
+                            _ => Err(format!(
+                                "`{target}` cannot be pressed: it is not an Add right now"
+                            )),
+                        });
+                    }
+                }
+            }
+            // A private skill on the Installed page: its detail, or its switch for the open Bot.
+            if modal.page == MarketPage::Installed {
+                for row in self
+                    .monitor_plugins
+                    .iter()
+                    .filter(|row| matches!(row.selection, PluginSelection::Skill(_)))
+                {
+                    if target == row.selection.detail_id() {
+                        return Some(Ok(Command::SelectMonitorPlugin(Some(
+                            row.selection.clone(),
+                        ))));
+                    }
+                    if target == row.selection.switch_id()
+                        && let PluginSelection::Skill(id) = &row.selection
+                    {
+                        return Some(if row.live {
+                            Ok(Command::SetBotSkill {
+                                skill_id: id.clone(),
+                                attached: !row.on,
+                            })
+                        } else {
+                            Err("this switch is waiting on the server or unavailable".into())
+                        });
+                    }
+                }
+            }
+            // The older list's controls are not drawn in the marketplace: a driver cannot press
+            // what a person cannot see.
+            if target.starts_with("market-")
+                || target.starts_with("agent-connection-lend-")
+                || target.starts_with("agent-skills-switch-")
+                || target.starts_with("monitor-connection-detail-")
+                || target.starts_with("monitor-skill-detail-")
+            {
+                return Some(Err(format!(
+                    "`{target}` is not a live control on this page"
+                )));
+            }
+            return None;
+        }
+        if let Some(account) = &modal.bots_for {
+            if target == market::BOTS_BACK {
+                return m(MarketCommand::Bots(None));
+            }
+            if let Some(row) = self
+                .market_bots
+                .iter()
+                .find(|r| target == market::bot_row_id(&r.id))
+            {
+                return Some(if row.live {
+                    Ok(Command::Market(MarketCommand::LendTo {
+                        connection_id: account.clone(),
+                        coworker_id: row.id.clone(),
+                        lent: !row.on,
+                    }))
+                } else {
+                    Err("this account is waiting on the server".into())
+                });
+            }
+            return (target.starts_with("market-") || target.starts_with("monitor-"))
+                .then(|| Err(format!("`{target}` is not on the Bots list")));
+        }
+        let detail = self.market_detail.as_ref();
+        if target == monitor::BACK {
+            return if modal.removing {
+                Some(Err("wait for the removal to finish".into()))
+            } else {
+                m(MarketCommand::CloseDetail)
+            };
+        }
+        let Some(detail) = detail else {
+            return target
+                .starts_with("market-")
+                .then(|| Err("this plugin is no longer listed".into()));
+        };
+        if target == market::DETAIL_ACTION {
+            let name = match modal.selected.as_ref() {
+                Some(PluginSelection::Plugin(name)) => name.clone(),
+                _ => return Some(Err("a service has no Add or Uninstall".into())),
+            };
+            return Some(match &detail.action {
+                Some(DetailAction::Add { live: true }) => {
+                    Ok(Command::Market(MarketCommand::Install(name)))
+                }
+                Some(DetailAction::Uninstall { live: true }) if !modal.confirming => {
+                    Ok(Command::Market(MarketCommand::AskUninstall(true)))
+                }
+                _ => Err("its button cannot be pressed right now".into()),
+            });
+        }
+        if detail.question.is_some() && !modal.removing {
+            match target {
+                t if t == market::UNINSTALL_YES && modal.removal.is_none() => {
+                    return m(MarketCommand::Uninstall);
+                }
+                t if t == market::UNINSTALL_NO && modal.removal.is_none() => {
+                    return m(MarketCommand::AskUninstall(false));
+                }
+                t if t == market::REMOVE_YES && modal.removal.is_some() => {
+                    return Some(Ok(Command::RemoveMonitorPlugin));
+                }
+                t if t == market::REMOVE_NO && modal.removal.is_some() => {
+                    return m(MarketCommand::AskAccountRemove(None));
+                }
+                _ => {}
+            }
+        }
+        if target == market::TOOLS {
+            return m(MarketCommand::ToggleTools);
+        }
+        if let Some(name) = target.strip_prefix("market-use-prompt-on-") {
+            return Some(match detail.use_prompt {
+                true => Ok(Command::SetCeilingTool {
+                    name: name.to_string(),
+                    enabled: true,
+                }),
+                false => Err("there is no prompt to answer".into()),
+            });
+        }
+        if let Some(name) = target.strip_prefix("market-use-prompt-not-now-") {
+            return m(MarketCommand::DeclineUse(name.to_string()));
+        }
+        if let Some(name) = target.strip_prefix("monitor-plugin-switch-") {
+            return Some(match &detail.bot_switch {
+                Some((on, true, _)) => Ok(Command::SetCeilingTool {
+                    name: name.to_string(),
+                    enabled: !on,
+                }),
+                _ => Err("this plugin's switch is not available".into()),
+            });
+        }
+        if let Some(form) = &self.market_token {
+            if target == market::TOKEN_SAVE {
+                return Some(if form.saving || form.typed_chars == 0 {
+                    Err("type a token first".into())
+                } else {
+                    Ok(Command::Market(MarketCommand::SaveToken))
+                });
+            }
+            if target == market::TOKEN_CANCEL && !form.saving {
+                return m(MarketCommand::CancelToken);
+            }
+        }
+        let plugin = match modal.selected.as_ref() {
+            Some(PluginSelection::Plugin(name)) => Some(name.clone()),
+            _ => None,
+        };
+        for card in &detail.accounts {
+            if target == market::add_account_id(&card.connector) {
+                return Some(if !card.can_add || self.market_token.is_some() {
+                    Err("an account cannot be added right now".into())
+                } else if let (Some(plugin), true) = (&plugin, card.pasted) {
+                    Ok(Command::Market(MarketCommand::StartToken {
+                        plugin: plugin.clone(),
+                        connector: card.connector.clone(),
+                        replacing: None,
+                    }))
+                } else if let Some(plugin) = &plugin {
+                    // A plugin whose server signs people in itself (#364).
+                    Ok(Command::Market(MarketCommand::Authorize {
+                        plugin: plugin.clone(),
+                        connector: card.connector.clone(),
+                        connection_id: None,
+                    }))
+                } else {
+                    Ok(Command::ConnectService(card.connector.clone()))
+                });
+            }
+            if target == monitor::PICK_ASK {
+                return Some(Ok(Command::PickAccount {
+                    connector: card.connector.clone(),
+                    connection_id: None,
+                }));
+            }
+            for line in &card.lines {
+                if target == monitor::pick_id(&line.id) && line.status == AccountStatus::Connected {
+                    return Some(Ok(Command::PickAccount {
+                        connector: card.connector.clone(),
+                        connection_id: Some(line.id.clone()),
+                    }));
+                }
+                if target == monitor::rename_id(&line.id) {
+                    return Some(if line.can_rename {
+                        Ok(Command::RenameAccount(line.id.clone()))
+                    } else {
+                        Err("this account cannot be renamed right now".into())
+                    });
+                }
+                if let Some((_, action, live)) = &line.action {
+                    let id = match action {
+                        AccountAction::Reconnect => monitor::reconnect_id(&line.id),
+                        AccountAction::Reopen => market::reopen_id(&line.id),
+                        AccountAction::ReplaceToken => market::replace_token_id(&line.id),
+                        AccountAction::PluginReconnect => monitor::reconnect_id(&line.id),
+                    };
+                    if target == id {
+                        if !live {
+                            return Some(Err(format!("`{target}` cannot be pressed right now")));
+                        }
+                        return Some(Ok(match action {
+                            AccountAction::Reconnect => Command::ReconnectAccount(line.id.clone()),
+                            AccountAction::Reopen => {
+                                Command::Market(MarketCommand::Reopen(line.id.clone()))
+                            }
+                            AccountAction::ReplaceToken => {
+                                Command::Market(MarketCommand::StartToken {
+                                    plugin: plugin.clone().unwrap_or_default(),
+                                    connector: card.connector.clone(),
+                                    replacing: Some(line.id.clone()),
+                                })
+                            }
+                            AccountAction::PluginReconnect => {
+                                Command::Market(MarketCommand::Authorize {
+                                    plugin: plugin.clone().unwrap_or_default(),
+                                    connector: card.connector.clone(),
+                                    connection_id: Some(line.id.clone()),
+                                })
+                            }
+                        }));
+                    }
+                }
+                let waiting = matches!(line.status, AccountStatus::NeedsAuth(_));
+                if target == market::dismiss_id(&line.id) && waiting && line.removable {
+                    return m(MarketCommand::Dismiss(line.id.clone()));
+                }
+                if target == market::remove_account_id(&line.id) && !waiting && line.removable {
+                    return m(MarketCommand::AskAccountRemove(Some(line.id.clone())));
+                }
+                if target == market::bots_id(&line.id) && matches!(line.lent, Some((_, true))) {
+                    return m(MarketCommand::Bots(Some(line.id.clone())));
+                }
+            }
+        }
+        if modal.renaming.is_some() {
+            if target == "monitor-account-save" {
+                return Some(Ok(Command::SaveAccountLabel));
+            }
+            if target == "monitor-account-cancel" {
+                return Some(Ok(Command::CancelAccountLabel));
+            }
+        }
+        (target.starts_with("market-")
+            || target.starts_with("monitor-account-")
+            || target.starts_with("agent-connection-lend-"))
+        .then(|| {
+            Err(format!(
+                "`{target}` is not a live control in this plugin's detail"
+            ))
+        })
+    }
+
     fn monitor_modal_node(&self) -> Option<UiNode> {
         use crate::components::monitor_modal as monitor;
         let modal = self.monitor_modal.as_ref()?;
+        if self.market_mode() {
+            return Some(self.market_node(modal));
+        }
         let mut node = UiNode::dialog(ids::MONITOR_MODAL, modal.kind.title())
             .with_child(UiNode::button(ids::MONITOR_CLOSE, "Close"));
         match modal.kind {
@@ -5365,11 +6205,45 @@ impl NativeChatHost {
                                 .with_value(value.clone()),
                             );
                         }
-                        if detail.connection {
+                        if let Some(accounts) = &detail.accounts {
                             fields = fields.with_child(
                                 UiNode::button(monitor::ADD_ACCOUNT, "Add another account")
-                                    .with_enabled(false)
-                                    .with_value("Coming later"),
+                                    .with_enabled(accounts.can_add),
+                            );
+                            for row in &accounts.rows {
+                                fields = fields.with_child(
+                                    UiNode::button(monitor::rename_id(&row.id), "Rename")
+                                        .with_enabled(row.can_rename),
+                                );
+                                if let Some(text) = &row.renaming {
+                                    fields = fields
+                                        .with_child(
+                                            UiNode::textbox(
+                                                monitor::rename_field_id(&row.id),
+                                                "Account label",
+                                            )
+                                            .with_value(text.clone()),
+                                        )
+                                        .with_child(UiNode::button("monitor-account-save", "Save"))
+                                        .with_child(UiNode::button(
+                                            "monitor-account-cancel",
+                                            "Cancel",
+                                        ));
+                                }
+                                fields = fields.with_child(
+                                    UiNode::button(monitor::pick_id(&row.id), row.label.clone())
+                                        .with_enabled(accounts.picker.live),
+                                );
+                                if row.reconnects {
+                                    fields = fields.with_child(
+                                        UiNode::button(monitor::reconnect_id(&row.id), "Reconnect")
+                                            .with_enabled(row.can_reconnect),
+                                    );
+                                }
+                            }
+                            fields = fields.with_child(
+                                UiNode::button(monitor::PICK_ASK, monitor::ASK_EACH_TIME)
+                                    .with_enabled(accounts.picker.live),
                             );
                         }
                         if let Some(error) = modal.error.as_ref().or(detail.error.as_ref()) {
@@ -5408,6 +6282,22 @@ impl NativeChatHost {
                         monitor::STATUS,
                         self.monitor_status.join("\n"),
                     ));
+                    if let Some(card) = &self.agent_ceiling {
+                        for row in crate::components::agent_settings::shown_ceiling_rows(card)
+                            .into_iter()
+                            .filter(|row| !row.builtin)
+                        {
+                            node = node.with_child(
+                                UiNode::new(
+                                    monitor::plugin_switch_id(&row.name),
+                                    "switch",
+                                    row.title,
+                                )
+                                .with_checked(row.on)
+                                .with_enabled(row.live),
+                            );
+                        }
+                    }
                     for row in &self.monitor_plugins {
                         node = node
                             .with_child(
@@ -5452,6 +6342,19 @@ impl NativeChatHost {
                 },
             );
         }
+        if target != ids::MONITOR_CLOSE
+            && let Some(answer) = self.market_command(target)
+        {
+            if let Some(modal) = &self.monitor_modal
+                && !self
+                    .sessions
+                    .iter()
+                    .any(|bot| bot.active && bot.id == modal.coworker_id)
+            {
+                return Some(Err("the modal belongs to another Bot".into()));
+            }
+            return Some(answer);
+        }
         let shaped = target == ids::MONITOR_CLOSE
             || target.starts_with("monitor-")
             || (self
@@ -5480,7 +6383,67 @@ impl NativeChatHost {
             return Some(Err("open Plugins first".into()));
         }
         if target == monitor::ADD_ACCOUNT {
-            return Some(Err("Coming later".into()));
+            return Some(
+                match self
+                    .monitor_detail
+                    .as_ref()
+                    .and_then(|detail| detail.accounts.as_ref())
+                {
+                    Some(accounts) if accounts.can_add => {
+                        Ok(Command::ConnectService(accounts.connector.clone()))
+                    }
+                    _ => Err("this service cannot add an account right now".into()),
+                },
+            );
+        }
+        if let Some(name) = target.strip_prefix("monitor-plugin-switch-") {
+            return Some(
+                match self.agent_ceiling.as_ref().and_then(|card| {
+                    crate::components::agent_settings::shown_ceiling_rows(card)
+                        .into_iter()
+                        .find(|row| !row.builtin && row.name == name)
+                }) {
+                    Some(row) if row.live => Ok(Command::SetCeilingTool {
+                        name: row.name,
+                        enabled: !row.on,
+                    }),
+                    _ => Err("this plugin's switch is not available".into()),
+                },
+            );
+        }
+        if let Some(accounts) = self
+            .monitor_detail
+            .as_ref()
+            .and_then(|detail| detail.accounts.as_ref())
+        {
+            if target == monitor::PICK_ASK && accounts.picker.live {
+                return Some(Ok(Command::PickAccount {
+                    connector: accounts.connector.clone(),
+                    connection_id: None,
+                }));
+            }
+            for row in &accounts.rows {
+                if target == monitor::pick_id(&row.id) && accounts.picker.live {
+                    return Some(Ok(Command::PickAccount {
+                        connector: accounts.connector.clone(),
+                        connection_id: Some(row.id.clone()),
+                    }));
+                }
+                if target == monitor::reconnect_id(&row.id) && row.reconnects && row.can_reconnect {
+                    return Some(Ok(Command::ReconnectAccount(row.id.clone())));
+                }
+                if target == monitor::rename_id(&row.id) && row.can_rename {
+                    return Some(Ok(Command::RenameAccount(row.id.clone())));
+                }
+            }
+            if modal.renaming.is_some() {
+                if target == "monitor-account-save" {
+                    return Some(Ok(Command::SaveAccountLabel));
+                }
+                if target == "monitor-account-cancel" {
+                    return Some(Ok(Command::CancelAccountLabel));
+                }
+            }
         }
         if target == monitor::BACK && modal.selected.is_some() && !modal.removing {
             return Some(Ok(Command::SelectMonitorPlugin(None)));
@@ -5512,6 +6475,10 @@ impl NativeChatHost {
                             skill_id: id.clone(),
                             attached: !row.on,
                         },
+                        monitor::PluginSelection::Service(_)
+                        | monitor::PluginSelection::Plugin(_) => {
+                            return Some(Err("the marketplace's rows have no switch".into()));
+                        }
                     })
                 });
             }
@@ -5648,84 +6615,14 @@ impl NativeChatHost {
         ))
     }
 
-    /// One of the Connections controls, on Settings → Connections or the open bot's card, or
-    /// `None` for a target that is not one.
-    ///
-    /// The tab answers from anywhere in Settings, and not while Settings is shut: arriving on it
-    /// reads the connections, and nobody can press it there. Every other control is refused while
-    /// its surface is not on screen, for a row or a service that surface is not showing, and
-    /// while it is dead on screen: a connection whose change is with the server, or a Connect
-    /// while a sign-in page is being asked for.
+    /// A switch on the open Bot's Connections card, or `None` for a target that is not one.
+    /// Refused while the card is not on screen, and while its connection's change is with the
+    /// server. Signing in, renaming and removing accounts are the Plugins marketplace's.
     fn connection_command(&self, target: &str) -> Option<Result<Command, String>> {
-        if target == ids::SETTINGS_CONNECTIONS {
-            return Some(if self.account_open {
-                Ok(Command::SetAppSettingsTab(AppSettingsTab::Connections))
-            } else {
-                Err(format!(
-                    "`{target}` is in Settings, which is shut: open it with `{}`",
-                    ids::FOOTER_ACCOUNT
-                ))
-            });
-        }
         let connections = &self.connections;
-        let on_tab = self.account_open && self.connections_tab;
-        let off_tab = || {
-            Err(format!(
-                "`{target}` is on Settings → Connections, which is not what is on screen: open \
-                 it with `{}`",
-                ids::SETTINGS_CONNECTIONS
-            ))
-        };
-        let busy = |label: &str| {
-            Err(format!(
-                "`{target}` is dead: a change to {label} is with the server"
-            ))
-        };
-        if target == ids::CONNECTIONS_REFRESH {
-            return Some(if on_tab {
-                Ok(Command::RefreshConnections)
-            } else {
-                off_tab()
-            });
-        }
-        let rows = connections.own_rows();
-        if let Some(row) = rows
-            .iter()
-            .find(|row| target == ids::connection_disconnect(&row.id))
-        {
-            return Some(if !on_tab {
-                off_tab()
-            } else if connections.is_changing(&row.id) {
-                busy(&row.label)
-            } else if connections.is_confirming_disconnect(&row.id) {
-                Err(format!(
-                    "`{target}` is asking first: click `{}` or `{}`",
-                    connections::confirm_yes_id(&row.id),
-                    connections::confirm_no_id(&row.id)
-                ))
-            } else {
-                Ok(Command::AskDisconnect(row.id.clone()))
-            });
-        }
-        if let Some(row) = rows.iter().find(|row| {
-            target == connections::confirm_yes_id(&row.id)
-                || target == connections::confirm_no_id(&row.id)
-        }) {
-            return Some(if !on_tab {
-                off_tab()
-            } else if !connections.is_confirming_disconnect(&row.id) {
-                Err(format!(
-                    "`{target}` is only there while the row asks \"Disconnect …?\": click `{}` first",
-                    ids::connection_disconnect(&row.id)
-                ))
-            } else if target == connections::confirm_yes_id(&row.id) {
-                Ok(Command::DisconnectConnection(row.id.clone()))
-            } else {
-                Ok(Command::KeepConnection)
-            });
-        }
-        if let Some(row) = rows
-            .iter()
+        if let Some(row) = connections
+            .own_rows()
+            .into_iter()
             .find(|row| target == ids::connection_lend(&row.id))
         {
             let bot = self
@@ -5737,40 +6634,19 @@ impl NativeChatHost {
                 None => Err(format!(
                     "`{target}` is on a bot's Connections card, which is not on screen"
                 )),
-                Some(_) if connections.is_changing(&row.id) => busy(&row.label),
+                Some(_) if connections.is_changing(&row.id) => Err(format!(
+                    "`{target}` is dead: a change to {} is with the server",
+                    row.label
+                )),
                 Some(bot) => Ok(Command::SetConnectionLent {
                     connection_id: row.id.clone(),
                     lent: !connections.shows_lent(row, &bot.id),
                 }),
             });
         }
-        if let ConnectOffer::Offered(open) = connections::connect_offer(connections)
-            && let Some(connector) = open
-                .iter()
-                .find(|connector| target == ids::connect(&connector.name))
-        {
-            return Some(if !on_tab {
-                off_tab()
-            } else if connections.opening.is_some() {
-                Err(format!(
-                    "`{target}` is dead: a sign-in page is being asked for"
-                ))
-            } else {
-                Ok(Command::ConnectService(connector.name.clone()))
-            });
-        }
-        // Shaped like one of these controls, and naming nothing the surfaces show: a wrong
-        // address rather than an unknown control. A Connect's refusal line shares its prefix
-        // and is no control at all.
-        let shaped = target.starts_with("settings-connection-disconnect-")
-            || target.starts_with("settings-connection-confirm-")
-            || target.starts_with("settings-connection-keep-")
-            || target.starts_with("agent-connection-lend-")
-            || (target.starts_with("settings-connect-")
-                && !target.starts_with("settings-connect-error-"));
-        shaped.then(|| {
+        target.starts_with("agent-connection-lend-").then(|| {
             Err(format!(
-                "no `{target}` on screen: it names no connection or service the page is showing"
+                "no `{target}` on screen: it names no connection the card is showing"
             ))
         })
     }
@@ -7713,6 +8589,11 @@ impl NativeChatHost {
             return Ok(DispatchResult::empty());
         } else if target == ids::NAV_RECIPES {
             Command::OpenRecipes
+        } else if target == ids::FOOTER_PLUGINS {
+            if !self.sessions.iter().any(|bot| bot.active) {
+                return Err("open a Bot first: the marketplace is that Bot's".into());
+            }
+            Command::Market(MarketCommand::Open)
         } else if target == ids::RECIPE_RUN {
             let open = self
                 .recipe_detail
@@ -7817,6 +8698,8 @@ impl NativeChatHost {
             cmd
         } else if let Some(cmd) = self.save_login_command(target) {
             cmd
+        } else if let Some(cmd) = self.plugin_needs_command(target) {
+            cmd?
         } else if let Some(cmd) = self.skill_command(target) {
             cmd?
         } else if let Some(cmd) = self.taught_skill_command(target) {
@@ -7925,12 +8808,130 @@ impl NativeChatHost {
         Ok(DispatchResult::empty())
     }
 
+    /// The marketplace's search field and its token field: what is typed goes to the state, as the
+    /// window's field sends it. `None` for any other target.
+    fn market_field(
+        &mut self,
+        target: &str,
+        next: impl FnOnce(&str) -> String,
+    ) -> Option<Result<DispatchResult, String>> {
+        use crate::components::marketplace as market;
+        if target == market::SEARCH {
+            let Some(modal) = self.monitor_modal.as_mut().filter(|m| m.selected.is_none()) else {
+                return Some(Err("the marketplace's search is not on screen".into()));
+            };
+            let query = next(&modal.query);
+            modal.query = query.clone();
+            modal.highlight = 0;
+            self.pending = Some(Command::Market(MarketCommand::SetQuery(query)));
+            return Some(Ok(DispatchResult::empty()));
+        }
+        if target == market::BOTS_SEARCH {
+            let Some(modal) = self.monitor_modal.as_mut().filter(|m| m.bots_for.is_some()) else {
+                return Some(Err("no Bots list is open".into()));
+            };
+            let query = next(&modal.bots_query);
+            modal.bots_query = query.clone();
+            self.pending = Some(Command::Market(MarketCommand::BotsQuery(query)));
+            return Some(Ok(DispatchResult::empty()));
+        }
+        if target == market::TOKEN_FIELD {
+            // The token typed is never kept here: only its length, so a snapshot can say a field
+            // holds something without saying what.
+            let Some(form) = self.market_token.as_mut().filter(|f| !f.saving) else {
+                return Some(Err("no token field is open".into()));
+            };
+            let typed = next("");
+            if form.typed_chars > 0
+                && typed.chars().count() < form.typed_chars + 1
+                && !typed.is_empty()
+            {
+                // `type` appends; the driver cannot read the field back, so appending to a token
+                // already typed is refused rather than guessed at.
+                return Some(Err("use set_value to replace the token".into()));
+            }
+            form.typed_chars = typed.chars().count();
+            self.pending = Some(Command::Market(MarketCommand::SetToken(typed)));
+            return Some(Ok(DispatchResult::empty()));
+        }
+        None
+    }
+
+    /// Up, Down and Enter in the marketplace's search (Enter opens the highlighted plugin's
+    /// detail, never installs it); Enter and Escape in the token field.
+    fn market_key(&mut self, target: &str, key: &str) -> Option<Result<DispatchResult, String>> {
+        use crate::components::marketplace as market;
+        if target == market::SEARCH {
+            let token = match key_token(key) {
+                Ok(token) => token,
+                Err(why) => return Some(Err(why)),
+            };
+            let command = match token.as_str() {
+                "up" => MarketCommand::Move(-1),
+                "down" => MarketCommand::Move(1),
+                "enter" => MarketCommand::OpenHighlight,
+                "backspace" => {
+                    let Some(modal) = self.monitor_modal.as_mut() else {
+                        return Some(Err("the marketplace is closed".into()));
+                    };
+                    modal.query.pop();
+                    modal.highlight = 0;
+                    MarketCommand::SetQuery(modal.query.clone())
+                }
+                _ => {
+                    return Some(Err(
+                        "the search takes text, Up, Down, Enter or Backspace".into()
+                    ));
+                }
+            };
+            if self
+                .monitor_modal
+                .as_ref()
+                .is_none_or(|m| m.selected.is_some())
+            {
+                return Some(Err("the marketplace's search is not on screen".into()));
+            }
+            self.pending = Some(Command::Market(command));
+            return Some(Ok(DispatchResult::empty()));
+        }
+        if target == market::TOKEN_FIELD {
+            let token = match key_token(key) {
+                Ok(token) => token,
+                Err(why) => return Some(Err(why)),
+            };
+            self.pending = Some(Command::Market(match token.as_str() {
+                "enter" => MarketCommand::SaveToken,
+                "escape" => MarketCommand::CancelToken,
+                _ => {
+                    return Some(Err(
+                        "use set_value for the token, Enter to save, Escape to cancel".into(),
+                    ));
+                }
+            }));
+            return Some(Ok(DispatchResult::empty()));
+        }
+        None
+    }
+
     /// Replace what is in a field.
     ///
     /// On the composer that is select-all, delete, then type it — the three things a person
     /// does — so a value beginning with `/` or `@` opens the panel exactly as typing it would.
     /// A set-value that wrote the draft behind the field's back would leave the panel shut.
     fn set_value(&mut self, target: &str, value: &str) -> Result<DispatchResult, String> {
+        if let Some(result) = self.market_field(target, |_| value.to_string()) {
+            return result;
+        }
+        if let Some((id, current)) = self
+            .monitor_modal
+            .as_mut()
+            .and_then(|modal| modal.renaming.as_mut())
+            && target == crate::components::monitor_modal::rename_field_id(id)
+        {
+            *current = value.to_string();
+            self.pending = Some(Command::SetAccountLabel(value.to_string()));
+            return Ok(DispatchResult::empty());
+        }
         if let Some(field) = login_field(target) {
             return self.set_login(field, value.to_string());
         }
@@ -7986,6 +8987,24 @@ impl NativeChatHost {
 
     /// Add text to the end of what a field holds, one keystroke per character.
     fn type_into(&mut self, target: &str, text: &str) -> Result<DispatchResult, String> {
+        if let Some(result) = self.market_field(target, |current| format!("{current}{text}")) {
+            return result;
+        }
+        if let Some((id, current)) = self
+            .monitor_modal
+            .as_ref()
+            .and_then(|modal| modal.renaming.as_ref())
+            && target == crate::components::monitor_modal::rename_field_id(id)
+        {
+            let value = format!("{current}{text}");
+            if let Some(modal) = self.monitor_modal.as_mut()
+                && let Some((_, current)) = modal.renaming.as_mut()
+            {
+                *current = value.clone();
+            }
+            self.pending = Some(Command::SetAccountLabel(value));
+            return Ok(DispatchResult::empty());
+        }
         if let Some(field) = login_field(target) {
             let value = match field {
                 LoginField::Email => format!("{}{text}", self.login_email),
@@ -8025,6 +9044,38 @@ impl NativeChatHost {
 
     /// Press one key. No modifiers: a chord is `op keybinding`'s business, not this one's.
     fn key(&mut self, target: &str, key: &str) -> Result<DispatchResult, String> {
+        if let Some(result) = self.market_key(target, key) {
+            return result;
+        }
+        if let Some((id, current)) = self
+            .monitor_modal
+            .as_ref()
+            .and_then(|modal| modal.renaming.as_ref())
+            && target == crate::components::monitor_modal::rename_field_id(id)
+        {
+            self.pending = Some(match key_token(key)?.as_str() {
+                "enter" => Command::SaveAccountLabel,
+                "escape" => Command::CancelAccountLabel,
+                "backspace" => {
+                    let mut value = current.clone();
+                    value.pop();
+                    // Kept here too, as typing keeps it: a second Backspace before the window has
+                    // drawn again takes the next character, not the same one twice.
+                    if let Some(modal) = self.monitor_modal.as_mut()
+                        && let Some((_, current)) = modal.renaming.as_mut()
+                    {
+                        *current = value.clone();
+                    }
+                    Command::SetAccountLabel(value)
+                }
+                _ => {
+                    return Err(
+                        "use type for the account label, Enter to save, or Escape to cancel".into(),
+                    );
+                }
+            });
+            return Ok(DispatchResult::empty());
+        }
         if let Some(field) = login_field(target) {
             return self.login_key(field, target, key);
         }
@@ -11217,7 +12268,16 @@ mod tests {
         // Nothing told yet: the list is everything the recipe needs.
         let untold = recipe(&[]);
         host.composer_panel = Some(PanelMode::Parameters);
-        host.panel_rows = panel_rows(PanelMode::Parameters, &[], &listed(&[]), Some(&untold));
+        host.panel_rows = panel_rows(
+            PanelMode::Parameters,
+            &[],
+            &listed(&[]),
+            Some(&untold),
+            &ToolSource {
+                plugins: Vec::new(),
+                apps: Vec::new(),
+            },
+        );
         let tree = host.snapshot();
         let panel = tree.find(ids::COMPOSER_PANEL).unwrap();
         assert!(tree.find(ids::COMPOSER_PANEL_SEARCH).unwrap().focused);
@@ -11234,7 +12294,16 @@ mod tests {
         // parameter leaves this list and lives in the bar above the composer, where it can still
         // be changed. A driver asserting on the panel must read it as the outstanding work.
         let told = recipe(&[("city", "London")]);
-        host.panel_rows = panel_rows(PanelMode::Parameters, &[], &listed(&[]), Some(&told));
+        host.panel_rows = panel_rows(
+            PanelMode::Parameters,
+            &[],
+            &listed(&[]),
+            Some(&told),
+            &ToolSource {
+                plugins: Vec::new(),
+                apps: Vec::new(),
+            },
+        );
         let tree = host.snapshot();
         let rows: Vec<&str> = tree
             .find(ids::COMPOSER_PANEL)
@@ -11538,7 +12607,16 @@ mod tests {
 
         let (listing, skills) = slash_listing();
         host.composer_panel = Some(PanelMode::Slash);
-        host.panel_rows = panel_rows(PanelMode::Slash, &listing, &listed(&skills), None);
+        host.panel_rows = panel_rows(
+            PanelMode::Slash,
+            &listing,
+            &listed(&skills),
+            None,
+            &ToolSource {
+                plugins: Vec::new(),
+                apps: Vec::new(),
+            },
+        );
 
         let tree = host.snapshot();
         assert_eq!(
@@ -11566,7 +12644,16 @@ mod tests {
         let mut host = host();
         let (listing, skills) = slash_listing();
         host.composer_panel = Some(PanelMode::Slash);
-        host.panel_rows = panel_rows(PanelMode::Slash, &listing, &listed(&skills), None);
+        host.panel_rows = panel_rows(
+            PanelMode::Slash,
+            &listing,
+            &listed(&skills),
+            None,
+            &ToolSource {
+                plugins: Vec::new(),
+                apps: Vec::new(),
+            },
+        );
 
         let tree = host.snapshot();
         let skill = tree.find("composer-panel-row-skill:skl_1").unwrap();
@@ -11582,7 +12669,16 @@ mod tests {
         assert!(draft.states.contains(&"note".to_string()));
 
         // And a library with nothing in it says so under the id that row has always had.
-        host.panel_rows = panel_rows(PanelMode::Slash, &listing, &listed(&[]), None);
+        host.panel_rows = panel_rows(
+            PanelMode::Slash,
+            &listing,
+            &listed(&[]),
+            None,
+            &ToolSource {
+                plugins: Vec::new(),
+                apps: Vec::new(),
+            },
+        );
         let empty = host.snapshot();
         let none = empty.find("composer-skills-none").unwrap();
         assert!(none.states.contains(&"note".to_string()));
@@ -11894,6 +12990,60 @@ mod tests {
             host.take_command(),
             Some(Command::UserFormOpenScreen { .. })
         ));
+    }
+
+    /// A driver answers a "Which account?" card by the account's id, as the person taps Use, and
+    /// Remember is a switch beside it; a card that is no longer the thread's last turn refuses
+    /// in words rather than sending the newest message again (#360).
+    #[test]
+    fn a_which_account_card_is_answered_by_the_accounts_id() {
+        use crate::opengrok::{PluginNeed, PluginNeedKind, PluginNeedsSpec};
+        let mut host = host();
+        let spec = PluginNeedsSpec {
+            needs: vec![PluginNeed {
+                plugin: "cloudflare".into(),
+                connector: Some("cloudflare".into()),
+                kind: PluginNeedKind::Choose(vec![
+                    ("conn_a".into(), "Work".into(), "mcp".into()),
+                    ("conn_b".into(), "Personal".into(), "token".into()),
+                ]),
+            }],
+            send_again: true,
+        };
+        host.plugin_needs = vec![PluginNeedsSnap {
+            message_id: "m_9".into(),
+            spec: spec.clone(),
+            answerable: true,
+            remember: false,
+        }];
+        let tree = host.snapshot();
+        let work = tree.find("plugin-needs-use-m_9-conn_a").unwrap();
+        assert_eq!(
+            (work.name.as_str(), work.value.as_deref()),
+            ("Work", Some("mcp"))
+        );
+        assert!(tree.find("plugin-needs-remember-m_9").is_some());
+        assert!(
+            tree.find("plugin-needs-again-m_9").is_none(),
+            "a choice is the answer itself"
+        );
+        host.dispatch(&Op::click("plugin-needs-use-m_9-conn_b"))
+            .unwrap();
+        match host.take_command() {
+            Some(Command::ChoosePluginAccount { message_id, pick }) => {
+                assert_eq!(message_id, "m_9");
+                assert_eq!(
+                    pick,
+                    ("cloudflare".into(), "cloudflare".into(), "conn_b".into())
+                );
+            }
+            other => panic!("expected the pick, got {other:?}"),
+        }
+        host.plugin_needs[0].answerable = false;
+        assert!(
+            host.dispatch(&Op::click("plugin-needs-use-m_9-conn_b"))
+                .is_err()
+        );
     }
 
     #[test]
@@ -14376,6 +15526,7 @@ mod tests {
             loans: loans.iter().map(|lent| lent.to_string()).collect(),
             updated_at_ms: 1,
             expires_at_ms: None,
+            kind: crate::opengrok::ConnectionKind::Oauth,
         }
     }
 
@@ -14386,234 +15537,6 @@ mod tests {
             ..connection(id, connector, &[])
         }
     }
-
-    fn service(name: &str, label: &str) -> crate::opengrok::Connector {
-        crate::opengrok::Connector {
-            name: name.into(),
-            label: label.into(),
-        }
-    }
-
-    /// Settings → Connections is on the tree as the page draws it (#2): each of the person's
-    /// own connections with the line under it (the service, and who it is lent to by name) and
-    /// its Disconnect, a Connect for each service on offer that is not connected, and what a
-    /// refusal said. Each click is the page's own, and refused off the page and while its
-    /// control is dead; the tab itself only while Settings is open.
-    #[test]
-    fn the_connections_page_is_on_the_tree_and_clicks_as_the_page_does() {
-        use crate::state::{BROWSER_WAIT, ConnectionChange, ConnectorList};
-        let mut host = host();
-        // Settings is shut: nobody can press its tab, and arriving on it would read the list.
-        let shut = host.click(ids::SETTINGS_CONNECTIONS).unwrap_err();
-        assert!(shut.contains(ids::FOOTER_ACCOUNT), "{shut}");
-        assert!(host.take_command().is_none());
-        // The tab answers from anywhere in Settings once it is open: it is how the page is
-        // reached. The other tabs are as they were.
-        host.account_open = true;
-        host.click(ids::SETTINGS_CONNECTIONS).unwrap();
-        assert!(matches!(
-            host.take_command(),
-            Some(Command::SetAppSettingsTab(AppSettingsTab::Connections))
-        ));
-        host.account_open = false;
-        host.click("settings-tab-logins").unwrap();
-        assert!(matches!(
-            host.take_command(),
-            Some(Command::SetAppSettingsTab(AppSettingsTab::Logins))
-        ));
-
-        host.connections.list = Some(ConnectionList::Listed(vec![
-            connection("conn_1", "gmail", &["bot-1", "cw_gone"]),
-            bots_own("conn_2", "drive"),
-        ]));
-        host.connections.connectors = Some(ConnectorList::Listed(vec![
-            service("gmail", "Gmail"),
-            service("github", "GitHub"),
-        ]));
-        assert!(
-            host.snapshot().find(ids::CONNECTIONS).is_none(),
-            "Settings is not open on Connections"
-        );
-        assert!(host.click(&ids::connection_disconnect("conn_1")).is_err());
-        assert!(host.click(&ids::connect("github")).is_err());
-        assert!(host.click(ids::CONNECTIONS_REFRESH).is_err());
-
-        host.account_open = true;
-        host.connections_tab = true;
-        let tree = host.snapshot();
-        assert_eq!(
-            tree.find(ids::CONNECTIONS).unwrap().value.as_deref(),
-            Some("1"),
-            "only the person's own"
-        );
-        let row = tree.find(&ids::connection("conn_1")).unwrap();
-        assert_eq!(row.name, "gmail account");
-        assert_eq!(
-            row.value.as_deref(),
-            Some("Gmail · Lent to Ada and 1 Bot not on your list")
-        );
-        assert!(tree.find(&ids::connection("conn_2")).is_none());
-        assert!(
-            tree.find(&ids::connect("gmail")).is_none(),
-            "a service already connected is not offered"
-        );
-        assert_eq!(
-            tree.find(ids::CONNECTORS).unwrap().value.as_deref(),
-            Some("1")
-        );
-        assert_eq!(
-            tree.find(&ids::connect("github")).unwrap().name,
-            "Connect GitHub"
-        );
-        assert!(tree.ids_are_unique());
-
-        // Disconnect asks first; its Yes and No are not there until it does.
-        let yes = crate::components::connections::confirm_yes_id("conn_1");
-        let no = crate::components::connections::confirm_no_id("conn_1");
-        assert!(host.click(&yes).is_err(), "nothing to say yes to yet");
-        host.click(&ids::connection_disconnect("conn_1")).unwrap();
-        assert!(matches!(
-            host.take_command(),
-            Some(Command::AskDisconnect(id)) if id == "conn_1"
-        ));
-        host.connections.confirming_disconnect = Some("conn_1".into());
-        let tree = host.snapshot();
-        assert_eq!(
-            tree.find(&crate::components::connections::confirm_question_id(
-                "conn_1"
-            ))
-            .unwrap()
-            .name,
-            "Disconnect Gmail? Ada and 1 Bot not on your list will lose it."
-        );
-        assert!(tree.find(&ids::connection_disconnect("conn_1")).is_none());
-        assert!(tree.ids_are_unique());
-        host.click(&no).unwrap();
-        assert!(matches!(host.take_command(), Some(Command::KeepConnection)));
-        host.click(&yes).unwrap();
-        assert!(matches!(
-            host.take_command(),
-            Some(Command::DisconnectConnection(id)) if id == "conn_1"
-        ));
-        host.connections.confirming_disconnect = None;
-        host.click(&ids::connect("github")).unwrap();
-        assert!(matches!(
-            host.take_command(),
-            Some(Command::ConnectService(name)) if name == "github"
-        ));
-        host.click(ids::CONNECTIONS_REFRESH).unwrap();
-        assert!(matches!(
-            host.take_command(),
-            Some(Command::RefreshConnections)
-        ));
-        assert!(host.click(&ids::connect("gmail")).is_err());
-        assert!(host.click(&ids::connection_disconnect("conn_9")).is_err());
-        assert!(
-            host.click(&ids::connection_disconnect("conn_2")).is_err(),
-            "a bot's own sign-in is not the person's to disconnect"
-        );
-
-        // A change with the server leaves its row dead and saying so, and a sign-in page being
-        // asked for leaves every Connect dead.
-        host.connections
-            .changing
-            .insert("conn_1".into(), ConnectionChange::Disconnect);
-        host.connections.opening = Some("github".into());
-        let tree = host.snapshot();
-        let row = tree.find(&ids::connection("conn_1")).unwrap();
-        assert!(row.states.contains(&"changing".to_string()));
-        let disconnect = tree.find(&ids::connection_disconnect("conn_1")).unwrap();
-        assert_eq!(
-            (disconnect.name.as_str(), disconnect.enabled),
-            ("Disconnecting…", false)
-        );
-        let connect = tree.find(&ids::connect("github")).unwrap();
-        assert!(connect.states.contains(&"opening".to_string()) && !connect.enabled);
-        assert!(host.click(&ids::connection_disconnect("conn_1")).is_err());
-        assert!(host.click(&ids::connect("github")).is_err());
-
-        // A lend with the server is on the row as it is on the bot's switch.
-        host.connections
-            .changing
-            .insert("conn_1".into(), ConnectionChange::Revoke("bot-1".into()));
-        assert_eq!(
-            host.snapshot()
-                .find(&ids::connection("conn_1"))
-                .unwrap()
-                .value
-                .as_deref(),
-            Some("Gmail · Lent to 1 Bot not on your list")
-        );
-
-        // A refusal of a Disconnect is under its row in the server's words, and a lend's is
-        // not; the browser's wait is on its Connect, and a Connect that could not start says
-        // why beside it.
-        host.connections.changing.clear();
-        host.connections.opening = None;
-        host.connections.not_disconnected.insert(
-            "conn_1".into(),
-            "Not disconnected: the store is unavailable.".into(),
-        );
-        host.connections.not_changed.insert(
-            ("conn_1".into(), "bot-1".into()),
-            "Could not change this: no such connection.".into(),
-        );
-        host.connections
-            .waiting
-            .insert("github".into(), std::time::Instant::now() + BROWSER_WAIT);
-        host.connections.connect_refused = Some((
-            "github".into(),
-            "GitHub could not be connected: no provider is configured for github.".into(),
-        ));
-        let tree = host.snapshot();
-        let row = tree.find(&ids::connection("conn_1")).unwrap();
-        let lines: Vec<&str> = row.children.iter().map(|line| line.name.as_str()).collect();
-        assert_eq!(
-            lines,
-            ["Disconnect", "Not disconnected: the store is unavailable."]
-        );
-        assert!(
-            tree.find(&ids::connect("github"))
-                .unwrap()
-                .states
-                .contains(&"waiting".to_string())
-        );
-        assert_eq!(
-            tree.find(&ids::connect_error("github")).unwrap().name,
-            "GitHub could not be connected: no provider is configured for github."
-        );
-
-        // Each empty list says which it is, and a list that could not be read says why. A list
-        // with none of the person's own in it is nothing connected.
-        host.connections.list = Some(ConnectionList::Listed(vec![bots_own("conn_2", "drive")]));
-        host.connections.connectors = Some(ConnectorList::Listed(Vec::new()));
-        let tree = host.snapshot();
-        assert_eq!(
-            tree.find(ids::CONNECTIONS_EMPTY).unwrap().name,
-            connections::NOTHING_CONNECTED
-        );
-        assert_eq!(
-            tree.find(ids::CONNECTORS_EMPTY).unwrap().name,
-            connections::NO_CONNECTORS
-        );
-        assert!(tree.find(ids::CONNECTIONS).is_none() && tree.find(ids::CONNECTORS).is_none());
-        host.connections.list = Some(ConnectionList::Unavailable(
-            "Your connections could not be read.".into(),
-        ));
-        host.connections.connectors = Some(ConnectorList::Unavailable(
-            crate::state::CONNECTORS_NOT_LISTED.into(),
-        ));
-        let tree = host.snapshot();
-        assert_eq!(
-            tree.find(ids::CONNECTIONS_ERROR).unwrap().name,
-            "Your connections could not be read."
-        );
-        assert_eq!(
-            tree.find(ids::CONNECTORS_ERROR).unwrap().name,
-            crate::state::CONNECTORS_NOT_LISTED
-        );
-    }
-
     /// The open bot's Connections card is on the tree while its settings are open: a switch
     /// per connection of the person's own, checked while it is lent to this bot, whose click
     /// asks for the other way; dead while a change to it is with the server; a refusal about
@@ -14621,7 +15544,7 @@ mod tests {
     /// not do yet (opengrok-server#268).
     #[test]
     fn a_bots_connections_card_lends_from_the_tree() {
-        use crate::state::ConnectionChange;
+        use crate::state::{ConnectionChange, ConnectionList};
         let mut host = host();
         host.connections.list = Some(ConnectionList::Listed(vec![
             connection("conn_1", "gmail", &["bot-1"]),
@@ -14713,49 +15636,6 @@ mod tests {
         assert!(host.click("agent-connection-lend-conn_9").is_err());
     }
 
-    /// What the app holds is what the tree draws: a state's connections and roster come through
-    /// `from_app`, and the bot's names are the roster's.
-    #[test]
-    fn the_connections_on_the_tree_are_the_apps() {
-        let mut state = AppState::new();
-        // Signed in, or the roster is not what the sidebar lists and no bot has a name.
-        state.auth_status = crate::state::AuthStatus::SignedIn;
-        state.account = Some(
-            serde_json::from_value(serde_json::json!({ "id": "acct_1", "email": "a@b.c" }))
-                .unwrap(),
-        );
-        state.coworkers = vec![
-            serde_json::from_value(serde_json::json!({ "id": "cw_1", "name": "Ada" })).unwrap(),
-            serde_json::from_value(serde_json::json!({ "id": "cw_2", "name": "Bo" })).unwrap(),
-        ];
-        state.active_coworker_id = Some("cw_2".into());
-        state.connections.list = Some(ConnectionList::Listed(vec![connection(
-            "conn_1",
-            "gmail",
-            &["cw_1", "cw_2"],
-        )]));
-        state.is_app_settings_open = true;
-        state.app_settings_tab = AppSettingsTab::Connections;
-        state.right_pane = crate::state::RightPane::Settings;
-        let mut host = NativeChatHost::from_app(&state);
-        // The Bot's settings draw no Connections card (#174), so the card is named only for a
-        // host that is told one is on screen.
-        host.agent_connections_card = true;
-        let tree = host.snapshot();
-        assert_eq!(
-            tree.find(ids::AGENT_CONNECTIONS).unwrap().value.as_deref(),
-            Some("1 of 1 lent to this Bot"),
-            "the open bot is Bo, who has it"
-        );
-        assert_eq!(
-            tree.find(&ids::connection("conn_1"))
-                .unwrap()
-                .value
-                .as_deref(),
-            Some("gmail · Lent to Ada and Bo")
-        );
-    }
-
     /// The Bot's settings have no Save: Name, Label and Description save as they are left, so
     /// there is no control for it on the tree and a click on the old id is refused; a refused
     /// change is on the tree in the server's words, where the pane shows it.
@@ -14808,47 +15688,6 @@ mod tests {
                 ..kept_source(crate::opengrok::InferenceKind::Gateway, true)
             },
         ))
-    }
-
-    /// The Relay tab is gone from the tree: Settings' pages are General, Computer, Updates, Logins,
-    /// Connections and Skills, nothing answers at the id the Relay tab had, and none of the ids of
-    /// the page it held is on the tree or takes a click. The relay is on Computer, in each
-    /// computer's card.
-    #[test]
-    fn the_relay_tab_is_gone_from_the_tree_and_answers_no_click() {
-        let mut host = host();
-        host.account_open = true;
-        host.computer_tab = true;
-        host.computers = vec![a_card("mac_1", true)];
-        let tree = host.snapshot();
-        for id in [
-            ids::SETTINGS_GENERAL,
-            "settings-tab-computer",
-            "settings-tab-updates",
-            "settings-tab-logins",
-            ids::SETTINGS_CONNECTIONS,
-            ids::SETTINGS_SKILLS,
-        ] {
-            assert!(tree.find(id).is_some(), "{id} is a page of Settings");
-        }
-        for gone in [
-            "settings-tab-reply-source",
-            "settings-reply-source",
-            "settings-relay",
-            "settings-relay-switch",
-            "settings-relay-switch-error",
-            "settings-relay-status",
-        ] {
-            assert!(tree.find(gone).is_none(), "{gone} is gone from the tree");
-            let refused = host.click(gone).unwrap_err();
-            assert!(
-                refused.contains(&format!("no `{gone}` on screen"))
-                    && refused.contains("settings-computer-{id}-relay"),
-                "{gone}: {refused}"
-            );
-            assert!(host.take_command().is_none(), "{gone} sent nothing");
-        }
-        assert!(tree.ids_are_unique());
     }
 
     /// Each computer is a card on the tree as the window draws it, while Settings is open on
@@ -18117,58 +18956,167 @@ mod tests {
         ));
     }
 
+    /// The Relay tab is gone from the tree: Settings' pages are General, Computer, Updates, Logins,
+    /// and Skills, nothing answers at the id the Relay tab had, and none of the ids of
+    /// the page it held is on the tree or takes a click. The relay is on Computer, in each
+    /// computer's card.
     #[test]
-    fn the_monitor_driver_lends_connections_attaches_private_skills_and_requires_remove_confirmation()
-     {
-        use crate::components::monitor_modal::{MonitorKind, MonitorModal, PluginSelection};
+    fn the_relay_tab_is_gone_from_the_tree_and_answers_no_click() {
+        let mut host = host();
+        host.account_open = true;
+        host.computer_tab = true;
+        host.computers = vec![a_card("mac_1", true)];
+        let tree = host.snapshot();
+        for id in [
+            ids::SETTINGS_GENERAL,
+            "settings-tab-computer",
+            "settings-tab-updates",
+            "settings-tab-logins",
+            ids::SETTINGS_SKILLS,
+        ] {
+            assert!(tree.find(id).is_some(), "{id} is a page of Settings");
+        }
+        for gone in [
+            "settings-tab-reply-source",
+            "settings-reply-source",
+            "settings-relay",
+            "settings-relay-switch",
+            "settings-relay-switch-error",
+            "settings-relay-status",
+        ] {
+            assert!(tree.find(gone).is_none(), "{gone} is gone from the tree");
+            let refused = host.click(gone).unwrap_err();
+            assert!(
+                refused.contains(&format!("no `{gone}` on screen"))
+                    && refused.contains("settings-computer-{id}-relay"),
+                "{gone}: {refused}"
+            );
+            assert!(host.take_command().is_none(), "{gone} sent nothing");
+        }
+        assert!(tree.ids_are_unique());
+    }
+
+    #[test]
+    fn the_marketplace_driver_opens_a_service_lends_attaches_and_confirms_removal() {
+        use crate::components::monitor_modal::{
+            MarketPage, MonitorKind, MonitorModal, PluginSelection,
+        };
         let mut state = crate::components::monitor_modal::tests::catalog();
         state.monitor_modal = Some(MonitorModal::new("cw_1".into(), MonitorKind::Plugins));
         let mut host = NativeChatHost::from_app(&state);
         let tree = host.snapshot();
-        assert!(tree.find("agent-connection-lend-conn_1").unwrap().checked == Some(true));
-        assert!(tree.find("agent-skills-switch-sk_1").is_some());
-        assert!(tree.find("agent-skills-switch-sk_org").is_none());
-        host.dispatch(&Op::click("agent-connection-lend-conn_1"))
-            .unwrap();
-        assert!(
-            matches!(host.take_command(), Some(Command::SetConnectionLent {connection_id, lent:false}) if connection_id == "conn_1")
-        );
-        host.dispatch(&Op::click("agent-skills-switch-sk_1"))
-            .unwrap();
-        assert!(
-            matches!(host.take_command(), Some(Command::SetBotSkill {skill_id, attached:true}) if skill_id == "sk_1")
-        );
-        host.dispatch(&Op::click("monitor-connection-detail-conn_1"))
-            .unwrap();
-        assert!(
-            matches!(host.take_command(), Some(Command::SelectMonitorPlugin(Some(PluginSelection::Connection(id)))) if id == "conn_1")
-        );
-        state.monitor_modal.as_mut().unwrap().selected =
-            Some(PluginSelection::Connection("conn_1".into()));
-        let mut host = NativeChatHost::from_app(&state);
-        assert!(
-            !host
-                .snapshot()
-                .find("monitor-plugin-add-account")
-                .unwrap()
-                .enabled
-        );
-        assert!(
-            host.dispatch(&Op::click("monitor-plugin-add-account"))
-                .is_err()
-        );
-        assert!(
-            host.dispatch(&Op::click("monitor-plugin-remove-confirm"))
-                .is_err()
-        );
-        host.dispatch(&Op::click("monitor-plugin-remove")).unwrap();
+        // The service this server signs in to is a row, and Added: the person has an account of it.
+        assert!(tree.find("market-service-gmail").is_some());
+        let added = tree.find("market-service-gmail-add").unwrap();
+        assert_eq!(added.name, "Added");
+        assert!(!added.enabled);
+        host.dispatch(&Op::click("market-service-gmail")).unwrap();
         assert!(matches!(
             host.take_command(),
-            Some(Command::AskMonitorRemove(true))
+            Some(Command::Market(MarketCommand::OpenDetail(PluginSelection::Service(name)))) if name == "gmail"
         ));
-        state.monitor_modal.as_mut().unwrap().confirming = true;
+
+        state.monitor_modal.as_mut().unwrap().selected =
+            Some(PluginSelection::Service("gmail".into()));
         let mut host = NativeChatHost::from_app(&state);
-        host.dispatch(&Op::click("monitor-plugin-remove-confirm"))
+        let tree = host.snapshot();
+        assert!(tree.find("market-account-bots-conn_1").unwrap().enabled);
+        assert!(
+            tree.find("monitor-account-row-conn_foreign").is_none(),
+            "a Bot's own sign-in is not the person's"
+        );
+        host.dispatch(&Op::click("market-account-bots-conn_1"))
+            .unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::Market(MarketCommand::Bots(Some(id)))) if id == "conn_1"
+        ));
+        state.monitor_modal.as_mut().unwrap().bots_for = Some("conn_1".into());
+        let mut bots = NativeChatHost::from_app(&state);
+        let bot_id = crate::components::marketplace::bot_row_id("cw_1");
+        assert_eq!(bots.snapshot().find(&bot_id).unwrap().checked, Some(true));
+        bots.dispatch(&Op::click(&bot_id)).unwrap();
+        assert!(matches!(
+            bots.take_command(),
+            Some(Command::Market(MarketCommand::LendTo { connection_id, coworker_id, lent: false }))
+                if connection_id == "conn_1" && coworker_id == "cw_1"
+        ));
+        state.monitor_modal.as_mut().unwrap().bots_for = None;
+        assert!(tree.find("market-add-account-gmail").unwrap().enabled);
+        host.dispatch(&Op::click("market-add-account-gmail"))
+            .unwrap();
+        assert!(
+            matches!(host.take_command(), Some(Command::ConnectService(connector)) if connector == "gmail")
+        );
+        host.dispatch(&Op::click("monitor-account-reconnect-conn_1"))
+            .unwrap();
+        assert!(
+            matches!(host.take_command(), Some(Command::ReconnectAccount(id)) if id == "conn_1")
+        );
+        host.dispatch(&Op::click("monitor-account-rename-conn_1"))
+            .unwrap();
+        assert!(matches!(host.take_command(), Some(Command::RenameAccount(id)) if id == "conn_1"));
+
+        state.monitor_modal.as_mut().unwrap().renaming = Some(("conn_1".into(), "Gmail".into()));
+        let mut rename = NativeChatHost::from_app(&state);
+        rename
+            .set_value("monitor-account-label-conn_1", "Work")
+            .unwrap();
+        assert!(
+            matches!(rename.take_command(), Some(Command::SetAccountLabel(label)) if label == "Work")
+        );
+        rename
+            .type_into("monitor-account-label-conn_1", " account")
+            .unwrap();
+        assert!(
+            matches!(rename.take_command(), Some(Command::SetAccountLabel(label)) if label == "Work account")
+        );
+        // Two Backspaces before the window draws again take two characters.
+        rename
+            .key("monitor-account-label-conn_1", "Backspace")
+            .unwrap();
+        assert!(
+            matches!(rename.take_command(), Some(Command::SetAccountLabel(label)) if label == "Work accoun")
+        );
+        rename
+            .key("monitor-account-label-conn_1", "Backspace")
+            .unwrap();
+        assert!(
+            matches!(rename.take_command(), Some(Command::SetAccountLabel(label)) if label == "Work accou")
+        );
+        rename.key("monitor-account-label-conn_1", "Enter").unwrap();
+        assert!(matches!(
+            rename.take_command(),
+            Some(Command::SaveAccountLabel)
+        ));
+        state.monitor_modal.as_mut().unwrap().renaming = None;
+
+        // Remove asks first, and only the question's Remove sends anything.
+        let mut host = NativeChatHost::from_app(&state);
+        assert!(
+            host.dispatch(&Op::click("market-account-remove-confirm"))
+                .is_err()
+        );
+        host.dispatch(&Op::click("market-account-remove-conn_1"))
+            .unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::Market(MarketCommand::AskAccountRemove(Some(id)))) if id == "conn_1"
+        ));
+        {
+            let modal = state.monitor_modal.as_mut().unwrap();
+            modal.confirming = true;
+            modal.removal = Some("conn_1".into());
+        }
+        let mut host = NativeChatHost::from_app(&state);
+        assert!(
+            host.snapshot()
+                .find("monitor-plugin-remove-question")
+                .unwrap()
+                .name
+                .contains("Ada and Bo")
+        );
+        host.dispatch(&Op::click("market-account-remove-confirm"))
             .unwrap();
         assert!(matches!(
             host.take_command(),
@@ -18176,9 +19124,27 @@ mod tests {
         ));
         host.sessions.iter_mut().for_each(|bot| bot.active = false);
         assert!(
-            host.dispatch(&Op::click("monitor-plugin-remove-confirm"))
+            host.dispatch(&Op::click("market-account-remove-confirm"))
                 .is_err(),
             "another Bot cannot inherit the old modal"
+        );
+
+        // The person's private skills are switched from Installed, as they always were.
+        {
+            let modal = state.monitor_modal.as_mut().unwrap();
+            modal.selected = None;
+            modal.confirming = false;
+            modal.removal = None;
+            modal.page = MarketPage::Installed;
+        }
+        let mut host = NativeChatHost::from_app(&state);
+        let tree = host.snapshot();
+        assert!(tree.find("agent-skills-switch-sk_1").is_some());
+        assert!(tree.find("agent-skills-switch-sk_org").is_none());
+        host.dispatch(&Op::click("agent-skills-switch-sk_1"))
+            .unwrap();
+        assert!(
+            matches!(host.take_command(), Some(Command::SetBotSkill {skill_id, attached:true}) if skill_id == "sk_1")
         );
     }
 }

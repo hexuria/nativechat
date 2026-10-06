@@ -55,13 +55,14 @@ use super::activity::{
     activity_from_replay,
 };
 use super::client::{
-    AnswerReply, AsyncRunResponse, BotSkillScope, BoxShareScope, ConnectLink, ConnectionOwner,
-    ConnectionView, Connector, CoworkerCeiling, CoworkerComputer, CoworkerSkills, CoworkerUsage,
-    DaemonEnrol, DaemonList, DaemonMachine, LocalExecMode, LocalExecPolicy, OpenGrokClient,
-    QueuedApproval, RecipeDetail, RecipeList, RecipeParameterKind, RecipeRunResult, RunBy,
-    RunCause, RunReplay, SKIPPED_FIRING, ScheduleKind, ScheduleRow, ScheduleRun,
-    ScheduleRunStarted, ScheduleRunStatus, SkillDetail, SkillSummary, SkillVersion, StopReply,
-    ThreadReplay, ToolListing, host_egress_tunnel_available, host_egress_tunnel_flag,
+    AddedToken, AnswerReply, AsyncRunResponse, BotSkillScope, BoxShareScope, ConnectLink,
+    ConnectionAttempt, ConnectionKind, ConnectionOwner, ConnectionPin, ConnectionView, Connector,
+    CoworkerCeiling, CoworkerComputer, CoworkerSkills, CoworkerUsage, DaemonEnrol, DaemonList,
+    DaemonMachine, LocalExecMode, LocalExecPolicy, OpenGrokClient, PluginCatalog, PluginDetail,
+    PluginInstallation, QueuedApproval, RecipeDetail, RecipeList, RecipeParameterKind,
+    RecipeRunResult, RunBy, RunCause, RunReplay, SKIPPED_FIRING, ScheduleKind, ScheduleRow,
+    ScheduleRun, ScheduleRunStarted, ScheduleRunStatus, SkillDetail, SkillSummary, SkillVersion,
+    StopReply, ThreadReplay, ToolListing, host_egress_tunnel_available, host_egress_tunnel_flag,
 };
 use super::credential::{CREDENTIAL_OFFER_SAVE, SaveLoginSpec};
 use super::error::{Failure, Unreachable, reads_as_gateway_unreachable};
@@ -240,6 +241,9 @@ fn ledger() -> Vec<(Slot, &'static str)> {
         UI_CUSTOM_NAME,
         // `TurnAssembler::push_event` reads which door a run went through, for the reply's badge.
         INFERENCE_SOURCE_CUSTOM,
+        // `PluginNeedsSpec::from_event`: the card a tagged plugin that needs something answers
+        // the turn with (#360).
+        super::gen_ui::PLUGIN_NEEDS_CUSTOM,
         // `UiSpec::from_custom` reads a CUSTOM with no name as a widget that names itself.
         "",
     ]
@@ -554,6 +558,26 @@ const FIVE_HUNDRED_SHAPE: &str = "should carry its sentence under error, as JSON
 /// asked comes off this list and gets a reading in [`REST_ROUTES`] in the same change, and
 /// [`every_route_this_app_does_not_read_is_recorded_and_says_why`] fails until it does.
 const REST_NOT_READ: &[(&str, &str, &str)] = &[
+    (
+        "DELETE__auto-review_policy",
+        "/auto-review/policy",
+        "The auto-review policy (opengrok-server #357, `auto_review` routes, merged to the server's main before #366). This app has no client half of it on this branch: nothing here asks the route, so nothing can be wrong in how it reads it. Built in the change that starts asking it.",
+    ),
+    (
+        "GET__auto-review_effective",
+        "/auto-review/effective",
+        "The auto-review policy (opengrok-server #357, `auto_review` routes, merged to the server's main before #366). This app has no client half of it on this branch: nothing here asks the route, so nothing can be wrong in how it reads it. Built in the change that starts asking it.",
+    ),
+    (
+        "GET__auto-review_policy",
+        "/auto-review/policy",
+        "The auto-review policy (opengrok-server #357, `auto_review` routes, merged to the server's main before #366). This app has no client half of it on this branch: nothing here asks the route, so nothing can be wrong in how it reads it. Built in the change that starts asking it.",
+    ),
+    (
+        "PUT__auto-review_policy",
+        "/auto-review/policy",
+        "The auto-review policy (opengrok-server #357, `auto_review` routes, merged to the server's main before #366). This app has no client half of it on this branch: nothing here asks the route, so nothing can be wrong in how it reads it. Built in the change that starts asking it.",
+    ),
     (
         "GET__auth_cursor_dev_session_token",
         "/auth/cursor_dev_session_token",
@@ -1858,11 +1882,54 @@ fn custom(frame: &Value) -> Check {
         USER_FORM_CUSTOM => settled_form(frame),
         CREDENTIAL_OFFER_SAVE => offer_save(frame),
         INFERENCE_SOURCE_CUSTOM => inference_source_frame(frame),
+        super::gen_ui::PLUGIN_NEEDS_CUSTOM => plugin_needs_frame(frame),
         name if is_excused(CLIENT_IGNORES, Slot::CustomName, name) => ignored(frame),
         name => Err(format!(
             "no check for a CUSTOM {name:?}: say here what this app does with one"
         )),
     }
+}
+
+/// What a tagged plugin still needs (`opengrok.pluginNeeds`, #360): one card, holding every need
+/// as sent, each account to choose with its id and label, and nothing waiting, since the run ends
+/// with the frame and the card's answer is a new turn.
+fn plugin_needs_frame(frame: &Value) -> Check {
+    use super::gen_ui::{PluginNeedKind, PluginNeedsSpec};
+    let sent = frame["value"]["needs"]
+        .as_array()
+        .ok_or("the frame should list its needs")?;
+    let (_, parts) = assembled(&[frame]).snapshot();
+    let [ChatPart::PluginNeeds(card)] = parts.as_slice() else {
+        return Err(format!(
+            "the frame should paint one needs card, got {parts:?}"
+        ));
+    };
+    must!(
+        card.needs.len() == sent.len() && card.send_again,
+        "every need should be on the card, which sends the message again: {card:?} from {sent:?}"
+    );
+    for (need, wire) in card.needs.iter().zip(sent) {
+        must!(
+            need.plugin == str_at(wire, "plugin"),
+            "the need should name its plugin as sent: {need:?} from {wire}"
+        );
+        if let PluginNeedKind::Choose(accounts) = &need.kind {
+            let ids: Vec<&str> = wire["accounts"]
+                .as_array()
+                .map(|listed| listed.iter().map(|a| str_at(a, "id")).collect())
+                .unwrap_or_default();
+            let read: Vec<&str> = accounts.iter().map(|(id, ..)| id.as_str()).collect();
+            must!(
+                ids == read,
+                "each account to choose should be the one sent: {read:?} from {ids:?}"
+            );
+        }
+    }
+    must!(
+        PluginNeedsSpec::from_event(frame).is_some(),
+        "the card should come from the frame alone"
+    );
+    Ok(())
 }
 
 /// Which door a run goes through (`opengrok.inferenceSource`): it says nothing on the status line
@@ -2346,10 +2413,53 @@ const REST_ROUTES: &[(&str, RestCheck)] = &[
     ("GET__coworkers__coworker_id__skills", coworker_skills),
     ("PUT__coworkers__coworker_id__skills", coworker_skills),
     ("GET__connections", connections_listed),
+    ("GET__connections__id__reconnect", sign_in_link),
+    ("PATCH__connections__id_", connection_changed),
+    ("GET__connections_pins", connection_pins),
+    (
+        "PUT__coworkers__coworker_id__pins__connector_",
+        connection_pin,
+    ),
+    (
+        "DELETE__coworkers__coworker_id__pins__connector_",
+        connection_gone,
+    ),
     ("POST__connections__id__lend", connection_changed),
     ("POST__connections__id__revoke", connection_changed),
     ("DELETE__connections__id_", connection_gone),
     ("GET__connectors", connectors_listed),
+    // Sign-ins that have not finished (#359): what the app shows as Needs Auth, Reopen's page, a
+    // rename and a dismiss.
+    ("GET__connections_attempts", attempts_listed),
+    ("GET__connections_attempts__id__reopen", sign_in_link),
+    ("PATCH__connections_attempts__id_", attempt_changed),
+    ("DELETE__connections_attempts__id_", read_as_done),
+    // Signing in at an installed plugin's own MCP server (#364): how a service adds an account,
+    // and its provider's page.
+    (
+        "GET__plugins_installations__name__connectors__connector__sign-in",
+        sign_in_method,
+    ),
+    (
+        "GET__plugins_installations__name__connectors__connector__authorize",
+        sign_in_link,
+    ),
+    // The plugin marketplace (#184): the catalog, a plugin's pinned detail, the installs, an
+    // install and an uninstall (any 2xx is done; the installs are read again), and the tokens
+    // pasted for an install's services.
+    ("GET__plugins_catalog", plugin_catalog),
+    ("GET__plugins_catalog__name_", plugin_detail),
+    ("GET__plugins_installations", plugin_installations),
+    ("POST__plugins_installations", read_as_done),
+    ("DELETE__plugins_installations__name_", read_as_done),
+    (
+        "POST__plugins_installations__name__credentials__connector_",
+        token_added,
+    ),
+    (
+        "PUT__plugins_installations__name__credentials__connector_",
+        read_as_done,
+    ),
     ("GET__connections__connector__authorize", sign_in_link),
     ("GET__coworkers__coworker_id__usage", coworker_usage),
     ("GET__coworkers__coworker_id__computer", computer),
@@ -3717,13 +3827,21 @@ fn coworker_usage(_: u16, body: &Value) -> Check {
 
 /// One of the person's connections as the list and a lend or a revoke answer it
 /// (opengrok-server#267 `ConnectionView`): its id, service, whose it is, its label and the Bots
-/// it is lent to come through as sent.
+/// it is lent to come through as sent, and how it was signed in to (opengrok-server #359), which
+/// is waiting for a recording that carries it ([`REST_FIELDS_NOT_RECORDED_YET`]).
 fn connection_reads_as_sent(row: &ConnectionView, raw: &Value) -> Check {
     let owner = match (str_at(&raw["owner"], "scope"), opt_str(&raw["owner"], "id")) {
         ("user", Some(id)) => ConnectionOwner::User(id.to_string()),
         ("bot", Some(id)) => ConnectionOwner::Bot(id.to_string()),
         ("global", _) => ConnectionOwner::Global,
         _ => ConnectionOwner::Other,
+    };
+    // Absent on a server from before opengrok-server #359, and read as the sign-in page then.
+    let kind = match raw.get("kind").and_then(Value::as_str) {
+        None | Some("oauth") => ConnectionKind::Oauth,
+        Some("token") => ConnectionKind::Token,
+        Some("mcp") => ConnectionKind::Mcp,
+        Some(_) => ConnectionKind::Other,
     };
     let loans: Vec<&str> = raw["loans"]
         .as_array()
@@ -3738,7 +3856,8 @@ fn connection_reads_as_sent(row: &ConnectionView, raw: &Value) -> Check {
             && row.label == str_at(raw, "label")
             && row.loans == loans
             && Some(row.updated_at_ms) == raw.get("updatedAtMs").and_then(Value::as_i64)
-            && row.expires_at_ms == raw.get("expiresAtMs").and_then(Value::as_i64),
+            && row.expires_at_ms == raw.get("expiresAtMs").and_then(Value::as_i64)
+            && row.kind == kind,
         "a connection came through changed: {row:?} from {raw}"
     );
     Ok(())
@@ -3791,6 +3910,190 @@ fn connections_listed(_: u16, body: &Value) -> Check {
 fn connection_changed(_: u16, body: &Value) -> Check {
     let row: ConnectionView = parse(body)?;
     connection_reads_as_sent(&row, body)
+}
+
+fn pin_reads_as_sent(pin: &ConnectionPin, raw: &Value) -> Check {
+    must!(
+        pin.coworker_id == str_at(raw, "coworkerId")
+            && pin.connector == str_at(raw, "connector")
+            && pin.connection_id == str_at(raw, "connectionId"),
+        "a connection pin came through changed: {pin:?} from {raw}"
+    );
+    Ok(())
+}
+
+fn connection_pin(_: u16, body: &Value) -> Check {
+    let pin: ConnectionPin = parse(body)?;
+    pin_reads_as_sent(&pin, body)
+}
+
+fn connection_pins(_: u16, body: &Value) -> Check {
+    let pins: Vec<ConnectionPin> = parse(body)?;
+    let raw = body.as_array().ok_or("pins must be a list")?;
+    same_len(&pins, raw)?;
+    for (pin, raw) in pins.iter().zip(raw) {
+        pin_reads_as_sent(pin, raw)?;
+    }
+    Ok(())
+}
+
+fn attempt_reads_as_sent(attempt: &ConnectionAttempt, raw: &Value) -> Check {
+    must!(
+        attempt.id == str_at(raw, "id")
+            && attempt.connector == str_at(raw, "connector")
+            && attempt.label == str_at(raw, "label")
+            && attempt.coworker_id.as_deref() == opt_str(raw, "coworkerId")
+            && attempt.status == str_at(raw, "status")
+            && attempt.error.as_deref() == opt_str(raw, "error")
+            && attempt.plugin.as_deref() == opt_str(raw, "plugin")
+            && Some(attempt.updated_at_ms) == raw.get("updatedAtMs").and_then(Value::as_i64),
+        "a waiting sign-in came through changed: {attempt:?} from {raw}"
+    );
+    // Either is an account that needs auth; a status this app does not know is not shown as one
+    // that connected.
+    must!(
+        matches!(attempt.status.as_str(), "pending" | "failed"),
+        "a waiting sign-in should be pending or failed: {raw}"
+    );
+    Ok(())
+}
+
+/// `GET /connections/attempts` (opengrok-server #359): always a list, every row as sent.
+fn attempts_listed(_: u16, body: &Value) -> Check {
+    let listed: Vec<ConnectionAttempt> = parse(body)?;
+    let raw = body
+        .as_array()
+        .ok_or("the waiting sign-ins should be a list")?;
+    same_len(&listed, raw)?;
+    for (row, raw) in listed.iter().zip(raw) {
+        attempt_reads_as_sent(row, raw)?;
+    }
+    Ok(())
+}
+
+fn attempt_changed(_: u16, body: &Value) -> Check {
+    let row: ConnectionAttempt = parse(body)?;
+    attempt_reads_as_sent(&row, body)
+}
+
+/// `GET /plugins/catalog`: the registry, the commit it was read at, and every entry as sent, its
+/// category the marketplace's own and absent when the marketplace files it nowhere.
+fn plugin_catalog(_: u16, body: &Value) -> Check {
+    let catalog: PluginCatalog = parse(body)?;
+    must!(
+        catalog.registry == str_at(body, "registry")
+            && catalog.revision == str_at(body, "revision"),
+        "the catalog's registry and commit came through changed: {body}"
+    );
+    let raw = body["plugins"]
+        .as_array()
+        .ok_or("the catalog should list plugins")?;
+    same_len(&catalog.plugins, raw)?;
+    for (entry, raw) in catalog.plugins.iter().zip(raw) {
+        must!(
+            entry.name == str_at(raw, "name")
+                && entry.description == str_at(raw, "description")
+                && entry.category.as_deref() == opt_str(raw, "category")
+                && entry.repository == str_at(raw, "repository")
+                && entry.revision == str_at(raw, "revision")
+                && entry.path == str_at(raw, "path")
+                && entry.unavailable_reason.as_deref() == opt_str(raw, "unavailableReason"),
+            "a catalog entry came through changed: {entry:?} from {raw}"
+        );
+    }
+    Ok(())
+}
+
+/// `GET /plugins/catalog/{name}`: the entry, the commit, every part as sent and the services.
+fn plugin_detail(_: u16, body: &Value) -> Check {
+    let detail: PluginDetail = parse(body)?;
+    must!(
+        detail.entry.name == str_at(&body["entry"], "name")
+            && detail.registry_revision == str_at(body, "registryRevision"),
+        "a plugin's detail came through changed: {body}"
+    );
+    let raw = body["parts"]
+        .as_array()
+        .ok_or("a detail should list its parts")?;
+    same_len(&detail.parts, raw)?;
+    for (part, raw) in detail.parts.iter().zip(raw) {
+        must!(
+            part.kind == str_at(raw, "kind")
+                && part.name == str_at(raw, "name")
+                && Some(part.supported) == raw.get("supported").and_then(Value::as_bool)
+                && part.reason.as_deref() == opt_str(raw, "reason"),
+            "a part came through changed: {part:?} from {raw}"
+        );
+    }
+    let connectors: Vec<&str> = body["connectors"]
+        .as_array()
+        .ok_or("a detail should name its services")?
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    must!(
+        detail.connectors == connectors,
+        "a detail's services came through changed: {body}"
+    );
+    Ok(())
+}
+
+/// `GET /plugins/installations`: every install as sent, with its services and the pasted accounts
+/// it holds.
+fn plugin_installations(_: u16, body: &Value) -> Check {
+    let listed: Vec<PluginInstallation> = parse(body)?;
+    let raw = body.as_array().ok_or("the installs should be a list")?;
+    same_len(&listed, raw)?;
+    for (install, raw) in listed.iter().zip(raw) {
+        let connectors: Vec<&str> = raw["connectors"]
+            .as_array()
+            .ok_or("an install should name its services")?
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        let accounts = raw["accounts"]
+            .as_array()
+            .ok_or("an install should list its accounts")?;
+        must!(
+            install.name == str_at(raw, "name")
+                && install.registry == str_at(raw, "registry")
+                && install.registry_revision == str_at(raw, "registryRevision")
+                && install.repository == str_at(raw, "repository")
+                && install.revision == str_at(raw, "revision")
+                && Some(install.installed_at_ms)
+                    == raw.get("installedAtMs").and_then(Value::as_i64)
+                && install.bundle.manifest.name == str_at(&raw["bundle"]["manifest"], "name")
+                && install.bundle.parts.len()
+                    == raw["bundle"]["parts"].as_array().map_or(0, Vec::len)
+                && install.connectors == connectors
+                && install.accounts.len() == accounts.len()
+                && install.accounts.iter().zip(accounts).all(|(a, raw)| {
+                    a.connector == str_at(raw, "connector")
+                        && a.connection_id == str_at(raw, "connectionId")
+                }),
+            "an install came through changed: {install:?} from {raw}"
+        );
+    }
+    Ok(())
+}
+
+/// How an installed plugin's service adds an account: at its own provider or by a pasted token.
+fn sign_in_method(_: u16, body: &Value) -> Check {
+    must!(
+        matches!(opt_str(body, "method"), Some("oauth" | "token")),
+        "a sign-in method should be oauth or token: {body}"
+    );
+    Ok(())
+}
+
+/// Adding a pasted account answers the new account's id, which the app goes on to name it by.
+fn token_added(_: u16, body: &Value) -> Check {
+    let added: AddedToken = parse(body)?;
+    must!(
+        !added.connection_id.is_empty() && added.connection_id == str_at(body, "connectionId"),
+        "an added account should be named: {body}"
+    );
+    Ok(())
 }
 
 /// A disconnect answers 204 with nothing; the app takes any 2xx as the connection gone.
@@ -6440,6 +6743,12 @@ fn account_event_frame(frame: &Value) -> Check {
             routine_id: text("routineId"),
             coworker_id: text("coworkerId"),
             change: serde_json::from_value(word("change")).unwrap_or_default(),
+        },
+        // A card waiting in a thread (#358): the window reads that thread again, with the run.
+        "run.waiting" => AccountEvent::ThreadChanged {
+            thread_id: text("threadId"),
+            coworker_id: text("coworkerId"),
+            run_id: Some(text("runId")),
         },
         "reset" => AccountEvent::Reset,
         other => {
