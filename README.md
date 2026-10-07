@@ -1006,50 +1006,27 @@ Identity, memory, skills, credentials, policy, and eventually the software envir
 
 ---
 
-# The Goal
+# Contributing
 
-OpenGrok is not trying to build another chatbot.
+Contributions are welcome.
 
-It is building infrastructure for AI coworkers that can accumulate capability over time.
+If you want to improve OpenGrok, fix a bug, add a capability, or work on one of the surrounding infrastructure projects, open an issue or submit a pull request.
 
-```text
-Coworker
- ├── remembers
- ├── learns workflows
- ├── gains skills
- ├── installs capabilities
- ├── operates computers
- ├── works in browsers
- ├── follows policy
- ├── protects credentials
- ├── asks humans when required
- └── keeps working
-```
+Please keep changes focused, testable, and aligned with the architecture of the project.
 
-An AI coworker should not belong to one chat.
+For larger changes, open an issue first so the design can be discussed before implementation.
 
-It should not belong to one container.
+## Project
 
-It should not belong to one machine.
+OpenGrok is a project of [Goldcoders](https://goldcoders.dev/).
 
-Its identity should persist.
+Created by **Uriah Galang**  
+X: [@codeitlikemiley](https://x.com/codeitlikemiley)
 
-Its memory should persist.
 
-Its skills should persist.
 
-Its credentials should remain protected.
+## License
 
-Its plugins should remain controlled.
+See the repository license for usage, modification, and distribution terms.
 
-Its permissions should remain explicit.
-
-Its computer should be replaceable.
-
-Its work should continue.
-
-And eventually, its entire software environment should travel with it.
-
-**Own your harness.  
-Own your AI infrastructure.  
-Own your data.**
+Third-party dependencies, plugins, skills, models, and external integrations remain subject to their respective licenses and terms.
