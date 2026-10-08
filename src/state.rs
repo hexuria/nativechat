@@ -523,19 +523,35 @@ pub enum ReplySourceRead {
 pub(crate) const REPLY_SOURCE_NOT_ON_SERVER: &str =
     "This server can't switch where your replies come from yet.";
 
-/// Why Save will not keep an opencodex address that is not on this computer, beside why not.
+static TOKIO: std::sync::OnceLock<tokio::runtime::Handle> = std::sync::OnceLock::new();
+
+/// Keep the main runtime available to GPUI executor threads, which may have no Tokio context.
+pub fn keep_tokio_handle(handle: tokio::runtime::Handle) {
+    let _ = TOKIO.set(handle);
+}
+
+fn tokio_handle() -> Option<tokio::runtime::Handle> {
+    tokio::runtime::Handle::try_current()
+        .ok()
+        .or_else(|| TOKIO.get().cloned())
+}
+
 /// Run database work on the Tokio runtime, which sqlx needs, wherever the caller is: a task on
 /// gpui's executors may be polled on a thread that holds no Tokio context, and the app aborted the
-/// first time a notice was written that way (8 Oct 2026). Nothing happens without a runtime.
+/// first time a notice was written that way (8 Oct 2026). The kept handle reaches those threads;
+/// without any runtime, the skipped work is said in the log.
 fn on_tokio(work: impl std::future::Future<Output = ()> + Send + 'static) {
-    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+    if let Some(handle) = tokio_handle() {
         handle.spawn(work);
+    } else {
+        log::warn!("database work was skipped because no Tokio runtime exists");
     }
 }
 
 /// How old the model list may be before a picker opening reads it again.
 const MODELS_STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(3);
 
+/// Why Save will not keep an opencodex address that is not on this computer, beside why not.
 pub(crate) const RELAY_ADDRESS_NOT_HERE: &str = "Give opencodex's address on this computer first.";
 
 impl ReplySourceSettings {
@@ -10992,7 +11008,8 @@ impl AppState {
         let Some(pool) = self.database_service.as_ref().map(|db| db.pool()) else {
             return;
         };
-        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        let Some(handle) = tokio_handle() else {
+            log::warn!("notices could not be loaded because no Tokio runtime exists");
             return;
         };
         let read = handle.spawn(async move { crate::notifications::load(&pool).await });
@@ -24845,6 +24862,38 @@ fn skill_bundle(found: Vec<(String, Vec<u8>)>) -> Result<(String, Vec<SkillFile>
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn database_work_uses_the_kept_tokio_runtime_off_context() {
+        use std::sync::OnceLock;
+        use tokio::runtime::Runtime;
+
+        static RUNTIME: OnceLock<Runtime> = OnceLock::new();
+        let runtime = RUNTIME.get_or_init(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .build()
+                .expect("the test runtime could not be built")
+        });
+        super::keep_tokio_handle(runtime.handle().clone());
+
+        let (sent, received) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            super::on_tokio(async move {
+                let _ = sent.send(());
+            });
+        })
+        .join()
+        .expect("the thread without Tokio context panicked");
+
+        assert!(
+            received
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .is_ok(),
+            "database work did not run on the kept runtime"
+        );
+    }
+
     #[gpui_kit::test]
     fn sidebar_click_restores_last_size_and_hidden_stays_hidden(cx: &mut gpui_kit::TestAppContext) {
         use gpui_kit::AppContext as _;

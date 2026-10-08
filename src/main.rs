@@ -28,6 +28,7 @@ fn main() {
         .build()
         .expect("Failed to create tokio runtime");
     let _guard = runtime.enter();
+    nativechat::state::keep_tokio_handle(runtime.handle().clone());
 
     dotenvy::from_filename(".env.local").ok();
     dotenvy::dotenv().ok();
