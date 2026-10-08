@@ -31,6 +31,7 @@ pub mod message_actions;
 pub mod model_picker;
 pub mod monitor_modal;
 pub mod multi_select;
+pub mod notifications_pane;
 pub mod persona;
 pub mod plugin_needs;
 pub mod recipes;

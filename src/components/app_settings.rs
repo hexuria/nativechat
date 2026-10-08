@@ -3,7 +3,6 @@ use crate::chrome::TITLE_BAR_H;
 use crate::components::computers::{self, ComputerCard, OpencodexFields};
 use crate::components::default_models::DefaultModels;
 use crate::components::logins::LoginsPage;
-use crate::components::skills::SkillsPage;
 use crate::components::switch::Switch;
 use crate::opengrok::LocalExecMode;
 use crate::send_policy::OnSend;
@@ -23,8 +22,6 @@ pub struct AppSettings {
     state: Entity<AppState>,
     /// Settings → Logins, made on the first render of that tab (its fields need a window).
     logins: Option<Entity<LoginsPage>>,
-    /// Settings → Skills, made on the first render of that tab, for the same reason.
-    skills: Option<Entity<SkillsPage>>,
     /// This computer's opencodex address and key, on its card in Settings → Computer, made on the
     /// first render of that tab, for the same reason.
     opencodex: Option<Entity<OpencodexFields>>,
@@ -39,7 +36,6 @@ impl AppSettings {
         Self {
             state,
             logins: None,
-            skills: None,
             opencodex: None,
             default_models: None,
         }
@@ -52,16 +48,6 @@ impl AppSettings {
         let state = self.state.clone();
         let page = cx.new(|cx| LoginsPage::new(window, state, cx));
         self.logins = Some(page.clone());
-        page
-    }
-
-    fn skills_page(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Entity<SkillsPage> {
-        if let Some(page) = &self.skills {
-            return page.clone();
-        }
-        let state = self.state.clone();
-        let page = cx.new(|cx| SkillsPage::new(window, state, cx));
-        self.skills = Some(page.clone());
         page
     }
 
@@ -162,7 +148,7 @@ impl Render for AppSettings {
             AppSettingsTab::Updates => Some(
                 updates_page(&bot_name, &controls, muted, app.clone(), &theme).into_any_element(),
             ),
-            AppSettingsTab::Logins | AppSettingsTab::Skills => None,
+            AppSettingsTab::Logins => None,
         };
         let body = match cards {
             Some(page) => div()
@@ -188,11 +174,7 @@ impl Render for AppSettings {
                 )
                 .into_any_element(),
             None => {
-                let pane: AnyElement = if tab == AppSettingsTab::Skills {
-                    self.skills_page(window, cx).into_any_element()
-                } else {
-                    self.logins_page(window, cx).into_any_element()
-                };
+                let pane: AnyElement = self.logins_page(window, cx).into_any_element();
                 div()
                     .id("app-settings-body")
                     .flex_1()
@@ -326,13 +308,7 @@ impl AppSettings {
                 AppSettingsTab::Logins,
                 cx,
             ))
-            .child(nav_item(
-                "settings-tab-skills",
-                "Skills",
-                tab == AppSettingsTab::Skills,
-                AppSettingsTab::Skills,
-                cx,
-            ))
+        // No Skills tab: skills are in the Plugins window, under Installed (7 Oct 2026).
     }
 }
 
@@ -345,7 +321,6 @@ fn tab_title(tab: AppSettingsTab) -> &'static str {
         AppSettingsTab::Computer => "Computer",
         AppSettingsTab::Updates => "Updates",
         AppSettingsTab::Logins => "Logins",
-        AppSettingsTab::Skills => "Skills",
     }
 }
 
@@ -1403,11 +1378,14 @@ mod tests {
             "computer",
             "updates",
             "logins",
-            "skills",
         ] {
             let id = format!("settings-tab-{tab}");
             assert!(drawn(cx, &id).is_some(), "{id} is in the list of pages");
         }
+        assert!(
+            drawn(cx, "settings-tab-skills").is_none(),
+            "Skills moved to the Plugins window"
+        );
         assert!(
             drawn(cx, "settings-tab-reply-source").is_none(),
             "the Relay tab is gone"

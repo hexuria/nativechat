@@ -140,6 +140,7 @@ impl AppState {
             return;
         };
         self.monitor_generation += 1;
+        self.dismiss_popovers(cx);
         self.monitor_modal = Some(MonitorModal::new(coworker_id, MonitorKind::Plugins));
         self.plugin_market.generation += 1;
         self.plugin_market.refusals.clear();
@@ -154,6 +155,7 @@ impl AppState {
         self.read_catalog(cx);
         self.read_installations(cx);
         self.read_attempts(cx);
+        self.record_window_nav();
         cx.notify();
     }
 
@@ -326,8 +328,9 @@ impl AppState {
             return;
         }
         let next = (modal.highlight as isize + by).clamp(0, count as isize - 1) as usize;
-        if next != modal.highlight {
+        if next != modal.highlight || !modal.keyed {
             modal.highlight = next;
+            modal.keyed = true;
             cx.notify();
         }
     }
@@ -345,7 +348,103 @@ impl AppState {
         }
     }
 
+    /// Space (search empty) or ⌘Enter: the highlighted tool's switch flips, its page stays shut.
+    /// Enter is always "open", so the two never compete (7 Oct 2026).
+    pub fn flip_market_highlight(&mut self, cx: &mut Context<Self>) {
+        let rows = crate::components::marketplace::visible_rows(self);
+        let Some(modal) = self.monitor_modal.as_ref() else {
+            return;
+        };
+        if let Some(row) = rows.get(modal.highlight)
+            && let (
+                PluginSelection::Tool(name),
+                crate::components::marketplace::RowAction::Switch { on, live: true },
+            ) = (&row.selection, &row.action)
+        {
+            let (name, on) = (name.clone(), !*on);
+            if let Some(modal) = self.monitor_modal.as_mut() {
+                modal.keyed = true;
+            }
+            self.switch_ceiling_tool(name, on, cx);
+        }
+    }
+
+    /// Every Bot's shared logins, for the Logins page's counts and a login's Bots page.
+    pub fn read_all_login_shares(&mut self, cx: &mut Context<Self>) {
+        let Some(client) = self.opengrok.clone() else {
+            return;
+        };
+        let bots: Vec<String> = self.coworkers.iter().map(|bot| bot.id.clone()).collect();
+        cx.spawn(async move |this, cx| {
+            for bot in bots {
+                if let Ok(ids) = client.logins_shared_with(&bot).await {
+                    let _ = this.update(cx, |state, cx| {
+                        state
+                            .site_login_shares
+                            .insert(bot, ids.into_iter().collect());
+                        cx.notify();
+                    });
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// One Bot's switch on a login's Bots page. The switch moves at once and goes back, with
+    /// the server's words, if the server refuses.
+    pub fn set_login_shared(
+        &mut self,
+        login: String,
+        bot: String,
+        on: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(client) = self.opengrok.clone() else {
+            return;
+        };
+        let flip = |state: &mut Self, on: bool, login: &str, bot: &str| {
+            let ids = state.site_login_shares.entry(bot.to_string()).or_default();
+            if on {
+                ids.insert(login.to_string());
+            } else {
+                ids.remove(login);
+            }
+        };
+        flip(self, on, &login, &bot);
+        self.tool_mode_refusal = None;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = client.set_site_login_shared(&login, &bot, on).await;
+            let _ = this.update(cx, |state, cx| {
+                if let Err(error) = result {
+                    flip(state, !on, &login, &bot);
+                    state.notify_error(
+                        Some(bot.clone()),
+                        "Logins page",
+                        &error.message,
+                        None,
+                        None,
+                        cx,
+                    );
+                    state.tool_mode_refusal = Some(error.message);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     pub fn set_market_page(&mut self, page: MarketPage, cx: &mut Context<Self>) {
+        // Back to the first page from one opened from it is a step back, not a new one.
+        if page == MarketPage::Browse
+            && self
+                .monitor_modal
+                .as_ref()
+                .is_some_and(|m| m.selected.is_none())
+            && self.window_back(|w| w.page == MarketPage::Browse && w.selected.is_none(), cx)
+        {
+            return;
+        }
         let Some(modal) = self.monitor_modal.as_mut() else {
             return;
         };
@@ -360,6 +459,105 @@ impl AppState {
         modal.error = None;
         modal.renaming = None;
         self.plugin_market.token = None;
+        // The Logins page counts each login's Bots: every Bot's shares are read for it.
+        if self
+            .monitor_modal
+            .as_ref()
+            .is_some_and(|m| m.page == MarketPage::Logins)
+        {
+            self.read_all_login_shares(cx);
+        }
+        self.record_window_nav();
+        cx.notify();
+    }
+
+    /// The choice dialog for one tool of the open Bot (Always / Ask / Never), from its chip.
+    pub fn open_tool_mode(
+        &mut self,
+        tool: String,
+        title: String,
+        mode: String,
+        cx: &mut Context<Self>,
+    ) {
+        self.tool_mode_dialog = Some((tool, title, mode));
+        self.tool_mode_refusal = None;
+        cx.notify();
+    }
+
+    pub fn close_tool_mode(&mut self, cx: &mut Context<Self>) {
+        if self.tool_mode_dialog.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// One tool's choice for the open Bot, kept on the server (`PUT /coworkers/{id}/tool-mode`);
+    /// the Bot's tools are read again so every row says what the server now has.
+    pub fn set_tool_mode(&mut self, tool: String, mode: &'static str, cx: &mut Context<Self>) {
+        let (Some(client), Some(bot)) = (self.opengrok.clone(), self.active_coworker_id.clone())
+        else {
+            return;
+        };
+        if self.tool_mode_changing.is_some() {
+            return;
+        }
+        self.tool_mode_changing = Some(tool.clone());
+        self.tool_mode_refusal = None;
+        self.tool_mode_dialog = None;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = client.set_tool_mode(&bot, &tool, mode).await;
+            let _ = this.update(cx, |state, cx| {
+                state.tool_mode_changing = None;
+                if let Err(error) = result {
+                    state.tool_mode_refusal = Some(error.message);
+                }
+                state.refresh_coworker_tools(cx);
+                state.refresh_coworker_ceiling(cx);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Several tools' choices, one after another on the server (each answer is read before the
+    /// next is asked, so no change is lost to another), then the Bot's tools are read again.
+    pub fn set_tool_modes(&mut self, changes: Vec<(String, &'static str)>, cx: &mut Context<Self>) {
+        let (Some(client), Some(bot)) = (self.opengrok.clone(), self.active_coworker_id.clone())
+        else {
+            return;
+        };
+        if self.tool_mode_changing.is_some() || changes.is_empty() {
+            return;
+        }
+        self.tool_mode_changing = changes.first().map(|(tool, _)| tool.clone());
+        self.tool_mode_refusal = None;
+        self.tool_mode_dialog = None;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let mut refusal = None;
+            for (tool, mode) in changes {
+                if let Err(error) = client.set_tool_mode(&bot, &tool, mode).await {
+                    refusal = Some(error.message);
+                    break;
+                }
+            }
+            let _ = this.update(cx, |state, cx| {
+                state.tool_mode_changing = None;
+                if let Some(why) = &refusal {
+                    state.notify_error(Some(bot.clone()), "Tools window", why, None, None, cx);
+                }
+                state.tool_mode_refusal = refusal;
+                state.refresh_coworker_tools(cx);
+                state.refresh_coworker_ceiling(cx);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Opens or closes the "Current Bot" default-account menu for a service.
+    pub fn toggle_account_menu(&mut self, connector: Option<String>, cx: &mut Context<Self>) {
+        self.account_menu = connector;
         cx.notify();
     }
 
@@ -480,22 +678,144 @@ impl AppState {
         modal.confirming = false;
         modal.removal = None;
         modal.error = None;
+        modal.keyed = false;
         modal.renaming = None;
         modal.tools_open = false;
         self.plugin_market.token = None;
+        // A skill's page reads the skill's prose and starts with nothing typed.
+        if let PluginSelection::Skill(id) = &selection {
+            self.open_skill_page(id.clone(), cx);
+        }
+        if let PluginSelection::PluginSkill(plugin, skill) = &selection {
+            self.read_plugin_skill_page(plugin.clone(), skill.clone(), cx);
+        }
         if let PluginSelection::Plugin(name) = selection {
             self.read_sign_in_methods(&name, cx);
+            self.read_plugin_skills(cx);
             self.read_detail(name, cx);
         }
+        self.record_window_nav();
         cx.notify();
+    }
+
+    /// The open Bot's plugin skills and their switches, for a plugin's Skills rows. A failed read
+    /// leaves the rows without switches rather than guessing them on.
+    pub fn read_plugin_skills(&mut self, cx: &mut Context<Self>) {
+        let (Some(client), Some(bot)) = (self.opengrok.clone(), self.active_coworker_id.clone())
+        else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let read = client.plugin_skills(&bot).await;
+            let _ = this.update(cx, |state, cx| {
+                state.plugin_skills = read.unwrap_or_default();
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn read_plugin_skill_page(&mut self, plugin: String, skill: String, cx: &mut Context<Self>) {
+        let (Some(client), Some(bot)) = (self.opengrok.clone(), self.active_coworker_id.clone())
+        else {
+            return;
+        };
+        self.plugin_skill_page = None;
+        cx.spawn(async move |this, cx| {
+            let read = client.plugin_skill(&bot, &plugin, &skill).await;
+            let _ = this.update(cx, |state, cx| {
+                match read {
+                    Ok(page) => state.plugin_skill_page = Some(page),
+                    Err(error) => state.tool_mode_refusal = Some(error.message),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// One plugin skill on or off for the open Bot. The switch moves at once and goes back, with
+    /// the server's words, if the server refuses.
+    pub fn set_plugin_skill(
+        &mut self,
+        plugin: String,
+        skill: String,
+        on: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let (Some(client), Some(bot)) = (self.opengrok.clone(), self.active_coworker_id.clone())
+        else {
+            return;
+        };
+        for row in self
+            .plugin_skills
+            .iter_mut()
+            .chain(self.plugin_skill_page.iter_mut())
+        {
+            if row.plugin == plugin && row.skill == skill {
+                row.on = on;
+            }
+        }
+        self.tool_mode_refusal = None;
+        cx.notify();
+        let (p, s) = (plugin, skill);
+        cx.spawn(async move |this, cx| {
+            let result = client.set_plugin_skill(&bot, &p, &s, on).await;
+            let _ = this.update(cx, |state, cx| {
+                if let Err(error) = result {
+                    for row in state
+                        .plugin_skills
+                        .iter_mut()
+                        .chain(state.plugin_skill_page.iter_mut())
+                    {
+                        if row.plugin == p && row.skill == s {
+                            row.on = !on;
+                        }
+                    }
+                    state.notify_error(
+                        Some(bot.clone()),
+                        "Plugin skill",
+                        &error.message,
+                        None,
+                        None,
+                        cx,
+                    );
+                    state.tool_mode_refusal = Some(error.message);
+                }
+                state.refresh_coworker_tools(cx);
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// Back, in a detail: the page it was opened from, with the highlight where it was.
     pub fn close_market_detail(&mut self, cx: &mut Context<Self>) {
+        if let Some(modal) = self.monitor_modal.as_ref().filter(|m| !m.removing) {
+            let page = modal.page.clone();
+            let up = match modal.selected.clone() {
+                Some(PluginSelection::PluginSkill(plugin, _)) => {
+                    Some(PluginSelection::Plugin(plugin))
+                }
+                _ => None,
+            };
+            if self.window_back(
+                |w| w.page == page && w.selected == up && w.bots_for.is_none(),
+                cx,
+            ) {
+                return;
+            }
+        }
         let Some(modal) = self.monitor_modal.as_mut() else {
             return;
         };
         if modal.removing {
+            return;
+        }
+        // A plugin's skill goes back to its plugin, not the list.
+        if let Some(PluginSelection::PluginSkill(plugin, _)) = modal.selected.clone() {
+            self.plugin_skill_page = None;
+            self.open_market_detail(PluginSelection::Plugin(plugin), cx);
             return;
         }
         modal.selected = None;
@@ -504,6 +824,9 @@ impl AppState {
         modal.renaming = None;
         modal.bots_for = None;
         self.plugin_market.token = None;
+        self.skill_edit = None;
+        self.skill_bots = None;
+        self.record_window_nav();
         cx.notify();
     }
 
@@ -862,9 +1185,19 @@ impl AppState {
 
     /// An account's Bots button: the detail gives way to the list of Bots that may use it.
     pub fn open_account_bots(&mut self, connection_id: Option<String>, cx: &mut Context<Self>) {
+        let here = self.monitor_modal.as_ref().map(|m| m.selected.clone());
+        if connection_id.is_none()
+            && self.window_back(
+                |w| Some(w.selected.clone()) == here && w.bots_for.is_none(),
+                cx,
+            )
+        {
+            return;
+        }
         if let Some(modal) = self.monitor_modal.as_mut() {
             modal.bots_for = connection_id;
             modal.bots_query.clear();
+            self.record_window_nav();
             cx.notify();
         }
     }
@@ -978,5 +1311,290 @@ impl AppState {
             });
         })
         .detach();
+    }
+}
+
+/// One skill's Bots: each Bot's skills as the server last listed them, which Bot's switch is with
+/// the server, and why the last switch did not go through.
+#[derive(Clone, Debug, Default)]
+pub struct SkillBots {
+    pub skill_id: String,
+    /// The Bots' skills, by Bot id, once read; a Bot missing here is still being read.
+    pub read: BTreeMap<String, crate::opengrok::CoworkerSkills>,
+    pub changing: Option<String>,
+    pub refusal: Option<String>,
+    /// The Bots page is open over the skill's page.
+    pub open: bool,
+}
+
+impl SkillBots {
+    /// Whether `bot` has the skill attached, `None` while its skills are being read.
+    pub fn attached(&self, bot: &str) -> Option<bool> {
+        self.read.get(bot).map(|skills| {
+            skills
+                .skills
+                .iter()
+                .any(|s| s.id == self.skill_id && s.attached)
+        })
+    }
+}
+
+/// What the person has typed on their own skill's page, over what the server holds, and where the
+/// save stands. A field that is `None` is as the server has it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SkillEdit {
+    pub id: String,
+    pub name: Option<String>,
+    pub description: Option<String>,
+    pub body: Option<String>,
+    pub saving: bool,
+    pub refusal: Option<String>,
+    /// "Delete <name>?" is open over the page.
+    pub confirming_delete: bool,
+    /// Counts the times the fields were put back to the server's words (Revert, a save), so the
+    /// page fills them again.
+    pub revision: u32,
+}
+
+/// Which of a skill's three fields was typed in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SkillField {
+    Name,
+    Description,
+    Instructions,
+}
+
+impl SkillEdit {
+    /// Whether what was typed differs from the server's `detail`: Save is live only then.
+    pub fn changed(&self, detail: &crate::opengrok::SkillDetail) -> bool {
+        self.name.as_ref().is_some_and(|n| n != &detail.skill.name)
+            || self
+                .description
+                .as_ref()
+                .is_some_and(|d| d != &detail.skill.description)
+            || self.body.as_ref().is_some_and(|b| b != &detail.body)
+    }
+}
+
+impl AppState {
+    /// Reads every Bot's skills for one skill's "N Bots" and its Bots page.
+    pub fn read_skill_bots(&mut self, skill_id: String, cx: &mut Context<Self>) {
+        let Some(client) = self.opengrok.clone() else {
+            return;
+        };
+        let open = self
+            .skill_bots
+            .as_ref()
+            .is_some_and(|b| b.skill_id == skill_id && b.open);
+        self.skill_bots = Some(SkillBots {
+            skill_id: skill_id.clone(),
+            open,
+            ..Default::default()
+        });
+        let bots: Vec<String> = self.coworkers.iter().map(|bot| bot.id.clone()).collect();
+        cx.spawn(async move |this, cx| {
+            for bot in bots {
+                let read = client.coworker_skills(&bot).await;
+                let _ = this.update(cx, |state, cx| {
+                    if let (Ok(skills), Some(sb)) = (read, state.skill_bots.as_mut())
+                        && sb.skill_id == skill_id
+                    {
+                        sb.read.insert(bot.clone(), skills);
+                        cx.notify();
+                    }
+                });
+            }
+        })
+        .detach();
+    }
+
+    pub fn open_skill_bots(&mut self, open: bool, cx: &mut Context<Self>) {
+        let here = self.monitor_modal.as_ref().map(|m| m.selected.clone());
+        if !open
+            && self.window_back(
+                |w| Some(w.selected.clone()) == here && !w.skill_bots_open,
+                cx,
+            )
+        {
+            return;
+        }
+        if let Some(sb) = self.skill_bots.as_mut() {
+            sb.open = open;
+            self.record_window_nav();
+            cx.notify();
+        }
+    }
+
+    /// One Bot's switch on a skill's Bots page: that Bot's attached set with this skill in or out,
+    /// sent with the version it was read at, then that Bot's skills read again.
+    pub fn set_skill_bot(&mut self, bot: String, attached: bool, cx: &mut Context<Self>) {
+        let Some(client) = self.opengrok.clone() else {
+            return;
+        };
+        let Some(sb) = self.skill_bots.as_mut() else {
+            return;
+        };
+        if sb.changing.is_some() {
+            return;
+        }
+        let Some(skills) = sb.read.get(&bot).cloned() else {
+            return;
+        };
+        let skill_id = sb.skill_id.clone();
+        let mut set: Vec<String> = skills
+            .skills
+            .iter()
+            .filter(|s| s.attached && s.id != skill_id)
+            .map(|s| s.id.clone())
+            .collect();
+        if attached {
+            set.push(skill_id.clone());
+        }
+        sb.changing = Some(bot.clone());
+        sb.refusal = None;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = client.set_coworker_skills(&bot, &set, skills.version).await;
+            let reread = client.coworker_skills(&bot).await;
+            let _ = this.update(cx, |state, cx| {
+                if let Some(sb) = state.skill_bots.as_mut().filter(|b| b.skill_id == skill_id) {
+                    sb.changing = None;
+                    if let Err(error) = result {
+                        sb.refusal = Some(error.message);
+                    }
+                    if let Ok(skills) = reread {
+                        sb.read.insert(bot.clone(), skills);
+                    }
+                }
+                if state.active_coworker_id.as_deref() == Some(bot.as_str()) {
+                    state.refresh_coworker_skills(cx);
+                    state.refresh_coworker_tools(cx);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// A skill's page opens with its prose read from the server, the same read the Skills page
+    /// makes, and nothing typed yet.
+    pub fn open_skill_page(&mut self, id: String, cx: &mut Context<Self>) {
+        self.read_skill_bots(id.clone(), cx);
+        self.skill_edit = Some(SkillEdit {
+            id: id.clone(),
+            ..Default::default()
+        });
+        self.open_skill(id, cx);
+    }
+
+    pub fn set_skill_field(&mut self, field: SkillField, text: String, cx: &mut Context<Self>) {
+        let Some(edit) = self.skill_edit.as_mut() else {
+            return;
+        };
+        let slot = match field {
+            SkillField::Name => &mut edit.name,
+            SkillField::Description => &mut edit.description,
+            SkillField::Instructions => &mut edit.body,
+        };
+        if slot.as_deref() != Some(text.as_str()) {
+            *slot = Some(text);
+            edit.refusal = None;
+            cx.notify();
+        }
+    }
+
+    /// Save: the name and description as a change to the skill, the instructions as a new version
+    /// of it with its files kept, then the page reads the skill again.
+    pub fn save_skill_page(&mut self, cx: &mut Context<Self>) {
+        let (Some(client), Some(edit), Some(detail)) = (
+            self.opengrok.clone(),
+            self.skill_edit.clone(),
+            self.skill_open.clone(),
+        ) else {
+            return;
+        };
+        if edit.saving || edit.id != detail.skill.id || !edit.changed(&detail) {
+            return;
+        }
+        if let Some(e) = self.skill_edit.as_mut() {
+            e.saving = true;
+            e.refusal = None;
+        }
+        cx.notify();
+        let patch = crate::opengrok::SkillPatch {
+            name: edit.name.clone().filter(|n| n != &detail.skill.name),
+            description: edit
+                .description
+                .clone()
+                .filter(|d| d != &detail.skill.description),
+            enabled: None,
+        };
+        let body = edit.body.clone().filter(|b| b != &detail.body);
+        let id = edit.id.clone();
+        cx.spawn(async move |this, cx| {
+            let mut result = Ok(());
+            if patch.name.is_some() || patch.description.is_some() {
+                result = client.update_skill(&id, &patch).await.map(|_| ());
+            }
+            if result.is_ok()
+                && let Some(body) = body
+            {
+                result = client
+                    .add_skill_version(&id, &body, "", detail.skill.source, &detail.files)
+                    .await
+                    .map(|_| ());
+            }
+            let _ = this.update(cx, |state, cx| {
+                let Some(edit) = state.skill_edit.as_mut().filter(|e| e.id == id) else {
+                    return;
+                };
+                edit.saving = false;
+                match result {
+                    Ok(()) => {
+                        *edit = SkillEdit {
+                            id: id.clone(),
+                            revision: edit.revision + 1,
+                            ..Default::default()
+                        };
+                        state.open_skill(id.clone(), cx);
+                        state.refresh_coworker_skills(cx);
+                        state.refresh_skills(cx);
+                    }
+                    Err(error) => edit.refusal = Some(error.message),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Revert: what was typed goes, and the fields show the server's words again.
+    pub fn revert_skill_page(&mut self, cx: &mut Context<Self>) {
+        if let Some(edit) = self.skill_edit.as_mut().filter(|e| !e.saving) {
+            *edit = SkillEdit {
+                id: edit.id.clone(),
+                revision: edit.revision + 1,
+                ..Default::default()
+            };
+            cx.notify();
+        }
+    }
+
+    pub fn ask_skill_page_delete(&mut self, open: bool, cx: &mut Context<Self>) {
+        if let Some(edit) = self.skill_edit.as_mut() {
+            edit.confirming_delete = open;
+            cx.notify();
+        }
+    }
+
+    /// Delete Skill, once confirmed: the skill leaves the library for every Bot, and the page
+    /// goes back to the list.
+    pub fn confirm_skill_page_delete(&mut self, cx: &mut Context<Self>) {
+        let Some(edit) = self.skill_edit.take() else {
+            return;
+        };
+        self.delete_skill(edit.id, cx);
+        self.close_market_detail(cx);
+        self.refresh_coworker_skills(cx);
     }
 }

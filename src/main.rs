@@ -153,6 +153,11 @@ fn main() {
                     nativechat::actions::CloseMonitorModal,
                     Some("MonitorModal"),
                 ),
+                KeyBinding::new(
+                    "cmd-s",
+                    nativechat::actions::SaveSkillPage,
+                    Some("MonitorModal"),
+                ),
                 KeyBinding::new("tab", PaletteNextTab, Some("CommandPalette")),
                 KeyBinding::new("shift-tab", PalettePrevTab, Some("CommandPalette")),
                 KeyBinding::new("down", PaletteSelectNext, Some("CommandPalette")),

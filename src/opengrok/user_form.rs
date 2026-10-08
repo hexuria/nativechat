@@ -700,6 +700,16 @@ pub fn user_form_use_saved_id(card_key: &str, login_id: &str) -> String {
     format!("user-form-use-saved-{card_key}-{login_id}")
 }
 
+/// "Give <Bot> its own computer", where a saved login cannot be used on a shared one.
+pub fn user_form_own_computer_id(card_key: &str) -> String {
+    format!("user-form-own-computer-{card_key}")
+}
+
+/// "Type it by hand", beside it.
+pub fn user_form_by_hand_id(card_key: &str) -> String {
+    format!("user-form-by-hand-{card_key}")
+}
+
 /// The line under the field while a saved login is being used, or after it was not.
 pub fn user_form_saved_note_id(card_key: &str) -> String {
     format!("user-form-saved-note-{card_key}")

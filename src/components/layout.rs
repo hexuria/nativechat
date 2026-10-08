@@ -70,6 +70,7 @@ impl ShellRev {
                 RightPane::Closed => 0,
                 RightPane::Settings => 1,
                 RightPane::Computer => 2,
+                RightPane::Notifications => 3,
             },
             computer_editor: matches!(
                 state.computer_view,
@@ -95,6 +96,7 @@ pub struct Layout {
     chat: Entity<ChatView>,
     login: Entity<LoginView>,
     agent_settings: Entity<AgentSettings>,
+    notifications: Entity<crate::components::notifications_pane::NotificationsPane>,
     computer: Entity<ComputerPane>,
     title_bar: Entity<TitleBar>,
     app_settings: Entity<AppSettings>,
@@ -113,6 +115,9 @@ impl Layout {
         let chat = cx.new(|cx| ChatView::new(window, state.clone(), cx));
         let login = cx.new(|cx| LoginView::new(window, state.clone(), cx));
         let agent_settings = cx.new(|cx| AgentSettings::new(window, state.clone(), cx));
+        let notifications = cx.new(|cx| {
+            crate::components::notifications_pane::NotificationsPane::new(state.clone(), cx)
+        });
         let computer = cx.new(|cx| ComputerPane::new(window, state.clone(), cx));
         let recipes = cx.new(|cx| RecipesView::new(window, state.clone(), cx));
         // The bar draws the Recipes page's header, so the page comes before it.
@@ -144,6 +149,7 @@ impl Layout {
             chat,
             login,
             agent_settings,
+            notifications,
             computer,
             title_bar,
             app_settings,
@@ -322,6 +328,7 @@ impl Render for Layout {
         let right_child = match right_pane {
             RightPane::Settings => self.agent_settings.clone().into_any_element(),
             RightPane::Computer => self.computer.clone().into_any_element(),
+            RightPane::Notifications => self.notifications.clone().into_any_element(),
             RightPane::Closed => div().into_any_element(),
         };
 
@@ -446,6 +453,9 @@ impl Render for Layout {
                         .child(match right_pane {
                             RightPane::Settings => self.agent_settings.clone().into_any_element(),
                             RightPane::Computer => self.computer.clone().into_any_element(),
+                            RightPane::Notifications => {
+                                self.notifications.clone().into_any_element()
+                            }
                             RightPane::Closed => div().into_any_element(),
                         }),
                 )

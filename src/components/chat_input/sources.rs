@@ -132,23 +132,73 @@ pub fn tags_in(text: &str, known: impl Fn(&str) -> bool) -> Vec<String> {
     tags
 }
 
-/// What `@` offers: the server's built-in tools, then each of the person's installed plugins once,
-/// then the services they signed in to that are no plugin's (#184, #359). Picking one puts `@name`
-/// in the message, where it means something: a plugin's tag gives the open Bot that plugin for that
-/// message, switched on or not, and asks the person first if it still needs an account; a tool's
-/// tag is a preference the server names to the model.
+/// The `@name:function` tags in `text`, each once, in order: `name` lowercased as [`tags_in`]
+/// reads it, `function` as typed. A tag with nothing after its colon is a bare tag.
+pub fn function_tags_in(text: &str) -> Vec<(String, String)> {
+    let mut tags: Vec<(String, String)> = Vec::new();
+    let mut before: Option<char> = None;
+    for (at, c) in text.char_indices() {
+        let starts = before.is_none_or(|b| b.is_whitespace() || "([{\"'".contains(b));
+        before = Some(c);
+        if c != '@' || !starts {
+            continue;
+        }
+        let rest = &text[at + 1..];
+        let word = |s: &str| {
+            s.find(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_'))
+                .unwrap_or(s.len())
+        };
+        let end = word(rest);
+        let Some(after) = rest[end..].strip_prefix(':') else {
+            continue;
+        };
+        let function = &after[..word(after)];
+        let tag = (rest[..end].to_ascii_lowercase(), function.to_string());
+        if !tag.0.is_empty() && !function.is_empty() && !tags.contains(&tag) {
+            tags.push(tag);
+        }
+    }
+    tags
+}
+
+/// One function under a tag: what "@name:" lists. `id` is what goes after the colon, `title` what
+/// a person reads (the server's title, else the name), `about` the tool's own words.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TagFunction {
+    pub id: String,
+    pub title: String,
+    pub about: String,
+}
+
+/// What `@` offers (#184, #359): each installed plugin once, then the built-in tool groups
+/// (Routines, Plugins), then the services signed in to that are no plugin's. Built-in tools that
+/// are on anyway (`shell`, `read_file`…) are not offered: tagging one adds nothing, and they are
+/// switched in the Tools modal (6 Oct 2026, the owner's call).
+///
+/// "@name:" lists that tag's functions in place of the list, from the Bot's own tools listing
+/// (`GET /coworkers/{id}/tools`): a plugin's tools carry `plugin`, a group's row its `tools`. A
+/// plugin this Bot has not reached yet has none listed, and its tag still works bare.
 ///
 /// ONE ROW PER THING. A plugin's own account is the plugin's, not an app beside it: listed again
-/// as a "Connected app", Cloudflare showed twice, and the second row did nothing (6 Oct 2026). And
-/// no row says "off": a tag is how a Bot with the switch off uses it.
+/// as a "Connected app", Cloudflare showed twice (6 Oct 2026). No row says "off": a tag is how a
+/// Bot with the switch off uses it.
+/// `(name, what it is, its functions)` for each tool group.
+pub(crate) type Groups = Vec<(String, String, Vec<TagFunction>)>;
+/// Each plugin's functions, by plugin.
+pub(crate) type Functions = std::collections::BTreeMap<String, Vec<TagFunction>>;
+
 pub struct ToolSource {
     /// `(name, what it does, needs an account first)`.
     pub plugins: Vec<(String, String, bool)>,
     pub apps: Vec<(String, String)>,
+    /// `(name, what it is, its functions)`: Routines, Plugins.
+    pub groups: Groups,
+    /// Each plugin's functions, by plugin.
+    pub functions: Functions,
 }
 
 impl ToolSource {
-    /// The plugins and apps of `state`.
+    /// The plugins, groups and apps of `state`, for its open Bot.
     pub fn of(state: &crate::state::AppState) -> Self {
         let installs = state
             .plugin_market
@@ -188,29 +238,103 @@ impl ToolSource {
                 ));
             }
         }
-        Self { plugins, apps }
+        let listed = match &state.coworker_tools {
+            Some((bot, crate::state::ToolList::Listed(tools)))
+                if Some(bot) == state.active_coworker_id.as_ref() =>
+            {
+                tools.as_slice()
+            }
+            _ => &[],
+        };
+        let (groups, functions) = Self::functions_of(listed);
+        Self {
+            plugins,
+            apps,
+            groups,
+            functions,
+        }
+    }
+
+    /// The groups and each plugin's functions as "@name:" lists them, from the Bot's tool
+    /// listing. A tool this Bot has at Never is left out: it can't be preferred for a message, and
+    /// its page is where it is switched back on.
+    pub(crate) fn functions_of(listed: &[crate::opengrok::CoworkerTool]) -> (Groups, Functions) {
+        let offered = |tool: &&crate::opengrok::CoworkerTool| tool.mode.as_deref() != Some("never");
+        let function = |tool: &crate::opengrok::CoworkerTool, id: String| TagFunction {
+            title: tool.title.clone().unwrap_or_else(|| id.clone()),
+            about: tool
+                .description
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .to_string(),
+            id,
+        };
+        let groups = listed
+            .iter()
+            .filter(|tool| !tool.tools.is_empty())
+            .map(|group| {
+                let members = group
+                    .tools
+                    .iter()
+                    .filter(offered)
+                    .map(|tool| function(tool, tool.name.clone()))
+                    .collect();
+                (group.name.clone(), group.description.clone(), members)
+            })
+            .collect();
+        let mut functions: std::collections::BTreeMap<String, Vec<TagFunction>> =
+            std::collections::BTreeMap::new();
+        for tool in listed.iter().filter(offered) {
+            if let (Some(plugin), Some(qualified)) = (&tool.plugin, &tool.qualified) {
+                let short = qualified
+                    .rsplit('.')
+                    .next()
+                    .unwrap_or(qualified)
+                    .to_string();
+                functions
+                    .entry(plugin.clone())
+                    .or_default()
+                    .push(function(tool, short));
+            }
+        }
+        (groups, functions)
     }
 
     pub fn rows(&self) -> Vec<(ComposerPanelRow, ComposerPick)> {
-        let mut rows: Vec<(ComposerPanelRow, ComposerPick)> = BUILTIN_TOOLS
-            .iter()
-            .map(|(name, icon, description)| {
-                (
-                    ComposerPanelRow::new(format!("tool:{name}"), *icon, *name, *description)
-                        .label("Tool"),
-                    ComposerPick::Token {
-                        kind: TokenKind::Tool,
-                        id: (*name).to_string(),
-                        text: format!("@{name}"),
-                    },
-                )
-            })
-            .collect();
+        let mut rows: Vec<(ComposerPanelRow, ComposerPick)> = Vec::new();
+        let functions_of = |name: &str, kind: TokenKind, list: &[TagFunction]| {
+            list.iter()
+                .map(|function| {
+                    (
+                        ComposerPanelRow::new(
+                            format!("fn:{name}:{}", function.id),
+                            "icons/wrench.svg",
+                            function.title.clone(),
+                            function.about.clone(),
+                        )
+                        .label(name.to_string())
+                        .scope(name.to_string()),
+                        ComposerPick::Token {
+                            kind,
+                            id: format!("{name}:{}", function.id),
+                            text: format!("@{name}:{}", function.id),
+                        },
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
         for (name, about, accountless) in &self.plugins {
             let line = if *accountless {
                 "Needs an account — you'll be asked to add one".to_string()
             } else {
                 about.clone()
+            };
+            let count = self.functions.get(name).map_or(0, Vec::len);
+            let label = if count == 0 {
+                "Plugin".to_string()
+            } else {
+                format!("Plugin · {count}")
             };
             rows.push((
                 ComposerPanelRow::new(
@@ -219,13 +343,33 @@ impl ToolSource {
                     name.clone(),
                     line,
                 )
-                .label("Plugin"),
+                .label(label),
                 ComposerPick::Token {
                     kind: TokenKind::Plugin,
                     id: name.clone(),
                     text: format!("@{name}"),
                 },
             ));
+            if let Some(list) = self.functions.get(name) {
+                rows.extend(functions_of(name, TokenKind::Plugin, list));
+            }
+        }
+        for (name, about, members) in &self.groups {
+            rows.push((
+                ComposerPanelRow::new(
+                    format!("group:{name}"),
+                    "icons/wrench.svg",
+                    name.clone(),
+                    about.clone(),
+                )
+                .label(format!("Tools · {}", members.len())),
+                ComposerPick::Token {
+                    kind: TokenKind::Tool,
+                    id: name.clone(),
+                    text: format!("@{name}"),
+                },
+            ));
+            rows.extend(functions_of(name, TokenKind::Tool, members));
         }
         for (name, label) in &self.apps {
             rows.push((
@@ -243,7 +387,7 @@ impl ToolSource {
                 },
             ));
         }
-        if self.plugins.is_empty() && self.apps.is_empty() {
+        if self.plugins.is_empty() && self.apps.is_empty() && self.groups.is_empty() {
             rows.push((
                 ComposerPanelRow::new(
                     "tool:plugins",
@@ -777,8 +921,8 @@ const APP_COMMANDS: &[(&str, &str, &str, &str, AppCommand)] = &[
 #[cfg(test)]
 mod tests {
     use super::{
-        ComposerPanelRow, ComposerPick, ParameterSource, SkillLibrary, SlashSource, TokenKind,
-        ToolSource, ValueSource, tags_in,
+        ComposerPanelRow, ComposerPick, ParameterSource, SkillLibrary, SlashSource, TagFunction,
+        TokenKind, ToolSource, ValueSource, function_tags_in, tags_in,
     };
     use crate::opengrok::{RecipeParameter, RecipeSummary, SkillSummary};
     use crate::state::ActiveRecipe;
@@ -945,24 +1089,15 @@ mod tests {
     }
 
     #[test]
-    fn a_tool_becomes_an_at_chip_and_the_notice_becomes_nothing() {
-        let rows = ToolSource {
+    fn with_nothing_to_tag_the_notice_is_all_there_is() {
+        let none = ToolSource {
             plugins: Vec::new(),
             apps: Vec::new(),
-        }
-        .rows();
-        let shell = rows
-            .iter()
-            .find(|(row, _)| row.id == "tool:shell")
-            .expect("the built-in shell tool is offered");
-        assert_eq!(
-            shell.1,
-            ComposerPick::Token {
-                kind: TokenKind::Tool,
-                id: "shell".into(),
-                text: "@shell".into(),
-            }
-        );
+            groups: Vec::new(),
+            functions: Default::default(),
+        };
+        let rows = none.rows();
+        assert_eq!(rows.len(), 1, "built-in tools are not offered on @");
         let notice = rows.last().expect("the plugins notice closes the list");
         assert_eq!(notice.1, ComposerPick::Nothing);
         assert!(!notice.0.selectable);
@@ -971,6 +1106,8 @@ mod tests {
         let rows = ToolSource {
             plugins: vec![("cloudflare".into(), "Build on Cloudflare".into(), false)],
             apps: vec![("gmail".into(), "Gmail".into())],
+            groups: Vec::new(),
+            functions: Default::default(),
         }
         .rows();
         assert!(rows.iter().any(|(row, _)| row.id == "app:gmail"));
@@ -1460,6 +1597,8 @@ mod tests {
                 ("linear".into(), "Issues".into(), true),
             ],
             apps: vec![("gmail".into(), "Gmail".into())],
+            groups: Vec::new(),
+            functions: Default::default(),
         };
         let rows = source.rows();
         let plugin = |name: &str| {
@@ -1486,6 +1625,102 @@ mod tests {
         assert!(
             rows.iter()
                 .all(|(row, _)| !row.description.contains("Off for"))
+        );
+    }
+
+    /// "@" offers plugins and tool groups, never the built-in tools that are on anyway; a group is
+    /// labelled Tools with its count, and its functions are rows scoped to it, each picked as
+    /// "@routines:create_routine".
+    #[test]
+    fn built_in_tools_leave_the_list_and_groups_bring_their_functions() {
+        let make = |id: &str| TagFunction {
+            id: id.into(),
+            title: id.into(),
+            about: String::new(),
+        };
+        let source = ToolSource {
+            plugins: vec![("cloudflare".into(), "Cloudflare's API".into(), false)],
+            apps: Vec::new(),
+            groups: vec![(
+                "routines".into(),
+                "Routines".into(),
+                vec![make("create_routine"), make("run_routine")],
+            )],
+            functions: [("cloudflare".to_string(), vec![make("execute")])].into(),
+        };
+        let rows = source.rows();
+        assert!(
+            rows.iter().all(|(row, _)| !row.id.starts_with("tool:")),
+            "no built-in tool rows"
+        );
+        let row = |id: &str| rows.iter().find(|(row, _)| row.id.as_ref() == id).unwrap();
+        assert_eq!(row("group:routines").0.label.as_deref(), Some("Tools · 2"));
+        assert_eq!(
+            row("plugin:cloudflare").0.label.as_deref(),
+            Some("Plugin · 1")
+        );
+        let create = row("fn:routines:create_routine");
+        assert_eq!(create.0.scope.as_deref(), Some("routines"));
+        assert_eq!(
+            create.1,
+            ComposerPick::Token {
+                kind: TokenKind::Tool,
+                id: "routines:create_routine".into(),
+                text: "@routines:create_routine".into()
+            }
+        );
+        assert_eq!(
+            row("fn:cloudflare:execute").1,
+            ComposerPick::Token {
+                kind: TokenKind::Plugin,
+                id: "cloudflare:execute".into(),
+                text: "@cloudflare:execute".into()
+            }
+        );
+    }
+
+    /// A tool at Never stays on its page but leaves "@name:": the group and the plugin list only
+    /// what the Bot can be asked to use.
+    #[test]
+    fn a_tool_at_never_is_not_offered_after_the_colon() {
+        use crate::opengrok::CoworkerTool;
+        let tool = |name: &str, mode: &str| CoworkerTool {
+            name: name.into(),
+            mode: Some(mode.into()),
+            ..Default::default()
+        };
+        let listed = vec![
+            CoworkerTool {
+                name: "routines".into(),
+                tools: vec![tool("create_routine", "ask"), tool("run_routine", "never")],
+                ..Default::default()
+            },
+            CoworkerTool {
+                plugin: Some("cloudflare".into()),
+                qualified: Some("cloudflare.cloudflare.search".into()),
+                ..tool("cloudflare_cloudflare_search", "always")
+            },
+            CoworkerTool {
+                plugin: Some("cloudflare".into()),
+                qualified: Some("cloudflare.cloudflare.execute".into()),
+                ..tool("cloudflare_cloudflare_execute", "never")
+            },
+        ];
+        let (groups, functions) = ToolSource::functions_of(&listed);
+        let ids = |list: &[TagFunction]| list.iter().map(|f| f.id.clone()).collect::<Vec<_>>();
+        assert_eq!(ids(&groups[0].2), ["create_routine"]);
+        assert_eq!(ids(&functions["cloudflare"]), ["search"]);
+    }
+
+    #[test]
+    fn a_function_tag_is_its_name_and_function() {
+        let said = "@cloudflare:execute then @routines:create_routine, mail me@x.com, @routines";
+        assert_eq!(
+            function_tags_in(said),
+            [
+                ("cloudflare".to_string(), "execute".to_string()),
+                ("routines".to_string(), "create_routine".to_string())
+            ]
         );
     }
 }

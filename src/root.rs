@@ -617,6 +617,11 @@ impl Render for RootView {
             .when(monitor_modal_open, |this| {
                 this.child(self.monitor_modal.clone())
             })
+            // Something just went wrong: the toast, over the window's corner (8 Oct 2026).
+            .children(crate::components::notifications_pane::toast(
+                self.state.clone(),
+                cx,
+            ))
             // Root overlay layers
             .children(Root::render_dialog_layer(window, cx))
             .children(Root::render_sheet_layer(window, cx))

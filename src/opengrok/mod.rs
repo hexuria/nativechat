@@ -78,9 +78,10 @@ pub use user_form::{
     computer_window_attention_skip_id, continue_enabled, dismiss_request_body,
     is_form_entry_missing, is_user_form_awaiting, is_user_form_custom_name, is_user_form_event,
     is_user_form_tool, resolve_handoff_request_body, settle_user_form_http, submit_request_body,
-    submit_request_body_for, user_form_action_from_http, user_form_card_id, user_form_continue_id,
-    user_form_dismiss_id, user_form_field_id, user_form_pill_id, user_form_saved_clear_id,
-    user_form_saved_list_id, user_form_saved_note_id, user_form_screen_id, user_form_use_saved_id,
+    submit_request_body_for, user_form_action_from_http, user_form_by_hand_id, user_form_card_id,
+    user_form_continue_id, user_form_dismiss_id, user_form_field_id, user_form_own_computer_id,
+    user_form_pill_id, user_form_saved_clear_id, user_form_saved_list_id, user_form_saved_note_id,
+    user_form_screen_id, user_form_use_saved_id,
 };
 pub use visibility::ImageVisibility;
 
@@ -91,17 +92,18 @@ pub use client::{
     CoworkerSkills, CoworkerTool, CoworkerUsage, DaemonMachine, EgressTunnel, ImageStatus,
     InertRule, InstalledAccount, InstalledBundle, LocalExecMode, LocalExecPolicy,
     MAX_ATTACHMENT_BYTES, ModelUsage, NewSchedule, NewSkill, OpenGrokClient, PluginAuthor,
-    PluginCatalog, PluginDetail, PluginInstallation, PluginManifest, PluginPart, QueuedApproval,
-    RecipeBot, RecipeDetail, RecipeGrant, RecipeKind, RecipeParameter, RecipeParameterKind,
-    RecipeRelation, RecipeRun, RecipeRunResult, RecipeScreen, RecipeShare, RecipeShareState,
-    RecipeShareTarget, RecipeStep, RecipeSummary, RecipeTape, RecipeTapeEvent, RecipeVersion,
-    RevealedSecrets, RunBy, RunCause, RunRecipeResponse, RunReplay, SKILL_BODY_CHARS,
-    SKILL_BUNDLE_FILES, SKILL_BUNDLE_LIMIT, ScheduleEdit, ScheduleKind, ScheduleRow, ScheduleRun,
-    ScheduleRunStatus, SiteLoginSave, SiteLoginUpdate, SkillDetail, SkillFile, SkillPatch,
-    SkillSource, SkillSummary, SkillVersion, StopReply, ThreadReplay, ThreadRun, TurnRecipe,
-    TurnTags, UpdateStatus, UsageTotals, UsageWindow, WebhookInfo, collapse_computer_roster,
-    collapse_computers_by_machine_id, env_egress_tunnel_enabled, host_egress_tunnel_available,
-    host_egress_tunnel_enabled, host_egress_tunnel_flag, thin_tape,
+    PluginCatalog, PluginDetail, PluginInstallation, PluginManifest, PluginPart, PluginSkill,
+    QueuedApproval, RecipeBot, RecipeDetail, RecipeGrant, RecipeKind, RecipeParameter,
+    RecipeParameterKind, RecipeRelation, RecipeRun, RecipeRunResult, RecipeScreen, RecipeShare,
+    RecipeShareState, RecipeShareTarget, RecipeStep, RecipeSummary, RecipeTape, RecipeTapeEvent,
+    RecipeVersion, RevealedSecrets, RunBy, RunCause, RunRecipeResponse, RunReplay,
+    SKILL_BODY_CHARS, SKILL_BUNDLE_FILES, SKILL_BUNDLE_LIMIT, SavedLoginCheck, ScheduleEdit,
+    ScheduleKind, ScheduleRow, ScheduleRun, ScheduleRunStatus, SiteLoginSave, SiteLoginUpdate,
+    SkillDetail, SkillFile, SkillPatch, SkillSource, SkillSummary, SkillVersion, StopReply,
+    ThreadReplay, ThreadRun, TurnRecipe, TurnTags, UpdateStatus, UsageTotals, UsageWindow,
+    WebhookInfo, collapse_computer_roster, collapse_computers_by_machine_id,
+    env_egress_tunnel_enabled, host_egress_tunnel_available, host_egress_tunnel_enabled,
+    host_egress_tunnel_flag, thin_tape,
 };
 pub use error::{Failure, OpenGrokError, Unreachable, reads_as_gateway_unreachable, retry_enqueue};
 pub use events::{

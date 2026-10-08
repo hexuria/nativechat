@@ -1157,6 +1157,9 @@ fn dollars(six: &str) -> Option<String> {
 
 /// The Tools card's second line: how many the bot is offered, and from where, or why the app
 /// cannot say.
+// Only the gpui-agent driver reads the Tools card's words now that the Tools window is the
+// marketplace layout (#359); the shipping build has no caller.
+#[cfg_attr(not(feature = "agent"), allow(dead_code))]
 pub(crate) fn tools_summary(list: &ToolList) -> String {
     match list {
         ToolList::Loading => "Asking the server…".to_string(),
@@ -1194,6 +1197,9 @@ fn first_line_of(description: &str) -> String {
 /// switches to show it by: the ceiling could not be read (a server without the route, a Bot this
 /// person does not own, the server out of reach), and the card still says what the Bot is
 /// offered. Nothing while the switches are there or on their way.
+// Only the gpui-agent driver reads the Tools card's words now that the Tools window is the
+// marketplace layout (#359); the shipping build has no caller.
+#[cfg_attr(not(feature = "agent"), allow(dead_code))]
 pub(crate) fn offered_without_switches<'a>(
     ceiling: Option<&CeilingCard>,
     tools: Option<&'a ToolList>,
@@ -1203,50 +1209,6 @@ pub(crate) fn offered_without_switches<'a>(
         (_, Some(ToolList::Listed(all))) => all,
         _ => &[],
     }
-}
-
-/// The list of what the next turn is offered, read-only, for a card with no switches to show it
-/// by: each tool by its wire name, which is what the model is told, with the first line of what
-/// the server says it does.
-fn tools_body(all: &[CoworkerTool], muted: Hsla) -> impl IntoElement {
-    let (built_in, plugins): (Vec<_>, Vec<_>) = all.iter().partition(|tool| tool.is_builtin());
-    let group = |title: &'static str, tools: Vec<&CoworkerTool>| {
-        v_flex()
-            .gap(px(6.))
-            .child(div().text_xs().text_color(muted).child(title))
-            .children(tools.into_iter().enumerate().map(|(at, tool)| {
-                let first_line = first_line_of(&tool.description);
-                // By place, not by name: the server's names are unique per turn, but a row's id
-                // must not depend on that holding.
-                v_flex()
-                    .id(SharedString::from(format!("agent-tool-{title}-{at}")))
-                    .gap(px(1.))
-                    .child(
-                        div()
-                            .text_sm()
-                            .font_family("Menlo")
-                            .child(tool.name.clone()),
-                    )
-                    .when(!first_line.is_empty(), |this| {
-                        this.child(div().text_xs().text_color(muted).child(first_line))
-                    })
-            }))
-    };
-    v_flex()
-        .pt(px(12.))
-        .gap(px(12.))
-        .when(!built_in.is_empty(), |this| {
-            this.child(group("Built in", built_in))
-        })
-        .when(!plugins.is_empty(), |this| {
-            this.child(group("From plugins", plugins))
-        })
-        .child(
-            div()
-                .text_xs()
-                .text_color(muted)
-                .child("What this Bot is offered on its next turn."),
-        )
 }
 
 /// Why `user_machine_shell` cannot be offered now: it runs its commands on a machine of the
@@ -1264,6 +1226,9 @@ pub(crate) const NO_LONGER_ON_THE_SERVER: &str = "No longer on the server";
 pub(crate) const NOT_AVAILABLE_NOW: &str = "Not available on this server now";
 
 /// The ceiling's line when the server has no rows in it at all.
+// Only the gpui-agent driver reads the Tools card's words now that the Tools window is the
+// marketplace layout (#359); the shipping build has no caller.
+#[cfg_attr(not(feature = "agent"), allow(dead_code))]
 pub(crate) const NOTHING_TO_SWITCH: &str = "Nothing to switch on or off.";
 
 /// One row of the Tools card, as it is drawn and as the driver is told it is drawn: both are made
@@ -1375,6 +1340,9 @@ pub(crate) fn ceiling_card_lines(card: &CeilingCard) -> Vec<CeilingCardLine> {
 /// The Tools card's line about the ceiling, under the line about the next turn: how many rows are
 /// allowed as the switches stand, or why there are no switches. Nothing while it is still being
 /// asked for, which the card's own line is already saying.
+// Only the gpui-agent driver reads the Tools card's words now that the Tools window is the
+// marketplace layout (#359); the shipping build has no caller.
+#[cfg_attr(not(feature = "agent"), allow(dead_code))]
 pub(crate) fn ceiling_line(
     ceiling: &ToolCeiling,
     pending: Option<&CeilingSwitch>,
@@ -1438,147 +1406,6 @@ pub(crate) fn connector_note(row: &CeilingRow) -> Option<String> {
         _ => connector,
     };
     Some(format!("Uses your {named} connection"))
-}
-
-/// The switches: every tool the server has and every plugin it knows, under the two headings the
-/// card has always had, below the card's own lines. A switch is sent the moment it is clicked,
-/// and only a live one takes a click; one that cannot move now is drawn dimmed.
-fn ceiling_body(
-    app: Entity<AppState>,
-    rows: Vec<ShownCeilingRow>,
-    lines: Vec<CeilingCardLine>,
-    muted: Hsla,
-    danger: Hsla,
-) -> impl IntoElement {
-    let (built_in, plugins): (Vec<_>, Vec<_>) = rows.into_iter().partition(|row| row.builtin);
-    let group = |title: &'static str, rows: Vec<ShownCeilingRow>| {
-        v_flex()
-            .gap(px(8.))
-            .child(div().text_xs().text_color(muted).child(title))
-            .children(
-                rows.into_iter()
-                    .map(|row| ceiling_row(app.clone(), row, muted, danger)),
-            )
-    };
-    v_flex()
-        .pt(px(12.))
-        .gap(px(12.))
-        // Above the switches, because each is about all of them.
-        .children(lines.into_iter().map(|line| {
-            let (id, words) = match line {
-                CeilingCardLine::ReadOnly(words) => ("agent-ceiling-read-only", words),
-                CeilingCardLine::Wait(words) => ("agent-ceiling-wait", words),
-                CeilingCardLine::Note(words) => ("agent-ceiling-note", words),
-            };
-            div().id(id).text_xs().text_color(muted).child(words)
-        }))
-        .when(!built_in.is_empty(), |this| this.child(group("Built in", built_in)))
-        .when(!plugins.is_empty(), |this| this.child(group("From plugins", plugins)))
-        .child(
-            div()
-                .text_xs()
-                .text_color(muted)
-                .child("What this Bot may be offered. Its next turn is not offered anything switched off here."),
-        )
-}
-
-/// One row: what it is, and its switch at the right, with "Saving…" beside it while it is with
-/// the server. A row the server could not offer is dimmed with why under it, and what the card
-/// says about the row's last switch is under the row it is about.
-fn ceiling_row(
-    app: Entity<AppState>,
-    row: ShownCeilingRow,
-    muted: Hsla,
-    danger: Hsla,
-) -> impl IntoElement {
-    let ShownCeilingRow {
-        name,
-        title,
-        builtin,
-        first_line,
-        on,
-        switching,
-        live,
-        unavailable,
-        connector,
-        note,
-    } = row;
-    // A builtin headed by its wire name is drawn as code, as the model is told it; one the server
-    // labels for people, as the routine tools' row, is drawn as a name.
-    let wire_name = builtin && title == name;
-    // Every id under a row has a fixed word between `agent-ceiling-` and the server's name, and
-    // the card's own lines have none, so no name a plugin can have makes one id another's.
-    let switch_id = SharedString::from(format!("agent-ceiling-switch-{name}"));
-    let why_id = SharedString::from(format!("agent-ceiling-why-{name}"));
-    let connector_id = SharedString::from(format!("agent-ceiling-connector-{name}"));
-    let error_id = SharedString::from(format!("agent-ceiling-error-{name}"));
-    v_flex()
-        .id(SharedString::from(format!("agent-ceiling-row-{name}")))
-        .gap(px(2.))
-        .child(
-            div()
-                .flex()
-                .items_center()
-                .justify_between()
-                .gap(px(10.))
-                .child(
-                    v_flex()
-                        .min_w(px(0.))
-                        .flex_1()
-                        .gap(px(1.))
-                        .when(unavailable.is_some(), |this| this.opacity(0.5))
-                        .child(
-                            div()
-                                .text_sm()
-                                .when(wire_name, |this| this.font_family("Menlo"))
-                                .child(title),
-                        )
-                        .when(!first_line.is_empty(), |this| {
-                            this.child(div().text_xs().text_color(muted).child(first_line))
-                        }),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap(px(6.))
-                        .flex_shrink_0()
-                        .when(switching, |this| {
-                            this.child(div().text_xs().text_color(muted).child("Saving…"))
-                        })
-                        .child(
-                            div()
-                                .id(switch_id)
-                                .when(!live, |this| this.opacity(0.5))
-                                .when(live, |this| {
-                                    this.cursor_pointer().on_mouse_down(
-                                        MouseButton::Left,
-                                        move |_, _, cx| {
-                                            app.update(cx, |state, cx| {
-                                                state.switch_ceiling_tool(name.clone(), !on, cx);
-                                            });
-                                        },
-                                    )
-                                })
-                                .child(notify_switch(on)),
-                        ),
-                ),
-        )
-        .when_some(unavailable, |this, why| {
-            this.child(div().id(why_id).text_xs().text_color(muted).child(why))
-        })
-        .when_some(connector, |this, words| {
-            this.child(
-                div()
-                    .id(connector_id)
-                    .text_xs()
-                    .text_color(muted)
-                    .child(words),
-            )
-        })
-        .when_some(note, |this, words| {
-            this.child(div().id(error_id).text_xs().text_color(danger).child(words))
-        })
 }
 
 /// The Skills card's line when the account's library has nothing in it the owner may attach.
@@ -1856,113 +1683,26 @@ fn skill_row(
         })
 }
 
-/// The Tools card: what the next turn is offered, and behind its Show button the Bot's tool
-/// switches. The Bot's settings drew it between Auto-review and Skills until Tools moved to the
-/// agent monitor (hexuria/nativechat#174, #175); this is the card as it was, built from what the
-/// state holds, for the monitor to mount. `None` while neither the tools nor the ceiling have
-/// been asked for.
-pub fn tools_card(
-    app: Entity<AppState>,
-    theme: &gpui_kit::component::Theme,
-    cx: &App,
-) -> Option<AnyElement> {
-    let state = app.read(cx);
-    let tools = state
-        .coworker_tools
-        .as_ref()
-        .filter(|(owner, _)| state.active_coworker_id.as_deref() == Some(owner.as_str()))
-        .map(|(_, list)| list.clone());
-    let ceiling = state.ceiling_card();
-    if tools.is_none() && ceiling.is_none() {
-        return None;
-    }
-    let tools_open = state.agent_tools_open;
-    let muted = theme.muted_foreground;
-    let danger = theme.danger;
-    let tools_line = tools.as_ref().map(tools_summary);
-    let allowed_line = ceiling
-        .as_ref()
-        .and_then(|card| ceiling_line(&card.ceiling, card.pending.as_ref()));
-    let (ceiling_rows, card_lines) = ceiling
-        .as_ref()
-        .map(|card| (shown_ceiling_rows(card), ceiling_card_lines(card)))
-        .unwrap_or_default();
-    let has_switches = !ceiling_rows.is_empty();
-    let offered = offered_without_switches(ceiling.as_ref(), tools.as_ref()).to_vec();
-    let has_list = !offered.is_empty();
-    Some(
-        div()
-            .id("agent-tools")
-            .debug_selector(|| "agent-tools".into())
-            .mb(px(16.))
-            .px(px(14.))
-            .py(px(12.))
-            .rounded(px(10.))
-            .border_1()
-            .border_color(theme.border)
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .gap(px(10.))
-                    .child(
-                        v_flex()
-                            .min_w(px(0.))
-                            .gap(px(2.))
-                            .child(div().text_sm().child("Tools"))
-                            // What the next turn is offered, as
-                            // the server lists it: the switches
-                            // below are one of what decides that,
-                            // not the whole of it.
-                            .when_some(tools_line, |this, line| {
-                                this.child(div().text_xs().text_color(muted).child(line))
-                            })
-                            .when_some(allowed_line, |this, line| {
-                                this.child(
-                                    div()
-                                        .id("agent-ceiling")
-                                        .text_xs()
-                                        .text_color(muted)
-                                        .child(line),
-                                )
-                            }),
-                    )
-                    .when(has_switches || has_list, |this| {
-                        this.child(
-                            div()
-                                .id("agent-tools-toggle")
-                                .px(px(11.))
-                                .py(px(5.))
-                                .rounded(px(8.))
-                                .border_1()
-                                .border_color(rgb(0x7f7f7f).opacity(0.4))
-                                .text_xs()
-                                .cursor_pointer()
-                                .on_mouse_down(MouseButton::Left, {
-                                    let app = app.clone();
-                                    move |_, _, cx| {
-                                        app.update(cx, |state, cx| state.toggle_agent_tools(cx));
-                                    }
-                                })
-                                .child(if tools_open { "Hide" } else { "Show" }),
-                        )
-                    }),
-            )
-            .when(tools_open && has_switches, |this| {
-                this.child(ceiling_body(
-                    app.clone(),
-                    ceiling_rows,
-                    card_lines,
-                    muted,
-                    danger,
-                ))
-            })
-            .when(tools_open && has_list, |this| {
-                this.child(tools_body(&offered, muted))
-            })
-            .into_any_element(),
-    )
+/// A tool group's tools as its page draws them, from the Bot's listing: each with its title and
+/// this Bot's choice. A group the listing doesn't have has none.
+pub(crate) fn group_tools(
+    listed: &[CoworkerTool],
+    group: &str,
+) -> Vec<crate::components::marketplace::DetailTool> {
+    listed
+        .iter()
+        .find(|row| row.name == group)
+        .map(|row| {
+            row.tools
+                .iter()
+                .map(|tool| crate::components::marketplace::DetailTool {
+                    qualified: tool.name.clone(),
+                    title: tool.title.clone().unwrap_or_else(|| tool.name.clone()),
+                    mode: tool.mode.clone().unwrap_or_else(|| "always".into()),
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// The Skills card: what the Bot is told about on every turn, beside what it may do
@@ -2059,6 +1799,46 @@ mod tools_tests {
         ANOTHER_BOTS_SWITCH, CeilingBlock, CeilingCard, CeilingNote, CeilingRead, CeilingSwitch,
         NOT_THE_OWNER, NotePlace, ToolCeiling, ToolList,
     };
+
+    /// A group's page lists its tools from the Bot's listing, each with its title and this Bot's
+    /// choice, Never included so it can be switched back on.
+    #[test]
+    fn a_groups_page_lists_each_tool_with_its_choice() {
+        let tool = |name: &str, mode: Option<&str>| CoworkerTool {
+            name: name.into(),
+            mode: mode.map(str::to_string),
+            ..Default::default()
+        };
+        let listed = vec![
+            tool("shell", Some("always")),
+            CoworkerTool {
+                name: "routines".into(),
+                tools: vec![
+                    CoworkerTool {
+                        title: Some("Delete a routine".into()),
+                        ..tool("delete_routine", Some("ask"))
+                    },
+                    tool("run_routine", Some("never")),
+                    tool("list_routines", None),
+                ],
+                ..Default::default()
+            },
+        ];
+        let page = super::group_tools(&listed, "routines");
+        let shown = page
+            .iter()
+            .map(|t| (t.qualified.as_str(), t.title.as_str(), t.mode.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            shown,
+            [
+                ("delete_routine", "Delete a routine", "ask"),
+                ("run_routine", "run_routine", "never"),
+                ("list_routines", "list_routines", "always"),
+            ]
+        );
+        assert!(super::group_tools(&listed, "plugins").is_empty());
+    }
 
     fn rows(json: serde_json::Value) -> Vec<CeilingRow> {
         serde_json::from_value(json).expect("ceiling rows")
@@ -2355,6 +2135,7 @@ mod tools_tests {
             name: name.into(),
             description: String::new(),
             kind: kind.into(),
+            ..Default::default()
         }
     }
 
@@ -2886,6 +2667,7 @@ mod pane_tests {
                 name: "shell".into(),
                 description: "Run a command.".into(),
                 kind: "builtin".into(),
+                ..Default::default()
             }]),
         ));
         app.coworker_skills = Some(("cw_1".into(), BotSkills::Loading));

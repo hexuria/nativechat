@@ -42,7 +42,7 @@ pub(crate) const PICKER: &str = "monitor-account-picker";
 pub(crate) const PICK_ASK: &str = "monitor-account-ask";
 pub(crate) const PICKER_NOTE: &str = "monitor-account-picker-note";
 /// The picker's choice of no account: the Bot has none picked, and asks each time.
-pub(crate) const ASK_EACH_TIME: &str = "Ask each time";
+pub(crate) const ASK_EACH_TIME: &str = "Always ask";
 
 /// One account's row in a connection's detail, by its connection id.
 pub(crate) fn account_id(id: &str) -> String {
@@ -99,6 +99,15 @@ impl MonitorKind {
     }
 }
 
+/// Your own skill's page fields: the skill they were made for, its Name, Description and
+/// Instructions.
+type SkillInputs = (
+    String,
+    Entity<gpui_kit::component::input::InputState>,
+    Entity<gpui_kit::component::input::InputState>,
+    Entity<gpui_kit::component::input::TextareaState>,
+);
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PluginSelection {
     Connection(String),
@@ -108,6 +117,14 @@ pub enum PluginSelection {
     Service(String),
     /// A marketplace plugin, by its name in the catalog or in the person's installs.
     Plugin(String),
+    /// A built-in tool or tool group in the Tools window, by its ceiling name.
+    Tool(String),
+    /// "+ New skill": the skill page, empty, before the skill exists.
+    NewSkill,
+    /// One of a plugin's skills, read-only, by plugin and skill: back goes to the plugin.
+    PluginSkill(String, String),
+    /// One saved login's Bots page: a switch per Bot, by the login's id.
+    Login(String),
 }
 
 impl PluginSelection {
@@ -117,6 +134,10 @@ impl PluginSelection {
             Self::Skill(id) => format!("monitor-skill-detail-{id}"),
             Self::Service(name) => format!("market-service-{name}"),
             Self::Plugin(name) => format!("market-plugin-{name}"),
+            Self::Tool(name) => format!("market-tool-item-{name}"),
+            Self::NewSkill => "market-skill-new-page".to_string(),
+            Self::PluginSkill(plugin, skill) => format!("market-plugin-skill-{plugin}-{skill}"),
+            Self::Login(id) => format!("market-login-{id}"),
         }
     }
     pub(crate) fn switch_id(&self) -> String {
@@ -125,6 +146,12 @@ impl PluginSelection {
             Self::Skill(id) => format!("agent-skills-switch-{id}"),
             Self::Service(name) => format!("market-service-switch-{name}"),
             Self::Plugin(name) => plugin_switch_id(name),
+            Self::Tool(name) => format!("agent-ceiling-switch-{name}"),
+            Self::NewSkill => String::new(),
+            Self::PluginSkill(plugin, skill) => {
+                crate::components::marketplace::plugin_skill_switch_id(plugin, skill)
+            }
+            Self::Login(_) => String::new(),
         }
     }
 }
@@ -146,6 +173,9 @@ pub struct MonitorModal {
     pub query: String,
     /// The result Up and Down move and Enter opens, by its place among the rows shown.
     pub highlight: usize,
+    /// The highlight is drawn: Up or Down moved it, or a search is typed (Enter opens it). A
+    /// click is not keyboard use, and leaves no row lit after Back (7 Oct 2026).
+    pub keyed: bool,
     /// A plugin detail's Tools section is open.
     pub tools_open: bool,
     /// The account whose Remove was pressed on its row, which the confirmation is about.
@@ -162,6 +192,8 @@ pub enum MarketPage {
     Browse,
     Category(String),
     Installed,
+    /// Your saved logins, each with the Bots it is shared with (8 Oct 2026).
+    Logins,
 }
 
 impl MonitorModal {
@@ -177,6 +209,7 @@ impl MonitorModal {
             page: MarketPage::Browse,
             query: String::new(),
             highlight: 0,
+            keyed: false,
             tools_open: false,
             removal: None,
             bots_for: None,
@@ -224,7 +257,8 @@ pub(crate) fn plugin_rows(state: &AppState) -> Vec<PluginRow> {
         })
         .collect();
     if let Some(card) = state.skills_card() {
-        rows.extend(private_skill_rows(&card).into_iter().map(|row| PluginRow {
+        // Yours and your org's, as the Installed page lists them (7 Oct 2026).
+        rows.extend(shown_skill_rows(&card).into_iter().map(|row| PluginRow {
             selection: PluginSelection::Skill(row.id),
             title: row.title,
             subtitle: if row.switched_off {
@@ -278,9 +312,16 @@ pub(crate) fn plugin_switches(state: &AppState) -> Vec<PluginSwitch> {
 
 pub(crate) fn plugin_exists(state: &AppState, selected: &PluginSelection) -> bool {
     match selected {
-        PluginSelection::Service(_) | PluginSelection::Plugin(_) => {
-            crate::components::marketplace::row_exists(state, selected)
-        }
+        PluginSelection::Service(_)
+        | PluginSelection::Plugin(_)
+        | PluginSelection::Tool(_)
+        | PluginSelection::NewSkill => crate::components::marketplace::row_exists(state, selected),
+        PluginSelection::Login(id) => state.site_logins.iter().any(|row| &row.id == id),
+        // A plugin's skill page stays while its plugin does.
+        PluginSelection::PluginSkill(plugin, _) => crate::components::marketplace::row_exists(
+            state,
+            &PluginSelection::Plugin(plugin.clone()),
+        ),
         _ => plugin_rows(state)
             .iter()
             .any(|row| &row.selection == selected),
@@ -450,7 +491,12 @@ pub(crate) fn plugin_detail(state: &AppState, selected: &PluginSelection) -> Opt
                 error: connections.disconnect_refusal(id).map(str::to_string),
             })
         }
-        PluginSelection::Service(_) | PluginSelection::Plugin(_) => None,
+        PluginSelection::Service(_)
+        | PluginSelection::Plugin(_)
+        | PluginSelection::Tool(_)
+        | PluginSelection::NewSkill
+        | PluginSelection::PluginSkill(..)
+        | PluginSelection::Login(_) => None,
         PluginSelection::Skill(id) => {
             let card = state.skills_card()?;
             let row = private_skill_rows(&card)
@@ -532,6 +578,13 @@ pub struct MonitorModalView {
     was_open: bool,
     pending_focus: bool,
     rename_input: Option<Entity<gpui_kit::component::input::InputState>>,
+    /// Your own skill's page: its Name, Description and Instructions, for the skill they were
+    /// made for.
+    skill_inputs: Option<SkillInputs>,
+    /// The Write / Upload sheet's fields, made the first time "+ New skill" opens it.
+    add_skill: Option<crate::components::skills::AddSheetInputs>,
+    /// The Tools window's search, which says "Search tools".
+    tools_search_input: Option<Entity<gpui_kit::component::input::InputState>>,
     rename_account: Option<String>,
     /// The marketplace's search field, made on first draw (it needs the window).
     search_input: Option<Entity<gpui_kit::component::input::InputState>>,
@@ -563,6 +616,9 @@ impl MonitorModalView {
             was_open: open,
             pending_focus: open,
             rename_input: None,
+            tools_search_input: None,
+            skill_inputs: None,
+            add_skill: None,
             rename_account: None,
             search_input: None,
             token_input: None,
@@ -582,10 +638,21 @@ impl MonitorModalView {
         cx: &mut Context<Self>,
     ) {
         use gpui_kit::component::input::{InputEvent, InputState};
-        let search = match &self.search_input {
+        let tools = modal.kind == MonitorKind::Tools;
+        let slot = if tools {
+            &self.tools_search_input
+        } else {
+            &self.search_input
+        };
+        let search = match slot {
             Some(search) => search.clone(),
             None => {
-                let search = cx.new(|cx| InputState::new(window, cx).placeholder("Search plugins"));
+                let words = if tools {
+                    "Search tools"
+                } else {
+                    "Search plugins"
+                };
+                let search = cx.new(|cx| InputState::new(window, cx).placeholder(words));
                 cx.subscribe(&search, |this, input, event: &InputEvent, cx| {
                     if matches!(event, InputEvent::Change) {
                         let query = input.read(cx).value().to_string();
@@ -594,10 +661,41 @@ impl MonitorModalView {
                     }
                 })
                 .detach();
-                self.search_input = Some(search.clone());
+                if tools {
+                    self.tools_search_input = Some(search.clone());
+                } else {
+                    self.search_input = Some(search.clone());
+                }
                 search
             }
         };
+        // Esc cleared the search in the state: the field follows.
+        if modal.query.is_empty() && !search.read(cx).value().is_empty() {
+            search.update(cx, |input, cx| input.set_value("", window, cx));
+        }
+        self.sync_skill_inputs(modal, window, cx);
+        // "+ New skill": the sheet's fields, made when it first opens. The server took the last
+        // create, so the next sheet opens clean; a refusal leaves the words where they were.
+        let (add_open, taken) = {
+            let state = self.state.read(cx);
+            (state.skill_add_open, state.skill_add_taken)
+        };
+        let new_page = modal.selected == Some(PluginSelection::NewSkill);
+        if (add_open || new_page) && self.add_skill.is_none() {
+            let inputs = crate::components::skills::AddSheetInputs::new(window, cx);
+            // The page's Create follows what is typed: it lights up once the name is valid and
+            // there are instructions.
+            cx.observe(&inputs.name, |_, _, cx| cx.notify()).detach();
+            cx.observe(&inputs.body, |_, _, cx| cx.notify()).detach();
+            self.add_skill = Some(inputs);
+        }
+        if taken {
+            if let Some(add) = &self.add_skill {
+                add.clear(window, cx);
+            }
+            self.state
+                .update(cx, |state, _| state.skill_add_fields_cleared());
+        }
         if search.read(cx).value().as_str() != modal.query.as_str() {
             let query = modal.query.clone();
             search.update(cx, |input, cx| input.set_value(query, window, cx));
@@ -738,18 +836,16 @@ impl Render for MonitorModalView {
         }
         let theme = cx.theme().clone();
         let app = self.state.clone();
-        if modal.kind == MonitorKind::Plugins
-            && !matches!(
-                modal.selected,
-                Some(PluginSelection::Connection(_) | PluginSelection::Skill(_))
-            )
+        // Tools is the marketplace layout too: its rows are the Bot's built-in tools (#359).
+        if (modal.kind == MonitorKind::Plugins || modal.kind == MonitorKind::Tools)
+            && !matches!(modal.selected, Some(PluginSelection::Connection(_)))
         {
             self.sync_market_inputs(&modal, window, cx);
             return self.render_market(&modal, window, cx);
         }
         let body = match modal.kind {
-            MonitorKind::Tools => agent_settings::tools_card(app.clone(), &theme, cx)
-                .unwrap_or_else(|| div().child(connections::ASKING).into_any_element()),
+            // Drawn as the marketplace above, always.
+            MonitorKind::Tools => div().into_any_element(),
             MonitorKind::Plugins => {
                 plugins_body(app.clone(), &modal, &theme, self.rename_input.as_ref(), cx)
             }
@@ -789,6 +885,7 @@ impl Render for MonitorModalView {
                 v_flex()
                     .id(MODAL)
                     .debug_selector(|| MODAL.into())
+                    .relative()
                     .w(px(480.))
                     .max_h(window.viewport_size().height - px(60.))
                     .bg(theme.popover)
@@ -850,6 +947,91 @@ impl Render for MonitorModalView {
 }
 
 impl MonitorModalView {
+    /// Your own skill's three fields: made when its prose arrives, filled with it, and what is
+    /// typed goes to the state. Gone when no skill page of yours is open.
+    fn sync_skill_inputs(
+        &mut self,
+        modal: &MonitorModal,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::state::SkillField;
+        use gpui_kit::component::input::{InputEvent, InputState, TextareaState};
+        let state = self.state.read(cx);
+        let open = match &modal.selected {
+            Some(PluginSelection::Skill(id)) => state
+                .skill_open
+                .as_ref()
+                .filter(|d| &d.skill.id == id)
+                .filter(|_| {
+                    state.skills_card().is_some_and(|card| {
+                        agent_settings::shown_skill_rows(&card)
+                            .iter()
+                            .any(|row| &row.id == id && row.mine)
+                    })
+                })
+                .cloned(),
+            _ => None,
+        };
+        let Some(detail) = open else {
+            self.skill_inputs = None;
+            return;
+        };
+        // The server's words again after Revert or a save: the fields are made afresh with them.
+        let key = format!(
+            "{}#{}",
+            detail.skill.id,
+            state.skill_edit.as_ref().map(|e| e.revision).unwrap_or(0)
+        );
+        if self
+            .skill_inputs
+            .as_ref()
+            .is_some_and(|(made, ..)| made == &key)
+        {
+            return;
+        }
+        let name = cx.new(|cx| {
+            let mut input = InputState::new(window, cx);
+            input.set_value(detail.skill.name.clone(), window, cx);
+            input
+        });
+        let description = cx.new(|cx| {
+            let mut input = InputState::new(window, cx);
+            input.set_value(detail.skill.description.clone(), window, cx);
+            input
+        });
+        let body = cx.new(|cx| {
+            let mut input = TextareaState::new(window, cx);
+            // Grows to twelve lines, then scrolls inside, so Save never moves out of reach.
+            input.set_auto_grow(6, 12, cx);
+            input.set_value(detail.body.clone(), window, cx);
+            input
+        });
+        for (field, input) in [
+            (SkillField::Name, &name),
+            (SkillField::Description, &description),
+        ] {
+            cx.subscribe(input, move |this, input, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::Change) {
+                    let text = input.read(cx).value().to_string();
+                    this.state
+                        .update(cx, |state, cx| state.set_skill_field(field, text, cx));
+                }
+            })
+            .detach();
+        }
+        cx.subscribe(&body, |this, input, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::Change) {
+                let text = input.read(cx).value().to_string();
+                this.state.update(cx, |state, cx| {
+                    state.set_skill_field(SkillField::Instructions, text, cx)
+                });
+            }
+        })
+        .detach();
+        self.skill_inputs = Some((key, name, description, body));
+    }
+
     /// The marketplace, in the Grok Bot layout: a wide card over the window, two columns when it
     /// is wide enough and one when it is not, the highlighted result kept in view.
     fn render_market(
@@ -864,12 +1046,20 @@ impl MonitorModalView {
         let viewport = window.viewport_size();
         let width = (viewport.width - px(80.)).min(px(880.)).max(px(320.));
         let columns = if width >= px(640.) { 2 } else { 1 };
-        let search = self
-            .search_input
-            .clone()
-            .expect("made by sync_market_inputs");
+        let search = if modal.kind == MonitorKind::Tools {
+            &self.tools_search_input
+        } else {
+            &self.search_input
+        }
+        .clone()
+        .expect("made by sync_market_inputs");
         let inputs = marketplace::MarketInputs {
             search: &search,
+            new_skill: self.add_skill.as_ref(),
+            skill: self
+                .skill_inputs
+                .as_ref()
+                .map(|(_, name, description, body)| (name, description, body)),
             bots: self.bots_input.as_ref(),
             token: self.token_input.as_ref(),
             rename: self.rename_input.as_ref(),
@@ -895,6 +1085,77 @@ impl MonitorModalView {
         if modal.selected.is_some() {
             self.scrolled_to = None;
         }
+        let dialog = marketplace::remove_dialog(&app, modal, &theme, cx);
+        let skill_dialog = marketplace::skill_delete_dialog(&app, &theme, cx);
+        let footer = marketplace::skill_footer(&app, &theme, cx)
+            .or_else(|| marketplace::new_skill_footer(&app, self.add_skill.as_ref(), &theme, cx));
+
+        // The window's bar, the same on every page (7 Oct 2026): Back when there is somewhere
+        // to go back to, the title, Close. A page with its own big heading (a plugin, a tool, a
+        // skill) shows its name in the bar only once that heading has scrolled out of sight.
+        let scrolled = self.scroll.offset().y < px(-60.);
+        let bar = {
+            let back_app = app.clone();
+            let (back, title): (Option<marketplace::BackAction>, Option<String>) = match &modal
+                .selected
+            {
+                Some(_) if modal.bots_for.is_some() => (
+                    Some(Box::new(move |cx: &mut App| {
+                        back_app.update(cx, |state, cx| state.open_account_bots(None, cx))
+                    })),
+                    modal
+                        .bots_for
+                        .as_deref()
+                        .map(|account| marketplace::bots_title(app.read(cx), account)),
+                ),
+                Some(PluginSelection::Skill(id))
+                    if app
+                        .read(cx)
+                        .skill_bots
+                        .as_ref()
+                        .is_some_and(|b| &b.skill_id == id && b.open) =>
+                {
+                    let name =
+                        marketplace::page_title(app.read(cx), &PluginSelection::Skill(id.clone()))
+                            .unwrap_or_default();
+                    (
+                        Some(Box::new(move |cx: &mut App| {
+                            back_app.update(cx, |state, cx| state.open_skill_bots(false, cx))
+                        })),
+                        Some(format!("Bots using {name}")),
+                    )
+                }
+                Some(selection) => {
+                    let removing = modal.removing;
+                    let title = if *selection == PluginSelection::NewSkill {
+                        Some("New skill".to_string())
+                    } else {
+                        scrolled
+                            .then(|| marketplace::page_title(app.read(cx), selection))
+                            .flatten()
+                    };
+                    (
+                        Some(Box::new(move |cx: &mut App| {
+                            if !removing {
+                                back_app.update(cx, |state, cx| state.close_market_detail(cx))
+                            }
+                        })),
+                        title,
+                    )
+                }
+                None => (
+                    (modal.page != MarketPage::Browse).then(|| {
+                        Box::new(move |cx: &mut App| {
+                            back_app.update(cx, |state, cx| {
+                                state.set_market_page(MarketPage::Browse, cx)
+                            })
+                        }) as Box<dyn Fn(&mut App)>
+                    }),
+                    Some(marketplace::list_title(modal)),
+                ),
+            };
+            marketplace::page_bar(&app, back, title, scrolled, &theme)
+        };
         div()
             .id("monitor-modal-overlay")
             .track_focus(&self.focus)
@@ -921,6 +1182,9 @@ impl MonitorModalView {
                             state.cancel_market_token(cx);
                         } else if modal.is_some_and(|modal| modal.selected.is_some()) {
                             state.close_market_detail(cx);
+                        } else if modal.is_some_and(|modal| !modal.query.is_empty()) {
+                            // Esc clears the search first; the next one closes the window.
+                            state.set_market_query(String::new(), cx);
                         } else {
                             state.close_monitor_modal(cx);
                         }
@@ -941,46 +1205,50 @@ impl MonitorModalView {
                     .border_color(theme.border)
                     .rounded(px(18.))
                     .shadow_lg()
-                    .pt(px(28.))
-                    .pb(px(12.))
-                    .gap(px(16.))
+                    .gap(px(8.))
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    .child(
-                        div()
-                            .id(CLOSE)
-                            .debug_selector(|| CLOSE.into())
-                            .absolute()
-                            .top(px(14.))
-                            .right(px(14.))
-                            .size(px(28.))
-                            .rounded(px(8.))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .cursor_pointer()
-                            .on_mouse_down(MouseButton::Left, {
-                                let app = app.clone();
-                                move |_, _, cx| {
-                                    app.update(cx, |state, cx| state.close_monitor_modal(cx))
+                    .on_action({
+                        let app = app.clone();
+                        let new_skill = self.add_skill.clone();
+                        let creating = modal.selected == Some(PluginSelection::NewSkill);
+                        move |_: &crate::actions::SaveSkillPage, _: &mut Window, cx: &mut App| {
+                            // ⌘S is Create on the New skill page, and Save on a skill's own.
+                            match (creating, &new_skill) {
+                                (true, Some(inputs)) => {
+                                    let name = inputs.name.read(cx).value().to_string();
+                                    let description =
+                                        inputs.description.read(cx).value().to_string();
+                                    let body = inputs.body.read(cx).value().to_string();
+                                    if crate::components::marketplace::skill_name_ok(&name)
+                                        && !body.trim().is_empty()
+                                    {
+                                        app.update(cx, |state, cx| {
+                                            state.create_skill(name, description, body, cx)
+                                        })
+                                    }
                                 }
-                            })
-                            .child(
-                                Icon::new(IconName::Close)
-                                    .size(px(16.))
-                                    .text_color(theme.muted_foreground),
-                            ),
-                    )
-                    .when_some(top, |this, top| this.child(div().px(px(40.)).child(top)))
+                                _ => app.update(cx, |state, cx| state.save_skill_page(cx)),
+                            }
+                        }
+                    })
+                    .child(bar)
+                    // Every page's content sits on the same two edges, 32px in.
+                    .when_some(top, |this, top| this.child(div().px(px(32.)).child(top)))
                     .child(
                         div()
                             .id("market-scroll")
                             .flex_1()
                             .min_h(px(0.))
-                            .px(px(28.))
+                            .px(px(32.))
+                            .pb(px(16.))
                             .overflow_y_scroll()
                             .track_scroll(&self.scroll)
                             .children(blocks),
-                    ),
+                    )
+                    .when_some(footer, |this, footer| this.child(footer))
+                    // Uninstall's and Remove's question, over the whole window (#184).
+                    .when_some(dialog, |this, dialog| this.child(dialog))
+                    .when_some(skill_dialog, |this, dialog| this.child(dialog)),
             )
             .into_any_element()
     }
@@ -1295,7 +1563,12 @@ fn plugins_body(
                                 PluginSelection::Skill(id) => {
                                     state.switch_bot_skill(id.clone(), *on, cx)
                                 }
-                                PluginSelection::Service(_) | PluginSelection::Plugin(_) => {}
+                                PluginSelection::Service(_)
+                                | PluginSelection::Plugin(_)
+                                | PluginSelection::Tool(_)
+                                | PluginSelection::NewSkill
+                                | PluginSelection::PluginSkill(..)
+                                | PluginSelection::Login(_) => {}
                             })
                         }),
                 ),
@@ -1389,11 +1662,46 @@ pub(crate) mod tests {
         state
     }
 
+    /// A plugin's own account is picked per Bot, never lent (#359): its Bots page shows a Bot on
+    /// when that Bot uses it by pick, so Cloudflare's Bots page works as Gmail's does (7 Oct 2026).
+    #[test]
+    fn a_plugin_accounts_bots_are_the_bots_that_pick_it() {
+        let mut state = catalog();
+        if let Some(ConnectionList::Listed(rows)) = state.connections.list.as_mut() {
+            rows.push(ConnectionView {
+                id: "conn_tok".into(),
+                connector: "cloudflare".into(),
+                label: "work".into(),
+                owner: ConnectionOwner::User("acct_1".into()),
+                loans: vec!["cw_2".into()],
+                updated_at_ms: 1,
+                expires_at_ms: None,
+                kind: crate::opengrok::ConnectionKind::Token,
+            });
+        }
+        state.connections.pins = Some(crate::state::PinList::Listed(vec![
+            crate::opengrok::ConnectionPin {
+                coworker_id: "cw_1".into(),
+                connector: "cloudflare".into(),
+                connection_id: "conn_tok".into(),
+            },
+        ]));
+        let rows = crate::components::marketplace::bot_rows(&state, "conn_tok", "");
+        let on: Vec<_> = rows.iter().map(|r| (r.id.as_str(), r.on)).collect();
+        assert_eq!(
+            on,
+            [("cw_1", true), ("cw_2", false)],
+            "picks, not the loan list"
+        );
+    }
+
     #[test]
     fn plugins_show_only_owned_connections_and_private_skills_and_pending_switches() {
         let mut state = catalog();
         let rows = plugin_rows(&state);
-        assert_eq!(rows.len(), 2);
+        // The owned Gmail connection, your skill and your org's skill (listed under Installed
+        // since 7 Oct 2026); never another's connection.
+        assert_eq!(rows.len(), 3);
         assert_eq!(rows[0].title, "Gmail");
         assert!(rows[0].on && rows[0].live);
         assert!(!rows[1].on);
@@ -1471,6 +1779,183 @@ pub(crate) mod tests {
         (state, cx)
     }
 
+    /// ⌘[ and ⌘] walk the window's pages in the app's one history: back from a detail is the
+    /// list, back from the list closes the window, forward reopens it page by page, the window's
+    /// own ‹ is the same step, and Close keeps the steps so ⌘] brings the window back
+    /// (7 Oct 2026: ⌘[ moved the page behind the window instead).
+    #[gpui_kit::test]
+    fn back_and_forward_walk_the_windows_pages_in_one_history(cx: &mut gpui_kit::TestAppContext) {
+        let state = cx.new(|_| {
+            let mut state = catalog();
+            state.active_coworker_id = Some("cw_1".into());
+            state
+        });
+        let gmail = PluginSelection::Service("gmail".into());
+        let at = |cx: &mut gpui_kit::TestAppContext| {
+            state.read_with(cx, |state, _| {
+                state
+                    .monitor_modal
+                    .as_ref()
+                    .map(|m| (m.kind, m.selected.clone()))
+            })
+        };
+        state.update(cx, |state, cx| {
+            state.record_nav_for_test();
+            state.open_monitor_modal(MonitorKind::Plugins, cx);
+            state.open_market_detail(PluginSelection::Service("gmail".into()), cx);
+        });
+        assert_eq!(at(cx), Some((MonitorKind::Plugins, Some(gmail.clone()))));
+        state.update(cx, |state, cx| state.nav_back(cx));
+        assert_eq!(at(cx), Some((MonitorKind::Plugins, None)), "back: the list");
+        state.update(cx, |state, cx| state.nav_back(cx));
+        assert_eq!(at(cx), None, "back on the first page: the window closes");
+        state.update(cx, |state, cx| state.nav_forward(cx));
+        assert_eq!(
+            at(cx),
+            Some((MonitorKind::Plugins, None)),
+            "forward: it opens again"
+        );
+        state.update(cx, |state, cx| state.nav_forward(cx));
+        assert_eq!(at(cx), Some((MonitorKind::Plugins, Some(gmail.clone()))));
+        // The window's own ‹ is the same step back, so forward still leads to the detail.
+        state.update(cx, |state, cx| state.close_market_detail(cx));
+        assert_eq!(at(cx), Some((MonitorKind::Plugins, None)));
+        state.update(cx, |state, cx| state.nav_forward(cx));
+        assert_eq!(at(cx), Some((MonitorKind::Plugins, Some(gmail.clone()))));
+        // Close keeps the steps: ⌘] reopens the window, then the detail.
+        state.update(cx, |state, cx| state.close_monitor_modal(cx));
+        assert_eq!(at(cx), None);
+        state.update(cx, |state, cx| state.nav_forward(cx));
+        assert_eq!(at(cx), Some((MonitorKind::Plugins, None)));
+        state.update(cx, |state, cx| state.nav_forward(cx));
+        assert_eq!(at(cx), Some((MonitorKind::Plugins, Some(gmail))));
+    }
+
+    /// "+ New skill" opens the skill page in the same card (no sheet over it), with Upload and
+    /// Create in its pinned footer; a skill name is what is typed after a slash.
+    #[gpui_kit::test]
+    fn new_skill_is_a_page_in_the_same_card(cx: &mut gpui_kit::TestAppContext) {
+        let (state, cx) = open(cx, MonitorKind::Plugins);
+        state.update(cx, |state, cx| {
+            state.monitor_modal.as_mut().unwrap().page = super::MarketPage::Installed;
+            cx.notify();
+        });
+        click(cx, crate::components::marketplace::SKILL_NEW);
+        assert!(state.read_with(cx, |state, _| {
+            state.monitor_modal.as_ref().unwrap().selected == Some(PluginSelection::NewSkill)
+        }));
+        for id in [
+            crate::components::marketplace::NEW_SKILL_NAME,
+            crate::components::marketplace::NEW_SKILL_INSTRUCTIONS,
+            crate::components::marketplace::NEW_SKILL_UPLOAD,
+            crate::components::marketplace::NEW_SKILL_CREATE,
+            super::BACK,
+        ] {
+            assert!(cx.debug_bounds(id).is_some(), "{id} is drawn");
+        }
+        assert!(
+            cx.debug_bounds("settings-skill-add-sheet").is_none(),
+            "no sheet over the card"
+        );
+        use crate::components::marketplace::skill_name_ok;
+        assert!(skill_name_ok("expense-report") && skill_name_ok("v2.notes"));
+        for bad in ["", "Expense", "a b", "-a", "a.", "x/y"] {
+            assert!(!skill_name_ok(bad), "{bad:?}");
+        }
+    }
+
+    /// With a search typed the caret stays in the field, after Enter or a click on a result, and
+    /// ⌘[ / ⌘] there are still Back and Forward, not the field's outdent and indent (7 Oct 2026:
+    /// Back did nothing on a tool's page reached from a search).
+    #[gpui_kit::test]
+    fn back_and_forward_keys_work_from_the_search_field(cx: &mut gpui_kit::TestAppContext) {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::components::marketplace::init(cx);
+        });
+        let backs = Arc::new(AtomicUsize::new(0));
+        let forwards = Arc::new(AtomicUsize::new(0));
+        cx.update(|cx| {
+            let b = backs.clone();
+            cx.on_action(move |_: &crate::actions::NavBack, _| {
+                b.fetch_add(1, Ordering::SeqCst);
+            });
+            let f = forwards.clone();
+            cx.on_action(move |_: &crate::actions::NavForward, _| {
+                f.fetch_add(1, Ordering::SeqCst);
+            });
+        });
+        let state = cx.new(|_| {
+            let mut state = catalog();
+            state.monitor_modal = Some(MonitorModal::new("cw_1".into(), MonitorKind::Tools));
+            state
+        });
+        let (view, cx) = cx.add_window_view({
+            let state = state.clone();
+            move |_, cx| MonitorModalView::new(state, cx)
+        });
+        cx.simulate_resize(size(px(1000.), px(800.)));
+        draw(cx);
+        let search = view.read_with(cx, |view, _| view.tools_search_input.clone().unwrap());
+        cx.update(|window, cx| search.update(cx, |input, cx| input.focus(window, cx)));
+        cx.simulate_input("shell");
+        draw(cx);
+        cx.simulate_keystrokes("cmd-[");
+        cx.simulate_keystrokes("cmd-]");
+        assert_eq!(backs.load(Ordering::SeqCst), 1, "⌘[ in the field is Back");
+        assert_eq!(
+            forwards.load(Ordering::SeqCst),
+            1,
+            "⌘] in the field is Forward"
+        );
+    }
+
+    /// A tool's pop-up opens under its button, lined up with the button's right edge, and a
+    /// choice in it sends that choice (#359: the menu once opened off to the button's left).
+    #[gpui_kit::test]
+    fn a_tools_menu_opens_under_its_button(cx: &mut gpui_kit::TestAppContext) {
+        let (state, cx) = open(cx, MonitorKind::Tools);
+        state.update(cx, |state, cx| {
+            let ceiling: crate::opengrok::CoworkerCeiling =
+                serde_json::from_value(serde_json::json!({"tools":[
+                    {"name":"routines", "kind":"builtin", "enabled":true, "label":"Routines"}
+                ], "version":1}))
+                .unwrap();
+            state.coworker_ceiling = Some(("cw_1".into(), ToolCeiling::Read(ceiling.into())));
+            state.coworker_tools = Some((
+                "cw_1".into(),
+                crate::state::ToolList::Listed(vec![crate::opengrok::CoworkerTool {
+                    name: "routines".into(),
+                    tools: vec![crate::opengrok::CoworkerTool {
+                        name: "delete_routine".into(),
+                        mode: Some("ask".into()),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }]),
+            ));
+            state.monitor_modal.as_mut().unwrap().selected =
+                Some(PluginSelection::Tool("routines".into()));
+            cx.notify();
+        });
+        click(cx, "market-tool-mode-delete_routine");
+        assert!(state.read_with(cx, |state, _| state.tool_mode_dialog.is_some()));
+        let button = cx.debug_bounds("market-tool-mode-delete_routine").unwrap();
+        let menu = cx
+            .debug_bounds("tool-mode-dialog")
+            .expect("the menu is drawn");
+        assert!(
+            menu.top() >= button.bottom(),
+            "under the button: {menu:?} {button:?}"
+        );
+        assert!(
+            (menu.right() - button.right()).abs() <= px(1.),
+            "its right edge on the button's: {menu:?} {button:?}"
+        );
+    }
+
     #[gpui_kit::test]
     fn plugins_open_a_services_accounts_and_confirm_removal(cx: &mut gpui_kit::TestAppContext) {
         let (state, cx) = open(cx, MonitorKind::Plugins);
@@ -1519,11 +2004,35 @@ pub(crate) mod tests {
     }
 
     #[gpui_kit::test]
-    fn tools_show_the_ceiling_and_close_with_escape_the_button_and_the_backdrop(
+    fn tools_list_and_open_like_the_marketplace_and_close_with_escape_the_button_and_the_backdrop(
         cx: &mut gpui_kit::TestAppContext,
     ) {
         let (state, cx) = open(cx, MonitorKind::Tools);
-        assert!(cx.debug_bounds("agent-tools").is_some());
+        // The marketplace layout: a row per built-in tool, which opens the plugin page reused,
+        // with the tool's switch in the header; back goes to the list.
+        assert!(cx.debug_bounds("market-tool-item-shell").is_some());
+        assert!(
+            cx.debug_bounds(crate::components::marketplace::SEARCH)
+                .is_some()
+        );
+        assert!(
+            cx.debug_bounds(crate::components::marketplace::INSTALLED)
+                .is_none(),
+            "Tools has no installed count"
+        );
+        click(cx, "market-tool-item-shell");
+        assert!(state.read_with(cx, |state, _| {
+            state.monitor_modal.as_ref().unwrap().selected
+                == Some(super::PluginSelection::Tool("shell".into()))
+        }));
+        assert!(
+            cx.debug_bounds(crate::components::marketplace::DETAIL)
+                .is_some()
+        );
+        click(cx, super::BACK);
+        assert!(state.read_with(cx, |state, _| {
+            state.monitor_modal.as_ref().unwrap().selected.is_none()
+        }));
         click(cx, super::CLOSE);
         assert!(state.read_with(cx, |state, _| state.monitor_modal.is_none()));
         state.update(cx, |state, cx| {

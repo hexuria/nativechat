@@ -19,10 +19,6 @@ use crate::components::connections;
 use crate::components::default_models;
 use crate::components::model_picker;
 use crate::components::reply_source;
-use crate::components::skills::{
-    NEVER_UPDATED, NOT_YET_RECORDING, NOT_YET_WITH_BOT, NOTHING_WRITTEN_YET, empty_line,
-    short_relative_time, skill_matches, waiting_to_be_read,
-};
 use crate::components::usage_modal;
 use crate::opengrok::{
     BoxHandoffResolution, ChatPart, ChoiceCard, ComputerHandoffStatus, CoworkerPatch,
@@ -38,8 +34,8 @@ use crate::opengrok::{
 use crate::site_login::{SiteLoginRecord, grouped_logins, login_title};
 use crate::state::{
     ActiveRecipe, AfterRefusal, AppSettingsTab, AppState, BotSkills, CeilingCard, LocalRuleRow,
-    LocalRules, PickerFor, PickerView, RuleKind, SWITCH_IN_FLIGHT, SkillScope, SkillsCard,
-    TaughtSkill, ToolCeiling, ToolList, WRITING_A_LESSON,
+    LocalRules, PickerFor, PickerView, RuleKind, SkillsCard, TaughtSkill, ToolCeiling, ToolList,
+    WRITING_A_LESSON,
 };
 
 pub mod ids {
@@ -755,6 +751,162 @@ impl std::fmt::Debug for RedactedSecret {
     }
 }
 
+/// A skill's page as the window draws it: whose it is, its switch or its owner's buttons, and
+/// its three fields with what is typed in them.
+#[derive(Clone, Debug)]
+struct SkillPageSnap {
+    id: String,
+    title: String,
+    mine: bool,
+    on: bool,
+    live: bool,
+    /// `(name, description, instructions)` as the page shows them; `None` while loading.
+    fields: Option<(String, String, String)>,
+    changed: bool,
+    saving: bool,
+    confirming_delete: bool,
+    /// Your own skill's "Switched on", once its prose is read.
+    enabled: Option<bool>,
+    /// Each Bot's `(id, name, has it)`, `None` inside while that Bot's skills are being read;
+    /// and whether the Bots page is open.
+    bots: Vec<(String, String, Option<bool>)>,
+    bots_open: bool,
+}
+
+impl SkillPageSnap {
+    fn of(state: &AppState) -> Option<Self> {
+        use crate::components::monitor_modal::PluginSelection;
+        let id = match state.monitor_modal.as_ref()?.selected.as_ref()? {
+            PluginSelection::Skill(id) => id.clone(),
+            _ => return None,
+        };
+        let row = crate::components::agent_settings::shown_skill_rows(&state.skills_card()?)
+            .into_iter()
+            .find(|row| row.id == id)?;
+        let detail = state.skill_open.as_ref().filter(|d| d.skill.id == id);
+        let edit = state.skill_edit.as_ref().filter(|e| e.id == id);
+        Some(Self {
+            fields: detail.map(|d| {
+                (
+                    edit.and_then(|e| e.name.clone())
+                        .unwrap_or(d.skill.name.clone()),
+                    edit.and_then(|e| e.description.clone())
+                        .unwrap_or(d.skill.description.clone()),
+                    edit.and_then(|e| e.body.clone()).unwrap_or(d.body.clone()),
+                )
+            }),
+            changed: detail.zip(edit).is_some_and(|(d, e)| e.changed(d)),
+            saving: edit.is_some_and(|e| e.saving),
+            confirming_delete: edit.is_some_and(|e| e.confirming_delete),
+            enabled: detail.map(|d| d.skill.enabled),
+            bots: state
+                .skill_bots
+                .as_ref()
+                .filter(|b| b.skill_id == id)
+                .map(|b| {
+                    state
+                        .coworkers
+                        .iter()
+                        .map(|bot| (bot.id.clone(), bot.name.clone(), b.attached(&bot.id)))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            bots_open: state
+                .skill_bots
+                .as_ref()
+                .is_some_and(|b| b.skill_id == id && b.open),
+            id,
+            title: row.title,
+            mine: row.mine,
+            on: row.on,
+            live: row.live,
+        })
+    }
+
+    fn node(&self) -> UiNode {
+        use crate::components::marketplace as market;
+        // "N Bots", and its page: one switch per Bot.
+        let count = self
+            .bots
+            .iter()
+            .filter(|(_, _, on)| *on == Some(true))
+            .count();
+        if self.bots_open {
+            let mut page = UiNode::dialog(market::DETAIL, format!("Bots using {}", self.title));
+            for (id, name, on) in &self.bots {
+                page = page.with_child(
+                    UiNode::new(
+                        format!("market-skill-bot-switch-{id}"),
+                        "switch",
+                        name.clone(),
+                    )
+                    .with_checked(*on == Some(true))
+                    .with_enabled(on.is_some()),
+                );
+            }
+            return page;
+        }
+        let mut page = UiNode::dialog(market::DETAIL, self.title.clone())
+            .with_value(if self.mine { "mine" } else { "not mine" })
+            .with_child(
+                UiNode::button(market::SKILL_BOTS, format!("{count} Bots"))
+                    .with_value(count.to_string()),
+            );
+        if self.mine {
+            if let Some(on) = self.enabled {
+                page = page.with_child(
+                    UiNode::new(market::SKILL_ENABLED, "switch", "Enabled for all Bots")
+                        .with_checked(on),
+                );
+            }
+            page = page
+                .with_child(UiNode::button(market::SKILL_PUBLISH, "Publish").with_enabled(false))
+                .with_child(UiNode::button(market::SKILL_DELETE, "Delete Skill"));
+        } else {
+            page = page.with_child(
+                UiNode::new(
+                    format!("agent-skills-switch-{}", self.id),
+                    "switch",
+                    self.title.clone(),
+                )
+                .with_checked(self.on)
+                .with_enabled(self.live),
+            );
+        }
+        match &self.fields {
+            None => page.with_child(UiNode::status("market-skill-loading", "Loading…")),
+            Some((name, description, body)) => {
+                let field = |id: &str, label: &str, value: &str| {
+                    if self.mine {
+                        UiNode::textbox(id, label).with_value(value.to_string())
+                    } else {
+                        UiNode::status(id, label).with_value(value.to_string())
+                    }
+                };
+                page = page
+                    .with_child(field(market::SKILL_NAME, "Name", name))
+                    .with_child(field(market::SKILL_DESCRIPTION, "Description", description))
+                    .with_child(field(market::SKILL_INSTRUCTIONS, "Instructions", body));
+                if self.mine {
+                    page = page.with_child(
+                        UiNode::button(
+                            market::SKILL_SAVE,
+                            if self.saving { "Saving…" } else { "Save" },
+                        )
+                        .with_enabled(self.changed && !self.saving),
+                    );
+                }
+                if self.confirming_delete {
+                    page = page
+                        .with_child(UiNode::button(market::SKILL_DELETE_YES, "Delete"))
+                        .with_child(UiNode::button(market::SKILL_DELETE_NO, "Cancel"));
+                }
+                page
+            }
+        }
+    }
+}
+
 /// The token form as a driver may see it: whose it is, how much is typed, never what.
 #[derive(Debug, Clone)]
 pub struct MarketTokenSnap {
@@ -955,6 +1107,14 @@ pub enum Command {
         login_id: String,
     },
     /// "Change" on a locked card: the held password is dropped.
+    /// "Type it by hand" where a saved login cannot be used.
+    UserFormByHand {
+        card_key: String,
+    },
+    /// "Give <Bot> its own computer" on a login card.
+    UserFormOwnComputer {
+        card_key: String,
+    },
     UserFormClearSaved {
         card_key: String,
     },
@@ -1094,6 +1254,70 @@ pub enum Command {
     SkipSaveLogin {
         form_entry_id: String,
     },
+    /// A tool's choice dialog, from its chip (#359).
+    OpenToolMode {
+        tool: String,
+        title: String,
+        mode: String,
+    },
+    /// A tool's choice for the open Bot: `always`, `ask` or `never`.
+    SetToolMode {
+        tool: String,
+        mode: &'static str,
+    },
+    CloseToolMode,
+    /// A tool group's header switch on its page: every tool to Never, or each back (#359).
+    SwitchToolGroup {
+        group: String,
+        on: bool,
+    },
+    /// A skill's Bots page, opened or closed.
+    OpenSkillBots(bool),
+    /// The bell, and what its page and the toast do.
+    ToggleNotifications,
+    OpenNotificationsFor(Option<String>),
+    DismissToast,
+    CopyNotice(String),
+    CopyBotNotices,
+    /// `Some(bot)` clears one Bot's notices; `None` every notice.
+    ClearNotices(Option<String>),
+    MarkNoticesRead(Option<String>),
+    SelectNotice(String),
+    SelectAllNotices,
+    FilterNotices(bool),
+    SetNoticesRead(Vec<String>, bool),
+    DeleteNotices(Vec<String>),
+    UndoNoticeDelete,
+    ExpandNotice(String),
+    /// A made-up notice, to see the toast and the page without breaking anything.
+    FakeNotice {
+        bot: Option<String>,
+        place: String,
+        said: String,
+        raw: Option<String>,
+    },
+    /// One Bot's switch on a saved login's Bots page.
+    SetLoginShared {
+        login: String,
+        bot: String,
+        on: bool,
+    },
+    /// One plugin skill on or off for the open Bot.
+    SetPluginSkill {
+        plugin: String,
+        skill: String,
+        on: bool,
+    },
+    /// One Bot's switch on a skill's Bots page.
+    SetSkillBot {
+        bot: String,
+        attached: bool,
+    },
+    /// What was typed in one of your own skill's fields on its page.
+    SetSkillField(crate::state::SkillField, String),
+    SaveSkillPage,
+    AskSkillPageDelete(bool),
+    ConfirmSkillPageDelete,
     /// Use, on a "Which account?" card: `(plugin, connector, account)` (#360).
     ChoosePluginAccount {
         message_id: String,
@@ -1337,6 +1561,12 @@ impl Command {
                 state.pick_saved_login(card_key, login_id, cx)
             }
             Self::UserFormClearSaved { card_key } => state.clear_saved_login_pick(card_key, cx),
+            Self::UserFormByHand { card_key } => state.type_login_by_hand(card_key, cx),
+            Self::UserFormOwnComputer { card_key } => {
+                if let Some(bot) = state.card_coworker(&card_key) {
+                    state.give_bot_own_computer(bot, cx);
+                }
+            }
             Self::UserFormRegisterPasskey { card_key } => {
                 state.confirm_passkey_register(card_key, cx)
             }
@@ -1428,6 +1658,42 @@ impl Command {
                 state.choose_plugin_account(message_id, pick, cx)
             }
             Self::ToggleNeedsRemember { message_id } => state.toggle_needs_remember(message_id, cx),
+            Self::OpenToolMode { tool, title, mode } => state.open_tool_mode(tool, title, mode, cx),
+            Self::SetToolMode { tool, mode } => state.set_tool_mode(tool, mode, cx),
+            Self::CloseToolMode => state.close_tool_mode(cx),
+            Self::SetSkillField(field, text) => state.set_skill_field(field, text, cx),
+            Self::SaveSkillPage => state.save_skill_page(cx),
+            Self::OpenSkillBots(open) => state.open_skill_bots(open, cx),
+            Self::SetSkillBot { bot, attached } => state.set_skill_bot(bot, attached, cx),
+            Self::SetLoginShared { login, bot, on } => state.set_login_shared(login, bot, on, cx),
+            Self::ToggleNotifications => state.toggle_notifications(cx),
+            Self::OpenNotificationsFor(bot) => state.open_notifications_for(bot, cx),
+            Self::DismissToast => state.dismiss_toast(cx),
+            Self::CopyNotice(id) => state.copy_notice(&id, cx),
+            Self::CopyBotNotices => state.copy_bot_notices(cx),
+            Self::ClearNotices(bot) => state.clear_notices(bot, cx),
+            Self::MarkNoticesRead(bot) => state.mark_notices_read(bot, cx),
+            Self::SelectNotice(id) => state.toggle_notice_selected(id, cx),
+            Self::SelectAllNotices => state.toggle_select_all_notices(cx),
+            Self::FilterNotices(unread) => state.set_notice_filter(unread, cx),
+            Self::SetNoticesRead(ids, read) => state.set_notices_read(ids, read, cx),
+            Self::DeleteNotices(ids) => state.delete_notices(ids, cx),
+            Self::UndoNoticeDelete => state.undo_notice_delete(cx),
+            Self::ExpandNotice(id) => state.toggle_notice_expanded(id, cx),
+            Self::FakeNotice {
+                bot,
+                place,
+                said,
+                raw,
+            } => {
+                state.notify_error(bot, &place, &said, raw, None, cx);
+            }
+            Self::SetPluginSkill { plugin, skill, on } => {
+                state.set_plugin_skill(plugin, skill, on, cx)
+            }
+            Self::SwitchToolGroup { group, on } => state.switch_ceiling_tool(group, on, cx),
+            Self::AskSkillPageDelete(open) => state.ask_skill_page_delete(open, cx),
+            Self::ConfirmSkillPageDelete => state.confirm_skill_page_delete(cx),
             Self::OpenPluginDetail { plugin } => state.open_plugin_detail(plugin, cx),
             Self::ResendAfterNeeds { message_id } => state.resend_after_needs(message_id, cx),
             Self::DeleteSiteLogin { id } => state.delete_site_login(id, cx),
@@ -1947,57 +2213,10 @@ struct RecipeSnap {
     pending: bool,
 }
 
-/// One row of Settings → Skills. A skill is prose the model reads before it works, which is
-/// why the row carries its description: that sentence is what the model chooses by, and a
-/// driver checking that a skill was written down checks the words, not a count.
+/// A skill of the library, by its id: what `skill.open` and `skill.delete` name.
 #[derive(Clone)]
 struct SkillSnap {
     id: String,
-    name: String,
-    /// `authored`, `uploaded` or `taught` — where the prose came from, as a state on the row so
-    /// an assert does not have to match a sentence.
-    source: &'static str,
-    description: String,
-    /// Named and kept, with no prose in it yet, so there is nothing to invoke.
-    draft: bool,
-    /// The switch. Off is drawn on the row as a chip, so it is a state here: after this branch
-    /// most rows in a library are off, because every lesson a model writes starts that way.
-    enabled: bool,
-}
-
-// How stale a skill is has no field here. The row shows it, but as a bare line with no id of
-// its own; where the screen gives that fact an element to point at is the open skill's pane,
-// and it is read off [`OpenSkillSnap`] there.
-
-/// The skill on the pane, from the moment it was asked for.
-///
-/// Not read off the list: the list holds one side of the toggle and the pane keeps whatever was
-/// opened, including a skill from the side that is no longer shown. Reading it off the rows put
-/// the driver and the screen out of step exactly there — the person saw the pane, the driver saw
-/// nothing to assert on.
-#[derive(Clone)]
-struct OpenSkillSnap {
-    id: String,
-    name: String,
-    /// The prose. Empty while it is coming, and empty for a draft — which is why `arrived` is
-    /// its own bit rather than something to be worked out from this being empty.
-    body: String,
-    /// The fetch has answered. Until it has, the pane is the close button and a line saying so.
-    arrived: bool,
-    updated_at_ms: i64,
-    /// Where the switch is. Off means nothing may run it — the server refuses a switched-off
-    /// skill even to its owner — and off is where every lesson a model wrote starts.
-    enabled: bool,
-    /// When somebody first switched this skill on, and `None` while nobody has. The raw fact,
-    /// not the answer: whether it is waiting to be read is worked out by the screen's own
-    /// function, so the tree and the pane cannot say different things about it.
-    approved_at_ms: Option<i64>,
-    /// The switch is with the server. It is dead while it is, both on screen and here.
-    switching: bool,
-    /// What the fetch said when it was refused, or what the switch was refused with. The pane
-    /// says this instead of "Loading…" while there is nothing to draw, and beside the switch
-    /// once there is.
-    error: Option<String>,
 }
 
 /// One routine on the open bot's Computer pane, which is one schedule on the server.
@@ -2171,6 +2390,10 @@ struct ApprovalSnap {
 /// User-form card in the open thread. Idle cards expose fields + Continue /
 /// Open the screen / Dismiss. Settled cards expose a pill so Open the screen
 /// cannot drop `user-form-*` from the tree.
+/// One Bot on a saved login's Bots page: its id, its name, whether the login is shared with it,
+/// and whether its shares are read yet.
+type LoginBotSnap = (String, String, bool, bool);
+
 #[derive(Clone)]
 struct UserFormSnap {
     card_key: String,
@@ -2189,6 +2412,9 @@ struct UserFormSnap {
     saved_login_held: bool,
     /// A passkey card in register mode: one row to confirm instead of a list.
     passkey_register: bool,
+    /// Why a saved login cannot be used for this card's Bot, known before Touch ID: the
+    /// reason (`shared-computer` or `shared-bot`) and whether its own computer is being made.
+    saved_login_blocked: Option<(String, bool)>,
 }
 
 #[derive(Clone)]
@@ -2455,6 +2681,21 @@ fn agent_tools_node(card: &ToolsCardSnap<'_>) -> UiNode {
     node
 }
 
+/// One tool with this Bot's choice: `market-tool-<name>` (label = its title, value = its
+/// choice) and its pop-up button `market-tool-mode-<name>`, which opens the menu of three
+/// (`tool-mode-always` / `-ask` / `-never`).
+fn tool_choice_node(tool: &crate::components::marketplace::DetailTool) -> UiNode {
+    UiNode::status(
+        format!("market-tool-{}", tool.qualified),
+        tool.title.clone(),
+    )
+    .with_value(tool.mode.clone())
+    .with_child(UiNode::button(
+        format!("market-tool-mode-{}", tool.qualified),
+        crate::components::marketplace::mode_label(&tool.mode),
+    ))
+}
+
 fn ceiling_switch_node(row: &ShownCeilingRow) -> UiNode {
     let mut node = UiNode::new(ids::ceiling_switch(&row.name), "switch", row.title.clone())
         .with_value(if row.builtin { "builtin" } else { "plugin" })
@@ -2577,6 +2818,25 @@ fn user_form_node(form: &UserFormSnap) -> UiNode {
     }
     if form.saved_login_held {
         card = card.with_child(UiNode::button(user_form_saved_clear_id(key), "Change"));
+    }
+    if let Some((reason, changing)) = &form.saved_login_blocked {
+        card = card.with_child(UiNode::status(
+            format!("user-form-saved-blocked-{key}"),
+            reason.clone(),
+        ));
+        if reason != "shared-bot" {
+            card = card.with_child(
+                UiNode::button(
+                    crate::opengrok::user_form_own_computer_id(key),
+                    "Give it its own computer",
+                )
+                .with_enabled(!changing),
+            );
+        }
+        card = card.with_child(UiNode::button(
+            crate::opengrok::user_form_by_hand_id(key),
+            "Type it by hand",
+        ));
     }
     if form.passkey_register && !form.saved_login_held {
         card = card.with_child(UiNode::button(
@@ -3152,121 +3412,11 @@ fn site_login_detail_node(login: &SiteLoginSnap) -> UiNode {
     ))
 }
 
-/// One row of the list: what the skill is called and what it is FOR — its description, which is
-/// the sentence the model chooses by. What it SAYS is not on the row; that is fetched when the
-/// skill is opened and read off its pane, at [`ids::skill_body`].
-///
-/// Where the prose came from rides as a state, and a draft says so: a skill with no prose in it
-/// cannot be invoked, which is the one thing worth knowing about it.
-fn skill_node(skill: &SkillSnap, open: bool) -> UiNode {
-    let mut node = UiNode::listitem(ids::skill(&skill.id), skill.name.clone())
-        .with_value(skill.description.clone());
-    node.states.push(skill.source.to_string());
-    if skill.draft {
-        node.states.push("draft".to_string());
-    }
-    if !skill.enabled {
-        node.states.push("off".to_string());
-    }
-    if open {
-        node.states.push("selected".to_string());
-    }
-    node.with_child(UiNode::button(ids::skill_delete(&skill.id), "Delete"))
-}
-
-/// The pane for the open skill: the prose, how stale it is, and the way out of it.
-///
-/// The prose is here because this is the only place it is. A row carries what a skill is FOR;
-/// what it SAYS is fetched when it is opened, and a driver that had just written one down could
-/// otherwise not check that a word of it was kept.
-fn skill_detail_node(skill: &OpenSkillSnap) -> UiNode {
-    let now_ms = chrono::Utc::now().timestamp_millis();
-    let mut node = UiNode::dialog(ids::skill_detail(&skill.id), skill.name.clone());
-    // Refused, still coming, or here — three states the pane has and a driver has to be able to
-    // tell apart. "Here" is not "has prose": a draft arrives with none, and reading the empty
-    // body as "still coming" left a driver waiting at a pane that was already finished.
-    //
-    // A refusal with no skill under it is the whole pane. One WITH a skill under it came from
-    // the switch, and goes beside the switch, because that is what it is about.
-    if !skill.arrived {
-        let said = match &skill.error {
-            Some(error) => UiNode::status(ids::SKILL_ERROR, error.clone()),
-            None => UiNode::status(ids::SKILL_LOADING, "Loading…"),
-        };
-        return node
-            .with_child(said)
-            .with_child(UiNode::button(ids::SKILL_CLOSE, "Close"));
-    }
-    let updated = if skill.updated_at_ms > 0 {
-        short_relative_time(skill.updated_at_ms, now_ms)
-    } else {
-        NEVER_UPDATED.to_string()
-    };
-    // The one control on this pane that changes what the skill can do: off means nothing may
-    // run it, and a lesson a model wrote from a recording is born off. Where it stands rides as
-    // `checked`, so an assert does not have to match the sentence beside it, and it is not
-    // enabled while the server is being told — a switch pressed twice sends two answers about
-    // one flag.
-    node = node.with_child(
-        UiNode::new(
-            ids::skill_enabled(&skill.id),
-            "switch",
-            if skill.enabled {
-                "Switched on"
-            } else {
-                "Switched off"
-            },
-        )
-        .with_checked(skill.enabled)
-        .with_enabled(!skill.switching),
-    );
-    // Off and never switched on by anybody, which is not the same as off: a lesson a model
-    // wrote and nobody has read, as against one somebody read and switched off again. The
-    // screen's own function answers it, so the tree and the pane cannot disagree — they did,
-    // because each worked it out for itself and the tree called every skill on a server that
-    // sends no stamp unread, switched on or not.
-    if waiting_to_be_read(skill.enabled, skill.approved_at_ms)
-        && let Some(switch) = node.children.last_mut()
-    {
-        switch.states.push("unread".to_string());
-    }
-    if let Some(error) = &skill.error {
-        node = node.with_child(UiNode::status(ids::SKILL_ERROR, error.clone()));
-    }
-    node = node.with_child(
-        // The sentence the pane draws where the prose would be, with nothing under it: a draft
-        // is a skill that has none, not a skill whose prose could not be read.
-        UiNode::status(
-            ids::skill_body(&skill.id),
-            if skill.body.is_empty() {
-                NOTHING_WRITTEN_YET
-            } else {
-                "Instructions"
-            },
-        )
-        .with_value(skill.body.clone()),
-    );
-    node.with_child(UiNode::status(ids::skill_updated(&skill.id), "Updated").with_value(updated))
-        .with_child(UiNode::button(
-            ids::skill_detail_delete(&skill.id),
-            "Delete",
-        ))
-        .with_child(UiNode::button(ids::SKILL_CLOSE, "Close"))
-}
-
 /// What a second create is told while the first is still going.
 ///
 /// The person cannot ask twice — Save goes dead and the sheet closes on the way out — so this is
 /// for the driver, which would otherwise be told nothing and conclude its skill was taken.
 const ALREADY_SAVING: &str = "a skill is already being saved";
-
-/// What a control on the Skills page says when the Skills page is not what is on screen.
-fn skills_off_screen(target: &str) -> String {
-    format!(
-        "`{target}` is on Settings → Skills, which is not what is on screen: open it with \
-         `skills.open`"
-    )
-}
 
 /// What to use instead of typing into the Create sheet. One sentence, because the three fields
 /// and the Save button are refused for the same reason, and a driver has to be told the same
@@ -3441,6 +3591,20 @@ struct RelaySnap {
 #[derive(Default)]
 pub struct NativeChatHost {
     ready: bool,
+    /// Every notice kept, newest first, each with its Bot's name, for the bell, its page, the
+    /// toast and `notices.*`.
+    notices: Vec<(crate::notifications::Notice, Option<String>)>,
+    /// The notice the toast shows.
+    toast: Option<String>,
+    /// The bell's page is what the right sidebar shows.
+    notifications_open: bool,
+    /// The open Bot, whose notices the bell counts and its page lists.
+    notice_bot: Option<String>,
+    /// The page's ticked rows, its Unread filter, its opened row, and whether an Undo stands.
+    notice_selection: std::collections::HashSet<String>,
+    notice_unread_only: bool,
+    notice_expanded: Option<String>,
+    notice_undo: bool,
     sidebar_hidden: bool,
     theme_mode: String,
     sessions: Vec<SessionSnap>,
@@ -3493,6 +3657,13 @@ pub struct NativeChatHost {
     /// the token typed).
     market_sections: Vec<crate::components::marketplace::Section>,
     market_detail: Option<crate::components::marketplace::MarketDetail>,
+    /// A skill's page, while one is open in the Plugins window.
+    market_skill: Option<SkillPageSnap>,
+    /// The open Bot's plugin skills and their switches.
+    plugin_skills: Vec<crate::opengrok::PluginSkill>,
+    /// A saved login's Bots page, while one is open: the login, and each Bot as (id, name,
+    /// shared, whether its shares are read yet).
+    login_page: Option<(String, Vec<LoginBotSnap>)>,
     market_status: Vec<String>,
     market_installed: usize,
     market_token: Option<MarketTokenSnap>,
@@ -3612,6 +3783,8 @@ pub struct NativeChatHost {
     computer_handoffs: Vec<ComputerHandoffSnap>,
     save_logins: Vec<SaveLoginSnap>,
     plugin_needs: Vec<PluginNeedsSnap>,
+    /// The open tool choice dialog: `(tool, title, mode)` (#359).
+    tool_mode_dialog: Option<(String, String, String)>,
     site_logins: Vec<SiteLoginSnap>,
     logins_tab: bool,
     /// What the last Add / Import / sync said on Settings → Logins.
@@ -3622,20 +3795,8 @@ pub struct NativeChatHost {
     site_login_query: String,
     site_login_selected: Option<String>,
     site_login_add_open: bool,
-    /// Settings → Skills, as that page has it: the library for the open side of the toggle, a
-    /// count for each side, the search, the skill on the pane and the Create sheet.
+    /// The library's skills, by id, for the `skill.*` verbs.
     skills: Vec<SkillSnap>,
-    skills_tab: bool,
-    skills_query: String,
-    skills_scope: crate::state::SkillScope,
-    skills_counts: crate::state::SkillCounts,
-    skills_loading: bool,
-    /// The three error slots the page has, kept apart here because they are apart on screen: a
-    /// driver that read the list's slot for the sheet's would read a refusal nobody was shown.
-    skills_error: Option<String>,
-    skill_open: Option<OpenSkillSnap>,
-    skill_add_open: bool,
-    skill_add_error: Option<String>,
     skill_saving: bool,
     /// The skill the delete dialog is about, by name, while it is up.
     skill_delete_confirm: Option<String>,
@@ -3753,6 +3914,18 @@ impl NativeChatHost {
             turn_in_flight: state.is_turn_in_flight(),
             queued_sends: state.queued_send_count(),
             agent_settings_open: state.is_agent_settings_open(),
+            notices: state
+                .notices
+                .iter()
+                .map(|n| (n.clone(), state.notice_bot_name(n)))
+                .collect(),
+            toast: state.toast.clone(),
+            notifications_open: state.right_pane == crate::state::RightPane::Notifications,
+            notice_bot: state.active_coworker_id.clone(),
+            notice_selection: state.notice_selection.clone(),
+            notice_unread_only: state.notice_unread_only,
+            notice_expanded: state.notice_expanded.clone(),
+            notice_undo: state.notice_undo.is_some(),
             // The monitor owns Tools and Plugins (#175). Only the modal that draws a card
             // publishes its state; Bot settings keeps none of these cards (#174).
             agent_connections_card: false,
@@ -3791,6 +3964,33 @@ impl NativeChatHost {
                 .and_then(|plugin| crate::components::monitor_modal::plugin_detail(state, plugin)),
             monitor_status: crate::components::monitor_modal::plugin_status(state),
             market_sections: crate::components::marketplace::sections(state),
+            market_skill: SkillPageSnap::of(state),
+            plugin_skills: state.plugin_skills.clone(),
+            login_page: state
+                .monitor_modal
+                .as_ref()
+                .and_then(|m| match &m.selected {
+                    Some(crate::components::monitor_modal::PluginSelection::Login(id)) => {
+                        Some(id.clone())
+                    }
+                    _ => None,
+                })
+                .map(|id| {
+                    let bots = state
+                        .coworkers
+                        .iter()
+                        .map(|bot| {
+                            let known = state.site_login_shares.get(&bot.id);
+                            (
+                                bot.id.clone(),
+                                bot.name.clone(),
+                                known.is_some_and(|ids| ids.contains(&id)),
+                                known.is_some(),
+                            )
+                        })
+                        .collect();
+                    (id, bots)
+                }),
             market_detail: state
                 .monitor_modal
                 .as_ref()
@@ -4162,7 +4362,15 @@ impl NativeChatHost {
                     let saved_login_held = current.is_some_and(|use_| use_.ready().is_some());
                     let passkey_register = spec.challenge_kind.as_deref() == Some("passkey")
                         && spec.passkey_mode.as_deref() == Some("register");
+                    let saved_login_blocked = state.card_coworker(&key).and_then(|bot| {
+                        let check = state.saved_login_checks.get(&bot).filter(|c| !c.usable)?;
+                        Some((
+                            check.reason.clone().unwrap_or_default(),
+                            state.own_computer_changing.as_deref() == Some(bot.as_str()),
+                        ))
+                    });
                     UserFormSnap {
+                        saved_login_blocked,
                         title: if spec.title.is_empty() {
                             "Form".into()
                         } else {
@@ -4213,6 +4421,7 @@ impl NativeChatHost {
                         .collect()
                 })
                 .unwrap_or_default(),
+            tool_mode_dialog: state.tool_mode_dialog.clone(),
             plugin_needs: state
                 .conversations
                 .iter()
@@ -4250,46 +4459,8 @@ impl NativeChatHost {
                 .iter()
                 .map(|skill| SkillSnap {
                     id: skill.id.clone(),
-                    name: skill.name.clone(),
-                    source: skill.source.word(),
-                    description: skill.description.clone(),
-                    draft: skill.draft,
-                    enabled: skill.enabled,
                 })
                 .collect(),
-            skills_tab: state.app_settings_tab == AppSettingsTab::Skills,
-            skills_query: state.skills_query.clone(),
-            skills_scope: state.skills_scope,
-            skills_counts: state.skills_counts,
-            skills_loading: state.skills_loading,
-            skills_error: state.skills_error.clone(),
-            skill_open: state.skill_open_id.clone().map(|id| {
-                let detail = state.skill_open.as_ref().filter(|open| open.skill.id == id);
-                let row = state.skills.iter().find(|skill| skill.id == id);
-                OpenSkillSnap {
-                    name: detail
-                        .map(|open| open.skill.name.clone())
-                        .or_else(|| row.map(|row| row.name.clone()))
-                        .filter(|name| !name.trim().is_empty())
-                        .unwrap_or_else(|| id.clone()),
-                    body: detail.map(|open| open.body.clone()).unwrap_or_default(),
-                    arrived: detail.is_some(),
-                    // The detail's and not the row's: the pane draws this row only once the
-                    // fetch has answered, and a timestamp taken off the list would be a fact
-                    // advertised for an element nobody can point at yet.
-                    updated_at_ms: detail
-                        .map(|open| open.skill.updated_at_ms)
-                        .unwrap_or_default(),
-                    enabled: detail.map(|open| open.skill.enabled).unwrap_or(true),
-                    approved_at_ms: detail.and_then(|open| open.skill.approved_at_ms),
-                    // Any switch, as on screen: one at a time, whichever skill.
-                    switching: state.skill_enabling.is_some(),
-                    error: state.skill_error.clone(),
-                    id,
-                }
-            }),
-            skill_add_open: state.skill_add_open,
-            skill_add_error: state.skill_add_error.clone(),
             skill_saving: state.skill_saving,
             skill_delete_confirm: state.skill_delete_prompt(),
             taught_skill: state.taught_skill.clone(),
@@ -4469,7 +4640,20 @@ impl NativeChatHost {
                 "Toggle right sidebar",
             ));
             if self.sessions.iter().any(|session| session.active) {
+                let unread = self.unread_notices();
+                let mut bell = UiNode::button(crate::components::title_bar::BELL, "Notifications")
+                    .with_value(unread.to_string());
+                if self.notifications_open {
+                    bell.states.push("selected".into());
+                }
+                page = page.with_child(bell);
                 page = page.with_child(UiNode::button(ids::HEADER_MONITOR, "Toggle computer pane"));
+            }
+            if self.notifications_open {
+                page = page.with_child(self.notifications_node());
+            }
+            if let Some(toast) = self.toast_node() {
+                page = page.with_child(toast);
             }
             if let Some(bot) = self.sessions.iter().find(|session| session.active) {
                 let mut chip = UiNode::button(ids::HEADER_COWORKER, bot.title.clone());
@@ -4616,6 +4800,21 @@ impl NativeChatHost {
         }
         for card in &self.plugin_needs {
             page = page.with_child(plugin_needs_node(card));
+        }
+        if let Some((tool, title, mode)) = &self.tool_mode_dialog {
+            let mut dialog =
+                UiNode::dialog("tool-mode-dialog", title.clone()).with_value(tool.clone());
+            for choice in ["always", "ask", "never"] {
+                let mut option = UiNode::button(
+                    format!("tool-mode-{choice}"),
+                    crate::components::marketplace::mode_label(choice),
+                );
+                if choice == mode {
+                    option.states.push("selected".into());
+                }
+                dialog = dialog.with_child(option);
+            }
+            page = page.with_child(dialog.with_child(UiNode::button("tool-mode-close", "Close")));
         }
         let mut status = UiNode::new("computer-status", "status", self.computer_status.clone());
         if let Some((line, code)) = &self.computer_error {
@@ -4846,8 +5045,7 @@ impl NativeChatHost {
                             .with_child(UiNode::button(ids::SETTINGS_GENERAL, "General"))
                             .with_child(UiNode::button("settings-tab-computer", "Computer"))
                             .with_child(UiNode::button("settings-tab-updates", "Updates"))
-                            .with_child(UiNode::button("settings-tab-logins", "Logins"))
-                            .with_child(UiNode::button(ids::SETTINGS_SKILLS, "Skills"));
+                            .with_child(UiNode::button("settings-tab-logins", "Logins"));
                         if self.logins_tab {
                             settings = self.logins_nodes(settings);
                         }
@@ -4856,9 +5054,6 @@ impl NativeChatHost {
                             settings = settings
                                 .with_child(self.default_models_node())
                                 .with_child(self.show_turn_timing_node());
-                        }
-                        if self.skills_tab {
-                            settings = self.skills_nodes(settings);
                         }
                         if self.updates_tab {
                             settings = settings.with_child(UiNode::button(
@@ -5381,6 +5576,23 @@ impl NativeChatHost {
                     });
                 }
             }
+            if form.saved_login_blocked.is_some()
+                && target == crate::opengrok::user_form_by_hand_id(key)
+            {
+                return Some(Command::UserFormByHand {
+                    card_key: key.clone(),
+                });
+            }
+            if form
+                .saved_login_blocked
+                .as_ref()
+                .is_some_and(|(reason, changing)| reason != "shared-bot" && !changing)
+                && target == crate::opengrok::user_form_own_computer_id(key)
+            {
+                return Some(Command::UserFormOwnComputer {
+                    card_key: key.clone(),
+                });
+            }
             if form.saved_login_held && target == user_form_saved_clear_id(key) {
                 return Some(Command::UserFormClearSaved {
                     card_key: key.clone(),
@@ -5509,11 +5721,8 @@ impl NativeChatHost {
     fn market_mode(&self) -> bool {
         use crate::components::monitor_modal::{MonitorKind, PluginSelection};
         self.monitor_modal.as_ref().is_some_and(|modal| {
-            modal.kind == MonitorKind::Plugins
-                && !matches!(
-                    modal.selected,
-                    Some(PluginSelection::Connection(_) | PluginSelection::Skill(_))
-                )
+            (modal.kind == MonitorKind::Plugins || modal.kind == MonitorKind::Tools)
+                && !matches!(modal.selected, Some(PluginSelection::Connection(_)))
         })
     }
 
@@ -5524,19 +5733,26 @@ impl NativeChatHost {
             self as market, AccountAction, AccountStatus, DetailAction, RowAction,
         };
         use crate::components::monitor_modal::{self as monitor, MarketPage};
+        let tools = modal.kind == monitor::MonitorKind::Tools;
         let title = match (&modal.selected, &modal.page) {
+            (Some(_), _) if tools => "Tool".to_string(),
             (Some(_), _) => "Plugin".to_string(),
+            (None, MarketPage::Browse) if tools => "Tools".to_string(),
             (None, MarketPage::Browse) => "Marketplace".to_string(),
             (None, MarketPage::Installed) => "Installed".to_string(),
+            (None, MarketPage::Logins) => "Logins".to_string(),
             (None, MarketPage::Category(c)) => market::category_title(c),
         };
         let mut node = UiNode::dialog(ids::MONITOR_MODAL, title)
             .with_child(UiNode::button(ids::MONITOR_CLOSE, "Close"));
         let Some(selection) = &modal.selected else {
             if modal.page != MarketPage::Browse {
-                node = node.with_child(UiNode::button(market::BACK, "Marketplace"));
+                node = node.with_child(UiNode::button(monitor::BACK, "Back"));
             }
-            if modal.page != MarketPage::Installed {
+            if modal.page == MarketPage::Browse && !tools {
+                node = node.with_child(UiNode::button(market::LOGINS, "Logins"));
+            }
+            if modal.page != MarketPage::Installed && !tools {
                 node = node.with_child(
                     UiNode::button(
                         market::INSTALLED,
@@ -5546,7 +5762,15 @@ impl NativeChatHost {
                 );
             }
             node = node.with_child(
-                UiNode::textbox(market::SEARCH, "Search plugins").with_value(modal.query.clone()),
+                UiNode::textbox(
+                    market::SEARCH,
+                    if tools {
+                        "Search tools"
+                    } else {
+                        "Search plugins"
+                    },
+                )
+                .with_value(modal.query.clone()),
             );
             if !self.market_status.is_empty() {
                 node = node.with_child(UiNode::status(
@@ -5564,11 +5788,26 @@ impl NativeChatHost {
                         item.states.push("selected".into());
                     }
                     index += 1;
+                    // A tool's row has its switch where a plugin's has Add.
+                    if let RowAction::Switch { on, live } = &row.action {
+                        group = group.with_child(item).with_child(
+                            UiNode::new(row.selection.switch_id(), "switch", row.title.clone())
+                                .with_checked(*on)
+                                .with_enabled(*live),
+                        );
+                        continue;
+                    }
                     let (label, live) = match &row.action {
+                        RowAction::Switch { .. } => unreachable!("handled above"),
                         RowAction::Add { live } => ("Add", *live),
                         RowAction::Adding => ("Adding…", false),
                         RowAction::Added => ("Added", false),
                         RowAction::Unavailable => ("Unavailable", false),
+                        // A login's "2 Bots": the row itself opens its Bots page.
+                        RowAction::Count(_) => {
+                            group = group.with_child(item);
+                            continue;
+                        }
                     };
                     group = group.with_child(item).with_child(
                         UiNode::button(market::add_id(&row.selection), label).with_enabled(live),
@@ -5581,6 +5820,7 @@ impl NativeChatHost {
                 node = node.with_child(group);
             }
             if modal.page == MarketPage::Installed && modal.query.trim().is_empty() {
+                node = node.with_child(UiNode::button(market::SKILL_NEW, "+ New skill"));
                 for row in self
                     .monitor_plugins
                     .iter()
@@ -5603,9 +5843,53 @@ impl NativeChatHost {
             }
             return node;
         };
+        // A saved login's Bots page: a switch per Bot.
+        if let Some((login, bots)) = &self.login_page {
+            let mut page = UiNode::dialog(market::DETAIL, "Login · Bots");
+            for (bot, name, on, known) in bots {
+                page = page.with_child(
+                    UiNode::new(
+                        market::login_bot_switch_id(login, bot),
+                        "switch",
+                        name.clone(),
+                    )
+                    .with_checked(*on)
+                    .with_enabled(*known),
+                );
+            }
+            return node
+                .with_child(UiNode::button(monitor::BACK, "Back"))
+                .with_child(page);
+        }
+        // "+ New skill": the page before the skill exists. Its fields are the window's; the
+        // driver creates with `skill.create`, as it did from the sheet.
+        if *selection == monitor::PluginSelection::NewSkill {
+            return node
+                .with_child(UiNode::button(monitor::BACK, "Back"))
+                .with_child(
+                    UiNode::dialog(market::DETAIL, "New skill")
+                        .with_child(UiNode::textbox(market::NEW_SKILL_NAME, "Name"))
+                        .with_child(UiNode::textbox(
+                            market::NEW_SKILL_DESCRIPTION,
+                            "Description",
+                        ))
+                        .with_child(UiNode::textbox(
+                            market::NEW_SKILL_INSTRUCTIONS,
+                            "Instructions",
+                        ))
+                        .with_child(UiNode::button(market::NEW_SKILL_UPLOAD, "Upload SKILL.md…"))
+                        .with_child(UiNode::button(market::NEW_SKILL_CANCEL, "Cancel"))
+                        .with_child(UiNode::button(market::NEW_SKILL_CREATE, "Create")),
+                );
+        }
+        if let (monitor::PluginSelection::Skill(_), Some(skill)) = (selection, &self.market_skill) {
+            return node
+                .with_child(UiNode::button(monitor::BACK, "Back"))
+                .with_child(skill.node());
+        }
         if modal.bots_for.is_some() {
             node = node
-                .with_child(UiNode::button(market::BOTS_BACK, "Back"))
+                .with_child(UiNode::button(monitor::BACK, "Back"))
                 .with_child(
                     UiNode::textbox(market::BOTS_SEARCH, "Filter Bots")
                         .with_value(modal.bots_query.clone()),
@@ -5634,6 +5918,31 @@ impl NativeChatHost {
                 UiNode::button(market::SOURCE, format!("View Source {repository}"))
                     .with_value(url.clone()),
             );
+        }
+        // A built-in tool's page: its switch in the header, a group's tools each with chip and
+        // switch, or a lone tool's choice chip `market-tool-mode-<name>`.
+        if let Some((name, on, live)) = &detail.header_switch {
+            body = body.with_child(
+                UiNode::new(
+                    format!("agent-ceiling-switch-{name}"),
+                    "switch",
+                    detail.title.clone(),
+                )
+                .with_checked(*on)
+                .with_enabled(*live),
+            );
+            for tool in &detail.tools {
+                body = body.with_child(tool_choice_node(tool));
+            }
+            if let Some(tool) = &detail.choice {
+                body = body.with_child(
+                    UiNode::button(
+                        format!("market-tool-mode-{}", tool.qualified),
+                        market::mode_label(&tool.mode),
+                    )
+                    .with_value(tool.mode.clone()),
+                );
+            }
         }
         if let Some(action) = &detail.action {
             let (label, live) = match action {
@@ -5842,9 +6151,10 @@ impl NativeChatHost {
                         format!("{server} · MCP server"),
                     ));
                 }
+                // Each tool: `market-tool-<dotted name>` (label = its title, value = its choice),
+                // its chip `market-tool-mode-<name>` and its switch `market-tool-switch-<name>`.
                 for tool in &detail.tools {
-                    body = body
-                        .with_child(UiNode::status(format!("market-tool-{tool}"), tool.clone()));
+                    body = body.with_child(tool_choice_node(tool));
                 }
                 if let Some(status) = &detail.tools_status {
                     body = body.with_child(UiNode::status("market-tools-status", status.clone()));
@@ -5852,9 +6162,27 @@ impl NativeChatHost {
             }
         }
         for skill in &detail.skills {
+            let monitor::PluginSelection::Plugin(plugin) = selection else {
+                continue;
+            };
             body = body.with_child(
-                UiNode::status(format!("market-skill-{skill}"), skill.clone()).with_value("Skill"),
+                UiNode::button(market::plugin_skill_row_id(plugin, skill), skill.clone())
+                    .with_value("Skill"),
             );
+            if let Some(row) = self
+                .plugin_skills
+                .iter()
+                .find(|r| &r.plugin == plugin && &r.skill == skill)
+            {
+                body = body.with_child(
+                    UiNode::new(
+                        market::plugin_skill_switch_id(plugin, skill),
+                        "switch",
+                        format!("Use {plugin}.{skill}"),
+                    )
+                    .with_checked(row.on),
+                );
+            }
         }
         for app in &detail.apps {
             body = body.with_child(
@@ -5890,9 +6218,52 @@ impl NativeChatHost {
         }
         let modal = self.monitor_modal.as_ref()?;
         let m = |command| Some(Ok(Command::Market(command)));
+        // A plugin's skills: the row opens its page, the switch is this Bot's; both work from the
+        // plugin's page and the switch from the skill's own page.
+        for row in &self.plugin_skills {
+            let here = match &modal.selected {
+                Some(PluginSelection::Plugin(p)) => p == &row.plugin,
+                Some(PluginSelection::PluginSkill(p, s)) => p == &row.plugin && s == &row.skill,
+                _ => false,
+            };
+            if !here {
+                continue;
+            }
+            if target == market::plugin_skill_switch_id(&row.plugin, &row.skill) {
+                return Some(Ok(Command::SetPluginSkill {
+                    plugin: row.plugin.clone(),
+                    skill: row.skill.clone(),
+                    on: !row.on,
+                }));
+            }
+            if target == market::plugin_skill_row_id(&row.plugin, &row.skill) {
+                return m(MarketCommand::OpenDetail(PluginSelection::PluginSkill(
+                    row.plugin.clone(),
+                    row.skill.clone(),
+                )));
+            }
+        }
+        if let Some((login, bots)) = &self.login_page {
+            for (bot, _, on, known) in bots {
+                if target == market::login_bot_switch_id(login, bot) {
+                    return Some(if *known {
+                        Ok(Command::SetLoginShared {
+                            login: login.clone(),
+                            bot: bot.clone(),
+                            on: !on,
+                        })
+                    } else {
+                        Err("that Bot's logins are still being read".into())
+                    });
+                }
+            }
+        }
         if modal.selected.is_none() {
-            if target == market::BACK && modal.page != MarketPage::Browse {
+            if target == monitor::BACK && modal.page != MarketPage::Browse {
                 return m(MarketCommand::Page(MarketPage::Browse));
+            }
+            if target == market::LOGINS && modal.page == MarketPage::Browse {
+                return m(MarketCommand::Page(MarketPage::Logins));
             }
             if target == market::INSTALLED && modal.page != MarketPage::Installed {
                 return m(MarketCommand::Page(MarketPage::Installed));
@@ -5906,6 +6277,21 @@ impl NativeChatHost {
                 for row in &section.rows {
                     if target == row.selection.detail_id() {
                         return m(MarketCommand::OpenDetail(row.selection.clone()));
+                    }
+                    // A tool group's switch in the Tools list is the group's (#359).
+                    if let (PluginSelection::Tool(name), RowAction::Switch { on, live }) =
+                        (&row.selection, &row.action)
+                        && market::is_tool_group(name)
+                        && target == row.selection.switch_id()
+                    {
+                        return Some(if *live {
+                            Ok(Command::SwitchToolGroup {
+                                group: name.clone(),
+                                on: !on,
+                            })
+                        } else {
+                            Err("this switch is waiting on the server".into())
+                        });
                     }
                     if target == market::add_id(&row.selection) {
                         return Some(match (&row.action, &row.selection) {
@@ -5922,6 +6308,9 @@ impl NativeChatHost {
                     }
                 }
             }
+            if modal.page == MarketPage::Installed && target == market::SKILL_NEW {
+                return m(MarketCommand::OpenDetail(PluginSelection::NewSkill));
+            }
             // A private skill on the Installed page: its detail, or its switch for the open Bot.
             if modal.page == MarketPage::Installed {
                 for row in self
@@ -5930,9 +6319,7 @@ impl NativeChatHost {
                     .filter(|row| matches!(row.selection, PluginSelection::Skill(_)))
                 {
                     if target == row.selection.detail_id() {
-                        return Some(Ok(Command::SelectMonitorPlugin(Some(
-                            row.selection.clone(),
-                        ))));
+                        return m(MarketCommand::OpenDetail(row.selection.clone()));
                     }
                     if target == row.selection.switch_id()
                         && let PluginSelection::Skill(id) = &row.selection
@@ -5963,7 +6350,7 @@ impl NativeChatHost {
             return None;
         }
         if let Some(account) = &modal.bots_for {
-            if target == market::BOTS_BACK {
+            if target == monitor::BACK {
                 return m(MarketCommand::Bots(None));
             }
             if let Some(row) = self
@@ -5984,6 +6371,88 @@ impl NativeChatHost {
             return (target.starts_with("market-") || target.starts_with("monitor-"))
                 .then(|| Err(format!("`{target}` is not on the Bots list")));
         }
+        if modal.selected == Some(PluginSelection::NewSkill) {
+            match target {
+                t if t == market::NEW_SKILL_CANCEL => return m(MarketCommand::CloseDetail),
+                t if t == market::NEW_SKILL_CREATE
+                    || t == market::NEW_SKILL_NAME
+                    || t == market::NEW_SKILL_DESCRIPTION
+                    || t == market::NEW_SKILL_INSTRUCTIONS =>
+                {
+                    return Some(Err(SHEET_IS_NOT_TYPED_INTO.to_string()));
+                }
+                t if t == market::NEW_SKILL_UPLOAD => {
+                    return Some(Err(
+                        "Upload opens the system file picker, which the driver cannot work: use \
+                         `skill.upload --arg path=`"
+                            .to_string(),
+                    ));
+                }
+                _ => {}
+            }
+        }
+        if let Some(skill) = &self.market_skill {
+            let control = |live: bool, command: Command| {
+                Some(if live {
+                    Ok(command)
+                } else {
+                    Err(format!("`{target}` is not live on this skill's page"))
+                })
+            };
+            if skill.bots_open {
+                if target == monitor::BACK {
+                    return Some(Ok(Command::OpenSkillBots(false)));
+                }
+                if let Some(bot) = target.strip_prefix("market-skill-bot-switch-") {
+                    return Some(match skill.bots.iter().find(|(id, _, _)| id == bot) {
+                        Some((_, _, Some(on))) => Ok(Command::SetSkillBot {
+                            bot: bot.to_string(),
+                            attached: !on,
+                        }),
+                        Some(_) => Err("that Bot's skills are still being read".into()),
+                        None => Err(format!("no Bot `{bot}`")),
+                    });
+                }
+            }
+            if target == market::SKILL_BOTS && !skill.bots_open {
+                return Some(Ok(Command::OpenSkillBots(true)));
+            }
+            match target {
+                t if t == market::SKILL_PUBLISH && skill.mine => {
+                    return Some(Err(market::PUBLISH_NOT_YET.into()));
+                }
+                t if t == market::SKILL_ENABLED && skill.mine => {
+                    return skill.enabled.map(|on| {
+                        Ok(Command::SetSkillEnabled {
+                            id: skill.id.clone(),
+                            enabled: !on,
+                        })
+                    });
+                }
+                t if t == market::SKILL_DELETE && skill.mine => {
+                    return control(!skill.confirming_delete, Command::AskSkillPageDelete(true));
+                }
+                t if t == market::SKILL_DELETE_YES => {
+                    return control(skill.confirming_delete, Command::ConfirmSkillPageDelete);
+                }
+                t if t == market::SKILL_DELETE_NO => {
+                    return control(skill.confirming_delete, Command::AskSkillPageDelete(false));
+                }
+                t if t == market::SKILL_SAVE && skill.mine => {
+                    return control(skill.changed && !skill.saving, Command::SaveSkillPage);
+                }
+                t if t == format!("agent-skills-switch-{}", skill.id) && !skill.mine => {
+                    return control(
+                        skill.live,
+                        Command::SetBotSkill {
+                            skill_id: skill.id.clone(),
+                            attached: !skill.on,
+                        },
+                    );
+                }
+                _ => {}
+            }
+        }
         let detail = self.market_detail.as_ref();
         if target == monitor::BACK {
             return if modal.removing {
@@ -5997,6 +6466,20 @@ impl NativeChatHost {
                 .starts_with("market-")
                 .then(|| Err("this plugin is no longer listed".into()));
         };
+        // A group's header switch: the group as a whole, its tools' own choices remembered.
+        if let Some((name, on, live)) = &detail.header_switch
+            && !detail.tools.is_empty()
+            && target == format!("agent-ceiling-switch-{name}")
+        {
+            return Some(if *live {
+                Ok(Command::SwitchToolGroup {
+                    group: name.clone(),
+                    on: !on,
+                })
+            } else {
+                Err("this switch is waiting on the server".into())
+            });
+        }
         if target == market::DETAIL_ACTION {
             let name = match modal.selected.as_ref() {
                 Some(PluginSelection::Plugin(name)) => name.clone(),
@@ -6028,6 +6511,22 @@ impl NativeChatHost {
                 }
                 _ => {}
             }
+        }
+        // A tool's chip opens its choice dialog; its switch sets Never, or its default back on.
+        if let Some(name) = target.strip_prefix("market-tool-mode-") {
+            let Some(tool) = detail
+                .tools
+                .iter()
+                .chain(detail.choice.iter())
+                .find(|tool| tool.qualified == name)
+            else {
+                return Some(Err("no such tool on this page".into()));
+            };
+            return Some(Ok(Command::OpenToolMode {
+                tool: tool.qualified.clone(),
+                title: tool.title.clone(),
+                mode: tool.mode.clone(),
+            }));
         }
         if target == market::TOOLS {
             return m(MarketCommand::ToggleTools);
@@ -6476,7 +6975,11 @@ impl NativeChatHost {
                             attached: !row.on,
                         },
                         monitor::PluginSelection::Service(_)
-                        | monitor::PluginSelection::Plugin(_) => {
+                        | monitor::PluginSelection::Plugin(_)
+                        | monitor::PluginSelection::Tool(_)
+                        | monitor::PluginSelection::NewSkill
+                        | monitor::PluginSelection::PluginSkill(..)
+                        | monitor::PluginSelection::Login(_) => {
                             return Some(Err("the marketplace's rows have no switch".into()));
                         }
                     })
@@ -7844,104 +8347,6 @@ impl NativeChatHost {
         settings
     }
 
-    /// Settings → Skills as the page draws it: the toggle with a count on each side, the
-    /// search field, Add and the four things it offers, the rows the search leaves, the open
-    /// skill's pane, and the Create sheet while it is up.
-    fn skills_nodes(&self, mut settings: UiNode) -> UiNode {
-        for side in SkillScope::ALL {
-            let mut chip = UiNode::button(
-                side.element_id(),
-                format!("{} {}", side.label(), self.skills_counts.of(side)),
-            );
-            if side == self.skills_scope {
-                chip.states.push("selected".to_string());
-            }
-            settings = settings.with_child(chip);
-        }
-        settings = settings
-            .with_child(
-                UiNode::textbox(ids::SKILLS_SEARCH, "Search skills")
-                    .with_value(self.skills_query.clone()),
-            )
-            .with_child(UiNode::button(ids::SKILL_ADD, "Add"))
-            .with_child(UiNode::button(ids::SKILL_UPLOAD, "Upload skill"))
-            .with_child(UiNode::button(ids::SKILL_WRITE, "Create a skill"))
-            // The two nobody has built are statuses carrying their own sentence, not buttons:
-            // what a driver needs from them is the answer, which is the same answer the person
-            // reads in the menu.
-            .with_child(UiNode::status(ids::SKILL_WITH_BOT, NOT_YET_WITH_BOT))
-            .with_child(UiNode::status(ids::SKILL_RECORD, NOT_YET_RECORDING));
-        if let Some(error) = &self.skills_error {
-            settings = settings.with_child(UiNode::status(ids::SKILLS_ERROR, error.clone()));
-        }
-        // Saving with no sheet up is an upload, which is the one long thing this page does with
-        // nothing else on screen to say it is going.
-        if self.skill_saving && !self.skill_add_open {
-            settings = settings.with_child(UiNode::status(ids::SKILLS_SAVING, "Uploading…"));
-        }
-        let rows: Vec<&SkillSnap> = self
-            .skills
-            .iter()
-            .filter(|skill| skill_matches(&skill.name, &skill.description, &self.skills_query))
-            .collect();
-        if rows.is_empty()
-            && let Some(line) = empty_line(
-                self.skills_loading,
-                self.skills.len(),
-                self.skills_scope,
-                self.skills_error.is_some(),
-            )
-        {
-            settings = settings.with_child(UiNode::status(ids::SKILLS_EMPTY, line));
-        }
-        let mut list = UiNode::list("settings-skills-rows", "Skills");
-        for skill in &rows {
-            list = list.with_child(skill_node(
-                skill,
-                self.skill_open.as_ref().map(|open| open.id.as_str()) == Some(skill.id.as_str()),
-            ));
-        }
-        settings = settings.with_child(list);
-        // The pane stays on the open skill whatever the list is showing: a search that hides
-        // its row, or a toggle moved to the other side. It is not read off the rows for exactly
-        // that reason.
-        if let Some(open) = &self.skill_open {
-            settings = settings.with_child(skill_detail_node(open));
-        }
-        if self.skill_add_open {
-            let mut sheet = UiNode::dialog(ids::SKILL_SHEET, "New skill")
-                .with_child(UiNode::textbox(ids::SKILL_SHEET_NAME, "Name"))
-                .with_child(UiNode::textbox(ids::SKILL_SHEET_DESCRIPTION, "Description"))
-                .with_child(UiNode::textbox(ids::SKILL_SHEET_BODY, "Instructions"))
-                .with_child(UiNode::button(ids::SKILL_SHEET_CANCEL, "Cancel"))
-                .with_child(UiNode::button(
-                    ids::SKILL_SHEET_SAVE,
-                    // Dead while the create is in flight, and saying so: a Save that is still
-                    // working is not a Save that can be pressed again.
-                    if self.skill_saving {
-                        "Saving…"
-                    } else {
-                        "Save"
-                    },
-                ));
-            // The sheet's own slot, over the fields it is about. What the list was refused is
-            // said in the list's slot, and a driver reading one for the other would read a
-            // refusal from a place nobody was shown one.
-            if let Some(error) = &self.skill_add_error {
-                sheet = sheet.with_child(UiNode::status(ids::SKILL_ADD_ERROR, error.clone()));
-            }
-            settings = settings.with_child(sheet);
-        }
-        if let Some(name) = &self.skill_delete_confirm {
-            settings = settings.with_child(
-                UiNode::dialog(ids::SKILL_DELETE_SHEET, format!("Delete {name}?"))
-                    .with_child(UiNode::button(ids::SKILL_DELETE_CONFIRM, "Delete"))
-                    .with_child(UiNode::button(ids::SKILL_DELETE_CANCEL, "Cancel")),
-            );
-        }
-        settings
-    }
-
     /// The skill an invoke names, checked against the ones the page has: an id nobody is showing
     /// is a wrong address, and saying so is better than a call going out under it.
     fn skill_id(&self, id: &str) -> Option<String> {
@@ -7956,145 +8361,6 @@ impl NativeChatHost {
             .ok_or_else(|| format!("{invoke} requires arg id"))?;
         self.skill_id(&id)
             .ok_or_else(|| format!("no skill `{id}` on Settings → Skills"))
-    }
-
-    /// Typing into the search field, which is only there to be typed into while the page it
-    /// belongs to is on screen.
-    ///
-    /// The verb is not held to this: `skills.search` says what the page's search is, the way
-    /// `skills.scope` says which side is open, and neither is a claim about a keystroke landing
-    /// somewhere. A `type` or a `set_value` IS that claim, and this field is not in the tree for
-    /// it to land in until Settings is open on Skills.
-    fn skills_search(&mut self, value: String) -> Result<DispatchResult, String> {
-        if !(self.account_open && self.skills_tab) {
-            return Err(skills_off_screen(ids::SKILLS_SEARCH));
-        }
-        self.set_skills_query(value)
-    }
-
-    /// The search field on Settings → Skills: the host keeps the copy the list filters by.
-    fn set_skills_query(&mut self, value: String) -> Result<DispatchResult, String> {
-        self.skills_query = value.clone();
-        self.pending = Some(Command::SetSkillsQuery(value));
-        Ok(DispatchResult::empty())
-    }
-
-    /// One of the Skills page's controls, or `None` for a target that is not one.
-    ///
-    /// The tab itself answers from anywhere in Settings — it is how the page is reached. Every
-    /// other control here is refused while the page is not the one on screen: these ids sit in
-    /// the tree under a dialog that may be shut, and one of them answering while the person is
-    /// on Settings → Updates would be a click nobody could have made.
-    fn skill_command(&self, target: &str) -> Option<Result<Command, String>> {
-        if target == ids::SETTINGS_SKILLS {
-            return Some(Ok(Command::SetAppSettingsTab(AppSettingsTab::Skills)));
-        }
-        let found = self.skill_target(target)?;
-        if !(self.account_open && self.skills_tab) {
-            return Some(Err(skills_off_screen(target)));
-        }
-        Some(found)
-    }
-
-    /// What one of the page's controls does, leaving aside whether the page is on screen.
-    ///
-    /// A ROW IS A SKILL THIS PAGE IS SHOWING, and that is tested before anything else is read
-    /// off the target. Stripping `settings-skill-delete-` and calling what is left an id sent
-    /// `settings-skill-delete-confirm` looking for a skill called `confirm`, and the delete
-    /// dialog could not be answered at all; it did the same to `-delete-sheet`, the dialog's own
-    /// container. Membership closes both directions at once.
-    ///
-    /// An id that is shaped like a row's and names nothing on the page still answers with "no
-    /// skill", because that is a wrong address rather than an unknown control — and it is told
-    /// apart by the `skl_` the server mints, the way a recipe row's id is (see
-    /// [`recipe_row_target`]).
-    #[allow(clippy::type_complexity)]
-    fn skill_target(&self, target: &str) -> Option<Result<Command, String>> {
-        for side in SkillScope::ALL {
-            if target == side.element_id() {
-                return Some(Ok(Command::SetSkillsScope(side)));
-            }
-        }
-        let row: [(&str, fn(String) -> Command); 4] = [
-            ("settings-skill-row-", Command::OpenSkill),
-            ("settings-skill-open-", Command::OpenSkill),
-            ("settings-skill-detail-delete-", |id| {
-                Command::AskSkillDelete { id }
-            }),
-            ("settings-skill-delete-", |id| Command::AskSkillDelete {
-                id,
-            }),
-        ];
-        for (prefix, make) in row {
-            if let Some(id) = target.strip_prefix(prefix).and_then(|id| self.skill_id(id)) {
-                return Some(Ok(make(id)));
-            }
-        }
-        // The switch, which is the open skill's and nobody else's: it toggles, the way it does
-        // under a finger, so what it is now has to be read off the pane rather than guessed.
-        if let Some(id) = target.strip_prefix("settings-skill-enabled-") {
-            return Some(
-                match self.skill_open.as_ref().filter(|open| open.id == id) {
-                    Some(open) if !open.arrived => Err(format!(
-                        "`{target}` is not on the pane yet: skill `{id}` is still being fetched"
-                    )),
-                    // One at a time, whichever skill, and in the words the app answers with:
-                    // the driver and the person are told the same thing about the same fact.
-                    Some(open) if open.switching => Err(SWITCH_IN_FLIGHT.to_string()),
-                    Some(open) => Ok(Command::SetSkillEnabled {
-                        id: id.to_string(),
-                        enabled: !open.enabled,
-                    }),
-                    None => Err(format!("no skill `{id}` is open to switch")),
-                },
-            );
-        }
-        let fixed = match target {
-            ids::SKILL_WRITE => Some(Ok(Command::OpenSkillAdd)),
-            ids::SKILL_SHEET_CANCEL => Some(Ok(Command::CloseSkillAdd)),
-            ids::SKILL_CLOSE => Some(Ok(Command::CloseSkill)),
-            ids::SKILL_DELETE_CONFIRM => Some(if self.skill_delete_confirm.is_some() {
-                Ok(Command::ConfirmSkillDelete)
-            } else {
-                Err("no delete is waiting to be answered".to_string())
-            }),
-            ids::SKILL_DELETE_CANCEL => Some(Ok(Command::CloseSkillDeleteConfirm)),
-            ids::SKILL_ADD => Some(Err(
-                "`settings-skill-add` opens a menu: click what you want from it                  (`settings-skill-write`), or use `skill.create` / `skill.upload`"
-                    .to_string(),
-            )),
-            ids::SKILL_UPLOAD => Some(Err(
-                "`settings-skill-upload` opens a file picker: use `skill.upload --arg path=`                  with a SKILL.md or the folder one lives in"
-                    .to_string(),
-            )),
-            // The sheet's fields are the window's own; the driver hands the values over.
-            ids::SKILL_SHEET_SAVE => Some(Err(SHEET_IS_NOT_TYPED_INTO.to_string())),
-            ids::SKILL_WITH_BOT => Some(Err(NOT_YET_WITH_BOT.to_string())),
-            ids::SKILL_RECORD => Some(Err(NOT_YET_RECORDING.to_string())),
-            _ => None,
-        };
-        if fixed.is_some() {
-            return fixed;
-        }
-        for (prefix, _) in row {
-            if let Some(id) = target
-                .strip_prefix(prefix)
-                .filter(|id| id.starts_with("skl_"))
-            {
-                return Some(Err(format!("no skill `{id}`")));
-            }
-        }
-        if let Some(id) = target
-            .strip_prefix("settings-skill-menu-")
-            .filter(|id| id.starts_with("skl_"))
-        {
-            return Some(Err(format!(
-                "`{target}` opens that row's menu: click `{}` to open the skill or `{}` to                  delete it",
-                ids::skill_open(id),
-                ids::skill_delete(id)
-            )));
-        }
-        None
     }
 
     /// The two controls a taught skill has, or `None` for a target that is neither.
@@ -8498,6 +8764,8 @@ impl NativeChatHost {
             Command::ToggleSidebar
         } else if target == ids::HEADER_MONITOR {
             Command::ToggleComputerPane
+        } else if let Some(command) = self.notice_click(target) {
+            command?
         } else if target == ids::HEADER_COWORKER {
             if !self.sessions.iter().any(|session| session.active) {
                 return Err("the Bot chip is there only while a Bot is open".into());
@@ -8700,8 +8968,24 @@ impl NativeChatHost {
             cmd
         } else if let Some(cmd) = self.plugin_needs_command(target) {
             cmd?
-        } else if let Some(cmd) = self.skill_command(target) {
-            cmd?
+        } else if let (Some((tool, ..)), Some(choice)) =
+            (&self.tool_mode_dialog, target.strip_prefix("tool-mode-"))
+        {
+            match choice {
+                "always" => Command::SetToolMode {
+                    tool: tool.clone(),
+                    mode: "always",
+                },
+                "ask" => Command::SetToolMode {
+                    tool: tool.clone(),
+                    mode: "ask",
+                },
+                "never" => Command::SetToolMode {
+                    tool: tool.clone(),
+                    mode: "never",
+                },
+                _ => Command::CloseToolMode,
+            }
         } else if let Some(cmd) = self.taught_skill_command(target) {
             cmd?
         } else if let Some(cmd) = self.local_rule_command(target) {
@@ -8826,6 +9110,35 @@ impl NativeChatHost {
             self.pending = Some(Command::Market(MarketCommand::SetQuery(query)));
             return Some(Ok(DispatchResult::empty()));
         }
+        let skill_field = [
+            (market::SKILL_NAME, crate::state::SkillField::Name),
+            (
+                market::SKILL_DESCRIPTION,
+                crate::state::SkillField::Description,
+            ),
+            (
+                market::SKILL_INSTRUCTIONS,
+                crate::state::SkillField::Instructions,
+            ),
+        ]
+        .into_iter()
+        .find(|(id, _)| *id == target);
+        if let Some((_, field)) = skill_field {
+            let Some(skill) = self.market_skill.as_mut().filter(|s| s.mine) else {
+                return Some(Err("no skill of yours is open to edit".into()));
+            };
+            let Some(fields) = skill.fields.as_mut() else {
+                return Some(Err("the skill is still loading".into()));
+            };
+            let slot = match field {
+                crate::state::SkillField::Name => &mut fields.0,
+                crate::state::SkillField::Description => &mut fields.1,
+                crate::state::SkillField::Instructions => &mut fields.2,
+            };
+            *slot = next(slot);
+            self.pending = Some(Command::SetSkillField(field, slot.clone()));
+            return Some(Ok(DispatchResult::empty()));
+        }
         if target == market::BOTS_SEARCH {
             let Some(modal) = self.monitor_modal.as_mut().filter(|m| m.bots_for.is_some()) else {
                 return Some(Err("no Bots list is open".into()));
@@ -8941,9 +9254,6 @@ impl NativeChatHost {
         if target == "settings-logins-search" {
             return self.set_site_login_query(value.to_string());
         }
-        if target == ids::SKILLS_SEARCH {
-            return self.skills_search(value.to_string());
-        }
         if target == ids::RELAY_ADDR || target == ids::RELAY_KEY {
             return self.set_relay_field(target, value);
         }
@@ -9018,9 +9328,6 @@ impl NativeChatHost {
         if target == "settings-logins-search" {
             return self.set_site_login_query(format!("{}{text}", self.site_login_query));
         }
-        if target == ids::SKILLS_SEARCH {
-            return self.skills_search(format!("{}{text}", self.skills_query));
-        }
         if target == ids::RELAY_ADDR {
             let address = format!("{}{text}", self.reply_source.relay.address);
             return self.set_relay_field(target, &address);
@@ -9084,23 +9391,6 @@ impl NativeChatHost {
         }
         if target == ids::RELAY_ADDR || target == ids::RELAY_KEY {
             return Err(self.relay_field_keys(target));
-        }
-        if target == ids::SKILLS_SEARCH {
-            return match key_token(key)?.as_str() {
-                "backspace" => {
-                    let mut value = self.skills_query.clone();
-                    value.pop();
-                    self.skills_search(value)
-                }
-                // The list filters as the text changes; Enter has nothing left to do — but a
-                // key pressed at a field that is not on screen did not land, and saying it did
-                // would be the same lie as taking the text.
-                "enter" if self.account_open && self.skills_tab => Ok(DispatchResult::empty()),
-                "enter" => Err(skills_off_screen(target)),
-                other => Err(format!(
-                    "unhandled key `{other}` on `{target}` (Enter, Backspace)"
-                )),
-            };
         }
         if let Some(which) = picker_field(target, |ids| ids.search) {
             if let Some(closed) = self.picker_search_closed(which, target) {
@@ -9401,7 +9691,379 @@ impl NativeChatHost {
         })
     }
 
+    /// The open Bot's notices not seen yet.
+    fn unread_notices(&self) -> usize {
+        self.notices
+            .iter()
+            .filter(|(n, _)| !n.read && n.bot.is_some() && n.bot == self.notice_bot)
+            .count()
+    }
+
+    /// The open Bot's notices the page shows (the Unread filter applied).
+    fn shown_notices(&self) -> Vec<&crate::notifications::Notice> {
+        self.notices
+            .iter()
+            .map(|(n, _)| n)
+            .filter(|n| n.bot.is_some() && n.bot == self.notice_bot)
+            .filter(|n| !self.notice_unread_only || !n.read)
+            .collect()
+    }
+
+    /// The bell's page as the tree has it: the unread count, the toolbar as the selection makes
+    /// it, each shown row with its controls, the empty states, and the Undo bar.
+    fn notifications_node(&self) -> UiNode {
+        use crate::components::notifications_pane as pane;
+        let all = self
+            .notices
+            .iter()
+            .filter(|(n, _)| n.bot.is_some() && n.bot == self.notice_bot)
+            .count();
+        let mut node = UiNode::dialog(pane::PANE, "Notifications");
+        let unread = self.unread_notices();
+        if unread > 0 {
+            node = node.with_child(
+                UiNode::status(pane::UNREAD_COUNT, "Unread").with_value(unread.to_string()),
+            );
+        }
+        if self.notice_undo {
+            node = node
+                .with_child(UiNode::status(pane::UNDO_BAR, "Deleted"))
+                .with_child(UiNode::button(pane::UNDO, "Undo"));
+        }
+        if all == 0 {
+            return node.with_child(UiNode::status(pane::EMPTY, "You're all caught up"));
+        }
+        let shown = self.shown_notices();
+        let ticked = self.notice_selection.len();
+        let all_ticked =
+            !shown.is_empty() && shown.iter().all(|n| self.notice_selection.contains(&n.id));
+        let mut select_all =
+            UiNode::checkbox(pane::SELECT_ALL, "Select all").with_checked(all_ticked);
+        select_all = select_all.with_value(if all_ticked {
+            "all"
+        } else if ticked > 0 {
+            "some"
+        } else {
+            "none"
+        });
+        node = node.with_child(select_all);
+        if ticked > 0 {
+            node = node
+                .with_child(UiNode::status(
+                    pane::SELECTED_COUNT,
+                    format!("{ticked} selected"),
+                ))
+                .with_child(UiNode::button(pane::MARK_READ, "Mark read"))
+                .with_child(UiNode::button(pane::MARK_UNREAD, "Mark unread"))
+                .with_child(UiNode::button(pane::DELETE_SELECTED, "Delete"));
+        } else {
+            let mut all_tab = UiNode::button(pane::FILTER_ALL, "All");
+            let mut unread_tab = UiNode::button(pane::FILTER_UNREAD, format!("Unread ({unread})"));
+            if self.notice_unread_only {
+                unread_tab.states.push("selected".into())
+            } else {
+                all_tab.states.push("selected".into())
+            }
+            node = node
+                .with_child(all_tab)
+                .with_child(unread_tab)
+                .with_child(
+                    UiNode::button(pane::MARK_ALL_READ, "Mark all read").with_enabled(unread > 0),
+                )
+                .with_child(UiNode::button(pane::DELETE_ALL, "Delete all"));
+        }
+        if shown.is_empty() {
+            node = node
+                .with_child(UiNode::status(
+                    pane::EMPTY_UNREAD,
+                    "No unread notifications",
+                ))
+                .with_child(UiNode::button(pane::SHOW_ALL, "Show all"));
+        }
+        for n in shown {
+            let mut row =
+                UiNode::listitem(pane::row_id(&n.id), format!("{} · {}", n.place, n.said))
+                    .with_value(if n.read { "read" } else { "unread" });
+            if self.notice_expanded.as_deref() == Some(n.id.as_str()) {
+                row.states.push("expanded".into());
+                row = row.with_child(UiNode::status(pane::details_id(&n.id), n.code.clone()));
+            }
+            node = node
+                .with_child(row)
+                .with_child(
+                    UiNode::checkbox(pane::select_id(&n.id), "Select")
+                        .with_checked(self.notice_selection.contains(&n.id)),
+                )
+                .with_child(UiNode::button(pane::copy_id(&n.id), "Copy"))
+                .with_child(UiNode::button(
+                    pane::read_toggle_id(&n.id),
+                    if n.read { "Mark unread" } else { "Mark read" },
+                ))
+                .with_child(UiNode::button(pane::delete_id(&n.id), "Delete"));
+        }
+        node
+    }
+
+    /// The toast, while one shows.
+    fn toast_node(&self) -> Option<UiNode> {
+        use crate::components::notifications_pane as pane;
+        let id = self.toast.as_ref()?;
+        let (n, name) = self.notices.iter().find(|(n, _)| &n.id == id)?;
+        let title = match name {
+            Some(name) => format!("{name} · {}", n.place),
+            None => n.place.clone(),
+        };
+        Some(
+            UiNode::dialog(pane::TOAST, title)
+                .with_child(UiNode::status(
+                    format!("{}-said", pane::TOAST),
+                    n.said.clone(),
+                ))
+                .with_child(UiNode::button(pane::TOAST_CLOSE, "Close"))
+                .with_child(UiNode::button(pane::TOAST_COPY, "Copy"))
+                .with_child(UiNode::button(pane::TOAST_OPEN, "Open notifications")),
+        )
+    }
+
+    /// A click on the bell, its page or the toast.
+    fn notice_click(&self, target: &str) -> Option<Result<Command, String>> {
+        use crate::components::notifications_pane as pane;
+        if target == crate::components::title_bar::BELL {
+            return Some(Ok(Command::ToggleNotifications));
+        }
+        if let Some(id) = &self.toast {
+            match target {
+                t if t == pane::TOAST_CLOSE => return Some(Ok(Command::DismissToast)),
+                t if t == pane::TOAST_COPY => return Some(Ok(Command::CopyNotice(id.clone()))),
+                t if t == pane::TOAST_OPEN => {
+                    let bot = self
+                        .notices
+                        .iter()
+                        .find(|(n, _)| &n.id == id)
+                        .and_then(|(n, _)| n.bot.clone());
+                    return Some(Ok(Command::OpenNotificationsFor(bot)));
+                }
+                _ => {}
+            }
+        }
+        if !self.notifications_open {
+            return None;
+        }
+        let shown = self.shown_notices();
+        let selected: Vec<String> = self.notice_selection.iter().cloned().collect();
+        // The toolbar shows the filter and the all-actions with nothing ticked, the selection's
+        // actions with something ticked; a click on the one not drawn is refused, as on screen.
+        let selecting = !selected.is_empty();
+        let only_unticked = [
+            pane::FILTER_ALL,
+            pane::FILTER_UNREAD,
+            pane::MARK_ALL_READ,
+            pane::DELETE_ALL,
+        ];
+        let only_ticked = [pane::MARK_READ, pane::MARK_UNREAD, pane::DELETE_SELECTED];
+        if (selecting && only_unticked.contains(&target))
+            || (!selecting && only_ticked.contains(&target))
+        {
+            return Some(Err(format!(
+                "`{target}` is not on the toolbar while {} rows are ticked",
+                selected.len()
+            )));
+        }
+        let command = match target {
+            t if t == pane::SELECT_ALL => Command::SelectAllNotices,
+            t if t == pane::FILTER_ALL => Command::FilterNotices(false),
+            t if t == pane::FILTER_UNREAD => Command::FilterNotices(true),
+            t if t == pane::SHOW_ALL => Command::FilterNotices(false),
+            t if t == pane::MARK_READ => Command::SetNoticesRead(selected, true),
+            t if t == pane::MARK_UNREAD => Command::SetNoticesRead(selected, false),
+            t if t == pane::DELETE_SELECTED => Command::DeleteNotices(selected),
+            t if t == pane::MARK_ALL_READ => Command::SetNoticesRead(
+                shown
+                    .iter()
+                    .filter(|n| !n.read)
+                    .map(|n| n.id.clone())
+                    .collect(),
+                true,
+            ),
+            t if t == pane::DELETE_ALL => {
+                Command::DeleteNotices(shown.iter().map(|n| n.id.clone()).collect())
+            }
+            t if t == pane::UNDO && self.notice_undo => Command::UndoNoticeDelete,
+            _ => {
+                let n = shown.iter().find(|n| {
+                    [
+                        pane::row_id(&n.id),
+                        pane::select_id(&n.id),
+                        pane::copy_id(&n.id),
+                        pane::read_toggle_id(&n.id),
+                        pane::delete_id(&n.id),
+                    ]
+                    .contains(&target.to_string())
+                })?;
+                let id = n.id.clone();
+                if target == pane::row_id(&id) {
+                    Command::ExpandNotice(id)
+                } else if target == pane::select_id(&id) {
+                    Command::SelectNotice(id)
+                } else if target == pane::copy_id(&id) {
+                    Command::CopyNotice(id)
+                } else if target == pane::read_toggle_id(&id) {
+                    Command::SetNoticesRead(vec![id], !n.read)
+                } else {
+                    Command::DeleteNotices(vec![id])
+                }
+            }
+        };
+        Some(Ok(command))
+    }
+
+    /// The Bot an argument names, by id or by name; `None` for "none"; the open Bot when absent.
+    fn notice_bot_arg(&self, args: &serde_json::Value) -> Result<Option<String>, String> {
+        let Some(asked) = invoke_arg_str(args, &["bot", "bot_id", "botId"]) else {
+            return Ok(self.notice_bot.clone());
+        };
+        if asked.eq_ignore_ascii_case("none") {
+            return Ok(None);
+        }
+        let by_id = self.sessions.iter().find(|s| s.id == asked);
+        let by_name = self
+            .sessions
+            .iter()
+            .find(|s| s.title.eq_ignore_ascii_case(&asked));
+        by_id
+            .or(by_name)
+            .map(|s| Some(s.id.clone()))
+            .ok_or_else(|| format!("no Bot `{asked}`"))
+    }
+
+    /// `notices.*`: everything a driver needs to read, make and tidy the notifications.
+    ///
+    /// - `notices.list` `{bot?, last?, all?}` → the newest `last` (20) of a Bot's (the open
+    ///   Bot's by default; `all: true` for every Bot's), each as `Notice::to_json`.
+    /// - `notices.get` `{id}` → one, with `copyText`, the block Copy gives.
+    /// - `notices.count` `{bot?}` → `{total, unread}`; `{bot: "all"}` counts every Bot's.
+    /// - `notices.fake` `{bot?, place?, said?, raw?}` → a made-up notice, toast and all.
+    /// - `notices.dismiss` → the toast goes.  `notices.open` `{bot?}` → the bell's page.
+    /// - `notices.copy` `{id}` → onto the clipboard, and its text returned.
+    /// - `notices.read` `{bot?}` → counted as seen.  `notices.clear` `{bot?}` → one Bot's go.
+    /// - `notices.clear-all` → every notice goes.
+    fn notices_invoke(
+        &mut self,
+        name: &str,
+        args: &serde_json::Value,
+    ) -> Option<Result<DispatchResult, String>> {
+        let json =
+            |n: &crate::notifications::Notice, name: &Option<String>| n.to_json(name.as_deref());
+        let answer = match name {
+            "notices.list" => (|| {
+                let all = args.get("all").and_then(|v| v.as_bool()).unwrap_or(false);
+                let last = args
+                    .get("last")
+                    .and_then(|v| v.as_u64().or_else(|| v.as_str()?.parse().ok()))
+                    .unwrap_or(20) as usize;
+                let bot = if all {
+                    None
+                } else {
+                    self.notice_bot_arg(args)?
+                };
+                let rows: Vec<_> = self
+                    .notices
+                    .iter()
+                    .filter(|(n, _)| all || n.bot == bot)
+                    .take(last)
+                    .map(|(n, name)| json(n, name))
+                    .collect();
+                Ok(DispatchResult::json(serde_json::json!(rows)))
+            })(),
+            "notices.get" => (|| {
+                let id = invoke_arg_str(args, &["id"]).ok_or("notices.get requires arg id")?;
+                let (n, name) = self
+                    .notices
+                    .iter()
+                    .find(|(n, _)| n.id == id)
+                    .ok_or_else(|| format!("no notice `{id}`"))?;
+                let mut out = json(n, name);
+                out["copyText"] = serde_json::json!(n.copy_text(name.as_deref()));
+                Ok(DispatchResult::json(out))
+            })(),
+            "notices.count" => (|| {
+                let every = invoke_arg_str(args, &["bot"]).is_some_and(|b| b == "all");
+                let bot = if every {
+                    None
+                } else {
+                    self.notice_bot_arg(args)?
+                };
+                let mine: Vec<_> = self
+                    .notices
+                    .iter()
+                    .filter(|(n, _)| every || n.bot == bot)
+                    .collect();
+                let unread = mine.iter().filter(|(n, _)| !n.read).count();
+                Ok(DispatchResult::json(
+                    serde_json::json!({ "total": mine.len(), "unread": unread }),
+                ))
+            })(),
+            "notices.copy" => (|| {
+                let id = invoke_arg_str(args, &["id"]).ok_or("notices.copy requires arg id")?;
+                let (n, name) = self
+                    .notices
+                    .iter()
+                    .find(|(n, _)| n.id == id)
+                    .ok_or_else(|| format!("no notice `{id}`"))?;
+                let text = n.copy_text(name.as_deref());
+                self.pending = Some(Command::CopyNotice(id));
+                Ok(DispatchResult::json(
+                    serde_json::json!({ "copyText": text }),
+                ))
+            })(),
+            "notices.fake" => (|| {
+                let bot = self.notice_bot_arg(args)?;
+                self.pending = Some(Command::FakeNotice {
+                    bot,
+                    place: invoke_arg_str(args, &["place"]).unwrap_or_else(|| "Test".into()),
+                    said: invoke_arg_str(args, &["said", "message"])
+                        .unwrap_or_else(|| "A test notification from the driver.".into()),
+                    raw: invoke_arg_str(args, &["raw"]),
+                });
+                Ok(DispatchResult::empty())
+            })(),
+            "notices.dismiss" => {
+                self.pending = Some(Command::DismissToast);
+                Ok(DispatchResult::empty())
+            }
+            "notices.open" => (|| {
+                let bot = self.notice_bot_arg(args)?;
+                self.pending = Some(Command::OpenNotificationsFor(bot));
+                Ok(DispatchResult::empty())
+            })(),
+            "notices.read" => (|| {
+                let bot = self.notice_bot_arg(args)?;
+                self.pending = Some(Command::MarkNoticesRead(bot));
+                Ok(DispatchResult::empty())
+            })(),
+            "notices.clear" => (|| {
+                let bot = self.notice_bot_arg(args)?;
+                if bot.is_none() {
+                    return Err(
+                        "notices.clear needs a Bot; notices.clear-all clears every one".into(),
+                    );
+                }
+                self.pending = Some(Command::ClearNotices(bot));
+                Ok(DispatchResult::empty())
+            })(),
+            "notices.clear-all" => {
+                self.pending = Some(Command::ClearNotices(None));
+                Ok(DispatchResult::empty())
+            }
+            _ => return None,
+        };
+        Some(answer)
+    }
+
     fn invoke(&mut self, name: &str, args: &serde_json::Value) -> Result<DispatchResult, String> {
+        if let Some(answer) = self.notices_invoke(name, args) {
+            return answer;
+        }
         let cmd = match name {
             "chat.new" => Command::NewChat,
             "sidebar.toggle" => Command::ToggleSidebar,
@@ -9700,21 +10362,10 @@ impl NativeChatHost {
             // Settings → Skills. A skill is prose the model reads before it works; `recipe.*`
             // is the taped replay of clicks, and the two verbs never cross.
             "skills.open" => Command::OpenSkills,
-            "skills.scope" => {
-                let word = invoke_arg_str(args, &["scope", "side"])
-                    .ok_or_else(|| "skills.scope requires arg scope".to_string())?;
-                Command::SetSkillsScope(
-                    SkillScope::from_word(&word).ok_or_else(|| {
-                        format!("unknown skills scope `{word}` (yours, discover)")
-                    })?,
-                )
-            }
-            // No `q` clears the search.
-            "skills.search" => {
-                let query = invoke_arg_str(args, &["q", "query"]).unwrap_or_default();
-                return self.set_skills_query(query);
-            }
-            "skill.open" => Command::OpenSkill(self.invoke_skill_id(args, "skill.open")?),
+            // A skill's page in the Plugins window (Settings → Skills is gone).
+            "skill.open" => Command::OpenTaughtSkill {
+                id: Some(self.invoke_skill_id(args, "skill.open")?),
+            },
             "skill.create" if self.skill_saving => return Err(ALREADY_SAVING.to_string()),
             "skill.create" => Command::CreateSkill {
                 name: invoke_arg_str(args, &["name"])
@@ -11017,375 +11668,14 @@ mod tests {
         ));
     }
 
-    fn skill(id: &str, name: &str, description: &str) -> SkillSnap {
-        SkillSnap {
-            id: id.into(),
-            name: name.into(),
-            source: "authored",
-            description: description.into(),
-            draft: false,
-            enabled: true,
-        }
-    }
-
-    fn open_skill(id: &str, name: &str) -> OpenSkillSnap {
-        OpenSkillSnap {
-            id: id.into(),
-            name: name.into(),
-            body: "Ask for the receipt first.".into(),
-            arrived: true,
-            updated_at_ms: 1_700_000_000_000,
-            enabled: true,
-            approved_at_ms: Some(1_700_000_000_000),
-            switching: false,
-            error: None,
-        }
-    }
-
-    /// A host with Settings open on Skills and two of them listed.
+    /// A host whose library has two skills, for the `skill.*` verbs.
     fn skills_host() -> NativeChatHost {
         let mut host = host();
-        host.account_open = true;
-        host.skills_tab = true;
         host.skills = vec![
-            skill("skl_1", "expense-report", "How we file expenses"),
-            skill(
-                "skl_2",
-                "new-hire",
-                "First week for somebody who just joined",
-            ),
+            SkillSnap { id: "skl_1".into() },
+            SkillSnap { id: "skl_2".into() },
         ];
-        host.skills_counts = crate::state::SkillCounts {
-            yours: 2,
-            discover: 5,
-        };
         host
-    }
-
-    /// The tree is the page: both sides of the toggle with their counts, the search field with
-    /// what is in it, and a row per skill carrying what that skill is for.
-    #[test]
-    fn the_skills_tab_reads_as_the_page_reads() {
-        let host = skills_host();
-        let tree = host.snapshot();
-        assert_eq!(
-            tree.find(SkillScope::Yours.element_id()).unwrap().name,
-            "Yours 2"
-        );
-        let discover = tree.find(SkillScope::Discover.element_id()).unwrap();
-        assert_eq!(discover.name, "Discover 5");
-        assert!(
-            !discover.states.contains(&"selected".to_string()),
-            "the side that is not open is not the one marked"
-        );
-        assert!(
-            tree.find(SkillScope::Yours.element_id())
-                .unwrap()
-                .states
-                .contains(&"selected".to_string())
-        );
-        let row = tree.find(&ids::skill("skl_1")).unwrap();
-        assert_eq!(row.name, "expense-report");
-        assert_eq!(
-            row.value.as_deref(),
-            Some("How we file expenses"),
-            "the description is what the model chooses by, so it is what a driver can assert on"
-        );
-        assert!(row.states.contains(&"authored".to_string()));
-        assert!(tree.find(&ids::skill_delete("skl_1")).is_some());
-        assert!(tree.find(ids::SKILLS_EMPTY).is_none());
-    }
-
-    /// A skill with no prose in it cannot be invoked, and that is the one thing worth knowing
-    /// about it — so it is a state, not something to be worked out from a count.
-    #[test]
-    fn a_draft_says_so_on_its_row() {
-        let mut host = skills_host();
-        host.skills[1].draft = true;
-        host.skills[1].source = "uploaded";
-        let tree = host.snapshot();
-        assert!(
-            !tree
-                .find(&ids::skill("skl_1"))
-                .unwrap()
-                .states
-                .contains(&"draft".to_string())
-        );
-        let draft = tree.find(&ids::skill("skl_2")).unwrap();
-        assert!(draft.states.contains(&"draft".to_string()));
-        assert!(draft.states.contains(&"uploaded".to_string()));
-
-        // And the switch, which the row wears as a chip: after this branch most rows in a
-        // library are off, because every lesson a model writes from a recording starts off.
-        assert!(
-            !draft.states.contains(&"off".to_string()),
-            "a draft is not a skill that was switched off"
-        );
-        host.skills[1].enabled = false;
-        assert!(
-            host.snapshot()
-                .find(&ids::skill("skl_2"))
-                .unwrap()
-                .states
-                .contains(&"off".to_string())
-        );
-    }
-
-    /// The tree lists the rows the search leaves, exactly the rows the screen has: a driver
-    /// shown a row nobody can see would click something that is not there.
-    #[test]
-    fn the_search_leaves_the_driver_the_same_rows_it_leaves_the_screen() {
-        let mut host = skills_host();
-        host.dispatch(&Op::Invoke {
-            name: "skills.search".into(),
-            args: serde_json::json!({ "q": "joined" }),
-        })
-        .unwrap();
-        assert!(matches!(
-            host.take_command().unwrap(),
-            Command::SetSkillsQuery(query) if query == "joined"
-        ));
-        let tree = host.snapshot();
-        assert_eq!(
-            tree.find(ids::SKILLS_SEARCH).unwrap().value.as_deref(),
-            Some("joined")
-        );
-        assert!(tree.find(&ids::skill("skl_2")).is_some());
-        assert!(tree.find(&ids::skill("skl_1")).is_none());
-        // Nothing left is a sentence about the search, not about the library.
-        host.skills_query = "payroll".into();
-        assert_eq!(
-            host.snapshot().find(ids::SKILLS_EMPTY).unwrap().name,
-            "No skills match."
-        );
-    }
-
-    /// The pane stays on the open skill whatever the list is showing — a search that hides its
-    /// row, and a toggle moved to the side the skill is not on. The screen keeps it on the open
-    /// id alone, and a tree that read it off the rows would go blank where the person sees a
-    /// pane.
-    #[test]
-    fn the_open_skill_keeps_its_pane_whatever_the_list_shows() {
-        let mut host = skills_host();
-        host.skill_open = Some(open_skill("skl_1", "expense-report"));
-        host.skills_query = "joined".into();
-        let tree = host.snapshot();
-        assert!(tree.find(&ids::skill("skl_1")).is_none());
-        let pane = tree.find(&ids::skill_detail("skl_1")).unwrap();
-        assert_eq!(pane.name, "expense-report");
-        assert!(tree.find(&ids::skill_updated("skl_1")).is_some());
-        assert!(tree.find(ids::SKILL_CLOSE).is_some());
-
-        // The other side of the toggle: the open skill is not among the rows at all.
-        host.skills_query = String::new();
-        host.skills.clear();
-        host.skills_scope = SkillScope::Discover;
-        assert!(
-            host.snapshot().find(&ids::skill_detail("skl_1")).is_some(),
-            "the pane is on screen, so it is in the tree"
-        );
-    }
-
-    /// What a skill SAYS is on its pane and nowhere else — a row carries what it is FOR. A
-    /// driver that has just written one down reads it back here or not at all.
-    #[test]
-    fn the_pane_carries_the_prose_and_tells_waiting_from_refused() {
-        let mut host = skills_host();
-        let mut open = open_skill("skl_1", "expense-report");
-        open.body = String::new();
-        open.arrived = false;
-        host.skill_open = Some(open);
-        let tree = host.snapshot();
-        assert_eq!(tree.find(ids::SKILL_LOADING).unwrap().name, "Loading…");
-        assert!(tree.find(&ids::skill_body("skl_1")).is_none());
-        assert!(tree.find(ids::SKILL_ERROR).is_none());
-        assert!(
-            tree.find(&ids::skill_updated("skl_1")).is_none(),
-            "the pane draws that row once the fetch has answered, and not before"
-        );
-
-        host.skill_open = Some(open_skill("skl_1", "expense-report"));
-        let tree = host.snapshot();
-        assert_eq!(
-            tree.find(&ids::skill_body("skl_1"))
-                .unwrap()
-                .value
-                .as_deref(),
-            Some("Ask for the receipt first.")
-        );
-        assert!(tree.find(ids::SKILL_LOADING).is_none());
-
-        // A skill that arrived with no prose in it is a draft, not a fetch that is still
-        // going: the pane says the sentence a person reads, and says it is not waiting.
-        let mut draft = open_skill("skl_1", "expense-report");
-        draft.body = String::new();
-        host.skill_open = Some(draft);
-        let tree = host.snapshot();
-        assert!(tree.find(ids::SKILL_LOADING).is_none());
-        let body = tree.find(&ids::skill_body("skl_1")).unwrap();
-        assert_eq!(body.name, NOTHING_WRITTEN_YET);
-        assert_eq!(body.value.as_deref(), Some(""));
-
-        let mut refused = open_skill("skl_1", "expense-report");
-        refused.body = String::new();
-        refused.arrived = false;
-        refused.error = Some("no such skill".into());
-        host.skill_open = Some(refused);
-        let tree = host.snapshot();
-        assert_eq!(tree.find(ids::SKILL_ERROR).unwrap().name, "no such skill");
-        assert!(
-            tree.find(ids::SKILL_LOADING).is_none(),
-            "a pane that was refused is not a pane that is still coming"
-        );
-        assert!(
-            tree.find(ids::SKILLS_ERROR).is_none(),
-            "the pane's refusal is the pane's; the list was refused nothing"
-        );
-    }
-
-    /// The sheet's refusal is the sheet's, over the fields it is about. The list's slot says
-    /// nothing about a create, and the three fields point at the verb that takes their values.
-    #[test]
-    fn the_sheet_carries_its_own_refusal_and_its_fields_name_the_verb() {
-        let mut host = skills_host();
-        host.skill_add_open = true;
-        host.skill_add_error = Some("that name is taken".into());
-        host.skills_error = Some("the library would not load".into());
-        let tree = host.snapshot();
-        assert_eq!(
-            tree.find(ids::SKILL_ADD_ERROR).unwrap().name,
-            "that name is taken"
-        );
-        assert_eq!(
-            tree.find(ids::SKILLS_ERROR).unwrap().name,
-            "the library would not load",
-            "two slots, because they are two places on screen"
-        );
-        assert_eq!(tree.find(ids::SKILL_SHEET_SAVE).unwrap().name, "Save");
-
-        for field in [
-            ids::SKILL_SHEET_NAME,
-            ids::SKILL_SHEET_DESCRIPTION,
-            ids::SKILL_SHEET_BODY,
-        ] {
-            let refused = host
-                .dispatch(&Op::type_text(field, "expense-report"))
-                .unwrap_err();
-            assert!(refused.contains("skill.create"), "{refused}");
-        }
-
-        host.skill_saving = true;
-        assert_eq!(
-            host.snapshot().find(ids::SKILL_SHEET_SAVE).unwrap().name,
-            "Saving…",
-            "a Save that is still working is not a Save that can be pressed again"
-        );
-    }
-
-    /// These ids sit in the tree under a dialog that may be shut. One of them answering while
-    /// the person is on another tab is a click nobody could have made.
-    #[test]
-    fn a_skills_control_off_screen_is_refused() {
-        let mut host = skills_host();
-        host.skills_tab = false;
-        host.updates_tab = true;
-        let refused = host.click(ids::SKILL_RECORD).unwrap_err();
-        assert!(refused.contains("skills.open"), "{refused}");
-        assert!(
-            host.click(&ids::skill("skl_1"))
-                .unwrap_err()
-                .contains("skills.open")
-        );
-        // A click is not the only thing that claims to have landed on an element. The search
-        // field is not in the tree while the page is shut, and typing into what is not there
-        // must not quietly become a change to the page.
-        for op in [
-            Op::type_text(ids::SKILLS_SEARCH, "expense"),
-            Op::key(ids::SKILLS_SEARCH, "Backspace"),
-            Op::key(ids::SKILLS_SEARCH, "Enter"),
-            Op::SetValue {
-                target: ids::SKILLS_SEARCH.into(),
-                value: "expense".into(),
-            },
-        ] {
-            let refused = host.dispatch(&op).unwrap_err();
-            assert!(refused.contains("skills.open"), "{refused}");
-        }
-        assert!(host.skills_query.is_empty(), "nothing was typed anywhere");
-        assert!(host.take_command().is_none());
-        // The tab itself is how the page is reached, so it answers from anywhere in Settings.
-        host.click(ids::SETTINGS_SKILLS).unwrap();
-        assert!(matches!(
-            host.take_command().unwrap(),
-            Command::SetAppSettingsTab(AppSettingsTab::Skills)
-        ));
-    }
-
-    /// Delete asks first, as every recipe does. The menu it is chosen from opens under the
-    /// pointer with Delete one row under Open.
-    #[test]
-    fn deleting_a_skill_asks_before_it_deletes() {
-        let mut host = skills_host();
-        host.click(&ids::skill_delete("skl_1")).unwrap();
-        assert!(matches!(
-            host.take_command().unwrap(),
-            Command::AskSkillDelete { id } if id == "skl_1"
-        ));
-        // The pane's Delete is its own control with its own id, and asks the same question.
-        host.click(&ids::skill_detail_delete("skl_1")).unwrap();
-        assert!(matches!(
-            host.take_command().unwrap(),
-            Command::AskSkillDelete { id } if id == "skl_1"
-        ));
-        assert_ne!(
-            ids::skill_delete("skl_1"),
-            ids::skill_detail_delete("skl_1")
-        );
-
-        // Nothing is deleted until the dialog is answered, and there is no answering a dialog
-        // that is not up.
-        assert!(host.click(ids::SKILL_DELETE_CONFIRM).is_err());
-        assert!(
-            host.invoke("skill.delete.confirm", &serde_json::json!({}))
-                .is_err()
-        );
-        host.skill_delete_confirm = Some("expense-report".into());
-        assert_eq!(
-            host.snapshot().find(ids::SKILL_DELETE_SHEET).unwrap().name,
-            "Delete expense-report?"
-        );
-        host.click(ids::SKILL_DELETE_CONFIRM).unwrap();
-        assert!(matches!(
-            host.take_command().unwrap(),
-            Command::ConfirmSkillDelete
-        ));
-        host.click(ids::SKILL_DELETE_CANCEL).unwrap();
-        assert!(matches!(
-            host.take_command().unwrap(),
-            Command::CloseSkillDeleteConfirm
-        ));
-    }
-
-    /// A container is not a row. Stripping `settings-skill-delete-` and calling what is left an
-    /// id sent the delete dialog's own two ids looking for skills called `confirm` and `sheet`,
-    /// and the dialog could not be answered at all.
-    #[test]
-    fn a_dialogs_own_id_is_never_read_as_a_rows() {
-        let mut host = skills_host();
-        for container in [ids::SKILL_DELETE_SHEET, ids::SKILL_SHEET] {
-            let refused = host.click(container).unwrap_err();
-            assert!(
-                !refused.contains("no skill"),
-                "`{container}` is a dialog, not a row: {refused}"
-            );
-        }
-        // And an id that is shaped like a row's and names nothing is still a wrong address,
-        // which is worth saying plainly.
-        assert!(
-            host.click(&ids::skill_delete("skl_9"))
-                .unwrap_err()
-                .contains("no skill `skl_9`")
-        );
     }
 
     /// A second create while the first is still going is told so. The person cannot ask twice —
@@ -11405,108 +11695,6 @@ mod tests {
             assert_eq!(refused, "a skill is already being saved");
         }
         assert!(host.take_command().is_none());
-        // And the page says it is going, where an upload has no sheet to say it in.
-        host.skill_add_open = false;
-        assert_eq!(
-            host.snapshot().find(ids::SKILLS_SAVING).unwrap().name,
-            "Uploading…"
-        );
-        host.skill_add_open = true;
-        assert!(
-            host.snapshot().find(ids::SKILLS_SAVING).is_none(),
-            "the sheet's own Save says so while it is the sheet that is saving"
-        );
-    }
-
-    /// The "…" is not in the tree — the row publishes itself and its Delete, and the menu's two
-    /// rows are what a driver clicks. But it is on screen, and an id read off the screen is an
-    /// id a driver will try, so it answers with the two it should have used.
-    #[test]
-    fn a_rows_menu_says_what_to_click_instead() {
-        let mut host = skills_host();
-        let refused = host.click("settings-skill-menu-skl_1").unwrap_err();
-        assert!(refused.contains(&ids::skill_open("skl_1")), "{refused}");
-        assert!(refused.contains(&ids::skill_delete("skl_1")), "{refused}");
-    }
-
-    /// Each control goes where it says it goes, and the two that open something the driver
-    /// cannot work say what to use instead rather than opening it.
-    #[test]
-    fn the_skills_controls_go_where_they_say() {
-        let mut host = skills_host();
-        let opened = |host: &mut NativeChatHost, target: &str| {
-            host.click(target).unwrap();
-            host.take_command().unwrap()
-        };
-        assert!(matches!(
-            opened(&mut host, &ids::skill("skl_2")),
-            Command::OpenSkill(id) if id == "skl_2"
-        ));
-        assert!(matches!(
-            opened(&mut host, &ids::skill_open("skl_2")),
-            Command::OpenSkill(id) if id == "skl_2"
-        ));
-        assert!(matches!(
-            opened(&mut host, &ids::skill_delete("skl_1")),
-            Command::AskSkillDelete { id } if id == "skl_1"
-        ));
-        assert!(matches!(
-            opened(&mut host, SkillScope::Discover.element_id()),
-            Command::SetSkillsScope(SkillScope::Discover)
-        ));
-        assert!(matches!(
-            opened(&mut host, ids::SKILL_WRITE),
-            Command::OpenSkillAdd
-        ));
-        assert!(matches!(
-            opened(&mut host, ids::SKILL_CLOSE),
-            Command::CloseSkill
-        ));
-        assert!(matches!(
-            opened(&mut host, ids::SETTINGS_SKILLS),
-            Command::SetAppSettingsTab(AppSettingsTab::Skills)
-        ));
-        // The picker and the sheet's fields belong to the window; the verbs take the values.
-        assert!(
-            host.click(ids::SKILL_UPLOAD)
-                .unwrap_err()
-                .contains("skill.upload")
-        );
-        assert!(
-            host.click(ids::SKILL_SHEET_SAVE)
-                .unwrap_err()
-                .contains("skill.create")
-        );
-        assert!(host.click(ids::SKILL_ADD).unwrap_err().contains("menu"));
-    }
-
-    /// The two ways nobody has built are in the tree with the sentence saying what would have
-    /// to be built, and clicking one answers with that sentence rather than doing nothing.
-    #[test]
-    fn the_ways_nobody_built_say_what_is_missing() {
-        let mut host = skills_host();
-        let tree = host.snapshot();
-        assert!(
-            tree.find(ids::SKILL_WITH_BOT)
-                .unwrap()
-                .name
-                .starts_with("Not yet")
-        );
-        // The half of Record that was missing is built, and the sentence says where it is
-        // rather than asking for a model that now exists: what this page still cannot do is
-        // record the Mac somebody is sitting in front of.
-        let record = &tree.find(ids::SKILL_RECORD).unwrap().name;
-        assert!(record.contains("Teach a task"), "{record}");
-        assert!(record.contains("this Mac"), "{record}");
-        assert!(
-            host.click(ids::SKILL_RECORD)
-                .unwrap_err()
-                .starts_with("Not yet")
-        );
-        assert!(
-            host.take_command().is_none(),
-            "nothing was asked of the app"
-        );
     }
 
     /// Every verb parses its args, and a missing one is named rather than guessed at.
@@ -11521,17 +11709,10 @@ mod tests {
             done(&mut host, "skills.open", serde_json::json!({})),
             Command::OpenSkills
         ));
-        assert!(matches!(
-            done(
-                &mut host,
-                "skills.scope",
-                serde_json::json!({"scope": "discover"})
-            ),
-            Command::SetSkillsScope(SkillScope::Discover)
-        ));
+        // A skill's page is in the Plugins window now.
         assert!(matches!(
             done(&mut host, "skill.open", serde_json::json!({"id": "skl_1"})),
-            Command::OpenSkill(id) if id == "skl_1"
+            Command::OpenTaughtSkill { id: Some(id) } if id == "skl_1"
         ));
         assert!(matches!(
             done(
@@ -11569,172 +11750,6 @@ mod tests {
                 .unwrap_err(),
             "skill.delete requires arg id"
         );
-        assert!(
-            host.invoke("skills.scope", &serde_json::json!({"scope": "mine"}))
-                .unwrap_err()
-                .contains("yours, discover"),
-            "the toggle is named by what it says, not by the word on the wire"
-        );
-    }
-
-    /// An id nobody is showing is a wrong address, and saying so beats sending a delete under
-    /// it.
-    #[test]
-    fn a_skill_the_page_does_not_have_is_not_a_target() {
-        let mut host = skills_host();
-        assert!(host.click(&ids::skill("skl_9")).is_err());
-        assert!(host.click(&ids::skill_delete("skl_9")).is_err());
-        assert!(
-            host.invoke("skill.delete", &serde_json::json!({"id": "skl_9"}))
-                .unwrap_err()
-                .contains("no skill `skl_9`")
-        );
-    }
-
-    /// The one control that makes the rest of this mean anything: a lesson a model wrote is off
-    /// until somebody reads it, and this is what they press when they have. It works both ways —
-    /// the server keeps one flag and somebody who reads a lesson they do not want puts it back.
-    #[test]
-    fn the_switch_says_where_it_is_and_turns_a_taught_skill_on() {
-        let mut host = skills_host();
-        let mut open = open_skill("skl_1", "invoice-lookup");
-        open.enabled = false;
-        open.approved_at_ms = None;
-        host.skill_open = Some(open);
-
-        let switch = host
-            .snapshot()
-            .find(&ids::skill_enabled("skl_1"))
-            .cloned()
-            .expect("the pane draws it, so the tree carries it");
-        assert_eq!(switch.name, "Switched off");
-        assert_eq!(switch.checked, Some(false));
-        assert!(
-            switch.states.contains(&"unread".to_string()),
-            "nobody has ever switched it on: {:?}",
-            switch.states
-        );
-
-        // On. The click toggles, the way a finger does, so what it is now is read off the pane.
-        host.click(&ids::skill_enabled("skl_1")).unwrap();
-        assert!(matches!(
-            host.take_command().unwrap(),
-            Command::SetSkillEnabled { id, enabled } if id == "skl_1" && enabled
-        ));
-
-        // And back off, for somebody who read it and did not want it. Once it has been switched
-        // on the stamp stands, so it is no longer waiting to be read.
-        let mut read = open_skill("skl_1", "invoice-lookup");
-        read.enabled = true;
-        read.approved_at_ms = Some(1_758_000_000_000);
-        host.skill_open = Some(read);
-        let switch = host
-            .snapshot()
-            .find(&ids::skill_enabled("skl_1"))
-            .cloned()
-            .expect("still there");
-        assert_eq!(switch.name, "Switched on");
-        assert_eq!(switch.checked, Some(true));
-        assert!(!switch.states.contains(&"unread".to_string()));
-        host.click(&ids::skill_enabled("skl_1")).unwrap();
-        assert!(matches!(
-            host.take_command().unwrap(),
-            Command::SetSkillEnabled { id, enabled } if id == "skl_1" && !enabled
-        ));
-    }
-
-    /// The pane and the tree draw one fact from one function. They used to work it out
-    /// separately and disagreed: the screen only tells the two kinds of off apart while a skill
-    /// IS off, and the tree called every skill on a server that sends no stamp unread —
-    /// including the ones somebody had switched on.
-    #[test]
-    fn the_tree_and_the_pane_agree_about_which_skills_are_waiting_to_be_read() {
-        let mut host = skills_host();
-        for (enabled, approved_at_ms) in [
-            (false, None),
-            (false, Some(1_758_000_000_000)),
-            (true, None),
-            (true, Some(1_758_000_000_000)),
-        ] {
-            let mut open = open_skill("skl_1", "invoice-lookup");
-            open.enabled = enabled;
-            open.approved_at_ms = approved_at_ms;
-            host.skill_open = Some(open);
-            let unread = host
-                .snapshot()
-                .find(&ids::skill_enabled("skl_1"))
-                .expect("the switch is on the pane")
-                .states
-                .contains(&"unread".to_string());
-            let said =
-                crate::components::skills::use_line("invoice-lookup", enabled, approved_at_ms)
-                    .unwrap_or_default();
-            assert_eq!(
-                unread,
-                said.contains("until somebody reads it"),
-                "enabled={enabled} approved={approved_at_ms:?}: the tree says {unread} and the \
-                 pane says {said:?}"
-            );
-        }
-    }
-
-    /// The switch is the open skill's and nobody else's, it is dead while the server is being
-    /// told, and a refusal is drawn beside it rather than in place of the pane — the pane is
-    /// still there, and so is the skill it is about.
-    #[test]
-    fn the_switch_is_refused_when_there_is_nothing_for_it_to_be_about() {
-        let mut host = skills_host();
-        assert!(
-            host.click(&ids::skill_enabled("skl_1"))
-                .unwrap_err()
-                .contains("no skill `skl_1` is open to switch"),
-            "a pane nobody opened has no switch on it"
-        );
-
-        // Still being fetched: the pane is a line saying so, and there is nothing to press.
-        let mut coming = open_skill("skl_1", "invoice-lookup");
-        coming.arrived = false;
-        host.skill_open = Some(coming);
-        assert!(host.snapshot().find(&ids::skill_enabled("skl_1")).is_none());
-        assert!(
-            host.click(&ids::skill_enabled("skl_1"))
-                .unwrap_err()
-                .contains("still being fetched")
-        );
-
-        // With the server. Pressed twice, two answers about one flag are in the air.
-        let mut switching = open_skill("skl_1", "invoice-lookup");
-        switching.switching = true;
-        host.skill_open = Some(switching);
-        assert!(
-            !host
-                .snapshot()
-                .find(&ids::skill_enabled("skl_1"))
-                .unwrap()
-                .enabled
-        );
-        assert_eq!(
-            host.click(&ids::skill_enabled("skl_1")).unwrap_err(),
-            SWITCH_IN_FLIGHT,
-            "and in the same words the app refuses a second switch with"
-        );
-
-        // Refused: the switch has already gone back, and the reason is on the pane with it.
-        let mut refused = open_skill("skl_1", "invoice-lookup");
-        refused.error = Some("Only the owner can switch a skill on.".into());
-        host.skill_open = Some(refused);
-        let tree = host.snapshot();
-        assert_eq!(
-            tree.find(ids::SKILL_ERROR).unwrap().name,
-            "Only the owner can switch a skill on.",
-            "the server's sentence, beside the control it is about"
-        );
-        assert!(
-            tree.find(&ids::skill_enabled("skl_1")).is_some(),
-            "and the pane is still a pane: the skill did not go anywhere"
-        );
-        assert!(tree.find(&ids::skill_body("skl_1")).is_some());
-        assert!(host.take_command().is_none());
     }
 
     /// A lesson being written from a tape takes a model call and a wait, and it happens in the
@@ -11963,29 +11978,6 @@ mod tests {
             Command::OpenTaughtSkill { id } if id.as_deref() == Some("skl_7")
         ));
         assert!(host.click(ids::TEACH_RETRY).is_err());
-    }
-
-    /// Typing into the field is typing into the field: the host keeps the copy the list filters
-    /// by, so the tree answers with what was typed without a round trip through the app.
-    #[test]
-    fn the_skills_search_takes_keys_the_way_the_logins_one_does() {
-        let mut host = skills_host();
-        host.dispatch(&Op::type_text(ids::SKILLS_SEARCH, "expen"))
-            .unwrap();
-        assert_eq!(host.skills_query, "expen");
-        host.dispatch(&Op::key(ids::SKILLS_SEARCH, "Backspace"))
-            .unwrap();
-        assert_eq!(host.skills_query, "expe");
-        host.dispatch(&Op::SetValue {
-            target: ids::SKILLS_SEARCH.into(),
-            value: "new".into(),
-        })
-        .unwrap();
-        assert_eq!(host.skills_query, "new");
-        assert!(matches!(
-            host.take_command().unwrap(),
-            Command::SetSkillsQuery(query) if query == "new"
-        ));
     }
 
     /// A host with a bot and a session, which is what the chat tree is drawn for.
@@ -12276,6 +12268,8 @@ mod tests {
             &ToolSource {
                 plugins: Vec::new(),
                 apps: Vec::new(),
+                groups: Vec::new(),
+                functions: Default::default(),
             },
         );
         let tree = host.snapshot();
@@ -12302,6 +12296,8 @@ mod tests {
             &ToolSource {
                 plugins: Vec::new(),
                 apps: Vec::new(),
+                groups: Vec::new(),
+                functions: Default::default(),
             },
         );
         let tree = host.snapshot();
@@ -12615,6 +12611,8 @@ mod tests {
             &ToolSource {
                 plugins: Vec::new(),
                 apps: Vec::new(),
+                groups: Vec::new(),
+                functions: Default::default(),
             },
         );
 
@@ -12652,6 +12650,8 @@ mod tests {
             &ToolSource {
                 plugins: Vec::new(),
                 apps: Vec::new(),
+                groups: Vec::new(),
+                functions: Default::default(),
             },
         );
 
@@ -12677,6 +12677,8 @@ mod tests {
             &ToolSource {
                 plugins: Vec::new(),
                 apps: Vec::new(),
+                groups: Vec::new(),
+                functions: Default::default(),
             },
         );
         let empty = host.snapshot();
@@ -12899,6 +12901,7 @@ mod tests {
             saved_logins: Vec::new(),
             saved_login_note: None,
             saved_login_held: false,
+            saved_login_blocked: None,
             passkey_register: false,
             title: "Google account".into(),
             fields: vec![
@@ -13055,6 +13058,7 @@ mod tests {
             saved_logins: Vec::new(),
             saved_login_note: None,
             saved_login_held: false,
+            saved_login_blocked: None,
             passkey_register: false,
             title: "Website login".into(),
             fields: vec![UserFormFieldSnap {
@@ -13188,6 +13192,7 @@ mod tests {
             saved_logins: Vec::new(),
             saved_login_note: None,
             saved_login_held: false,
+            saved_login_blocked: None,
             passkey_register: false,
             title: "Google account".into(),
             fields: Vec::new(),
@@ -14807,11 +14812,13 @@ mod tests {
                 name: "shell".into(),
                 description: "Run a shell command.".into(),
                 kind: "builtin".into(),
+                ..Default::default()
             },
             CoworkerTool {
                 name: "gmail_api_send".into(),
                 description: String::new(),
                 kind: "plugin".into(),
+                ..Default::default()
             },
         ]));
         host.agent_ceiling = Some(ceiling_card(ToolCeiling::Read(a_ceiling())));
@@ -18408,6 +18415,7 @@ mod tests {
                 name: "shell".into(),
                 description: "Run a command.".into(),
                 kind: "builtin".into(),
+                ..Default::default()
             }]),
         ));
         state.coworker_skills = Some(("cw_1".into(), BotSkills::Loading));
@@ -18956,6 +18964,293 @@ mod tests {
         ));
     }
 
+    /// The Tools window is the marketplace layout: a row per built-in tool with its switch (no
+    /// plugins: they are switched in Plugins), "Search tools", and a row opens the plugin page
+    /// reused, with the tool's switch in its header and a group's tools each with chip and switch.
+    #[test]
+    fn the_tools_window_lists_built_in_tools_and_opens_their_page() {
+        use crate::components::marketplace::MarketDetail;
+        use crate::components::monitor_modal::{MonitorKind, MonitorModal, PluginSelection};
+        use crate::opengrok::{CoworkerCeiling, CoworkerTool};
+        let mut state = crate::components::monitor_modal::tests::catalog();
+        let ceiling: CoworkerCeiling = serde_json::from_value(serde_json::json!({"tools":[
+            {"name":"shell", "kind":"builtin", "enabled":true, "description":"Run commands"},
+            {"name":"routines", "kind":"builtin", "enabled":false, "label":"Routines",
+                "description":"List, make, edit, delete and run routines."},
+            {"name":"cloudflare", "kind":"plugin", "enabled":true}
+        ], "version":1}))
+        .unwrap();
+        state.coworker_ceiling = Some(("cw_1".into(), ToolCeiling::Read(ceiling.into())));
+        let tool = |name: &str, mode: &str| CoworkerTool {
+            name: name.into(),
+            mode: Some(mode.into()),
+            ..Default::default()
+        };
+        state.coworker_tools = Some((
+            "cw_1".into(),
+            ToolList::Listed(vec![
+                tool("shell", "ask"),
+                CoworkerTool {
+                    name: "routines".into(),
+                    tools: vec![tool("delete_routine", "ask"), tool("run_routine", "never")],
+                    enabled: Some(true),
+                    ..Default::default()
+                },
+            ]),
+        ));
+        state.monitor_modal = Some(MonitorModal::new("cw_1".into(), MonitorKind::Tools));
+        state.agent_tools_open = true;
+        let mut host = NativeChatHost::from_app(&state);
+        let tree = host.snapshot();
+        assert_eq!(tree.find("monitor-modal").unwrap().name, "Tools");
+        assert_eq!(
+            tree.find(crate::components::marketplace::SEARCH)
+                .unwrap()
+                .name,
+            "Search tools"
+        );
+        assert!(tree.find("market-tool-item-shell").is_some());
+        assert_eq!(
+            tree.find("market-tool-item-routines")
+                .unwrap()
+                .value
+                .as_deref(),
+            Some("List, make, edit, delete and run routines."),
+            "the row says what it does, and no count"
+        );
+        assert!(
+            tree.find("market-tool-item-cloudflare").is_none(),
+            "plugins stay in Plugins"
+        );
+        // A group with some tools at Never is on in the list, as on its page; only all at
+        // Never is off. Its switch there is the group's, remembering each tool's choice.
+        assert_eq!(
+            tree.find("agent-ceiling-switch-routines").unwrap().checked,
+            Some(true),
+            "1 of 2 allowed is on"
+        );
+        host.dispatch(&Op::click("agent-ceiling-switch-routines"))
+            .unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::SwitchToolGroup { group, on: false }) if group == "routines"
+        ));
+        let mut host = NativeChatHost::from_app(&state);
+        let tree = host.snapshot();
+        assert!(
+            tree.find(crate::components::marketplace::INSTALLED)
+                .is_none()
+        );
+        host.dispatch(&Op::click("market-tool-item-routines"))
+            .unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::Market(MarketCommand::OpenDetail(PluginSelection::Tool(n)))) if n == "routines"
+        ));
+        host.dispatch(&Op::click("agent-ceiling-switch-shell"))
+            .unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::SetCeilingTool { name, enabled: false }) if name == "shell"
+        ));
+
+        state.monitor_modal.as_mut().unwrap().selected =
+            Some(PluginSelection::Tool("routines".into()));
+        let mut host = NativeChatHost::from_app(&state);
+        let detail: &MarketDetail = host.market_detail.as_ref().unwrap();
+        assert_eq!(detail.header_switch, Some(("routines".into(), true, true)));
+        assert_eq!(detail.tools.len(), 2);
+        let tree = host.snapshot();
+        assert_eq!(
+            tree.find("market-tool-mode-delete_routine").unwrap().name,
+            "Ask every time"
+        );
+        // One pop-up per tool, no switch on the row; a tool at Never is still listed.
+        assert!(tree.find("market-tool-switch-run_routine").is_none());
+        assert_eq!(
+            tree.find("market-tool-mode-run_routine").unwrap().name,
+            "Never allow"
+        );
+        // The group's switch is its own (7 Oct 2026): a press on it switches the group, and its
+        // tools keep their choices.
+        assert_eq!(
+            detail.subtitle.as_deref(),
+            Some("Built in · 1 of 2 allowed")
+        );
+        host.dispatch(&Op::click("agent-ceiling-switch-routines"))
+            .unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::SwitchToolGroup { group, on: false }) if group == "routines"
+        ));
+        // Switched off, its page says so and its tools' choices stay as they were.
+        if let Some((_, ToolList::Listed(all))) = state.coworker_tools.as_mut()
+            && let Some(group) = all.iter_mut().find(|t| t.name == "routines")
+        {
+            group.enabled = Some(false);
+        }
+        let host = NativeChatHost::from_app(&state);
+        let detail: &MarketDetail = host.market_detail.as_ref().unwrap();
+        assert_eq!(detail.header_switch, Some(("routines".into(), false, true)));
+        assert_eq!(
+            detail.subtitle.as_deref(),
+            Some("Built in · Off — 1 of 2 allowed when on")
+        );
+        assert_eq!(detail.tools[1].mode, "never", "run_routine keeps its Never");
+
+        // A lone tool: no Tools section, its own choice chip instead.
+        state.monitor_modal.as_mut().unwrap().selected =
+            Some(PluginSelection::Tool("shell".into()));
+        let mut host = NativeChatHost::from_app(&state);
+        let tree = host.snapshot();
+        assert_eq!(
+            tree.find("market-tool-mode-shell").unwrap().name,
+            "Ask every time"
+        );
+        host.dispatch(&Op::click("market-tool-mode-shell")).unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::OpenToolMode { tool, mode, .. }) if tool == "shell" && mode == "ask"
+        ));
+    }
+
+    /// A skill's page: your own has Publish (greyed: the server has no route for it yet) and
+    /// Delete Skill, and its three fields to edit, with Save live only after a change; one you
+    /// don't own has only its switch for the Bot, and the three read-only.
+    #[test]
+    fn a_skill_page_shows_owner_buttons_only_for_your_own_skill() {
+        use crate::components::marketplace as market;
+        use crate::components::monitor_modal::{MonitorKind, MonitorModal, PluginSelection};
+        let mut state = crate::components::monitor_modal::tests::catalog();
+        let detail = |id: &str, name: &str| -> crate::opengrok::SkillDetail {
+            serde_json::from_value(serde_json::json!({
+                "id": id, "name": name, "description": "What it is for", "source": "authored",
+                "updatedAtMs": 1, "versionCount": 1, "draft": false, "version": 1,
+                "body": "Do it this way."
+            }))
+            .unwrap()
+        };
+        let open = |state: &mut AppState, id: &str, name: &str| {
+            let mut modal = MonitorModal::new("cw_1".into(), MonitorKind::Plugins);
+            modal.selected = Some(PluginSelection::Skill(id.into()));
+            state.monitor_modal = Some(modal);
+            state.skill_open = Some(detail(id, name));
+            state.skill_edit = Some(crate::state::SkillEdit {
+                id: id.into(),
+                ..Default::default()
+            });
+        };
+
+        open(&mut state, "sk_1", "draft");
+        let mut host = NativeChatHost::from_app(&state);
+        let tree = host.snapshot();
+        assert!(
+            !tree.find(market::SKILL_PUBLISH).unwrap().enabled,
+            "no publish route yet"
+        );
+        assert!(tree.find(market::SKILL_DELETE).is_some());
+        assert!(
+            tree.find("agent-skills-switch-sk_1").is_none(),
+            "yours: buttons, not a switch"
+        );
+        assert_eq!(tree.find(market::SKILL_NAME).unwrap().role, "textbox");
+        assert!(
+            !tree.find(market::SKILL_SAVE).unwrap().enabled,
+            "nothing changed yet"
+        );
+        host.dispatch(&Op::type_text(market::SKILL_NAME, "-v2"))
+            .unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::SetSkillField(crate::state::SkillField::Name, n)) if n == "draft-v2"
+        ));
+        state.skill_edit.as_mut().unwrap().name = Some("draft-v2".into());
+        let mut host = NativeChatHost::from_app(&state);
+        host.dispatch(&Op::click(market::SKILL_SAVE)).unwrap();
+        assert!(matches!(host.take_command(), Some(Command::SaveSkillPage)));
+        host.dispatch(&Op::click(market::SKILL_DELETE)).unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::AskSkillPageDelete(true))
+        ));
+
+        open(&mut state, "sk_org", "organization");
+        let mut host = NativeChatHost::from_app(&state);
+        let tree = host.snapshot();
+        for id in [
+            market::SKILL_PUBLISH,
+            market::SKILL_DELETE,
+            market::SKILL_SAVE,
+        ] {
+            assert!(tree.find(id).is_none(), "not yours: no {id}");
+        }
+        assert_eq!(
+            tree.find(market::SKILL_NAME).unwrap().role,
+            "status",
+            "read-only"
+        );
+        assert!(
+            host.dispatch(&Op::type_text(market::SKILL_NAME, "x"))
+                .is_err()
+        );
+        host.dispatch(&Op::click("agent-skills-switch-sk_org"))
+            .unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::SetBotSkill { skill_id, attached: false }) if skill_id == "sk_org"
+        ));
+
+        // "N Bots" opens the skill's Bots page: one switch per Bot, Back to the skill.
+        let skills_of = |attached: bool| -> crate::opengrok::CoworkerSkills {
+            serde_json::from_value(serde_json::json!({"skills": [
+                {"id": "sk_org", "name": "organization", "scope": "org", "attached": attached,
+                 "enabled": true}
+            ], "version": 3}))
+            .unwrap()
+        };
+        let mut read = std::collections::BTreeMap::new();
+        read.insert("cw_1".to_string(), skills_of(true));
+        read.insert("cw_2".to_string(), skills_of(false));
+        state.skill_bots = Some(crate::state::SkillBots {
+            skill_id: "sk_org".into(),
+            read,
+            ..Default::default()
+        });
+        let mut host = NativeChatHost::from_app(&state);
+        assert_eq!(
+            host.snapshot()
+                .find(market::SKILL_BOTS)
+                .unwrap()
+                .value
+                .as_deref(),
+            Some("1")
+        );
+        host.dispatch(&Op::click(market::SKILL_BOTS)).unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::OpenSkillBots(true))
+        ));
+        state.skill_bots.as_mut().unwrap().open = true;
+        let mut host = NativeChatHost::from_app(&state);
+        let tree = host.snapshot();
+        assert_eq!(
+            tree.find("market-skill-bot-switch-cw_1").unwrap().checked,
+            Some(true)
+        );
+        host.dispatch(&Op::click("market-skill-bot-switch-cw_2"))
+            .unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::SetSkillBot { bot, attached: true }) if bot == "cw_2"
+        ));
+        host.dispatch(&Op::click(crate::components::monitor_modal::BACK))
+            .unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::OpenSkillBots(false))
+        ));
+    }
+
     /// The Relay tab is gone from the tree: Settings' pages are General, Computer, Updates, Logins,
     /// and Skills, nothing answers at the id the Relay tab had, and none of the ids of
     /// the page it held is on the tree or takes a click. The relay is on Computer, in each
@@ -18972,10 +19267,11 @@ mod tests {
             "settings-tab-computer",
             "settings-tab-updates",
             "settings-tab-logins",
-            ids::SETTINGS_SKILLS,
         ] {
             assert!(tree.find(id).is_some(), "{id} is a page of Settings");
         }
+        // Skills moved to the Plugins window (7 Oct 2026).
+        assert!(tree.find(ids::SETTINGS_SKILLS).is_none());
         for gone in [
             "settings-tab-reply-source",
             "settings-reply-source",
@@ -19140,7 +19436,45 @@ mod tests {
         let mut host = NativeChatHost::from_app(&state);
         let tree = host.snapshot();
         assert!(tree.find("agent-skills-switch-sk_1").is_some());
-        assert!(tree.find("agent-skills-switch-sk_org").is_none());
+        // Your org's skills are listed under Installed too, each switched for this Bot
+        // (7 Oct 2026).
+        assert!(tree.find("agent-skills-switch-sk_org").is_some());
+        // "+ New skill" opens the Write / Upload sheet that was on Settings → Skills.
+        assert!(
+            tree.find(crate::components::marketplace::SKILL_NEW)
+                .is_some()
+        );
+        host.dispatch(&Op::click(crate::components::marketplace::SKILL_NEW))
+            .unwrap();
+        // A page in the same card, never a sheet over it (7 Oct 2026).
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::Market(MarketCommand::OpenDetail(
+                PluginSelection::NewSkill
+            )))
+        ));
+        state.monitor_modal.as_mut().unwrap().selected = Some(PluginSelection::NewSkill);
+        let mut host = NativeChatHost::from_app(&state);
+        let tree = host.snapshot();
+        for id in [
+            crate::components::marketplace::NEW_SKILL_NAME,
+            crate::components::marketplace::NEW_SKILL_UPLOAD,
+            crate::components::marketplace::NEW_SKILL_CREATE,
+        ] {
+            assert!(tree.find(id).is_some(), "{id}");
+        }
+        assert!(
+            tree.find(ids::SKILL_SHEET).is_none(),
+            "no sheet over the page"
+        );
+        host.dispatch(&Op::click(crate::components::marketplace::NEW_SKILL_CANCEL))
+            .unwrap();
+        assert!(matches!(
+            host.take_command(),
+            Some(Command::Market(MarketCommand::CloseDetail))
+        ));
+        state.monitor_modal.as_mut().unwrap().selected = None;
+        let mut host = NativeChatHost::from_app(&state);
         host.dispatch(&Op::click("agent-skills-switch-sk_1"))
             .unwrap();
         assert!(

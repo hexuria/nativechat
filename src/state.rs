@@ -524,6 +524,18 @@ pub(crate) const REPLY_SOURCE_NOT_ON_SERVER: &str =
     "This server can't switch where your replies come from yet.";
 
 /// Why Save will not keep an opencodex address that is not on this computer, beside why not.
+/// Run database work on the Tokio runtime, which sqlx needs, wherever the caller is: a task on
+/// gpui's executors may be polled on a thread that holds no Tokio context, and the app aborted the
+/// first time a notice was written that way (8 Oct 2026). Nothing happens without a runtime.
+fn on_tokio(work: impl std::future::Future<Output = ()> + Send + 'static) {
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        handle.spawn(work);
+    }
+}
+
+/// How old the model list may be before a picker opening reads it again.
+const MODELS_STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(3);
+
 pub(crate) const RELAY_ADDRESS_NOT_HERE: &str = "Give opencodex's address on this computer first.";
 
 impl ReplySourceSettings {
@@ -3912,6 +3924,8 @@ pub enum RightPane {
     Closed,
     Settings,
     Computer,
+    /// The open Bot's notifications, in place of its settings (the bell, 8 Oct 2026).
+    Notifications,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
@@ -5067,7 +5081,6 @@ pub enum AppSettingsTab {
     Computer,
     Updates,
     Logins,
-    Skills,
 }
 
 /// Where Settings also shows routing controls for the active Bot's box. The monitor keeps
@@ -5215,6 +5228,21 @@ pub struct NavLocation {
     pub computer_view: ComputerView,
     pub app_settings_open: bool,
     pub app_settings_tab: AppSettingsTab,
+    /// The Plugins or Tools window's page, while one is open: its pages are steps in the same
+    /// history, so ⌘[ walks back through them and, on the window's first page, closes it
+    /// (7 Oct 2026).
+    pub window: Option<WindowNav>,
+}
+
+/// Where the Plugins or Tools window stands: which window, its page, the detail open on it, and
+/// a Bots page open over that detail.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WindowNav {
+    pub kind: crate::components::monitor_modal::MonitorKind,
+    pub page: crate::components::monitor_modal::MarketPage,
+    pub selected: Option<crate::components::monitor_modal::PluginSelection>,
+    pub bots_for: Option<String>,
+    pub skill_bots_open: bool,
 }
 
 impl NavLocation {
@@ -5257,6 +5285,36 @@ impl NavHistory {
         }
         self.current = Some(prev.clone());
         Some(prev)
+    }
+
+    /// Whether the step behind is a page of the same window: then the window's ‹ is ⌘[.
+    fn back_is_window(&self, leads_to: impl Fn(&WindowNav) -> bool) -> bool {
+        self.current.as_ref().is_some_and(|c| c.window.is_some())
+            && self
+                .back
+                .last()
+                .and_then(|b| b.window.as_ref())
+                .is_some_and(leads_to)
+    }
+
+    /// Close (✕, Esc): the window's steps move ahead of where the person now stands, as if
+    /// they had pressed ⌘[ through them, so ⌘] brings the window back.
+    fn rewind_window(&mut self) {
+        while self.current.as_ref().is_some_and(|c| c.window.is_some()) {
+            match self.back.pop() {
+                Some(prev) => {
+                    if let Some(cur) = self.current.take() {
+                        self.forward.push(cur);
+                    }
+                    self.current = Some(prev);
+                }
+                None => {
+                    if let Some(cur) = self.current.as_mut() {
+                        cur.window = None;
+                    }
+                }
+            }
+        }
     }
 
     fn go_forward(&mut self) -> Option<NavLocation> {
@@ -5317,6 +5375,46 @@ pub struct AppState {
     /// answer sends next and only that turn (`pluginAccounts`, [`crate::opengrok::TurnTags`]).
     pub next_turn_accounts:
         std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
+    /// The tool whose choice dialog is open: `(tool, what it is called, its mode)` (#359).
+    pub tool_mode_dialog: Option<(String, String, String)>,
+    /// The tool whose choice is with the server, and why the last change did not go through.
+    pub tool_mode_changing: Option<String>,
+    pub tool_mode_refusal: Option<String>,
+    /// A skill's Bots: each of the person's Bots' skills, read for the skill page's "N Bots" and
+    /// its Bots page (7 Oct 2026).
+    pub skill_bots: Option<crate::state::SkillBots>,
+    /// The open Bot's installed plugin skills with their own switches, read with a plugin's page
+    /// (`GET /coworkers/{id}/plugin-skills`), and the one open on its read-only page.
+    pub plugin_skills: Vec<crate::opengrok::PluginSkill>,
+    pub plugin_skill_page: Option<crate::opengrok::PluginSkill>,
+    /// Whether a saved login can be used for each Bot, asked before Touch ID: the person is
+    /// never asked for a fingerprint only to be refused (8 Oct 2026).
+    pub saved_login_checks: HashMap<String, crate::opengrok::SavedLoginCheck>,
+    /// What went wrong, newest first, kept on this Mac until cleared (`crate::notifications`).
+    pub notices: Vec<crate::notifications::Notice>,
+    /// The notice the toast shows, and whether the pointer is on it (it stays while it is).
+    pub toast: Option<String>,
+    pub toast_hovered: bool,
+    /// The notifications page: ticked rows, the Unread filter, the one row opened to its
+    /// details, and what a delete took away while its Undo stands.
+    pub notice_selection: HashSet<String>,
+    pub notice_unread_only: bool,
+    pub notice_expanded: Option<String>,
+    pub notice_undo: Option<(u64, Vec<crate::notifications::Notice>, String)>,
+    notice_undo_generation: u64,
+    /// Each Bot's shared logins, by Bot, read with the check: a Bot's card offers these first
+    /// and the rest under "Share with <Bot>" (8 Oct 2026).
+    pub site_login_shares: HashMap<String, HashSet<String>>,
+    /// The Bots one login is shared with, for its Bots page in the Plugins window.
+    pub login_bots: Option<(String, Option<HashSet<String>>)>,
+    /// The Bot being given a computer of its own from a login card, while the server makes it.
+    pub own_computer_changing: Option<String>,
+    /// What the server said when it could not give a Bot its own computer.
+    pub own_computer_refusal: Option<String>,
+    /// The service whose "Current Bot" default-account menu is open on a plugin's page.
+    pub account_menu: Option<String>,
+    /// A skill's page in the Plugins window, while the person edits their own skill there.
+    pub skill_edit: Option<SkillEdit>,
     /// The reply rows whose "Which account?" card has Remember on.
     pub plugin_needs_remember: HashSet<String>,
     /// The recipe the next message runs, once one has been picked with `/`. While it is set the
@@ -5351,6 +5449,9 @@ pub struct AppState {
     pub attach_requests: Vec<std::path::PathBuf>,
     /// Files a driver asked the composer to take off the draft, by their place on it.
     pub detach_requests: Vec<usize>,
+    /// A modal opened while the composer's "@" or "/" list was up: the composer closes it on its
+    /// next look at the state (`dismiss_popovers`).
+    pub composer_panel_close_requested: bool,
     pub is_app_settings_open: bool,
     pub bot_finder_open: bool,
     pub command_palette_open: bool,
@@ -5670,6 +5771,9 @@ pub struct AppState {
     /// Numbers the reads of `/models`, so only the newest answer lands
     /// ([`Self::begin_models_read`]).
     models_generation: u64,
+    /// When the model list last came back from the server. A picker opening reads it again once
+    /// it is a few seconds old; never read (a list built by hand) is left alone.
+    pub(crate) models_read_at: Option<std::time::Instant>,
     /// Settings → Computer was on screen when Settings last changed what it shows, so its arrival
     /// and its leaving are each told once ([`Self::settle_computer_page`]).
     computer_page_shown: bool,
@@ -6158,6 +6262,27 @@ impl AppState {
             more_menu_open: false,
             next_turn_accounts: Default::default(),
             plugin_needs_remember: HashSet::new(),
+            tool_mode_dialog: None,
+            tool_mode_changing: None,
+            tool_mode_refusal: None,
+            skill_edit: None,
+            account_menu: None,
+            skill_bots: None,
+            plugin_skills: Vec::new(),
+            plugin_skill_page: None,
+            saved_login_checks: HashMap::new(),
+            notices: Vec::new(),
+            toast: None,
+            toast_hovered: false,
+            notice_selection: HashSet::new(),
+            notice_unread_only: false,
+            notice_expanded: None,
+            notice_undo: None,
+            notice_undo_generation: 0,
+            site_login_shares: HashMap::new(),
+            login_bots: None,
+            own_computer_changing: None,
+            own_computer_refusal: None,
             active_recipe: None,
             active_skill: None,
             composer_files: Vec::new(),
@@ -6165,6 +6290,7 @@ impl AppState {
             transcript_following: true,
             attach_requests: Vec::new(),
             detach_requests: Vec::new(),
+            composer_panel_close_requested: false,
             composer_chips: Vec::new(),
             composer_panel: None,
             is_app_settings_open: false,
@@ -6304,6 +6430,7 @@ impl AppState {
             reply_source: ReplySourceSettings::default(),
             reply_source_generation: 0,
             models_generation: 0,
+            models_read_at: None,
             computer_page_shown: false,
             default_models_page_shown: false,
             relay_mac: RelayMac::default(),
@@ -7685,6 +7812,9 @@ impl AppState {
         if generation != self.models_generation {
             return None;
         }
+        if result.is_ok() {
+            self.models_read_at = Some(std::time::Instant::now());
+        }
         Some(result.map(|catalogue| apply_catalogue(&mut self.model_catalogue, catalogue)))
     }
 
@@ -8611,6 +8741,7 @@ impl AppState {
             return;
         };
         self.monitor_generation += 1;
+        self.dismiss_popovers(cx);
         self.monitor_modal = Some(MonitorModal::new(coworker_id, kind));
         match kind {
             MonitorKind::Tools => {
@@ -8621,10 +8752,14 @@ impl AppState {
             // Plugins is the marketplace (#184), wherever it is opened from.
             MonitorKind::Plugins => return self.open_plugin_market(cx),
         }
+        self.record_window_nav();
         cx.notify();
     }
 
     pub fn close_monitor_modal(&mut self, cx: &mut Context<Self>) {
+        if !self.nav.applying {
+            self.nav.rewind_window();
+        }
         self.monitor_modal = None;
         self.monitor_generation += 1;
         cx.notify();
@@ -8681,6 +8816,10 @@ impl AppState {
                 own.iter().find(|row| &row.id == open)?.connector.clone()
             }
             PluginSelection::Service(connector) => connector.clone(),
+            PluginSelection::Tool(_)
+            | PluginSelection::NewSkill
+            | PluginSelection::PluginSkill(..)
+            | PluginSelection::Login(_) => return None,
             // An installed plugin's detail lists the pasted accounts the install holds, and only
             // those: two installs naming one service each have their own.
             PluginSelection::Plugin(name) => {
@@ -10066,9 +10205,22 @@ impl AppState {
         connection_id: Option<String>,
         cx: &mut Context<Self>,
     ) {
-        let (Some(client), Some(coworker_id)) =
-            (self.opengrok.clone(), self.active_coworker_id.clone())
-        else {
+        let Some(coworker_id) = self.active_coworker_id.clone() else {
+            return;
+        };
+        self.pick_account_for(coworker_id, connector, connection_id, cx);
+    }
+
+    /// The same pick for any of the person's Bots: what a plugin account's Bots page switches,
+    /// one Bot at a time (7 Oct 2026).
+    pub fn pick_account_for(
+        &mut self,
+        coworker_id: String,
+        connector: String,
+        connection_id: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(client) = self.opengrok.clone() else {
             return;
         };
         if !self.begin_pick(&coworker_id, &connector, connection_id.clone()) {
@@ -10748,6 +10900,388 @@ impl AppState {
         self.computer_view = ComputerView::Overview;
         self.record_nav();
         cx.notify();
+    }
+
+    /// Something went wrong: kept in the Bot's notifications (on this Mac, until cleared) and
+    /// shown in the toast. Where in the source it was caught is the caller's own file and line,
+    /// so a notice can be traced back after the part of the app that raised it is gone.
+    #[track_caller]
+    pub fn notify_error(
+        &mut self,
+        bot: Option<String>,
+        place: &str,
+        said: &str,
+        raw: Option<String>,
+        run_id: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> String {
+        let mut notice =
+            crate::notifications::Notice::new(bot, place, said, std::panic::Location::caller());
+        notice.raw = raw;
+        notice.run_id = run_id;
+        let id = notice.id.clone();
+        // Seen at once when the Bot's notifications are what is open.
+        notice.read = self.right_pane == RightPane::Notifications
+            && notice.bot.is_some()
+            && notice.bot == self.active_coworker_id;
+        self.persist_notice(notice.clone());
+        self.notices.insert(0, notice);
+        self.notices.truncate(2000);
+        self.show_toast(id.clone(), cx);
+        cx.notify();
+        id
+    }
+
+    fn persist_notice(&self, notice: crate::notifications::Notice) {
+        let Some(pool) = self.database_service.as_ref().map(|db| db.pool()) else {
+            return;
+        };
+        on_tokio(async move {
+            if let Err(error) = crate::notifications::save(&pool, &notice).await {
+                log::warn!("a notification could not be kept: {error}");
+            }
+        });
+    }
+
+    /// The toast shows `id` for eight seconds, longer while the pointer is on it.
+    fn show_toast(&mut self, id: String, cx: &mut Context<Self>) {
+        self.toast = Some(id.clone());
+        self.toast_hovered = false;
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_secs(8))
+                    .await;
+                let gone = this
+                    .update(cx, |state, cx| {
+                        if state.toast.as_deref() != Some(id.as_str()) {
+                            return true;
+                        }
+                        if state.toast_hovered {
+                            return false;
+                        }
+                        state.toast = None;
+                        cx.notify();
+                        true
+                    })
+                    .unwrap_or(true);
+                if gone {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    pub fn dismiss_toast(&mut self, cx: &mut Context<Self>) {
+        if self.toast.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    pub fn set_toast_hovered(&mut self, hovered: bool, cx: &mut Context<Self>) {
+        if self.toast_hovered != hovered {
+            self.toast_hovered = hovered;
+            // Let go of, it goes away: the timer that waited on the pointer sees it on its turn.
+            cx.notify();
+        }
+    }
+
+    /// The notices kept on this Mac, read once the database is open.
+    pub fn load_notices(&mut self, cx: &mut Context<Self>) {
+        let Some(pool) = self.database_service.as_ref().map(|db| db.pool()) else {
+            return;
+        };
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let read = handle.spawn(async move { crate::notifications::load(&pool).await });
+        cx.spawn(async move |this, cx| {
+            let Ok(loaded) = read.await else {
+                return;
+            };
+            let _ = this.update(cx, |state, cx| match loaded {
+                Ok(kept) => {
+                    // Anything noticed before the read finished stays on top.
+                    let fresh = std::mem::take(&mut state.notices);
+                    let seen: HashSet<String> = fresh.iter().map(|n| n.id.clone()).collect();
+                    state.notices = fresh
+                        .into_iter()
+                        .chain(kept.into_iter().filter(|n| !seen.contains(&n.id)))
+                        .collect();
+                    cx.notify();
+                }
+                Err(error) => log::warn!("the notifications kept could not be read: {error}"),
+            });
+        })
+        .detach();
+    }
+
+    /// How many of a Bot's notices are not seen yet, for the bell's badge.
+    pub fn unread_notices(&self, bot: &str) -> usize {
+        self.notices
+            .iter()
+            .filter(|n| !n.read && n.bot.as_deref() == Some(bot))
+            .count()
+    }
+
+    /// The open Bot's notices, newest first.
+    pub fn bot_notices(&self) -> Vec<&crate::notifications::Notice> {
+        let Some(bot) = self.active_coworker_id.as_deref() else {
+            return Vec::new();
+        };
+        self.notices
+            .iter()
+            .filter(|n| n.bot.as_deref() == Some(bot))
+            .collect()
+    }
+
+    /// The bell: the open Bot's notifications in the right sidebar, every one of them seen; the
+    /// bell again (or the sidebar button) closes them.
+    pub fn toggle_notifications(&mut self, cx: &mut Context<Self>) {
+        if self.right_pane == RightPane::Notifications {
+            self.close_right_pane(cx);
+            return;
+        }
+        self.set_right_pane(RightPane::Notifications, cx);
+        self.notice_selection.clear();
+        self.notice_expanded = None;
+        self.model_picker = PickerView::default();
+        self.avatar_editor_open = false;
+        // Opening the page is not reading what is on it: a row opened, or Mark read, does that.
+        self.record_nav();
+        cx.notify();
+    }
+
+    /// The toast's "Open notifications": its Bot opened, and that Bot's notifications in the
+    /// right sidebar.
+    pub fn open_notifications_for(&mut self, bot: Option<String>, cx: &mut Context<Self>) {
+        let from_toast = self.toast.take();
+        if let Some(bot) = bot.filter(|bot| self.active_coworker_id.as_ref() != Some(bot)) {
+            self.select_coworker(bot, cx);
+        }
+        if self.right_pane != RightPane::Notifications {
+            self.toggle_notifications(cx);
+        }
+        // From the toast, the page opens on the notice that raised it.
+        if let Some(id) = from_toast.filter(|id| self.notices.iter().any(|n| &n.id == id)) {
+            self.notice_unread_only = false;
+            self.notice_expanded = None;
+            self.toggle_notice_expanded(id, cx);
+        }
+        cx.notify();
+    }
+
+    /// Every notice of `bot` (or every notice, with `None`) counted as seen.
+    pub fn mark_notices_read(&mut self, bot: Option<String>, cx: &mut Context<Self>) {
+        let mut changed = false;
+        for notice in &mut self.notices {
+            if !notice.read && (bot.is_none() || notice.bot == bot) {
+                notice.read = true;
+                changed = true;
+            }
+        }
+        if !changed {
+            return;
+        }
+        if let Some(pool) = self.database_service.as_ref().map(|db| db.pool()) {
+            on_tokio(async move {
+                let _ = crate::notifications::mark_read(&pool, bot.as_deref()).await;
+            });
+        }
+        cx.notify();
+    }
+
+    /// Forget `bot`'s notices, or every notice with `None`.
+    pub fn clear_notices(&mut self, bot: Option<String>, cx: &mut Context<Self>) {
+        self.notices
+            .retain(|n| bot.as_ref().is_some_and(|bot| n.bot.as_ref() != Some(bot)));
+        if self
+            .toast
+            .as_ref()
+            .is_some_and(|id| !self.notices.iter().any(|n| &n.id == id))
+        {
+            self.toast = None;
+        }
+        if let Some(pool) = self.database_service.as_ref().map(|db| db.pool()) {
+            on_tokio(async move {
+                let _ = crate::notifications::clear(&pool, bot.as_deref()).await;
+            });
+        }
+        cx.notify();
+    }
+
+    /// The rows the page shows: the open Bot's, unread only when the filter says so.
+    pub fn visible_notices(&self) -> Vec<&crate::notifications::Notice> {
+        self.bot_notices()
+            .into_iter()
+            .filter(|n| !self.notice_unread_only || !n.read)
+            .collect()
+    }
+
+    /// All / Unread. The selection is about the rows that were shown, so it goes.
+    pub fn set_notice_filter(&mut self, unread_only: bool, cx: &mut Context<Self>) {
+        self.notice_unread_only = unread_only;
+        self.notice_selection.clear();
+        cx.notify();
+    }
+
+    pub fn toggle_notice_selected(&mut self, id: String, cx: &mut Context<Self>) {
+        if !self.notice_selection.remove(&id) {
+            self.notice_selection.insert(id);
+        }
+        cx.notify();
+    }
+
+    /// The select-all box: every shown row, or none when all are ticked.
+    pub fn toggle_select_all_notices(&mut self, cx: &mut Context<Self>) {
+        let shown: HashSet<String> = self
+            .visible_notices()
+            .iter()
+            .map(|n| n.id.clone())
+            .collect();
+        if !shown.is_empty() && shown.is_subset(&self.notice_selection) {
+            self.notice_selection.clear();
+        } else {
+            self.notice_selection = shown;
+        }
+        cx.notify();
+    }
+
+    /// A row opened to its details, and so seen; opening another closes the first.
+    pub fn toggle_notice_expanded(&mut self, id: String, cx: &mut Context<Self>) {
+        if self.notice_expanded.as_deref() == Some(id.as_str()) {
+            self.notice_expanded = None;
+        } else {
+            self.notice_expanded = Some(id.clone());
+            self.set_notices_read(vec![id], true, cx);
+        }
+        cx.notify();
+    }
+
+    /// Read or unread, for these rows.
+    pub fn set_notices_read(&mut self, ids: Vec<String>, read: bool, cx: &mut Context<Self>) {
+        for notice in &mut self.notices {
+            if ids.contains(&notice.id) {
+                notice.read = read;
+            }
+        }
+        if let Some(pool) = self.database_service.as_ref().map(|db| db.pool()) {
+            on_tokio(async move {
+                let _ = crate::notifications::set_read(&pool, &ids, read).await;
+            });
+        }
+        cx.notify();
+    }
+
+    /// The ticked rows (or `ids`): read when any of them is unread, else all unread.
+    pub fn mark_selected_notices(&mut self, read: bool, cx: &mut Context<Self>) {
+        let ids: Vec<String> = self.notice_selection.iter().cloned().collect();
+        self.set_notices_read(ids, read, cx);
+    }
+
+    /// Delete: the rows go at once and an Undo stands for six seconds; only then is the database
+    /// told, so Undo puts them back exactly as they were.
+    pub fn delete_notices(&mut self, ids: Vec<String>, cx: &mut Context<Self>) {
+        if ids.is_empty() {
+            return;
+        }
+        self.commit_notice_undo();
+        let (gone, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut self.notices)
+            .into_iter()
+            .partition(|n| ids.contains(&n.id));
+        self.notices = kept;
+        for id in &ids {
+            self.notice_selection.remove(id);
+        }
+        if self
+            .notice_expanded
+            .as_ref()
+            .is_some_and(|e| ids.contains(e))
+        {
+            self.notice_expanded = None;
+        }
+        let label = if gone.len() == 1 {
+            "1 notification deleted".to_string()
+        } else {
+            format!("{} notifications deleted", gone.len())
+        };
+        self.notice_undo_generation += 1;
+        let generation = self.notice_undo_generation;
+        self.notice_undo = Some((generation, gone, label));
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_secs(6))
+                .await;
+            let _ = this.update(cx, |state, cx| {
+                if state
+                    .notice_undo
+                    .as_ref()
+                    .is_some_and(|(g, ..)| *g == generation)
+                {
+                    state.commit_notice_undo();
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// The deletes an Undo was holding, made for good.
+    fn commit_notice_undo(&mut self) {
+        let Some((_, gone, _)) = self.notice_undo.take() else {
+            return;
+        };
+        let ids: Vec<String> = gone.into_iter().map(|n| n.id).collect();
+        if let Some(pool) = self.database_service.as_ref().map(|db| db.pool()) {
+            on_tokio(async move {
+                let _ = crate::notifications::delete(&pool, &ids).await;
+            });
+        }
+    }
+
+    /// Undo: the deleted rows back where they were.
+    pub fn undo_notice_delete(&mut self, cx: &mut Context<Self>) {
+        let Some((_, gone, _)) = self.notice_undo.take() else {
+            return;
+        };
+        self.notices.extend(gone);
+        self.notices.sort_by_key(|n| std::cmp::Reverse(n.at_ms));
+        cx.notify();
+    }
+
+    /// The name of the Bot a notice belongs to, when that Bot is still there.
+    pub fn notice_bot_name(&self, notice: &crate::notifications::Notice) -> Option<String> {
+        let bot = notice.bot.as_deref()?;
+        self.coworkers
+            .iter()
+            .find(|c| c.id == bot)
+            .map(|c| c.name.clone())
+    }
+
+    /// Copy: one notice, whole, as plain text on the clipboard.
+    pub fn copy_notice(&mut self, id: &str, cx: &mut Context<Self>) {
+        if let Some(text) = self
+            .notices
+            .iter()
+            .find(|n| n.id == id)
+            .map(|n| n.copy_text(self.notice_bot_name(n).as_deref()))
+        {
+            cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(text));
+        }
+    }
+
+    /// Copy the ticked rows, newest first, one block each (⌘C on a selection).
+    pub fn copy_bot_notices(&mut self, cx: &mut Context<Self>) {
+        let text = self
+            .bot_notices()
+            .iter()
+            .filter(|n| self.notice_selection.is_empty() || self.notice_selection.contains(&n.id))
+            .map(|n| n.copy_text(self.notice_bot_name(n).as_deref()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(text));
     }
 
     pub fn toggle_computer_pane(&mut self, cx: &mut Context<Self>) {
@@ -11812,19 +12346,15 @@ impl AppState {
 
     /// Settings → Skills, asked for from anywhere. The page is a settings tab, so this brings
     /// Settings up when it is shut rather than setting a tab nobody can see.
+    /// Skills live in the Plugins window now (Settings → Skills is gone, the owner's call of
+    /// 7 Oct 2026): this opens it on Installed, where "Your skills" and "+ New skill" are.
     pub fn open_skills(&mut self, cx: &mut Context<Self>) {
-        // Opening Settings onto this tab fetches the list, and so does moving to it. Exactly one
-        // of those happens here, unless neither does — which is the case this last line is for:
-        // asking again for the tab already on screen, which would otherwise leave whatever was
-        // there when it was last visited.
-        let showing = self.is_app_settings_open && self.app_settings_tab == AppSettingsTab::Skills;
-        if !self.is_app_settings_open {
+        if self.is_app_settings_open {
             self.toggle_app_settings(cx);
         }
-        self.set_app_settings_tab(AppSettingsTab::Skills, cx);
-        if showing {
-            self.refresh_skills(cx);
-        }
+        self.open_plugin_market(cx);
+        self.set_market_page(crate::components::monitor_modal::MarketPage::Installed, cx);
+        self.refresh_coworker_skills(cx);
         cx.notify();
     }
 
@@ -12117,8 +12647,12 @@ impl AppState {
             let _ = window.update(cx, |_, window, _| window.activate_window());
         }
         self.open_skills(cx);
+        // The lesson just written opens on its own page there, where it is read and switched on.
         if let Some(id) = skill {
-            self.open_skill(id, cx);
+            self.open_market_detail(
+                crate::components::monitor_modal::PluginSelection::Skill(id),
+                cx,
+            );
         }
     }
 
@@ -12332,12 +12866,28 @@ impl AppState {
                         state.skill_add_error = None;
                         state.skill_add_taken = from == SkillCreateFrom::Sheet;
                         let id = detail.skill.id.clone();
-                        state.skill_open_id = Some(id);
+                        state.skill_open_id = Some(id.clone());
                         state.skill_error = None;
                         state.skill_open = Some(detail);
                         // A new skill is one of the person's own, whichever side was open.
                         state.take_skills_scope(SkillScope::Yours);
                         state.refresh_skills(cx);
+                        // Made from the Plugins window's New skill page: that page becomes the
+                        // new skill's own, so Back goes to the list, never to an empty form.
+                        if let Some(modal) = state.monitor_modal.as_mut().filter(|m| {
+                            m.selected
+                                == Some(crate::components::monitor_modal::PluginSelection::NewSkill)
+                        }) {
+                            modal.selected =
+                                Some(crate::components::monitor_modal::PluginSelection::Skill(
+                                    id.clone(),
+                                ));
+                            state.skill_edit = Some(crate::state::SkillEdit {
+                                id: id.clone(),
+                                ..Default::default()
+                            });
+                        }
+                        state.refresh_coworker_skills(cx);
                     }
                     Err(error) => state.refuse_create(from, error.message),
                 }
@@ -13897,6 +14447,11 @@ impl AppState {
     }
 
     pub fn dismiss_popovers(&mut self, cx: &mut Context<Self>) {
+        // The composer's list is its own view; it is asked to close, and closes on its next look.
+        if self.composer_panel.is_some() {
+            self.composer_panel_close_requested = true;
+            cx.notify();
+        }
         if !self.model_picker.open && !self.avatar_editor_open && self.emoji_picker.is_none() {
             return;
         }
@@ -14400,6 +14955,16 @@ impl AppState {
         self.shut_picker_list(which);
         if open && which == PickerFor::Bot {
             self.avatar_editor_open = false;
+        }
+        // The list is read again each time a picker opens: a model added or taken away in the
+        // person's opencodex, or on the gateway, shows here without a trip to Settings (8 Oct
+        // 2026). The list on screen stays until the answer, so nothing flickers.
+        if open
+            && self
+                .models_read_at
+                .is_some_and(|at| at.elapsed() >= MODELS_STALE_AFTER)
+        {
+            self.refresh_models(cx);
         }
         cx.notify();
     }
@@ -14907,6 +15472,8 @@ impl AppState {
 
     pub fn set_database_service(&mut self, service: DatabaseService, cx: &mut Context<Self>) {
         self.database_service = Some(service.clone());
+        // The notifications kept on this Mac come back with the database (`crate::notifications`).
+        self.load_notices(cx);
         self.ensure_site_login_vault(cx);
         cx.notify();
 
@@ -15397,7 +15964,76 @@ impl AppState {
             computer_view: self.computer_view.clone(),
             app_settings_open: self.is_app_settings_open,
             app_settings_tab: self.app_settings_tab,
+            window: self.monitor_modal.as_ref().map(|m| WindowNav {
+                kind: m.kind,
+                page: m.page.clone(),
+                selected: m.selected.clone(),
+                bots_for: m.bots_for.clone(),
+                skill_bots_open: self.skill_bots.as_ref().is_some_and(|b| b.open),
+            }),
         }
+    }
+
+    /// A move inside the Plugins or Tools window, recorded as a step.
+    pub(crate) fn record_window_nav(&mut self) {
+        if self.monitor_modal.is_some() {
+            self.record_nav();
+        }
+    }
+
+    /// The window's ‹ while the step behind is the same window's page: one step back in the
+    /// history, the same as ⌘[, so ⌘] can go forward again. `false` when it is not.
+    /// Only when the step behind is where ‹ leads (`leads_to`): ‹ is "up", and a step behind
+    /// that is somewhere else (a category opened before Installed) is not it.
+    pub(crate) fn window_back(
+        &mut self,
+        leads_to: impl Fn(&WindowNav) -> bool,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(kind) = self.monitor_modal.as_ref().map(|m| m.kind) else {
+            return false;
+        };
+        if self.nav.applying || !self.nav.back_is_window(|w| w.kind == kind && leads_to(w)) {
+            return false;
+        }
+        self.nav_back(cx);
+        true
+    }
+
+    /// The window as a history step says: opened if it is not, then its page, detail and Bots
+    /// page. Each move here is not a new step (`applying`).
+    fn apply_window(&mut self, window: Option<WindowNav>, cx: &mut Context<Self>) {
+        let Some(w) = window else {
+            if self.monitor_modal.is_some() {
+                self.monitor_modal = None;
+                self.monitor_generation += 1;
+            }
+            return;
+        };
+        if self.monitor_modal.as_ref().map(|m| m.kind) != Some(w.kind) {
+            self.open_monitor_modal(w.kind, cx);
+        }
+        if self.monitor_modal.as_ref().is_none_or(|m| m.page != w.page) {
+            self.set_market_page(w.page.clone(), cx);
+        }
+        let selected = self.monitor_modal.as_ref().and_then(|m| m.selected.clone());
+        if selected != w.selected {
+            match w.selected.clone() {
+                Some(selection) => self.open_market_detail(selection, cx),
+                None => self.close_market_detail(cx),
+            }
+        }
+        if self.monitor_modal.as_ref().and_then(|m| m.bots_for.clone()) != w.bots_for {
+            self.open_account_bots(w.bots_for.clone(), cx);
+        }
+        if self.skill_bots.as_ref().is_some_and(|b| b.open) != w.skill_bots_open {
+            self.open_skill_bots(w.skill_bots_open, cx);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn record_nav_for_test(&mut self) {
+        self.record_nav();
     }
 
     fn record_nav(&mut self) {
@@ -15452,12 +16088,6 @@ impl AppState {
             self.refresh_host_egress(cx);
             self.refresh_coworker_computer_quietly(cx);
         }
-        // And landing on Settings → Skills the same way: the library is the account's, nothing
-        // else fetches it, and a page that arrived here through back or forward would say "No
-        // skills yet" about a library nobody had asked for.
-        if self.is_app_settings_open && self.app_settings_tab == AppSettingsTab::Skills {
-            self.refresh_skills(cx);
-        }
         self.reply_source_page_moved(cx);
         // A routine's thread is somewhere a person can go back to, while it is still one of
         // this bot's routines' threads and this bot is the one open. Anything else lands on the
@@ -15485,6 +16115,7 @@ impl AppState {
         if self.page == MainPage::Recipes {
             self.refresh_recipes(cx);
         }
+        self.apply_window(loc.window, cx);
         self.nav.applying = false;
         cx.notify();
     }
@@ -16719,7 +17350,7 @@ impl AppState {
     /// `preferTools` ([`crate::opengrok::TurnTags`]). A plugin the list has not loaded yet is not
     /// a tag the app can tell from a word, and goes as a word.
     fn turn_tags(&self, text: &str) -> crate::opengrok::TurnTags {
-        use crate::components::chat_input::{BUILTIN_TOOLS, tags_in};
+        use crate::components::chat_input::{BUILTIN_TOOLS, function_tags_in, tags_in};
         let installs = self
             .plugin_market
             .installations
@@ -16729,11 +17360,54 @@ impl AppState {
             installs.is_some_and(|installs| installs.iter().any(|install| install.name == name))
         };
         let builtin = |name: &str| BUILTIN_TOOLS.iter().any(|(tool, ..)| *tool == name);
-        crate::opengrok::TurnTags {
+        let mut tags = crate::opengrok::TurnTags {
             plugins: tags_in(text, installed),
             tools: tags_in(text, builtin),
             ..Default::default()
+        };
+        // "@cloudflare:execute" and "@routines:create_routine" name one function, as the Bot's
+        // own tools listing names it (`preferTools`, which the server keeps to tools it offers);
+        // a bare "@routines" names every tool of the group.
+        let listed = match &self.coworker_tools {
+            Some((bot, ToolList::Listed(tools)))
+                if Some(bot) == self.active_coworker_id.as_ref() =>
+            {
+                tools.as_slice()
+            }
+            _ => &[],
+        };
+        let group = |name: &str| {
+            listed
+                .iter()
+                .find(|tool| tool.name == name && !tool.tools.is_empty())
+        };
+        let prefer = |name: String, tags: &mut crate::opengrok::TurnTags| {
+            if !tags.tools.contains(&name) {
+                tags.tools.push(name);
+            }
+        };
+        let named = function_tags_in(text);
+        for (name, function) in &named {
+            let plugin_tool = listed.iter().find(|tool| {
+                tool.plugin.as_deref() == Some(name.as_str())
+                    && tool
+                        .qualified
+                        .as_deref()
+                        .is_some_and(|q| q.rsplit('.').next() == Some(function.as_str()))
+            });
+            if let Some(tool) = plugin_tool {
+                prefer(tool.name.clone(), &mut tags);
+            } else if group(name).is_some_and(|g| g.tools.iter().any(|t| t.name == *function)) {
+                prefer(function.clone(), &mut tags);
+            }
         }
+        let with_function = |name: &str| named.iter().any(|(tagged, _)| tagged == name);
+        for name in tags_in(text, |name| group(name).is_some() && !with_function(name)) {
+            for member in group(&name).map(|g| g.tools.clone()).unwrap_or_default() {
+                prefer(member.name, &mut tags);
+            }
+        }
+        tags
     }
 
     /// `recipe` and `skill` are what the message was typed with. `stop_first` is a run this turn
@@ -17083,6 +17757,27 @@ impl AppState {
                         // answer landed when the run began.
                         stamp_run_finished(message, SystemTime::now());
                     }
+                }
+                // A turn that went wrong goes to its Bot's notifications and the toast too: the
+                // line in the chat stays small, and the whole sentence is kept where it can be
+                // copied and traced (8 Oct 2026).
+                if let Err(error) = &result
+                    && error.unreachable().is_none()
+                    && !error.is_signed_out()
+                {
+                    let bot = state
+                        .conversations
+                        .iter()
+                        .find(|c| c.id == conversation_id)
+                        .map(|c| {
+                            c.origin
+                                .as_ref()
+                                .map_or_else(|| c.id.clone(), |o| o.coworker_id.clone())
+                        });
+                    let said = error.message.clone();
+                    let raw = error.code().map(|code| format!("code {code}"));
+                    let run = (!run_id.is_empty()).then(|| run_id.clone());
+                    state.notify_error(bot, "Turn", &said, raw, run, cx);
                 }
                 let parked = waiting_approval || waiting_user_form;
                 // A turn the person's plan could not answer says why, and offers itself again on
@@ -19251,6 +19946,22 @@ impl AppState {
         else {
             return;
         };
+        // Before Touch ID: can a saved login be used for this Bot at all? Unknown, it is asked and
+        // the pick runs again with the answer; refused, the card says why and offers a way on.
+        if let Some(bot) = self.card_coworker(&card_key) {
+            match self.saved_login_checks.get(&bot) {
+                None => {
+                    self.check_saved_logins(bot, Some((card_key, login_id)), cx);
+                    return;
+                }
+                Some(check) if !check.usable => {
+                    self.user_form_list_open.insert(card_key);
+                    cx.notify();
+                    return;
+                }
+                Some(_) => {}
+            }
+        }
         let Some(vault) = self.site_login_vault.clone() else {
             return;
         };
@@ -19278,6 +19989,14 @@ impl AppState {
         }
         cx.notify();
         let client = self.opengrok.clone();
+        // A login not yet shared with this Bot is shared by the same Touch ID that fills it.
+        // Unknown counts as not shared: the share is idempotent, a fill of an unshared one is not.
+        let share_with = self.card_coworker(&card_key).filter(|bot| {
+            !self
+                .site_login_shares
+                .get(bot)
+                .is_some_and(|ids| ids.contains(&row.id))
+        });
         let wants = match &target {
             CardTarget::Login(_) | CardTarget::Password { .. } => HeldSecret::Password,
             CardTarget::Code { .. } => HeldSecret::CodeSeed,
@@ -19351,6 +20070,29 @@ impl AppState {
                 },
                 other => other,
             };
+            // Touch ID passed for a login this Bot did not have yet: share it now, before the
+            // fill names it. Refused, nothing is filled and the card says why.
+            if let (Ok(_), Some(bot), Some(client)) = (&unlocked, &share_with, client.as_ref()) {
+                if let Err(error) = client.set_site_login_shared(&row.id, bot, true).await {
+                    let _ = this.update(cx, |state, cx| {
+                        state.saved_login_use.insert(
+                            card_key.clone(),
+                            SavedLoginUse::Unavailable {
+                                message: format!(
+                                    "{username} could not be shared with this Bot: {}",
+                                    error.message
+                                ),
+                            },
+                        );
+                        cx.notify();
+                    });
+                    return;
+                }
+                let (bot, id) = (bot.clone(), row.id.clone());
+                let _ = this.update(cx, |state, _| {
+                    state.site_login_shares.entry(bot).or_default().insert(id);
+                });
+            }
             let _ = this.update(cx, |state, cx| {
                 use crate::site_login::touch_id::TouchIdOutcome;
                 // The card may have settled or been dismissed while the sheet was up; a
@@ -19505,6 +20247,99 @@ impl AppState {
     }
 
     /// "Change" on the locked password row: the held password is dropped; the person types.
+    /// The Bot a login card belongs to: on a routine's thread, the routine's Bot.
+    pub(crate) fn card_coworker(&self, card_key: &str) -> Option<String> {
+        self.user_form_context(card_key)
+            .map(|(_, _, _, coworker)| coworker)
+    }
+
+    /// Ask the server whether a saved login can be used for `bot`, then run `then` (a pick held
+    /// for the answer). A server from before the check answers 404: its fill refuses for itself,
+    /// so the app goes on as it did.
+    pub fn check_saved_logins(
+        &mut self,
+        bot: String,
+        then: Option<(String, String)>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(client) = self.opengrok.clone() else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let shares = client.logins_shared_with(&bot).await.ok();
+            let check = match client.saved_login_check(&bot).await {
+                Ok(check) => check,
+                Err(error) => {
+                    log::warn!("saved-login check for {bot}: {}", error.message);
+                    crate::opengrok::SavedLoginCheck {
+                        usable: true,
+                        reason: None,
+                        own_computer: false,
+                    }
+                }
+            };
+            let _ = this.update(cx, |state, cx| {
+                if let Some(shares) = shares {
+                    state
+                        .site_login_shares
+                        .insert(bot.clone(), shares.into_iter().collect());
+                }
+                state.saved_login_checks.insert(bot, check);
+                if let Some((card_key, login_id)) = then {
+                    state.pick_saved_login(card_key, login_id, cx);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// "Give <Bot> its own computer" on a login card: the server makes it a computer of its own,
+    /// and the check is asked again so the card's logins come back.
+    pub fn give_bot_own_computer(&mut self, bot: String, cx: &mut Context<Self>) {
+        let Some(client) = self.opengrok.clone() else {
+            return;
+        };
+        if self.own_computer_changing.is_some() {
+            return;
+        }
+        self.own_computer_changing = Some(bot.clone());
+        self.own_computer_refusal = None;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = client.set_own_computer(&bot, true).await;
+            let _ = this.update(cx, |state, cx| {
+                state.own_computer_changing = None;
+                match result {
+                    Ok(()) => {
+                        state.saved_login_checks.remove(&bot);
+                        state.check_saved_logins(bot.clone(), None, cx);
+                        state.refresh_coworker_computer_quietly(cx);
+                    }
+                    Err(error) => {
+                        state.notify_error(
+                            Some(bot.clone()),
+                            "Login card",
+                            &error.message,
+                            None,
+                            None,
+                            cx,
+                        );
+                        state.own_computer_refusal = Some(error.message);
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// "Type it by hand": the list goes away and the fields are the person's.
+    pub fn type_login_by_hand(&mut self, card_key: String, cx: &mut Context<Self>) {
+        self.user_form_list_open.remove(&card_key);
+        cx.notify();
+    }
+
     pub fn clear_saved_login_pick(&mut self, card_key: String, cx: &mut Context<Self>) {
         self.saved_login_use.remove(&card_key);
         cx.notify();
@@ -20009,6 +20844,12 @@ impl AppState {
             .and_then(card_target)
             .is_some_and(|target| target.list_field() == Some(field_id));
         if belongs {
+            if let Some(bot) = self
+                .card_coworker(&card_key)
+                .filter(|bot| !self.saved_login_checks.contains_key(bot))
+            {
+                self.check_saved_logins(bot, None, cx);
+            }
             self.user_form_list_open.insert(card_key);
             cx.notify();
         }
@@ -20429,6 +21270,10 @@ impl AppState {
                                 state
                                     .saved_login_use
                                     .insert(card_key.clone(), SavedLoginUse::Refused { message });
+                                // The Bot's computer changed under the check: ask again next pick.
+                                if let Some(bot) = state.card_coworker(&card_key) {
+                                    state.saved_login_checks.remove(&bot);
+                                }
                             }
                         }
                     }
@@ -22429,9 +23274,6 @@ impl AppState {
                 self.refresh_computers(cx);
                 self.refresh_coworker_computer_quietly(cx);
             }
-            if self.app_settings_tab == AppSettingsTab::Skills {
-                self.refresh_skills(cx);
-            }
         }
         self.reply_source_page_moved(cx);
         self.record_nav();
@@ -22448,11 +23290,6 @@ impl AppState {
                 // Route traffic and the network choice for a shared box live on this tab and
                 // read the open bot's computer record, which nothing else on this page fetches.
                 self.refresh_coworker_computer_quietly(cx);
-            }
-            // The library is the account's and nothing else fetches it, so arriving on the tab
-            // is when it is asked for.
-            if tab == AppSettingsTab::Skills {
-                self.refresh_skills(cx);
             }
             self.reply_source_page_moved(cx);
             cx.notify();
@@ -23259,7 +24096,9 @@ fn policy_not_kept(
 /// [`plain_reason`]). A server out of reach or a session that has gone is already said by the
 /// reconnect pill and the signed-out banner, and here it is only that it did not happen.
 mod plugin_market;
-pub use plugin_market::{Loaded, PluginMarket, TokenForm, sign_in_key};
+pub use plugin_market::{
+    Loaded, PluginMarket, SkillBots, SkillEdit, SkillField, TokenForm, sign_in_key,
+};
 
 fn rules_refusal(what: &str, error: &OpenGrokError) -> String {
     let reason = (error.failure() == Failure::Verdict)
@@ -24023,6 +24862,34 @@ mod tests {
                 state.toggle_sidebar(cx);
                 assert!(!state.sidebar_hidden);
                 assert_eq!(state.sidebar_collapsed, collapsed);
+            }
+        });
+    }
+
+    /// A modal opened over the composer takes the "@" or "/" list with it (6 Oct 2026: the list
+    /// stayed floating over Settings). The list is the composer's own, so the state asks it to
+    /// close; Settings, Plugins and the Tools modal each ask.
+    #[gpui_kit::test]
+    fn opening_a_modal_asks_the_composer_to_close_its_list(cx: &mut gpui_kit::TestAppContext) {
+        use crate::components::chat_input::PanelMode;
+        use crate::components::monitor_modal::MonitorKind;
+        use gpui_kit::AppContext as _;
+        let app = cx.new(|_| super::AppState::new());
+        app.update(cx, |state, cx| {
+            state.active_coworker_id = Some("cw_1".into());
+            type Open = dyn Fn(&mut super::AppState, &mut gpui_kit::Context<super::AppState>);
+            let opens: [&Open; 3] = [
+                &|state, cx| state.open_app_settings(super::AppSettingsTab::General, cx),
+                &|state, cx| state.open_plugin_market(cx),
+                &|state, cx| state.open_monitor_modal(MonitorKind::Tools, cx),
+            ];
+            for open in opens {
+                state.is_app_settings_open = false;
+                state.monitor_modal = None;
+                state.composer_panel_close_requested = false;
+                state.set_composer_panel(Some(PanelMode::Tools), cx);
+                open(state, cx);
+                assert!(state.composer_panel_close_requested);
             }
         });
     }
@@ -29477,6 +30344,78 @@ mod tests {
         state.active_conversation_id = Some("cw_1".into());
         state.routines.insert("cw_1".into(), routines);
         cx.new(|_| state)
+    }
+
+    /// A notice is written to the app's own database and read back from it after a restart. The
+    /// write runs where the database can run (8 Oct 2026: it ran on a background thread with no
+    /// Tokio context, and the app aborted the moment anything went wrong).
+    #[gpui_kit::test]
+    fn a_notice_is_kept_in_the_database_and_read_back(cx: &mut gpui_kit::TestAppContext) {
+        use gpui_kit::AppContext as _;
+        let runtime = a_runtime_for_the_relay(cx);
+        let _enter = runtime.enter();
+        let db = runtime.block_on(test_db());
+        let mut state = signed_in_state();
+        state.database_service = Some(db.clone());
+        let app = cx.new(|_| state);
+        app.update(cx, |state, cx| {
+            state.notify_error(Some("cw_1".into()), "Turn", "it broke", None, None, cx);
+        });
+        // A second window on the same database stands for a restart: it reads the notice back the
+        // way the app does, so the write is seen only once it really landed.
+        let reopened = cx.new(|_| {
+            let mut state = signed_in_state();
+            state.database_service = Some(db.clone());
+            state
+        });
+        wait_for(cx, "written, and read back after a restart", |cx| {
+            reopened.update(cx, |state, cx| {
+                if state.notices.is_empty() {
+                    state.load_notices(cx);
+                }
+            });
+            cx.run_until_parked();
+            reopened.read_with(cx, |state, _| {
+                state.notices.len() == 1 && state.notices[0].said == "it broke"
+            })
+        });
+    }
+
+    /// A turn that fails leaves one quiet line in the chat and its whole sentence in its Bot's
+    /// notifications, with where it was caught, and the toast says so (8 Oct 2026: the sentence
+    /// was a red line in the chat that could not be dismissed or copied).
+    #[gpui_kit::test]
+    fn a_failed_turn_goes_to_its_bots_notifications_and_the_toast(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        let runtime = a_runtime_for_the_relay(cx);
+        let _enter = runtime.enter();
+        let server = runtime.block_on(wiremock::MockServer::start());
+        let frames = vec![
+            json!({"type": "RUN_STARTED", "threadId": "cw_1", "runId": "run_turn"}),
+            json!({"type": "RUN_ERROR", "message": "upstream anthropic returned 400"}),
+        ];
+        let app = adas_window(cx, &runtime, &server, &frames, json!([]), Vec::new());
+        app.update(cx, |state, cx| state.send_message("hello".into(), cx));
+        wait_for(cx, "the failure is noticed", |cx| {
+            app.read_with(cx, |state, _| !state.notices.is_empty())
+        });
+        app.read_with(cx, |state, _| {
+            let notice = &state.notices[0];
+            assert_eq!(notice.bot.as_deref(), Some("cw_1"));
+            assert_eq!(notice.place, "Turn");
+            assert!(
+                notice.said.contains("upstream anthropic returned 400"),
+                "{notice:?}"
+            );
+            assert!(notice.code.starts_with("src/state.rs:"), "{notice:?}");
+            assert_eq!(
+                state.toast.as_deref(),
+                Some(notice.id.as_str()),
+                "the toast shows it"
+            );
+            assert_eq!(state.unread_notices("cw_1"), 1, "the bell counts it");
+        });
     }
 
     /// A Bot asked in chat makes a routine with `create_routine` (opengrok-server #316:
@@ -40003,6 +40942,70 @@ mod tests {
         serde_json::from_value(recorded["body"].clone()).unwrap()
     }
 
+    /// Uninstall asks in words that say what goes: every account of the plugin, with its keys and
+    /// sign-ins in the vault, and its use by every Bot (6 Oct 2026, the owner's call). The title is
+    /// the question; the line under it is what happens.
+    #[test]
+    fn uninstall_says_its_accounts_and_their_secrets_go() {
+        use crate::components::monitor_modal::{MonitorKind, MonitorModal, PluginSelection};
+        let mut state = signed_in_state();
+        state.plugin_market.installations = Some(crate::state::Loaded::Ready(recorded_installs()));
+        let mut modal = MonitorModal::new("cw_1".into(), MonitorKind::Plugins);
+        modal.confirming = true;
+        state.monitor_modal = Some(modal);
+        let detail =
+            crate::components::marketplace::detail(&state, &PluginSelection::Plugin("demo".into()))
+                .expect("the install has a detail");
+        assert_eq!(
+            detail.question.as_deref(),
+            Some(
+                "Uninstall demo?\nIts 2 accounts are deleted, with their keys and sign-ins in the \
+                 vault, and every Bot stops using it. Installing it again starts with no accounts."
+            )
+        );
+    }
+
+    /// "@demo:execute" and "@routines:create_routine" name one tool each, as the Bot's own
+    /// listing names it, so the server can name it to the model (`preferTools`); a bare
+    /// "@routines" names the whole group. A function the Bot does not have is a word.
+    #[test]
+    fn a_function_tag_names_the_tool_the_bot_has() {
+        use crate::opengrok::CoworkerTool;
+        let mut state = signed_in_state();
+        state.active_coworker_id = Some("cw_1".into());
+        state.plugin_market.installations = Some(crate::state::Loaded::Ready(recorded_installs()));
+        let member = |name: &str| CoworkerTool {
+            name: name.into(),
+            kind: "builtin".into(),
+            ..Default::default()
+        };
+        state.coworker_tools = Some((
+            "cw_1".into(),
+            crate::state::ToolList::Listed(vec![
+                CoworkerTool {
+                    name: "demo_hosted_execute".into(),
+                    kind: "plugin".into(),
+                    plugin: Some("demo".into()),
+                    qualified: Some("demo.hosted.execute".into()),
+                    ..Default::default()
+                },
+                CoworkerTool {
+                    name: "routines".into(),
+                    kind: "builtin".into(),
+                    tools: vec![member("create_routine"), member("run_routine")],
+                    ..Default::default()
+                },
+            ]),
+        ));
+        let tags = state.turn_tags("@demo:execute and @routines:create_routine, @demo:nope");
+        assert_eq!(tags.plugins, ["demo"]);
+        assert_eq!(tags.tools, ["demo_hosted_execute", "create_routine"]);
+        assert_eq!(
+            state.turn_tags("@routines please").tools,
+            ["create_routine", "run_routine"]
+        );
+    }
+
     /// What a turn carries is what its words tagged, read off them when it leaves: an installed
     /// plugin, a built-in tool. A plugin nobody installed is a word, and so is an address.
     #[test]
@@ -41198,6 +42201,203 @@ mod tests {
     /// back on what the server keeps. It goes through the road a real refusal takes, over a real
     /// answer: the callback `save_model_pick` hands the request is what puts the words in the
     /// popover, so the test fails without it.
+    /// Something going wrong shows the toast, counts on the bell, and is listed on the bell's
+    /// page with where it was caught; Copy hands it over whole and Clear empties the page. All of
+    /// it through the driver's `notices.*`, the way a driver checks it (8 Oct 2026).
+    #[cfg(feature = "agent")]
+    #[gpui_kit::test]
+    fn a_notice_toasts_counts_on_the_bell_and_is_kept_on_its_page(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        use crate::agent::NativeChatHost;
+        use crate::components::notifications_pane as pane;
+        use gpui_agent::AgentHost as _;
+        use gpui_agent::protocol::Op;
+        use gpui_kit::AppContext as _;
+        let mut state = AppState::new();
+        state.auth_status = super::AuthStatus::SignedIn;
+        state.account =
+            serde_json::from_value(json!({"id": "acct_1", "email": "ada@example.com"})).ok();
+        state.coworkers.push(bob());
+        state.conversations.push(thread("cw_1", Vec::new()));
+        state.active_coworker_id = Some("cw_1".into());
+        state.active_conversation_id = Some("cw_1".into());
+        let app = cx.new(|_| state);
+        let run = |cx: &mut gpui_kit::TestAppContext, op: Op| -> Option<serde_json::Value> {
+            let (value, command) = app.read_with(cx, |state, _| {
+                let mut host = NativeChatHost::from_app(state);
+                let value = host.dispatch(&op).unwrap().value;
+                (value, host.take_command())
+            });
+            if let Some(command) = command {
+                app.update(cx, |state, cx| command.apply(state, cx));
+            }
+            value
+        };
+        let invoke = |name: &str, args: serde_json::Value| Op::Invoke {
+            name: name.into(),
+            args,
+        };
+        let tree = |cx: &mut gpui_kit::TestAppContext| {
+            app.read_with(cx, |state, _| NativeChatHost::from_app(state).snapshot())
+        };
+
+        run(
+            cx,
+            invoke(
+                "notices.fake",
+                json!({"place": "Turn", "said": "upstream anthropic returned 400"}),
+            ),
+        );
+        let t = tree(cx);
+        assert!(t.find(pane::TOAST).is_some(), "the toast shows");
+        assert_eq!(
+            t.find(crate::components::title_bar::BELL)
+                .unwrap()
+                .value
+                .as_deref(),
+            Some("1"),
+            "the bell counts it"
+        );
+        let count = run(cx, invoke("notices.count", json!({}))).unwrap();
+        assert_eq!(count, json!({"total": 1, "unread": 1}));
+
+        run(cx, Op::click(crate::components::title_bar::BELL));
+        let listed = run(cx, invoke("notices.list", json!({"last": 5}))).unwrap();
+        let id = listed[0]["id"].as_str().unwrap().to_string();
+        assert_eq!(listed[0]["place"], "Turn");
+        assert_eq!(
+            listed[0]["read"], false,
+            "opening the page is not reading it"
+        );
+        assert!(
+            listed[0]["code"].as_str().unwrap().starts_with("src/"),
+            "{listed}"
+        );
+        let t = tree(cx);
+        assert!(t.find(&pane::row_id(&id)).is_some(), "listed on the page");
+        assert!(t.find(pane::UNREAD_COUNT).is_some(), "the title counts it");
+
+        // Opening a row shows where it was caught, and reads it.
+        run(cx, Op::click(pane::row_id(&id)));
+        assert!(
+            tree(cx).find(&pane::details_id(&id)).is_some(),
+            "its details"
+        );
+        assert_eq!(
+            tree(cx)
+                .find(crate::components::title_bar::BELL)
+                .unwrap()
+                .value
+                .as_deref(),
+            Some("0")
+        );
+        // Ticked, the toolbar is about the selection: unread again, then read.
+        run(cx, Op::click(pane::select_id(&id)));
+        assert!(tree(cx).find(pane::SELECTED_COUNT).is_some());
+        run(cx, Op::click(pane::MARK_UNREAD));
+        assert_eq!(
+            run(cx, invoke("notices.count", json!({}))).unwrap()["unread"],
+            1
+        );
+        assert!(
+            tree(cx).find(pane::FILTER_UNREAD).is_none(),
+            "the selection's toolbar stands"
+        );
+        run(cx, Op::click(pane::MARK_READ));
+        assert_eq!(
+            run(cx, invoke("notices.count", json!({}))).unwrap()["unread"],
+            0
+        );
+
+        let got = run(cx, invoke("notices.get", json!({"id": id}))).unwrap();
+        assert!(
+            got["copyText"].as_str().unwrap().contains("Where:  Turn"),
+            "{got}"
+        );
+
+        run(cx, invoke("notices.dismiss", json!({})));
+        assert!(tree(cx).find(pane::TOAST).is_none(), "dismissed");
+
+        // Delete leaves an Undo; Undo puts it back; Delete all empties the page.
+        run(cx, Op::click(pane::DELETE_SELECTED));
+        assert!(tree(cx).find(pane::UNDO).is_some(), "an Undo stands");
+        run(cx, Op::click(pane::UNDO));
+        assert!(tree(cx).find(&pane::row_id(&id)).is_some(), "put back");
+        run(cx, Op::click(pane::DELETE_ALL));
+        assert!(
+            tree(cx).find(pane::EMPTY).is_some(),
+            "the empty state after Delete all"
+        );
+        run(cx, invoke("notices.fake", json!({"bot": "none"})));
+        run(cx, invoke("notices.clear-all", json!({})));
+        let all = run(cx, invoke("notices.list", json!({"all": true}))).unwrap();
+        assert_eq!(all, json!([]));
+    }
+
+    /// Opening a picker reads the model list again: a model the person's opencodex (or the
+    /// gateway) began serving since the last read is in the list without a trip to Settings
+    /// (8 Oct 2026: a key added in opencodex showed nothing until Settings → General was opened).
+    #[gpui_kit::test]
+    fn opening_a_picker_reads_the_models_again(cx: &mut gpui_kit::TestAppContext) {
+        use super::PickerFor;
+        use gpui_kit::AppContext as _;
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("a runtime");
+        let _enter = runtime.enter();
+        cx.executor().allow_parking();
+        let server = runtime.block_on(wiremock::MockServer::start());
+        runtime.block_on(
+            wiremock::Mock::given(wiremock::matchers::method("GET"))
+                .and(wiremock::matchers::path("/models"))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
+                    "models": [
+                        {"id": "gpt-6-luna", "source": "local_proxy"},
+                        {"id": "new-model-today", "source": "local_proxy"}
+                    ],
+                    "note": null
+                })))
+                .mount(&server),
+        );
+        let mut state = signed_in_state();
+        state.opengrok = Some(runtime.block_on(client_signed_in_to(&server)));
+        with_bot(&mut state, json!("local_proxy"));
+        state.model_catalogue = serde_json::from_value(json!({
+            "models": [{"id": "gpt-6-luna", "source": "local_proxy"}],
+            "note": null
+        }))
+        .expect("a list");
+        // Read from the server a while ago, so the opening reads it again.
+        state.models_read_at =
+            std::time::Instant::now().checked_sub(std::time::Duration::from_secs(60));
+        let app = cx.new(|_| state);
+        app.update(cx, |state, cx| {
+            state.set_picker_open(PickerFor::Bot, true, cx)
+        });
+        let listed = |cx: &mut gpui_kit::TestAppContext| {
+            app.read_with(cx, |state, _| {
+                state
+                    .model_catalogue
+                    .models
+                    .iter()
+                    .any(|m| m.id == "new-model-today")
+            })
+        };
+        let mut waited = 0;
+        while !listed(cx) {
+            assert!(
+                waited < 400,
+                "the opened picker did not read the models again"
+            );
+            cx.run_until_parked();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            waited += 1;
+        }
+    }
+
     #[gpui_kit::test]
     fn a_bots_refused_effort_is_said_in_its_popover_through_the_real_refusal(
         cx: &mut gpui_kit::TestAppContext,
@@ -44135,6 +45335,265 @@ mod tests {
             "no row, nothing written"
         );
     }
+
+    /// Plugins → Logins lists each saved login with how many Bots may use it; a login opens its
+    /// Bots page, and a Bot's switch there takes the login back from it (8 Oct 2026).
+    #[cfg(feature = "agent")]
+    #[gpui_kit::test]
+    fn a_login_is_shared_with_bots_from_its_page_in_the_plugins_window(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        use crate::agent::NativeChatHost;
+        use crate::components::marketplace;
+        use crate::components::monitor_modal::{MarketPage, MonitorKind, MonitorModal};
+        use gpui_agent::AgentHost as _;
+        use gpui_agent::protocol::Op;
+        use gpui_kit::AppContext as _;
+        use wiremock::matchers::{body_json, method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        let runtime = a_runtime_for_the_relay(cx);
+        let _enter = runtime.enter();
+        let server = runtime.block_on(wiremock::MockServer::start());
+        runtime.block_on(async {
+            Mock::given(method("GET"))
+                .and(path("/coworkers/cw_1/site-logins"))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(json!({"logins": ["sl_ada"]})),
+                )
+                .up_to_n_times(1)
+                .mount(&server)
+                .await;
+            // After the switch, the server has it off.
+            Mock::given(method("GET"))
+                .and(path("/coworkers/cw_1/site-logins"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({"logins": []})))
+                .mount(&server)
+                .await;
+            Mock::given(method("PUT"))
+                .and(path("/site-logins/sl_ada/bots/cw_1"))
+                .and(body_json(json!({"shared": false})))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+                .expect(1)
+                .mount(&server)
+                .await;
+        });
+        let mut state = AppState::new();
+        state.auth_status = super::AuthStatus::SignedIn;
+        state.opengrok = Some(OpenGrokClient::new(&server.uri()).unwrap());
+        state.account =
+            serde_json::from_value(json!({"id": "acct_1", "email": "ada@example.com"})).ok();
+        state.coworkers.push(bob());
+        state.active_coworker_id = Some("cw_1".into());
+        state.site_logins = vec![saved_login(
+            "sl_ada",
+            "github.com",
+            "ada@example.com",
+            "password",
+        )];
+        state.monitor_modal = Some(MonitorModal::new("cw_1".into(), MonitorKind::Plugins));
+        let app = cx.new(|_| state);
+        let drive = |cx: &mut gpui_kit::TestAppContext, target: &str| {
+            let command = app.read_with(cx, |state, _| {
+                let mut host = NativeChatHost::from_app(state);
+                host.dispatch(&Op::click(target)).unwrap();
+                host.take_command()
+            });
+            app.update(cx, |state, cx| command.unwrap().apply(state, cx));
+        };
+        drive(cx, marketplace::LOGINS);
+        assert_eq!(
+            app.read_with(cx, |state, _| state
+                .monitor_modal
+                .as_ref()
+                .unwrap()
+                .page
+                .clone()),
+            MarketPage::Logins
+        );
+        let count = |cx: &mut gpui_kit::TestAppContext| {
+            app.read_with(cx, |state, _| {
+                marketplace::login_rows(state)[0].action.clone()
+            })
+        };
+        wait_for(cx, "each Bot's logins are read", |cx| {
+            count(cx) == marketplace::RowAction::Count("1 Bot".into())
+        });
+        drive(cx, "market-login-sl_ada");
+        let switch = marketplace::login_bot_switch_id("sl_ada", "cw_1");
+        app.read_with(cx, |state, _| {
+            let tree = NativeChatHost::from_app(state).snapshot();
+            let node = tree.find(&switch).expect("the Bot's switch is drawn");
+            assert!(node.states.iter().any(|s| s == "checked"), "on: {node:?}");
+        });
+        drive(cx, &switch);
+        wait_for(cx, "the server is told", |_| {
+            runtime
+                .block_on(server.received_requests())
+                .unwrap_or_default()
+                .iter()
+                .any(|r| r.method.as_str() == "PUT")
+        });
+        app.read_with(cx, |state, _| {
+            assert!(
+                state
+                    .site_login_shares
+                    .get("cw_1")
+                    .is_some_and(|ids| !ids.contains("sl_ada"))
+            );
+        });
+        drive(cx, crate::components::monitor_modal::BACK);
+        // Back on the list, the shares are read again; the count follows the switch.
+        wait_for(cx, "the list counts the login's Bots again", |cx| {
+            count(cx) == marketplace::RowAction::Count("0 Bots".into())
+                && runtime
+                    .block_on(server.received_requests())
+                    .unwrap_or_default()
+                    .iter()
+                    .filter(|r| r.method.as_str() == "GET")
+                    .count()
+                    >= 2
+        });
+        for _ in 0..20 {
+            cx.run_until_parked();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    /// On a Bot whose computer is shared, picking a saved login asks no Touch ID: the card says
+    /// why in place of the logins, "Give it its own computer" asks the server for one, and the
+    /// logins come back once the Bot has it (8 Oct 2026: Touch ID came first, then a refusal
+    /// with no way on).
+    #[cfg(feature = "agent")]
+    #[gpui_kit::test]
+    fn a_saved_login_on_a_shared_computer_asks_no_touch_id_and_offers_its_own(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        use crate::agent::NativeChatHost;
+        use gpui_agent::AgentHost as _;
+        use gpui_agent::protocol::Op;
+        use gpui_kit::AppContext as _;
+        use wiremock::matchers::{body_json, method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        let runtime = a_runtime_for_the_relay(cx);
+        let _enter = runtime.enter();
+        let server = runtime.block_on(wiremock::MockServer::start());
+        runtime.block_on(async {
+            Mock::given(method("GET"))
+                .and(path("/coworkers/cw_1/saved-login"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(
+                    json!({"usable": false, "reason": "shared-computer", "ownComputer": false}),
+                ))
+                .up_to_n_times(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/coworkers/cw_1/saved-login"))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(
+                        json!({"usable": true, "reason": null, "ownComputer": true}),
+                    ),
+                )
+                .mount(&server)
+                .await;
+            Mock::given(method("PUT"))
+                .and(path("/coworkers/cw_1/own-computer"))
+                .and(body_json(json!({"on": true})))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(json!({"ownComputer": true})),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+        });
+        let mut state = AppState::new();
+        state.auth_status = super::AuthStatus::SignedIn;
+        state.opengrok = Some(OpenGrokClient::new(&server.uri()).unwrap());
+        state.account =
+            serde_json::from_value(json!({"id": "acct_1", "email": "ada@example.com"})).ok();
+        state.coworkers.push(bob());
+        state.site_logins = vec![saved_login(
+            "sl_ada",
+            "google.com",
+            "ada@example.com",
+            "password",
+        )];
+        state.site_logins_ready = true;
+        let mut sign_in = message("m1", false, "");
+        sign_in.parts = vec![ChatPart::UserForm(google_card(
+            "e_login",
+            json!([
+                {"id": "email", "label": "Email", "type": "email", "required": true},
+                {"id": "password", "label": "Password", "type": "password", "required": true}
+            ]),
+        ))];
+        state.conversations.push(thread("cw_1", vec![sign_in]));
+        state.active_conversation_id = Some("cw_1".into());
+        let app = cx.new(|_| state);
+        let card = app.read_with(cx, |state, _| {
+            state
+                .conversations
+                .iter()
+                .flat_map(|c| &c.messages)
+                .flat_map(|m| &m.parts)
+                .find_map(|part| match part {
+                    ChatPart::UserForm(spec) => Some(spec.card_key().to_string()),
+                    _ => None,
+                })
+                .unwrap()
+        });
+        app.update(cx, |state, cx| {
+            state.pick_saved_login(card.clone(), "sl_ada".into(), cx)
+        });
+        wait_for(cx, "the check is answered", |cx| {
+            app.read_with(cx, |state, _| state.saved_login_checks.contains_key("cw_1"))
+        });
+        app.read_with(cx, |state, _| {
+            assert!(
+                !state.saved_login_use.contains_key(&card),
+                "no Touch ID was asked for a login that cannot be used"
+            );
+            assert!(
+                state.user_form_list_open.contains(&card),
+                "the card says why"
+            );
+        });
+        let own = crate::opengrok::user_form_own_computer_id(&card);
+        let command = app.read_with(cx, |state, _| {
+            let mut host = NativeChatHost::from_app(state);
+            let tree = host.snapshot();
+            assert!(
+                tree.find(&own).is_some(),
+                "{own} is drawn: {:?}",
+                tree.find(&format!("user-form-{card}")).map(|n| n
+                    .children
+                    .iter()
+                    .map(|c| c.id.clone())
+                    .collect::<Vec<_>>())
+            );
+            assert!(
+                host.snapshot()
+                    .find(&crate::opengrok::user_form_by_hand_id(&card))
+                    .is_some()
+            );
+            host.dispatch(&Op::click(&own)).unwrap();
+            host.take_command()
+        });
+        app.update(cx, |state, cx| command.unwrap().apply(state, cx));
+        wait_for(
+            cx,
+            "the Bot has its own computer and its logins are back",
+            |cx| {
+                app.read_with(cx, |state, _| {
+                    state
+                        .saved_login_checks
+                        .get("cw_1")
+                        .is_some_and(|check| check.usable)
+                        && state.own_computer_changing.is_none()
+                })
+            },
+        );
+    }
+
     #[cfg(feature = "agent")]
     #[gpui_kit::test]
     fn a_plugin_that_signs_people_in_adds_accounts_at_its_own_provider(
@@ -44314,6 +45773,10 @@ mod tests {
                 ("/coworkers/cw_1/tools", json!({"tools":[]})),
                 ("/coworkers/cw_1/ceiling", json!({"tools":[], "version":1})),
                 ("/coworkers/cw_1/skills", json!({"skills":[], "version":1})),
+                ("/coworkers/cw_1/plugin-skills", json!({"skills":[
+                    {"plugin":"bravo", "skill":"review", "description":"Review a change", "on":true}]})),
+                ("/coworkers/cw_1/plugin-skills/bravo/review", json!({"plugin":"bravo", "skill":"review",
+                    "description":"Review a change", "on":true, "body":"Read the diff first."})),
             ] {
                 Mock::given(method("GET"))
                     .and(path(at))
@@ -44348,6 +45811,13 @@ mod tests {
                 .and(path("/plugins/installations"))
                 .and(body_json(json!({"name":"bravo", "registryRevision": REV})))
                 .respond_with(ResponseTemplate::new(201).set_body_json(json!({"name":"bravo"})))
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("PUT"))
+                .and(path("/coworkers/cw_1/plugin-skills"))
+                .and(body_json(json!({"plugin":"bravo", "skill":"review", "on":false})))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
                 .expect(1)
                 .mount(&server)
                 .await;
@@ -44420,7 +45890,7 @@ mod tests {
             PluginSelection::Plugin("legacy-tool".into())
         );
         assert_eq!(installed[0].action, RowAction::Added);
-        drive(cx, Op::click("market-back"));
+        drive(cx, Op::click(crate::components::monitor_modal::BACK));
         assert_eq!(
             app.read_with(cx, |state, _| state
                 .monitor_modal
@@ -44551,6 +46021,36 @@ mod tests {
             .unwrap()
             .action),
             Some(marketplace::DetailAction::Uninstall { live: true })
+        );
+
+        // A plugin's skill has its own switch for this Bot, its row opens its read-only page with
+        // the skill's text, and Back from there is the plugin, not the list (7 Oct 2026).
+        wait_for(cx, "the Bot's plugin skills are read", |cx| {
+            app.read_with(cx, |state, _| !state.plugin_skills.is_empty())
+        });
+        drive(cx, Op::click("market-plugin-skill-row-bravo-review"));
+        wait_for(cx, "the skill's text is read", |cx| {
+            app.read_with(cx, |state, _| state.plugin_skill_page.is_some())
+        });
+        assert_eq!(
+            app.read_with(cx, |state, _| state.plugin_skill_page.clone().unwrap().body),
+            Some("Read the diff first.".into())
+        );
+        drive(cx, Op::click("market-plugin-skill-switch-bravo-review"));
+        assert!(app.read_with(cx, |state, _| !state.plugin_skills[0].on
+            && !state.plugin_skill_page.as_ref().unwrap().on));
+        wait_for(cx, "the switch is saved", |cx| {
+            app.read_with(cx, |state, _| state.tool_mode_refusal.is_none())
+        });
+        drive(cx, Op::click("monitor-plugin-back"));
+        assert_eq!(
+            app.read_with(cx, |state, _| state
+                .monitor_modal
+                .as_ref()
+                .unwrap()
+                .selected
+                .clone()),
+            Some(PluginSelection::Plugin("bravo".into()))
         );
 
         // A refused sign-in needs auth, says why, and Reopen asks for THAT sign-in's page.
@@ -44720,7 +46220,7 @@ mod tests {
         wait_for(cx, "the loan is answered", |cx| {
             app.read_with(cx, |state, _| state.connections.changing.is_empty())
         });
-        click(cx, "market-bots-back");
+        click(cx, crate::components::monitor_modal::BACK);
         click(cx, "monitor-plugin-back");
         click(cx, "market-installed");
         click(cx, "agent-skills-switch-sk_1");

@@ -11,6 +11,25 @@
 //! without opening a menu; the `sidebar.mini` action remains available to keyboard automation.
 //! `header-right-sidebar` (chat's window-level pane toggle),
 //! `header-monitor` (computer pane toggle while a bot is open),
+//! `header-notifications` (the bell, before the monitor while a Bot is open; value = the open
+//! Bot's unread notices; `selected` while its page is open), its page `notifications-pane` with
+//! `notifications-unread-count`, the toolbar's `notifications-select-all` (value none/some/all),
+//! with nothing ticked `notifications-filter-all`, `notifications-filter-unread` (`selected` on the
+//! active one), `notifications-mark-all-read`, `notifications-delete-all`, and with rows ticked
+//! `notifications-selected-count`, `notifications-mark-read`, `notifications-mark-unread`,
+//! `notifications-delete-selected` (the other set is refused); each row `notification-{id}`
+//! (value read/unread; a click opens it, `expanded`, with `notification-details-{id}` = where in
+//! the source it was caught) with `notification-select-{id}`, `notification-copy-{id}`,
+//! `notification-read-toggle-{id}` and `notification-delete-{id}`; `notifications-undo-bar` and
+//! `notifications-undo` after a delete; `notifications-empty`, or `notifications-empty-unread`
+//! with `notifications-show-all`; the toast
+//! `notification-toast` (named `<Bot> · <place>`) with `notification-toast-said`,
+//! `notification-toast-close`, `notification-toast-copy` and `notification-toast-open`. Invokes
+//! (all take `bot` as an id or a name, the open Bot by default, `none` for none): `notices.list
+//! {bot?, last?=20, all?}` → JSON rows, `notices.get {id}` → one with `copyText`, `notices.count
+//! {bot?|"all"}` → `{total, unread}`, `notices.fake {bot?, place?, said?, raw?}` (a made-up one,
+//! toast and all), `notices.copy {id}` (clipboard, and the text back), `notices.dismiss`,
+//! `notices.open {bot?}`, `notices.read {bot?}`, `notices.clear {bot}`, `notices.clear-all`.
 //! `header-coworker` (the chip at the top of the chat, while a bot is open: label = its name; a
 //! click opens the bot's settings, or, with state `goes-home` in one of its routines' threads,
 //! goes back to the bot's own chat),
@@ -41,7 +60,10 @@
 //! that asks for the name and the password on two pages is two cards, each with a row per
 //! password login, and on the password page the login picked on the name page in that thread
 //! is the first row), `user-form-saved-note-{key}`, `user-form-saved-clear-{key}` (Change, on
-//! the password row, or on the name row of a name page),
+//! the password row, or on the name row of a name page), and where a saved login cannot be used
+//! for the card's Bot (checked before Touch ID) `user-form-saved-blocked-{key}` (value = the
+//! reason, `shared-computer` or `shared-bot`), `user-form-own-computer-{key}` (gives the Bot a
+//! computer of its own; not on a shared-bot card) and `user-form-by-hand-{key}`,
 //! `settings-tab-logins`, `settings-logins-search` (value = the query), `settings-login-add`,
 //! `settings-login-import`, `settings-logins-notice`, `settings-logins-error`,
 //! `settings-logins-empty`, `settings-logins-group-passwords|passkeys|codes|security` (a
@@ -253,8 +275,12 @@
 //! `GET /coworkers/{id}/tools` says the bot is offered on its next turn: `2 built in · 1 from
 //! plugins`, `Asking the server…`, or why there is no list), `agent-ceiling` (value = `3 of 8
 //! allowed`, or why there are no switches; in the tree once the server has answered), and
-//! `agent-tools-toggle` (Show / Hide, only while there is something to show). Visible while the
-//! card is open: the card's own lines, `agent-ceiling-read-only` (the server's words for a 403:
+//! `agent-tools-toggle` (Show / Hide, only while there is something to show). The Tools window
+//! itself is the marketplace layout (#359): `market-tool-item-{name}` per built-in tool or group
+//! with its switch `agent-ceiling-switch-{name}`, `market-search` ("Search tools"), and on a
+//! tool's page that switch in the header, a group's tools as `market-tool-{name}` with
+//! `market-tool-mode-{name}` and `market-tool-switch-{name}`, and a lone tool's chip
+//! `market-tool-mode-{name}`. Visible while the card is open: the card's own lines, `agent-ceiling-read-only` (the server's words for a 403:
 //! every switch is dead), `agent-ceiling-wait` (why every switch is dead for now: another Bot's
 //! switch, or a read of this Bot's ceiling, is with the server) and `agent-ceiling-note` (the
 //! server's words about the last switch when no row is the one they are about, as a 409's "the
@@ -415,7 +441,11 @@
 //! `market-token-save` / `market-token-cancel` / `market-token-refusal`; the field's value is
 //! dots, never the token), `monitor-account-pick-<id>` and `monitor-account-ask`; then
 //! `market-tools` (expands its servers and tools), `monitor-plugin-switch-<name>`,
-//! `market-skill-*`, `market-app-*`, `market-unsupported-*` and `market-info-*`.
+//! `market-logins` (Plugins' first page: your saved logins, each row `market-login-<id>` with
+//! its Bots count, opening that login's Bots page with `market-login-bot-<login>-<bot>`
+//! switches), `market-plugin-skill-row-<plugin>-<skill>` (opens the skill's read-only page, Back returns to
+//! the plugin) with `market-plugin-skill-switch-<plugin>-<skill>` (on or off for the open Bot, on
+//! the plugin's page and the skill's), `market-app-*`, `market-unsupported-*` and `market-info-*`.
 //!
 //! A Bot's Connections card: `agent-connections` (value = the card's second line: `1 of 2 lent to
 //! this Bot`, `Asking the server…`, or why there is nothing to count), and per connection

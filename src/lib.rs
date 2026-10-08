@@ -12,6 +12,7 @@ pub mod db;
 pub mod error;
 pub mod find_text;
 pub mod icons;
+pub mod notifications;
 pub mod opengrok;
 pub mod prefs;
 pub(crate) mod private_file;

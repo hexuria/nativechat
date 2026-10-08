@@ -2203,6 +2203,214 @@ impl OpenGrokClient {
         .await
     }
 
+    /// `PUT /coworkers/{id}/tool-mode` `{tool, mode}`: one tool's choice for this Bot, `always`,
+    /// `ask` or `never` (opengrok-server `put_tool_mode` in `crates/opengrok-server/src/agui/
+    /// ceiling.rs`, gol/tools-and-skill-packs, uncommitted). `tool` is a built-in's name or a
+    /// plugin tool's dotted name. A refusal comes back as its sentence.
+    pub async fn set_tool_mode(
+        &self,
+        coworker_id: &str,
+        tool: &str,
+        mode: &str,
+    ) -> Result<(), OpenGrokError> {
+        let path = format!("/coworkers/{}/tool-mode", path_segment(coworker_id));
+        let body = json!({ "tool": tool, "mode": mode });
+        let response = self
+            .send_json_within(
+                reqwest::Method::PUT,
+                &path,
+                Some(&body),
+                Some(CEILING_TIMEOUT),
+                None,
+            )
+            .await?;
+        Self::json_or_error::<Value>(response).await.map(|_| ())
+    }
+
+    /// `GET /site-logins/{id}/bots`: the person's Bots this saved login is shared with
+    /// (opengrok-server `login_bots` in `crates/opengrok-server/src/agui/site_logins.rs`,
+    /// gol/tools-and-skill-packs).
+    pub async fn site_login_bots(&self, login_id: &str) -> Result<Vec<String>, OpenGrokError> {
+        #[derive(Deserialize)]
+        struct Bots {
+            bots: Vec<String>,
+        }
+        let path = format!("/site-logins/{}/bots", path_segment(login_id));
+        let response = self
+            .send_json_within::<()>(
+                reqwest::Method::GET,
+                &path,
+                None,
+                Some(CEILING_TIMEOUT),
+                None,
+            )
+            .await?;
+        Self::json_or_error::<Bots>(response).await.map(|b| b.bots)
+    }
+
+    /// `PUT /site-logins/{id}/bots/{coworker}` `{shared}`: one Bot may use this login, or no
+    /// longer (`share_with_bot`, same file). A share is a permission; the secret is not copied.
+    pub async fn set_site_login_shared(
+        &self,
+        login_id: &str,
+        coworker_id: &str,
+        shared: bool,
+    ) -> Result<(), OpenGrokError> {
+        let path = format!(
+            "/site-logins/{}/bots/{}",
+            path_segment(login_id),
+            path_segment(coworker_id)
+        );
+        let body = json!({ "shared": shared });
+        let response = self
+            .send_json_within(
+                reqwest::Method::PUT,
+                &path,
+                Some(&body),
+                Some(CEILING_TIMEOUT),
+                None,
+            )
+            .await?;
+        Self::json_or_error::<Value>(response).await.map(|_| ())
+    }
+
+    /// `GET /coworkers/{id}/site-logins`: the person's logins this Bot may use, for its login
+    /// cards (`shared_with_bot`, same file).
+    pub async fn logins_shared_with(
+        &self,
+        coworker_id: &str,
+    ) -> Result<Vec<String>, OpenGrokError> {
+        #[derive(Deserialize)]
+        struct Logins {
+            logins: Vec<String>,
+        }
+        let path = format!("/coworkers/{}/site-logins", path_segment(coworker_id));
+        let response = self
+            .send_json_within::<()>(
+                reqwest::Method::GET,
+                &path,
+                None,
+                Some(CEILING_TIMEOUT),
+                None,
+            )
+            .await?;
+        Self::json_or_error::<Logins>(response)
+            .await
+            .map(|l| l.logins)
+    }
+
+    /// `GET /coworkers/{id}/saved-login`: whether a saved login can be used for this Bot, asked
+    /// before Touch ID (opengrok-server `get_saved_login`, `agui/ceiling.rs`).
+    pub async fn saved_login_check(
+        &self,
+        coworker_id: &str,
+    ) -> Result<SavedLoginCheck, OpenGrokError> {
+        let path = format!("/coworkers/{}/saved-login", path_segment(coworker_id));
+        let response = self
+            .send_json_within::<()>(
+                reqwest::Method::GET,
+                &path,
+                None,
+                Some(CEILING_TIMEOUT),
+                None,
+            )
+            .await?;
+        Self::json_or_error::<SavedLoginCheck>(response).await
+    }
+
+    /// `PUT /coworkers/{id}/own-computer` `{on}`: this Bot gets a computer of its own while the
+    /// account's others keep sharing (opengrok-server `put_own_computer`, `agui/ceiling.rs`).
+    /// Making the computer can take a while, so it is given the computer's own patience.
+    pub async fn set_own_computer(&self, coworker_id: &str, on: bool) -> Result<(), OpenGrokError> {
+        let path = format!("/coworkers/{}/own-computer", path_segment(coworker_id));
+        let body = json!({ "on": on });
+        let response = self
+            .send_json_within(
+                reqwest::Method::PUT,
+                &path,
+                Some(&body),
+                Some(std::time::Duration::from_secs(180)),
+                None,
+            )
+            .await?;
+        Self::json_or_error::<Value>(response).await.map(|_| ())
+    }
+
+    /// `GET /coworkers/{id}/plugin-skills`: every installed plugin's skills with their switch for
+    /// this Bot (opengrok-server `list_plugin_skills` in `crates/opengrok-server/src/agui/
+    /// ceiling.rs`, gol/tools-and-skill-packs, uncommitted).
+    pub async fn plugin_skills(
+        &self,
+        coworker_id: &str,
+    ) -> Result<Vec<PluginSkill>, OpenGrokError> {
+        #[derive(Deserialize)]
+        struct Listed {
+            skills: Vec<PluginSkill>,
+        }
+        let path = format!("/coworkers/{}/plugin-skills", path_segment(coworker_id));
+        let response = self
+            .send_json_within::<()>(
+                reqwest::Method::GET,
+                &path,
+                None,
+                Some(CEILING_TIMEOUT),
+                None,
+            )
+            .await?;
+        Self::json_or_error::<Listed>(response)
+            .await
+            .map(|l| l.skills)
+    }
+
+    /// `GET /coworkers/{id}/plugin-skills/{plugin}/{skill}`: one plugin skill with its text, for
+    /// its read-only page (`get_plugin_skill`, same file).
+    pub async fn plugin_skill(
+        &self,
+        coworker_id: &str,
+        plugin: &str,
+        skill: &str,
+    ) -> Result<PluginSkill, OpenGrokError> {
+        let path = format!(
+            "/coworkers/{}/plugin-skills/{}/{}",
+            path_segment(coworker_id),
+            path_segment(plugin),
+            path_segment(skill)
+        );
+        let response = self
+            .send_json_within::<()>(
+                reqwest::Method::GET,
+                &path,
+                None,
+                Some(CEILING_TIMEOUT),
+                None,
+            )
+            .await?;
+        Self::json_or_error::<PluginSkill>(response).await
+    }
+
+    /// `PUT /coworkers/{id}/plugin-skills` `{plugin, skill, on}`: one plugin skill on or off for
+    /// this Bot, the rest of its plugin untouched (`put_plugin_skill`, same file).
+    pub async fn set_plugin_skill(
+        &self,
+        coworker_id: &str,
+        plugin: &str,
+        skill: &str,
+        on: bool,
+    ) -> Result<(), OpenGrokError> {
+        let path = format!("/coworkers/{}/plugin-skills", path_segment(coworker_id));
+        let body = json!({ "plugin": plugin, "skill": skill, "on": on });
+        let response = self
+            .send_json_within(
+                reqwest::Method::PUT,
+                &path,
+                Some(&body),
+                Some(CEILING_TIMEOUT),
+                None,
+            )
+            .await?;
+        Self::json_or_error::<Value>(response).await.map(|_| ())
+    }
+
     /// A read or a write of a bot's ceiling, given `timeout` to answer in. Apart from the two
     /// routes so a test can hold one to a deadline it can wait out.
     pub(crate) async fn ceiling_within(
@@ -3663,6 +3871,33 @@ pub struct UsageTotals {
     pub cost_usd: Option<String>,
 }
 
+/// Whether a saved login can be filled for a Bot, asked before Touch ID (opengrok-server
+/// `get_saved_login` in `crates/opengrok-server/src/agui/ceiling.rs`, gol/tools-and-skill-packs).
+/// `reason` is `shared-computer` or `shared-bot` when it cannot.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SavedLoginCheck {
+    pub usable: bool,
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub own_computer: bool,
+}
+
+/// One installed plugin skill and its switch for a Bot (opengrok-server `plugin_skill_rows` in
+/// `crates/opengrok-server/src/agui/ceiling.rs`, gol/tools-and-skill-packs). `body` comes only
+/// from the one-skill read.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct PluginSkill {
+    pub plugin: String,
+    pub skill: String,
+    #[serde(default)]
+    pub description: String,
+    pub on: bool,
+    #[serde(default)]
+    pub body: Option<String>,
+}
+
 /// One tool the bot is offered on a turn right now, as `GET /coworkers/{id}/tools` lists it.
 ///
 /// Transcribed from opengrok-server `crates/opengrok-server/src/agui/routes.rs` `list_tools`
@@ -3670,13 +3905,41 @@ pub struct UsageTotals {
 /// `tests/fixtures/wire/rest/GET__coworkers__coworker_id__tools/200-…json` (server #84's read
 /// half): `{"tools": [{"name", "description", "kind": "builtin" | "plugin"}]}`, where `kind`
 /// is "builtin" for the executor's own tools and `user_machine_shell`, and "plugin" for the rest.
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+///
+/// On gol/tools-and-skill-packs (uncommitted when transcribed) a plugin's tool also carries
+/// `plugin` (its install name), `qualified` (`<plugin>.<server>.<tool>`) and `title` when its
+/// server's annotations give one; a group row (`routines`, `plugins`) carries `tools`, the tools
+/// it switches, so "@routines:" and the group's page list them.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
 pub struct CoworkerTool {
     pub name: String,
     #[serde(default)]
     pub description: String,
     #[serde(default)]
     pub kind: String,
+    #[serde(default)]
+    pub plugin: Option<String>,
+    #[serde(default)]
+    pub qualified: Option<String>,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub tools: Vec<CoworkerTool>,
+    /// This Bot's choice for the tool: `always`, `ask` (a card first) or `never` (not offered;
+    /// listed only for a switched-on plugin's tool, so it can be switched back on).
+    #[serde(default)]
+    pub mode: Option<String>,
+    /// A built-in's or group's name and one sentence for people, beside `description`, which is
+    /// written for the model (opengrok-server `Executor::builtin_for_people`, #359, on
+    /// gol/tools-and-skill-packs, uncommitted when transcribed).
+    #[serde(default)]
+    pub label: Option<String>,
+    #[serde(default)]
+    pub summary: Option<String>,
+    /// A group row's own switch (opengrok-server `list_tools`, 7 Oct 2026, gol/tools-and-skill-
+    /// packs, uncommitted when transcribed): apart from its tools' choices, which it keeps.
+    #[serde(default)]
+    pub enabled: Option<bool>,
 }
 
 impl CoworkerTool {
@@ -4070,6 +4333,11 @@ pub struct CeilingRow {
     /// The connector a plugin's credential names (`gmail`), on a plugin whose credential names one.
     #[serde(default)]
     pub connector: Option<String>,
+    /// A built-in's one sentence for people (opengrok-server `agui/ceiling.rs`, #359, on
+    /// gol/tools-and-skill-packs, uncommitted when transcribed): what the Tools window lists,
+    /// where `description` is the model's.
+    #[serde(default)]
+    pub summary: Option<String>,
 }
 
 impl CeilingRow {
@@ -13075,5 +13343,134 @@ mod tests {
         assert_eq!(SkillSource::Uploaded.chip(), Some("Uploaded"));
         assert_eq!(SkillSource::Taught.chip(), Some("Taught"));
         assert_eq!(SkillSource::Taught.word(), "taught");
+    }
+
+    /// A login's Bots, one Bot's switch for it, and a Bot's logins are three small calls.
+    #[tokio::test]
+    async fn a_saved_login_is_shared_with_a_bot_by_one_switch() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/site-logins/sl_1/bots"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"bots": ["cw_1"]})))
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/site-logins/sl_1/bots/cw_2"))
+            .and(body_json(json!({"shared": true})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/coworkers/cw_1/site-logins"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"logins": ["sl_1"]})))
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        assert_eq!(client.site_login_bots("sl_1").await.unwrap(), ["cw_1"]);
+        client
+            .set_site_login_shared("sl_1", "cw_2", true)
+            .await
+            .unwrap();
+        assert_eq!(client.logins_shared_with("cw_1").await.unwrap(), ["sl_1"]);
+    }
+
+    /// The check before Touch ID reads why a saved login cannot be used, and giving a Bot its own
+    /// computer is one PUT.
+    #[tokio::test]
+    async fn a_saved_login_is_checked_and_a_bot_can_get_its_own_computer() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/coworkers/cw_1/saved-login"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "usable": false, "reason": "shared-computer", "ownComputer": false
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/coworkers/cw_1/own-computer"))
+            .and(body_json(json!({ "on": true })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ownComputer": true})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        let check = client.saved_login_check("cw_1").await.unwrap();
+        assert!(!check.usable);
+        assert_eq!(check.reason.as_deref(), Some("shared-computer"));
+        client.set_own_computer("cw_1", true).await.unwrap();
+    }
+
+    /// One plugin skill is switched by plugin and name, and its page reads the text the list
+    /// leaves out.
+    #[tokio::test]
+    async fn a_plugin_skill_is_listed_read_and_switched_for_one_bot() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/coworkers/cw_1/plugin-skills"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "skills": [
+                { "plugin": "demo", "skill": "triage", "description": "Triage safely", "on": false }
+            ]})))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/coworkers/cw_1/plugin-skills/demo/triage"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "plugin": "demo", "skill": "triage", "description": "", "on": true, "body": "Read it."
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/coworkers/cw_1/plugin-skills"))
+            .and(body_json(
+                json!({ "plugin": "demo", "skill": "triage", "on": true }),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        let listed = client.plugin_skills("cw_1").await.unwrap();
+        assert_eq!(listed[0].skill, "triage");
+        assert!(!listed[0].on);
+        assert_eq!(listed[0].body, None);
+        let page = client.plugin_skill("cw_1", "demo", "triage").await.unwrap();
+        assert_eq!(page.body.as_deref(), Some("Read it."));
+        client
+            .set_plugin_skill("cw_1", "demo", "triage", true)
+            .await
+            .unwrap();
+    }
+
+    /// A choice is the tool and the word, put to the Bot's own route. The server's 409 when the
+    /// ceiling moved meanwhile comes back as its sentence, so the dialog can say why nothing changed.
+    #[tokio::test]
+    async fn a_tool_choice_is_put_and_a_refusal_is_kept() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/coworkers/cw_1/tool-mode"))
+            .and(body_json(
+                json!({ "tool": "delete_routine", "mode": "always" }),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/coworkers/cw_1/tool-mode"))
+            .and(body_json(json!({ "tool": "shell", "mode": "never" })))
+            .respond_with(ResponseTemplate::new(409).set_body_string("the ceiling changed"))
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        client
+            .set_tool_mode("cw_1", "delete_routine", "always")
+            .await
+            .unwrap();
+        let error = client
+            .set_tool_mode("cw_1", "shell", "never")
+            .await
+            .unwrap_err();
+        assert_eq!(error.status, Some(409));
+        assert_eq!(error.message, "the ceiling changed");
     }
 }

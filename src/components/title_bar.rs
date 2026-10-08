@@ -26,11 +26,11 @@ const ROUTINE_LINE_TOP: f32 = TITLE_BAR_H - 6.;
 pub(crate) const BUTTON_PX: f32 = 28.;
 const BUTTON_GAP: f32 = 8.;
 
-/// How much of the right end of a pane's header row the chat's floating bar keeps for its two
-/// buttons, with a gap before them as wide as the one between them. Beside the chat the pane
+/// How much of the right end of a pane's header row the chat's floating bar keeps for its three
+/// buttons (the bell, the monitor and the sidebar), with a gap before them as wide as the one between them. Beside the chat the pane
 /// reaches the window's top right corner, docked or floating, and the bar is painted over it, so
 /// a control the row put in this run would sit under a button and lose its presses to it.
-pub const PANE_ROW_UNDER_BUTTONS: f32 = HEADER_PX + 2. * (BUTTON_PX + BUTTON_GAP);
+pub const PANE_ROW_UNDER_BUTTONS: f32 = HEADER_PX + 3. * (BUTTON_PX + BUTTON_GAP);
 
 /// A run of the bar with no control in it: a handle to drag the window by.
 pub fn window_drag(el: Div) -> Div {
@@ -104,6 +104,11 @@ impl Render for TitleBar {
             state.sidebar_expanded_width,
         );
         let right_pane = state.right_pane;
+        let bell_unread = state
+            .active_coworker_id
+            .as_deref()
+            .map_or(0, |bot| state.unread_notices(bot));
+        let bell_open = right_pane == RightPane::Notifications;
         let coworker = state
             .active_coworker_id
             .as_ref()
@@ -246,28 +251,33 @@ impl Render for TitleBar {
             // drawing them there pushed them out of the span and over the right pane's header.
             .when(coworker.is_some() && !on_a_page, |this| {
                 this.child(
-                    h_flex().gap_2().items_center().children(find_bar).child(
-                        div()
-                            .id("header-monitor")
-                            .size(px(28.))
-                            .rounded(px(8.))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .cursor_pointer()
-                            .hover(|s| s.bg(rgb(0x777777).opacity(0.2)))
-                            .on_mouse_down(MouseButton::Left, {
-                                let app = app.clone();
-                                move |_, _, cx| {
-                                    app.update(cx, |state, cx| state.toggle_computer_pane(cx));
-                                }
-                            })
-                            .child(
-                                Icon::default()
-                                    .path("icons/monitor.svg")
-                                    .size(px(CONTROL_ICON_PX)),
-                            ),
-                    ),
+                    h_flex()
+                        .gap_2()
+                        .items_center()
+                        .children(find_bar)
+                        .child(bell(app.clone(), bell_unread, bell_open))
+                        .child(
+                            div()
+                                .id("header-monitor")
+                                .size(px(28.))
+                                .rounded(px(8.))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .cursor_pointer()
+                                .hover(|s| s.bg(rgb(0x777777).opacity(0.2)))
+                                .on_mouse_down(MouseButton::Left, {
+                                    let app = app.clone();
+                                    move |_, _, cx| {
+                                        app.update(cx, |state, cx| state.toggle_computer_pane(cx));
+                                    }
+                                })
+                                .child(
+                                    Icon::default()
+                                        .path("icons/monitor.svg")
+                                        .size(px(CONTROL_ICON_PX)),
+                                ),
+                        ),
                 )
             });
 
@@ -398,6 +408,14 @@ impl TitleBar {
                     .right(px(HEADER_PX))
                     .top(px(12.))
                     .gap(px(BUTTON_GAP))
+                    .when_some(bot.map(|bot| bot.id.clone()), |this, bot| {
+                        let unread = state.unread_notices(&bot);
+                        this.child(bell(
+                            app.clone(),
+                            unread,
+                            state.right_pane == RightPane::Notifications,
+                        ))
+                    })
                     .when(bot.is_some(), |this| {
                         this.child(
                             header_icon(
@@ -535,6 +553,42 @@ fn bot_chip(
                 )
         })
         .when(bot.is_none(), |this| this.child("Bots"))
+}
+
+/// The bell: the open Bot's notifications in the right sidebar, with how many are not seen yet.
+pub(crate) const BELL: &str = "header-notifications";
+
+fn bell(app: Entity<AppState>, unread: usize, selected: bool) -> Stateful<Div> {
+    header_icon(BELL, "icons/bell.svg", selected)
+        .relative()
+        .when(unread > 0, |this| {
+            this.child(
+                div()
+                    .absolute()
+                    .top(px(-2.))
+                    .right(px(-2.))
+                    .min_w(px(15.))
+                    .h(px(15.))
+                    .px(px(3.))
+                    .rounded_full()
+                    .bg(rgb(0xe5484d))
+                    .text_color(gpui_kit::white())
+                    .text_size(px(10.))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(if unread > 99 {
+                        "99+".to_string()
+                    } else {
+                        unread.to_string()
+                    }),
+            )
+        })
+        .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+            cx.stop_propagation();
+            app.update(cx, |state, cx| state.toggle_notifications(cx));
+        })
 }
 
 fn header_icon(id: &'static str, path: &'static str, selected: bool) -> Stateful<Div> {
@@ -754,7 +808,7 @@ mod tests {
                 let pane = match self.app.read(cx).right_pane {
                     RightPane::Settings => Some(self.settings.clone().into_any_element()),
                     RightPane::Computer => Some(self.computer.clone().into_any_element()),
-                    RightPane::Closed => None,
+                    RightPane::Notifications | RightPane::Closed => None,
                 };
                 div()
                     .size_full()

@@ -2410,6 +2410,7 @@ const REST_ROUTES: &[(&str, RestCheck)] = &[
     ("GET__coworkers__coworker_id__tools", coworker_tools),
     ("GET__coworkers__coworker_id__ceiling", coworker_ceiling),
     ("PUT__coworkers__coworker_id__ceiling", coworker_ceiling),
+    ("PUT__coworkers__coworker_id__tool-mode", tool_mode),
     ("GET__coworkers__coworker_id__skills", coworker_skills),
     ("PUT__coworkers__coworker_id__skills", coworker_skills),
     ("GET__connections", connections_listed),
@@ -4138,6 +4139,21 @@ fn coworker_tools(_: u16, body: &Value) -> Check {
 /// sends back, exactly, or none from a server older than it. A row that does not say whether it is
 /// enabled cannot be sent back as it stands, so the parse refuses it; one that drops its kind is
 /// caught here rather than filed with the plugins.
+/// One tool's choice for a Bot, answered with what was set (opengrok-server `agui/ceiling.rs`
+/// `put_tool_mode`, #359): the app sends `{tool, mode}` and takes any 2xx as done, so the answer
+/// must name the tool and one of the three choices it knows.
+fn tool_mode(_: u16, body: &Value) -> Check {
+    must!(
+        body["tool"].as_str().is_some_and(|t| !t.is_empty()),
+        "a tool choice should name its tool: {body}"
+    );
+    must!(
+        matches!(body["mode"].as_str(), Some("always" | "ask" | "never")),
+        "a tool choice is always, ask or never: {body}"
+    );
+    Ok(())
+}
+
 fn coworker_ceiling(_: u16, body: &Value) -> Check {
     let ceiling: CoworkerCeiling = parse(body)?;
     must!(

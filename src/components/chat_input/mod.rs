@@ -4,7 +4,7 @@ pub mod sources;
 #[macro_use]
 mod sync_macros;
 
-pub use sources::{AppCommand, BUILTIN_TOOLS, ComposerPick, TokenKind, tags_in};
+pub use sources::{AppCommand, BUILTIN_TOOLS, ComposerPick, TokenKind, function_tags_in, tags_in};
 
 use crate::actions::{Library, NewChat, OpenSettings, Projects, ToggleTheme};
 use crate::audio::AudioInput;
@@ -296,6 +296,13 @@ impl MessageInput {
             if !requested.is_empty() {
                 this.add_attachments(requested, cx);
             }
+            // A modal opened over the composer: its list goes with it.
+            let close = state.update(cx, |state, _| {
+                std::mem::take(&mut state.composer_panel_close_requested)
+            });
+            if close {
+                this.close_panel(false, window, cx);
+            }
             // A driver's ✕, by the file's place on the draft.
             let detached = state.update(cx, |state, _| std::mem::take(&mut state.detach_requests));
             if !detached.is_empty() {
@@ -384,6 +391,14 @@ impl MessageInput {
                     SlashSource.rows(&state.recipes, &your_skills(state))
                 };
                 apply_shortcuts(&mut rows, window);
+                this.remember_picks(&rows);
+                let rows: Vec<ComposerPanelRow> = rows.into_iter().map(|(row, _)| row).collect();
+                this.panel.update(cx, |panel, cx| panel.set_rows(rows, cx));
+            }
+
+            // Installs and this Bot's tools that land while "@" is open fill it in.
+            if this.panel_mode == Some(PanelMode::Tools) {
+                let rows = ToolSource::of(state.read(cx)).rows();
                 this.remember_picks(&rows);
                 let rows: Vec<ComposerPanelRow> = rows.into_iter().map(|(row, _)| row).collect();
                 this.panel.update(cx, |panel, cx| panel.set_rows(rows, cx));
@@ -771,17 +786,25 @@ impl MessageInput {
 
     fn open_tools_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // The installs are asked for if this session has not read them, so a later `@` lists them.
+        // And this Bot's tools, which "@name:" lists the functions from.
         self.state.update(cx, |state, cx| {
             if state.plugin_market.installations.is_none() {
                 state.read_installations(cx);
+            }
+            let listed_for_this_bot = matches!(
+                &state.coworker_tools,
+                Some((bot, _)) if Some(bot) == state.active_coworker_id.as_ref()
+            );
+            if !listed_for_this_bot {
+                state.refresh_coworker_tools(cx);
             }
         });
         let rows = ToolSource::of(self.state.read(cx)).rows();
         self.show_panel(
             PanelMode::Tools,
             rows,
-            "Search tools",
-            "↑↓ to move, ⌘1–9 to take one straight away, ↵ to put it in the message, esc to close.",
+            "Search, or name:function",
+            "↑↓ to move, ↵ to put it in the message, type : after a name for its functions, esc to close.",
             window,
             cx,
         );
