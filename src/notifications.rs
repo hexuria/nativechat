@@ -93,6 +93,10 @@ impl Notice {
     }
 }
 
+/// The most entries kept: `load` reads the same cap, so an older one is gone rather than
+/// never shown.
+const KEPT_LIMIT: usize = 2000;
+
 /// Keep one entry.
 pub async fn save(pool: &DbPool, notice: &Notice) -> Result<(), sqlx::Error> {
     sqlx::query(
@@ -110,6 +114,15 @@ pub async fn save(pool: &DbPool, notice: &Notice) -> Result<(), sqlx::Error> {
     .bind(notice.read)
     .execute(pool)
     .await?;
+    // A Mac that never clears must not grow the table forever: only the newest are kept,
+    // under the same cap `load` reads.
+    sqlx::query(
+        "DELETE FROM notifications WHERE id NOT IN \
+         (SELECT id FROM notifications ORDER BY at_ms DESC LIMIT ?)",
+    )
+    .bind(KEPT_LIMIT as i64)
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
@@ -117,8 +130,9 @@ pub async fn save(pool: &DbPool, notice: &Notice) -> Result<(), sqlx::Error> {
 pub async fn load(pool: &DbPool) -> Result<Vec<Notice>, sqlx::Error> {
     let rows = sqlx::query(
         "SELECT id, at_ms, bot_id, place, code, said, raw, run_id, read FROM notifications \
-         ORDER BY at_ms DESC LIMIT 2000",
+         ORDER BY at_ms DESC LIMIT ?",
     )
+    .bind(KEPT_LIMIT as i64)
     .fetch_all(pool)
     .await?;
     rows.iter()
