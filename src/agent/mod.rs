@@ -37,7 +37,9 @@
 //! `fault-bot`, `fault-request`, `fault-status`, `fault-raised-at`, `fault-count`, `fault-raw`
 //! (the whole text as its value), `fault-newer`, `fault-older`, `fault-copy`, `fault-report`,
 //! `fault-mark-read` and `fault-close`. 🐞 opens `report-sheet` (named by the issue's title) with
-//! `report-body` (the issue body exactly as GitHub gets it), `report-include-text` (checked when
+//! `report-body` (the issue body exactly as GitHub gets it; or, when the first gate decides the
+//! fault is not worth a report, `report-verdict` (its words, value `noise` or `your-side`) with
+//! `report-anyway`), `report-include-text` (checked when
 //! the failure's own text goes too), `report-cancel` and `report-open-github`, which opens the
 //! person's browser: `report.link` returns that link (`{url, clipboard, fingerprint}`) without
 //! opening it.

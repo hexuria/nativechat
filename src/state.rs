@@ -2259,6 +2259,8 @@ pub struct ReportDraft {
     pub with_text: bool,
     /// GitHub's page was opened for this report; the sheet says to finish it there.
     pub opened: bool,
+    /// "Report anyway": the person wants to report a fault the first gate says is not worth it.
+    pub insisted: bool,
 }
 
 /// `https://www.facebook.com/` → `www.facebook.com`: a saved login's site as text names it.
@@ -11410,6 +11412,7 @@ impl AppState {
                 notice_id: notice_id.to_string(),
                 with_text: false,
                 opened: false,
+                insisted: false,
             });
             cx.notify();
         }
@@ -11425,6 +11428,21 @@ impl AppState {
         if let Some(draft) = self.report_draft.as_mut() {
             draft.with_text = !draft.with_text;
             draft.opened = false;
+            cx.notify();
+        }
+    }
+
+    /// What the first gate makes of the fault the preview is open on.
+    pub fn report_gate(&self) -> Option<crate::report::triage::Gate1> {
+        let draft = self.report_draft.as_ref()?;
+        let notice = self.notices.iter().find(|n| n.id == draft.notice_id)?;
+        Some(crate::report::triage::gate1(notice, &self.notices))
+    }
+
+    /// "Report anyway": show the preview for a fault the first gate would not offer.
+    pub fn insist_report(&mut self, cx: &mut Context<Self>) {
+        if let Some(draft) = self.report_draft.as_mut() {
+            draft.insisted = true;
             cx.notify();
         }
     }
@@ -40870,6 +40888,7 @@ mod tests {
             notice_id: id.clone(),
             with_text: false,
             opened: false,
+            insisted: false,
         });
         let plain = state.report_preview().expect("a fault previews");
         assert_eq!(
@@ -40901,6 +40920,7 @@ mod tests {
             notice_id: "ntf_turn".into(),
             with_text: true,
             opened: false,
+            insisted: false,
         });
         assert_eq!(state.report_preview(), None, "only a fault can be reported");
     }

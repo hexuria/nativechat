@@ -308,6 +308,17 @@ pub const SHEET_BODY_ID: &str = "report-body";
 pub const SHEET_TEXT_ID: &str = "report-include-text";
 pub const SHEET_SEND_ID: &str = "report-open-github";
 pub const SHEET_CANCEL_ID: &str = "report-cancel";
+pub const SHEET_VERDICT_ID: &str = "report-verdict";
+pub const SHEET_ANYWAY_ID: &str = "report-anyway";
+
+/// The first gate's words for a fault it decides.
+pub fn words_of(gate: crate::report::triage::Gate1) -> &'static str {
+    match gate {
+        crate::report::triage::Gate1::Noise(words)
+        | crate::report::triage::Gate1::YourSide(words) => words,
+        crate::report::triage::Gate1::Ask => "",
+    }
+}
 
 /// How many lines the preview's body box shows, always.
 const SHEET_ROWS: f32 = 12.;
@@ -333,7 +344,68 @@ pub fn report_sheet(app: &Entity<AppState>, cx: &App) -> Option<AnyElement> {
     let (back, toggle, send, cancel) = (app.clone(), app.clone(), app.clone(), app.clone());
     let tick = if draft.with_text { "☑" } else { "☐" };
     let line = px(18.);
-    let footer = if draft.opened {
+    // The first gate's word, unless the person insisted: a fault it decides is said in plain
+    // words where the body would be, with no checkbox and no way to GitHub but "Report anyway".
+    let decided = state
+        .report_gate()
+        .filter(|gate| !gate.worth_reporting() && !draft.insisted);
+    let body_area = match decided {
+        Some(gate) => {
+            let mark = match gate {
+                crate::report::triage::Gate1::YourSide(_) => "💡",
+                _ => "🚫",
+            };
+            v_flex()
+                .id(SHEET_VERDICT_ID)
+                .debug_selector(|| SHEET_VERDICT_ID.into())
+                .h(line * SHEET_ROWS + px(20.))
+                .justify_center()
+                .items_center()
+                .gap(px(10.))
+                .px(px(28.))
+                .child(div().text_2xl().child(mark))
+                .child(div().text_sm().text_center().child(words_of(gate)))
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(muted)
+                        .text_center()
+                        .child("Nothing here is the project's to fix, so it is not reported."),
+                )
+                .into_any_element()
+        }
+        None => div()
+            .id(SHEET_BODY_ID)
+            .debug_selector(|| SHEET_BODY_ID.into())
+            .h(line * SHEET_ROWS + px(20.))
+            .overflow_y_scroll()
+            .px(px(14.))
+            .py(px(10.))
+            .text_xs()
+            .child(TextView::markdown("report-body-text", shown).selectable(true))
+            .into_any_element(),
+    };
+    let insist = app.clone();
+    let footer = if decided.is_some() {
+        h_flex()
+            .gap(px(8.))
+            .p(px(12.))
+            .border_t_1()
+            .border_color(theme.border)
+            .child(div().flex_1())
+            .child(
+                button(SHEET_ANYWAY_ID, "Report anyway", false, &theme)
+                    .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                        insist.update(cx, |s, cx| s.insist_report(cx))
+                    }),
+            )
+            .child(
+                button(SHEET_CANCEL_ID, "Close", true, &theme)
+                    .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                        cancel.update(cx, |s, cx| s.close_report(cx))
+                    }),
+            )
+    } else if draft.opened {
         let note = if link.clipboard.is_some() {
             "Opened on GitHub. The full report is on your clipboard: paste it into the body, then submit."
         } else {
@@ -419,22 +491,16 @@ pub fn report_sheet(app: &Entity<AppState>, cx: &App) -> Option<AnyElement> {
                                 div()
                                     .text_xs()
                                     .text_color(muted)
-                                    .child("This is everything that leaves this Mac. Names, hosts, ids and secrets are already taken out."),
+                                    .child(if decided.is_some() {
+                                        "Checked on this Mac first. Nothing has left it."
+                                    } else {
+                                        "This is everything that leaves this Mac. Names, hosts, ids and secrets are already taken out."
+                                    }),
                             )
                             .child(div().pt(px(6.)).text_sm().truncate().child(title)),
                     )
-                    .child(
-                        div()
-                            .id(SHEET_BODY_ID)
-                            .debug_selector(|| SHEET_BODY_ID.into())
-                            .h(line * SHEET_ROWS + px(20.))
-                            .overflow_y_scroll()
-                            .px(px(14.))
-                            .py(px(10.))
-                            .text_xs()
-                            .child(TextView::markdown("report-body-text", shown).selectable(true)),
-                    )
-                    .child(
+                    .child(body_area)
+                    .when(decided.is_none(), |this| this.child(
                         h_flex()
                             .id(SHEET_TEXT_ID)
                             .debug_selector(|| SHEET_TEXT_ID.into())
@@ -456,7 +522,7 @@ pub fn report_sheet(app: &Entity<AppState>, cx: &App) -> Option<AnyElement> {
                                     .text_color(muted)
                                     .child("(redacted, off by default)"),
                             ),
-                    )
+                    ))
                     .child(footer),
             )
             .into_any_element(),
