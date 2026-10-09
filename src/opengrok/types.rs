@@ -1352,3 +1352,35 @@ mod tests {
         assert_eq!(error_message_from_body(""), "request failed");
     }
 }
+
+/// What `POST /triage` concluded about a fault. Transcribed from opengrok-server
+/// `crates/opengrok-server/src/triage.rs` (`Call`, branch gol/triage, 9 Oct 2026).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TriageCall {
+    Bug,
+    YourSide,
+    Noise,
+    Unsure,
+}
+
+/// `POST /triage`'s answer, every field bounded by the server. Transcribed from opengrok-server
+/// `crates/opengrok-server/src/triage.rs` (`Verdict`, branch gol/triage, 9 Oct 2026).
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TriageVerdict {
+    pub verdict: TriageCall,
+    pub confidence: f64,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub summary: String,
+    #[serde(default)]
+    pub evidence: Vec<String>,
+    #[serde(default)]
+    pub suspect: String,
+    #[serde(default)]
+    pub repro: Vec<String>,
+    #[serde(default)]
+    pub advice: String,
+}

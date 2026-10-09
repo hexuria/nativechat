@@ -2261,6 +2261,12 @@ pub struct ReportDraft {
     pub opened: bool,
     /// "Report anyway": the person wants to report a fault the first gate says is not worth it.
     pub insisted: bool,
+    /// The second gate, the person's agent on the server: `None` while it has not been asked
+    /// (the first gate decided, or the person has not insisted yet).
+    pub agent: Option<crate::report::agent::Agent>,
+    /// The fault window this report was opened from, to go back to on Cancel: the report takes
+    /// that window's place rather than opening a second one over it.
+    pub back_to: Option<(crate::faults::Place, usize)>,
 }
 
 /// `https://www.facebook.com/` → `www.facebook.com`: a saved login's site as text names it.
@@ -11408,18 +11414,118 @@ impl AppState {
             .iter()
             .any(|n| n.id == notice_id && n.fault.is_some());
         if is_fault {
+            // One window at a time: the fault window, if it is open, becomes the report.
+            let back_to = self.fault_window.take();
             self.report_draft = Some(ReportDraft {
+                back_to,
                 notice_id: notice_id.to_string(),
                 with_text: false,
                 opened: false,
                 insisted: false,
+                agent: None,
             });
+            if self
+                .report_gate()
+                .is_some_and(crate::report::triage::Gate1::worth_reporting)
+            {
+                self.ask_agent(cx);
+            }
             cx.notify();
         }
     }
 
+    /// What else failed around the fault the preview is open on, for the agent: each other
+    /// fault within a minute of it, by place, status and how far apart.
+    fn report_neighbours(&self, notice_id: &str) -> Vec<serde_json::Value> {
+        let Some(at) = self
+            .notices
+            .iter()
+            .find(|n| n.id == notice_id)
+            .map(|n| n.at_ms)
+        else {
+            return Vec::new();
+        };
+        self.notices
+            .iter()
+            .filter(|n| n.id != notice_id && (n.at_ms - at).abs() <= 60_000)
+            .filter_map(|n| {
+                let fault = n.fault.as_ref()?;
+                Some(serde_json::json!({
+                    "place": fault.place.word(),
+                    "status": fault.status,
+                    "secondsApart": (n.at_ms - at) / 1000,
+                }))
+            })
+            .take(10)
+            .collect()
+    }
+
+    /// Ask the person's agent, on the server, about the fault the preview is open on. The pack
+    /// carries the report with its text (redacted: it goes to the person's own server, never to
+    /// GitHub unless they tick it) and what else failed around it. Any failure is the manual
+    /// report (`report::agent::decide`).
+    fn ask_agent(&mut self, cx: &mut Context<Self>) {
+        let Some(draft) = self.report_draft.as_mut() else {
+            return;
+        };
+        let notice_id = draft.notice_id.clone();
+        let Some(client) = self.opengrok.clone() else {
+            draft.agent = Some(crate::report::agent::Agent::Manual(
+                crate::report::agent::NOT_ASKED,
+            ));
+            return;
+        };
+        draft.agent = Some(crate::report::agent::Agent::Asking);
+        let known = self.known_names();
+        let report = self
+            .notices
+            .iter()
+            .find(|n| n.id == notice_id)
+            .and_then(|n| crate::report::Report::from_notice(n, &known, true));
+        let pack = serde_json::json!({
+            "report": report,
+            "neighbours": self.report_neighbours(&notice_id),
+        });
+        cx.spawn(async move |this, cx| {
+            let answer = client.triage(&pack).await;
+            let _ = this.update(cx, |state, cx| {
+                let agent = crate::report::agent::decide(answer, &known);
+                if let Some(draft) = state
+                    .report_draft
+                    .as_mut()
+                    .filter(|draft| draft.notice_id == notice_id)
+                {
+                    draft.agent = Some(agent);
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// "Fill it in myself": skip the agent and go to the manual report.
+    pub fn skip_agent(&mut self, cx: &mut Context<Self>) {
+        if let Some(draft) = self.report_draft.as_mut() {
+            draft.agent = Some(crate::report::agent::Agent::Manual(
+                crate::report::agent::NOT_ASKED,
+            ));
+            cx.notify();
+        }
+    }
+
+    /// What the agent found, while it found a bug: what the issue is written from.
+    pub fn report_findings(&self) -> Option<&crate::report::agent::Findings> {
+        match self.report_draft.as_ref()?.agent.as_ref()? {
+            crate::report::agent::Agent::Found(found) => Some(found),
+            _ => None,
+        }
+    }
+
+    /// Cancel or Close on the report: back to the fault window it was opened from, if any.
     pub fn close_report(&mut self, cx: &mut Context<Self>) {
-        self.report_draft = None;
+        if let Some(draft) = self.report_draft.take() {
+            self.fault_window = draft.back_to;
+        }
         cx.notify();
     }
 
@@ -11439,12 +11545,18 @@ impl AppState {
         Some(crate::report::triage::gate1(notice, &self.notices))
     }
 
-    /// "Report anyway": show the preview for a fault the first gate would not offer.
+    /// "Report anyway": show the preview for a fault the first gate would not offer, and let
+    /// the person's agent write it if it has not been asked yet. Its advice no longer stands in
+    /// the way: insisting is the person's call.
     pub fn insist_report(&mut self, cx: &mut Context<Self>) {
-        if let Some(draft) = self.report_draft.as_mut() {
-            draft.insisted = true;
-            cx.notify();
+        let Some(draft) = self.report_draft.as_mut() else {
+            return;
+        };
+        draft.insisted = true;
+        if draft.agent.is_none() {
+            self.ask_agent(cx);
         }
+        cx.notify();
     }
 
     /// The report the preview shows, exactly as it would be sent.
@@ -11460,7 +11572,7 @@ impl AppState {
         let Some(report) = self.report_preview() else {
             return;
         };
-        let link = crate::report::github::issue_link(&report);
+        let link = crate::report::github::issue_link(&report, self.report_findings());
         if let Some(body) = link.clipboard {
             cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(body));
         }
@@ -40889,6 +41001,8 @@ mod tests {
             with_text: false,
             opened: false,
             insisted: false,
+            agent: None,
+            back_to: None,
         });
         let plain = state.report_preview().expect("a fault previews");
         assert_eq!(
@@ -40903,7 +41017,7 @@ mod tests {
         for gone in ["Blitz Ops", "acme", "jdoe"] {
             assert!(!text.contains(gone), "{gone} in {text}");
         }
-        let link = crate::report::github::issue_link(&ticked);
+        let link = crate::report::github::issue_link(&ticked, None);
         for gone in ["Blitz", "acme", "jdoe", "cw_018f"] {
             assert!(!link.url.contains(gone), "{gone} in {}", link.url);
         }
@@ -40921,6 +41035,8 @@ mod tests {
             with_text: true,
             opened: false,
             insisted: false,
+            agent: None,
+            back_to: None,
         });
         assert_eq!(state.report_preview(), None, "only a fault can be reported");
     }

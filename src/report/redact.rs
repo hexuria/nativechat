@@ -119,6 +119,7 @@ const ROUTE_WORDS: &[&str] = &[
     "threads",
     "tool-mode",
     "tools",
+    "triage",
     "update",
     "usage",
     "versions",

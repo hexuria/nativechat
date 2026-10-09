@@ -841,6 +841,26 @@ impl OpenGrokClient {
         Self::json_or_error(response).await
     }
 
+    /// `POST /triage` — a fault the person is about to report, weighed by one plain completion on
+    /// the server (opengrok-server `crates/opengrok-server/src/triage.rs`, `triage_fault`). `pack`
+    /// is `{report, neighbours, model?}`, already redacted on this Mac. Any answer but a 200 is the
+    /// caller's cue to fall back to the manual report. Given [`TRIAGE_TIMEOUT`].
+    pub async fn triage(
+        &self,
+        pack: &serde_json::Value,
+    ) -> Result<crate::opengrok::TriageVerdict, OpenGrokError> {
+        let response = self
+            .send_json_within(
+                reqwest::Method::POST,
+                "/triage",
+                Some(pack),
+                Some(TRIAGE_TIMEOUT),
+                None,
+            )
+            .await?;
+        Self::json_or_error(response).await
+    }
+
     pub async fn list_models(&self) -> Result<ModelCatalogue, OpenGrokError> {
         let response = self
             .send_json::<()>(reqwest::Method::GET, "/models", None)
@@ -4247,6 +4267,10 @@ pub const CONNECTIONS_TIMEOUT: std::time::Duration = std::time::Duration::from_s
 /// are given. Either is a read or a write of one row on the server, and the server's word about
 /// opencodex, which it gets by asking the proxy on loopback. While a Save is out every control on
 /// Settings → Reply source is dead, and one that never answered would leave them dead until the
+/// How long the app waits for `POST /triage`: the server gives the model 15 s, and a few more
+/// cover the trip. Past this the report falls back to being filled in by hand.
+const TRIAGE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
 /// app quit.
 pub const INFERENCE_SOURCE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
@@ -8159,6 +8183,41 @@ mod tests {
             serde_json::to_vec(&with).unwrap(),
             serde_json::to_vec(&without).unwrap(),
             "a turn with no skill on it is the turn this client sent before skills existed"
+        );
+    }
+
+    /// A fault's triage posts the pack to `/triage` and reads the server's verdict (opengrok-server
+    /// `crates/opengrok-server/src/triage.rs`); a refusal is an error the report falls back on.
+    #[tokio::test]
+    async fn a_triage_posts_the_pack_and_reads_the_verdict() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/triage"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "verdict": "bug", "confidence": 0.86,
+                "title": "Usage fails when the gateway returns 502",
+                "summary": "The usage read got a 502.", "evidence": ["status 502"],
+                "suspect": "src/state.rs:8258", "repro": [], "advice": "",
+            })))
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+        let pack = json!({ "report": { "place": "usage" }, "neighbours": [] });
+        let verdict = client.triage(&pack).await.unwrap();
+        assert_eq!(verdict.verdict, crate::opengrok::TriageCall::Bug);
+        assert_eq!(verdict.evidence, vec!["status 502".to_string()]);
+        let sent: serde_json::Value =
+            serde_json::from_slice(&server.received_requests().await.expect("recorded")[0].body)
+                .expect("the pack is JSON");
+        assert_eq!(sent, pack);
+
+        let older = MockServer::start().await;
+        let client = OpenGrokClient::new(&older.uri()).unwrap();
+        let error = client.triage(&pack).await.unwrap_err();
+        assert_eq!(
+            error.status,
+            Some(404),
+            "a server without the route says so"
         );
     }
 

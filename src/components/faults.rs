@@ -310,6 +310,8 @@ pub const SHEET_SEND_ID: &str = "report-open-github";
 pub const SHEET_CANCEL_ID: &str = "report-cancel";
 pub const SHEET_VERDICT_ID: &str = "report-verdict";
 pub const SHEET_ANYWAY_ID: &str = "report-anyway";
+pub const SHEET_AGENT_ID: &str = "report-agent";
+pub const SHEET_SKIP_ID: &str = "report-skip-agent";
 
 /// The first gate's words for a fault it decides.
 pub fn words_of(gate: crate::report::triage::Gate1) -> &'static str {
@@ -332,11 +334,12 @@ pub fn report_sheet(app: &Entity<AppState>, cx: &App) -> Option<AnyElement> {
     let report = state.report_preview()?;
     let theme = cx.theme().clone();
     let muted = theme.muted_foreground;
-    let title = crate::report::github::title(&report);
-    let link = crate::report::github::issue_link(&report);
+    let found = state.report_findings().cloned();
+    let title = crate::report::github::title(&report, found.as_ref());
+    let link = crate::report::github::issue_link(&report, found.as_ref());
     // The body as GitHub will show it: rendered Markdown, the failure's text in its code block.
     // The hidden fingerprint marker is GitHub's to hide; here it would show as text.
-    let shown = crate::report::github::body(&report)
+    let shown = crate::report::github::body(&report, found.as_ref())
         .lines()
         .filter(|line| !line.starts_with("<!-- fp:"))
         .collect::<Vec<_>>()
@@ -344,49 +347,102 @@ pub fn report_sheet(app: &Entity<AppState>, cx: &App) -> Option<AnyElement> {
     let (back, toggle, send, cancel) = (app.clone(), app.clone(), app.clone(), app.clone());
     let tick = if draft.with_text { "☑" } else { "☐" };
     let line = px(18.);
-    // The first gate's word, unless the person insisted: a fault it decides is said in plain
-    // words where the body would be, with no checkbox and no way to GitHub but "Report anyway".
-    let decided = state
+    // What the body area says. The first gate's word, or the agent's advice, unless the person
+    // insisted: a fault either decides is said in plain words, with no way to GitHub but "Report
+    // anyway". While the agent is asked it says so. Otherwise the report, with a line on how it
+    // was written when the agent wrote it or could not.
+    use crate::report::agent::Agent;
+    let gate = state
         .report_gate()
         .filter(|gate| !gate.worth_reporting() && !draft.insisted);
-    let body_area = match decided {
-        Some(gate) => {
-            let mark = match gate {
+    let verdict: Option<(&str, String, &str)> = match (gate, &draft.agent) {
+        (Some(gate), _) => Some((
+            match gate {
                 crate::report::triage::Gate1::YourSide(_) => "💡",
                 _ => "🚫",
-            };
-            v_flex()
-                .id(SHEET_VERDICT_ID)
-                .debug_selector(|| SHEET_VERDICT_ID.into())
-                .h(line * SHEET_ROWS + px(20.))
-                .justify_center()
-                .items_center()
-                .gap(px(10.))
-                .px(px(28.))
-                .child(div().text_2xl().child(mark))
-                .child(div().text_sm().text_center().child(words_of(gate)))
-                .child(
+            },
+            words_of(gate).to_string(),
+            "Nothing here is the project's to fix, so it is not reported.",
+        )),
+        (None, Some(Agent::Advice { your_side, words })) if !draft.insisted => Some((
+            if *your_side { "💡" } else { "🚫" },
+            words.clone(),
+            "Your agent looked at it: nothing here is the project's to fix.",
+        )),
+        _ => None,
+    };
+    let asking = verdict.is_none() && matches!(draft.agent, Some(Agent::Asking));
+    let note: Option<String> = match &draft.agent {
+        Some(Agent::Found(_)) => {
+            Some("Written by your agent from the evidence. Check it before you submit.".into())
+        }
+        Some(Agent::Manual(why)) => Some((*why).into()),
+        // Reported anyway against the agent's word: its word stays in view.
+        Some(Agent::Advice { words, .. }) => Some(format!(
+            "Your agent thought this was not the project's to fix: {words}"
+        )),
+        _ => None,
+    };
+    let skip = app.clone();
+    let body_area = if let Some((mark, words, under)) = verdict.clone() {
+        v_flex()
+            .id(SHEET_VERDICT_ID)
+            .debug_selector(|| SHEET_VERDICT_ID.into())
+            .h(line * SHEET_ROWS + px(20.))
+            .justify_center()
+            .items_center()
+            .gap(px(10.))
+            .px(px(28.))
+            .child(div().text_2xl().child(mark))
+            .child(div().text_sm().text_center().child(words))
+            .child(div().text_xs().text_color(muted).text_center().child(under))
+            .into_any_element()
+    } else if asking {
+        v_flex()
+            .id(SHEET_AGENT_ID)
+            .debug_selector(|| SHEET_AGENT_ID.into())
+            .h(line * SHEET_ROWS + px(20.))
+            .justify_center()
+            .items_center()
+            .gap(px(12.))
+            .child(div().text_2xl().child("🔎"))
+            .child(div().text_sm().child("Your agent is looking at it…"))
+            .child(
+                button(SHEET_SKIP_ID, "Fill it in myself", false, &theme)
+                    .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                        skip.update(cx, |s, cx| s.skip_agent(cx))
+                    }),
+            )
+            .into_any_element()
+    } else {
+        v_flex()
+            .when_some(note, |this, note| {
+                this.child(
                     div()
+                        .id(SHEET_AGENT_ID)
+                        .debug_selector(|| SHEET_AGENT_ID.into())
+                        .px(px(14.))
+                        .pt(px(8.))
                         .text_xs()
                         .text_color(muted)
-                        .text_center()
-                        .child("Nothing here is the project's to fix, so it is not reported."),
+                        .child(note),
                 )
-                .into_any_element()
-        }
-        None => div()
-            .id(SHEET_BODY_ID)
-            .debug_selector(|| SHEET_BODY_ID.into())
-            .h(line * SHEET_ROWS + px(20.))
-            .overflow_y_scroll()
-            .px(px(14.))
-            .py(px(10.))
-            .text_xs()
-            .child(TextView::markdown("report-body-text", shown).selectable(true))
-            .into_any_element(),
+            })
+            .child(
+                div()
+                    .id(SHEET_BODY_ID)
+                    .debug_selector(|| SHEET_BODY_ID.into())
+                    .h(line * SHEET_ROWS - px(4.))
+                    .overflow_y_scroll()
+                    .px(px(14.))
+                    .py(px(10.))
+                    .text_xs()
+                    .child(TextView::markdown("report-body-text", shown).selectable(true)),
+            )
+            .into_any_element()
     };
     let insist = app.clone();
-    let footer = if decided.is_some() {
+    let footer = if verdict.is_some() {
         h_flex()
             .gap(px(8.))
             .p(px(12.))
@@ -491,7 +547,7 @@ pub fn report_sheet(app: &Entity<AppState>, cx: &App) -> Option<AnyElement> {
                                 div()
                                     .text_xs()
                                     .text_color(muted)
-                                    .child(if decided.is_some() {
+                                    .child(if verdict.is_some() || asking {
                                         "Checked on this Mac first. Nothing has left it."
                                     } else {
                                         "This is everything that leaves this Mac. Names, hosts, ids and secrets are already taken out."
@@ -500,7 +556,7 @@ pub fn report_sheet(app: &Entity<AppState>, cx: &App) -> Option<AnyElement> {
                             .child(div().pt(px(6.)).text_sm().truncate().child(title)),
                     )
                     .child(body_area)
-                    .when(decided.is_none(), |this| this.child(
+                    .when(verdict.is_none() && !asking, |this| this.child(
                         h_flex()
                             .id(SHEET_TEXT_ID)
                             .debug_selector(|| SHEET_TEXT_ID.into())

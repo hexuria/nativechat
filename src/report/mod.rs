@@ -4,6 +4,7 @@
 //! passed through [`redact::redact`] first; nothing else of the notice leaves the Mac, whatever
 //! it grows to hold. The preview shows [`Report`] as it is, so what is seen is what is sent.
 
+pub mod agent;
 pub mod fingerprint;
 pub mod github;
 pub mod redact;

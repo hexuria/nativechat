@@ -9,6 +9,7 @@
 //! clipboard and the page says to paste it.
 
 use super::Report;
+use super::agent::Findings;
 
 /// The repository the desktop app's reports are filed in.
 pub const REPO: &str = "hexuria/opengrok";
@@ -33,7 +34,10 @@ pub struct IssueLink {
 
 /// The issue's title: what failed, where, and how it answered. `Usage failed: GET
 /// /coworkers/{id}/usage, no answer`.
-pub fn title(report: &Report) -> String {
+pub fn title(report: &Report, found: Option<&Findings>) -> String {
+    if let Some(found) = found.filter(|found| !found.title.is_empty()) {
+        return neutralize(&found.title);
+    }
     let place = report.place;
     let request = report.endpoint.as_deref().unwrap_or("in the app");
     let answer = match report.status {
@@ -51,10 +55,15 @@ pub fn title(report: &Report) -> String {
 /// The issue's body, in Markdown: the facts as a list, the app's sentence, the failure's text in
 /// a fenced block when the person included it, and the fingerprint as a hidden marker the relay
 /// will match on.
-pub fn body(report: &Report) -> String {
+pub fn body(report: &Report, found: Option<&Findings>) -> String {
     let mut lines = vec![
         format!("**What failed:** {}", neutralize(&report.said)),
         String::new(),
+    ];
+    if let Some(found) = found {
+        lines.extend(findings(found));
+    }
+    lines.extend([
         format!("- **Place:** {}", report.place),
         format!(
             "- **Request:** `{}`",
@@ -75,7 +84,7 @@ pub fn body(report: &Report) -> String {
             report.last_day
         ),
         format!("- **App:** {} on {}", report.app_version, report.os),
-    ];
+    ]);
     if let Some(text) = &report.text {
         lines.push(String::new());
         lines.push("```text".to_string());
@@ -91,11 +100,35 @@ pub fn body(report: &Report) -> String {
     lines.join("\n")
 }
 
+/// What the agent found, as the issue's second section: its summary, the evidence it rests on,
+/// where it suspects the code, and the steps to see it again.
+fn findings(found: &Findings) -> Vec<String> {
+    let mut lines = vec!["### What the person's agent found".to_string()];
+    if !found.summary.is_empty() {
+        lines.push(neutralize(&found.summary));
+    }
+    for line in &found.evidence {
+        lines.push(format!("- {}", neutralize(line)));
+    }
+    if !found.suspect.is_empty() {
+        lines.push(format!("- **Suspect:** `{}`", fence_safe(&found.suspect)));
+    }
+    if !found.repro.is_empty() {
+        lines.push(String::new());
+        lines.push("**To see it again:**".to_string());
+        for (at, step) in found.repro.iter().enumerate() {
+            lines.push(format!("{}. {}", at + 1, neutralize(step)));
+        }
+    }
+    lines.push(String::new());
+    lines
+}
+
 /// The new-issue page for `report`, with the body in the link when it fits and on the clipboard
 /// when it does not.
-pub fn issue_link(report: &Report) -> IssueLink {
-    let title = title(report);
-    let body = body(report);
+pub fn issue_link(report: &Report, found: Option<&Findings>) -> IssueLink {
+    let title = title(report, found);
+    let body = body(report, found);
     let full = new_issue_url(&title, &body);
     if full.len() <= LINK_CHARS {
         return IssueLink {
@@ -172,7 +205,7 @@ mod tests {
     /// carries the facts and the hidden fingerprint.
     #[test]
     fn the_link_opens_a_filled_new_issue_page() {
-        let link = issue_link(&report(Some("Connection refused (os error 61)")));
+        let link = issue_link(&report(Some("Connection refused (os error 61)")), None);
         assert!(
             link.url
                 .starts_with("https://github.com/hexuria/opengrok/issues/new?")
@@ -195,7 +228,7 @@ mod tests {
     #[test]
     fn a_long_body_goes_on_the_clipboard() {
         let long = "x ".repeat(5000);
-        let link = issue_link(&report(Some(&long)));
+        let link = issue_link(&report(Some(&long)), None);
         assert!(link.url.len() <= LINK_CHARS, "{}", link.url.len());
         let clipboard = link.clipboard.expect("the full body is on the clipboard");
         assert!(clipboard.contains(long.trim()));
@@ -204,12 +237,44 @@ mod tests {
         assert!(body.contains("fp:3fa91c0e2b7d"));
     }
 
+    /// What the person's agent found writes the issue's title and its own section, before the
+    /// facts, and the fingerprint does not change.
+    #[test]
+    fn the_agents_findings_write_the_title_and_a_section() {
+        let found = Findings {
+            title: "Usage fails when the gateway returns 502".into(),
+            summary: "The usage read got a 502 while other reads worked.".into(),
+            evidence: vec!["status 502".into(), "other reads ok".into()],
+            suspect: "src/state.rs:8258".into(),
+            repro: vec!["open a Bot's settings".into()],
+        };
+        let r = report(None);
+        assert_eq!(
+            title(&r, Some(&found)),
+            "Usage fails when the gateway returns 502"
+        );
+        let body = body(&r, Some(&found));
+        let agent = body
+            .find("### What the person's agent found")
+            .expect("a section");
+        let facts = body.find("- **Place:**").expect("the facts");
+        assert!(agent < facts, "the agent's section comes before the facts");
+        for line in [
+            "- status 502",
+            "- **Suspect:** `src/state.rs:8258`",
+            "1. open a Bot's settings",
+        ] {
+            assert!(body.contains(line), "{line} in {body}");
+        }
+        assert!(body.ends_with("<!-- fp:3fa91c0e2b7d -->"));
+    }
+
     /// Nothing in a report can ping a GitHub user, link or close an issue, or break out of its
     /// code block.
     #[test]
     fn a_report_cannot_ping_close_or_escape() {
         let tricky = "fixes #1, cc @maintainer\n```\n**bold**";
-        let body = body(&report(Some(tricky)));
+        let body = body(&report(Some(tricky)), None);
         assert!(!body.contains("@maintainer"), "{body}");
         assert!(!body.contains("#1"), "{body}");
         let inside = body.split("```text\n").nth(1).expect("a fenced block");

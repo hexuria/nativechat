@@ -1285,6 +1285,7 @@ pub enum Command {
     SendReport,
     CloseReport,
     InsistReport,
+    SkipAgent,
     CloseFaultWindow,
     PageFaultWindow(isize),
     CopyFaultWindow,
@@ -1686,6 +1687,7 @@ impl Command {
             Self::SendReport => state.send_report(cx),
             Self::CloseReport => state.close_report(cx),
             Self::InsistReport => state.insist_report(cx),
+            Self::SkipAgent => state.skip_agent(cx),
             Self::CloseFaultWindow => state.close_fault_window(cx),
             Self::PageFaultWindow(step) => state.page_fault_window(step, cx),
             Self::CopyFaultWindow => state.copy_fault_window(cx),
@@ -9958,6 +9960,7 @@ impl NativeChatHost {
             t if t == sheet::SHEET_SEND_ID => Command::SendReport,
             t if t == sheet::SHEET_CANCEL_ID => Command::CloseReport,
             t if t == sheet::SHEET_ANYWAY_ID => Command::InsistReport,
+            t if t == sheet::SHEET_SKIP_ID => Command::SkipAgent,
             _ => return None,
         };
         if self.report_shown.is_none() {
@@ -9971,35 +9974,79 @@ impl NativeChatHost {
     /// The report preview as nodes: the sheet, its title and body as values, and its controls.
     fn report_node(&self) -> Option<UiNode> {
         use crate::components::faults as sheet;
+        use crate::report::agent::Agent;
         let (draft, report) = self.report_shown.as_ref()?;
+        let found = match &draft.agent {
+            Some(Agent::Found(found)) => Some(found),
+            _ => None,
+        };
         let mut node = UiNode::new(
             sheet::SHEET_ID,
             "dialog",
-            crate::report::github::title(report),
+            crate::report::github::title(report, found),
         );
-        let decided = self
+        let gate = self
             .report_gate
             .filter(|gate| !gate.worth_reporting() && !draft.insisted);
-        if let Some(gate) = decided {
-            // The first gate decided: its words where the body would be, and only "Report
-            // anyway" and Close.
+        let advice = match (&draft.agent, draft.insisted) {
+            (Some(Agent::Advice { your_side, words }), false) => Some((*your_side, words.clone())),
+            _ => None,
+        };
+        // The first gate decided, or the agent advised: its words where the body would be, and
+        // only "Report anyway" and Close.
+        let verdict = gate
+            .map(|gate| {
+                (
+                    matches!(gate, crate::report::triage::Gate1::YourSide(_)),
+                    sheet::words_of(gate).to_string(),
+                )
+            })
+            .or(advice);
+        if let Some((your_side, words)) = verdict {
             return Some(
                 node.with_child(
-                    UiNode::status(sheet::SHEET_VERDICT_ID, sheet::words_of(gate)).with_value(
-                        match gate {
-                            crate::report::triage::Gate1::YourSide(_) => "your-side",
-                            _ => "noise",
-                        },
-                    ),
+                    UiNode::status(sheet::SHEET_VERDICT_ID, words).with_value(if your_side {
+                        "your-side"
+                    } else {
+                        "noise"
+                    }),
                 )
                 .with_child(UiNode::button(sheet::SHEET_ANYWAY_ID, "Report anyway"))
                 .with_child(UiNode::button(sheet::SHEET_CANCEL_ID, "Close")),
             );
         }
+        match &draft.agent {
+            Some(Agent::Asking) => {
+                return Some(
+                    node.with_child(
+                        UiNode::status(sheet::SHEET_AGENT_ID, "Your agent is looking at it")
+                            .with_value("asking"),
+                    )
+                    .with_child(UiNode::button(sheet::SHEET_SKIP_ID, "Fill it in myself"))
+                    .with_child(UiNode::button(sheet::SHEET_CANCEL_ID, "Cancel")),
+                );
+            }
+            Some(Agent::Found(_)) => {
+                node = node.with_child(
+                    UiNode::status(sheet::SHEET_AGENT_ID, "Written by your agent")
+                        .with_value("found"),
+                );
+            }
+            Some(Agent::Manual(why)) => {
+                node = node
+                    .with_child(UiNode::status(sheet::SHEET_AGENT_ID, *why).with_value("manual"));
+            }
+            Some(Agent::Advice { words, .. }) => {
+                node = node.with_child(
+                    UiNode::status(sheet::SHEET_AGENT_ID, words.clone()).with_value("advice"),
+                );
+            }
+            _ => {}
+        }
         node = node
             .with_child(
                 UiNode::status(sheet::SHEET_BODY_ID, "Report")
-                    .with_value(crate::report::github::body(report)),
+                    .with_value(crate::report::github::body(report, found)),
             )
             .with_child(
                 UiNode::checkbox(sheet::SHEET_TEXT_ID, "Include the server's own text")
@@ -10214,8 +10261,12 @@ impl NativeChatHost {
             "report.link" => self
                 .report_shown
                 .as_ref()
-                .map(|(_, report)| {
-                    let link = crate::report::github::issue_link(report);
+                .map(|(draft, report)| {
+                    let found = match &draft.agent {
+                        Some(crate::report::agent::Agent::Found(found)) => Some(found),
+                        _ => None,
+                    };
+                    let link = crate::report::github::issue_link(report, found);
                     DispatchResult::json(serde_json::json!({
                         "url": link.url,
                         "clipboard": link.clipboard.is_some(),
