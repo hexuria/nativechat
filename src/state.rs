@@ -2261,6 +2261,9 @@ pub struct ReportDraft {
     pub opened: bool,
     /// "Report anyway": the person wants to report a fault the first gate says is not worth it.
     pub insisted: bool,
+    /// The fault window this report was opened from, to go back to on Cancel or Close: the report
+    /// takes that window's place rather than opening a second window over it.
+    pub back_to: Option<(crate::faults::Place, usize)>,
 }
 
 /// `https://www.facebook.com/` → `www.facebook.com`: a saved login's site as text names it.
@@ -11403,24 +11406,42 @@ impl AppState {
 
     /// Open the report preview on a fault notice. A notice that is not a fault has none.
     pub fn open_report(&mut self, notice_id: &str, cx: &mut Context<Self>) {
+        if self.begin_report(notice_id) {
+            cx.notify();
+        }
+    }
+
+    /// Cancel or Close on the report: back to the fault window it was opened from, if any.
+    pub fn close_report(&mut self, cx: &mut Context<Self>) {
+        self.end_report();
+        cx.notify();
+    }
+
+    /// The report preview on a fault notice, in the place of the fault window when that is what
+    /// it was opened from: one window at a time. False for a notice that is not a fault.
+    fn begin_report(&mut self, notice_id: &str) -> bool {
         let is_fault = self
             .notices
             .iter()
             .any(|n| n.id == notice_id && n.fault.is_some());
         if is_fault {
+            let back_to = self.fault_window.take();
             self.report_draft = Some(ReportDraft {
                 notice_id: notice_id.to_string(),
                 with_text: false,
                 opened: false,
                 insisted: false,
+                back_to,
             });
-            cx.notify();
         }
+        is_fault
     }
 
-    pub fn close_report(&mut self, cx: &mut Context<Self>) {
-        self.report_draft = None;
-        cx.notify();
+    /// The report goes, and the fault window it was opened from comes back.
+    fn end_report(&mut self) {
+        if let Some(draft) = self.report_draft.take() {
+            self.fault_window = draft.back_to;
+        }
     }
 
     /// The preview's "Include the server's own text".
@@ -40889,6 +40910,7 @@ mod tests {
             with_text: false,
             opened: false,
             insisted: false,
+            back_to: None,
         });
         let plain = state.report_preview().expect("a fault previews");
         assert_eq!(
@@ -40921,8 +40943,42 @@ mod tests {
             with_text: true,
             opened: false,
             insisted: false,
+            back_to: None,
         });
         assert_eq!(state.report_preview(), None, "only a fault can be reported");
+    }
+
+    /// A report opened from the fault window takes that window's place, and Cancel brings the
+    /// fault window back where it was; one opened from a notice leaves no window behind.
+    #[test]
+    fn the_report_takes_the_fault_windows_place() {
+        use crate::faults::{FaultInput, Place};
+        let mut state = AppState::new();
+        let input = || FaultInput {
+            raw: "boom".into(),
+            endpoint: None,
+            status: Some(502),
+        };
+        state.raise_fault(Place::Usage, "Usage failed", input());
+        let id = state.notices[0].id.clone();
+        state.fault_window = Some((Place::Usage, 0));
+        assert!(state.begin_report(&id));
+        assert_eq!(state.fault_window, None, "one window at a time");
+        state.end_report();
+        assert_eq!(
+            state.fault_window,
+            Some((Place::Usage, 0)),
+            "Cancel goes back"
+        );
+        assert!(state.report_draft.is_none());
+
+        assert!(state.begin_report(&id));
+        state.report_draft.as_mut().expect("open").back_to = None;
+        state.end_report();
+        assert_eq!(
+            state.fault_window, None,
+            "from a notice, nothing comes back"
+        );
     }
 
     /// A login an import could not save is kept by its row, not by its username or site.
