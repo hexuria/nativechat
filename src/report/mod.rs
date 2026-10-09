@@ -7,6 +7,7 @@
 pub mod fingerprint;
 pub mod github;
 pub mod redact;
+pub mod triage;
 
 use crate::notifications::Notice;
 use fingerprint::FingerprintInput;

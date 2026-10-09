@@ -1284,6 +1284,7 @@ pub enum Command {
     ToggleReportText,
     SendReport,
     CloseReport,
+    InsistReport,
     CloseFaultWindow,
     PageFaultWindow(isize),
     CopyFaultWindow,
@@ -1684,6 +1685,7 @@ impl Command {
             Self::ToggleReportText => state.toggle_report_text(cx),
             Self::SendReport => state.send_report(cx),
             Self::CloseReport => state.close_report(cx),
+            Self::InsistReport => state.insist_report(cx),
             Self::CloseFaultWindow => state.close_fault_window(cx),
             Self::PageFaultWindow(step) => state.page_fault_window(step, cx),
             Self::CopyFaultWindow => state.copy_fault_window(cx),
@@ -3755,6 +3757,8 @@ pub struct NativeChatHost {
     fault_focus: Option<crate::faults::Place>,
     /// The report preview, while open: its draft and the report exactly as it would be sent.
     report_shown: Option<(crate::state::ReportDraft, crate::report::Report)>,
+    /// The first gate's verdict on the fault the preview is open on.
+    report_gate: Option<crate::report::triage::Gate1>,
     fault_shown: Option<(
         crate::faults::Place,
         usize,
@@ -4131,6 +4135,7 @@ impl NativeChatHost {
             plan_fallback_busy: state.picker_busy(PickerFor::PlanFallback),
             model_note: state.model_catalogue.note.clone(),
             fault_focus: state.fault_focus,
+            report_gate: state.report_gate(),
             report_shown: state.report_draft.clone().zip(state.report_preview()),
             fault_shown: state
                 .fault_in_window()
@@ -9952,6 +9957,7 @@ impl NativeChatHost {
             t if t == sheet::SHEET_TEXT_ID => Command::ToggleReportText,
             t if t == sheet::SHEET_SEND_ID => Command::SendReport,
             t if t == sheet::SHEET_CANCEL_ID => Command::CloseReport,
+            t if t == sheet::SHEET_ANYWAY_ID => Command::InsistReport,
             _ => return None,
         };
         if self.report_shown.is_none() {
@@ -9970,19 +9976,39 @@ impl NativeChatHost {
             sheet::SHEET_ID,
             "dialog",
             crate::report::github::title(report),
-        )
-        .with_child(
-            UiNode::status(sheet::SHEET_BODY_ID, "Report")
-                .with_value(crate::report::github::body(report)),
-        )
-        .with_child(
-            UiNode::checkbox(sheet::SHEET_TEXT_ID, "Include the server's own text")
-                .with_checked(draft.with_text),
-        )
-        .with_child(UiNode::button(
-            sheet::SHEET_CANCEL_ID,
-            if draft.opened { "Close" } else { "Cancel" },
-        ));
+        );
+        let decided = self
+            .report_gate
+            .filter(|gate| !gate.worth_reporting() && !draft.insisted);
+        if let Some(gate) = decided {
+            // The first gate decided: its words where the body would be, and only "Report
+            // anyway" and Close.
+            return Some(
+                node.with_child(
+                    UiNode::status(sheet::SHEET_VERDICT_ID, sheet::words_of(gate)).with_value(
+                        match gate {
+                            crate::report::triage::Gate1::YourSide(_) => "your-side",
+                            _ => "noise",
+                        },
+                    ),
+                )
+                .with_child(UiNode::button(sheet::SHEET_ANYWAY_ID, "Report anyway"))
+                .with_child(UiNode::button(sheet::SHEET_CANCEL_ID, "Close")),
+            );
+        }
+        node = node
+            .with_child(
+                UiNode::status(sheet::SHEET_BODY_ID, "Report")
+                    .with_value(crate::report::github::body(report)),
+            )
+            .with_child(
+                UiNode::checkbox(sheet::SHEET_TEXT_ID, "Include the server's own text")
+                    .with_checked(draft.with_text),
+            )
+            .with_child(UiNode::button(
+                sheet::SHEET_CANCEL_ID,
+                if draft.opened { "Close" } else { "Cancel" },
+            ));
         if !draft.opened {
             node = node.with_child(UiNode::button(sheet::SHEET_SEND_ID, "Open on GitHub"));
         }
