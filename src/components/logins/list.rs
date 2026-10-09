@@ -26,11 +26,14 @@ pub(super) fn render(
     any_rows: bool,
     theme: &Theme,
     app: Entity<AppState>,
+    fault_badge: Option<AnyElement>,
+    focused: bool,
 ) -> impl IntoElement {
     let muted = theme.muted_foreground;
     v_flex()
         .id("settings-logins-list-pane")
         .w(px(320.))
+        .map(|pane| crate::components::faults::ring(pane, focused))
         .h_full()
         .flex_shrink_0()
         .border_r_1()
@@ -62,7 +65,8 @@ pub(super) fn render(
                                 app.update(cx, |state, cx| state.open_site_login_add(cx));
                             }
                         }),
-                ),
+                )
+                .children(fault_badge),
         )
         .when_some(notice, |this, notice| {
             this.child(

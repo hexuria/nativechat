@@ -40,6 +40,9 @@ pub(crate) const THREAD_CHANGED: &str = "thread.changed";
 pub(crate) const RUN_STARTED: &str = "run.started";
 /// A run ended, however it ended.
 pub(crate) const RUN_FINISHED: &str = "run.finished";
+/// A run is parked on a card for the person (`reason`: which card), in a thread the app may not
+/// be streaming (opengrok-server #358, `RUN_WAITING` in `crates/opengrok-wire/src/events.rs`).
+pub(crate) const RUN_WAITING: &str = "run.waiting";
 /// One of a Bot's routines was made, changed, deleted, paused or resumed.
 pub(crate) const ROUTINE_CHANGED: &str = "routine.changed";
 /// The server could not replay from the id the app resumed with.
@@ -47,9 +50,10 @@ pub(crate) const RESET: &str = "reset";
 
 /// Every note this app reads off the stream, by its `event:` name, for the conformance ledger.
 #[cfg(test)]
-pub(crate) const ACCOUNT_EVENT_NAMES: [&str; 5] = [
+pub(crate) const ACCOUNT_EVENT_NAMES: [&str; 6] = [
     THREAD_CHANGED,
     RUN_STARTED,
+    RUN_WAITING,
     RUN_FINISHED,
     ROUTINE_CHANGED,
     RESET,
@@ -238,6 +242,19 @@ impl AccountEvent {
                         routine_id,
                         state: note.state,
                     }
+                })
+            }
+            // Read as what it means to this app: the thread has something new to show, the card,
+            // so it is read again, as for `thread.changed`. The server sends that note too, and
+            // two reads of one thread coalesce; this one carries the run, so the card is never
+            // missed when only it arrives.
+            RUN_WAITING => {
+                let note: RunNote = body(data)?;
+                ids_given(&[&note.run_id, &note.thread_id, &note.coworker_id])?;
+                Ok(Self::ThreadChanged {
+                    thread_id: note.thread_id,
+                    coworker_id: note.coworker_id,
+                    run_id: Some(note.run_id),
                 })
             }
             ROUTINE_CHANGED => {

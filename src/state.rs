@@ -64,8 +64,8 @@ use std::time::{Duration, Instant, SystemTime};
 pub enum UsageReport {
     Loading,
     Read(crate::opengrok::CoworkerUsage),
-    /// The server would not say, in its words or the app's.
-    Unavailable(String),
+    /// The server would not say, in its words or the app's, with what went wrong behind a badge.
+    Unavailable(Trouble),
 }
 
 /// The Usage modal, open over the window: the Bot it is about, the window its chip names, and
@@ -82,8 +82,9 @@ pub struct UsageModal {
 pub enum ToolList {
     Loading,
     Listed(Vec<crate::opengrok::CoworkerTool>),
-    /// The server would not list them, in its words or the app's.
-    Unavailable(String),
+    /// The server would not list them, in its words or the app's, with what went wrong behind a
+    /// badge.
+    Unavailable(Trouble),
 }
 
 /// The person's connections, as far as Settings → Connections and a Bot's Connections card know
@@ -113,6 +114,19 @@ pub enum ConnectionChange {
     /// Take it back from this Bot.
     Revoke(String),
     Disconnect,
+    /// Call the account this (opengrok-server #359), so two accounts of one service can be told
+    /// apart.
+    Rename(String),
+}
+
+/// Which account each of the person's Bots uses for each service, as far as the app knows it
+/// (opengrok-server #359): what a plugin's picker shows, and what the removal question names.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PinList {
+    Loading,
+    Listed(Vec<crate::opengrok::ConnectionPin>),
+    /// The server would not list them, in its words or the app's.
+    Unavailable(String),
 }
 
 /// The start of the line beside a Bot's switch when the server refuses a lend or a revoke, before
@@ -183,6 +197,25 @@ pub struct AccountConnections {
     /// the service from every Bot it is lent to and needs a browser sign-in to undo, so the row
     /// asks first, naming the Bots that would lose it. One at a time.
     pub confirming_disconnect: Option<String>,
+    /// What `GET /connections/pins` last said: which account each Bot uses for each service
+    /// (opengrok-server #359). `None` until it has been asked since sign-in.
+    pub pins: Option<PinList>,
+    /// The pick of an account that is with the server, by the Bot and the service: the account
+    /// asked for, or `None` for Ask each time. One at a time for each Bot and service: the
+    /// picker is dead until the server has answered, so two answers never land out of order.
+    pub picking: HashMap<(String, String), Option<String>>,
+    /// Why the last pick did not go through, by the Bot and the service: under that Bot's picker
+    /// until something is picked there again.
+    pub not_picked: HashMap<(String, String), String>,
+    /// Why the last rename of an account did not go through, by the connection's id: under its
+    /// row until it is renamed again, or the server stops listing it.
+    pub not_renamed: HashMap<String, String>,
+    /// The account whose Reconnect is asking for its sign-in page, beside [`Self::opening`],
+    /// which names its service.
+    pub reconnecting: Option<String>,
+    /// Why the last Reconnect did not open the browser: the account, by its connection id, and
+    /// why.
+    pub reconnect_refused: Option<(String, String)>,
 }
 
 impl AccountConnections {
@@ -302,7 +335,61 @@ impl AccountConnections {
             .collect()
     }
 
-    /// Put a lend's or a revoke's answer in the list, as the server wrote the row.
+    /// What an account is called on screen: what the server last said, or, while a rename is
+    /// with the server, the label asked for. A refusal takes the ask away, and the server's
+    /// label is what shows again.
+    pub fn shown_label(&self, row: &crate::opengrok::ConnectionView) -> String {
+        match self.changing.get(&row.id) {
+            Some(ConnectionChange::Rename(label)) => label.clone(),
+            _ => row.label.clone(),
+        }
+    }
+
+    /// The Bots the server last said use this account by pick, in its order. They ask each time
+    /// once it is removed, since the server drops every pin that named it.
+    pub fn pinned_bots(&self, connection_id: &str) -> Vec<String> {
+        match &self.pins {
+            Some(PinList::Listed(pins)) => pins
+                .iter()
+                .filter(|pin| pin.connection_id == connection_id)
+                .map(|pin| pin.coworker_id.clone())
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// The account a Bot shows as picked for a service, `None` inside for Ask each time: what the
+    /// server last said, or, while a pick is with the server, what was asked. `None` while the
+    /// pins have not been read, when the picker can say nothing true about either.
+    pub fn shown_pick(&self, coworker_id: &str, connector: &str) -> Option<Option<String>> {
+        let Some(PinList::Listed(pins)) = &self.pins else {
+            return None;
+        };
+        let key = (coworker_id.to_string(), connector.to_string());
+        if let Some(asked) = self.picking.get(&key) {
+            return Some(asked.clone());
+        }
+        Some(
+            pins.iter()
+                .find(|pin| pin.coworker_id == coworker_id && pin.connector == connector)
+                .map(|pin| pin.connection_id.clone()),
+        )
+    }
+
+    /// Whether a pick for this Bot and service is with the server.
+    pub fn is_picking(&self, coworker_id: &str, connector: &str) -> bool {
+        self.picking
+            .contains_key(&(coworker_id.to_string(), connector.to_string()))
+    }
+
+    /// Why the last pick for this Bot and service did not go through.
+    pub fn pick_refusal(&self, coworker_id: &str, connector: &str) -> Option<&str> {
+        self.not_picked
+            .get(&(coworker_id.to_string(), connector.to_string()))
+            .map(String::as_str)
+    }
+
+    /// Put a change's answer in the list, as the server wrote the row.
     fn put_row(&mut self, answered: crate::opengrok::ConnectionView) {
         if let Some(ConnectionList::Listed(rows)) = &mut self.list
             && let Some(row) = rows.iter_mut().find(|row| row.id == answered.id)
@@ -319,6 +406,19 @@ impl AccountConnections {
         self.not_disconnected.remove(id);
         self.not_changed.retain(|(about, _), _| about != id);
         self.not_changed_asked.retain(|(about, _), _| about != id);
+        self.not_renamed.remove(id);
+        if self
+            .reconnect_refused
+            .as_ref()
+            .is_some_and(|(about, _)| about == id)
+        {
+            self.reconnect_refused = None;
+        }
+        // The server drops every pin that named it, so the Bots it was picked for ask each time
+        // from now on; the read of the pins that follows says the same.
+        if let Some(PinList::Listed(pins)) = &mut self.pins {
+            pins.retain(|pin| pin.connection_id != id);
+        }
         if self.confirming_disconnect.as_deref() == Some(id) {
             self.confirming_disconnect = None;
         }
@@ -423,6 +523,34 @@ pub enum ReplySourceRead {
 /// What this computer's card says on a server without the route.
 pub(crate) const REPLY_SOURCE_NOT_ON_SERVER: &str =
     "This server can't switch where your replies come from yet.";
+
+static TOKIO: std::sync::OnceLock<tokio::runtime::Handle> = std::sync::OnceLock::new();
+
+/// Keep the main runtime available to GPUI executor threads, which may have no Tokio context.
+pub fn keep_tokio_handle(handle: tokio::runtime::Handle) {
+    let _ = TOKIO.set(handle);
+}
+
+fn tokio_handle() -> Option<tokio::runtime::Handle> {
+    tokio::runtime::Handle::try_current()
+        .ok()
+        .or_else(|| TOKIO.get().cloned())
+}
+
+/// Run database work on the Tokio runtime, which sqlx needs, wherever the caller is: a task on
+/// gpui's executors may be polled on a thread that holds no Tokio context, and the app aborted the
+/// first time a notice was written that way (8 Oct 2026). The kept handle reaches those threads;
+/// without any runtime, the skipped work is said in the log.
+fn on_tokio(work: impl std::future::Future<Output = ()> + Send + 'static) {
+    if let Some(handle) = tokio_handle() {
+        handle.spawn(work);
+    } else {
+        log::warn!("database work was skipped because no Tokio runtime exists");
+    }
+}
+
+/// How old the model list may be before a picker opening reads it again.
+const MODELS_STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// Why Save will not keep an opencodex address that is not on this computer, beside why not.
 pub(crate) const RELAY_ADDRESS_NOT_HERE: &str = "Give opencodex's address on this computer first.";
@@ -1525,7 +1653,8 @@ impl Message {
                 | ChatPart::UserForm(_)
                 | ChatPart::SaveLogin(_)
                 | ChatPart::Step(_)
-                | ChatPart::Reasoning(_) => true,
+                | ChatPart::Reasoning(_)
+                | ChatPart::PluginNeeds(_) => true,
             })
     }
 
@@ -1541,7 +1670,8 @@ impl Message {
                 | ChatPart::UserForm(_)
                 | ChatPart::SaveLogin(_)
                 | ChatPart::Step(_)
-                | ChatPart::Reasoning(_) => false,
+                | ChatPart::Reasoning(_)
+                | ChatPart::PluginNeeds(_) => false,
             })
     }
 
@@ -1628,9 +1758,12 @@ fn saved_parts(parts: &[ChatPart]) -> Vec<MessagePart> {
                     height: spec.height,
                 });
             }
-            ChatPart::Approval(_) | ChatPart::UserForm(_) | ChatPart::SaveLogin(_) => {
-                break_paragraph(&mut words)
-            }
+            // A needs card is answered by sending the message again, and a run that asked no
+            // model leaves nothing on the server to read it back from: it is this session's.
+            ChatPart::Approval(_)
+            | ChatPart::UserForm(_)
+            | ChatPart::SaveLogin(_)
+            | ChatPart::PluginNeeds(_) => break_paragraph(&mut words),
             ChatPart::Ui(spec) => {
                 close_text_run(&mut words, &mut saved);
                 saved.push(MessagePart::Ui {
@@ -2098,23 +2231,105 @@ fn carries_choice_card(message: &Message) -> bool {
         .any(|part| matches!(part, ChatPart::Ui(crate::opengrok::UiSpec::Form(_))))
 }
 
+/// The places whose badges [`AppState::troubles`] keeps: a Bot's usage (its card and the Usage
+/// modal) and its tools.
+pub(crate) const USAGE_TROUBLE: crate::faults::Place = crate::faults::Place::Usage;
+pub(crate) const TOOLS_TROUBLE: crate::faults::Place = crate::faults::Place::Tools;
+/// The Recipes and Skills pages' places, one per line that says a failure.
+pub(crate) const BOT_SKILLS_TROUBLE: crate::faults::Place = crate::faults::Place::BotSkills;
+pub(crate) const LOGINS_TROUBLE: crate::faults::Place = crate::faults::Place::Logins;
+pub(crate) const RECIPES_TROUBLE: crate::faults::Place = crate::faults::Place::Recipes;
+pub(crate) const RECIPE_TROUBLE: crate::faults::Place = crate::faults::Place::Recipe;
+pub(crate) const SKILLS_TROUBLE: crate::faults::Place = crate::faults::Place::Skills;
+pub(crate) const YOUR_SKILLS_TROUBLE: crate::faults::Place = crate::faults::Place::Skills;
+pub(crate) const SKILL_TROUBLE: crate::faults::Place = crate::faults::Place::Skill;
+
+/// A failed read as a pane says it, and what went wrong, which only the ⚠ badge shows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Trouble {
+    pub said: String,
+    pub detail: Option<crate::faults::FaultInput>,
+}
+
+impl From<&str> for Trouble {
+    fn from(said: &str) -> Self {
+        Self::plain(said)
+    }
+}
+
+impl Trouble {
+    /// A failure said as `said`, with its own text behind the badge, unless it is words for a
+    /// person: a sentence OpenGrok wrote, or any refusal (a 4xx), which is a verdict on what was
+    /// asked ("no such recipe", "this bot is already playing a recipe") and is said as it is. A
+    /// server's failure, a transport error or an answer that could not be read is no verdict,
+    /// and is what the badge is for.
+    pub(crate) fn failed(said: &str, error: &OpenGrokError) -> Self {
+        let message = error.message.trim();
+        let refusal = matches!(error.status, Some(400..=499));
+        if (error.written_by_opengrok() || refusal) && !message.is_empty() {
+            return Self::plain(message);
+        }
+        Self {
+            said: said.to_string(),
+            detail: Some(crate::faults::FaultInput::from_error(error)),
+        }
+    }
+
+    /// `said`, with text no person was meant to read, a vault's or a file's, behind the badge.
+    pub(crate) fn behind(said: &str, detail: impl Into<String>) -> Self {
+        Self {
+            said: said.to_string(),
+            detail: Some(crate::faults::FaultInput::local(detail)),
+        }
+    }
+
+    /// Words the app or the server wrote for a person, with nothing behind them.
+    pub(crate) fn plain(said: impl Into<String>) -> Self {
+        Self {
+            said: said.into(),
+            detail: None,
+        }
+    }
+
+    /// A read of `what` that failed: a sentence OpenGrok wrote for a person is said as it is,
+    /// and anything else, a transport error or an upstream's answer, is "Could not load `what`."
+    /// with the failure's own text behind the badge.
+    pub(crate) fn reading(what: &str, error: &OpenGrokError) -> Self {
+        Self::failed(&format!("Could not load {what}."), error)
+    }
+}
+
+/// What a usage report becomes when a read fails. A refusal is said in its own words. A fault
+/// says nothing in the card, whose ⚠ badge is the whole of it: the numbers last read stay, or
+/// "—" where there were none, so a server that blinks does not empty the card.
+fn after_failed_read(held: Option<&UsageReport>, trouble: Trouble) -> UsageReport {
+    match (trouble.detail.is_some(), held) {
+        (true, Some(UsageReport::Read(usage))) => UsageReport::Read(usage.clone()),
+        (true, _) => UsageReport::Unavailable(Trouble::plain(NOTHING_READ)),
+        (false, _) => UsageReport::Unavailable(trouble),
+    }
+}
+
+/// What a card says where a read failed and nothing was ever read.
+pub(crate) const NOTHING_READ: &str = "—";
+
 /// Why the open bot's usage is not shown, in words for its settings.
-fn usage_unavailable(error: &OpenGrokError) -> String {
+fn usage_unavailable(error: &OpenGrokError) -> Trouble {
     match error.status {
-        Some(404) => "Only this bot's owner can see its usage.".to_string(),
-        Some(401) => "Sign in again to see this bot's usage.".to_string(),
-        _ => format!("Could not load this bot's usage: {}", error.message),
+        Some(404) => Trouble::plain("Only this bot's owner can see its usage."),
+        Some(401) => Trouble::plain("Sign in again to see this bot's usage."),
+        _ => Trouble::reading("this bot's usage", error),
     }
 }
 
 /// Why the open bot's tools are not listed, in words for its settings. A 404 is the server
 /// saying this person does not own the bot (a bot shared with the org answers it that way), and
 /// a server older than the route says the same; neither is a fault to report.
-fn tools_unavailable(error: &OpenGrokError) -> String {
+fn tools_unavailable(error: &OpenGrokError) -> Trouble {
     match error.status {
-        Some(404) => "Only this bot's owner can see its tools.".to_string(),
-        Some(401) => "Sign in again to see this bot's tools.".to_string(),
-        _ => format!("Could not load this bot's tools: {}", error.message),
+        Some(404) => Trouble::plain("Only this bot's owner can see its tools."),
+        Some(401) => Trouble::plain("Sign in again to see this bot's tools."),
+        _ => Trouble::reading("this bot's tools", error),
     }
 }
 
@@ -2348,9 +2563,16 @@ fn skills_unavailable(error: &OpenGrokError) -> String {
         Some(404) => SKILLS_NOT_ON_SERVER.to_string(),
         Some(401) => SIGN_IN_FOR_SKILLS.to_string(),
         Some(403) => error.message.clone(),
-        Some(_) => format!("Could not read this Bot's skills: {}", error.message),
+        Some(_) if error.written_by_opengrok() => {
+            format!("Could not read this Bot's skills: {}", error.message)
+        }
+        // Not a sentence OpenGrok wrote for a person: the card's ⚠ is all it says.
+        Some(_) => NOTHING_READ.to_string(),
     }
 }
+
+/// The Skills card's line when an answer no person was meant to read came back.
+pub(crate) const COULD_NOT_READ_BOT_SKILLS: &str = "Could not read this Bot's skills.";
 
 /// What the Skills card says after a switch that did not go as asked, and where it says it, by
 /// the rules [`ceiling_switch_note`] follows. A 422 that names the skill switched (`no skill
@@ -3054,6 +3276,7 @@ fn stream_part_sig(parts: &[ChatPart]) -> (usize, u8) {
             ChatPart::SaveLogin(_) => 16,
             ChatPart::Step(_) => 32,
             ChatPart::Reasoning(_) => 64,
+            ChatPart::PluginNeeds(_) => 128,
         }
     });
     let settled = parts
@@ -3807,6 +4030,8 @@ pub enum RightPane {
     Closed,
     Settings,
     Computer,
+    /// The open Bot's notifications, in place of its settings (the bell, 8 Oct 2026).
+    Notifications,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
@@ -4962,9 +5187,6 @@ pub enum AppSettingsTab {
     Computer,
     Updates,
     Logins,
-    /// The services the person has signed in to for their Bots, and the ones on offer (#2).
-    Connections,
-    Skills,
 }
 
 /// Where Settings also shows routing controls for the active Bot's box. The monitor keeps
@@ -5112,6 +5334,21 @@ pub struct NavLocation {
     pub computer_view: ComputerView,
     pub app_settings_open: bool,
     pub app_settings_tab: AppSettingsTab,
+    /// The Plugins or Tools window's page, while one is open: its pages are steps in the same
+    /// history, so ⌘[ walks back through them and, on the window's first page, closes it
+    /// (7 Oct 2026).
+    pub window: Option<WindowNav>,
+}
+
+/// Where the Plugins or Tools window stands: which window, its page, the detail open on it, and
+/// a Bots page open over that detail.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WindowNav {
+    pub kind: crate::components::monitor_modal::MonitorKind,
+    pub page: crate::components::monitor_modal::MarketPage,
+    pub selected: Option<crate::components::monitor_modal::PluginSelection>,
+    pub bots_for: Option<String>,
+    pub skill_bots_open: bool,
 }
 
 impl NavLocation {
@@ -5154,6 +5391,36 @@ impl NavHistory {
         }
         self.current = Some(prev.clone());
         Some(prev)
+    }
+
+    /// Whether the step behind is a page of the same window: then the window's ‹ is ⌘[.
+    fn back_is_window(&self, leads_to: impl Fn(&WindowNav) -> bool) -> bool {
+        self.current.as_ref().is_some_and(|c| c.window.is_some())
+            && self
+                .back
+                .last()
+                .and_then(|b| b.window.as_ref())
+                .is_some_and(leads_to)
+    }
+
+    /// Close (✕, Esc): the window's steps move ahead of where the person now stands, as if
+    /// they had pressed ⌘[ through them, so ⌘] brings the window back.
+    fn rewind_window(&mut self) {
+        while self.current.as_ref().is_some_and(|c| c.window.is_some()) {
+            match self.back.pop() {
+                Some(prev) => {
+                    if let Some(cur) = self.current.take() {
+                        self.forward.push(cur);
+                    }
+                    self.current = Some(prev);
+                }
+                None => {
+                    if let Some(cur) = self.current.as_mut() {
+                        cur.window = None;
+                    }
+                }
+            }
+        }
     }
 
     fn go_forward(&mut self) -> Option<NavLocation> {
@@ -5210,7 +5477,58 @@ pub struct AppState {
     pub more_menu_open: bool,
     /// The composer's "+" picker: what it can offer, what is picked, and what each entry is.
     /// Tools named for the next message. They show as chips beside the composer's "+".
-    pub picked_tools: Vec<PickedTool>,
+    /// The accounts a "Which account?" card picked, by plugin then service, for the turn its
+    /// answer sends next and only that turn (`pluginAccounts`, [`crate::opengrok::TurnTags`]).
+    pub next_turn_accounts:
+        std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
+    /// The tool whose choice dialog is open: `(tool, what it is called, its mode)` (#359).
+    pub tool_mode_dialog: Option<(String, String, String)>,
+    /// The tool whose choice is with the server, and why the last change did not go through.
+    pub tool_mode_changing: Option<String>,
+    pub tool_mode_refusal: Option<String>,
+    /// A skill's Bots: each of the person's Bots' skills, read for the skill page's "N Bots" and
+    /// its Bots page (7 Oct 2026).
+    pub skill_bots: Option<crate::state::SkillBots>,
+    /// The open Bot's installed plugin skills with their own switches, read with a plugin's page
+    /// (`GET /coworkers/{id}/plugin-skills`), and the one open on its read-only page.
+    pub plugin_skills: Vec<crate::opengrok::PluginSkill>,
+    pub plugin_skill_page: Option<crate::opengrok::PluginSkill>,
+    /// Whether a saved login can be used for each Bot, asked before Touch ID: the person is
+    /// never asked for a fingerprint only to be refused (8 Oct 2026).
+    pub saved_login_checks: HashMap<String, crate::opengrok::SavedLoginCheck>,
+    /// What went wrong, newest first, kept on this Mac until cleared (`crate::notifications`).
+    pub notices: Vec<crate::notifications::Notice>,
+    /// The notice the toast shows, and whether the pointer is on it (it stays while it is).
+    pub toast: Option<String>,
+    pub toast_hovered: bool,
+    /// The notifications page: ticked rows, the Unread filter, the one row opened to its
+    /// details, and what a delete took away while its Undo stands.
+    pub notice_selection: HashSet<String>,
+    pub notice_unread_only: bool,
+    pub notice_expanded: Option<String>,
+    pub notice_undo: Option<(u64, Vec<crate::notifications::Notice>, String)>,
+    notice_undo_generation: u64,
+    /// The fault window, while it is open: which place's faults it pages through, and which of
+    /// them, newest first (`components::fault_window`).
+    pub fault_window: Option<(crate::faults::Place, usize)>,
+    /// The place a notice's 🎯 just took the person to, ringed for a moment so the eye finds it.
+    pub fault_focus: Option<crate::faults::Place>,
+    fault_focus_generation: u64,
+    /// Each Bot's shared logins, by Bot, read with the check: a Bot's card offers these first
+    /// and the rest under "Share with <Bot>" (8 Oct 2026).
+    pub site_login_shares: HashMap<String, HashSet<String>>,
+    /// The Bots one login is shared with, for its Bots page in the Plugins window.
+    pub login_bots: Option<(String, Option<HashSet<String>>)>,
+    /// The Bot being given a computer of its own from a login card, while the server makes it.
+    pub own_computer_changing: Option<String>,
+    /// What the server said when it could not give a Bot its own computer.
+    pub own_computer_refusal: Option<String>,
+    /// The service whose "Current Bot" default-account menu is open on a plugin's page.
+    pub account_menu: Option<String>,
+    /// A skill's page in the Plugins window, while the person edits their own skill there.
+    pub skill_edit: Option<SkillEdit>,
+    /// The reply rows whose "Which account?" card has Remember on.
+    pub plugin_needs_remember: HashSet<String>,
     /// The recipe the next message runs, once one has been picked with `/`. While it is set the
     /// composer is in recipe mode: `@` offers this recipe's parameters instead of the bot's
     /// tools, because a turn that is already a recipe run has no use for a tool roster.
@@ -5243,6 +5561,9 @@ pub struct AppState {
     pub attach_requests: Vec<std::path::PathBuf>,
     /// Files a driver asked the composer to take off the draft, by their place on it.
     pub detach_requests: Vec<usize>,
+    /// A modal opened while the composer's "@" or "/" list was up: the composer closes it on its
+    /// next look at the state (`dismiss_popovers`).
+    pub composer_panel_close_requested: bool,
     pub is_app_settings_open: bool,
     pub bot_finder_open: bool,
     pub command_palette_open: bool,
@@ -5527,6 +5848,8 @@ pub struct AppState {
     /// A monitor modal belongs to the Bot that opened it and closes on a Bot change.
     pub monitor_modal: Option<crate::components::monitor_modal::MonitorModal>,
     monitor_generation: u64,
+    /// The plugin marketplace: catalog, installs, details and unfinished sign-ins (#184/#185).
+    pub plugin_market: PluginMarket,
     /// Counts the reads the Usage modal asked for, so only the newest answer is shown: a chip
     /// pressed twice, or two in a row, can come back out of order.
     usage_modal_generation: u64,
@@ -5547,6 +5870,9 @@ pub struct AppState {
     /// Connect it was asked for. The service's name cannot tell that ask from another for the
     /// same service, or from one an account that has since signed out made.
     connect_asks: u64,
+    /// Counts the reads of the pins (opengrok-server #359), so only the newest answer is shown,
+    /// and none from before a sign-out.
+    pins_generation: u64,
     /// Where the server keeps this account's replies paid from, and the unsaved changes to this
     /// computer's half of the relay on its card in Settings → Computer. A Bot that has picked no
     /// door of its own follows the kind the server keeps, which nothing here switches.
@@ -5557,6 +5883,9 @@ pub struct AppState {
     /// Numbers the reads of `/models`, so only the newest answer lands
     /// ([`Self::begin_models_read`]).
     models_generation: u64,
+    /// When the model list last came back from the server. A picker opening reads it again once
+    /// it is a few seconds old; never read (a list built by hand) is left alone.
+    pub(crate) models_read_at: Option<std::time::Instant>,
     /// Settings → Computer was on screen when Settings last changed what it shows, so its arrival
     /// and its leaving are each told once ([`Self::settle_computer_page`]).
     computer_page_shown: bool,
@@ -5775,7 +6104,7 @@ pub struct AppState {
     /// What the OPEN SKILL's fetch said when it was refused, shown on its pane.
     pub skill_error: Option<String>,
     /// What the CREATE said when it was refused — the server's own sentence, including the one
-    /// naming the 8000-character cap on a body. Shown in the sheet, over the fields it is about.
+    /// naming the cap on a body. Shown in the sheet, over the fields it is about.
     pub skill_add_error: Option<String>,
     /// Bumped per refresh, so a late answer for an earlier scope is dropped.
     skills_epoch: u64,
@@ -5883,39 +6212,6 @@ pub struct SourceTtsState {
     pub message_id: Option<String>,
     pub is_paused: bool,
     pub is_loading: bool,
-}
-
-/// A tool the person named for the next message, by typing `@` in the composer.
-///
-/// The kind travels with it. The chip row used to decide Tools from Apps by matching the name
-/// against a hardcoded list, which only worked while the names came from one hardcoded menu;
-/// a real tool's name comes from the server and matches nothing.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PickedTool {
-    /// What the server calls it: `shell`, or a plugin's qualified `plugin.server.tool`.
-    pub id: String,
-    /// What the chip reads.
-    pub label: String,
-    pub kind: PickedKind,
-}
-
-/// Which group a chip sits in. A bare name is one of the server's built-in tools; a qualified
-/// one belongs to a plugin, which is what the person means by an app.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PickedKind {
-    Tool,
-    App,
-}
-
-impl PickedKind {
-    /// Read the kind off the name, the same rule the server's tool listing uses.
-    pub fn of(id: &str) -> Self {
-        if id.contains('.') {
-            Self::App
-        } else {
-            Self::Tool
-        }
-    }
 }
 
 /// The skill the next message is sent with, picked with `/` in the composer.
@@ -6076,7 +6372,32 @@ impl AppState {
             is_sidebar_open: true,
             voice_status: VoiceStatus::Ready,
             more_menu_open: false,
-            picked_tools: Vec::new(),
+            next_turn_accounts: Default::default(),
+            plugin_needs_remember: HashSet::new(),
+            tool_mode_dialog: None,
+            tool_mode_changing: None,
+            tool_mode_refusal: None,
+            skill_edit: None,
+            account_menu: None,
+            skill_bots: None,
+            plugin_skills: Vec::new(),
+            plugin_skill_page: None,
+            saved_login_checks: HashMap::new(),
+            notices: Vec::new(),
+            toast: None,
+            toast_hovered: false,
+            notice_selection: HashSet::new(),
+            notice_unread_only: false,
+            notice_expanded: None,
+            notice_undo: None,
+            notice_undo_generation: 0,
+            fault_window: None,
+            fault_focus: None,
+            fault_focus_generation: 0,
+            site_login_shares: HashMap::new(),
+            login_bots: None,
+            own_computer_changing: None,
+            own_computer_refusal: None,
             active_recipe: None,
             active_skill: None,
             composer_files: Vec::new(),
@@ -6084,6 +6405,7 @@ impl AppState {
             transcript_following: true,
             attach_requests: Vec::new(),
             detach_requests: Vec::new(),
+            composer_panel_close_requested: false,
             composer_chips: Vec::new(),
             composer_panel: None,
             is_app_settings_open: false,
@@ -6211,6 +6533,7 @@ impl AppState {
             agent_tools_open: false,
             usage_modal: None,
             monitor_modal: None,
+            plugin_market: PluginMarket::default(),
             monitor_generation: 0,
             usage_modal_generation: 0,
             tools_generation: 0,
@@ -6218,9 +6541,11 @@ impl AppState {
             connections_generation: 0,
             connectors_generation: 0,
             connect_asks: 0,
+            pins_generation: 0,
             reply_source: ReplySourceSettings::default(),
             reply_source_generation: 0,
             models_generation: 0,
+            models_read_at: None,
             computer_page_shown: false,
             default_models_page_shown: false,
             relay_mac: RelayMac::default(),
@@ -7392,6 +7717,11 @@ impl AppState {
     fn forget_account(&mut self) {
         self.monitor_modal = None;
         self.monitor_generation += 1;
+        // Nothing read for the account that signed out answers for the next one.
+        self.plugin_market = PluginMarket {
+            generation: self.plugin_market.generation + 1,
+            ..PluginMarket::default()
+        };
         self.account = None;
         self.auth_status = AuthStatus::SignedOut;
         self.saved_login_use.clear();
@@ -7431,6 +7761,7 @@ impl AppState {
         self.connections_generation += 1;
         self.connectors_generation += 1;
         self.connect_asks += 1;
+        self.pins_generation += 1;
         // So was the reply source, its default for new Bots, and whatever read or change of it
         // is still out.
         self.reply_source = ReplySourceSettings::default();
@@ -7596,7 +7927,31 @@ impl AppState {
         if generation != self.models_generation {
             return None;
         }
-        Some(result.map(|catalogue| apply_catalogue(&mut self.model_catalogue, catalogue)))
+        if result.is_ok() {
+            self.models_read_at = Some(std::time::Instant::now());
+        }
+        let taken = result.map(|catalogue| apply_catalogue(&mut self.model_catalogue, catalogue));
+        // A gateway the server could not reach is a fault on the list, its ⚠ on the list's
+        // heading; any other answer is the list as it is, and resolves one.
+        match &taken {
+            Ok(Some(note)) => {
+                if let (said, Some(raw)) =
+                    crate::components::model_picker::catalogue_note_parts(note)
+                {
+                    let input = crate::faults::FaultInput {
+                        raw,
+                        endpoint: Some("GET /models".to_string()),
+                        status: None,
+                    };
+                    self.raise_fault(crate::faults::Place::Models, &said, input);
+                } else {
+                    self.resolve_faults(crate::faults::Place::Models);
+                }
+            }
+            Ok(None) => self.resolve_faults(crate::faults::Place::Models),
+            Err(_) => {}
+        }
+        Some(taken)
     }
 
     /// Every failure the app hears about is sorted here, once, so that no call site has to guess.
@@ -7640,6 +7995,17 @@ impl AppState {
         if self.reachability.fail(what, detail) {
             cx.notify();
         }
+        // One fault for the whole spell out of reach, its text the latest failure's, behind the
+        // reconnect banner's ⚠; `came_back` resolves it.
+        let said = match what {
+            Unreachable::Server => "The server is not answering.",
+            Unreachable::Gateway => "The model gateway is not answering.",
+        };
+        self.raise_fault(
+            crate::faults::Place::Server,
+            said,
+            crate::faults::FaultInput::local(detail),
+        );
         self.start_reconnect(cx);
     }
 
@@ -7664,6 +8030,7 @@ impl AppState {
     /// asking for it asks for the catalogue too — so the model picker's list fills again without
     /// anybody going and looking at it.
     fn came_back(&mut self, cx: &mut Context<Self>) {
+        self.resolve_faults(crate::faults::Place::Server);
         self.reconnecting = false;
         self.reconnect_epoch += 1;
         if self.is_signed_in() {
@@ -7744,6 +8111,11 @@ impl AppState {
     /// The two lines the reconnecting indicator shows, or `None` while everything answers.
     pub fn reachability_indicator(&self) -> Option<(String, String)> {
         self.reachability.indicator()
+    }
+
+    /// What the reconnecting indicator's ⚠ badge holds: the failure's own words.
+    pub fn reachability_trouble(&self) -> Option<String> {
+        self.reachability.trouble()
     }
 
     /// Which machine the app cannot reach, if it is failing to reach one.
@@ -7857,7 +8229,9 @@ impl AppState {
                 .coworker_usage(&coworker_id, crate::opengrok::UsageWindow::Month)
                 .await;
             let _ = this.update(cx, |state, cx| {
-                if state.settle_coworker_usage(generation, coworker_id, result) {
+                let settled = state.settle_coworker_usage(generation, coworker_id, result);
+
+                if settled {
                     cx.notify();
                 }
             });
@@ -7880,8 +8254,20 @@ impl AppState {
             return false;
         }
         let report = match result {
-            Ok(usage) => UsageReport::Read(usage),
-            Err(error) => UsageReport::Unavailable(usage_unavailable(&error)),
+            Ok(usage) => {
+                self.clear_trouble(USAGE_TROUBLE);
+                UsageReport::Read(usage)
+            }
+            Err(error) => {
+                let trouble = usage_unavailable(&error);
+                self.keep_trouble(USAGE_TROUBLE, &trouble);
+                let held = self
+                    .coworker_usage
+                    .as_ref()
+                    .filter(|(owner, _)| *owner == coworker_id)
+                    .map(|(_, report)| report);
+                after_failed_read(held, trouble)
+            }
         };
         self.coworker_usage = Some((coworker_id, report));
         true
@@ -7917,8 +8303,26 @@ impl AppState {
                     return;
                 }
                 let list = match result {
-                    Ok(tools) => ToolList::Listed(tools),
-                    Err(error) => ToolList::Unavailable(tools_unavailable(&error)),
+                    Ok(tools) => {
+                        state.clear_trouble(TOOLS_TROUBLE);
+                        ToolList::Listed(tools)
+                    }
+                    Err(error) => {
+                        let trouble = tools_unavailable(&error);
+                        state.note_trouble(TOOLS_TROUBLE, &trouble, cx);
+                        // A fault keeps the tools last listed for this Bot, or says "—"; its
+                        // ⚠ is the whole of what is said about it.
+                        let held = state
+                            .coworker_tools
+                            .as_ref()
+                            .filter(|(owner, _)| *owner == coworker_id)
+                            .map(|(_, list)| list.clone());
+                        match (trouble.detail.is_some(), held) {
+                            (true, Some(ToolList::Listed(tools))) => ToolList::Listed(tools),
+                            (true, _) => ToolList::Unavailable(Trouble::plain(NOTHING_READ)),
+                            (false, _) => ToolList::Unavailable(trouble),
+                        }
+                    }
                 };
                 state.coworker_tools = Some((coworker_id, list));
                 cx.notify();
@@ -8225,7 +8629,9 @@ impl AppState {
         cx.spawn(async move |this, cx| {
             let result = client.coworker_skills(&coworker_id).await;
             let _ = this.update(cx, |state, cx| {
-                if state.settle_coworker_skills(generation, coworker_id, result) {
+                let settled = state.settle_coworker_skills(generation, coworker_id, result);
+
+                if settled {
                     cx.notify();
                 }
             });
@@ -8285,6 +8691,7 @@ impl AppState {
         }
         let skills = match result {
             Ok(skills) => {
+                self.clear_trouble(BOT_SKILLS_TROUBLE);
                 // A skill the server does not list is not attached.
                 let took = |skill_id: &str, attached: bool| {
                     skills
@@ -8306,7 +8713,14 @@ impl AppState {
                 }
                 BotSkills::Read(skills.into())
             }
-            Err(error) => BotSkills::Unavailable(skills_unavailable(&error)),
+            Err(error) => {
+                let said = skills_unavailable(&error);
+                if said == NOTHING_READ {
+                    let input = crate::faults::FaultInput::from_error(&error);
+                    self.raise_fault(BOT_SKILLS_TROUBLE, COULD_NOT_READ_BOT_SKILLS, input);
+                }
+                BotSkills::Unavailable(said)
+            }
         };
         self.coworker_skills = Some((coworker_id, skills));
         true
@@ -8522,6 +8936,7 @@ impl AppState {
             return;
         };
         self.monitor_generation += 1;
+        self.dismiss_popovers(cx);
         self.monitor_modal = Some(MonitorModal::new(coworker_id, kind));
         match kind {
             MonitorKind::Tools => {
@@ -8529,16 +8944,17 @@ impl AppState {
                 self.refresh_coworker_tools(cx);
                 self.refresh_coworker_ceiling(cx);
             }
-            MonitorKind::Plugins => {
-                self.agent_skills_open = true;
-                self.refresh_connections(cx);
-                self.refresh_coworker_skills(cx);
-            }
+            // Plugins is the marketplace (#184), wherever it is opened from.
+            MonitorKind::Plugins => return self.open_plugin_market(cx),
         }
+        self.record_window_nav();
         cx.notify();
     }
 
     pub fn close_monitor_modal(&mut self, cx: &mut Context<Self>) {
+        if !self.nav.applying {
+            self.nav.rewind_window();
+        }
         self.monitor_modal = None;
         self.monitor_generation += 1;
         cx.notify();
@@ -8565,6 +8981,7 @@ impl AppState {
         modal.selected = plugin;
         modal.confirming = false;
         modal.error = None;
+        modal.renaming = None;
         cx.notify();
     }
 
@@ -8580,6 +8997,134 @@ impl AppState {
         cx.notify();
     }
 
+    /// One of the accounts a plugin's detail lists: one of the person's own, of the service the
+    /// detail is open on. `None` for any other, and while no such detail is open.
+    fn account_in_detail(&self, connection_id: &str) -> Option<&crate::opengrok::ConnectionView> {
+        use crate::components::monitor_modal::{MonitorKind, PluginSelection};
+        let modal = self
+            .monitor_modal
+            .as_ref()
+            .filter(|modal| modal.kind == MonitorKind::Plugins)?;
+        let own = self.connections.own_rows();
+        let service = match modal.selected.as_ref()? {
+            PluginSelection::Connection(open) => {
+                own.iter().find(|row| &row.id == open)?.connector.clone()
+            }
+            PluginSelection::Service(connector) => connector.clone(),
+            PluginSelection::Tool(_)
+            | PluginSelection::NewSkill
+            | PluginSelection::PluginSkill(..)
+            | PluginSelection::Login(_) => return None,
+            // An installed plugin's detail lists the pasted accounts the install holds, and only
+            // those: two installs naming one service each have their own.
+            PluginSelection::Plugin(name) => {
+                let install = self.plugin_market.installation(name)?;
+                let bound = install
+                    .accounts
+                    .iter()
+                    .find(|a| a.connection_id == connection_id)?;
+                bound.connector.clone()
+            }
+            PluginSelection::Skill(_) => return None,
+        };
+        own.into_iter()
+            .find(|row| row.id == connection_id && row.connector == service)
+    }
+
+    /// Rename, on an account in a plugin's detail: its label becomes a field holding it, where
+    /// Enter saves and Escape puts the label back. One account at a time, only one with nothing
+    /// with the server.
+    pub fn start_account_rename(&mut self, connection_id: String, cx: &mut Context<Self>) {
+        // A sign-in still waiting is renamed through the same field: the account takes the label
+        // when it connects.
+        if let Some(label) = self
+            .attempt_in_detail(&connection_id)
+            .map(|a| a.label.clone())
+        {
+            if let Some(modal) = self.monitor_modal.as_mut().filter(|modal| !modal.removing) {
+                modal.renaming = Some((connection_id, label));
+                cx.notify();
+            }
+            return;
+        }
+        let Some(label) = self
+            .account_in_detail(&connection_id)
+            .filter(|row| !self.connections.is_changing(&row.id))
+            .map(|row| self.connections.shown_label(row))
+        else {
+            return;
+        };
+        let Some(modal) = self.monitor_modal.as_mut().filter(|modal| !modal.removing) else {
+            return;
+        };
+        modal.renaming = Some((connection_id, label));
+        cx.notify();
+    }
+
+    /// What the open rename field holds, as typed.
+    pub fn set_account_rename(&mut self, text: String, cx: &mut Context<Self>) {
+        if let Some((_, typed)) = self
+            .monitor_modal
+            .as_mut()
+            .and_then(|modal| modal.renaming.as_mut())
+            && *typed != text
+        {
+            *typed = text;
+            cx.notify();
+        }
+    }
+
+    /// Escape, in an account's rename field: the field closes, and nothing is sent.
+    pub fn cancel_account_rename(&mut self, cx: &mut Context<Self>) {
+        if let Some(modal) = self.monitor_modal.as_mut()
+            && modal.renaming.take().is_some()
+        {
+            cx.notify();
+        }
+    }
+
+    /// Enter, in an account's rename field: the label typed goes to the server
+    /// (opengrok-server #359), unless it is the label the account has already. The field closes
+    /// either way, and while the server has it the row shows the label asked for
+    /// ([`AccountConnections::shown_label`]); a refusal is said under the row in the server's
+    /// words, an empty label or one past 80 characters among them, and the server's label shows
+    /// again.
+    pub fn save_account_rename(&mut self, cx: &mut Context<Self>) {
+        let Some((connection_id, typed)) = self
+            .monitor_modal
+            .as_mut()
+            .and_then(|modal| modal.renaming.take())
+        else {
+            return;
+        };
+        cx.notify();
+        let label = typed.trim().to_string();
+        if self.attempt_in_detail(&connection_id).is_some() {
+            self.save_attempt_rename(connection_id, label, cx);
+            return;
+        }
+        let Some(row) = self.account_in_detail(&connection_id) else {
+            return;
+        };
+        if row.label == label {
+            return;
+        }
+        self.change_connection(connection_id, ConnectionChange::Rename(label), cx);
+    }
+
+    /// A sign-in still waiting, of the service a detail is open on. `None` for any other.
+    fn attempt_in_detail(&self, attempt_id: &str) -> Option<&crate::opengrok::ConnectionAttempt> {
+        use crate::components::monitor_modal::PluginSelection;
+        let modal = self.monitor_modal.as_ref()?;
+        let Some(PluginSelection::Service(connector)) = &modal.selected else {
+            return None;
+        };
+        self.plugin_market
+            .attempts_for(connector)
+            .into_iter()
+            .find(|attempt| attempt.id == attempt_id)
+    }
+
     /// Removing is account-wide, rather than detaching from this Bot. The confirmation says so.
     pub fn remove_monitor_plugin(&mut self, cx: &mut Context<Self>) {
         use crate::components::monitor_modal::{PluginSelection, plugin_exists};
@@ -8587,6 +9132,16 @@ impl AppState {
             return;
         };
         if !modal.confirming || modal.removing {
+            return;
+        }
+        // One account of a service's, asked from its row: disconnected, and its Bots ask again.
+        if let Some(id) = modal.removal.clone() {
+            if self.account_in_detail(&id).is_some() {
+                let modal = self.monitor_modal.as_mut().unwrap();
+                modal.confirming = false;
+                modal.removal = None;
+                self.disconnect_connection(id, cx);
+            }
             return;
         }
         let Some(plugin) = modal.selected.clone() else {
@@ -8697,7 +9252,9 @@ impl AppState {
         cx.spawn(async move |this, cx| {
             let result = client.coworker_usage(&coworker_id, window).await;
             let _ = this.update(cx, |state, cx| {
-                if state.settle_usage_modal(generation, coworker_id, window, result) {
+                let settled = state.settle_usage_modal(generation, coworker_id, window, result);
+
+                if settled {
                     cx.notify();
                 }
             });
@@ -8724,10 +9281,21 @@ impl AppState {
         {
             return false;
         }
-        modal.report = match result {
-            Ok(usage) => UsageReport::Read(usage),
-            Err(error) => UsageReport::Unavailable(usage_unavailable(&error)),
+        let report = match result {
+            Ok(usage) => {
+                self.clear_trouble(USAGE_TROUBLE);
+                UsageReport::Read(usage)
+            }
+            Err(error) => {
+                let trouble = usage_unavailable(&error);
+                self.keep_trouble(USAGE_TROUBLE, &trouble);
+                let held = self.usage_modal.as_ref().map(|modal| &modal.report);
+                after_failed_read(held, trouble)
+            }
         };
+        if let Some(modal) = self.usage_modal.as_mut() {
+            modal.report = report;
+        }
         true
     }
 
@@ -9776,12 +10344,222 @@ impl AppState {
         }
     }
 
-    /// Ask the server for the person's connections and for the services it can connect: each
-    /// time Settings → Connections or a bot's settings open, and on Refresh. What was listed
-    /// stays on screen while it is asked again.
+    /// Ask the server for the person's connections, for the services it can connect and for
+    /// which account each Bot uses: each time Settings → Connections, a bot's settings or the
+    /// monitor's Plugins open, and on Refresh. What was listed stays on screen while it is asked
+    /// again.
     pub fn refresh_connections(&mut self, cx: &mut Context<Self>) {
         self.read_connections(cx);
         self.read_connectors(cx);
+        self.read_pins(cx);
+    }
+
+    /// Ask the server which account each Bot uses for each service (opengrok-server #359): with
+    /// the connections, and again after every pick and every Disconnect, since the server drops
+    /// the pins that named a connection it disconnects.
+    fn read_pins(&mut self, cx: &mut Context<Self>) {
+        let Some(client) = self.opengrok.clone() else {
+            return;
+        };
+        let generation = self.begin_pins_read();
+        cx.spawn(async move |this, cx| {
+            let listed = client.list_connection_pins().await;
+            let _ = this.update(cx, |state, cx| {
+                if state.settle_pins(generation, listed) {
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Begin a read of the pins, which overtakes every read begun before it. What was listed
+    /// stays on screen while it is asked again.
+    fn begin_pins_read(&mut self) -> u64 {
+        if !matches!(self.connections.pins, Some(PinList::Listed(_))) {
+            self.connections.pins = Some(PinList::Loading);
+        }
+        self.pins_generation += 1;
+        self.pins_generation
+    }
+
+    /// Put a read of the pins on screen, unless a newer read has begun or the person has signed
+    /// out since. `false` when it was dropped and nothing was touched.
+    fn settle_pins(
+        &mut self,
+        generation: u64,
+        listed: Result<Vec<crate::opengrok::ConnectionPin>, OpenGrokError>,
+    ) -> bool {
+        if self.pins_generation != generation {
+            return false;
+        }
+        self.connections.pins = Some(match listed {
+            Ok(pins) => PinList::Listed(pins),
+            Err(error) => PinList::Unavailable(rules_refusal(
+                "Which account each Bot uses could not be read",
+                &error,
+            )),
+        });
+        true
+    }
+
+    /// A pick on a plugin's picker: the open Bot uses this account for the service, or, for
+    /// `None`, Ask each time (opengrok-server #359). The picker shows what was asked while the
+    /// server has it and the server's word once it answers; a refusal puts back what the server
+    /// says, with its sentence under the picker. The pins are read again whatever it said.
+    pub fn pick_account(
+        &mut self,
+        connector: String,
+        connection_id: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(coworker_id) = self.active_coworker_id.clone() else {
+            return;
+        };
+        self.pick_account_for(coworker_id, connector, connection_id, cx);
+    }
+
+    /// The same pick for any of the person's Bots: what a plugin account's Bots page switches,
+    /// one Bot at a time (7 Oct 2026).
+    pub fn pick_account_for(
+        &mut self,
+        coworker_id: String,
+        connector: String,
+        connection_id: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(client) = self.opengrok.clone() else {
+            return;
+        };
+        if !self.begin_pick(&coworker_id, &connector, connection_id.clone()) {
+            return;
+        }
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let answer = match &connection_id {
+                Some(id) => client.pin_connection(&coworker_id, &connector, id).await,
+                None => client
+                    .unpin_connection(&coworker_id, &connector)
+                    .await
+                    .map(|()| None),
+            };
+            let _ = this.update(cx, |state, cx| {
+                if state.settle_pick(&coworker_id, &connector, &connection_id, answer) {
+                    state.read_pins(cx);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Mark a pick as with the server. `false` while the pins are not read, while another pick
+    /// for this Bot and service is out, for an account that is not one of the person's own of
+    /// this service, and for what the picker shows already, which would change nothing.
+    fn begin_pick(&mut self, coworker_id: &str, connector: &str, pick: Option<String>) -> bool {
+        let connections = &mut self.connections;
+        let shown = connections.shown_pick(coworker_id, connector);
+        let unknown_account = pick.as_ref().is_some_and(|id| {
+            !connections
+                .own_rows()
+                .iter()
+                .any(|row| &row.id == id && row.connector == connector)
+        });
+        if connections.is_picking(coworker_id, connector)
+            || shown.is_none_or(|shown| shown == pick)
+            || unknown_account
+        {
+            return false;
+        }
+        let key = (coworker_id.to_string(), connector.to_string());
+        // Picked again, the line about the last pick goes.
+        connections.not_picked.remove(&key);
+        connections.picking.insert(key, pick);
+        true
+    }
+
+    /// What the server said to a pick. `false` when it is not the pick that was waiting (the
+    /// person signed out meanwhile), and nothing was touched. Taken, the pins hold it as the
+    /// server wrote it, or as asked when the answer had no pin in it, until the read that
+    /// follows says what they are; refused, the server's words go under the picker, and the
+    /// picker shows what the server last said.
+    fn settle_pick(
+        &mut self,
+        coworker_id: &str,
+        connector: &str,
+        asked: &Option<String>,
+        answer: Result<Option<crate::opengrok::ConnectionPin>, OpenGrokError>,
+    ) -> bool {
+        let key = (coworker_id.to_string(), connector.to_string());
+        if self.connections.picking.get(&key) != Some(asked) {
+            return false;
+        }
+        let connections = &mut self.connections;
+        connections.picking.remove(&key);
+        match answer {
+            Ok(pin) => {
+                if let Some(PinList::Listed(pins)) = &mut connections.pins {
+                    pins.retain(|kept| {
+                        !(kept.coworker_id == coworker_id && kept.connector == connector)
+                    });
+                    let pin = pin
+                        .filter(|pin| pin.coworker_id == coworker_id && pin.connector == connector)
+                        .or_else(|| {
+                            asked
+                                .clone()
+                                .map(|connection_id| crate::opengrok::ConnectionPin {
+                                    coworker_id: coworker_id.to_string(),
+                                    connector: connector.to_string(),
+                                    connection_id,
+                                })
+                        });
+                    pins.extend(pin);
+                }
+            }
+            Err(error) => {
+                connections
+                    .not_picked
+                    .insert(key, rules_refusal(NOT_CHANGED, &error));
+            }
+        }
+        true
+    }
+
+    /// Reconnect, on an account in a plugin's detail: ask the server for that account's sign-in
+    /// page and open it in the person's browser, as Connect does, so the same account is signed
+    /// in again rather than another added (opengrok-server #359). Only an account signed in to
+    /// through such a page has one to go back to ([`crate::opengrok::ConnectionKind::Oauth`]),
+    /// and one sign-in page is asked for at a time.
+    pub fn reconnect_connection(&mut self, connection_id: String, cx: &mut Context<Self>) {
+        let Some(connector) = self
+            .connections
+            .own_rows()
+            .into_iter()
+            .find(|row| {
+                row.id == connection_id
+                    && row.kind == crate::opengrok::ConnectionKind::Oauth
+                    && !self.connections.is_changing(&row.id)
+            })
+            .map(|row| row.connector.clone())
+        else {
+            return;
+        };
+        let Some((client, ask)) = self.begin_connect(&connector) else {
+            return;
+        };
+        self.connections.reconnecting = Some(connection_id.clone());
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let link = client.reconnect_link(&connection_id, None).await;
+            let _ = this.update(cx, |state, cx| {
+                if let Some(url) = state.settle_connect_link(ask, &connector, link, Instant::now())
+                {
+                    cx.open_url(&url);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn read_connections(&mut self, cx: &mut Context<Self>) {
@@ -9860,6 +10638,14 @@ impl AppState {
                 // person's takes its lines along.
                 connections.not_disconnected.retain(|id, _| own(id));
                 connections.not_changed.retain(|(id, _), _| own(id));
+                connections.not_renamed.retain(|id, _| own(id));
+                if connections
+                    .reconnect_refused
+                    .as_ref()
+                    .is_some_and(|(id, _)| !own(id))
+                {
+                    connections.reconnect_refused = None;
+                }
                 // A change the server took after all, its answer lost, is a refusal no longer: the
                 // read shows the loan as it was asked.
                 let asked = &connections.not_changed_asked;
@@ -9942,6 +10728,22 @@ impl AppState {
         self.change_connection(connection_id, change, cx);
     }
 
+    /// A row of an account's Bots list: that Bot may use the account, or no longer.
+    pub fn set_connection_lent_to(
+        &mut self,
+        connection_id: String,
+        coworker_id: String,
+        lent: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let change = if lent {
+            ConnectionChange::Lend(coworker_id)
+        } else {
+            ConnectionChange::Revoke(coworker_id)
+        };
+        self.change_connection(connection_id, change, cx);
+    }
+
     /// Settings → Connections' Disconnect. The row stays, dimmed, until the server has said the
     /// connection is gone, and every loan goes with it.
     pub fn disconnect_connection(&mut self, connection_id: String, cx: &mut Context<Self>) {
@@ -9990,11 +10792,19 @@ impl AppState {
                     .disconnect_connection(&connection_id)
                     .await
                     .map(|()| None),
+                ConnectionChange::Rename(label) => {
+                    client.rename_connection(&connection_id, label).await
+                }
             };
             let _ = this.update(cx, |state, cx| {
                 if let Some(read) = state.settle_connection_change(&connection_id, &change, answer)
                 {
                     Self::send_connections_read(read, cx);
+                    // The server drops every pin that named a connection it disconnects
+                    // (opengrok-server #359), and the pins are read again to say so.
+                    if change == ConnectionChange::Disconnect {
+                        state.read_pins(cx);
+                    }
                 }
                 cx.notify();
             });
@@ -10025,6 +10835,9 @@ impl AppState {
                     .not_changed
                     .remove(&(connection_id.to_string(), coworker.clone()));
             }
+            ConnectionChange::Rename(_) => {
+                connections.not_renamed.remove(connection_id);
+            }
         }
         connections
             .changing
@@ -10036,13 +10849,14 @@ impl AppState {
     /// said, for the caller to send. `None` when the change is not the one the connection was
     /// waiting on (the person signed out meanwhile), and nothing was touched.
     ///
-    /// A lend's or a revoke's row goes into the list as the server wrote it. A 2xx with no row
-    /// in it is the change taken all the same: it is never shown as a refusal, and never taken
-    /// for the connection gone, and the read says what the row is now. A Disconnect the server
-    /// took takes the row, and so does a 404 or a 409 to one, which is the server saying the
-    /// connection is already gone: what the person asked for. Anything else the server refused
-    /// is said where it was asked, in the server's words: under the row for a Disconnect, and
-    /// beside that Bot's switch for a lend or a revoke ([`NOT_CHANGED`]).
+    /// A lend's, a revoke's or a rename's row goes into the list as the server wrote it. A 2xx
+    /// with no row in it is the change taken all the same: it is never shown as a refusal, and
+    /// never taken for the connection gone, and the read says what the row is now. A Disconnect
+    /// the server took takes the row, and so does a 404 or a 409 to one, which is the server
+    /// saying the connection is already gone: what the person asked for. Anything else the
+    /// server refused is said where it was asked, in the server's words: under the row for a
+    /// Disconnect or a rename, and beside that Bot's switch for a lend or a revoke
+    /// ([`NOT_CHANGED`]).
     ///
     /// The read overtakes any read still out, which may have been taken before the change, and
     /// is what the list shows from then on. Without it, a list left asking by a Refresh that was
@@ -10082,13 +10896,21 @@ impl AppState {
                     .not_changed
                     .insert(key, rules_refusal(NOT_CHANGED, &error));
             }
+            (ConnectionChange::Rename(_), Err(error)) => {
+                connections.not_renamed.insert(
+                    connection_id.to_string(),
+                    rules_refusal("Not renamed", &error),
+                );
+            }
         }
         self.begin_connections_read()
     }
 
-    /// Settings → Connections' Connect: ask the server for the service's sign-in page and open it
-    /// in the person's browser (#269). The browser comes back to the server, never to the app, so
-    /// the list is read again when the person comes back to the window, or on Refresh.
+    /// Settings → Connections' Connect, and Add another account in a plugin's detail: ask the
+    /// server for the service's sign-in page and open it in the person's browser (#269). Since
+    /// opengrok-server #359 the sign-in always adds an account beside any the person has. The
+    /// browser comes back to the server, never to the app, so the list is read again when the
+    /// person comes back to the window, or on Refresh.
     pub fn connect_service(&mut self, connector: String, cx: &mut Context<Self>) {
         let Some((client, ask)) = self.begin_connect(&connector) else {
             return;
@@ -10101,6 +10923,8 @@ impl AppState {
                 {
                     cx.open_url(&url);
                 }
+                // The server started a sign-in it now lists as waiting (#359): show it.
+                state.reread_market_accounts(cx);
                 cx.notify();
             });
         })
@@ -10118,17 +10942,28 @@ impl AppState {
         self.connect_asks += 1;
         self.connections.opening = Some(connector.to_string());
         self.connections.connect_refused = None;
+        self.connections.reconnect_refused = None;
+        self.connections.reconnecting = None;
         Some((client, self.connect_asks))
     }
 
+    /// Whether a page that asks for sign-in pages is on screen for the person: the Plugins
+    /// marketplace for the open Bot, whose details add and reconnect accounts.
+    fn sign_in_on_screen(&self) -> bool {
+        self.monitor_modal.as_ref().is_some_and(|modal| {
+            modal.kind == crate::components::monitor_modal::MonitorKind::Plugins
+                && self.active_coworker_id.as_deref() == Some(modal.coworker_id.as_str())
+        })
+    }
+
     /// What the server said when asked for a sign-in page: the page to open, or why there is
-    /// none, which is kept to show beside the service.
+    /// none, which is kept to show beside the service, or beside the account for a Reconnect.
     ///
-    /// Only for the Connect this ask was, and only while Settings → Connections is on screen.
-    /// The ask's number tells it from any other, among them one for the same service by an
-    /// account that has signed out since; and a browser opening for a page the person has left
-    /// is a sign-in they did not ask for now. `None` for either, with nothing kept, and whenever
-    /// there is nothing to open.
+    /// Only for the Connect or Reconnect this ask was, and only while a page that asks for them
+    /// is on screen ([`Self::sign_in_on_screen`]). The ask's number tells it from any other,
+    /// among them one for the same service by an account that has signed out since; and a
+    /// browser opening for a page the person has left is a sign-in they did not ask for now.
+    /// `None` for either, with nothing kept, and whenever there is nothing to open.
     fn settle_connect_link(
         &mut self,
         ask: u64,
@@ -10140,7 +10975,8 @@ impl AppState {
             return None;
         }
         self.connections.opening = None;
-        if !(self.is_app_settings_open && self.app_settings_tab == AppSettingsTab::Connections) {
+        let reconnecting = self.connections.reconnecting.take();
+        if !self.sign_in_on_screen() {
             return None;
         }
         match link {
@@ -10152,10 +10988,20 @@ impl AppState {
             }
             Err(error) => {
                 let label = self.connections.connector_label(connector);
-                self.connections.connect_refused = Some((
-                    connector.to_string(),
-                    rules_refusal(&format!("{label} could not be connected"), &error),
-                ));
+                match reconnecting {
+                    Some(account) => {
+                        self.connections.reconnect_refused = Some((
+                            account,
+                            rules_refusal(&format!("{label} could not be reconnected"), &error),
+                        ));
+                    }
+                    None => {
+                        self.connections.connect_refused = Some((
+                            connector.to_string(),
+                            rules_refusal(&format!("{label} could not be connected"), &error),
+                        ));
+                    }
+                }
                 None
             }
         }
@@ -10167,6 +11013,8 @@ impl AppState {
     /// connections list is on screen, so someone who signed in and came back later than the wait
     /// still finds it without pressing Refresh.
     pub fn window_activated(&mut self, cx: &mut Context<Self>) {
+        // A sign-in finishes in the browser: what still needs auth is asked again on return.
+        self.reread_market_accounts(cx);
         let reads = self.reads_on_activation(Instant::now());
         if reads.connections {
             self.read_connections(cx);
@@ -10212,13 +11060,10 @@ impl AppState {
     }
 
     /// Whether coming back to the window asks for the person's connections again: a sign-in is
-    /// still waited on, or Settings → Connections or a Bot's settings (with its Connections
-    /// card) is showing.
+    /// still waited on, or Plugins or a Bot's settings (with its Connections card) is showing.
     fn rereads_connections_on_activation(&mut self, now: Instant) -> bool {
         let waiting = self.connections.still_waiting(now);
-        let showing = (self.is_app_settings_open
-            && self.app_settings_tab == AppSettingsTab::Connections)
-            || self.right_pane == RightPane::Settings
+        let showing = self.right_pane == RightPane::Settings
             || self.monitor_modal.as_ref().is_some_and(|modal| {
                 modal.kind == crate::components::monitor_modal::MonitorKind::Plugins
             });
@@ -10263,6 +11108,655 @@ impl AppState {
         self.computer_view = ComputerView::Overview;
         self.record_nav();
         cx.notify();
+    }
+
+    /// Keep `trouble` as a fault at `place` when it has a failure behind its words, and give back
+    /// the words. Words written for a person (a refusal) are no fault and leave the badge alone.
+    #[track_caller]
+    pub(crate) fn keep_trouble(
+        &mut self,
+        place: crate::faults::Place,
+        trouble: &Trouble,
+    ) -> String {
+        if let Some(input) = &trouble.detail {
+            self.raise_fault(place, &trouble.said, input.clone());
+        }
+        trouble.said.clone()
+    }
+
+    /// [`Self::keep_trouble`], redrawing.
+    #[track_caller]
+    pub(crate) fn note_trouble(
+        &mut self,
+        place: crate::faults::Place,
+        trouble: &Trouble,
+        cx: &mut Context<Self>,
+    ) -> String {
+        let said = self.keep_trouble(place, trouble);
+        cx.notify();
+        said
+    }
+
+    /// What a page's error line says after `trouble`: a refusal's own words, or nothing for a
+    /// fault, which is raised at `place` and shown only as the page title's ⚠.
+    #[track_caller]
+    pub(crate) fn shown_after(
+        &mut self,
+        place: crate::faults::Place,
+        trouble: &Trouble,
+    ) -> Option<String> {
+        match &trouble.detail {
+            Some(input) => {
+                self.raise_fault(place, &trouble.said, input.clone());
+                None
+            }
+            None => Some(trouble.said.clone()),
+        }
+    }
+
+    /// A read at `place` worked: its faults went away on their own.
+    pub(crate) fn clear_trouble(&mut self, place: crate::faults::Place) {
+        self.resolve_faults(place);
+    }
+
+    /// The Bot a fault at `place` belongs to: the open one for a Bot's own card, else none.
+    fn fault_bot(&self, place: crate::faults::Place) -> Option<String> {
+        place
+            .per_bot()
+            .then(|| self.active_coworker_id.clone())
+            .flatten()
+    }
+
+    /// Keep a failure at `place` as a fault notice, unread, raised at the caller's line. The same
+    /// failure again (same place, Bot, request and text) is the same notice, counted again and
+    /// unread again, so a read that fails every minute is one fault ×60.
+    #[track_caller]
+    pub(crate) fn raise_fault(
+        &mut self,
+        place: crate::faults::Place,
+        said: &str,
+        input: crate::faults::FaultInput,
+    ) {
+        let bot = self.fault_bot(place);
+        let now =
+            crate::notifications::Notice::new(None, "", "", std::panic::Location::caller()).at_ms;
+        // The server out of reach is one fault for as long as it lasts, whichever request found
+        // it out; anywhere else the same failure is the same place, Bot, request and text.
+        let one_spell = place == crate::faults::Place::Server;
+        let same = self.notices.iter_mut().find(|notice| {
+            notice.bot == bot
+                && (one_spell || notice.raw.as_deref() == Some(input.raw.as_str()))
+                && notice.fault.as_ref().is_some_and(|fault| {
+                    fault.place == place
+                        && !fault.resolved
+                        && (one_spell || fault.endpoint == input.endpoint)
+                })
+        });
+        let notice = match same {
+            Some(notice) => {
+                if let Some(fault) = notice.fault.as_mut() {
+                    fault.count += 1;
+                    fault.last_ms = now;
+                    fault.status = input.status;
+                }
+                notice.raw = Some(input.raw);
+                notice.read = false;
+                notice.clone()
+            }
+            None => {
+                let mut notice = crate::notifications::Notice::new(
+                    bot,
+                    place.label(),
+                    said,
+                    std::panic::Location::caller(),
+                );
+                notice.raw = Some(input.raw);
+                notice.fault = Some(crate::notifications::FaultFacts {
+                    place,
+                    endpoint: input.endpoint,
+                    status: input.status,
+                    count: 1,
+                    last_ms: now,
+                    resolved: false,
+                });
+                self.notices.insert(0, notice.clone());
+                self.notices.truncate(2000);
+                notice
+            }
+        };
+        self.persist_notice(notice);
+    }
+
+    /// Every open fault at `place` for the Bot it belongs to is resolved: read, and kept in the
+    /// notifications as having gone away on its own.
+    pub(crate) fn resolve_faults(&mut self, place: crate::faults::Place) {
+        let bot = self.fault_bot(place);
+        let mut changed = Vec::new();
+        for notice in &mut self.notices {
+            let Some(fault) = notice.fault.as_mut() else {
+                continue;
+            };
+            if fault.place == place && notice.bot == bot && !fault.resolved {
+                fault.resolved = true;
+                notice.read = true;
+                changed.push(notice.clone());
+            }
+        }
+        for notice in changed {
+            self.persist_notice(notice);
+        }
+    }
+
+    /// The unread faults at `place` for the Bot it belongs to, newest first: what the badge and
+    /// the fault window's pages are.
+    pub fn faults_at(&self, place: crate::faults::Place) -> Vec<&crate::notifications::Notice> {
+        let bot = self.fault_bot(place);
+        let mut open: Vec<_> = self
+            .notices
+            .iter()
+            .filter(|notice| {
+                !notice.read
+                    && notice.bot == bot
+                    && notice
+                        .fault
+                        .as_ref()
+                        .is_some_and(|fault| fault.place == place)
+            })
+            .collect();
+        open.sort_by_key(|notice| std::cmp::Reverse(notice.last_ms()));
+        open
+    }
+
+    /// The newest unread fault at `place`: the badge shows while there is one.
+    pub fn open_fault(&self, place: crate::faults::Place) -> Option<&crate::notifications::Notice> {
+        self.faults_at(place).into_iter().next()
+    }
+
+    /// A fault notice's 🎯: the Bot it belongs to, and the card or page it is on, opened as if
+    /// the person had gone there, and ringed for a moment.
+    pub fn reveal_fault(&mut self, notice_id: &str, cx: &mut Context<Self>) {
+        use crate::components::monitor_modal::MonitorKind;
+        use crate::faults::Place;
+        let Some(notice) = self.notices.iter().find(|n| n.id == notice_id) else {
+            return;
+        };
+        let Some(place) = notice.fault.as_ref().map(|fault| fault.place) else {
+            return;
+        };
+        if let Some(bot) = notice.bot.clone()
+            && self.active_coworker_id.as_deref() != Some(bot.as_str())
+        {
+            self.select_coworker(bot, cx);
+        }
+        match place {
+            Place::Usage | Place::BotSkills => self.set_right_pane(RightPane::Settings, cx),
+            Place::Models => {
+                self.set_right_pane(RightPane::Settings, cx);
+                self.set_picker_open(PickerFor::Bot, true, cx);
+            }
+            Place::Tools => self.open_monitor_modal(MonitorKind::Tools, cx),
+            Place::Skills | Place::Skill => self.open_monitor_modal(MonitorKind::Plugins, cx),
+            Place::Recipes | Place::Recipe => self.open_recipes(cx),
+            Place::Logins => self.open_app_settings(AppSettingsTab::Logins, cx),
+            Place::Server => {}
+        }
+        self.focus_place(place, cx);
+        self.record_nav();
+        cx.notify();
+    }
+
+    /// How long a place stays ringed after a 🎯.
+    const FOCUS_FOR: std::time::Duration = std::time::Duration::from_millis(2400);
+
+    /// Ring `place` for a moment: its card or page draws an amber border while it is the focus.
+    pub fn focus_place(&mut self, place: crate::faults::Place, cx: &mut Context<Self>) {
+        self.fault_focus = Some(place);
+        self.fault_focus_generation += 1;
+        let generation = self.fault_focus_generation;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(Self::FOCUS_FOR).await;
+            let _ = this.update(cx, |state, cx| {
+                if state.fault_focus_generation == generation {
+                    state.fault_focus = None;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// Whether `place` is ringed right now.
+    pub fn is_focused(&self, place: crate::faults::Place) -> bool {
+        self.fault_focus == Some(place)
+    }
+
+    /// Open the fault window on `place`'s newest fault.
+    pub fn open_fault_window(&mut self, place: crate::faults::Place, cx: &mut Context<Self>) {
+        self.fault_window = Some((place, 0));
+        cx.notify();
+    }
+
+    /// "Copy all": every fact of the fault the window shows, then its whole text.
+    pub fn copy_fault_window(&mut self, cx: &mut Context<Self>) {
+        if let Some((_, _, _, notice)) = self.fault_in_window() {
+            let text = crate::components::faults::copy_block(self, notice);
+            cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(text));
+        }
+    }
+
+    pub fn close_fault_window(&mut self, cx: &mut Context<Self>) {
+        self.fault_window = None;
+        cx.notify();
+    }
+
+    /// Page through the open faults: `step` is −1 (newer) or +1 (older).
+    pub fn page_fault_window(&mut self, step: isize, cx: &mut Context<Self>) {
+        if let Some((place, at)) = self.fault_window {
+            let count = self.faults_at(place).len();
+            let next = (at as isize + step).clamp(0, count.saturating_sub(1) as isize) as usize;
+            self.fault_window = Some((place, next));
+            cx.notify();
+        }
+    }
+
+    /// The fault the window shows, while it is open and the place still has one.
+    pub fn fault_in_window(
+        &self,
+    ) -> Option<(
+        crate::faults::Place,
+        usize,
+        usize,
+        &crate::notifications::Notice,
+    )> {
+        let (place, at) = self.fault_window?;
+        let open = self.faults_at(place);
+        let count = open.len();
+        let notice = open.get(at.min(count.saturating_sub(1))).copied()?;
+        Some((place, at.min(count - 1), count, notice))
+    }
+
+    /// Something went wrong: kept in the Bot's notifications (on this Mac, until cleared) and
+    /// shown in the toast. Where in the source it was caught is the caller's own file and line,
+    /// so a notice can be traced back after the part of the app that raised it is gone.
+    #[track_caller]
+    pub fn notify_error(
+        &mut self,
+        bot: Option<String>,
+        place: &str,
+        said: &str,
+        raw: Option<String>,
+        run_id: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> String {
+        let mut notice =
+            crate::notifications::Notice::new(bot, place, said, std::panic::Location::caller());
+        notice.raw = raw;
+        notice.run_id = run_id;
+        let id = notice.id.clone();
+        // Seen at once when the Bot's notifications are what is open.
+        notice.read = self.right_pane == RightPane::Notifications
+            && notice.bot.is_some()
+            && notice.bot == self.active_coworker_id;
+        self.persist_notice(notice.clone());
+        self.notices.insert(0, notice);
+        self.notices.truncate(2000);
+        self.show_toast(id.clone(), cx);
+        cx.notify();
+        id
+    }
+
+    fn persist_notice(&self, notice: crate::notifications::Notice) {
+        let Some(pool) = self.database_service.as_ref().map(|db| db.pool()) else {
+            return;
+        };
+        on_tokio(async move {
+            if let Err(error) = crate::notifications::save(&pool, &notice).await {
+                log::warn!("a notification could not be kept: {error}");
+            }
+        });
+    }
+
+    /// The toast shows `id` for eight seconds, longer while the pointer is on it.
+    fn show_toast(&mut self, id: String, cx: &mut Context<Self>) {
+        self.toast = Some(id.clone());
+        self.toast_hovered = false;
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_secs(8))
+                    .await;
+                let gone = this
+                    .update(cx, |state, cx| {
+                        if state.toast.as_deref() != Some(id.as_str()) {
+                            return true;
+                        }
+                        if state.toast_hovered {
+                            return false;
+                        }
+                        state.toast = None;
+                        cx.notify();
+                        true
+                    })
+                    .unwrap_or(true);
+                if gone {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    pub fn dismiss_toast(&mut self, cx: &mut Context<Self>) {
+        if self.toast.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    pub fn set_toast_hovered(&mut self, hovered: bool, cx: &mut Context<Self>) {
+        if self.toast_hovered != hovered {
+            self.toast_hovered = hovered;
+            // Let go of, it goes away: the timer that waited on the pointer sees it on its turn.
+            cx.notify();
+        }
+    }
+
+    /// The notices kept on this Mac, read once the database is open.
+    pub fn load_notices(&mut self, cx: &mut Context<Self>) {
+        let Some(pool) = self.database_service.as_ref().map(|db| db.pool()) else {
+            return;
+        };
+        let Some(handle) = tokio_handle() else {
+            log::warn!("notices could not be loaded because no Tokio runtime exists");
+            return;
+        };
+        let read = handle.spawn(async move { crate::notifications::load(&pool).await });
+        cx.spawn(async move |this, cx| {
+            let Ok(loaded) = read.await else {
+                return;
+            };
+            let _ = this.update(cx, |state, cx| match loaded {
+                Ok(kept) => {
+                    // Anything noticed before the read finished stays on top.
+                    let fresh = std::mem::take(&mut state.notices);
+                    let seen: HashSet<String> = fresh.iter().map(|n| n.id.clone()).collect();
+                    state.notices = fresh
+                        .into_iter()
+                        .chain(kept.into_iter().filter(|n| !seen.contains(&n.id)))
+                        .collect();
+                    cx.notify();
+                }
+                Err(error) => log::warn!("the notifications kept could not be read: {error}"),
+            });
+        })
+        .detach();
+    }
+
+    /// How many of a Bot's notices are not seen yet, for the bell's badge.
+    pub fn unread_notices(&self, bot: &str) -> usize {
+        self.notices
+            .iter()
+            .filter(|n| !n.read && n.bot.as_deref() == Some(bot))
+            .count()
+    }
+
+    /// The open Bot's notices, newest first.
+    pub fn bot_notices(&self) -> Vec<&crate::notifications::Notice> {
+        let Some(bot) = self.active_coworker_id.as_deref() else {
+            return Vec::new();
+        };
+        self.notices
+            .iter()
+            .filter(|n| n.bot.as_deref() == Some(bot))
+            .collect()
+    }
+
+    /// The bell: the open Bot's notifications in the right sidebar, every one of them seen; the
+    /// bell again (or the sidebar button) closes them.
+    pub fn toggle_notifications(&mut self, cx: &mut Context<Self>) {
+        if self.right_pane == RightPane::Notifications {
+            self.close_right_pane(cx);
+            return;
+        }
+        self.set_right_pane(RightPane::Notifications, cx);
+        self.notice_selection.clear();
+        self.notice_expanded = None;
+        self.model_picker = PickerView::default();
+        self.avatar_editor_open = false;
+        // Opening the page is not reading what is on it: a row opened, or Mark read, does that.
+        self.record_nav();
+        cx.notify();
+    }
+
+    /// The toast's "Open notifications": its Bot opened, and that Bot's notifications in the
+    /// right sidebar.
+    pub fn open_notifications_for(&mut self, bot: Option<String>, cx: &mut Context<Self>) {
+        let from_toast = self.toast.take();
+        if let Some(bot) = bot.filter(|bot| self.active_coworker_id.as_ref() != Some(bot)) {
+            self.select_coworker(bot, cx);
+        }
+        if self.right_pane != RightPane::Notifications {
+            self.toggle_notifications(cx);
+        }
+        // From the toast, the page opens on the notice that raised it.
+        if let Some(id) = from_toast.filter(|id| self.notices.iter().any(|n| &n.id == id)) {
+            self.notice_unread_only = false;
+            self.notice_expanded = None;
+            self.toggle_notice_expanded(id, cx);
+        }
+        cx.notify();
+    }
+
+    /// Every notice of `bot` (or every notice, with `None`) counted as seen.
+    pub fn mark_notices_read(&mut self, bot: Option<String>, cx: &mut Context<Self>) {
+        let mut changed = false;
+        for notice in &mut self.notices {
+            if !notice.read && (bot.is_none() || notice.bot == bot) {
+                notice.read = true;
+                changed = true;
+            }
+        }
+        if !changed {
+            return;
+        }
+        if let Some(pool) = self.database_service.as_ref().map(|db| db.pool()) {
+            on_tokio(async move {
+                let _ = crate::notifications::mark_read(&pool, bot.as_deref()).await;
+            });
+        }
+        cx.notify();
+    }
+
+    /// Forget `bot`'s notices, or every notice with `None`.
+    pub fn clear_notices(&mut self, bot: Option<String>, cx: &mut Context<Self>) {
+        self.notices
+            .retain(|n| bot.as_ref().is_some_and(|bot| n.bot.as_ref() != Some(bot)));
+        if self
+            .toast
+            .as_ref()
+            .is_some_and(|id| !self.notices.iter().any(|n| &n.id == id))
+        {
+            self.toast = None;
+        }
+        if let Some(pool) = self.database_service.as_ref().map(|db| db.pool()) {
+            on_tokio(async move {
+                let _ = crate::notifications::clear(&pool, bot.as_deref()).await;
+            });
+        }
+        cx.notify();
+    }
+
+    /// The rows the page shows: the open Bot's, unread only when the filter says so.
+    pub fn visible_notices(&self) -> Vec<&crate::notifications::Notice> {
+        self.bot_notices()
+            .into_iter()
+            .filter(|n| !self.notice_unread_only || !n.read)
+            .collect()
+    }
+
+    /// All / Unread. The selection is about the rows that were shown, so it goes.
+    pub fn set_notice_filter(&mut self, unread_only: bool, cx: &mut Context<Self>) {
+        self.notice_unread_only = unread_only;
+        self.notice_selection.clear();
+        cx.notify();
+    }
+
+    pub fn toggle_notice_selected(&mut self, id: String, cx: &mut Context<Self>) {
+        if !self.notice_selection.remove(&id) {
+            self.notice_selection.insert(id);
+        }
+        cx.notify();
+    }
+
+    /// The select-all box: every shown row, or none when all are ticked.
+    pub fn toggle_select_all_notices(&mut self, cx: &mut Context<Self>) {
+        let shown: HashSet<String> = self
+            .visible_notices()
+            .iter()
+            .map(|n| n.id.clone())
+            .collect();
+        if !shown.is_empty() && shown.is_subset(&self.notice_selection) {
+            self.notice_selection.clear();
+        } else {
+            self.notice_selection = shown;
+        }
+        cx.notify();
+    }
+
+    /// A row opened to its details, and so seen; opening another closes the first.
+    pub fn toggle_notice_expanded(&mut self, id: String, cx: &mut Context<Self>) {
+        if self.notice_expanded.as_deref() == Some(id.as_str()) {
+            self.notice_expanded = None;
+        } else {
+            self.notice_expanded = Some(id.clone());
+            self.set_notices_read(vec![id], true, cx);
+        }
+        cx.notify();
+    }
+
+    /// Read or unread, for these rows.
+    pub fn set_notices_read(&mut self, ids: Vec<String>, read: bool, cx: &mut Context<Self>) {
+        for notice in &mut self.notices {
+            if ids.contains(&notice.id) {
+                notice.read = read;
+            }
+        }
+        if let Some(pool) = self.database_service.as_ref().map(|db| db.pool()) {
+            on_tokio(async move {
+                let _ = crate::notifications::set_read(&pool, &ids, read).await;
+            });
+        }
+        cx.notify();
+    }
+
+    /// The ticked rows (or `ids`): read when any of them is unread, else all unread.
+    pub fn mark_selected_notices(&mut self, read: bool, cx: &mut Context<Self>) {
+        let ids: Vec<String> = self.notice_selection.iter().cloned().collect();
+        self.set_notices_read(ids, read, cx);
+    }
+
+    /// Delete: the rows go at once and an Undo stands for six seconds; only then is the database
+    /// told, so Undo puts them back exactly as they were.
+    pub fn delete_notices(&mut self, ids: Vec<String>, cx: &mut Context<Self>) {
+        if ids.is_empty() {
+            return;
+        }
+        self.commit_notice_undo();
+        let (gone, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut self.notices)
+            .into_iter()
+            .partition(|n| ids.contains(&n.id));
+        self.notices = kept;
+        for id in &ids {
+            self.notice_selection.remove(id);
+        }
+        if self
+            .notice_expanded
+            .as_ref()
+            .is_some_and(|e| ids.contains(e))
+        {
+            self.notice_expanded = None;
+        }
+        let label = if gone.len() == 1 {
+            "1 notification deleted".to_string()
+        } else {
+            format!("{} notifications deleted", gone.len())
+        };
+        self.notice_undo_generation += 1;
+        let generation = self.notice_undo_generation;
+        self.notice_undo = Some((generation, gone, label));
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_secs(6))
+                .await;
+            let _ = this.update(cx, |state, cx| {
+                if state
+                    .notice_undo
+                    .as_ref()
+                    .is_some_and(|(g, ..)| *g == generation)
+                {
+                    state.commit_notice_undo();
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// The deletes an Undo was holding, made for good.
+    fn commit_notice_undo(&mut self) {
+        let Some((_, gone, _)) = self.notice_undo.take() else {
+            return;
+        };
+        let ids: Vec<String> = gone.into_iter().map(|n| n.id).collect();
+        if let Some(pool) = self.database_service.as_ref().map(|db| db.pool()) {
+            on_tokio(async move {
+                let _ = crate::notifications::delete(&pool, &ids).await;
+            });
+        }
+    }
+
+    /// Undo: the deleted rows back where they were.
+    pub fn undo_notice_delete(&mut self, cx: &mut Context<Self>) {
+        let Some((_, gone, _)) = self.notice_undo.take() else {
+            return;
+        };
+        self.notices.extend(gone);
+        self.notices.sort_by_key(|n| std::cmp::Reverse(n.at_ms));
+        cx.notify();
+    }
+
+    /// The name of the Bot a notice belongs to, when that Bot is still there.
+    pub fn notice_bot_name(&self, notice: &crate::notifications::Notice) -> Option<String> {
+        let bot = notice.bot.as_deref()?;
+        self.coworkers
+            .iter()
+            .find(|c| c.id == bot)
+            .map(|c| c.name.clone())
+    }
+
+    /// Copy: one notice, whole, as plain text on the clipboard.
+    pub fn copy_notice(&mut self, id: &str, cx: &mut Context<Self>) {
+        if let Some(text) = self
+            .notices
+            .iter()
+            .find(|n| n.id == id)
+            .map(|n| n.copy_text(self.notice_bot_name(n).as_deref()))
+        {
+            cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(text));
+        }
+    }
+
+    /// Copy the ticked rows, newest first, one block each (⌘C on a selection).
+    pub fn copy_bot_notices(&mut self, cx: &mut Context<Self>) {
+        let text = self
+            .bot_notices()
+            .iter()
+            .filter(|n| self.notice_selection.is_empty() || self.notice_selection.contains(&n.id))
+            .map(|n| n.copy_text(self.notice_bot_name(n).as_deref()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(text));
     }
 
     pub fn toggle_computer_pane(&mut self, cx: &mut Context<Self>) {
@@ -10683,8 +12177,16 @@ impl AppState {
                 }
                 state.recipes_loading = false;
                 match result {
-                    Ok(recipes) => state.recipes = recipes,
-                    Err(error) => state.recipes_error = Some(error.message),
+                    Ok(recipes) => {
+                        state.clear_trouble(RECIPES_TROUBLE);
+                        state.recipes = recipes;
+                    }
+                    Err(error) => {
+                        state.recipes_error = state.shown_after(
+                            RECIPES_TROUBLE,
+                            &Trouble::failed("Could not load the recipes.", &error),
+                        )
+                    }
                 }
                 cx.notify();
             });
@@ -10725,8 +12227,16 @@ impl AppState {
                 state.recipe_loading = false;
                 state.recipe_detail_epoch += 1;
                 match result {
-                    Ok(detail) => state.set_open_recipe(detail, cx),
-                    Err(error) => state.recipe_error = Some(error.message),
+                    Ok(detail) => {
+                        state.clear_trouble(RECIPE_TROUBLE);
+                        state.set_open_recipe(detail, cx);
+                    }
+                    Err(error) => {
+                        state.recipe_error = state.shown_after(
+                            RECIPE_TROUBLE,
+                            &Trouble::failed("That did not go through.", &error),
+                        )
+                    }
                 }
                 cx.notify();
             });
@@ -10957,7 +12467,10 @@ impl AppState {
                 true
             }
             Err(error) => {
-                self.recipe_error = Some(error.message);
+                self.recipe_error = self.shown_after(
+                    RECIPE_TROUBLE,
+                    &Trouble::failed("That did not go through.", &error),
+                );
                 self.end_recipe_run(&id);
                 self.recipe_run_poll = None;
                 return false;
@@ -11030,7 +12543,12 @@ impl AppState {
                         state.set_open_recipe(detail, cx);
                         state.refresh_recipes(cx);
                     }
-                    Err(error) => state.recipe_error = Some(error.message),
+                    Err(error) => {
+                        state.recipe_error = state.shown_after(
+                            RECIPE_TROUBLE,
+                            &Trouble::failed("That did not go through.", &error),
+                        )
+                    }
                 }
                 cx.notify();
             });
@@ -11169,8 +12687,18 @@ impl AppState {
                         }
                         state.refresh_recipes(cx);
                     }
-                    Err(error) if open => state.recipe_error = Some(error.message),
-                    Err(error) => state.recipes_error = Some(error.message),
+                    Err(error) if open => {
+                        state.recipe_error = state.shown_after(
+                            RECIPE_TROUBLE,
+                            &Trouble::failed("That did not go through.", &error),
+                        )
+                    }
+                    Err(error) => {
+                        state.recipes_error = state.shown_after(
+                            RECIPES_TROUBLE,
+                            &Trouble::failed("Could not load the recipes.", &error),
+                        )
+                    }
                 }
                 cx.notify();
             });
@@ -11248,7 +12776,10 @@ impl AppState {
                 let unknown = error.status.is_none()
                     || error.unreachable().is_some()
                     || error.history_missed();
-                self.recipe_error = Some(error.message);
+                self.recipe_error = self.shown_after(
+                    RECIPE_TROUBLE,
+                    &Trouble::failed("That did not go through.", &error),
+                );
                 if unknown {
                     AfterRun::Reload
                 } else {
@@ -11301,7 +12832,12 @@ impl AppState {
                         state.close_recipe(cx);
                         state.refresh_recipes(cx);
                     }
-                    Err(error) => state.recipe_error = Some(error.message),
+                    Err(error) => {
+                        state.recipe_error = state.shown_after(
+                            RECIPE_TROUBLE,
+                            &Trouble::failed("That did not go through.", &error),
+                        )
+                    }
                 }
                 cx.notify();
             });
@@ -11327,19 +12863,15 @@ impl AppState {
 
     /// Settings → Skills, asked for from anywhere. The page is a settings tab, so this brings
     /// Settings up when it is shut rather than setting a tab nobody can see.
+    /// Skills live in the Plugins window now (Settings → Skills is gone, the owner's call of
+    /// 7 Oct 2026): this opens it on Installed, where "Your skills" and "+ New skill" are.
     pub fn open_skills(&mut self, cx: &mut Context<Self>) {
-        // Opening Settings onto this tab fetches the list, and so does moving to it. Exactly one
-        // of those happens here, unless neither does — which is the case this last line is for:
-        // asking again for the tab already on screen, which would otherwise leave whatever was
-        // there when it was last visited.
-        let showing = self.is_app_settings_open && self.app_settings_tab == AppSettingsTab::Skills;
-        if !self.is_app_settings_open {
+        if self.is_app_settings_open {
             self.toggle_app_settings(cx);
         }
-        self.set_app_settings_tab(AppSettingsTab::Skills, cx);
-        if showing {
-            self.refresh_skills(cx);
-        }
+        self.open_plugin_market(cx);
+        self.set_market_page(crate::components::monitor_modal::MarketPage::Installed, cx);
+        self.refresh_coworker_skills(cx);
         cx.notify();
     }
 
@@ -11433,6 +12965,7 @@ impl AppState {
         self.skills_loading = false;
         match (yours, discover) {
             (Ok(yours), Ok(discover)) => {
+                self.clear_trouble(SKILLS_TROUBLE);
                 self.skills_counts = SkillCounts {
                     yours: yours.len(),
                     discover: discover.len(),
@@ -11454,7 +12987,10 @@ impl AppState {
                 // current.
                 self.skills.clear();
                 self.skills_counts = SkillCounts::default();
-                self.skills_error = Some(error.message);
+                self.skills_error = self.shown_after(
+                    SKILLS_TROUBLE,
+                    &Trouble::failed("Could not load the skills.", &error),
+                );
             }
         }
         true
@@ -11518,7 +13054,12 @@ impl AppState {
             // listed a minute ago is as pickable as it was — the server is the authority on an
             // id either way. Emptying the list because a refresh failed would take away the one
             // thing the person opened `/` for.
-            Err(error) => self.your_skills_error = Some(error.message),
+            Err(error) => {
+                self.your_skills_error = self.shown_after(
+                    YOUR_SKILLS_TROUBLE,
+                    &Trouble::failed("Could not load your skills.", &error),
+                )
+            }
         }
         true
     }
@@ -11531,6 +13072,7 @@ impl AppState {
     fn take_your_skills(&mut self, rows: Vec<SkillSummary>) {
         self.your_skills_epoch += 1;
         self.your_skills = rows;
+        self.clear_trouble(YOUR_SKILLS_TROUBLE);
         self.your_skills_loading = false;
         self.your_skills_error = None;
         // Same as above: what this app has just done to a switch outlives a listing that was
@@ -11632,8 +13174,12 @@ impl AppState {
             let _ = window.update(cx, |_, window, _| window.activate_window());
         }
         self.open_skills(cx);
+        // The lesson just written opens on its own page there, where it is read and switched on.
         if let Some(id) = skill {
-            self.open_skill(id, cx);
+            self.open_market_detail(
+                crate::components::monitor_modal::PluginSelection::Skill(id),
+                cx,
+            );
         }
     }
 
@@ -11661,11 +13207,19 @@ impl AppState {
                     return;
                 }
                 match result {
-                    Ok(detail) => state.skill_open = Some(detail),
+                    Ok(detail) => {
+                        state.clear_trouble(SKILL_TROUBLE);
+                        state.skill_open = Some(detail);
+                    }
                     // On the pane, where the person is waiting for it. In the list's slot it
                     // would be a sentence about the library, and the pane would go on saying
                     // "Loading…" at something that is never going to arrive.
-                    Err(error) => state.skill_error = Some(error.message),
+                    Err(error) => {
+                        state.skill_error = state.shown_after(
+                            SKILL_TROUBLE,
+                            &Trouble::failed("Could not load this skill.", &error),
+                        )
+                    }
                 }
                 cx.notify();
             });
@@ -11847,12 +13401,28 @@ impl AppState {
                         state.skill_add_error = None;
                         state.skill_add_taken = from == SkillCreateFrom::Sheet;
                         let id = detail.skill.id.clone();
-                        state.skill_open_id = Some(id);
+                        state.skill_open_id = Some(id.clone());
                         state.skill_error = None;
                         state.skill_open = Some(detail);
                         // A new skill is one of the person's own, whichever side was open.
                         state.take_skills_scope(SkillScope::Yours);
                         state.refresh_skills(cx);
+                        // Made from the Plugins window's New skill page: that page becomes the
+                        // new skill's own, so Back goes to the list, never to an empty form.
+                        if let Some(modal) = state.monitor_modal.as_mut().filter(|m| {
+                            m.selected
+                                == Some(crate::components::monitor_modal::PluginSelection::NewSkill)
+                        }) {
+                            modal.selected =
+                                Some(crate::components::monitor_modal::PluginSelection::Skill(
+                                    id.clone(),
+                                ));
+                            state.skill_edit = Some(crate::state::SkillEdit {
+                                id: id.clone(),
+                                ..Default::default()
+                            });
+                        }
+                        state.refresh_coworker_skills(cx);
                     }
                     Err(error) => state.refuse_create(from, error.message),
                 }
@@ -11926,7 +13496,12 @@ impl AppState {
                         state.refresh_skills(cx);
                         state.library_skill_changed(cx);
                     }
-                    Err(error) => state.skills_error = Some(error.message),
+                    Err(error) => {
+                        state.skills_error = state.shown_after(
+                            SKILLS_TROUBLE,
+                            &Trouble::failed("Could not load the skills.", &error),
+                        )
+                    }
                 }
                 cx.notify();
             });
@@ -13412,6 +14987,11 @@ impl AppState {
     }
 
     pub fn dismiss_popovers(&mut self, cx: &mut Context<Self>) {
+        // The composer's list is its own view; it is asked to close, and closes on its next look.
+        if self.composer_panel.is_some() {
+            self.composer_panel_close_requested = true;
+            cx.notify();
+        }
         if !self.model_picker.open && !self.avatar_editor_open && self.emoji_picker.is_none() {
             return;
         }
@@ -13454,33 +15034,6 @@ impl AppState {
     ) {
         self.emoji_picker = Some(EmojiPickerOpen { message_id, bounds });
         cx.notify();
-    }
-
-    /// Pick one of the composer's capabilities. The picked ones show as chips beside the field.
-    /// Name a tool for the next message. Naming the same one twice is one chip, not two.
-    pub fn pick_tool(&mut self, id: String, label: String, cx: &mut Context<Self>) {
-        if self.picked_tools.iter().any(|picked| picked.id == id) {
-            return;
-        }
-        let kind = PickedKind::of(&id);
-        self.picked_tools.push(PickedTool { id, label, kind });
-        cx.notify();
-    }
-
-    /// Take a named tool back.
-    pub fn unpick_tool(&mut self, id: &str, cx: &mut Context<Self>) {
-        if let Some(index) = self.picked_tools.iter().position(|picked| picked.id == id) {
-            self.picked_tools.remove(index);
-            cx.notify();
-        }
-    }
-
-    /// The names to send with the next message, in the order they were named.
-    pub fn picked_tool_ids(&self) -> Vec<String> {
-        self.picked_tools
-            .iter()
-            .map(|picked| picked.id.clone())
-            .collect()
     }
 
     /// Put a recipe or a workflow on the next message, from the list the composer picked it out
@@ -13942,6 +15495,16 @@ impl AppState {
         self.shut_picker_list(which);
         if open && which == PickerFor::Bot {
             self.avatar_editor_open = false;
+        }
+        // The list is read again each time a picker opens: a model added or taken away in the
+        // person's opencodex, or on the gateway, shows here without a trip to Settings (8 Oct
+        // 2026). The list on screen stays until the answer, so nothing flickers.
+        if open
+            && self
+                .models_read_at
+                .is_some_and(|at| at.elapsed() >= MODELS_STALE_AFTER)
+        {
+            self.refresh_models(cx);
         }
         cx.notify();
     }
@@ -14449,6 +16012,8 @@ impl AppState {
 
     pub fn set_database_service(&mut self, service: DatabaseService, cx: &mut Context<Self>) {
         self.database_service = Some(service.clone());
+        // The notifications kept on this Mac come back with the database (`crate::notifications`).
+        self.load_notices(cx);
         self.ensure_site_login_vault(cx);
         cx.notify();
 
@@ -14939,7 +16504,76 @@ impl AppState {
             computer_view: self.computer_view.clone(),
             app_settings_open: self.is_app_settings_open,
             app_settings_tab: self.app_settings_tab,
+            window: self.monitor_modal.as_ref().map(|m| WindowNav {
+                kind: m.kind,
+                page: m.page.clone(),
+                selected: m.selected.clone(),
+                bots_for: m.bots_for.clone(),
+                skill_bots_open: self.skill_bots.as_ref().is_some_and(|b| b.open),
+            }),
         }
+    }
+
+    /// A move inside the Plugins or Tools window, recorded as a step.
+    pub(crate) fn record_window_nav(&mut self) {
+        if self.monitor_modal.is_some() {
+            self.record_nav();
+        }
+    }
+
+    /// The window's ‹ while the step behind is the same window's page: one step back in the
+    /// history, the same as ⌘[, so ⌘] can go forward again. `false` when it is not.
+    /// Only when the step behind is where ‹ leads (`leads_to`): ‹ is "up", and a step behind
+    /// that is somewhere else (a category opened before Installed) is not it.
+    pub(crate) fn window_back(
+        &mut self,
+        leads_to: impl Fn(&WindowNav) -> bool,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(kind) = self.monitor_modal.as_ref().map(|m| m.kind) else {
+            return false;
+        };
+        if self.nav.applying || !self.nav.back_is_window(|w| w.kind == kind && leads_to(w)) {
+            return false;
+        }
+        self.nav_back(cx);
+        true
+    }
+
+    /// The window as a history step says: opened if it is not, then its page, detail and Bots
+    /// page. Each move here is not a new step (`applying`).
+    fn apply_window(&mut self, window: Option<WindowNav>, cx: &mut Context<Self>) {
+        let Some(w) = window else {
+            if self.monitor_modal.is_some() {
+                self.monitor_modal = None;
+                self.monitor_generation += 1;
+            }
+            return;
+        };
+        if self.monitor_modal.as_ref().map(|m| m.kind) != Some(w.kind) {
+            self.open_monitor_modal(w.kind, cx);
+        }
+        if self.monitor_modal.as_ref().is_none_or(|m| m.page != w.page) {
+            self.set_market_page(w.page.clone(), cx);
+        }
+        let selected = self.monitor_modal.as_ref().and_then(|m| m.selected.clone());
+        if selected != w.selected {
+            match w.selected.clone() {
+                Some(selection) => self.open_market_detail(selection, cx),
+                None => self.close_market_detail(cx),
+            }
+        }
+        if self.monitor_modal.as_ref().and_then(|m| m.bots_for.clone()) != w.bots_for {
+            self.open_account_bots(w.bots_for.clone(), cx);
+        }
+        if self.skill_bots.as_ref().is_some_and(|b| b.open) != w.skill_bots_open {
+            self.open_skill_bots(w.skill_bots_open, cx);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn record_nav_for_test(&mut self) {
+        self.record_nav();
     }
 
     fn record_nav(&mut self) {
@@ -14994,15 +16628,6 @@ impl AppState {
             self.refresh_host_egress(cx);
             self.refresh_coworker_computer_quietly(cx);
         }
-        // And landing on Settings → Skills the same way: the library is the account's, nothing
-        // else fetches it, and a page that arrived here through back or forward would say "No
-        // skills yet" about a library nobody had asked for.
-        if self.is_app_settings_open && self.app_settings_tab == AppSettingsTab::Skills {
-            self.refresh_skills(cx);
-        }
-        if self.is_app_settings_open && self.app_settings_tab == AppSettingsTab::Connections {
-            self.refresh_connections(cx);
-        }
         self.reply_source_page_moved(cx);
         // A routine's thread is somewhere a person can go back to, while it is still one of
         // this bot's routines' threads and this bot is the one open. Anything else lands on the
@@ -15030,6 +16655,7 @@ impl AppState {
         if self.page == MainPage::Recipes {
             self.refresh_recipes(cx);
         }
+        self.apply_window(loc.window, cx);
         self.nav.applying = false;
         cx.notify();
     }
@@ -16260,6 +17886,70 @@ impl AppState {
         (run_id, reply_id)
     }
 
+    /// The tags in `text` a turn sends: installed plugins as `mentionedPlugins`, built-in tools as
+    /// `preferTools` ([`crate::opengrok::TurnTags`]). A plugin the list has not loaded yet is not
+    /// a tag the app can tell from a word, and goes as a word.
+    fn turn_tags(&self, text: &str) -> crate::opengrok::TurnTags {
+        use crate::components::chat_input::{BUILTIN_TOOLS, function_tags_in, tags_in};
+        let installs = self
+            .plugin_market
+            .installations
+            .as_ref()
+            .and_then(Loaded::ready);
+        let installed = |name: &str| {
+            installs.is_some_and(|installs| installs.iter().any(|install| install.name == name))
+        };
+        let builtin = |name: &str| BUILTIN_TOOLS.iter().any(|(tool, ..)| *tool == name);
+        let mut tags = crate::opengrok::TurnTags {
+            plugins: tags_in(text, installed),
+            tools: tags_in(text, builtin),
+            ..Default::default()
+        };
+        // "@cloudflare:execute" and "@routines:create_routine" name one function, as the Bot's
+        // own tools listing names it (`preferTools`, which the server keeps to tools it offers);
+        // a bare "@routines" names every tool of the group.
+        let listed = match &self.coworker_tools {
+            Some((bot, ToolList::Listed(tools)))
+                if Some(bot) == self.active_coworker_id.as_ref() =>
+            {
+                tools.as_slice()
+            }
+            _ => &[],
+        };
+        let group = |name: &str| {
+            listed
+                .iter()
+                .find(|tool| tool.name == name && !tool.tools.is_empty())
+        };
+        let prefer = |name: String, tags: &mut crate::opengrok::TurnTags| {
+            if !tags.tools.contains(&name) {
+                tags.tools.push(name);
+            }
+        };
+        let named = function_tags_in(text);
+        for (name, function) in &named {
+            let plugin_tool = listed.iter().find(|tool| {
+                tool.plugin.as_deref() == Some(name.as_str())
+                    && tool
+                        .qualified
+                        .as_deref()
+                        .is_some_and(|q| q.rsplit('.').next() == Some(function.as_str()))
+            });
+            if let Some(tool) = plugin_tool {
+                prefer(tool.name.clone(), &mut tags);
+            } else if group(name).is_some_and(|g| g.tools.iter().any(|t| t.name == *function)) {
+                prefer(function.clone(), &mut tags);
+            }
+        }
+        let with_function = |name: &str| named.iter().any(|(tagged, _)| tagged == name);
+        for name in tags_in(text, |name| group(name).is_some() && !with_function(name)) {
+            for member in group(&name).map(|g| g.tools.clone()).unwrap_or_default() {
+                prefer(member.name, &mut tags);
+            }
+        }
+        tags
+    }
+
     /// `recipe` and `skill` are what the message was typed with. `stop_first` is a run this turn
     /// replaces: it is stopped on the wire before the turn is posted. `drained` is the hold this
     /// turn is firing, when it came off `queued_sends`. `retry_of` is the run of the failed reply
@@ -16299,6 +17989,11 @@ impl AppState {
         // The Bot's door as the turn leaves, or for a held send the one it had when the message
         // was sent, or the server's keys for a turn sent again on them: see `turn_door`.
         let turn_source = self.turn_door(drained.as_ref(), on_server);
+        // What the person's own words tagged, read off the message this turn answers, so a
+        // queued send, a retry and Send on Server carry the tags it was typed with.
+        let said = history.iter().rev().find(|message| message.role == "user");
+        let mut tags = self.turn_tags(said.map_or("", |message| message.content.as_str()));
+        tags.accounts = std::mem::take(&mut self.next_turn_accounts);
 
         let (run_id, reply_id) = self.open_turn(&conversation_id);
         // The thread is the app's own to paint while the turn streams: a re-read the account's
@@ -16346,16 +18041,13 @@ impl AppState {
                     // run's own frame: kept here so the row is told once, when it arrives.
                     let mut told_source: Option<ReplySource> = None;
                     let result = client
-                        .run_turn(
-                            &id,
-                            &conversation_id,
-                            &run_id,
+                        .run_turn_tagged(
+                            (&id, &conversation_id, &run_id),
                             &history,
-                            recipe.as_ref(),
-                            skill.as_deref(),
-                            pending_id.as_deref(),
-                            retry_of.as_deref(),
+                            (recipe.as_ref(), skill.as_deref()),
+                            (pending_id.as_deref(), retry_of.as_deref()),
                             turn_source,
+                            &tags,
                             |event, arrived_at| {
                                 // A routine the Bot made, changed, deleted or ran is the server's
                                 // the moment the call answers, whatever becomes of the turn.
@@ -16566,6 +18258,13 @@ impl AppState {
                             Ok(text) if !text.is_empty() => message.content = text.clone(),
                             // Parked on a permission card or a user-form: the turn is not over yet.
                             Ok(_) if waiting_approval || waiting_user_form => {}
+                            // A tagged plugin's needs card is the whole answer (#360): it says
+                            // what to do, and "returned no text" over it would read as a fault.
+                            Ok(_)
+                                if message
+                                    .parts
+                                    .iter()
+                                    .any(|part| matches!(part, ChatPart::PluginNeeds(_))) => {}
                             Ok(_) => {
                                 message.content = tool_standin(&deeds)
                                     .unwrap_or_else(|| EMPTY_TURN_NOTE.to_string())
@@ -16598,6 +18297,27 @@ impl AppState {
                         // answer landed when the run began.
                         stamp_run_finished(message, SystemTime::now());
                     }
+                }
+                // A turn that went wrong goes to its Bot's notifications and the toast too: the
+                // line in the chat stays small, and the whole sentence is kept where it can be
+                // copied and traced (8 Oct 2026).
+                if let Err(error) = &result
+                    && error.unreachable().is_none()
+                    && !error.is_signed_out()
+                {
+                    let bot = state
+                        .conversations
+                        .iter()
+                        .find(|c| c.id == conversation_id)
+                        .map(|c| {
+                            c.origin
+                                .as_ref()
+                                .map_or_else(|| c.id.clone(), |o| o.coworker_id.clone())
+                        });
+                    let said = error.message.clone();
+                    let raw = error.code().map(|code| format!("code {code}"));
+                    let run = (!run_id.is_empty()).then(|| run_id.clone());
+                    state.notify_error(bot, "Turn", &said, raw, run, cx);
                 }
                 let parked = waiting_approval || waiting_user_form;
                 // A turn the person's plan could not answer says why, and offers itself again on
@@ -18629,6 +20349,7 @@ impl AppState {
                         state.site_logins_with_code = with_code;
                         state.site_logins = rows;
                         state.site_login_error = None;
+                        state.clear_trouble(LOGINS_TROUBLE);
                         // Only a successful read makes the vault readable. A vault
                         // that failed to open must not read as empty: left false, the
                         // card offers nothing and the person types the login instead.
@@ -18641,7 +20362,13 @@ impl AppState {
                         }
                         state.fetch_site_login_icons(cx);
                     }
-                    Err(err) => state.site_login_error = Some(err.to_string()),
+                    Err(err) => {
+                        let trouble =
+                            Trouble::behind("Could not read your saved logins.", err.to_string());
+                        // A fault is the Logins title's ⚠, never a line on the page.
+                        state.note_trouble(LOGINS_TROUBLE, &trouble, cx);
+                        state.site_login_error = None;
+                    }
                 }
                 cx.notify();
             });
@@ -18766,6 +20493,22 @@ impl AppState {
         else {
             return;
         };
+        // Before Touch ID: can a saved login be used for this Bot at all? Unknown, it is asked and
+        // the pick runs again with the answer; refused, the card says why and offers a way on.
+        if let Some(bot) = self.card_coworker(&card_key) {
+            match self.saved_login_checks.get(&bot) {
+                None => {
+                    self.check_saved_logins(bot, Some((card_key, login_id)), cx);
+                    return;
+                }
+                Some(check) if !check.usable => {
+                    self.user_form_list_open.insert(card_key);
+                    cx.notify();
+                    return;
+                }
+                Some(_) => {}
+            }
+        }
         let Some(vault) = self.site_login_vault.clone() else {
             return;
         };
@@ -18793,6 +20536,14 @@ impl AppState {
         }
         cx.notify();
         let client = self.opengrok.clone();
+        // A login not yet shared with this Bot is shared by the same Touch ID that fills it.
+        // Unknown counts as not shared: the share is idempotent, a fill of an unshared one is not.
+        let share_with = self.card_coworker(&card_key).filter(|bot| {
+            !self
+                .site_login_shares
+                .get(bot)
+                .is_some_and(|ids| ids.contains(&row.id))
+        });
         let wants = match &target {
             CardTarget::Login(_) | CardTarget::Password { .. } => HeldSecret::Password,
             CardTarget::Code { .. } => HeldSecret::CodeSeed,
@@ -18866,6 +20617,29 @@ impl AppState {
                 },
                 other => other,
             };
+            // Touch ID passed for a login this Bot did not have yet: share it now, before the
+            // fill names it. Refused, nothing is filled and the card says why.
+            if let (Ok(_), Some(bot), Some(client)) = (&unlocked, &share_with, client.as_ref()) {
+                if let Err(error) = client.set_site_login_shared(&row.id, bot, true).await {
+                    let _ = this.update(cx, |state, cx| {
+                        state.saved_login_use.insert(
+                            card_key.clone(),
+                            SavedLoginUse::Unavailable {
+                                message: format!(
+                                    "{username} could not be shared with this Bot: {}",
+                                    error.message
+                                ),
+                            },
+                        );
+                        cx.notify();
+                    });
+                    return;
+                }
+                let (bot, id) = (bot.clone(), row.id.clone());
+                let _ = this.update(cx, |state, _| {
+                    state.site_login_shares.entry(bot).or_default().insert(id);
+                });
+            }
             let _ = this.update(cx, |state, cx| {
                 use crate::site_login::touch_id::TouchIdOutcome;
                 // The card may have settled or been dismissed while the sheet was up; a
@@ -19020,6 +20794,99 @@ impl AppState {
     }
 
     /// "Change" on the locked password row: the held password is dropped; the person types.
+    /// The Bot a login card belongs to: on a routine's thread, the routine's Bot.
+    pub(crate) fn card_coworker(&self, card_key: &str) -> Option<String> {
+        self.user_form_context(card_key)
+            .map(|(_, _, _, coworker)| coworker)
+    }
+
+    /// Ask the server whether a saved login can be used for `bot`, then run `then` (a pick held
+    /// for the answer). A server from before the check answers 404: its fill refuses for itself,
+    /// so the app goes on as it did.
+    pub fn check_saved_logins(
+        &mut self,
+        bot: String,
+        then: Option<(String, String)>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(client) = self.opengrok.clone() else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let shares = client.logins_shared_with(&bot).await.ok();
+            let check = match client.saved_login_check(&bot).await {
+                Ok(check) => check,
+                Err(error) => {
+                    log::warn!("saved-login check for {bot}: {}", error.message);
+                    crate::opengrok::SavedLoginCheck {
+                        usable: true,
+                        reason: None,
+                        own_computer: false,
+                    }
+                }
+            };
+            let _ = this.update(cx, |state, cx| {
+                if let Some(shares) = shares {
+                    state
+                        .site_login_shares
+                        .insert(bot.clone(), shares.into_iter().collect());
+                }
+                state.saved_login_checks.insert(bot, check);
+                if let Some((card_key, login_id)) = then {
+                    state.pick_saved_login(card_key, login_id, cx);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// "Give <Bot> its own computer" on a login card: the server makes it a computer of its own,
+    /// and the check is asked again so the card's logins come back.
+    pub fn give_bot_own_computer(&mut self, bot: String, cx: &mut Context<Self>) {
+        let Some(client) = self.opengrok.clone() else {
+            return;
+        };
+        if self.own_computer_changing.is_some() {
+            return;
+        }
+        self.own_computer_changing = Some(bot.clone());
+        self.own_computer_refusal = None;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = client.set_own_computer(&bot, true).await;
+            let _ = this.update(cx, |state, cx| {
+                state.own_computer_changing = None;
+                match result {
+                    Ok(()) => {
+                        state.saved_login_checks.remove(&bot);
+                        state.check_saved_logins(bot.clone(), None, cx);
+                        state.refresh_coworker_computer_quietly(cx);
+                    }
+                    Err(error) => {
+                        state.notify_error(
+                            Some(bot.clone()),
+                            "Login card",
+                            &error.message,
+                            None,
+                            None,
+                            cx,
+                        );
+                        state.own_computer_refusal = Some(error.message);
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// "Type it by hand": the list goes away and the fields are the person's.
+    pub fn type_login_by_hand(&mut self, card_key: String, cx: &mut Context<Self>) {
+        self.user_form_list_open.remove(&card_key);
+        cx.notify();
+    }
+
     pub fn clear_saved_login_pick(&mut self, card_key: String, cx: &mut Context<Self>) {
         self.saved_login_use.remove(&card_key);
         cx.notify();
@@ -19257,10 +21124,16 @@ impl AppState {
                 match result {
                     Ok((_, notice)) => {
                         state.site_login_error = None;
+                        state.clear_trouble(LOGINS_TROUBLE);
                         state.site_login_notice = notice;
                         state.reload_site_logins(cx);
                     }
-                    Err(err) => state.site_login_error = Some(err),
+                    Err(err) => {
+                        let trouble = Trouble::behind("That did not go through.", err);
+                        // A fault is the Logins title's ⚠, never a line on the page.
+                        state.note_trouble(LOGINS_TROUBLE, &trouble, cx);
+                        state.site_login_error = None;
+                    }
                 }
                 cx.notify();
             });
@@ -19318,12 +21191,18 @@ impl AppState {
                 match result {
                     Ok((id, notice)) => {
                         state.site_login_error = None;
+                        state.clear_trouble(LOGINS_TROUBLE);
                         state.site_login_notice =
                             notice.or_else(|| Some(format!("Saved {username} on {origin}.")));
                         state.site_login_selected = Some(id);
                         state.reload_site_logins(cx);
                     }
-                    Err(err) => state.site_login_error = Some(err),
+                    Err(err) => {
+                        let trouble = Trouble::behind("That did not go through.", err);
+                        // A fault is the Logins title's ⚠, never a line on the page.
+                        state.note_trouble(LOGINS_TROUBLE, &trouble, cx);
+                        state.site_login_error = None;
+                    }
                 }
                 cx.notify();
             });
@@ -19362,7 +21241,10 @@ impl AppState {
                 Ok(read) => read,
                 Err(error) => {
                     let _ = this.update(cx, |state, cx| {
-                        state.site_login_error = Some(format!("Import failed: {error}"));
+                        let trouble = Trouble::behind("Import failed.", error.to_string());
+                        // A fault is the Logins title's ⚠, never a line on the page.
+                        state.note_trouble(LOGINS_TROUBLE, &trouble, cx);
+                        state.site_login_error = None;
                         cx.notify();
                     });
                     return;
@@ -19417,7 +21299,12 @@ impl AppState {
                 if let Some(first) = first_error {
                     errors.insert(0, first);
                 }
-                state.site_login_error = (!errors.is_empty()).then(|| errors.join("; "));
+                if !errors.is_empty() {
+                    let trouble =
+                        Trouble::behind("Some logins could not be imported.", errors.join("; "));
+                    state.note_trouble(LOGINS_TROUBLE, &trouble, cx);
+                }
+                state.site_login_error = None;
                 state.reload_site_logins(cx);
                 cx.notify();
             });
@@ -19488,9 +21375,15 @@ impl AppState {
                             state.site_login_selected = None;
                         }
                         state.site_login_error = None;
+                        state.clear_trouble(LOGINS_TROUBLE);
                         state.reload_site_logins(cx);
                     }
-                    Err(err) => state.site_login_error = Some(err),
+                    Err(err) => {
+                        let trouble = Trouble::behind("That did not go through.", err);
+                        // A fault is the Logins title's ⚠, never a line on the page.
+                        state.note_trouble(LOGINS_TROUBLE, &trouble, cx);
+                        state.site_login_error = None;
+                    }
                 }
                 cx.notify();
             });
@@ -19524,6 +21417,12 @@ impl AppState {
             .and_then(card_target)
             .is_some_and(|target| target.list_field() == Some(field_id));
         if belongs {
+            if let Some(bot) = self
+                .card_coworker(&card_key)
+                .filter(|bot| !self.saved_login_checks.contains_key(bot))
+            {
+                self.check_saved_logins(bot, None, cx);
+            }
             self.user_form_list_open.insert(card_key);
             cx.notify();
         }
@@ -19640,10 +21539,16 @@ impl AppState {
                 match result {
                     Ok(notice) => {
                         state.site_login_error = None;
+                        state.clear_trouble(LOGINS_TROUBLE);
                         state.site_login_notice = notice;
                         state.reload_site_logins(cx);
                     }
-                    Err(err) => state.site_login_error = Some(err),
+                    Err(err) => {
+                        let trouble = Trouble::behind("That did not go through.", err);
+                        // A fault is the Logins title's ⚠, never a line on the page.
+                        state.note_trouble(LOGINS_TROUBLE, &trouble, cx);
+                        state.site_login_error = None;
+                    }
                 }
                 cx.notify();
             });
@@ -19944,6 +21849,10 @@ impl AppState {
                                 state
                                     .saved_login_use
                                     .insert(card_key.clone(), SavedLoginUse::Refused { message });
+                                // The Bot's computer changed under the check: ask again next pick.
+                                if let Some(bot) = state.card_coworker(&card_key) {
+                                    state.saved_login_checks.remove(&bot);
+                                }
                             }
                         }
                     }
@@ -21944,12 +23853,6 @@ impl AppState {
                 self.refresh_computers(cx);
                 self.refresh_coworker_computer_quietly(cx);
             }
-            if self.app_settings_tab == AppSettingsTab::Skills {
-                self.refresh_skills(cx);
-            }
-            if self.app_settings_tab == AppSettingsTab::Connections {
-                self.refresh_connections(cx);
-            }
         }
         self.reply_source_page_moved(cx);
         self.record_nav();
@@ -21966,16 +23869,6 @@ impl AppState {
                 // Route traffic and the network choice for a shared box live on this tab and
                 // read the open bot's computer record, which nothing else on this page fetches.
                 self.refresh_coworker_computer_quietly(cx);
-            }
-            // The library is the account's and nothing else fetches it, so arriving on the tab
-            // is when it is asked for.
-            if tab == AppSettingsTab::Skills {
-                self.refresh_skills(cx);
-            }
-            // The connections are the server's, and whatever was last read may be a sign-in in
-            // the browser out of date.
-            if tab == AppSettingsTab::Connections {
-                self.refresh_connections(cx);
             }
             self.reply_source_page_moved(cx);
             cx.notify();
@@ -22422,9 +24315,6 @@ impl AppState {
         if tab == AppSettingsTab::Computer {
             self.refresh_computers(cx);
         }
-        if tab == AppSettingsTab::Connections {
-            self.refresh_connections(cx);
-        }
         self.reply_source_page_moved(cx);
         self.record_nav();
         cx.notify();
@@ -22784,6 +24674,11 @@ fn policy_not_kept(
 /// then the server's own reason when it refused and gave one as a line of plain text (see
 /// [`plain_reason`]). A server out of reach or a session that has gone is already said by the
 /// reconnect pill and the signed-out banner, and here it is only that it did not happen.
+mod plugin_market;
+pub use plugin_market::{
+    Loaded, PluginMarket, SkillBots, SkillEdit, SkillField, TokenForm, sign_in_key,
+};
+
 fn rules_refusal(what: &str, error: &OpenGrokError) -> String {
     let reason = (error.failure() == Failure::Verdict)
         .then(|| plain_reason(&error.message))
@@ -23529,6 +25424,38 @@ fn skill_bundle(found: Vec<(String, Vec<u8>)>) -> Result<(String, Vec<SkillFile>
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn database_work_uses_the_kept_tokio_runtime_off_context() {
+        use std::sync::OnceLock;
+        use tokio::runtime::Runtime;
+
+        static RUNTIME: OnceLock<Runtime> = OnceLock::new();
+        let runtime = RUNTIME.get_or_init(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .build()
+                .expect("the test runtime could not be built")
+        });
+        super::keep_tokio_handle(runtime.handle().clone());
+
+        let (sent, received) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            super::on_tokio(async move {
+                let _ = sent.send(());
+            });
+        })
+        .join()
+        .expect("the thread without Tokio context panicked");
+
+        assert!(
+            received
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .is_ok(),
+            "database work did not run on the kept runtime"
+        );
+    }
+
     #[gpui_kit::test]
     fn sidebar_click_restores_last_size_and_hidden_stays_hidden(cx: &mut gpui_kit::TestAppContext) {
         use gpui_kit::AppContext as _;
@@ -23546,6 +25473,34 @@ mod tests {
                 state.toggle_sidebar(cx);
                 assert!(!state.sidebar_hidden);
                 assert_eq!(state.sidebar_collapsed, collapsed);
+            }
+        });
+    }
+
+    /// A modal opened over the composer takes the "@" or "/" list with it (6 Oct 2026: the list
+    /// stayed floating over Settings). The list is the composer's own, so the state asks it to
+    /// close; Settings, Plugins and the Tools modal each ask.
+    #[gpui_kit::test]
+    fn opening_a_modal_asks_the_composer_to_close_its_list(cx: &mut gpui_kit::TestAppContext) {
+        use crate::components::chat_input::PanelMode;
+        use crate::components::monitor_modal::MonitorKind;
+        use gpui_kit::AppContext as _;
+        let app = cx.new(|_| super::AppState::new());
+        app.update(cx, |state, cx| {
+            state.active_coworker_id = Some("cw_1".into());
+            type Open = dyn Fn(&mut super::AppState, &mut gpui_kit::Context<super::AppState>);
+            let opens: [&Open; 3] = [
+                &|state, cx| state.open_app_settings(super::AppSettingsTab::General, cx),
+                &|state, cx| state.open_plugin_market(cx),
+                &|state, cx| state.open_monitor_modal(MonitorKind::Tools, cx),
+            ];
+            for open in opens {
+                state.is_app_settings_open = false;
+                state.monitor_modal = None;
+                state.composer_panel_close_requested = false;
+                state.set_composer_panel(Some(PanelMode::Tools), cx);
+                open(state, cx);
+                assert!(state.composer_panel_close_requested);
             }
         });
     }
@@ -24159,7 +26114,10 @@ mod tests {
             "rows left under a red line are rows somebody reads as current"
         );
         assert_eq!(state.skills_counts, super::SkillCounts::default());
-        assert_eq!(state.skills_error.as_deref(), Some("the gateway is down"));
+        // A fault is the page's ⚠, never a line: no words, the text behind the badge.
+        assert_eq!(state.skills_error, None);
+        let fault = state.open_fault(super::SKILLS_TROUBLE).expect("a fault");
+        assert_eq!(fault.raw.as_deref(), Some("the gateway is down"));
     }
 
     /// The rows on screen belong to the side that was open, so they go the moment it does —
@@ -24772,15 +26730,6 @@ mod tests {
         assert_eq!(routine("@daily").triggers[0].label(), "@daily");
     }
 
-    #[test]
-    fn a_picked_tool_knows_whether_it_is_a_tool_or_an_app() {
-        // The chip row used to read the kind off a hardcoded list of menu names. A real tool's
-        // name comes from the server, so the rule is the one the server itself uses: a
-        // qualified name belongs to a plugin, which is what a person means by an app.
-        assert_eq!(PickedKind::of("shell"), PickedKind::Tool);
-        assert_eq!(PickedKind::of("run_recipe"), PickedKind::Tool);
-        assert_eq!(PickedKind::of("gmail.api.send"), PickedKind::App);
-    }
     /// Picking a workflow from `/` puts it on the draft the way a recipe goes, and the draft
     /// keeps the one thing that differs: what it is called. Everything else — the declaration,
     /// the defaults standing in their fields, what the turn carries — is the same machinery,
@@ -25143,18 +27092,17 @@ mod tests {
     use super::{
         ActiveRecipe, ActivityTick, AfterRefusal, AppState, BotActivity, ChatMessage, ChatPart,
         ChoiceCard, Conversation, DatabaseService, EMPTY_TURN_NOTE, LiveTurn, Message,
-        ModelCatalogue, PickedKind, REPLY_QUOTE_CHARS, RUN_ERROR_PREFIX, RecipeSummary,
-        RecoveredQuestion, RecoveredReply, RouteTrafficSurface, STOP_UNSENT_NOTE,
-        STOPPED_TURN_NOTE, SaveStamp, SkillScope, SkillSummary, TURN_SIGNED_OUT_NOTE,
-        TURN_UNREACHED_NOTE, TaughtSkill, ThreadRun, TurnAssembler, TurnEnding,
-        WAITING_APPROVAL_STATUS, WAITING_FOR_YOU_STATUS, agui_messages, apply_catalogue,
-        apply_reload, apply_timing, bot_status_line, bubble_for_run, choice_card_in, clock_label,
-        graft_questions, graft_reply, hide_messages_of_runs, is_status_line, is_tool_standin,
-        is_unsent_turn_note, keep_reply, mark_enabled, missing_questions, missing_replies,
-        overlay_server_cards, parse_sql_time, reads_as_gateway_unreachable, replayed_ending,
-        reply_from_replay, reply_to_keep, restored_message, restored_parts, saved_parts,
-        spec_from_queued, stamp_run_finished, stream_paint_due, stream_part_sig,
-        streaming_message_mut, turn_ending, unheard_hidden_runs,
+        ModelCatalogue, REPLY_QUOTE_CHARS, RUN_ERROR_PREFIX, RecipeSummary, RecoveredQuestion,
+        RecoveredReply, RouteTrafficSurface, STOP_UNSENT_NOTE, STOPPED_TURN_NOTE, SaveStamp,
+        SkillScope, SkillSummary, TURN_SIGNED_OUT_NOTE, TURN_UNREACHED_NOTE, TaughtSkill,
+        ThreadRun, TurnAssembler, TurnEnding, WAITING_APPROVAL_STATUS, WAITING_FOR_YOU_STATUS,
+        agui_messages, apply_catalogue, apply_reload, apply_timing, bot_status_line,
+        bubble_for_run, choice_card_in, clock_label, graft_questions, graft_reply,
+        hide_messages_of_runs, is_status_line, is_tool_standin, is_unsent_turn_note, keep_reply,
+        mark_enabled, missing_questions, missing_replies, overlay_server_cards, parse_sql_time,
+        reads_as_gateway_unreachable, replayed_ending, reply_from_replay, reply_to_keep,
+        restored_message, restored_parts, saved_parts, spec_from_queued, stamp_run_finished,
+        stream_paint_due, stream_part_sig, streaming_message_mut, turn_ending, unheard_hidden_runs,
     };
     // `CredentialRequestResolution` went with the broker this branch deleted; everything
     // else main's tests reach for is still here.
@@ -25935,6 +27883,7 @@ mod tests {
                 ChatPart::SaveLogin(spec) => {
                     format!("save-login {} {}", spec.origin, spec.username)
                 }
+                ChatPart::PluginNeeds(spec) => format!("plugin-needs {:?}", spec.needs),
                 ChatPart::Step(step) => format!(
                     "step {} {} {} {:?} {:?}",
                     step.call_id, step.tool, step.arguments, step.result, step.ok
@@ -29009,6 +30958,78 @@ mod tests {
         state.active_conversation_id = Some("cw_1".into());
         state.routines.insert("cw_1".into(), routines);
         cx.new(|_| state)
+    }
+
+    /// A notice is written to the app's own database and read back from it after a restart. The
+    /// write runs where the database can run (8 Oct 2026: it ran on a background thread with no
+    /// Tokio context, and the app aborted the moment anything went wrong).
+    #[gpui_kit::test]
+    fn a_notice_is_kept_in_the_database_and_read_back(cx: &mut gpui_kit::TestAppContext) {
+        use gpui_kit::AppContext as _;
+        let runtime = a_runtime_for_the_relay(cx);
+        let _enter = runtime.enter();
+        let db = runtime.block_on(test_db());
+        let mut state = signed_in_state();
+        state.database_service = Some(db.clone());
+        let app = cx.new(|_| state);
+        app.update(cx, |state, cx| {
+            state.notify_error(Some("cw_1".into()), "Turn", "it broke", None, None, cx);
+        });
+        // A second window on the same database stands for a restart: it reads the notice back the
+        // way the app does, so the write is seen only once it really landed.
+        let reopened = cx.new(|_| {
+            let mut state = signed_in_state();
+            state.database_service = Some(db.clone());
+            state
+        });
+        wait_for(cx, "written, and read back after a restart", |cx| {
+            reopened.update(cx, |state, cx| {
+                if state.notices.is_empty() {
+                    state.load_notices(cx);
+                }
+            });
+            cx.run_until_parked();
+            reopened.read_with(cx, |state, _| {
+                state.notices.len() == 1 && state.notices[0].said == "it broke"
+            })
+        });
+    }
+
+    /// A turn that fails leaves one quiet line in the chat and its whole sentence in its Bot's
+    /// notifications, with where it was caught, and the toast says so (8 Oct 2026: the sentence
+    /// was a red line in the chat that could not be dismissed or copied).
+    #[gpui_kit::test]
+    fn a_failed_turn_goes_to_its_bots_notifications_and_the_toast(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        let runtime = a_runtime_for_the_relay(cx);
+        let _enter = runtime.enter();
+        let server = runtime.block_on(wiremock::MockServer::start());
+        let frames = vec![
+            json!({"type": "RUN_STARTED", "threadId": "cw_1", "runId": "run_turn"}),
+            json!({"type": "RUN_ERROR", "message": "upstream anthropic returned 400"}),
+        ];
+        let app = adas_window(cx, &runtime, &server, &frames, json!([]), Vec::new());
+        app.update(cx, |state, cx| state.send_message("hello".into(), cx));
+        wait_for(cx, "the failure is noticed", |cx| {
+            app.read_with(cx, |state, _| !state.notices.is_empty())
+        });
+        app.read_with(cx, |state, _| {
+            let notice = &state.notices[0];
+            assert_eq!(notice.bot.as_deref(), Some("cw_1"));
+            assert_eq!(notice.place, "Turn");
+            assert!(
+                notice.said.contains("upstream anthropic returned 400"),
+                "{notice:?}"
+            );
+            assert!(notice.code.starts_with("src/state.rs:"), "{notice:?}");
+            assert_eq!(
+                state.toast.as_deref(),
+                Some(notice.id.as_str()),
+                "the toast shows it"
+            );
+            assert_eq!(state.unread_notices("cw_1"), 1, "the bell counts it");
+        });
     }
 
     /// A Bot asked in chat makes a routine with `create_routine` (opengrok-server #316:
@@ -34907,12 +36928,13 @@ mod tests {
             Day,
             Err(OpenGrokError::message("boom".to_string()))
         ));
-        assert_eq!(
-            state.usage_modal.as_ref().map(|modal| modal.report.clone()),
-            Some(super::UsageReport::Unavailable(
-                "Could not load this bot's usage: boom".into()
-            ))
-        );
+        // A fault keeps the numbers last read, and is the modal's ⚠ only.
+        assert!(matches!(
+            state.usage_modal.as_ref().map(|modal| &modal.report),
+            Some(super::UsageReport::Read(_))
+        ));
+        let fault = state.open_fault(super::USAGE_TROUBLE).expect("a fault");
+        assert_eq!(fault.raw.as_deref(), Some("boom"));
         state.usage_modal = None;
         assert!(
             !state.settle_usage_modal(5, "cw_1".into(), Day, answer("24h")),
@@ -34935,6 +36957,7 @@ mod tests {
             loans: loans.iter().map(|lent| lent.to_string()).collect(),
             updated_at_ms: 1,
             expires_at_ms: None,
+            kind: crate::opengrok::ConnectionKind::Oauth,
         }
     }
 
@@ -35002,6 +37025,7 @@ mod tests {
         crate::opengrok::Connector {
             name: "gmail".into(),
             label: "Gmail".into(),
+            plugin: None,
         }
     }
 
@@ -35295,6 +37319,7 @@ mod tests {
         let service = |name: &str| crate::opengrok::Connector {
             name: name.into(),
             label: String::new(),
+            plugin: None,
         };
         state.connections.connectors = Some(ConnectorList::Listed(vec![
             gmail(),
@@ -35311,73 +37336,6 @@ mod tests {
             offered,
             ["github", "weather"],
             "a service connected in another scope is still the person's to connect"
-        );
-    }
-
-    /// Each service the person is sent to their browser for is waited on by itself: it stops
-    /// being waited on once the list has it as the person's own, or once its wait runs out, and
-    /// coming back to the window reads the list again only while one is still waited on.
-    #[test]
-    fn each_browser_sign_in_is_waited_on_until_it_is_listed_or_runs_out() {
-        let mut state = listed(Vec::new());
-        state.is_app_settings_open = true;
-        state.app_settings_tab = AppSettingsTab::Connections;
-        let start = Instant::now();
-        let later = start + Duration::from_secs(5 * 60);
-        for (service, at) in [("gmail", start), ("github", later)] {
-            let (_, ask) = state.begin_connect(service).expect("a Connect");
-            assert!(
-                state
-                    .settle_connect_link(ask, service, Ok("https://example.com/".into()), at)
-                    .is_some()
-            );
-        }
-        assert!(state.connections.is_waiting("gmail", start));
-        assert!(state.connections.is_waiting("github", start));
-        assert!(state.connections.still_waiting(later));
-
-        // A github connection that is a bot's own is not the person's sign-in coming back.
-        let mut bots = connection("conn_2", "github", &[]);
-        bots.owner = crate::opengrok::ConnectionOwner::Bot("cw_1".into());
-        let read = state.begin_connections_read().expect("a read").generation;
-        assert!(state.settle_connections(read, Ok(vec![connection("conn_1", "gmail", &[]), bots])));
-        assert!(!state.connections.is_waiting("gmail", start));
-        assert!(state.connections.is_waiting("github", start));
-
-        // Gmail's ten minutes would be up by now; github's are not.
-        let gmail_over = start + BROWSER_WAIT + Duration::from_secs(1);
-        assert!(state.connections.still_waiting(gmail_over));
-        assert!(state.connections.is_waiting("github", gmail_over));
-        let all_over = later + BROWSER_WAIT + Duration::from_secs(1);
-        assert!(!state.connections.is_waiting("github", all_over));
-        assert!(!state.connections.still_waiting(all_over));
-        assert!(state.connections.waiting.is_empty());
-    }
-
-    /// Coming back to the window reads the connections again while a sign-in is waited on, and
-    /// also, once the wait is over, whenever a connections list is on screen: someone who signed
-    /// in and came back after the ten minutes still finds the new connection.
-    #[test]
-    fn coming_back_to_the_window_reads_the_connections_while_they_are_on_screen() {
-        let mut state = listed(vec![]);
-        let now = Instant::now();
-        assert!(
-            !state.rereads_connections_on_activation(now),
-            "nothing waited on and nothing on screen"
-        );
-        state.is_app_settings_open = true;
-        state.app_settings_tab = AppSettingsTab::Connections;
-        assert!(
-            state.rereads_connections_on_activation(now),
-            "Settings → Connections is on screen, after any wait"
-        );
-        state.app_settings_tab = AppSettingsTab::Logins;
-        assert!(!state.rereads_connections_on_activation(now));
-        state.is_app_settings_open = false;
-        state.right_pane = super::RightPane::Settings;
-        assert!(
-            state.rereads_connections_on_activation(now),
-            "a Bot's settings, with its Connections card, is on screen"
         );
     }
 
@@ -35471,15 +37429,87 @@ mod tests {
         assert_eq!(lines(&state), (false, false));
     }
 
-    /// Connect opens the page the server gave, only for the ask it was and only while Settings
-    /// → Connections is on screen, and waits for the browser; a refusal is said beside the
+    /// The Plugins marketplace open for the open Bot: where accounts are signed in to now.
+    fn open_plugins(state: &mut AppState) {
+        state.active_coworker_id = Some("cw_1".into());
+        state.monitor_modal = Some(crate::components::monitor_modal::MonitorModal::new(
+            "cw_1".into(),
+            crate::components::monitor_modal::MonitorKind::Plugins,
+        ));
+    }
+
+    /// Each service the person is sent to their browser for is waited on by itself: it stops
+    /// being waited on once the list has it as the person's own, or once its wait runs out, and
+    /// coming back to the window reads the list again only while one is still waited on.
+    #[test]
+    fn each_browser_sign_in_is_waited_on_until_it_is_listed_or_runs_out() {
+        let mut state = listed(Vec::new());
+        open_plugins(&mut state);
+        let start = Instant::now();
+        let later = start + Duration::from_secs(5 * 60);
+        for (service, at) in [("gmail", start), ("github", later)] {
+            let (_, ask) = state.begin_connect(service).expect("a Connect");
+            assert!(
+                state
+                    .settle_connect_link(ask, service, Ok("https://example.com/".into()), at)
+                    .is_some()
+            );
+        }
+        assert!(state.connections.is_waiting("gmail", start));
+        assert!(state.connections.is_waiting("github", start));
+        assert!(state.connections.still_waiting(later));
+
+        // A github connection that is a bot's own is not the person's sign-in coming back.
+        let mut bots = connection("conn_2", "github", &[]);
+        bots.owner = crate::opengrok::ConnectionOwner::Bot("cw_1".into());
+        let read = state.begin_connections_read().expect("a read").generation;
+        assert!(state.settle_connections(read, Ok(vec![connection("conn_1", "gmail", &[]), bots])));
+        assert!(!state.connections.is_waiting("gmail", start));
+        assert!(state.connections.is_waiting("github", start));
+
+        // Gmail's ten minutes would be up by now; github's are not.
+        let gmail_over = start + BROWSER_WAIT + Duration::from_secs(1);
+        assert!(state.connections.still_waiting(gmail_over));
+        assert!(state.connections.is_waiting("github", gmail_over));
+        let all_over = later + BROWSER_WAIT + Duration::from_secs(1);
+        assert!(!state.connections.is_waiting("github", all_over));
+        assert!(!state.connections.still_waiting(all_over));
+        assert!(state.connections.waiting.is_empty());
+    }
+
+    /// Coming back to the window reads the connections again while a sign-in is waited on, and
+    /// also, once the wait is over, whenever a connections list is on screen: someone who signed
+    /// in and came back after the ten minutes still finds the new connection.
+    #[test]
+    fn coming_back_to_the_window_reads_the_connections_while_they_are_on_screen() {
+        let mut state = listed(vec![]);
+        let now = Instant::now();
+        assert!(
+            !state.rereads_connections_on_activation(now),
+            "nothing waited on and nothing on screen"
+        );
+        open_plugins(&mut state);
+        assert!(
+            state.rereads_connections_on_activation(now),
+            "Plugins is on screen, after any wait"
+        );
+        state.monitor_modal = None;
+        assert!(!state.rereads_connections_on_activation(now));
+        state.right_pane = super::RightPane::Settings;
+        assert!(
+            state.rereads_connections_on_activation(now),
+            "a Bot's settings, with its Connections card, is on screen"
+        );
+    }
+
+    /// Connect opens the page the server gave, only for the ask it was and only while Plugins is on
+    /// screen, and waits for the browser; a refusal is said beside the
     /// service, by its label, in the server's words.
     #[test]
     fn a_connect_opens_only_the_page_its_own_ask_was_given() {
         let mut state = listed(Vec::new());
         state.connections.connectors = Some(ConnectorList::Listed(vec![gmail()]));
-        state.is_app_settings_open = true;
-        state.app_settings_tab = AppSettingsTab::Connections;
+        open_plugins(&mut state);
         let now = Instant::now();
         let url = || Ok("https://accounts.google.com/o".to_string());
 
@@ -35520,14 +37550,14 @@ mod tests {
         // alive again.
         state.connections.waiting.clear();
         let (_, ask) = state.begin_connect("gmail").expect("a Connect");
-        state.is_app_settings_open = false;
+        state.monitor_modal = None;
         assert_eq!(state.settle_connect_link(ask, "gmail", url(), now), None);
         assert_eq!(state.connections.opening, None);
         assert!(!state.connections.is_waiting("gmail", now));
     }
 
     /// A Connect asked for by an account that has since signed out is not opened: not when the
-    /// next account is on Settings → Connections asking nothing, and not when it has asked for
+    /// next account has Plugins open asking nothing, and not when it has asked for
     /// the same service, where the ask's number tells the two apart and the service's name
     /// cannot. Signing out is `logout`'s own `forget_account`, not a copy of it.
     #[test]
@@ -35543,11 +37573,9 @@ mod tests {
                     .expect("an account"),
             );
             state.auth_status = AuthStatus::SignedIn;
-            state.is_app_settings_open = true;
-            state.app_settings_tab = AppSettingsTab::Connections;
+            open_plugins(state);
         };
-        state.is_app_settings_open = true;
-        state.app_settings_tab = AppSettingsTab::Connections;
+        open_plugins(&mut state);
 
         let (_, theirs) = state.begin_connect("gmail").expect("a Connect");
         sign_out_and_in(&mut state);
@@ -38226,7 +40254,10 @@ mod tests {
         assert!(!state.take_polled_recipe(trouble));
         assert!(!waits_on(&state, "rcp_1"));
         assert_eq!(state.recipe_busy, None);
-        assert_eq!(state.recipe_error.as_deref(), Some("pool timed out"));
+        assert_eq!(state.recipe_error, None, "a fault is no line on the page");
+        let fault = state.open_fault(super::RECIPE_TROUBLE).expect("a fault");
+        assert_eq!(fault.raw.as_deref(), Some("pool timed out"));
+        assert_eq!(fault.fault.as_ref().and_then(|f| f.status), Some(500));
 
         for answer in [
             OpenGrokError::from_server(Some(404), "no such recipe"),
@@ -38505,7 +40536,15 @@ mod tests {
             let said = error.message.clone();
             let next = state.take_run_answer("rcp_1".into(), "cw_1".into(), Err(error));
             assert_eq!(next, super::AfterRun::Reload, "{said}");
-            assert_eq!(state.recipe_error.as_deref(), Some(said.as_str()));
+            // No line on the page; the answer's own text only behind the ⚠ badge.
+            assert_eq!(state.recipe_error, None, "{said}");
+            let behind = state
+                .open_fault(super::RECIPE_TROUBLE)
+                .and_then(|fault| fault.raw.clone());
+            assert!(
+                behind.is_some_and(|behind| behind.contains(&said)),
+                "{said}"
+            );
             assert_eq!(state.recipe_busy, None, "{said}");
         }
 
@@ -38656,25 +40695,109 @@ mod tests {
     }
 
     /// A bot the person does not own answers 404, and that is said as what it is, not as a
-    /// failure; anything else keeps the server's own words.
+    /// failure. Anything else says it could not load them, and the failure's own text is only
+    /// behind the ⚠ badge, never in the pane.
     #[test]
     fn a_tool_list_the_server_will_not_give_says_why() {
         let owner = crate::opengrok::OpenGrokError::status(404, "no such coworker");
         assert_eq!(
             super::tools_unavailable(&owner),
-            "Only this bot's owner can see its tools."
+            "Only this bot's owner can see its tools.".into()
         );
         assert_eq!(
             super::tools_unavailable(&crate::opengrok::OpenGrokError::status(
                 401,
                 "sign in first"
             )),
-            "Sign in again to see this bot's tools."
+            "Sign in again to see this bot's tools.".into()
         );
         let down = crate::opengrok::OpenGrokError::status(503, "busy");
         assert_eq!(
             super::tools_unavailable(&down),
-            "Could not load this bot's tools: busy"
+            super::Trouble {
+                said: "Could not load this bot's tools.".into(),
+                detail: Some(crate::faults::FaultInput {
+                    raw: "busy".into(),
+                    endpoint: None,
+                    status: Some(503),
+                }),
+            }
+        );
+    }
+
+    /// A failed read is one fault notice however often it fails the same way, counted; marking
+    /// it read hides the badge and unread brings it back; the newest of several shows first; a
+    /// read that works resolves them; words written for a person raise none.
+    #[test]
+    fn a_fault_is_a_notice_the_badge_reads() {
+        use crate::faults::{FaultInput, Place};
+        let mut state = AppState::new();
+        let down = |raw: &str| FaultInput {
+            raw: raw.into(),
+            endpoint: Some("GET /coworkers/cw_1/usage".into()),
+            status: Some(502),
+        };
+        state.raise_fault(Place::Usage, "Usage failed", down("error sending request"));
+        state.raise_fault(Place::Usage, "Usage failed", down("error sending request"));
+        let first = state.open_fault(Place::Usage).expect("a badge").clone();
+        assert_eq!(
+            first.fault.as_ref().map(|f| f.count),
+            Some(2),
+            "the same failure is one notice"
+        );
+        assert_eq!(state.notices.len(), 1);
+
+        state.notices[0].read = true;
+        assert!(
+            state.open_fault(Place::Usage).is_none(),
+            "read hides the badge"
+        );
+        state.notices[0].read = false;
+        assert!(
+            state.open_fault(Place::Usage).is_some(),
+            "unread brings it back"
+        );
+
+        state.raise_fault(Place::Usage, "Usage failed", down("pool timed out"));
+        let open = state.faults_at(Place::Usage);
+        assert_eq!(open.len(), 2);
+        assert_eq!(
+            open[0].raw.as_deref(),
+            Some("pool timed out"),
+            "newest first"
+        );
+        let newest = open[0].id.clone();
+        state
+            .notices
+            .iter_mut()
+            .find(|n| n.id == newest)
+            .unwrap()
+            .read = true;
+        assert_eq!(
+            state
+                .open_fault(Place::Usage)
+                .and_then(|n| n.raw.as_deref()),
+            Some("error sending request"),
+            "the next one shows once the newest is read"
+        );
+
+        state.clear_trouble(Place::Usage);
+        assert!(
+            state.open_fault(Place::Usage).is_none(),
+            "a read that works resolves them"
+        );
+        assert!(
+            state
+                .notices
+                .iter()
+                .all(|n| n.fault.as_ref().is_some_and(|f| f.resolved))
+        );
+
+        let plain = state.keep_trouble(Place::Usage, &"Sign in again.".into());
+        assert_eq!(plain, "Sign in again.");
+        assert!(
+            state.open_fault(Place::Usage).is_none(),
+            "a person's words raise no fault"
         );
     }
 
@@ -39519,6 +41642,126 @@ mod tests {
 
     /// The open thread `cw_1`: a message that was queued, and the reply of `run_queued`, the run
     /// that fired it, which ended in `ending`.
+    /// The installs `GET /plugins/installations` answered with in the recording: `demo`, with
+    /// two pasted accounts.
+    fn recorded_installs() -> Vec<crate::opengrok::PluginInstallation> {
+        let recorded: serde_json::Value = serde_json::from_str(include_str!(
+            "../fixtures/wire/rest/GET__plugins_installations/200-a_second_pasted_account_is_added_beside_the_first_and_each_bot_uses_its_own.json"
+        ))
+        .unwrap();
+        serde_json::from_value(recorded["body"].clone()).unwrap()
+    }
+
+    /// Uninstall asks in words that say what goes: every account of the plugin, with its keys and
+    /// sign-ins in the vault, and its use by every Bot (6 Oct 2026, the owner's call). The title is
+    /// the question; the line under it is what happens.
+    #[test]
+    fn uninstall_says_its_accounts_and_their_secrets_go() {
+        use crate::components::monitor_modal::{MonitorKind, MonitorModal, PluginSelection};
+        let mut state = signed_in_state();
+        state.plugin_market.installations = Some(crate::state::Loaded::Ready(recorded_installs()));
+        let mut modal = MonitorModal::new("cw_1".into(), MonitorKind::Plugins);
+        modal.confirming = true;
+        state.monitor_modal = Some(modal);
+        let detail =
+            crate::components::marketplace::detail(&state, &PluginSelection::Plugin("demo".into()))
+                .expect("the install has a detail");
+        assert_eq!(
+            detail.question.as_deref(),
+            Some(
+                "Uninstall demo?\nIts 2 accounts are deleted, with their keys and sign-ins in the \
+                 vault, and every Bot stops using it. Installing it again starts with no accounts."
+            )
+        );
+    }
+
+    /// "@demo:execute" and "@routines:create_routine" name one tool each, as the Bot's own
+    /// listing names it, so the server can name it to the model (`preferTools`); a bare
+    /// "@routines" names the whole group. A function the Bot does not have is a word.
+    #[test]
+    fn a_function_tag_names_the_tool_the_bot_has() {
+        use crate::opengrok::CoworkerTool;
+        let mut state = signed_in_state();
+        state.active_coworker_id = Some("cw_1".into());
+        state.plugin_market.installations = Some(crate::state::Loaded::Ready(recorded_installs()));
+        let member = |name: &str| CoworkerTool {
+            name: name.into(),
+            kind: "builtin".into(),
+            ..Default::default()
+        };
+        state.coworker_tools = Some((
+            "cw_1".into(),
+            crate::state::ToolList::Listed(vec![
+                CoworkerTool {
+                    name: "demo_hosted_execute".into(),
+                    kind: "plugin".into(),
+                    plugin: Some("demo".into()),
+                    qualified: Some("demo.hosted.execute".into()),
+                    ..Default::default()
+                },
+                CoworkerTool {
+                    name: "routines".into(),
+                    kind: "builtin".into(),
+                    tools: vec![member("create_routine"), member("run_routine")],
+                    ..Default::default()
+                },
+            ]),
+        ));
+        let tags = state.turn_tags("@demo:execute and @routines:create_routine, @demo:nope");
+        assert_eq!(tags.plugins, ["demo"]);
+        assert_eq!(tags.tools, ["demo_hosted_execute", "create_routine"]);
+        assert_eq!(
+            state.turn_tags("@routines please").tools,
+            ["create_routine", "run_routine"]
+        );
+    }
+
+    /// What a turn carries is what its words tagged, read off them when it leaves: an installed
+    /// plugin, a built-in tool. A plugin nobody installed is a word, and so is an address.
+    #[test]
+    fn a_turn_carries_what_its_words_tagged() {
+        let mut state = signed_in_state();
+        let said = "@demo triage this with @shell, mail me@demo.com, ask @nope";
+        assert!(
+            state.turn_tags(said).plugins.is_empty(),
+            "no installs loaded yet"
+        );
+        state.plugin_market.installations = Some(crate::state::Loaded::Ready(recorded_installs()));
+        let tags = state.turn_tags(said);
+        assert_eq!(tags.plugins, ["demo"]);
+        assert_eq!(tags.tools, ["shell"]);
+    }
+
+    /// `@` lists a plugin once: its own account is the plugin's row, not a "Connected app" beside
+    /// it, which showed Cloudflare twice (6 Oct 2026). A service signed in to that is no plugin's
+    /// is still an app.
+    #[test]
+    fn a_plugins_own_account_is_not_listed_again_as_an_app() {
+        use crate::components::chat_input::sources::ToolSource;
+        let mut state = signed_in_state();
+        state.plugin_market.installations = Some(crate::state::Loaded::Ready(recorded_installs()));
+        let recorded: serde_json::Value = serde_json::from_str(include_str!(
+            "../fixtures/wire/rest/GET__connections/200-a_plugin_account_is_signed_in_at_its_own_server_refreshed_and_used_by_its_bot.json"
+        ))
+        .unwrap();
+        let mut rows: Vec<crate::opengrok::ConnectionView> =
+            serde_json::from_value(recorded["body"].clone()).unwrap();
+        assert!(
+            rows.iter()
+                .any(|row| row.kind == crate::opengrok::ConnectionKind::Mcp)
+        );
+        let mut gmail = rows[0].clone();
+        gmail.id = "conn_gmail".into();
+        gmail.connector = "gmail".into();
+        gmail.kind = crate::opengrok::ConnectionKind::Oauth;
+        rows.push(gmail);
+        state.connections.list = Some(ConnectionList::Listed(rows));
+        let source = ToolSource::of(&state);
+        assert_eq!(source.plugins.len(), 1);
+        let apps: Vec<&str> = source.apps.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(apps, ["gmail"]);
+    }
+
     fn a_queued_messages_reply(ending: &str) -> AppState {
         let mut state = signed_in_state();
         state.conversations.push(thread(
@@ -40082,7 +42325,7 @@ mod tests {
         };
         let pick = state.model_pick().expect("a Bot is open");
         assert_eq!(pick.summary(), "GPT-6 Luna · High ⚡");
-        let groups: Vec<(&str, Vec<&str>)> = pick
+        let groups: Vec<(String, Vec<&str>)> = pick
             .groups
             .iter()
             .map(|group| {
@@ -40095,8 +42338,8 @@ mod tests {
         assert_eq!(
             groups,
             vec![
-                (SUBSCRIPTION_GROUP, vec!["gpt-6-luna"]),
-                (GATEWAY_GROUP, vec!["oag/cheap"]),
+                (SUBSCRIPTION_GROUP.to_string(), vec!["gpt-6-luna"]),
+                (GATEWAY_GROUP.to_string(), vec!["oag/cheap"]),
             ]
         );
         assert_eq!(pick.fast_blocked, None);
@@ -40668,6 +42911,203 @@ mod tests {
     /// back on what the server keeps. It goes through the road a real refusal takes, over a real
     /// answer: the callback `save_model_pick` hands the request is what puts the words in the
     /// popover, so the test fails without it.
+    /// Something going wrong shows the toast, counts on the bell, and is listed on the bell's
+    /// page with where it was caught; Copy hands it over whole and Clear empties the page. All of
+    /// it through the driver's `notices.*`, the way a driver checks it (8 Oct 2026).
+    #[cfg(feature = "agent")]
+    #[gpui_kit::test]
+    fn a_notice_toasts_counts_on_the_bell_and_is_kept_on_its_page(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        use crate::agent::NativeChatHost;
+        use crate::components::notifications_pane as pane;
+        use gpui_agent::AgentHost as _;
+        use gpui_agent::protocol::Op;
+        use gpui_kit::AppContext as _;
+        let mut state = AppState::new();
+        state.auth_status = super::AuthStatus::SignedIn;
+        state.account =
+            serde_json::from_value(json!({"id": "acct_1", "email": "ada@example.com"})).ok();
+        state.coworkers.push(bob());
+        state.conversations.push(thread("cw_1", Vec::new()));
+        state.active_coworker_id = Some("cw_1".into());
+        state.active_conversation_id = Some("cw_1".into());
+        let app = cx.new(|_| state);
+        let run = |cx: &mut gpui_kit::TestAppContext, op: Op| -> Option<serde_json::Value> {
+            let (value, command) = app.read_with(cx, |state, _| {
+                let mut host = NativeChatHost::from_app(state);
+                let value = host.dispatch(&op).unwrap().value;
+                (value, host.take_command())
+            });
+            if let Some(command) = command {
+                app.update(cx, |state, cx| command.apply(state, cx));
+            }
+            value
+        };
+        let invoke = |name: &str, args: serde_json::Value| Op::Invoke {
+            name: name.into(),
+            args,
+        };
+        let tree = |cx: &mut gpui_kit::TestAppContext| {
+            app.read_with(cx, |state, _| NativeChatHost::from_app(state).snapshot())
+        };
+
+        run(
+            cx,
+            invoke(
+                "notices.fake",
+                json!({"place": "Turn", "said": "upstream anthropic returned 400"}),
+            ),
+        );
+        let t = tree(cx);
+        assert!(t.find(pane::TOAST).is_some(), "the toast shows");
+        assert_eq!(
+            t.find(crate::components::title_bar::BELL)
+                .unwrap()
+                .value
+                .as_deref(),
+            Some("1"),
+            "the bell counts it"
+        );
+        let count = run(cx, invoke("notices.count", json!({}))).unwrap();
+        assert_eq!(count, json!({"total": 1, "unread": 1}));
+
+        run(cx, Op::click(crate::components::title_bar::BELL));
+        let listed = run(cx, invoke("notices.list", json!({"last": 5}))).unwrap();
+        let id = listed[0]["id"].as_str().unwrap().to_string();
+        assert_eq!(listed[0]["place"], "Turn");
+        assert_eq!(
+            listed[0]["read"], false,
+            "opening the page is not reading it"
+        );
+        assert!(
+            listed[0]["code"].as_str().unwrap().starts_with("src/"),
+            "{listed}"
+        );
+        let t = tree(cx);
+        assert!(t.find(&pane::row_id(&id)).is_some(), "listed on the page");
+        assert!(t.find(pane::UNREAD_COUNT).is_some(), "the title counts it");
+
+        // Opening a row shows where it was caught, and reads it.
+        run(cx, Op::click(pane::row_id(&id)));
+        assert!(
+            tree(cx).find(&pane::details_id(&id)).is_some(),
+            "its details"
+        );
+        assert_eq!(
+            tree(cx)
+                .find(crate::components::title_bar::BELL)
+                .unwrap()
+                .value
+                .as_deref(),
+            Some("0")
+        );
+        // Ticked, the toolbar is about the selection: unread again, then read.
+        run(cx, Op::click(pane::select_id(&id)));
+        assert!(tree(cx).find(pane::SELECTED_COUNT).is_some());
+        run(cx, Op::click(pane::MARK_UNREAD));
+        assert_eq!(
+            run(cx, invoke("notices.count", json!({}))).unwrap()["unread"],
+            1
+        );
+        assert!(
+            tree(cx).find(pane::FILTER_UNREAD).is_none(),
+            "the selection's toolbar stands"
+        );
+        run(cx, Op::click(pane::MARK_READ));
+        assert_eq!(
+            run(cx, invoke("notices.count", json!({}))).unwrap()["unread"],
+            0
+        );
+
+        let got = run(cx, invoke("notices.get", json!({"id": id}))).unwrap();
+        assert!(
+            got["copyText"].as_str().unwrap().contains("Where:  Turn"),
+            "{got}"
+        );
+
+        run(cx, invoke("notices.dismiss", json!({})));
+        assert!(tree(cx).find(pane::TOAST).is_none(), "dismissed");
+
+        // Delete leaves an Undo; Undo puts it back; Delete all empties the page.
+        run(cx, Op::click(pane::DELETE_SELECTED));
+        assert!(tree(cx).find(pane::UNDO).is_some(), "an Undo stands");
+        run(cx, Op::click(pane::UNDO));
+        assert!(tree(cx).find(&pane::row_id(&id)).is_some(), "put back");
+        run(cx, Op::click(pane::DELETE_ALL));
+        assert!(
+            tree(cx).find(pane::EMPTY).is_some(),
+            "the empty state after Delete all"
+        );
+        run(cx, invoke("notices.fake", json!({"bot": "none"})));
+        run(cx, invoke("notices.clear-all", json!({})));
+        let all = run(cx, invoke("notices.list", json!({"all": true}))).unwrap();
+        assert_eq!(all, json!([]));
+    }
+
+    /// Opening a picker reads the model list again: a model the person's opencodex (or the
+    /// gateway) began serving since the last read is in the list without a trip to Settings
+    /// (8 Oct 2026: a key added in opencodex showed nothing until Settings → General was opened).
+    #[gpui_kit::test]
+    fn opening_a_picker_reads_the_models_again(cx: &mut gpui_kit::TestAppContext) {
+        use super::PickerFor;
+        use gpui_kit::AppContext as _;
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("a runtime");
+        let _enter = runtime.enter();
+        cx.executor().allow_parking();
+        let server = runtime.block_on(wiremock::MockServer::start());
+        runtime.block_on(
+            wiremock::Mock::given(wiremock::matchers::method("GET"))
+                .and(wiremock::matchers::path("/models"))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
+                    "models": [
+                        {"id": "gpt-6-luna", "source": "local_proxy"},
+                        {"id": "new-model-today", "source": "local_proxy"}
+                    ],
+                    "note": null
+                })))
+                .mount(&server),
+        );
+        let mut state = signed_in_state();
+        state.opengrok = Some(runtime.block_on(client_signed_in_to(&server)));
+        with_bot(&mut state, json!("local_proxy"));
+        state.model_catalogue = serde_json::from_value(json!({
+            "models": [{"id": "gpt-6-luna", "source": "local_proxy"}],
+            "note": null
+        }))
+        .expect("a list");
+        // Read from the server a while ago, so the opening reads it again.
+        state.models_read_at =
+            std::time::Instant::now().checked_sub(std::time::Duration::from_secs(60));
+        let app = cx.new(|_| state);
+        app.update(cx, |state, cx| {
+            state.set_picker_open(PickerFor::Bot, true, cx)
+        });
+        let listed = |cx: &mut gpui_kit::TestAppContext| {
+            app.read_with(cx, |state, _| {
+                state
+                    .model_catalogue
+                    .models
+                    .iter()
+                    .any(|m| m.id == "new-model-today")
+            })
+        };
+        let mut waited = 0;
+        while !listed(cx) {
+            assert!(
+                waited < 400,
+                "the opened picker did not read the models again"
+            );
+            cx.run_until_parked();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            waited += 1;
+        }
+    }
+
     #[gpui_kit::test]
     fn a_bots_refused_effort_is_said_in_its_popover_through_the_real_refusal(
         cx: &mut gpui_kit::TestAppContext,
@@ -43605,6 +46045,781 @@ mod tests {
             "no row, nothing written"
         );
     }
+
+    /// Plugins → Logins lists each saved login with how many Bots may use it; a login opens its
+    /// Bots page, and a Bot's switch there takes the login back from it (8 Oct 2026).
+    #[cfg(feature = "agent")]
+    #[gpui_kit::test]
+    fn a_login_is_shared_with_bots_from_its_page_in_the_plugins_window(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        use crate::agent::NativeChatHost;
+        use crate::components::marketplace;
+        use crate::components::monitor_modal::{MarketPage, MonitorKind, MonitorModal};
+        use gpui_agent::AgentHost as _;
+        use gpui_agent::protocol::Op;
+        use gpui_kit::AppContext as _;
+        use wiremock::matchers::{body_json, method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        let runtime = a_runtime_for_the_relay(cx);
+        let _enter = runtime.enter();
+        let server = runtime.block_on(wiremock::MockServer::start());
+        runtime.block_on(async {
+            Mock::given(method("GET"))
+                .and(path("/coworkers/cw_1/site-logins"))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(json!({"logins": ["sl_ada"]})),
+                )
+                .up_to_n_times(1)
+                .mount(&server)
+                .await;
+            // After the switch, the server has it off.
+            Mock::given(method("GET"))
+                .and(path("/coworkers/cw_1/site-logins"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({"logins": []})))
+                .mount(&server)
+                .await;
+            Mock::given(method("PUT"))
+                .and(path("/site-logins/sl_ada/bots/cw_1"))
+                .and(body_json(json!({"shared": false})))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+                .expect(1)
+                .mount(&server)
+                .await;
+        });
+        let mut state = AppState::new();
+        state.auth_status = super::AuthStatus::SignedIn;
+        state.opengrok = Some(OpenGrokClient::new(&server.uri()).unwrap());
+        state.account =
+            serde_json::from_value(json!({"id": "acct_1", "email": "ada@example.com"})).ok();
+        state.coworkers.push(bob());
+        state.active_coworker_id = Some("cw_1".into());
+        state.site_logins = vec![saved_login(
+            "sl_ada",
+            "github.com",
+            "ada@example.com",
+            "password",
+        )];
+        state.monitor_modal = Some(MonitorModal::new("cw_1".into(), MonitorKind::Plugins));
+        let app = cx.new(|_| state);
+        let drive = |cx: &mut gpui_kit::TestAppContext, target: &str| {
+            let command = app.read_with(cx, |state, _| {
+                let mut host = NativeChatHost::from_app(state);
+                host.dispatch(&Op::click(target)).unwrap();
+                host.take_command()
+            });
+            app.update(cx, |state, cx| command.unwrap().apply(state, cx));
+        };
+        drive(cx, marketplace::LOGINS);
+        assert_eq!(
+            app.read_with(cx, |state, _| state
+                .monitor_modal
+                .as_ref()
+                .unwrap()
+                .page
+                .clone()),
+            MarketPage::Logins
+        );
+        let count = |cx: &mut gpui_kit::TestAppContext| {
+            app.read_with(cx, |state, _| {
+                marketplace::login_rows(state)[0].action.clone()
+            })
+        };
+        wait_for(cx, "each Bot's logins are read", |cx| {
+            count(cx) == marketplace::RowAction::Count("1 Bot".into())
+        });
+        drive(cx, "market-login-sl_ada");
+        let switch = marketplace::login_bot_switch_id("sl_ada", "cw_1");
+        app.read_with(cx, |state, _| {
+            let tree = NativeChatHost::from_app(state).snapshot();
+            let node = tree.find(&switch).expect("the Bot's switch is drawn");
+            assert!(node.states.iter().any(|s| s == "checked"), "on: {node:?}");
+        });
+        drive(cx, &switch);
+        wait_for(cx, "the server is told", |_| {
+            runtime
+                .block_on(server.received_requests())
+                .unwrap_or_default()
+                .iter()
+                .any(|r| r.method.as_str() == "PUT")
+        });
+        app.read_with(cx, |state, _| {
+            assert!(
+                state
+                    .site_login_shares
+                    .get("cw_1")
+                    .is_some_and(|ids| !ids.contains("sl_ada"))
+            );
+        });
+        drive(cx, crate::components::monitor_modal::BACK);
+        // Back on the list, the shares are read again; the count follows the switch.
+        wait_for(cx, "the list counts the login's Bots again", |cx| {
+            count(cx) == marketplace::RowAction::Count("0 Bots".into())
+                && runtime
+                    .block_on(server.received_requests())
+                    .unwrap_or_default()
+                    .iter()
+                    .filter(|r| r.method.as_str() == "GET")
+                    .count()
+                    >= 2
+        });
+        for _ in 0..20 {
+            cx.run_until_parked();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    /// On a Bot whose computer is shared, picking a saved login asks no Touch ID: the card says
+    /// why in place of the logins, "Give it its own computer" asks the server for one, and the
+    /// logins come back once the Bot has it (8 Oct 2026: Touch ID came first, then a refusal
+    /// with no way on).
+    #[cfg(feature = "agent")]
+    #[gpui_kit::test]
+    fn a_saved_login_on_a_shared_computer_asks_no_touch_id_and_offers_its_own(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        use crate::agent::NativeChatHost;
+        use gpui_agent::AgentHost as _;
+        use gpui_agent::protocol::Op;
+        use gpui_kit::AppContext as _;
+        use wiremock::matchers::{body_json, method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        let runtime = a_runtime_for_the_relay(cx);
+        let _enter = runtime.enter();
+        let server = runtime.block_on(wiremock::MockServer::start());
+        runtime.block_on(async {
+            Mock::given(method("GET"))
+                .and(path("/coworkers/cw_1/saved-login"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(
+                    json!({"usable": false, "reason": "shared-computer", "ownComputer": false}),
+                ))
+                .up_to_n_times(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/coworkers/cw_1/saved-login"))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(
+                        json!({"usable": true, "reason": null, "ownComputer": true}),
+                    ),
+                )
+                .mount(&server)
+                .await;
+            Mock::given(method("PUT"))
+                .and(path("/coworkers/cw_1/own-computer"))
+                .and(body_json(json!({"on": true})))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(json!({"ownComputer": true})),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+        });
+        let mut state = AppState::new();
+        state.auth_status = super::AuthStatus::SignedIn;
+        state.opengrok = Some(OpenGrokClient::new(&server.uri()).unwrap());
+        state.account =
+            serde_json::from_value(json!({"id": "acct_1", "email": "ada@example.com"})).ok();
+        state.coworkers.push(bob());
+        state.site_logins = vec![saved_login(
+            "sl_ada",
+            "google.com",
+            "ada@example.com",
+            "password",
+        )];
+        state.site_logins_ready = true;
+        let mut sign_in = message("m1", false, "");
+        sign_in.parts = vec![ChatPart::UserForm(google_card(
+            "e_login",
+            json!([
+                {"id": "email", "label": "Email", "type": "email", "required": true},
+                {"id": "password", "label": "Password", "type": "password", "required": true}
+            ]),
+        ))];
+        state.conversations.push(thread("cw_1", vec![sign_in]));
+        state.active_conversation_id = Some("cw_1".into());
+        let app = cx.new(|_| state);
+        let card = app.read_with(cx, |state, _| {
+            state
+                .conversations
+                .iter()
+                .flat_map(|c| &c.messages)
+                .flat_map(|m| &m.parts)
+                .find_map(|part| match part {
+                    ChatPart::UserForm(spec) => Some(spec.card_key().to_string()),
+                    _ => None,
+                })
+                .unwrap()
+        });
+        app.update(cx, |state, cx| {
+            state.pick_saved_login(card.clone(), "sl_ada".into(), cx)
+        });
+        wait_for(cx, "the check is answered", |cx| {
+            app.read_with(cx, |state, _| state.saved_login_checks.contains_key("cw_1"))
+        });
+        app.read_with(cx, |state, _| {
+            assert!(
+                !state.saved_login_use.contains_key(&card),
+                "no Touch ID was asked for a login that cannot be used"
+            );
+            assert!(
+                state.user_form_list_open.contains(&card),
+                "the card says why"
+            );
+        });
+        let own = crate::opengrok::user_form_own_computer_id(&card);
+        let command = app.read_with(cx, |state, _| {
+            let mut host = NativeChatHost::from_app(state);
+            let tree = host.snapshot();
+            assert!(
+                tree.find(&own).is_some(),
+                "{own} is drawn: {:?}",
+                tree.find(&format!("user-form-{card}")).map(|n| n
+                    .children
+                    .iter()
+                    .map(|c| c.id.clone())
+                    .collect::<Vec<_>>())
+            );
+            assert!(
+                host.snapshot()
+                    .find(&crate::opengrok::user_form_by_hand_id(&card))
+                    .is_some()
+            );
+            host.dispatch(&Op::click(&own)).unwrap();
+            host.take_command()
+        });
+        app.update(cx, |state, cx| command.unwrap().apply(state, cx));
+        wait_for(
+            cx,
+            "the Bot has its own computer and its logins are back",
+            |cx| {
+                app.read_with(cx, |state, _| {
+                    state
+                        .saved_login_checks
+                        .get("cw_1")
+                        .is_some_and(|check| check.usable)
+                        && state.own_computer_changing.is_none()
+                })
+            },
+        );
+    }
+
+    #[cfg(feature = "agent")]
+    #[gpui_kit::test]
+    fn a_plugin_that_signs_people_in_adds_accounts_at_its_own_provider(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        use crate::agent::NativeChatHost;
+        use crate::components::marketplace::{self, AccountAction, AccountStatus};
+        use crate::components::monitor_modal::PluginSelection;
+        use gpui_agent::AgentHost as _;
+        use gpui_agent::protocol::Op;
+        use gpui_kit::AppContext as _;
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, ResponseTemplate};
+        const REV: &str = "0123456789abcdef0123456789abcdef01234567";
+        let runtime = a_runtime_for_the_relay(cx);
+        let _enter = runtime.enter();
+        let server = runtime.block_on(wiremock::MockServer::start());
+        let install = json!({"name": "cloudflare", "registry": "xai-org/plugin-marketplace",
+            "registryRevision": REV, "repository": "cloudflare/skills", "revision": REV,
+            "installedAtMs": 1, "bundle": {"manifest": {"name": "cloudflare"}, "parts": []},
+            "connectors": ["cloudflare"], "accounts": [{"connector": "cloudflare", "connectionId": "conn_mcp_1"}]});
+        let mcp_account = json!({"id": "conn_mcp_1", "connector": "cloudflare",
+            "owner": {"scope": "user", "id": "acct_1"}, "label": "Cloudflare", "loans": [],
+            "updatedAtMs": 1, "kind": "mcp"});
+        let waiting = json!([{"id": "attempt_9", "connector": "cloudflare", "label": "Cloudflare 2",
+            "coworkerId": null, "status": "pending", "error": null, "updatedAtMs": 2, "plugin": "cloudflare"}]);
+        runtime.block_on(async {
+            for (at, body) in [
+                ("/plugins/catalog", json!({"registry": "xai-org/plugin-marketplace", "revision": REV, "plugins": []})),
+                ("/plugins/installations", json!([install])),
+                ("/connections", json!([mcp_account])),
+                ("/connectors", json!([])),
+                ("/connections/pins", json!([])),
+                ("/coworkers/cw_1/tools", json!({"tools": []})),
+                ("/coworkers/cw_1/ceiling", json!({"tools": [], "version": 1})),
+                ("/coworkers/cw_1/skills", json!({"skills": [], "version": 1})),
+                ("/plugins/installations/cloudflare/connectors/cloudflare/sign-in", json!({"method": "oauth"})),
+            ] {
+                Mock::given(method("GET")).and(path(at))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(body))
+                    .mount(&server).await;
+            }
+            // Nothing waits until Add starts a sign-in; then the server lists it.
+            Mock::given(method("GET")).and(path("/connections/attempts"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+                .up_to_n_times(1).mount(&server).await;
+            Mock::given(method("GET")).and(path("/connections/attempts"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(waiting))
+                .mount(&server).await;
+            let page = json!({"url": "https://dash.cloudflare.com/oauth2/auth?state=x", "expiresAtMs": 1});
+            Mock::given(method("GET")).and(path("/plugins/installations/cloudflare/connectors/cloudflare/authorize"))
+                .and(query_param("format", "json"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(page))
+                .expect(2).mount(&server).await;
+        });
+        let mut state = crate::components::monitor_modal::tests::catalog();
+        state.connections.list = None;
+        state.connections.connectors = None;
+        state.opengrok = Some(OpenGrokClient::new(&server.uri()).unwrap());
+        let app = cx.new(|_| state);
+        let drive = |cx: &mut gpui_kit::TestAppContext, target: &str| {
+            let command = app.read_with(cx, |state, _| {
+                let mut host = NativeChatHost::from_app(state);
+                host.dispatch(&Op::click(target)).unwrap();
+                host.take_command()
+            });
+            if let Some(command) = command {
+                app.update(cx, |state, cx| command.apply(state, cx));
+            }
+        };
+        let settled = |cx: &mut gpui_kit::TestAppContext| {
+            app.read_with(cx, |state, _| {
+                state.plugin_market.in_flight == 0
+                    && !matches!(
+                        state.connections.list,
+                        Some(super::ConnectionList::Loading) | None
+                    )
+                    && !matches!(state.connections.pins, Some(super::PinList::Loading))
+                    && !matches!(
+                        state.coworker_tools,
+                        Some((_, crate::state::ToolList::Loading))
+                    )
+                    && state.ceiling_reading.is_none()
+                    && state.skills_reading.is_none()
+            })
+        };
+        drive(cx, "footer-plugins");
+        wait_for(cx, "the marketplace is read", settled);
+        app.update(cx, |state, cx| {
+            state.open_market_detail(PluginSelection::Plugin("cloudflare".into()), cx)
+        });
+        wait_for(cx, "how it adds an account is read", settled);
+        let card = |cx: &mut gpui_kit::TestAppContext| {
+            app.read_with(cx, |state, _| {
+                marketplace::detail(state, &PluginSelection::Plugin("cloudflare".into()))
+                    .unwrap()
+                    .accounts[0]
+                    .clone()
+            })
+        };
+        let first = card(cx);
+        assert!(
+            !first.pasted,
+            "it signs people in itself: Add opens its page, not a token field"
+        );
+        assert!(first.can_add);
+        assert_eq!(
+            first.lines[0].action.as_ref().unwrap().1,
+            AccountAction::PluginReconnect
+        );
+
+        // Add asks the server for the provider's page; the sign-in then waits as Needs Auth.
+        drive(cx, "market-add-account-cloudflare");
+        wait_for(
+            cx,
+            "the page is asked for and the sign-ins read again",
+            settled,
+        );
+        let after = card(cx);
+        let line = after.lines.iter().find(|l| l.id == "attempt_9").unwrap();
+        assert_eq!(line.status, AccountStatus::NeedsAuth(None));
+        assert_eq!(line.label, "Cloudflare 2");
+        assert_eq!(line.action.as_ref().unwrap().1, AccountAction::Reopen);
+        assert!(
+            app.read_with(cx, |state, _| state.plugin_market.token.is_none()),
+            "no token field"
+        );
+
+        // Reconnect on the MCP account asks for its page again, by its id.
+        drive(cx, "monitor-account-reconnect-conn_mcp_1");
+        wait_for(cx, "the reconnect page is asked for", settled);
+        runtime.block_on(server.verify());
+    }
+
+    #[cfg(feature = "agent")]
+    #[gpui_kit::test]
+    fn the_marketplace_groups_by_category_searches_by_keyboard_and_installs_only_on_add(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        use crate::agent::NativeChatHost;
+        use crate::components::marketplace::{self, RowAction};
+        use crate::components::monitor_modal::{MarketPage, PluginSelection};
+        use gpui_agent::AgentHost as _;
+        use gpui_agent::protocol::Op;
+        use gpui_kit::AppContext as _;
+        use wiremock::matchers::{body_json, method, path, query_param};
+        use wiremock::{Mock, ResponseTemplate};
+        const REV: &str = "0123456789abcdef0123456789abcdef01234567";
+        let runtime = a_runtime_for_the_relay(cx);
+        let _enter = runtime.enter();
+        let server = runtime.block_on(wiremock::MockServer::start());
+        let entry = |name: &str, category: Option<&str>| {
+            json!({"name": name, "description": format!("{name} does things"), "category": category,
+                   "repository": "fixture/plugins", "revision": REV, "path": name, "unavailableReason": null})
+        };
+        let mut plugins: Vec<serde_json::Value> = ["alpha", "bravo", "charlie", "delta", "echo"]
+            .iter()
+            .map(|n| entry(n, Some("development")))
+            .collect();
+        plugins.push(entry("golf", Some("database")));
+        plugins.push(entry("hotel", None));
+        let install = |name: &str| {
+            json!({"name": name, "registry": "fixture/plugins", "registryRevision": REV,
+                   "repository": "fixture/plugins", "revision": REV, "installedAtMs": 1,
+                   "bundle": {"manifest": {"name": name, "description": "Installed before"}, "parts": []},
+                   "connectors": [], "accounts": []})
+        };
+        runtime.block_on(async {
+            for (at, body) in [
+                ("/plugins/catalog", json!({"registry":"fixture/plugins", "revision": REV, "plugins": plugins})),
+                ("/connections", json!([])),
+                ("/connectors", json!([{"name":"gmail", "label":"Gmail"}])),
+                ("/connections/pins", json!([])),
+                ("/connections/attempts", json!([{"id":"attempt_1", "connector":"gmail", "label":"Gmail",
+                    "coworkerId": null, "status":"failed", "error":"the provider did not connect: access_denied",
+                    "updatedAtMs": 1}])),
+                ("/coworkers/cw_1/tools", json!({"tools":[]})),
+                ("/coworkers/cw_1/ceiling", json!({"tools":[], "version":1})),
+                ("/coworkers/cw_1/skills", json!({"skills":[], "version":1})),
+                ("/coworkers/cw_1/plugin-skills", json!({"skills":[
+                    {"plugin":"bravo", "skill":"review", "description":"Review a change", "on":true}]})),
+                ("/coworkers/cw_1/plugin-skills/bravo/review", json!({"plugin":"bravo", "skill":"review",
+                    "description":"Review a change", "on":true, "body":"Read the diff first."})),
+            ] {
+                Mock::given(method("GET"))
+                    .and(path(at))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(body))
+                    .mount(&server)
+                    .await;
+            }
+            Mock::given(method("GET"))
+                .and(path("/plugins/catalog/bravo"))
+                .and(query_param("revision", REV))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "entry": entry("bravo", Some("development")), "registryRevision": REV,
+                    "parts": [{"kind":"skill", "name":"review", "supported":true, "reason":null},
+                              {"kind":"mcp", "name":"bravo", "supported":true, "reason":null},
+                              {"kind":"hooks", "name":"hooks", "supported":false, "reason":"hooks never run here"}],
+                    "connectors": ["bravo"]})))
+                .mount(&server)
+                .await;
+            // Installed before: one the marketplace no longer lists. After Add, bravo too.
+            Mock::given(method("GET"))
+                .and(path("/plugins/installations"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!([install("legacy-tool")])))
+                .up_to_n_times(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/plugins/installations"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!([install("legacy-tool"), install("bravo")])))
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path("/plugins/installations"))
+                .and(body_json(json!({"name":"bravo", "registryRevision": REV})))
+                .respond_with(ResponseTemplate::new(201).set_body_json(json!({"name":"bravo"})))
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("PUT"))
+                .and(path("/coworkers/cw_1/plugin-skills"))
+                .and(body_json(json!({"plugin":"bravo", "skill":"review", "on":false})))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/connections/attempts/attempt_1/reopen"))
+                .and(query_param("format", "json"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(
+                    json!({"url":"https://accounts.example.com/authorize?state=x", "expiresAtMs": 1}),
+                ))
+                .expect(1)
+                .mount(&server)
+                .await;
+        });
+        let mut state = crate::components::monitor_modal::tests::catalog();
+        state.connections.list = None;
+        state.connections.connectors = None;
+        state.opengrok = Some(OpenGrokClient::new(&server.uri()).unwrap());
+        let app = cx.new(|_| state);
+        let drive = |cx: &mut gpui_kit::TestAppContext, op: Op| {
+            let command = app.read_with(cx, |state, _| {
+                let mut host = NativeChatHost::from_app(state);
+                host.dispatch(&op).unwrap();
+                host.take_command()
+            });
+            if let Some(command) = command {
+                app.update(cx, |state, cx| command.apply(state, cx));
+            }
+        };
+        // No Computer is needed: the sidebar's Plugins opens it.
+        drive(cx, Op::click("footer-plugins"));
+        wait_for(
+            cx,
+            "the marketplace, installs and sign-ins are read",
+            |cx| {
+                app.read_with(cx, |state, _| {
+                    let m = &state.plugin_market;
+                    matches!(m.catalog, Some(super::Loaded::Ready(_)))
+                        && matches!(m.installations, Some(super::Loaded::Ready(_)))
+                        && matches!(m.attempts, Some(super::Loaded::Ready(_)))
+                        && matches!(
+                            state.connections.connectors,
+                            Some(super::ConnectorList::Listed(_))
+                        )
+                })
+            },
+        );
+        let sections = app.read_with(cx, |state, _| marketplace::sections(state));
+        let titles: Vec<_> = sections.iter().map(|s| s.title.as_str()).collect();
+        assert_eq!(titles, ["Apps", "Development", "Database", "More plugins"]);
+        assert_eq!(sections[1].rows.len(), marketplace::PER_SECTION);
+        assert_eq!(sections[1].view_all.as_deref(), Some("development"));
+        assert_eq!(
+            sections[0].rows[0].action,
+            RowAction::Add { live: true },
+            "no Gmail account yet"
+        );
+
+        // View all opens the whole category.
+        drive(cx, Op::click("market-view-all-development"));
+        let category = app.read_with(cx, |state, _| marketplace::sections(state));
+        assert_eq!(category.len(), 1);
+        assert_eq!(category[0].rows.len(), 5);
+
+        // Installed lists what the marketplace no longer does, too.
+        drive(cx, Op::click("market-installed"));
+        let installed = app.read_with(cx, |state, _| marketplace::visible_rows(state));
+        assert_eq!(installed.len(), 1);
+        assert_eq!(
+            installed[0].selection,
+            PluginSelection::Plugin("legacy-tool".into())
+        );
+        assert_eq!(installed[0].action, RowAction::Added);
+        drive(cx, Op::click(crate::components::monitor_modal::BACK));
+        assert_eq!(
+            app.read_with(cx, |state, _| state
+                .monitor_modal
+                .as_ref()
+                .unwrap()
+                .page
+                .clone()),
+            MarketPage::Browse
+        );
+
+        // Search filters; Up and Down move through the results and stop at the ends.
+        drive(
+            cx,
+            Op::SetValue {
+                target: "market-search".into(),
+                value: "ch".into(),
+            },
+        );
+        let found: Vec<_> = app.read_with(cx, |state, _| {
+            marketplace::visible_rows(state)
+                .into_iter()
+                .map(|r| r.title)
+                .collect()
+        });
+        assert_eq!(found, ["charlie", "echo"]);
+        let highlight = |cx: &mut gpui_kit::TestAppContext| {
+            app.read_with(cx, |state, _| {
+                state.monitor_modal.as_ref().unwrap().highlight
+            })
+        };
+        drive(cx, Op::key("market-search", "Up"));
+        assert_eq!(highlight(cx), 0, "stops at the first");
+        drive(cx, Op::key("market-search", "Down"));
+        assert_eq!(highlight(cx), 1);
+        drive(cx, Op::key("market-search", "Down"));
+        assert_eq!(highlight(cx), 1, "stops at the last");
+        drive(cx, Op::key("market-search", "Up"));
+        assert_eq!(highlight(cx), 0);
+
+        // Nothing matches: the highlight stays put and Enter opens nothing.
+        drive(
+            cx,
+            Op::SetValue {
+                target: "market-search".into(),
+                value: "zzz".into(),
+            },
+        );
+        assert!(app.read_with(cx, |state, _| marketplace::sections(state).is_empty()));
+        drive(cx, Op::key("market-search", "Down"));
+        drive(cx, Op::key("market-search", "Enter"));
+        assert!(app.read_with(cx, |state, _| {
+            state.monitor_modal.as_ref().unwrap().selected.is_none()
+        }));
+
+        // Enter opens the highlighted plugin's detail, and installs nothing.
+        drive(
+            cx,
+            Op::SetValue {
+                target: "market-search".into(),
+                value: "bravo".into(),
+            },
+        );
+        drive(cx, Op::key("market-search", "Enter"));
+        assert_eq!(
+            app.read_with(cx, |state, _| state
+                .monitor_modal
+                .as_ref()
+                .unwrap()
+                .selected
+                .clone()),
+            Some(PluginSelection::Plugin("bravo".into()))
+        );
+        assert!(app.read_with(cx, |state, _| state.plugin_market.changing.is_none()));
+        wait_for(cx, "the pinned bundle's parts are read", |cx| {
+            app.read_with(cx, |state, _| {
+                matches!(
+                    state.plugin_market.details.get("bravo"),
+                    Some(super::Loaded::Ready(_))
+                )
+            })
+        });
+        let detail = app.read_with(cx, |state, _| {
+            marketplace::detail(state, &PluginSelection::Plugin("bravo".into())).unwrap()
+        });
+        assert_eq!(detail.skills, ["review"]);
+        assert_eq!(detail.servers, ["bravo"]);
+        assert_eq!(detail.apps, ["bravo"]);
+        assert_eq!(detail.unsupported.len(), 1);
+        assert!(detail.accounts.is_empty(), "accounts come with the install");
+        assert_eq!(
+            detail.action,
+            Some(marketplace::DetailAction::Add { live: true })
+        );
+        assert!(
+            detail
+                .source
+                .unwrap()
+                .1
+                .starts_with("https://github.com/fixture/plugins/tree/")
+        );
+
+        // Add installs at the commit the marketplace was read at; Uninstall only once it has.
+        drive(cx, Op::click("market-detail-action"));
+        assert_eq!(
+            app.read_with(cx, |state, _| marketplace::detail(
+                state,
+                &PluginSelection::Plugin("bravo".into())
+            )
+            .unwrap()
+            .action),
+            Some(marketplace::DetailAction::Adding)
+        );
+        wait_for(
+            cx,
+            "the install is answered and the installs read again",
+            |cx| {
+                app.read_with(cx, |state, _| {
+                    state.plugin_market.changing.is_none()
+                        && state.plugin_market.installation("bravo").is_some()
+                })
+            },
+        );
+        assert_eq!(
+            app.read_with(cx, |state, _| marketplace::detail(
+                state,
+                &PluginSelection::Plugin("bravo".into())
+            )
+            .unwrap()
+            .action),
+            Some(marketplace::DetailAction::Uninstall { live: true })
+        );
+
+        // A plugin's skill has its own switch for this Bot, its row opens its read-only page with
+        // the skill's text, and Back from there is the plugin, not the list (7 Oct 2026).
+        wait_for(cx, "the Bot's plugin skills are read", |cx| {
+            app.read_with(cx, |state, _| !state.plugin_skills.is_empty())
+        });
+        drive(cx, Op::click("market-plugin-skill-row-bravo-review"));
+        wait_for(cx, "the skill's text is read", |cx| {
+            app.read_with(cx, |state, _| state.plugin_skill_page.is_some())
+        });
+        assert_eq!(
+            app.read_with(cx, |state, _| state.plugin_skill_page.clone().unwrap().body),
+            Some("Read the diff first.".into())
+        );
+        drive(cx, Op::click("market-plugin-skill-switch-bravo-review"));
+        assert!(app.read_with(cx, |state, _| !state.plugin_skills[0].on
+            && !state.plugin_skill_page.as_ref().unwrap().on));
+        wait_for(cx, "the switch is saved", |cx| {
+            app.read_with(cx, |state, _| state.tool_mode_refusal.is_none())
+        });
+        drive(cx, Op::click("monitor-plugin-back"));
+        assert_eq!(
+            app.read_with(cx, |state, _| state
+                .monitor_modal
+                .as_ref()
+                .unwrap()
+                .selected
+                .clone()),
+            Some(PluginSelection::Plugin("bravo".into()))
+        );
+
+        // A refused sign-in needs auth, says why, and Reopen asks for THAT sign-in's page.
+        drive(cx, Op::click("monitor-plugin-back"));
+        drive(
+            cx,
+            Op::SetValue {
+                target: "market-search".into(),
+                value: "".into(),
+            },
+        );
+        drive(cx, Op::click("market-service-gmail"));
+        let gmail = app.read_with(cx, |state, _| {
+            marketplace::detail(state, &PluginSelection::Service("gmail".into())).unwrap()
+        });
+        let line = &gmail.accounts[0].lines[0];
+        assert_eq!(line.id, "attempt_1");
+        assert_eq!(
+            line.status,
+            marketplace::AccountStatus::NeedsAuth(Some(
+                "the provider did not connect: access_denied".into()
+            ))
+        );
+        drive(cx, Op::click("market-reopen-attempt_1"));
+        wait_for(cx, "the reopen is answered", |cx| {
+            app.read_with(cx, |state, _| {
+                state.plugin_market.attempt_changing.is_none()
+            })
+        });
+        wait_for(
+            cx,
+            "every read finishes before the runtime shuts down",
+            |cx| {
+                app.read_with(cx, |state, _| {
+                    state.plugin_market.in_flight == 0
+                        && !state
+                            .plugin_market
+                            .details
+                            .values()
+                            .any(|d| matches!(d, super::Loaded::Loading))
+                        && !matches!(
+                            state.coworker_tools,
+                            Some((_, crate::state::ToolList::Loading))
+                        )
+                        && !matches!(state.connections.list, Some(super::ConnectionList::Loading))
+                        && !matches!(state.connections.pins, Some(super::PinList::Loading))
+                        && !matches!(
+                            state.connections.connectors,
+                            Some(super::ConnectorList::Loading)
+                        )
+                        && state.connections.opening.is_none()
+                        && state.ceiling_reading.is_none()
+                        && state.skills_reading.is_none()
+                })
+            },
+        );
+        runtime.block_on(server.verify());
+    }
+
     #[cfg(feature = "agent")]
     #[gpui_kit::test]
     fn monitor_controls_send_the_servers_ceiling_loans_skills_and_removal_requests(
@@ -43700,10 +46915,24 @@ mod tests {
         wait_for(cx, "private skills are read", |cx| {
             app.read_with(cx, |state, _| state.skills_reading.is_none())
         });
-        click(cx, "agent-connection-lend-conn_1");
+        wait_for(cx, "the services are read", |cx| {
+            app.read_with(cx, |state, _| {
+                matches!(
+                    state.connections.connectors,
+                    Some(super::ConnectorList::Listed(_))
+                )
+            })
+        });
+        // The loan is switched in the service's detail, and private skills from Installed.
+        click(cx, "market-service-gmail");
+        click(cx, "market-account-bots-conn_1");
+        click(cx, "market-bot-cw_1");
         wait_for(cx, "the loan is answered", |cx| {
             app.read_with(cx, |state, _| state.connections.changing.is_empty())
         });
+        click(cx, crate::components::monitor_modal::BACK);
+        click(cx, "monitor-plugin-back");
+        click(cx, "market-installed");
         click(cx, "agent-skills-switch-sk_1");
         wait_for(cx, "the skill switch is answered", |cx| {
             app.read_with(cx, |state, _| state.skill_switch.is_none())

@@ -127,12 +127,15 @@ impl Reachability {
                 "OpenGrok is answering; the model gateway behind it is not.",
             ),
         };
-        let detail = if self.detail.is_empty() {
-            lead.to_string()
-        } else {
-            format!("{lead} {}", clip(&self.detail, DETAIL_CHARS))
-        };
-        Some((title, detail))
+        Some((title, lead.to_string()))
+    }
+
+    /// The failure's own words, for the indicator's ⚠ badge rather than its line: a transport
+    /// error ("error sending request for url (…)") is useful to copy and paste, and is not a
+    /// sentence for a person to read. `None` while everything answers, or with nothing said.
+    pub fn trouble(&self) -> Option<String> {
+        self.unreachable?;
+        (!self.detail.is_empty()).then(|| clip(&self.detail, DETAIL_CHARS))
     }
 }
 
@@ -264,14 +267,22 @@ mod tests {
             detail.contains("OpenGrok is answering"),
             "nobody should restart the server over this: {detail}"
         );
-        assert!(detail.contains("29080"), "the dead port survives: {detail}");
+        assert!(
+            !detail.contains("29080"),
+            "the raw error is not on the line: {detail}"
+        );
+        let behind = state.trouble().expect("the failure is behind the badge");
+        assert!(
+            behind.contains("29080"),
+            "the dead port survives there: {behind}"
+        );
     }
 
     #[test]
     fn a_long_reason_is_clipped_rather_than_sprawling() {
         let mut state = Reachability::default();
         state.fail(Unreachable::Server, &"x".repeat(500));
-        let (_, detail) = state.indicator().expect("shows");
+        let detail = state.trouble().expect("shows");
         assert!(detail.chars().count() < 260, "{}", detail.len());
         assert!(detail.ends_with('…'), "{detail}");
     }

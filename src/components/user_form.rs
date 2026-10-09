@@ -32,7 +32,7 @@ use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::{ActiveTheme, Disableable, Icon, IconName, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 type Theme = gpui_kit::component::Theme;
 
@@ -785,6 +785,22 @@ struct SavedLoginContext {
     /// The list is up: the person put the cursor in the field it belongs to. A card that
     /// has just arrived has it down.
     open: bool,
+    /// Why a saved login cannot be used for this card's Bot, asked before Touch ID: the list
+    /// says so in place of the logins, with a way on.
+    blocked: Option<Blocked>,
+    /// The card's Bot and the logins shared with it, once read: those come first, and the
+    /// rest are offered to share with it.
+    shares: Option<(String, HashSet<String>)>,
+}
+
+#[derive(Clone, Default)]
+struct Blocked {
+    reason: String,
+    bot: String,
+    bot_name: String,
+    /// The server is making the Bot its own computer.
+    changing: bool,
+    refusal: Option<String>,
 }
 
 impl SavedLoginContext {
@@ -805,11 +821,44 @@ impl SavedLoginContext {
         } else {
             target
         };
+        let blocked = state.card_coworker(spec.card_key()).and_then(|bot| {
+            let check = state.saved_login_checks.get(&bot).filter(|c| !c.usable)?;
+            let bot_name = state
+                .coworkers
+                .iter()
+                .find(|c| c.id == bot)
+                .map(|c| c.name.clone())
+                .unwrap_or_else(|| "this Bot".to_string());
+            Some(Blocked {
+                reason: check.reason.clone().unwrap_or_default(),
+                changing: state.own_computer_changing.as_deref() == Some(bot.as_str()),
+                refusal: state.own_computer_refusal.clone(),
+                bot,
+                bot_name,
+            })
+        });
+        let shares = state.card_coworker(spec.card_key()).and_then(|bot| {
+            let ids = state.site_login_shares.get(&bot)?.clone();
+            let name = state
+                .coworkers
+                .iter()
+                .find(|c| c.id == bot)
+                .map(|c| c.name.clone())
+                .unwrap_or_else(|| "this Bot".to_string());
+            Some((name, ids))
+        });
+        // The Bot's own logins first, keeping their order within each group.
+        let mut rows = rows;
+        if let Some((_, ids)) = &shares {
+            rows.sort_by_key(|row| !ids.contains(&row.id));
+        }
         Self {
             rows,
             target,
             current,
             open,
+            blocked,
+            shares,
         }
     }
 
@@ -1346,6 +1395,81 @@ fn floating_account_list(
 /// autofill does (under the one field of a code card or a password page): pick one, confirm
 /// with Touch ID, and the fields fill. The password never appears here; each row is the
 /// account's name, so on a password page the person knows whose password they are choosing.
+/// In place of the logins, when this Bot cannot be given one: why, before any Touch ID, and the
+/// way on. A shared computer can become the Bot's own; a Bot shown to an org cannot take a saved
+/// login at all, so only typing is offered (8 Oct 2026).
+fn blocked_panel(
+    card_key: &str,
+    blocked: &Blocked,
+    app: Option<Entity<AppState>>,
+    cx: &App,
+) -> AnyElement {
+    let theme = cx.theme();
+    let name = &blocked.bot_name;
+    let words = if blocked.reason == "shared-bot" {
+        format!(
+            "{name} is shared with your org, so your saved logins can't be used with it. Type \
+             the login by hand."
+        )
+    } else {
+        format!(
+            "{name}'s computer is shared with other Bots, so a saved login can't be used on it. \
+             Give {name} a computer of its own, or type the login by hand."
+        )
+    };
+    let mut buttons = h_flex().gap(px(8.)).flex_wrap();
+    if blocked.reason != "shared-bot" {
+        let own = app.clone();
+        let bot = blocked.bot.clone();
+        buttons = buttons.child(
+            Button::new(SharedString::from(
+                crate::opengrok::user_form_own_computer_id(card_key),
+            ))
+            .primary()
+            .small()
+            .loading(blocked.changing)
+            .disabled(blocked.changing)
+            .label(if blocked.changing {
+                "Making its computer…".to_string()
+            } else {
+                format!("Give {name} its own computer")
+            })
+            .on_click(move |_, _, cx| {
+                if let Some(app) = &own {
+                    app.update(cx, |state, cx| state.give_bot_own_computer(bot.clone(), cx));
+                }
+            }),
+        );
+    }
+    let key = card_key.to_string();
+    buttons = buttons.child(
+        Button::new(SharedString::from(crate::opengrok::user_form_by_hand_id(
+            card_key,
+        )))
+        .small()
+        .label("Type it by hand")
+        .on_click(move |_, _, cx| {
+            if let Some(app) = &app {
+                app.update(cx, |state, cx| state.type_login_by_hand(key.clone(), cx));
+            }
+        }),
+    );
+    v_flex()
+        .gap(px(8.))
+        .p(px(10.))
+        .child(div().text_sm().child(words))
+        .when(blocked.reason != "shared-bot", |this| {
+            this.child(div().text_xs().text_color(theme.muted_foreground).child(
+                "It starts on a fresh computer; what it left on the shared one stays there.",
+            ))
+        })
+        .child(buttons)
+        .when_some(blocked.refusal.clone(), |this, why| {
+            this.child(div().text_xs().text_color(theme.danger).child(why))
+        })
+        .into_any_element()
+}
+
 fn render_account_list(
     spec: &UserFormSpec,
     saved: &SavedLoginContext,
@@ -1372,10 +1496,47 @@ fn render_account_list(
         // It floats over the card: a click on it is for it, not for what lies under.
         .occlude()
         .overflow_hidden();
+    if let Some(blocked) = &saved.blocked {
+        return list
+            .child(blocked_panel(&card_key, blocked, app, cx))
+            .into_any_element();
+    }
+    let shared = |id: &str| {
+        saved
+            .shares
+            .as_ref()
+            .is_none_or(|(_, ids)| ids.contains(id))
+    };
+    let group = |words: String| {
+        div()
+            .px(px(10.))
+            .pt(px(8.))
+            .pb(px(2.))
+            .text_xs()
+            .text_color(theme.muted_foreground)
+            .child(words)
+    };
+    if let Some((name, _)) = &saved.shares
+        && saved.rows.first().is_some_and(|row| shared(&row.id))
+    {
+        list = list.child(group(format!("{name}'s logins")));
+    }
     for (i, row) in saved.rows.iter().enumerate() {
-        if i > 0 {
+        let is_shared = shared(&row.id);
+        let starts_others = !is_shared && (i == 0 || shared(&saved.rows[i - 1].id));
+        if starts_others && saved.shares.is_some() {
+            list = list.child(group("Your other logins".to_string()));
+        } else if i > 0 {
             list = list.child(div().h(px(1.)).bg(theme.border));
         }
+        let share_tag = (!is_shared)
+            .then(|| {
+                saved
+                    .shares
+                    .as_ref()
+                    .map(|(name, _)| format!("Share with {name}"))
+            })
+            .flatten();
         let id = user_form_use_saved_id(&card_key, &row.id);
         let app = app.clone();
         let key = card_key.clone();
@@ -1410,6 +1571,19 @@ fn render_account_list(
                                 .child(row.origin.clone()),
                         ),
                 )
+                .when_some(share_tag, |this, tag| {
+                    this.child(
+                        div()
+                            .text_xs()
+                            .px(px(8.))
+                            .py(px(2.))
+                            .rounded_full()
+                            .border_1()
+                            .border_color(theme.border)
+                            .text_color(theme.muted_foreground)
+                            .child(tag),
+                    )
+                })
                 .on_click(move |_, window, cx| {
                     if let Some(input) = &name_input {
                         input.update(cx, |input, cx| {

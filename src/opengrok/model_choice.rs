@@ -121,6 +121,10 @@ pub struct ModelChoice {
     pub has_fast: bool,
     /// What the row reads as ([`model_label`]).
     pub label: String,
+    /// For one of the gateway's models, the upstream that serves it ([`ModelEntry::provider`]),
+    /// which is the group it is listed in. None for the plan's models, and on a server that does
+    /// not say.
+    pub provider: Option<String>,
     /// The levels of effort the model lists, lowest first: the slider's stops. Empty where it
     /// lists none, and then there is no slider. A row that folded a fast twin in has its base
     /// model's: the twin is the same model at the faster tier.
@@ -193,18 +197,78 @@ fn holds_query(texts: &[&str], query: &str) -> bool {
             .any(|text| text.to_lowercase().contains(&query))
 }
 
-/// One group of the list: the models of one door, in the server's order.
+/// One group of the list: the models of one door, in the server's order; the gateway's split by
+/// the upstream that serves them, so "Anthropic" and "Merge" are not one long list.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChoiceGroup {
     pub source: InferenceKind,
+    /// The upstream of every row in a gateway group ([`ModelChoice::provider`]). None for the
+    /// Subscription group, and for the one Gateway group of a server that does not say.
+    pub provider: Option<String>,
     pub rows: Vec<ModelChoice>,
 }
 
 impl ChoiceGroup {
-    /// The group's heading.
-    pub fn title(&self) -> &'static str {
-        group_title(self.source)
+    /// The group's heading: the upstream's name for one of the gateway's, else the door's.
+    pub fn title(&self) -> String {
+        match &self.provider {
+            Some(provider) => provider_title(provider),
+            None => group_title(self.source).to_string(),
+        }
     }
+
+    /// The word a heading's stable id ends with: the door's, and the upstream's after it.
+    pub fn id_word(&self) -> String {
+        match &self.provider {
+            Some(provider) => format!("{}-{provider}", self.source.word()),
+            None => self.source.word().to_string(),
+        }
+    }
+}
+
+/// An upstream as a heading names it. The gateway's own words for the providers it knows (its
+/// `Provider`), `oag`'s virtual names as Auto, and an operator's endpoint by its word, capitalised.
+pub fn provider_title(provider: &str) -> String {
+    let known = match provider {
+        "oag" => "Auto",
+        "anthropic" => "Anthropic",
+        "openai" => "OpenAI",
+        "gemini" => "Gemini",
+        "xai" => "xAI",
+        "deepseek" => "DeepSeek",
+        "kimi" => "Kimi",
+        "zhipu" => "Zhipu",
+        "bedrock" => "Bedrock",
+        "jev" => "Jev",
+        other => return capitalised(other),
+    };
+    known.to_string()
+}
+
+/// The gateway's models as groups, one per upstream: Auto, the gateway's virtual names, always
+/// first, then the rest by name, A to Z, so "Anthropic" is never lost under a long "Merge". Each
+/// group keeps the server's order inside it. Rows with no upstream named, as from a server before
+/// it, are one Gateway group, as they always were.
+pub fn gateway_groups(catalogue: &ModelCatalogue) -> Vec<ChoiceGroup> {
+    let mut groups: Vec<ChoiceGroup> = Vec::new();
+    for row in server_choices(catalogue) {
+        match groups
+            .iter_mut()
+            .find(|group| group.provider == row.provider)
+        {
+            Some(group) => group.rows.push(row),
+            None => groups.push(ChoiceGroup {
+                source: InferenceKind::Gateway,
+                provider: row.provider.clone(),
+                rows: vec![row],
+            }),
+        }
+    }
+    groups.sort_by_cached_key(|group| {
+        let auto = group.provider.as_deref() == Some("oag");
+        (!auto, group.title().to_lowercase())
+    });
+    groups
 }
 
 /// A group's heading, by the door its models are served through.
@@ -227,7 +291,7 @@ pub const LIST_ROWS: usize = 5;
 /// One line of the list's window ([`list_window`]): a group's heading, or a model.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ListLine<'a> {
-    Heading(InferenceKind),
+    Heading(&'a ChoiceGroup),
     Row(&'a ModelChoice),
 }
 
@@ -251,7 +315,7 @@ pub fn list_window(groups: &[ChoiceGroup], start: usize) -> Vec<ListLine<'_>> {
         for row in &group.rows {
             if in_view.contains(&at) {
                 if !headed {
-                    lines.push(ListLine::Heading(group.source));
+                    lines.push(ListLine::Heading(group));
                     headed = true;
                 }
                 lines.push(ListLine::Row(row));
@@ -279,6 +343,7 @@ pub fn fold<'a>(source: InferenceKind, ids: impl IntoIterator<Item = &'a str>) -
             base_id: base.to_string(),
             has_fast: plain.is_some() || (!is_fast(id) && listed(&format!("{id}{FAST_SUFFIX}"))),
             label: model_label(base),
+            provider: None,
             efforts: Vec::new(),
             own_effort: None,
         });
@@ -297,6 +362,7 @@ fn with_levels<'a>(
     rows.into_iter()
         .map(|row| match listed(&row.base_id) {
             Some(entry) => ModelChoice {
+                provider: entry.provider.clone(),
                 efforts: entry.efforts.clone().unwrap_or_default(),
                 own_effort: entry.own_level().map(|level| level.value.clone()),
                 ..row
@@ -673,17 +739,13 @@ fn choice_groups(
         (true, Some(via)) => plan_choices(&plan_models(via), via, catalogue),
         _ => Vec::new(),
     };
-    [
-        ChoiceGroup {
-            source: InferenceKind::LocalProxy,
-            rows: plan,
-        },
-        ChoiceGroup {
-            source: InferenceKind::Gateway,
-            rows: server_choices(catalogue),
-        },
-    ]
+    [ChoiceGroup {
+        source: InferenceKind::LocalProxy,
+        provider: None,
+        rows: plan,
+    }]
     .into_iter()
+    .chain(gateway_groups(catalogue))
     .filter(|group| !group.rows.is_empty())
     .collect()
 }
@@ -759,13 +821,7 @@ pub fn plan_fallback_pick(
     fallback: Option<&PlanFallback>,
     catalogue: &ModelCatalogue,
 ) -> ModelPick {
-    let groups: Vec<ChoiceGroup> = [ChoiceGroup {
-        source: InferenceKind::Gateway,
-        rows: server_choices(catalogue),
-    }]
-    .into_iter()
-    .filter(|group| !group.rows.is_empty())
-    .collect();
+    let groups = gateway_groups(catalogue);
     let door = fallback.map(|_| InferenceKind::Gateway);
     let model = fallback
         .map(|fallback| fallback.model.clone())
@@ -878,6 +934,7 @@ impl ModelPick {
             .iter()
             .map(|group| ChoiceGroup {
                 source: group.source,
+                provider: group.provider.clone(),
                 rows: group
                     .rows
                     .iter()
@@ -1118,6 +1175,7 @@ mod tests {
             via: via.map(str::to_string),
             efforts: Some(levels_of(id)),
             own_effort: Some(if id.contains("sol") { "high" } else { "medium" }.to_string()),
+            ..ModelEntry::default()
         }
     }
 
@@ -1446,6 +1504,7 @@ mod tests {
                     base_id: format!("{word}-{at}"),
                     has_fast: false,
                     label: format!("{word} {at}"),
+                    provider: None,
                     efforts: Vec::new(),
                     own_effort: None,
                 })
@@ -1454,13 +1513,57 @@ mod tests {
         vec![
             ChoiceGroup {
                 source: InferenceKind::LocalProxy,
+                provider: None,
                 rows: rows(InferenceKind::LocalProxy, plan, "s"),
             },
             ChoiceGroup {
                 source: InferenceKind::Gateway,
+                provider: None,
                 rows: rows(InferenceKind::Gateway, keys, "g"),
             },
         ]
+    }
+
+    /// The gateway's models are grouped by the upstream that serves them: Auto first, wherever the
+    /// server lists it, then the others A to Z, each group in the server's order; a server that
+    /// names no upstream still gets the one Gateway group it always had.
+    #[test]
+    fn the_gateway_s_models_are_grouped_by_their_upstream() {
+        let entry = |id: &str, provider: Option<&str>| ModelEntry {
+            id: id.to_string(),
+            source: Some("gateway".to_string()),
+            provider: provider.map(str::to_string),
+            ..ModelEntry::default()
+        };
+        let listed = ModelCatalogue {
+            models: vec![
+                entry("merge/anthropic/claude-opus-5-5", Some("merge")),
+                entry("xai/grok-4.6", Some("xai")),
+                entry("anthropic/claude-opus-5-5", Some("anthropic")),
+                entry("oag/auto", Some("oag")),
+                entry("anthropic/claude-sonnet-5-5", Some("anthropic")),
+            ],
+            ..ModelCatalogue::default()
+        };
+        let groups = gateway_groups(&listed);
+        let titles: Vec<String> = groups.iter().map(ChoiceGroup::title).collect();
+        assert_eq!(titles, ["Auto", "Anthropic", "Merge", "xAI"]);
+        assert_eq!(
+            groups[1].rows.len(),
+            2,
+            "both Anthropic models, in the server's order"
+        );
+        assert_eq!(groups[1].id_word(), "gateway-anthropic");
+        let unsaid = ModelCatalogue {
+            models: vec![entry("oag/auto", None), entry("xai/grok-4.6", None)],
+            ..ModelCatalogue::default()
+        };
+        let groups = gateway_groups(&unsaid);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(
+            (groups[0].title(), groups[0].id_word()),
+            ("Gateway".to_string(), "gateway".to_string())
+        );
     }
 
     /// The window shows five models at a time, whatever the headings: each group's heading is
@@ -1473,7 +1576,7 @@ mod tests {
             list_window(&groups, start)
                 .into_iter()
                 .map(|line| match line {
-                    ListLine::Heading(source) => group_title(source).to_string(),
+                    ListLine::Heading(group) => group.title(),
                     ListLine::Row(row) => row.base_id.clone(),
                 })
                 .collect()

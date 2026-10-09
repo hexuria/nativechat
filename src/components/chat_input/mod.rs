@@ -4,7 +4,7 @@ pub mod sources;
 #[macro_use]
 mod sync_macros;
 
-pub use sources::{AppCommand, ComposerPick, TokenKind};
+pub use sources::{AppCommand, BUILTIN_TOOLS, ComposerPick, TokenKind, function_tags_in, tags_in};
 
 use crate::actions::{Library, NewChat, OpenSettings, Projects, ToggleTheme};
 use crate::audio::AudioInput;
@@ -25,7 +25,6 @@ use gpui_kit::component::{
     button::{Button, ButtonVariants},
     h_flex,
     input::InputEvent,
-    popover::Popover,
     tooltip::Tooltip,
     v_flex,
 };
@@ -209,7 +208,6 @@ pub struct MessageInput {
     audio_input: Option<AudioInput>,
     state: Entity<AppState>,
     // Cached state to avoid re-rendering on every AppState change
-    picked_tools: Vec<crate::state::PickedTool>,
     is_voice_mode_open: bool,
     is_app_settings_open: bool,
     submit_chord: SubmitChord,
@@ -255,7 +253,6 @@ impl MessageInput {
 
         // Cache initial values from AppState
         let app_state = state.read(cx);
-        let picked_tools = app_state.picked_tools.clone();
         let is_voice_mode_open = app_state.is_voice_mode_open;
         let is_app_settings_open = app_state.is_app_settings_open;
         let active_recipe = app_state.active_recipe.clone();
@@ -267,7 +264,6 @@ impl MessageInput {
         let this = Self {
             state: state.clone(),
             input_state: input_state.clone(),
-            picked_tools,
             is_voice_mode_open,
             is_app_settings_open,
             submit_chord,
@@ -300,6 +296,13 @@ impl MessageInput {
             if !requested.is_empty() {
                 this.add_attachments(requested, cx);
             }
+            // A modal opened over the composer: its list goes with it.
+            let close = state.update(cx, |state, _| {
+                std::mem::take(&mut state.composer_panel_close_requested)
+            });
+            if close {
+                this.close_panel(false, window, cx);
+            }
             // A driver's ✕, by the file's place on the draft.
             let detached = state.update(cx, |state, _| std::mem::take(&mut state.detach_requests));
             if !detached.is_empty() {
@@ -316,7 +319,6 @@ impl MessageInput {
             }
             {
                 let state = state.read(cx);
-                sync_field_clone!(this, state, picked_tools, changed);
                 sync_field_copy!(this, state, is_voice_mode_open, changed);
                 sync_field_copy!(this, state, is_app_settings_open, changed);
                 sync_field_clone!(this, state, reply_to, changed);
@@ -389,6 +391,14 @@ impl MessageInput {
                     SlashSource.rows(&state.recipes, &your_skills(state))
                 };
                 apply_shortcuts(&mut rows, window);
+                this.remember_picks(&rows);
+                let rows: Vec<ComposerPanelRow> = rows.into_iter().map(|(row, _)| row).collect();
+                this.panel.update(cx, |panel, cx| panel.set_rows(rows, cx));
+            }
+
+            // Installs and this Bot's tools that land while "@" is open fill it in.
+            if this.panel_mode == Some(PanelMode::Tools) {
+                let rows = ToolSource::of(state.read(cx)).rows();
                 this.remember_picks(&rows);
                 let rows: Vec<ComposerPanelRow> = rows.into_iter().map(|(row, _)| row).collect();
                 this.panel.update(cx, |panel, cx| panel.set_rows(rows, cx));
@@ -775,12 +785,26 @@ impl MessageInput {
     }
 
     fn open_tools_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let rows = ToolSource.rows();
+        // The installs are asked for if this session has not read them, so a later `@` lists them.
+        // And this Bot's tools, which "@name:" lists the functions from.
+        self.state.update(cx, |state, cx| {
+            if state.plugin_market.installations.is_none() {
+                state.read_installations(cx);
+            }
+            let listed_for_this_bot = matches!(
+                &state.coworker_tools,
+                Some((bot, _)) if Some(bot) == state.active_coworker_id.as_ref()
+            );
+            if !listed_for_this_bot {
+                state.refresh_coworker_tools(cx);
+            }
+        });
+        let rows = ToolSource::of(self.state.read(cx)).rows();
         self.show_panel(
             PanelMode::Tools,
             rows,
-            "Search tools",
-            "↑↓ to move, ⌘1–9 to take one straight away, ↵ to put it in the message, esc to close.",
+            "Search, or name:function",
+            "↑↓ to move, ↵ to put it in the message, type : after a name for its functions, esc to close.",
             window,
             cx,
         );
@@ -873,15 +897,14 @@ impl MessageInput {
         match pick {
             ComposerPick::AttachFiles => self.attach_files(cx),
             ComposerPick::TeachTask => self.teach_task(cx),
-            // A tool is a chip beside the "+", not text in the message: naming a tool says
-            // something ABOUT the message, and the message should not have to carry it. A
-            // recipe is the opposite — it reads as part of the sentence, so it goes in at the
-            // caret.
+            // Every pick goes in at the caret, as part of the sentence. A tool or a plugin used to
+            // be a chip under the field that stayed for every message after and was never sent,
+            // so `@cloudflare` meant nothing to the Bot (6 Oct 2026). In the message it is this
+            // message's, gone with Backspace, and read off the words when the turn leaves
+            // (`AppState::turn_tags`).
             ComposerPick::Token { kind, id, text } => match kind {
-                TokenKind::Tool => {
-                    let label = text.trim_start_matches('@').to_string();
-                    self.state
-                        .update(cx, |state, cx| state.pick_tool(id, label, cx));
+                TokenKind::Tool | TokenKind::Plugin => {
+                    self.insert_token(kind, id, text, window, cx);
                 }
                 // A workflow goes the same way a recipe does, and on purpose: both are what the
                 // turn runs, both declare their parameters on the same field of the same row,
@@ -2016,13 +2039,11 @@ impl Render for MessageInput {
         let foreground = theme.foreground;
         let background = theme.background;
         let border = theme.border;
-        let picked_tools = self.picked_tools.clone();
 
         // Check if any modal is open using cached state
         let any_modal_open = self.is_voice_mode_open || self.is_app_settings_open;
         let draft = self.input_state.read(cx).value();
         let compact = !self.voice_mode
-            && self.picked_tools.is_empty()
             && self.attachments.is_empty()
             && self.notice.is_none()
             && self.active_recipe.is_none()
@@ -2053,571 +2074,415 @@ impl Render for MessageInput {
                     this.send_draft_steer(window, cx);
                 }))
                 .when(panel_open, |this| {
-                    this.child(deferred(
-                        // Above the composer and the width of it: `bottom: 100%` puts the
-                        // panel's bottom edge on the composer's top edge.
-                        div()
-                            .absolute()
-                            .left_0()
-                            .right_0()
-                            .bottom(relative(1.))
-                            .mb(px(8.))
-                            .child(self.panel.clone()),
+                    this.child(
+                        deferred(
+                            // Above the composer and the width of it: `bottom: 100%` puts the
+                            // panel's bottom edge on the composer's top edge.
+                            div()
+                                .absolute()
+                                .left_0()
+                                .right_0()
+                                .bottom(relative(1.))
+                                .mb(px(8.))
+                                .child(self.panel.clone()),
+                        )
+                        .with_priority(3),
                     )
-                    .with_priority(3))
                 })
                 .child(
-            // Input container - rounded pill shape with shadow
-            v_flex()
-                .key_context("MessageInput")
-                // A file dropped on the composer is picked, the way the + picks one.
-                .on_drop(cx.listener(|this, paths: &ExternalPaths, _, cx| {
-                    this.add_attachments(paths.paths().to_vec(), cx);
-                }))
-                .w_full()
-                .gap_2()
-                .when(compact, |this| this.px_3().py(px(6.)))
-                .when(!compact, |this| this.px_4().py_3())
-                .bg(background) // Match chat background (white in light mode)
-                .border_1()
-                .border_color(border)
-                .rounded(px(26.0)) // Rounded pill shape
-                .shadow_sm()
-                .when_some(self.reply_to.clone(), |this, reply| {
-                    let preview = reply.preview.clone();
-                    this.child(
-                        h_flex()
-                            .id("reply-bar")
-                            .w_full()
-                            .items_center()
-                            .justify_between()
-                            .gap_2()
-                            .px_1()
-                            .pb_1()
-                            .child(
-                                v_flex()
-                                    .min_w_0()
-                                    .flex_1()
+                    // Input container - rounded pill shape with shadow
+                    v_flex()
+                        .key_context("MessageInput")
+                        // A file dropped on the composer is picked, the way the + picks one.
+                        .on_drop(cx.listener(|this, paths: &ExternalPaths, _, cx| {
+                            this.add_attachments(paths.paths().to_vec(), cx);
+                        }))
+                        .w_full()
+                        .gap_2()
+                        .when(compact, |this| this.px_3().py(px(6.)))
+                        .when(!compact, |this| this.px_4().py_3())
+                        .bg(background) // Match chat background (white in light mode)
+                        .border_1()
+                        .border_color(border)
+                        .rounded(px(26.0)) // Rounded pill shape
+                        .shadow_sm()
+                        .when_some(self.reply_to.clone(), |this, reply| {
+                            let preview = reply.preview.clone();
+                            this.child(
+                                h_flex()
+                                    .id("reply-bar")
+                                    .w_full()
+                                    .items_center()
+                                    .justify_between()
+                                    .gap_2()
+                                    .px_1()
+                                    .pb_1()
                                     .child(
-                                        div()
-                                            .text_xs()
-                                            .font_weight(gpui_kit::FontWeight::MEDIUM)
-                                            .text_color(muted_foreground)
-                                            .child("Replying"),
+                                        v_flex()
+                                            .min_w_0()
+                                            .flex_1()
+                                            .child(
+                                                div()
+                                                    .text_xs()
+                                                    .font_weight(gpui_kit::FontWeight::MEDIUM)
+                                                    .text_color(muted_foreground)
+                                                    .child("Replying"),
+                                            )
+                                            .child(
+                                                div()
+                                                    .text_xs()
+                                                    .text_color(muted_foreground)
+                                                    .truncate()
+                                                    .child(preview),
+                                            ),
                                     )
                                     .child(
                                         div()
-                                            .text_xs()
-                                            .text_color(muted_foreground)
-                                            .truncate()
-                                            .child(preview),
+                                            .id("reply-dismiss")
+                                            .size(px(22.))
+                                            .rounded_full()
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .cursor_pointer()
+                                            .hover(move |s| s.bg(secondary))
+                                            .child(
+                                                Icon::new(IconName::Close)
+                                                    .size(px(12.))
+                                                    .text_color(secondary_foreground),
+                                            )
+                                            .on_click({
+                                                let state_model = state_model.clone();
+                                                move |_, _, cx| {
+                                                    cx.stop_propagation();
+                                                    state_model.update(cx, |state, cx| {
+                                                        state.clear_reply_to(cx);
+                                                    });
+                                                }
+                                            }),
                                     ),
                             )
-                            .child(
-                                div()
-                                    .id("reply-dismiss")
-                                    .size(px(22.))
-                                    .rounded_full()
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .cursor_pointer()
-                                    .hover(move |s| s.bg(secondary))
-                                    .child(
-                                        Icon::new(IconName::Close)
-                                            .size(px(12.))
-                                            .text_color(secondary_foreground),
-                                    )
-                                    .on_click({
-                                        let state_model = state_model.clone();
-                                        move |_, _, cx| {
-                                            cx.stop_propagation();
-                                            state_model.update(cx, |state, cx| {
-                                                state.clear_reply_to(cx);
-                                            });
-                                        }
-                                    }),
-                            ),
-                    )
-                })
-                .children(self.recipe_bar(&theme, cx))
-                .when_some(self.notice.clone(), |this, notice| {
-                    this.child(
-                        h_flex()
-                            .id("composer-notice")
-                            .w_full()
-                            .items_center()
-                            .justify_between()
-                            .gap_2()
-                            .px_1()
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .text_xs()
-                                    .text_color(muted_foreground)
-                                    .child(notice),
-                            )
-                            .child(
-                                div()
-                                    .id("composer-notice-dismiss")
-                                    .size(px(18.))
-                                    .rounded_full()
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .cursor_pointer()
-                                    .hover(move |s| s.bg(secondary))
-                                    .child(
-                                        Icon::new(IconName::Close)
-                                            .size(px(10.))
-                                            .text_color(secondary_foreground),
-                                    )
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.notice = None;
-                                        cx.notify();
-                                    })),
-                            ),
-                    )
-                })
-                .children(thumbnails)
-                .when(!compact, |this| {
-                    this.child(
-                        // Top: Input field (grows to fill space)
-                        div().flex_grow(1.).child(if self.voice_mode {
-                            if let Some(voice_wave) = &self.voice_wave {
-                                voice_wave.clone().into_any_element()
-                            } else {
-                                div().into_any_element()
-                            }
-                        } else {
-                            self.field(&theme, cx)
-                        }),
-                    )
-                })
-                .child(
-                    // Bottom: Toolbar (and the field, when the composer is one line)
-                    h_flex()
-                        .when(compact, |this| this.items_center().gap_1())
-                        .when(!compact, |this| this.justify_between().items_start().gap_2())
-                        .child(
-                            // The one wide panel, for everything the composer offers.
-                            Button::new("add-app")
-                                .icon(IconName::Plus)
-                                .with_size(ComponentSize::Large)
-                                .size(px(32.))
-                                .ghost()
-                                .rounded_full()
-                                .when(!any_modal_open, |this| this.cursor_pointer())
-                                .on_click(cx.listener(|this, event: &ClickEvent, window, cx| {
-                                    this.toggle_plus_panel(event, window, cx);
-                                })),
-                        )
-                        .when(!compact, |this| {
-                        this.child(
-                            // Bottom Row
-                            div()
-                                .flex()
-                                .flex_1() // Allow this section to shrink/grow
-                                .min_w_0() // Allow shrinking below content size to force wrapping
-                                .flex_wrap() // Allow wrapping
-                                .items_center()
-                                .gap_2()
-                                .children(
-                                    std::iter::once(
-                                        div().into_any_element() // Placeholder or remove entirely if not needed
-                                    )
-                                    .chain({
-                                        // Grouped by what each chip IS, which the pick recorded.
-                                        // Matching names against a hardcoded list only worked
-                                        // while the names came from one hardcoded menu.
-                                        use crate::state::PickedKind;
-                                        let (tool_calls, mini_apps): (Vec<_>, Vec<_>) = picked_tools
-                                            .iter()
-                                            .cloned()
-                                            .partition(|picked| picked.kind == PickedKind::Tool);
-
-                                        let groups = vec![
-                                            ("Tools", tool_calls, "icons/wrench.svg"),
-                                            ("Apps", mini_apps, "icons/plugins.svg"),
-                                        ];
-
-                                        let state_model = state_model.clone();
-                                        groups.into_iter().flat_map(move |(group_name, apps, icon_path)| -> Box<dyn Iterator<Item = AnyElement>> {
-                                            if apps.len() >= 2 {
-                                                let apps_clone = apps.clone();
-                                                let state_model = state_model.clone();
-                                                let group_name = group_name.to_string();
-                                                let icon_path = icon_path.to_string();
-
-                                                Box::new(std::iter::once(
-                                                    Popover::new(SharedString::from(format!("aggregated-{}-popover", group_name.to_lowercase())))
-                                                        .anchor(Anchor::BottomLeft)
-                                                        .trigger(
-                                                            Button::new(SharedString::from(format!("aggregated-{}-btn", group_name.to_lowercase())))
-                                                                .ghost()
-                                                                .bg(secondary)
-                                                                .rounded_md()
-                                                                .px_2()
-                                                                .py_1()
-                                                                .child(
-                                                                    h_flex()
-                                                                        .gap_1()
-                                                                        .items_center()
-                                                                        .child(
-                                                                            svg()
-                                                                                .path(icon_path.clone())
-                                                                                .size(px(12.0))
-                                                                                .text_color(secondary_foreground)
-                                                                        )
-                                                                        .child(
-                                                                            div()
-                                                                                .child(format!("{} {}", apps.len(), group_name.to_lowercase()))
-                                                                                .text_size(px(12.0)),
-                                                                        )
-                                                                        .child(
-                                                                            Icon::new(IconName::ChevronDown)
-                                                                                .size(px(12.0))
-                                                                                .text_color(secondary_foreground)
-                                                                        )
-                                                                )
-                                                        )
-                                                        .content(move |_, _, cx| {
-                                                            let theme = cx.theme();
-                                                            v_flex()
-                                                                .w(px(200.0))
-                                                                .p_1()
-                                                                .gap_1()
-                                                                .children(
-                                                                    apps_clone.iter().enumerate().map(|(i, app)| {
-                                                                        let app_id = app.id.clone();
-                                                                        let app_label = app.label.clone();
-                                                                        let icon = tool_icon(&app_label);
-
-                                                                        h_flex()
-                                                                            .gap_2()
-                                                                            .items_center()
-                                                                            .px_2()
-                                                                            .py_1()
-                                                                            .rounded_sm()
-                                                                            .hover(move |s| s.bg(theme.secondary))
-                                                                            .cursor_pointer()
-                                                                            .id(SharedString::from(format!("remove-{}-aggregated-{}", group_name.to_lowercase(), i)))
-                                                                            .on_click({
-                                                                                let state_model = state_model.clone();
-                                                                                move |_event, _window, cx| {
-                                                                                    state_model.update(cx, |state, cx| {
-                                                                                        state.unpick_tool(&app_id, cx);
-                                                                                    });
-                                                                                }
-                                                                            })
-                                                                            .child(
-                                                                                Icon::new(icon)
-                                                                                    .size(px(12.0))
-                                                                                    .text_color(theme.secondary_foreground)
-                                                                            )
-                                                                            .child(
-                                                                                div()
-                                                                                    .child(app_label.clone())
-                                                                                    .text_size(px(12.0))
-                                                                            )
-                                                                            .child(
-                                                                                div().flex_grow(1.) // Spacer
-                                                                            )
-                                                                            .child(
-                                                                                Icon::new(NativeIcon::Close)
-                                                                                    .size(px(12.0))
-                                                                                    .text_color(theme.secondary_foreground)
-                                                                            )
-                                                                    })
-                                                                )
-                                                        })
-                                                        .into_any_element()
-                                                ))
-                                            } else {
-                                                // Render individual tags
-                                                let state_model = state_model.clone();
-                                                Box::new(apps.into_iter().enumerate().map(move |(i, app)| {
-                                                        let app_id = app.id.clone();
-                                                        let app_name = app.label.clone();
-                                                        let icon = tool_icon(&app_name);
-
-                                                        div()
-                                                            .flex()
-                                                            .items_center()
-                                                            .gap_1()
-                                                            .bg(secondary)
-                                                            .rounded_md()
-                                                            .px_2()
-                                                            .py_1()
-                                                            .child(
-                                                                Icon::new(icon)
-                                                                    .size(px(12.0))
-                                                                    .text_color(secondary_foreground)
-                                                            )
-                                                            .child(
-                                                                div()
-                                                                    .child(app_name.clone())
-                                                                    .text_size(px(12.0)),
-                                                            )
-                                                            .child(
-                                                                div()
-                                                                    .id(SharedString::from(format!("remove-{}-{}", app_name.to_lowercase(), i)))
-                                                                    .cursor_pointer()
-                                                                    .on_click({
-                                                                        let state_model = state_model.clone();
-                                                                        move |_event, _window, cx| {
-                                                                            state_model.update(cx, |state, cx| {
-                                                                                state.unpick_tool(&app_id, cx);
-                                                                            });
-                                                                        }
-                                                                    })
-                                                                    .child(
-                                                                        Icon::new(NativeIcon::Close)
-                                                                            .size(px(14.0)),
-                                                                    ),
-                                                            )
-                                                            .into_any_element()
-                                                    }))
-                                            }
-                                        })
-                                    })
-                                )
-                                )
                         })
-                        .when(compact, |this| {
+                        .children(self.recipe_bar(&theme, cx))
+                        .when_some(self.notice.clone(), |this, notice| {
                             this.child(
-                                div()
-                                    .id("composer-field")
-                                    .flex_1()
-                                    .min_w_0()
+                                h_flex()
+                                    .id("composer-notice")
                                     .w_full()
-                                    .child(self.field(&theme, cx)),
+                                    .items_center()
+                                    .justify_between()
+                                    .gap_2()
+                                    .px_1()
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .text_xs()
+                                            .text_color(muted_foreground)
+                                            .child(notice),
+                                    )
+                                    .child(
+                                        div()
+                                            .id("composer-notice-dismiss")
+                                            .size(px(18.))
+                                            .rounded_full()
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .cursor_pointer()
+                                            .hover(move |s| s.bg(secondary))
+                                            .child(
+                                                Icon::new(IconName::Close)
+                                                    .size(px(10.))
+                                                    .text_color(secondary_foreground),
+                                            )
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.notice = None;
+                                                cx.notify();
+                                            })),
+                                    ),
+                            )
+                        })
+                        .children(thumbnails)
+                        .when(!compact, |this| {
+                            this.child(
+                                // Top: Input field (grows to fill space)
+                                div().flex_grow(1.).child(if self.voice_mode {
+                                    if let Some(voice_wave) = &self.voice_wave {
+                                        voice_wave.clone().into_any_element()
+                                    } else {
+                                        div().into_any_element()
+                                    }
+                                } else {
+                                    self.field(&theme, cx)
+                                }),
                             )
                         })
                         .child(
-                            // Right: Action Icons
+                            // Bottom: Toolbar (and the field, when the composer is one line)
                             h_flex()
-                                .flex_none() // Prevent this section from shrinking
-                                .gap_1()
-                                .items_center()
-                                .when(self.voice_mode, |this| {
-                                    // Voice Mode: Cancel (X) and Confirm (Check)
-                                    this.child({
-                                        let mut cancel_btn = div()
-                                            .id("cancel-voice-btn")
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.toggle_voice_mode(cx);
-                                            }))
-                                            .w(px(36.0))
-                                            .h(px(36.0))
-                                            .flex()
-                                            .items_center()
-                                            .justify_center()
-                                            .rounded_full()
-                                            .bg(gpui_kit::transparent_black())
-                                            .text_color(secondary_foreground)
-                                            .hover(move |style| style.bg(secondary))
-                                            .tooltip(|w, cx| Tooltip::new("Cancel").build(w, cx))
-                                            .child(
-                                                Icon::new(NativeIcon::Close)
-                                                    .text_color(secondary_foreground),
-                                            );
-
-                                        if !any_modal_open {
-                                            cancel_btn = cancel_btn.cursor_pointer();
-                                        }
-
-                                        cancel_btn
-                                    })
-                                    .child({
-                                        let mut confirm_btn = div()
-                                            .id("confirm-voice-btn")
-                                            .on_click(cx.listener(|this, _, window, cx| {
-                                                this.confirm_voice_input(window, cx);
-                                            }))
-                                            .w(px(36.0))
-                                            .h(px(36.0))
-                                            .flex()
-                                            .items_center()
-                                            .justify_center()
-                                            .rounded_full()
-                                            .bg(foreground) // Black/White
-                                            .text_color(background) // White/Black
-                                            .hover(move |style| {
-                                                style.bg(foreground.opacity(0.8))
-                                            })
-                                            .tooltip(|w, cx| Tooltip::new("Done").build(w, cx))
-                                            .child(
-                                                Icon::new(IconName::Check)
-                                                    .text_color(background),
-                                            );
-
-                                        if !any_modal_open {
-                                            confirm_btn = confirm_btn.cursor_pointer();
-                                        }
-
-                                        confirm_btn
-                                    })
+                                .when(compact, |this| this.items_center().gap_1())
+                                .when(!compact, |this| {
+                                    this.justify_between().items_start().gap_2()
                                 })
-                                .when(!self.voice_mode, |this| {
-                                    // Text Mode: Mic and Send/Headphone
-                                    this.child({
-                                        let mut mic_btn = div()
-                                            .id("dictate")
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.toggle_voice_mode(cx);
-                                            }))
-                                            .w(px(36.0))
-                                            .h(px(36.0))
+                                .child(
+                                    // The one wide panel, for everything the composer offers.
+                                    Button::new("add-app")
+                                        .icon(IconName::Plus)
+                                        .with_size(ComponentSize::Large)
+                                        .size(px(32.))
+                                        .ghost()
+                                        .rounded_full()
+                                        .when(!any_modal_open, |this| this.cursor_pointer())
+                                        .on_click(cx.listener(
+                                            |this, event: &ClickEvent, window, cx| {
+                                                this.toggle_plus_panel(event, window, cx);
+                                            },
+                                        )),
+                                )
+                                .when(!compact, |this| {
+                                    this.child(
+                                        // Bottom Row
+                                        div()
                                             .flex()
+                                            .flex_1() // Allow this section to shrink/grow
+                                            .min_w_0() // Allow shrinking below content size to force wrapping
+                                            .flex_wrap() // Allow wrapping
                                             .items_center()
-                                            .justify_center()
-                                            .rounded_full()
-                                            .bg(gpui_kit::transparent_black()) // Transparent/White by default
-                                            .text_color(secondary_foreground)
-                                            .hover(move |style| style.bg(secondary)) // Gray on hover
-                                            .tooltip(|w, cx| Tooltip::new("Dictate").build(w, cx))
-                                            .child(
-                                                svg()
-                                                    .path("icons/mic.svg")
-                                                    .size(px(COMPOSER_ICON_PX))
-                                                    .text_color(secondary_foreground),
-                                            );
-
-                                        if !any_modal_open {
-                                            mic_btn = mic_btn.cursor_pointer();
-                                        }
-
-                                        mic_btn
-                                    })
-                                    .child(
-                                        if self.turn_in_flight {
-                                            // The same round button in the same place, so the
-                                            // composer does not move under the hand that is
-                                            // about to press it. The square is drawn rather than
-                                            // brought in as an icon: it is a square.
-                                            let mut stop_btn = div()
-                                                .id("stop-btn")
-                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.state.update(cx, |state, cx| {
-                                                        state.stop_turn(cx);
-                                                    });
-                                                }))
-                                                .w(px(36.0))
-                                                .h(px(36.0))
-                                                .flex()
-                                                .items_center()
-                                                .justify_center()
-                                                .rounded_full()
-                                                .bg(foreground)
-                                                .text_color(background)
-                                                .hover(move |style| {
-                                                    style.bg(foreground.opacity(0.8))
-                                                })
-                                                .tooltip(|w, cx| {
-                                                    Tooltip::new("Stop").build(w, cx)
-                                                })
-                                                .child(
-                                                    div()
-                                                        .w(px(11.0))
-                                                        .h(px(11.0))
-                                                        .rounded(px(2.0))
-                                                        .bg(background),
-                                                );
-
-                                            if !any_modal_open {
-                                                stop_btn = stop_btn.cursor_pointer();
-                                            }
-
-                                            stop_btn
-                                        } else if self.input_state.read(cx).is_empty() {
-                                            // Empty state: Sparkles icon - opens voice mode modal
-                                            let mut sparkles_btn = div()
-                                                .id("voice-mode")
-                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.state.update(cx, |state, cx| {
-                                                        state.start_voice_mode(cx);
-                                                    });
-                                                }))
-                                                .w(px(36.0))
-                                                .h(px(36.0))
-                                                .flex()
-                                                .items_center()
-                                                .justify_center()
-                                                .rounded_full()
-                                                .bg(gpui_kit::transparent_black())
-                                                .text_color(secondary_foreground)
-                                                .hover(move |style| style.bg(secondary))
-                                                .tooltip(|w, cx| {
-                                                    Tooltip::new("Voice Mode").build(w, cx)
-                                                })
-                                                .child(
-                                                    svg()
-                                                        .path("icons/sparkles.svg")
-                                                        .size(px(COMPOSER_ICON_PX))
-                                                        .text_color(secondary_foreground),
-                                                );
-
-                                            if !any_modal_open {
-                                                sparkles_btn = sparkles_btn.cursor_pointer();
-                                            }
-
-                                            sparkles_btn
-                                        } else {
-                                            // Typing state: Send button (Black bg, White arrow)
-                                            let mut send_btn = div()
-                                                .id("send-btn")
-                                                .on_click(cx.listener(|this, _, window, cx| {
-                                                    this.trigger_submit(false, window, cx);
-                                                }))
-                                                .w(px(36.0))
-                                                .h(px(36.0))
-                                                .flex()
-                                                .items_center()
-                                                .justify_center()
-                                                .rounded_full()
-                                                .bg(foreground) // Theme-aware foreground (Black in light, White in dark)
-                                                .text_color(background) // Theme-aware background (White in light, Black in dark)
-                                                .hover(move |style| {
-                                                    style.bg(foreground.opacity(0.8))
-                                                })
-                                                .tooltip(|w, cx| {
-                                                    Tooltip::new("Send message").build(w, cx)
-                                                })
-                                                .child(
-                                                    Icon::new(IconName::ArrowUp)
-                                                        .size(px(COMPOSER_ICON_PX))
-                                                        .text_color(background),
-                                                );
-
-                                            if !any_modal_open {
-                                                send_btn = send_btn.cursor_pointer();
-                                            }
-
-                                            send_btn
-                                        }
+                                            .gap_2()
+                                            .child(div()),
                                     )
                                 })
-                        )
-                )),
-        )
-    }
-}
+                                .when(compact, |this| {
+                                    this.child(
+                                        div()
+                                            .id("composer-field")
+                                            .flex_1()
+                                            .min_w_0()
+                                            .w_full()
+                                            .child(self.field(&theme, cx)),
+                                    )
+                                })
+                                .child(
+                                    // Right: Action Icons
+                                    h_flex()
+                                        .flex_none() // Prevent this section from shrinking
+                                        .gap_1()
+                                        .items_center()
+                                        .when(self.voice_mode, |this| {
+                                            // Voice Mode: Cancel (X) and Confirm (Check)
+                                            this.child({
+                                                let mut cancel_btn = div()
+                                                    .id("cancel-voice-btn")
+                                                    .on_click(cx.listener(|this, _, _, cx| {
+                                                        this.toggle_voice_mode(cx);
+                                                    }))
+                                                    .w(px(36.0))
+                                                    .h(px(36.0))
+                                                    .flex()
+                                                    .items_center()
+                                                    .justify_center()
+                                                    .rounded_full()
+                                                    .bg(gpui_kit::transparent_black())
+                                                    .text_color(secondary_foreground)
+                                                    .hover(move |style| style.bg(secondary))
+                                                    .tooltip(|w, cx| {
+                                                        Tooltip::new("Cancel").build(w, cx)
+                                                    })
+                                                    .child(
+                                                        Icon::new(NativeIcon::Close)
+                                                            .text_color(secondary_foreground),
+                                                    );
 
-fn tool_icon(name: &str) -> Icon {
-    match name {
-        "Image Generation" => Icon::new(NativeIcon::CreateImage),
-        "Thinking" => Icon::new(NativeIcon::Thinking),
-        "Deep Research" => Icon::new(NativeIcon::DeepSearch),
-        "Study" => Icon::new(NativeIcon::Study),
-        "Web search" => Icon::new(NativeIcon::WebSearch),
-        "Canvas" => Icon::new(NativeIcon::Canvas),
-        "Canva" => Icon::new(NativeIcon::Canva),
-        "Coursera" => Icon::new(NativeIcon::Coursera),
-        "Figma" => Icon::new(NativeIcon::Figma),
-        "Spotify" => Icon::new(NativeIcon::Spotify),
-        _ => Icon::new(NativeIcon::Clip),
+                                                if !any_modal_open {
+                                                    cancel_btn = cancel_btn.cursor_pointer();
+                                                }
+
+                                                cancel_btn
+                                            })
+                                            .child({
+                                                let mut confirm_btn = div()
+                                                    .id("confirm-voice-btn")
+                                                    .on_click(cx.listener(|this, _, window, cx| {
+                                                        this.confirm_voice_input(window, cx);
+                                                    }))
+                                                    .w(px(36.0))
+                                                    .h(px(36.0))
+                                                    .flex()
+                                                    .items_center()
+                                                    .justify_center()
+                                                    .rounded_full()
+                                                    .bg(foreground) // Black/White
+                                                    .text_color(background) // White/Black
+                                                    .hover(move |style| {
+                                                        style.bg(foreground.opacity(0.8))
+                                                    })
+                                                    .tooltip(|w, cx| {
+                                                        Tooltip::new("Done").build(w, cx)
+                                                    })
+                                                    .child(
+                                                        Icon::new(IconName::Check)
+                                                            .text_color(background),
+                                                    );
+
+                                                if !any_modal_open {
+                                                    confirm_btn = confirm_btn.cursor_pointer();
+                                                }
+
+                                                confirm_btn
+                                            })
+                                        })
+                                        .when(!self.voice_mode, |this| {
+                                            // Text Mode: Mic and Send/Headphone
+                                            this.child({
+                                                let mut mic_btn = div()
+                                                    .id("dictate")
+                                                    .on_click(cx.listener(|this, _, _, cx| {
+                                                        this.toggle_voice_mode(cx);
+                                                    }))
+                                                    .w(px(36.0))
+                                                    .h(px(36.0))
+                                                    .flex()
+                                                    .items_center()
+                                                    .justify_center()
+                                                    .rounded_full()
+                                                    .bg(gpui_kit::transparent_black()) // Transparent/White by default
+                                                    .text_color(secondary_foreground)
+                                                    .hover(move |style| style.bg(secondary)) // Gray on hover
+                                                    .tooltip(|w, cx| {
+                                                        Tooltip::new("Dictate").build(w, cx)
+                                                    })
+                                                    .child(
+                                                        svg()
+                                                            .path("icons/mic.svg")
+                                                            .size(px(COMPOSER_ICON_PX))
+                                                            .text_color(secondary_foreground),
+                                                    );
+
+                                                if !any_modal_open {
+                                                    mic_btn = mic_btn.cursor_pointer();
+                                                }
+
+                                                mic_btn
+                                            })
+                                            .child(
+                                                if self.turn_in_flight {
+                                                    // The same round button in the same place, so the
+                                                    // composer does not move under the hand that is
+                                                    // about to press it. The square is drawn rather than
+                                                    // brought in as an icon: it is a square.
+                                                    let mut stop_btn = div()
+                                                        .id("stop-btn")
+                                                        .on_click(cx.listener(|this, _, _, cx| {
+                                                            this.state.update(cx, |state, cx| {
+                                                                state.stop_turn(cx);
+                                                            });
+                                                        }))
+                                                        .w(px(36.0))
+                                                        .h(px(36.0))
+                                                        .flex()
+                                                        .items_center()
+                                                        .justify_center()
+                                                        .rounded_full()
+                                                        .bg(foreground)
+                                                        .text_color(background)
+                                                        .hover(move |style| {
+                                                            style.bg(foreground.opacity(0.8))
+                                                        })
+                                                        .tooltip(|w, cx| {
+                                                            Tooltip::new("Stop").build(w, cx)
+                                                        })
+                                                        .child(
+                                                            div()
+                                                                .w(px(11.0))
+                                                                .h(px(11.0))
+                                                                .rounded(px(2.0))
+                                                                .bg(background),
+                                                        );
+
+                                                    if !any_modal_open {
+                                                        stop_btn = stop_btn.cursor_pointer();
+                                                    }
+
+                                                    stop_btn
+                                                } else if self.input_state.read(cx).is_empty() {
+                                                    // Empty state: Sparkles icon - opens voice mode modal
+                                                    let mut sparkles_btn = div()
+                                                        .id("voice-mode")
+                                                        .on_click(cx.listener(|this, _, _, cx| {
+                                                            this.state.update(cx, |state, cx| {
+                                                                state.start_voice_mode(cx);
+                                                            });
+                                                        }))
+                                                        .w(px(36.0))
+                                                        .h(px(36.0))
+                                                        .flex()
+                                                        .items_center()
+                                                        .justify_center()
+                                                        .rounded_full()
+                                                        .bg(gpui_kit::transparent_black())
+                                                        .text_color(secondary_foreground)
+                                                        .hover(move |style| style.bg(secondary))
+                                                        .tooltip(|w, cx| {
+                                                            Tooltip::new("Voice Mode").build(w, cx)
+                                                        })
+                                                        .child(
+                                                            svg()
+                                                                .path("icons/sparkles.svg")
+                                                                .size(px(COMPOSER_ICON_PX))
+                                                                .text_color(secondary_foreground),
+                                                        );
+
+                                                    if !any_modal_open {
+                                                        sparkles_btn =
+                                                            sparkles_btn.cursor_pointer();
+                                                    }
+
+                                                    sparkles_btn
+                                                } else {
+                                                    // Typing state: Send button (Black bg, White arrow)
+                                                    let mut send_btn = div()
+                                                        .id("send-btn")
+                                                        .on_click(cx.listener(
+                                                            |this, _, window, cx| {
+                                                                this.trigger_submit(
+                                                                    false, window, cx,
+                                                                );
+                                                            },
+                                                        ))
+                                                        .w(px(36.0))
+                                                        .h(px(36.0))
+                                                        .flex()
+                                                        .items_center()
+                                                        .justify_center()
+                                                        .rounded_full()
+                                                        .bg(foreground) // Theme-aware foreground (Black in light, White in dark)
+                                                        .text_color(background) // Theme-aware background (White in light, Black in dark)
+                                                        .hover(move |style| {
+                                                            style.bg(foreground.opacity(0.8))
+                                                        })
+                                                        .tooltip(|w, cx| {
+                                                            Tooltip::new("Send message")
+                                                                .build(w, cx)
+                                                        })
+                                                        .child(
+                                                            Icon::new(IconName::ArrowUp)
+                                                                .size(px(COMPOSER_ICON_PX))
+                                                                .text_color(background),
+                                                        );
+
+                                                    if !any_modal_open {
+                                                        send_btn = send_btn.cursor_pointer();
+                                                    }
+
+                                                    send_btn
+                                                },
+                                            )
+                                        }),
+                                ),
+                        ),
+                ),
+        )
     }
 }
 

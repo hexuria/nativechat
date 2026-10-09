@@ -74,6 +74,10 @@ pub struct ComposerPanelRow {
     /// `composer-panel-row-<id>` by default, which is what a list built from data wants; a row
     /// that is a fixed control of the composer, like Attach files, is named by the composer.
     pub element_id: Option<SharedString>,
+    /// The tag this row is a function of (`routines` for `create_routine`). Such a row shows only
+    /// once its tag and a colon are typed ("routines:"), and then the list holds only that tag's
+    /// rows, filtered by what follows the colon (#359, the owner's "@name:function").
+    pub scope: Option<SharedString>,
 }
 
 impl ComposerPanelRow {
@@ -93,7 +97,13 @@ impl ComposerPanelRow {
             selectable: true,
             always: false,
             element_id: None,
+            scope: None,
         }
+    }
+
+    pub fn scope(mut self, scope: impl Into<SharedString>) -> Self {
+        self.scope = Some(scope.into());
+        self
     }
 
     pub fn element_id(mut self, id: impl Into<SharedString>) -> Self {
@@ -150,6 +160,31 @@ pub enum ComposerPanelEvent {
     Dismissed {
         at: Option<Point<Pixels>>,
     },
+}
+
+/// The rows a search leaves, as indices into `rows`. "routines:cre" is the functions of
+/// `routines` matching "cre"; with no colon, the rows that are not anything's function. A list
+/// with no scoped rows filters as it always did, colon or not.
+pub(crate) fn filtered(rows: &[ComposerPanelRow], query: &str) -> Vec<usize> {
+    let needle = query.trim().to_lowercase();
+    let (scope, needle) = match needle.split_once(':') {
+        Some((scope, rest)) if rows.iter().any(|row| row.scope.is_some()) => {
+            (Some(scope.trim().to_string()), rest.trim().to_string())
+        }
+        _ => (None, needle),
+    };
+    rows.iter()
+        .enumerate()
+        .filter(|(_, row)| {
+            let in_scope = match (&scope, &row.scope) {
+                (Some(wanted), Some(of)) => of.to_lowercase() == *wanted,
+                (None, None) => true,
+                _ => false,
+            };
+            in_scope && row.matches(&needle)
+        })
+        .map(|(index, _)| index)
+        .collect()
 }
 
 pub struct ComposerPanel {
@@ -287,14 +322,7 @@ impl ComposerPanel {
     }
 
     fn apply_filter(&mut self, query: &str) {
-        let needle = query.trim().to_lowercase();
-        self.filtered = self
-            .rows
-            .iter()
-            .enumerate()
-            .filter(|(_, row)| row.matches(&needle))
-            .map(|(index, _)| index)
-            .collect();
+        self.filtered = filtered(&self.rows, query);
         self.highlighted = self.first_selectable();
     }
 
@@ -691,8 +719,50 @@ fn keycap(label: SharedString, muted: Hsla) -> impl IntoElement {
 #[cfg(test)]
 mod tests {
     use super::{
-        ComposerPanelRow, SharedString, chord_keys, held_highlight, quick_number, quick_position,
+        ComposerPanelRow, SharedString, chord_keys, filtered, held_highlight, quick_number,
+        quick_position,
     };
+
+    /// Typing a tag and a colon puts that tag's functions in place of the list, filtered by what
+    /// follows; taking the colon back brings the list back (6 Oct 2026, the owner's call).
+    #[test]
+    fn a_colon_after_a_tag_lists_only_its_functions() {
+        let rows = vec![
+            ComposerPanelRow::new("plugin:cloudflare", "i", "cloudflare", "Cloudflare's API"),
+            ComposerPanelRow::new("fn:cloudflare:execute", "i", "execute", "Run code")
+                .scope("cloudflare"),
+            ComposerPanelRow::new("group:routines", "i", "routines", "Routines"),
+            ComposerPanelRow::new(
+                "fn:routines:create_routine",
+                "i",
+                "create_routine",
+                "Make one",
+            )
+            .scope("routines"),
+            ComposerPanelRow::new(
+                "fn:routines:delete_routine",
+                "i",
+                "delete_routine",
+                "Delete one",
+            )
+            .scope("routines"),
+        ];
+        let ids = |query: &str| -> Vec<String> {
+            filtered(&rows, query)
+                .into_iter()
+                .map(|i| rows[i].id.to_string())
+                .collect()
+        };
+        assert_eq!(ids(""), ["plugin:cloudflare", "group:routines"]);
+        assert_eq!(ids("rout"), ["group:routines"]);
+        assert_eq!(
+            ids("routines:"),
+            ["fn:routines:create_routine", "fn:routines:delete_routine"]
+        );
+        assert_eq!(ids("Routines:del"), ["fn:routines:delete_routine"]);
+        assert_eq!(ids("cloudflare:"), ["fn:cloudflare:execute"]);
+        assert!(ids("nope:").is_empty());
+    }
 
     fn roster() -> Vec<ComposerPanelRow> {
         vec![

@@ -31,6 +31,8 @@ use crate::tts_text::{looks_like_markdown, map_utf16_range_to_utf8};
 /// Beside the line of a turn the person's plan could not answer: the turn again, on the server's
 /// paid keys.
 pub(crate) const SEND_ON_SERVER: &str = "run-error-send-on-server";
+/// What a failed turn's line says in the chat; the sentence itself is in the notifications.
+pub const TURN_FAILED: &str = "Turn failed";
 pub(crate) const SEND_ON_SERVER_LABEL: &str = "Send this reply on Server instead";
 use gpui_kit::base::{Align, Placement, Positioner};
 use gpui_kit::component::input::{InputEvent, InputState, TextareaState};
@@ -393,6 +395,7 @@ struct ChatRow {
     screenshots: Vec<ScreenshotSpec>,
     user_form: Option<UserFormSpec>,
     save_login: Option<SaveLoginSpec>,
+    plugin_needs: Option<crate::opengrok::PluginNeedsSpec>,
     /// A step, a stretch of steps, or a thought. Its `content` stays
     /// empty: none of it is words, so find, copy and read aloud pass it by.
     run: Option<RunRow>,
@@ -441,6 +444,7 @@ impl ChatRow {
             screenshots: Vec::new(),
             user_form: None,
             save_login: None,
+            plugin_needs: None,
             run: None,
             source_badge: None,
         }
@@ -787,6 +791,14 @@ fn snapshot_rows(state: &AppState) -> Arc<Vec<ChatRow>> {
                     rows.push(ChatRow {
                         save_login: Some(spec),
                         ..ChatRow::slot(format!("{}-save-login-{ui_n}", msg.id), msg.id.clone())
+                    });
+                    ui_n += 1;
+                }
+                ChatPart::PluginNeeds(spec) => {
+                    flush_text(&mut rows, &mut text_buf, &mut text_n);
+                    rows.push(ChatRow {
+                        plugin_needs: Some(spec),
+                        ..ChatRow::slot(format!("{}-plugin-needs-{ui_n}", msg.id), msg.id.clone())
                     });
                     ui_n += 1;
                 }
@@ -1534,6 +1546,17 @@ impl Render for ChatTranscript {
                                 } else {
                                     palette.secondary_foreground.opacity(0.7)
                                 };
+                                // A failed turn is one quiet line: the whole sentence is in the
+                                // Bot's notifications, a click away, and Copy takes it as it is
+                                // (8 Oct 2026: the line could be neither dismissed nor selected).
+                                let failed_turn = row.status_failed
+                                    && line.trim().starts_with(crate::state::RUN_ERROR_PREFIX);
+                                let shown = if failed_turn {
+                                    TURN_FAILED.to_string()
+                                } else {
+                                    line.clone()
+                                };
+                                let full = line.clone();
                                 return div()
                                     .id(ElementId::Name(row.id.clone().into()))
                                     .w_full()
@@ -1542,7 +1565,51 @@ impl Render for ChatTranscript {
                                     .items_center()
                                     .gap(px(8.))
                                     .py(px(8.))
-                                    .child(div().text_sm().text_color(color).child(line.clone()))
+                                    .child(div().text_sm().text_color(color).child(shown))
+                                    .when(failed_turn, |this| {
+                                        let open = app_state.clone();
+                                        let copy = full.clone();
+                                        this.child(
+                                            div()
+                                                .id(SharedString::from(format!(
+                                                    "turn-failed-details-{}",
+                                                    row.source_id
+                                                )))
+                                                .text_sm()
+                                                .text_color(palette.primary)
+                                                .cursor_pointer()
+                                                .on_mouse_down(
+                                                    MouseButton::Left,
+                                                    move |_, _, cx| {
+                                                        open.update(cx, |state, cx| {
+                                                            let bot =
+                                                                state.active_coworker_id.clone();
+                                                            state.open_notifications_for(bot, cx);
+                                                        });
+                                                    },
+                                                )
+                                                .child("Details"),
+                                        )
+                                        .child(
+                                            div()
+                                                .id(SharedString::from(format!(
+                                                    "turn-failed-copy-{}",
+                                                    row.source_id
+                                                )))
+                                                .text_sm()
+                                                .text_color(palette.primary)
+                                                .cursor_pointer()
+                                                .on_mouse_down(
+                                                    MouseButton::Left,
+                                                    move |_, _, cx| {
+                                                        cx.write_to_clipboard(
+                                                            ClipboardItem::new_string(copy.clone()),
+                                                        );
+                                                    },
+                                                )
+                                                .child("Copy"),
+                                        )
+                                    })
                                     // A turn that never left is the one status line worth
                                     // answering: retyping the message was the only way back
                                     // from it, and the message is still right there.
@@ -1651,6 +1718,23 @@ impl Render for ChatTranscript {
                                         Some(app_state.clone()),
                                         cx,
                                     )))
+                                    .into_any_element();
+                            }
+                            if let Some(spec) = &row.plugin_needs {
+                                return div()
+                                    .id(ElementId::Name(row.id.clone().into()))
+                                    .w_full()
+                                    .flex()
+                                    .justify_start()
+                                    .py(px(6.))
+                                    .child(div().w_full().max_w(px(560.)).child(
+                                        crate::components::plugin_needs::render_plugin_needs(
+                                            spec,
+                                            &row.source_id,
+                                            app_state.clone(),
+                                            cx,
+                                        ),
+                                    ))
                                     .into_any_element();
                             }
                             if let Some(spec) = &row.save_login {

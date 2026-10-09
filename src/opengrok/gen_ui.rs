@@ -39,6 +39,91 @@ pub enum ChatPart {
     /// What the coworker thought on the way (`REASONING_MESSAGE_*`), as a collapsed "Thought"
     /// row. It is never part of the reply's words.
     Reasoning(ThoughtSpec),
+    /// The whole answer to a message whose tagged plugins need something first: which account,
+    /// an account at all, or an install (`opengrok.pluginNeeds`, #360). No model was asked.
+    PluginNeeds(PluginNeedsSpec),
+}
+
+/// The CUSTOM a turn answers with, instead of asking the model, when a plugin its message tagged
+/// cannot be used yet (opengrok-server `plugin_needs_answer` in `crates/opengrok-server/src/agui/
+/// routes.rs` and `turn::needs` in `crates/opengrok-integrations/src/turn.rs`, #360,
+/// gol/service-accounts).
+pub const PLUGIN_NEEDS_CUSTOM: &str = "opengrok.pluginNeeds";
+
+/// The plugin tool whose answer is a card for the person rather than words for the model
+/// (opengrok-tools `plugin_desk::ADD_PLUGIN_ACCOUNT`, #359).
+pub const ADD_PLUGIN_ACCOUNT: &str = "add_plugin_account";
+
+/// What each tagged plugin still needs, in the order the server listed them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginNeedsSpec {
+    pub needs: Vec<PluginNeed>,
+    /// Whether answering it sends the message again: a turn that stopped for the card did not
+    /// run, while the Bot's own `add_plugin_account` card comes from a turn that did.
+    pub send_again: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginNeed {
+    pub plugin: String,
+    /// The service an account is for; none on an install.
+    pub connector: Option<String>,
+    pub kind: PluginNeedKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PluginNeedKind {
+    /// Tagged and not installed.
+    Install,
+    /// No account for a service that needs one.
+    Account,
+    /// Several accounts and nothing says which: `(id, label, kind)` of each, never a secret.
+    Choose(Vec<(String, String, String)>),
+}
+
+impl PluginNeedsSpec {
+    /// The card a `opengrok.pluginNeeds` frame carries; `None` for any other frame, or one whose
+    /// needs this app cannot read (a need it does not know is left out, not guessed at).
+    pub fn from_event(event: &Value) -> Option<Self> {
+        if event.get("name").and_then(Value::as_str) != Some(PLUGIN_NEEDS_CUSTOM) {
+            return None;
+        }
+        let listed = event.get("value")?.get("needs")?.as_array()?;
+        let text =
+            |need: &Value, key: &str| need.get(key).and_then(Value::as_str).map(str::to_string);
+        let needs: Vec<PluginNeed> = listed
+            .iter()
+            .filter_map(|need| {
+                let kind = match need.get("need").and_then(Value::as_str)? {
+                    "install" => PluginNeedKind::Install,
+                    "account" => PluginNeedKind::Account,
+                    "choose" => PluginNeedKind::Choose(
+                        need.get("accounts")?
+                            .as_array()?
+                            .iter()
+                            .filter_map(|account| {
+                                Some((
+                                    text(account, "id")?,
+                                    text(account, "label")?,
+                                    text(account, "kind").unwrap_or_default(),
+                                ))
+                            })
+                            .collect(),
+                    ),
+                    _ => return None,
+                };
+                Some(PluginNeed {
+                    plugin: text(need, "plugin")?,
+                    connector: text(need, "connector"),
+                    kind,
+                })
+            })
+            .collect();
+        (!needs.is_empty()).then_some(Self {
+            needs,
+            send_again: true,
+        })
+    }
 }
 
 /// A visible reasoning segment and its locally observed duration, never a guessed model round.
@@ -1159,6 +1244,11 @@ impl TurnAssembler {
                     }
                     return;
                 }
+                if let Some(spec) = PluginNeedsSpec::from_event(event) {
+                    self.flush_text();
+                    self.committed.push(ChatPart::PluginNeeds(spec));
+                    return;
+                }
                 if is_user_form_awaiting(event) {
                     self.flush_text();
                     let call_id = event
@@ -1451,9 +1541,32 @@ impl TurnAssembler {
             spec.ok = ok;
         }
         self.settle_step_arguments(&call_id);
+        let mut tool = String::new();
         if let Some(step) = step_mut(&mut self.committed, &call_id) {
             step.result = Some(capped(&content));
             step.ok = ok;
+            tool = step.tool.clone();
+        }
+        // The Bot asked for an account (`add_plugin_account`, #359): the person is shown the same
+        // card a tag that needed one shows, which opens Plugins, where the key or the sign-in
+        // goes. The result carries the plugin and the service and nothing else
+        // (opengrok-server `plugin_desk.rs`, `Ask::AddAccount`, gol/service-accounts).
+        if tool == ADD_PLUGIN_ACCOUNT
+            && ok != Some(false)
+            && let Ok(answer) = serde_json::from_str::<Value>(&content)
+            && answer["card"] == "shown"
+            && let Some(plugin) = answer["plugin"].as_str()
+        {
+            let need = PluginNeed {
+                plugin: plugin.to_string(),
+                connector: answer["connector"].as_str().map(str::to_string),
+                kind: PluginNeedKind::Account,
+            };
+            let card = PluginNeedsSpec {
+                needs: vec![need],
+                send_again: false,
+            };
+            self.committed.push(ChatPart::PluginNeeds(card));
         }
         // Keep every PNG with bytes for the Computer pane / last-screen thumb.
         // Chat row follows `image.visibility` (opengrok-server#139). Untagged
@@ -1612,7 +1725,8 @@ impl TurnAssembler {
             | ChatPart::UserForm(_)
             | ChatPart::SaveLogin(_)
             | ChatPart::Step(_)
-            | ChatPart::Reasoning(_) => true,
+            | ChatPart::Reasoning(_)
+            | ChatPart::PluginNeeds(_) => true,
         });
         self.committed.push(ChatPart::Ui(spec));
         self.completed_ui.retain(|tool| tool.name != name);
@@ -1998,7 +2112,8 @@ fn plain_text(parts: &[ChatPart]) -> String {
             | ChatPart::UserForm(_)
             | ChatPart::SaveLogin(_)
             | ChatPart::Step(_)
-            | ChatPart::Reasoning(_) => push_run(&mut out, std::mem::take(&mut run)),
+            | ChatPart::Reasoning(_)
+            | ChatPart::PluginNeeds(_) => push_run(&mut out, std::mem::take(&mut run)),
         }
     }
     push_run(&mut out, run);
@@ -5555,5 +5670,53 @@ mod tests {
         assert!(!changes.answered(&answer("list", Some(true))));
         assert!(!changes.answered(&answer("shell", Some(true))));
         assert!(!changes.answered(&answer("never-named", Some(true))));
+    }
+
+    /// A needs frame becomes the card, each need as the server listed it; one this app does not
+    /// know is left out rather than guessed at, and the Bot's `add_plugin_account` answer is the
+    /// same account card, with no Send again (#359, #360).
+    #[test]
+    fn a_needs_frame_and_an_add_account_answer_are_cards() {
+        let mut assembler = TurnAssembler::default();
+        assembler.push_event(&serde_json::json!({
+            "type": "CUSTOM", "name": PLUGIN_NEEDS_CUSTOM, "value": {"needs": [
+                {"plugin": "nope", "need": "install"},
+                {"plugin": "cloudflare", "connector": "cloudflare", "need": "choose",
+                 "accounts": [{"id": "conn_a", "label": "Work", "kind": "mcp"}]},
+                {"plugin": "x", "need": "telepathy"}
+            ]}
+        }));
+        let (_, parts) = assembler.snapshot();
+        let [ChatPart::PluginNeeds(card)] = parts.as_slice() else {
+            panic!("{parts:?}");
+        };
+        assert!(card.send_again);
+        assert_eq!(card.needs.len(), 2);
+        assert_eq!(card.needs[0].kind, PluginNeedKind::Install);
+        assert_eq!(
+            card.needs[1].kind,
+            PluginNeedKind::Choose(vec![("conn_a".into(), "Work".into(), "mcp".into())])
+        );
+
+        let mut assembler = TurnAssembler::default();
+        for event in [
+            serde_json::json!({"type": "TOOL_CALL_START", "toolCallId": "c1", "toolCallName": ADD_PLUGIN_ACCOUNT}),
+            serde_json::json!({"type": "TOOL_CALL_END", "toolCallId": "c1"}),
+            serde_json::json!({"type": "TOOL_CALL_RESULT", "toolCallId": "c1", "ok": true,
+                "content": "{\"plugin\":\"cloudflare\",\"connector\":\"cloudflare\",\"card\":\"shown\"}"}),
+        ] {
+            assembler.push_event(&event);
+        }
+        let card = assembler
+            .snapshot()
+            .1
+            .into_iter()
+            .find_map(|part| match part {
+                ChatPart::PluginNeeds(card) => Some(card),
+                _ => None,
+            });
+        let card = card.expect("the account card");
+        assert!(!card.send_again);
+        assert_eq!(card.needs[0].kind, PluginNeedKind::Account);
     }
 }

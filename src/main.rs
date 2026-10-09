@@ -28,6 +28,7 @@ fn main() {
         .build()
         .expect("Failed to create tokio runtime");
     let _guard = runtime.enter();
+    nativechat::state::keep_tokio_handle(runtime.handle().clone());
 
     dotenvy::from_filename(".env.local").ok();
     dotenvy::dotenv().ok();
@@ -153,6 +154,11 @@ fn main() {
                     nativechat::actions::CloseMonitorModal,
                     Some("MonitorModal"),
                 ),
+                KeyBinding::new(
+                    "cmd-s",
+                    nativechat::actions::SaveSkillPage,
+                    Some("MonitorModal"),
+                ),
                 KeyBinding::new("tab", PaletteNextTab, Some("CommandPalette")),
                 KeyBinding::new("shift-tab", PalettePrevTab, Some("CommandPalette")),
                 KeyBinding::new("down", PaletteSelectNext, Some("CommandPalette")),
@@ -230,6 +236,7 @@ fn main() {
 
             gpui_kit::init(cx);
             nativechat::components::model_picker::init(cx);
+            nativechat::components::marketplace::init(cx);
             // The composer's own field and its keys (#40).
             nativechat::components::composer_editor::init(cx);
             theme::init(cx);
@@ -241,6 +248,18 @@ fn main() {
             let bounds = display.bounds();
 
             let options = WindowOptions {
+                // Agent verification can leave the person's current app in front. This flag is
+                // absent from release builds; normal launches still focus the window.
+                focus: {
+                    #[cfg(feature = "agent")]
+                    {
+                        std::env::var("GPUI_AGENT_BACKGROUND").as_deref() != Ok("1")
+                    }
+                    #[cfg(not(feature = "agent"))]
+                    {
+                        true
+                    }
+                },
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 window_min_size: Some(size(px(520.), px(400.))),
                 // The title bar is ours: transparent, with the traffic lights centred in the

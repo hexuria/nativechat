@@ -1,13 +1,20 @@
 //! Tools and Plugins open from the Computer pane (hexuria/nativechat#175, R-A and P1).
-//! The lists, switch state and errors are the existing server-backed cards' own. Step one of
-//! Plugins uses connections and private skills; catalog installation and extra accounts await
+//! The lists, switch state and errors are the existing server-backed cards' own. Plugins uses
+//! connections, private skills and the open Bot's ceiling; catalog installation awaits
 //! opengrok-server#356. Connector metadata is not invented where the server supplies none.
+//!
+//! A service can have several accounts (hexuria/nativechat#185, the client half of
+//! opengrok-server #359): a connection's detail lists every account of its service, each with
+//! Rename and Reconnect, adds another, and picks which one the open Bot uses, or none, so it
+//! asks each time. Each installed plugin is switched for the open Bot through its ceiling row.
 
-use crate::components::agent_settings::{shown_skill_rows, skills_card_lines, skills_summary};
+use crate::components::agent_settings::{
+    CeilingCardLine, shown_skill_rows, skills_card_lines, skills_summary,
+};
 use crate::components::switch::Switch;
 use crate::components::{agent_settings, connections};
-use crate::state::{AppState, ConnectionList, ConnectorList, SkillsCard};
-use gpui_kit::component::tooltip::Tooltip;
+use crate::opengrok::ConnectionKind;
+use crate::state::{AppState, ConnectionList, ConnectorList, PinList, SkillsCard, ToolCeiling};
 use gpui_kit::component::{ActiveTheme, Icon, IconName, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
@@ -25,6 +32,57 @@ pub(crate) const ADD_ACCOUNT: &str = "monitor-plugin-add-account";
 pub(crate) const DETAIL: &str = "monitor-plugin-detail";
 pub(crate) const STATUS: &str = "monitor-plugin-status";
 pub(crate) const NOT_SUPPLIED: &str = "Not supplied by this server";
+/// A connection's detail lists every account of its service: the list, and under it why the
+/// last Add another account did not open the browser.
+pub(crate) const ACCOUNTS: &str = "monitor-plugin-accounts";
+pub(crate) const ADD_ACCOUNT_ERROR: &str = "monitor-plugin-add-account-error";
+/// Which account the open Bot uses for the service: the picker, its Ask each time, and the line
+/// under it.
+pub(crate) const PICKER: &str = "monitor-account-picker";
+pub(crate) const PICK_ASK: &str = "monitor-account-ask";
+pub(crate) const PICKER_NOTE: &str = "monitor-account-picker-note";
+/// The picker's choice of no account: the Bot has none picked, and asks each time.
+pub(crate) const ASK_EACH_TIME: &str = "Always ask";
+
+/// One account's row in a connection's detail, by its connection id.
+pub(crate) fn account_id(id: &str) -> String {
+    format!("monitor-account-row-{id}")
+}
+
+/// That account's Rename, which opens its label as a field.
+pub(crate) fn rename_id(id: &str) -> String {
+    format!("monitor-account-rename-{id}")
+}
+
+/// The field its label is renamed in, while it is open: Enter saves, Escape puts it back.
+pub(crate) fn rename_field_id(id: &str) -> String {
+    format!("monitor-account-label-{id}")
+}
+
+/// That account's Reconnect, on an account signed in to through a sign-in page.
+pub(crate) fn reconnect_id(id: &str) -> String {
+    format!("monitor-account-reconnect-{id}")
+}
+
+/// Why that account's last rename or Reconnect did not go through.
+pub(crate) fn account_note_id(id: &str) -> String {
+    format!("monitor-account-note-{id}")
+}
+
+/// The picker's choice of that account for the open Bot.
+pub(crate) fn pick_id(id: &str) -> String {
+    format!("monitor-account-pick-{id}")
+}
+
+/// An installed plugin's switch for the open Bot, by the plugin's name in the Bot's ceiling.
+pub(crate) fn plugin_switch_id(name: &str) -> String {
+    format!("monitor-plugin-switch-{name}")
+}
+
+/// Why that switch's last change did not go through.
+pub(crate) fn plugin_switch_note_id(name: &str) -> String {
+    format!("monitor-plugin-switch-note-{name}")
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MonitorKind {
@@ -41,10 +99,32 @@ impl MonitorKind {
     }
 }
 
+/// Your own skill's page fields: the skill they were made for, its Name, Description and
+/// Instructions.
+type SkillInputs = (
+    String,
+    Entity<gpui_kit::component::input::InputState>,
+    Entity<gpui_kit::component::input::InputState>,
+    Entity<gpui_kit::component::input::TextareaState>,
+);
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PluginSelection {
     Connection(String),
     Skill(String),
+    /// A service this server signs in to (`GET /connectors`), by name, whether or not the person
+    /// has an account of it yet.
+    Service(String),
+    /// A marketplace plugin, by its name in the catalog or in the person's installs.
+    Plugin(String),
+    /// A built-in tool or tool group in the Tools window, by its ceiling name.
+    Tool(String),
+    /// "+ New skill": the skill page, empty, before the skill exists.
+    NewSkill,
+    /// One of a plugin's skills, read-only, by plugin and skill: back goes to the plugin.
+    PluginSkill(String, String),
+    /// One saved login's Bots page: a switch per Bot, by the login's id.
+    Login(String),
 }
 
 impl PluginSelection {
@@ -52,12 +132,26 @@ impl PluginSelection {
         match self {
             Self::Connection(id) => format!("monitor-connection-detail-{id}"),
             Self::Skill(id) => format!("monitor-skill-detail-{id}"),
+            Self::Service(name) => format!("market-service-{name}"),
+            Self::Plugin(name) => format!("market-plugin-{name}"),
+            Self::Tool(name) => format!("market-tool-item-{name}"),
+            Self::NewSkill => "market-skill-new-page".to_string(),
+            Self::PluginSkill(plugin, skill) => format!("market-plugin-skill-{plugin}-{skill}"),
+            Self::Login(id) => format!("market-login-{id}"),
         }
     }
     pub(crate) fn switch_id(&self) -> String {
         match self {
             Self::Connection(id) => connections::lend_id(id),
             Self::Skill(id) => format!("agent-skills-switch-{id}"),
+            Self::Service(name) => format!("market-service-switch-{name}"),
+            Self::Plugin(name) => plugin_switch_id(name),
+            Self::Tool(name) => format!("agent-ceiling-switch-{name}"),
+            Self::NewSkill => String::new(),
+            Self::PluginSkill(plugin, skill) => {
+                crate::components::marketplace::plugin_skill_switch_id(plugin, skill)
+            }
+            Self::Login(_) => String::new(),
         }
     }
 }
@@ -70,6 +164,36 @@ pub struct MonitorModal {
     pub confirming: bool,
     pub removing: bool,
     pub error: Option<String>,
+    /// The account whose rename field is open in the detail, by its connection id, and what the
+    /// field holds as typed.
+    pub renaming: Option<(String, String)>,
+    /// Which marketplace page is open under any detail.
+    pub page: MarketPage,
+    /// What is typed in the marketplace's search.
+    pub query: String,
+    /// The result Up and Down move and Enter opens, by its place among the rows shown.
+    pub highlight: usize,
+    /// The highlight is drawn: Up or Down moved it, or a search is typed (Enter opens it). A
+    /// click is not keyboard use, and leaves no row lit after Back (7 Oct 2026).
+    pub keyed: bool,
+    /// A plugin detail's Tools section is open.
+    pub tools_open: bool,
+    /// The account whose Remove was pressed on its row, which the confirmation is about.
+    pub removal: Option<String>,
+    /// The account whose Bots list is open in place of the detail, and what its filter holds.
+    pub bots_for: Option<String>,
+    pub bots_query: String,
+}
+
+/// The marketplace's pages: everything by category, one category whole, or what is installed.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum MarketPage {
+    #[default]
+    Browse,
+    Category(String),
+    Installed,
+    /// Your saved logins, each with the Bots it is shared with (8 Oct 2026).
+    Logins,
 }
 
 impl MonitorModal {
@@ -81,6 +205,15 @@ impl MonitorModal {
             confirming: false,
             removing: false,
             error: None,
+            renaming: None,
+            page: MarketPage::Browse,
+            query: String::new(),
+            highlight: 0,
+            keyed: false,
+            tools_open: false,
+            removal: None,
+            bots_for: None,
+            bots_query: String::new(),
         }
     }
 }
@@ -124,7 +257,8 @@ pub(crate) fn plugin_rows(state: &AppState) -> Vec<PluginRow> {
         })
         .collect();
     if let Some(card) = state.skills_card() {
-        rows.extend(private_skill_rows(&card).into_iter().map(|row| PluginRow {
+        // Yours and your org's, as the Installed page lists them (7 Oct 2026).
+        rows.extend(shown_skill_rows(&card).into_iter().map(|row| PluginRow {
             selection: PluginSelection::Skill(row.id),
             title: row.title,
             subtitle: if row.switched_off {
@@ -140,10 +274,58 @@ pub(crate) fn plugin_rows(state: &AppState) -> Vec<PluginRow> {
     rows
 }
 
+/// An installed plugin's switch for the open Bot: its row in the Bot's ceiling
+/// (opengrok-server #268), which the Tools card switches as well. The window and the driver use
+/// the same rows, with a switch that is with the server shown where it was asked to go.
+#[derive(Clone, Debug)]
+pub(crate) struct PluginSwitch {
+    pub name: String,
+    pub title: String,
+    pub subtitle: String,
+    pub on: bool,
+    pub live: bool,
+    pub note: Option<String>,
+}
+
+/// Every plugin in the open Bot's ceiling, in the server's order, or none while it is not read.
+pub(crate) fn plugin_switches(state: &AppState) -> Vec<PluginSwitch> {
+    let Some(card) = state.ceiling_card() else {
+        return Vec::new();
+    };
+    agent_settings::shown_ceiling_rows(&card)
+        .into_iter()
+        .filter(|row| !row.builtin)
+        .map(|row| PluginSwitch {
+            subtitle: row
+                .unavailable
+                .map(str::to_string)
+                .or(row.connector)
+                .unwrap_or(row.first_line),
+            name: row.name,
+            title: row.title,
+            on: row.on,
+            live: row.live,
+            note: row.note,
+        })
+        .collect()
+}
+
 pub(crate) fn plugin_exists(state: &AppState, selected: &PluginSelection) -> bool {
-    plugin_rows(state)
-        .iter()
-        .any(|row| &row.selection == selected)
+    match selected {
+        PluginSelection::Service(_)
+        | PluginSelection::Plugin(_)
+        | PluginSelection::Tool(_)
+        | PluginSelection::NewSkill => crate::components::marketplace::row_exists(state, selected),
+        PluginSelection::Login(id) => state.site_logins.iter().any(|row| &row.id == id),
+        // A plugin's skill page stays while its plugin does.
+        PluginSelection::PluginSkill(plugin, _) => crate::components::marketplace::row_exists(
+            state,
+            &PluginSelection::Plugin(plugin.clone()),
+        ),
+        _ => plugin_rows(state)
+            .iter()
+            .any(|row| &row.selection == selected),
+    }
 }
 
 /// Only facts the current server supplies, with an explicit absence for metadata catalog #356
@@ -154,18 +336,91 @@ pub(crate) struct PluginDetail {
     pub fields: Vec<(&'static str, String)>,
     pub question: String,
     pub can_remove: bool,
-    pub connection: bool,
+    /// A connection's service: its accounts, Add another account and the open Bot's pick.
+    pub accounts: Option<ServiceAccounts>,
     pub error: Option<String>,
+}
+
+/// What a connection's detail shows of its service (opengrok-server #359): every account the
+/// person has of it, in the server's order, Add another account, and which one the open Bot
+/// uses.
+#[derive(Clone, Debug)]
+pub(crate) struct ServiceAccounts {
+    pub connector: String,
+    pub rows: Vec<AccountRow>,
+    /// Add another account can be pressed: no sign-in page is being asked for.
+    pub can_add: bool,
+    /// Its sign-in page is being asked for, and the button says so.
+    pub adding: bool,
+    /// Why the last Connect of this service did not open the browser.
+    pub add_refusal: Option<String>,
+    pub picker: AccountPicker,
+}
+
+/// One account of the service, as the window and the driver show it.
+#[derive(Clone, Debug)]
+pub(crate) struct AccountRow {
+    pub id: String,
+    /// What it is called, with a rename that is with the server shown as asked.
+    pub label: String,
+    /// The account the detail was opened on, which Remove removes.
+    pub selected: bool,
+    /// What its rename field holds, while the field is open.
+    pub renaming: Option<String>,
+    /// Rename can be pressed: nothing is with the server for it.
+    pub can_rename: bool,
+    /// It was signed in to through the service's sign-in page, which Reconnect opens again. An
+    /// account made from a key has no page to go back to, and no Reconnect.
+    pub reconnects: bool,
+    /// Reconnect can be pressed: nothing is with the server for it, and no sign-in page is being
+    /// asked for.
+    pub can_reconnect: bool,
+    /// Its Reconnect is asking for the page.
+    pub opening: bool,
+    /// Why its last rename or Reconnect did not go through, in the server's words.
+    pub note: Option<String>,
+}
+
+/// The open Bot's pick of an account for the service: one choice for each account, then
+/// [`ASK_EACH_TIME`].
+#[derive(Clone, Debug)]
+pub(crate) struct AccountPicker {
+    /// "Ada uses".
+    pub title: String,
+    /// What shows as picked, `None` inside for Ask each time: see
+    /// [`crate::state::AccountConnections::shown_pick`]. `None` until the pins are read.
+    pub picked: Option<Option<String>>,
+    /// A choice can be made: the pins are read, and no pick for this Bot and service is with the
+    /// server.
+    pub live: bool,
+    /// Why the last pick did not go through, or why nothing can be picked yet.
+    pub note: Option<String>,
+}
+
+fn account_picker(state: &AppState, connector: &str) -> AccountPicker {
+    let connections = &state.connections;
+    let bot = state.active_coworker_id.as_deref().unwrap_or_default();
+    let picked = connections.shown_pick(bot, connector);
+    let note = match (connections.pick_refusal(bot, connector), &connections.pins) {
+        (Some(why), _) => Some(why.to_string()),
+        (None, None | Some(PinList::Loading)) => Some(connections::ASKING.to_string()),
+        (None, Some(PinList::Unavailable(why))) => Some(why.clone()),
+        (None, Some(PinList::Listed(_))) => None,
+    };
+    AccountPicker {
+        title: format!("{} uses", state.active_bot_name()),
+        live: picked.is_some() && !connections.is_picking(bot, connector),
+        picked,
+        note,
+    }
 }
 
 pub(crate) fn plugin_detail(state: &AppState, selected: &PluginSelection) -> Option<PluginDetail> {
     match selected {
         PluginSelection::Connection(id) => {
-            let row = state
-                .connections
-                .own_rows()
-                .into_iter()
-                .find(|row| &row.id == id)?;
+            let connections = &state.connections;
+            let own = connections.own_rows();
+            let row = *own.iter().find(|row| &row.id == id)?;
             let name_of = |id: &str| {
                 state
                     .coworkers
@@ -173,21 +428,75 @@ pub(crate) fn plugin_detail(state: &AppState, selected: &PluginSelection) -> Opt
                     .find(|bot| bot.id == id)
                     .map(|bot| bot.name.clone())
             };
+            let modal = state.monitor_modal.as_ref();
+            let removing = modal.is_some_and(|modal| modal.removing);
+            let renaming = modal.and_then(|modal| modal.renaming.as_ref());
+            let reconnecting = connections.reconnecting.as_deref();
+            let rows = own
+                .iter()
+                .filter(|account| account.connector == row.connector)
+                .map(|account| {
+                    let changing = connections.is_changing(&account.id);
+                    let reconnects = account.kind == ConnectionKind::Oauth;
+                    let reconnect_refusal = connections
+                        .reconnect_refused
+                        .as_ref()
+                        .filter(|(about, _)| *about == account.id)
+                        .map(|(_, why)| why.clone());
+                    AccountRow {
+                        id: account.id.clone(),
+                        label: connections.shown_label(account),
+                        selected: account.id == *id,
+                        renaming: renaming
+                            .filter(|(about, _)| *about == account.id)
+                            .map(|(_, typed)| typed.clone()),
+                        can_rename: !changing && !removing,
+                        reconnects,
+                        can_reconnect: reconnects
+                            && !changing
+                            && !removing
+                            && connections.opening.is_none(),
+                        opening: reconnecting == Some(account.id.as_str()),
+                        note: connections
+                            .not_renamed
+                            .get(&account.id)
+                            .cloned()
+                            .or(reconnect_refusal),
+                    }
+                })
+                .collect();
             Some(PluginDetail {
-                title: state.connections.connector_label(&row.connector),
+                title: connections.connector_label(&row.connector),
                 fields: vec![
                     ("Source", row.connector.clone()),
                     ("Transport", NOT_SUPPLIED.into()),
                     ("URL", NOT_SUPPLIED.into()),
                     ("Tools", NOT_SUPPLIED.into()),
-                    ("Accounts", row.label.clone()),
                 ],
-                question: connections::confirm_question(&state.connections, row, name_of),
-                can_remove: !state.connections.is_changing(id),
-                connection: true,
-                error: state.connections.disconnect_refusal(id).map(str::to_string),
+                question: connections::confirm_question(connections, row, name_of),
+                can_remove: !connections.is_changing(id),
+                accounts: Some(ServiceAccounts {
+                    connector: row.connector.clone(),
+                    rows,
+                    can_add: connections.opening.is_none() && !removing,
+                    adding: reconnecting.is_none()
+                        && connections.opening.as_deref() == Some(row.connector.as_str()),
+                    add_refusal: connections
+                        .connect_refused
+                        .as_ref()
+                        .filter(|(service, _)| *service == row.connector)
+                        .map(|(_, why)| why.clone()),
+                    picker: account_picker(state, &row.connector),
+                }),
+                error: connections.disconnect_refusal(id).map(str::to_string),
             })
         }
+        PluginSelection::Service(_)
+        | PluginSelection::Plugin(_)
+        | PluginSelection::Tool(_)
+        | PluginSelection::NewSkill
+        | PluginSelection::PluginSkill(..)
+        | PluginSelection::Login(_) => None,
         PluginSelection::Skill(id) => {
             let card = state.skills_card()?;
             let row = private_skill_rows(&card)
@@ -207,7 +516,7 @@ pub(crate) fn plugin_detail(state: &AppState, selected: &PluginSelection) -> Opt
                     row.title
                 ),
                 can_remove: card.blocked.is_none(),
-                connection: false,
+                accounts: None,
                 error: None,
             })
         }
@@ -223,6 +532,19 @@ pub(crate) fn plugin_status(state: &AppState) -> Vec<String> {
     }
     if let Some(ConnectorList::Unavailable(why)) = &state.connections.connectors {
         lines.push(why.clone());
+    }
+    // The plugins' switches are the open Bot's ceiling rows, and the Tools card's lines say why
+    // they cannot move when they cannot.
+    if let Some(card) = state.ceiling_card() {
+        if let ToolCeiling::Unavailable(why) = &card.ceiling {
+            lines.push(why.clone());
+        }
+        for line in agent_settings::ceiling_card_lines(&card) {
+            let (CeilingCardLine::ReadOnly(words)
+            | CeilingCardLine::Wait(words)
+            | CeilingCardLine::Note(words)) = line;
+            lines.push(words);
+        }
     }
     if let Some(card) = state.skills_card() {
         if matches!(card.skills, crate::state::BotSkills::Read(_)) {
@@ -255,6 +577,25 @@ pub struct MonitorModalView {
     focus: FocusHandle,
     was_open: bool,
     pending_focus: bool,
+    rename_input: Option<Entity<gpui_kit::component::input::InputState>>,
+    /// Your own skill's page: its Name, Description and Instructions, for the skill they were
+    /// made for.
+    skill_inputs: Option<SkillInputs>,
+    /// The Write / Upload sheet's fields, made the first time "+ New skill" opens it.
+    add_skill: Option<crate::components::skills::AddSheetInputs>,
+    /// The Tools window's search, which says "Search tools".
+    tools_search_input: Option<Entity<gpui_kit::component::input::InputState>>,
+    rename_account: Option<String>,
+    /// The marketplace's search field, made on first draw (it needs the window).
+    search_input: Option<Entity<gpui_kit::component::input::InputState>>,
+    /// The token field, for the token form it was made for.
+    token_input: Option<Entity<gpui_kit::component::input::InputState>>,
+    /// The Bots list's filter, while one is open.
+    bots_input: Option<Entity<gpui_kit::component::input::InputState>>,
+    token_for: Option<(String, String, Option<String>)>,
+    /// The marketplace list, and the highlight it last scrolled into view.
+    scroll: ScrollHandle,
+    scrolled_to: Option<usize>,
 }
 
 impl MonitorModalView {
@@ -274,6 +615,143 @@ impl MonitorModalView {
             focus: cx.focus_handle(),
             was_open: open,
             pending_focus: open,
+            rename_input: None,
+            tools_search_input: None,
+            skill_inputs: None,
+            add_skill: None,
+            rename_account: None,
+            search_input: None,
+            token_input: None,
+            bots_input: None,
+            token_for: None,
+            scroll: ScrollHandle::new(),
+            scrolled_to: None,
+        }
+    }
+
+    /// The search field, made once, typing into the state; and whatever the state holds (a
+    /// driver's `set-value`, or a page change that cleared it) put back into the field.
+    fn sync_market_inputs(
+        &mut self,
+        modal: &MonitorModal,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use gpui_kit::component::input::{InputEvent, InputState};
+        let tools = modal.kind == MonitorKind::Tools;
+        let slot = if tools {
+            &self.tools_search_input
+        } else {
+            &self.search_input
+        };
+        let search = match slot {
+            Some(search) => search.clone(),
+            None => {
+                let words = if tools {
+                    "Search tools"
+                } else {
+                    "Search plugins"
+                };
+                let search = cx.new(|cx| InputState::new(window, cx).placeholder(words));
+                cx.subscribe(&search, |this, input, event: &InputEvent, cx| {
+                    if matches!(event, InputEvent::Change) {
+                        let query = input.read(cx).value().to_string();
+                        this.state
+                            .update(cx, |state, cx| state.set_market_query(query, cx));
+                    }
+                })
+                .detach();
+                if tools {
+                    self.tools_search_input = Some(search.clone());
+                } else {
+                    self.search_input = Some(search.clone());
+                }
+                search
+            }
+        };
+        // Esc cleared the search in the state: the field follows.
+        if modal.query.is_empty() && !search.read(cx).value().is_empty() {
+            search.update(cx, |input, cx| input.set_value("", window, cx));
+        }
+        self.sync_skill_inputs(modal, window, cx);
+        // "+ New skill": the sheet's fields, made when it first opens. The server took the last
+        // create, so the next sheet opens clean; a refusal leaves the words where they were.
+        let (add_open, taken) = {
+            let state = self.state.read(cx);
+            (state.skill_add_open, state.skill_add_taken)
+        };
+        let new_page = modal.selected == Some(PluginSelection::NewSkill);
+        if (add_open || new_page) && self.add_skill.is_none() {
+            let inputs = crate::components::skills::AddSheetInputs::new(window, cx);
+            // The page's Create follows what is typed: it lights up once the name is valid and
+            // there are instructions.
+            cx.observe(&inputs.name, |_, _, cx| cx.notify()).detach();
+            cx.observe(&inputs.body, |_, _, cx| cx.notify()).detach();
+            self.add_skill = Some(inputs);
+        }
+        if taken {
+            if let Some(add) = &self.add_skill {
+                add.clear(window, cx);
+            }
+            self.state
+                .update(cx, |state, _| state.skill_add_fields_cleared());
+        }
+        if search.read(cx).value().as_str() != modal.query.as_str() {
+            let query = modal.query.clone();
+            search.update(cx, |input, cx| input.set_value(query, window, cx));
+        }
+        if modal.bots_for.is_some() {
+            let bots = match &self.bots_input {
+                Some(bots) => bots.clone(),
+                None => {
+                    let bots = cx.new(|cx| InputState::new(window, cx).placeholder("Filter Bots"));
+                    cx.subscribe(&bots, |this, input, event: &InputEvent, cx| {
+                        if matches!(event, InputEvent::Change) {
+                            let query = input.read(cx).value().to_string();
+                            this.state
+                                .update(cx, |state, cx| state.set_bots_query(query, cx));
+                        }
+                    })
+                    .detach();
+                    self.bots_input = Some(bots.clone());
+                    bots
+                }
+            };
+            if bots.read(cx).value().as_str() != modal.bots_query.as_str() {
+                let query = modal.bots_query.clone();
+                bots.update(cx, |input, cx| input.set_value(query, window, cx));
+            }
+        } else {
+            self.bots_input = None;
+        }
+        let form = self.state.read(cx).plugin_market.token.clone();
+        let key = form.as_ref().map(|form| {
+            (
+                form.plugin.clone(),
+                form.connector.clone(),
+                form.replacing.clone(),
+            )
+        });
+        if key != self.token_for {
+            self.token_for = key.clone();
+            self.token_input = key.map(|_| {
+                let input = cx.new(|cx| {
+                    InputState::new(window, cx)
+                        .placeholder("Paste a token")
+                        .masked(true)
+                });
+                cx.subscribe(&input, |this, input, event: &InputEvent, cx| {
+                    let typed = input.read(cx).value().to_string();
+                    this.state.update(cx, |state, cx| {
+                        state.set_market_token(typed, cx);
+                        if matches!(event, InputEvent::PressEnter { .. }) {
+                            state.save_market_token(cx);
+                        }
+                    });
+                })
+                .detach();
+                input
+            });
         }
     }
 }
@@ -288,6 +766,7 @@ fn button(
     div()
         .id(SharedString::from(selector.clone()))
         .debug_selector(move || selector)
+        .flex_shrink_0()
         .text_xs()
         .px(px(10.))
         .py(px(6.))
@@ -319,12 +798,57 @@ impl Render for MonitorModalView {
         }) else {
             return div().into_any_element();
         };
+        if let Some((id, label)) = &modal.renaming {
+            if self.rename_account.as_ref() != Some(id) {
+                let label = label.clone();
+                let input = cx.new(|cx| {
+                    let mut input = gpui_kit::component::input::InputState::new(window, cx);
+                    input.set_value(label, window, cx);
+                    input
+                });
+                cx.subscribe(
+                    &input,
+                    |this, input, event: &gpui_kit::component::input::InputEvent, cx| {
+                        let text = input.read(cx).value().to_string();
+                        this.state.update(cx, |state, cx| {
+                            state.set_account_rename(text, cx);
+                            if matches!(
+                                event,
+                                gpui_kit::component::input::InputEvent::PressEnter { .. }
+                            ) {
+                                state.save_account_rename(cx);
+                            }
+                        });
+                    },
+                )
+                .detach();
+                self.rename_input = Some(input);
+                self.rename_account = Some(id.clone());
+            } else if let Some(input) = &self.rename_input
+                && input.read(cx).value().as_str() != label.as_str()
+            {
+                let label = label.clone();
+                input.update(cx, |input, cx| input.set_value(label, window, cx));
+            }
+        } else {
+            self.rename_input = None;
+            self.rename_account = None;
+        }
         let theme = cx.theme().clone();
         let app = self.state.clone();
+        // Tools is the marketplace layout too: its rows are the Bot's built-in tools (#359).
+        if (modal.kind == MonitorKind::Plugins || modal.kind == MonitorKind::Tools)
+            && !matches!(modal.selected, Some(PluginSelection::Connection(_)))
+        {
+            self.sync_market_inputs(&modal, window, cx);
+            return self.render_market(&modal, window, cx);
+        }
         let body = match modal.kind {
-            MonitorKind::Tools => agent_settings::tools_card(app.clone(), &theme, cx)
-                .unwrap_or_else(|| div().child(connections::ASKING).into_any_element()),
-            MonitorKind::Plugins => plugins_body(app.clone(), &modal, &theme, cx),
+            // Drawn as the marketplace above, always.
+            MonitorKind::Tools => div().into_any_element(),
+            MonitorKind::Plugins => {
+                plugins_body(app.clone(), &modal, &theme, self.rename_input.as_ref(), cx)
+            }
         };
         div()
             .id("monitor-modal-overlay")
@@ -344,13 +868,24 @@ impl Render for MonitorModalView {
             .on_action({
                 let app = app.clone();
                 move |_: &crate::actions::CloseMonitorModal, _: &mut Window, cx: &mut App| {
-                    app.update(cx, |state, cx| state.close_monitor_modal(cx))
+                    app.update(cx, |state, cx| {
+                        if state
+                            .monitor_modal
+                            .as_ref()
+                            .is_some_and(|modal| modal.renaming.is_some())
+                        {
+                            state.cancel_account_rename(cx);
+                        } else {
+                            state.close_monitor_modal(cx);
+                        }
+                    })
                 }
             })
             .child(
                 v_flex()
                     .id(MODAL)
                     .debug_selector(|| MODAL.into())
+                    .relative()
                     .w(px(480.))
                     .max_h(window.viewport_size().height - px(60.))
                     .bg(theme.popover)
@@ -411,10 +946,319 @@ impl Render for MonitorModalView {
     }
 }
 
+impl MonitorModalView {
+    /// Your own skill's three fields: made when its prose arrives, filled with it, and what is
+    /// typed goes to the state. Gone when no skill page of yours is open.
+    fn sync_skill_inputs(
+        &mut self,
+        modal: &MonitorModal,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::state::SkillField;
+        use gpui_kit::component::input::{InputEvent, InputState, TextareaState};
+        let state = self.state.read(cx);
+        let open = match &modal.selected {
+            Some(PluginSelection::Skill(id)) => state
+                .skill_open
+                .as_ref()
+                .filter(|d| &d.skill.id == id)
+                .filter(|_| {
+                    state.skills_card().is_some_and(|card| {
+                        agent_settings::shown_skill_rows(&card)
+                            .iter()
+                            .any(|row| &row.id == id && row.mine)
+                    })
+                })
+                .cloned(),
+            _ => None,
+        };
+        let Some(detail) = open else {
+            self.skill_inputs = None;
+            return;
+        };
+        // The server's words again after Revert or a save: the fields are made afresh with them.
+        let key = format!(
+            "{}#{}",
+            detail.skill.id,
+            state.skill_edit.as_ref().map(|e| e.revision).unwrap_or(0)
+        );
+        if self
+            .skill_inputs
+            .as_ref()
+            .is_some_and(|(made, ..)| made == &key)
+        {
+            return;
+        }
+        let name = cx.new(|cx| {
+            let mut input = InputState::new(window, cx);
+            input.set_value(detail.skill.name.clone(), window, cx);
+            input
+        });
+        let description = cx.new(|cx| {
+            let mut input = InputState::new(window, cx);
+            input.set_value(detail.skill.description.clone(), window, cx);
+            input
+        });
+        let body = cx.new(|cx| {
+            let mut input = TextareaState::new(window, cx);
+            // Grows to twelve lines, then scrolls inside, so Save never moves out of reach.
+            input.set_auto_grow(6, 12, cx);
+            input.set_value(detail.body.clone(), window, cx);
+            input
+        });
+        for (field, input) in [
+            (SkillField::Name, &name),
+            (SkillField::Description, &description),
+        ] {
+            cx.subscribe(input, move |this, input, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::Change) {
+                    let text = input.read(cx).value().to_string();
+                    this.state
+                        .update(cx, |state, cx| state.set_skill_field(field, text, cx));
+                }
+            })
+            .detach();
+        }
+        cx.subscribe(&body, |this, input, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::Change) {
+                let text = input.read(cx).value().to_string();
+                this.state.update(cx, |state, cx| {
+                    state.set_skill_field(SkillField::Instructions, text, cx)
+                });
+            }
+        })
+        .detach();
+        self.skill_inputs = Some((key, name, description, body));
+    }
+
+    /// The marketplace, in the Grok Bot layout: a wide card over the window, two columns when it
+    /// is wide enough and one when it is not, the highlighted result kept in view.
+    fn render_market(
+        &mut self,
+        modal: &MonitorModal,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        use crate::components::marketplace;
+        let theme = cx.theme().clone();
+        let app = self.state.clone();
+        let viewport = window.viewport_size();
+        let width = (viewport.width - px(80.)).min(px(880.)).max(px(320.));
+        let columns = if width >= px(640.) { 2 } else { 1 };
+        let search = if modal.kind == MonitorKind::Tools {
+            &self.tools_search_input
+        } else {
+            &self.search_input
+        }
+        .clone()
+        .expect("made by sync_market_inputs");
+        let inputs = marketplace::MarketInputs {
+            search: &search,
+            new_skill: self.add_skill.as_ref(),
+            skill: self
+                .skill_inputs
+                .as_ref()
+                .map(|(_, name, description, body)| (name, description, body)),
+            bots: self.bots_input.as_ref(),
+            token: self.token_input.as_ref(),
+            rename: self.rename_input.as_ref(),
+        };
+        let (top, blocks) = match &modal.selected {
+            Some(selection) => (
+                None,
+                vec![marketplace::detail_view(
+                    &app, modal, selection, &inputs, &theme, cx,
+                )],
+            ),
+            None => {
+                let (top, laid) = marketplace::browse(&app, modal, &inputs, columns, &theme, cx);
+                if let Some(&block) = laid.row_blocks.get(modal.highlight)
+                    && self.scrolled_to != Some(modal.highlight)
+                {
+                    self.scroll.scroll_to_item(block);
+                    self.scrolled_to = Some(modal.highlight);
+                }
+                (Some(top), laid.blocks)
+            }
+        };
+        if modal.selected.is_some() {
+            self.scrolled_to = None;
+        }
+        let dialog = marketplace::remove_dialog(&app, modal, &theme, cx);
+        let skill_dialog = marketplace::skill_delete_dialog(&app, &theme, cx);
+        let footer = marketplace::skill_footer(&app, &theme, cx)
+            .or_else(|| marketplace::new_skill_footer(&app, self.add_skill.as_ref(), &theme, cx));
+
+        // The window's bar, the same on every page (7 Oct 2026): Back when there is somewhere
+        // to go back to, the title, Close. A page with its own big heading (a plugin, a tool, a
+        // skill) shows its name in the bar only once that heading has scrolled out of sight.
+        let scrolled = self.scroll.offset().y < px(-60.);
+        let bar = {
+            let back_app = app.clone();
+            let (back, title): (Option<marketplace::BackAction>, Option<String>) = match &modal
+                .selected
+            {
+                Some(_) if modal.bots_for.is_some() => (
+                    Some(Box::new(move |cx: &mut App| {
+                        back_app.update(cx, |state, cx| state.open_account_bots(None, cx))
+                    })),
+                    modal
+                        .bots_for
+                        .as_deref()
+                        .map(|account| marketplace::bots_title(app.read(cx), account)),
+                ),
+                Some(PluginSelection::Skill(id))
+                    if app
+                        .read(cx)
+                        .skill_bots
+                        .as_ref()
+                        .is_some_and(|b| &b.skill_id == id && b.open) =>
+                {
+                    let name =
+                        marketplace::page_title(app.read(cx), &PluginSelection::Skill(id.clone()))
+                            .unwrap_or_default();
+                    (
+                        Some(Box::new(move |cx: &mut App| {
+                            back_app.update(cx, |state, cx| state.open_skill_bots(false, cx))
+                        })),
+                        Some(format!("Bots using {name}")),
+                    )
+                }
+                Some(selection) => {
+                    let removing = modal.removing;
+                    let title = if *selection == PluginSelection::NewSkill {
+                        Some("New skill".to_string())
+                    } else {
+                        scrolled
+                            .then(|| marketplace::page_title(app.read(cx), selection))
+                            .flatten()
+                    };
+                    (
+                        Some(Box::new(move |cx: &mut App| {
+                            if !removing {
+                                back_app.update(cx, |state, cx| state.close_market_detail(cx))
+                            }
+                        })),
+                        title,
+                    )
+                }
+                None => (
+                    (modal.page != MarketPage::Browse).then(|| {
+                        Box::new(move |cx: &mut App| {
+                            back_app.update(cx, |state, cx| {
+                                state.set_market_page(MarketPage::Browse, cx)
+                            })
+                        }) as Box<dyn Fn(&mut App)>
+                    }),
+                    Some(marketplace::list_title(modal)),
+                ),
+            };
+            marketplace::page_bar(&app, back, title, scrolled, &theme)
+        };
+        div()
+            .id("monitor-modal-overlay")
+            .track_focus(&self.focus)
+            .key_context("MonitorModal")
+            .absolute()
+            .inset_0()
+            .occlude()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(gpui::black().opacity(0.45))
+            .on_mouse_down(MouseButton::Left, {
+                let app = app.clone();
+                move |_, _, cx| app.update(cx, |state, cx| state.close_monitor_modal(cx))
+            })
+            .on_action({
+                let app = app.clone();
+                move |_: &crate::actions::CloseMonitorModal, _: &mut Window, cx: &mut App| {
+                    app.update(cx, |state, cx| {
+                        let modal = state.monitor_modal.as_ref();
+                        if modal.is_some_and(|modal| modal.renaming.is_some()) {
+                            state.cancel_account_rename(cx);
+                        } else if state.plugin_market.token.is_some() {
+                            state.cancel_market_token(cx);
+                        } else if modal.is_some_and(|modal| modal.selected.is_some()) {
+                            state.close_market_detail(cx);
+                        } else if modal.is_some_and(|modal| !modal.query.is_empty()) {
+                            // Esc clears the search first; the next one closes the window.
+                            state.set_market_query(String::new(), cx);
+                        } else {
+                            state.close_monitor_modal(cx);
+                        }
+                    })
+                }
+            })
+            .child(
+                v_flex()
+                    .id(MODAL)
+                    .debug_selector(|| MODAL.into())
+                    .relative()
+                    .w(width)
+                    .h(viewport.height - px(80.))
+                    .max_h(px(900.))
+                    .bg(theme.popover)
+                    .text_color(theme.foreground)
+                    .border_1()
+                    .border_color(theme.border)
+                    .rounded(px(18.))
+                    .shadow_lg()
+                    .gap(px(8.))
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_action({
+                        let app = app.clone();
+                        let new_skill = self.add_skill.clone();
+                        let creating = modal.selected == Some(PluginSelection::NewSkill);
+                        move |_: &crate::actions::SaveSkillPage, _: &mut Window, cx: &mut App| {
+                            // ⌘S is Create on the New skill page, and Save on a skill's own.
+                            match (creating, &new_skill) {
+                                (true, Some(inputs)) => {
+                                    let name = inputs.name.read(cx).value().to_string();
+                                    let description =
+                                        inputs.description.read(cx).value().to_string();
+                                    let body = inputs.body.read(cx).value().to_string();
+                                    if crate::components::marketplace::skill_name_ok(&name)
+                                        && !body.trim().is_empty()
+                                    {
+                                        app.update(cx, |state, cx| {
+                                            state.create_skill(name, description, body, cx)
+                                        })
+                                    }
+                                }
+                                _ => app.update(cx, |state, cx| state.save_skill_page(cx)),
+                            }
+                        }
+                    })
+                    .child(bar)
+                    // Every page's content sits on the same two edges, 32px in.
+                    .when_some(top, |this, top| this.child(div().px(px(32.)).child(top)))
+                    .child(
+                        div()
+                            .id("market-scroll")
+                            .flex_1()
+                            .min_h(px(0.))
+                            .px(px(32.))
+                            .pb(px(16.))
+                            .overflow_y_scroll()
+                            .track_scroll(&self.scroll)
+                            .children(blocks),
+                    )
+                    .when_some(footer, |this, footer| this.child(footer))
+                    // Uninstall's and Remove's question, over the whole window (#184).
+                    .when_some(dialog, |this, dialog| this.child(dialog))
+                    .when_some(skill_dialog, |this, dialog| this.child(dialog)),
+            )
+            .into_any_element()
+    }
+}
+
 fn plugins_body(
     app: Entity<AppState>,
     modal: &MonitorModal,
     theme: &gpui_kit::component::Theme,
+    rename_input: Option<&Entity<gpui_kit::component::input::InputState>>,
     cx: &App,
 ) -> AnyElement {
     let state = app.read(cx);
@@ -451,11 +1295,129 @@ fn plugins_body(
                     .child(div().text_sm().child(value)),
             );
         }
-        if detail.connection {
-            body = body.child(
-                button(ADD_ACCOUNT, "Add another account", false, |_| {})
-                    .tooltip(|window, cx| Tooltip::new("Coming later").build(window, cx)),
-            );
+        if let Some(accounts) = detail.accounts {
+            let add = app.clone();
+            let connector = accounts.connector.clone();
+            body = body.child(button(
+                ADD_ACCOUNT,
+                "Add another account",
+                accounts.can_add,
+                move |cx| {
+                    add.update(cx, |state, cx| state.connect_service(connector.clone(), cx));
+                },
+            ));
+            body = body.child(div().id(PICKER).child(accounts.picker.title.clone()));
+            if let Some(note) = accounts.add_refusal {
+                body = body.child(div().id(ADD_ACCOUNT_ERROR).child(note));
+            }
+            if let Some(note) = accounts.picker.note.clone() {
+                body = body.child(div().id(PICKER_NOTE).child(note));
+            }
+            body = body.child(div().id(ACCOUNTS).debug_selector(|| ACCOUNTS.into()).child(
+                if accounts.adding {
+                    "Opening sign-in…"
+                } else {
+                    "Accounts"
+                },
+            ));
+            for row in accounts.rows {
+                let rename = app.clone();
+                let rename_account = row.id.clone();
+                body = body.child(button(
+                    &rename_id(&row.id),
+                    "Rename",
+                    row.can_rename,
+                    move |cx| {
+                        rename.update(cx, |state, cx| {
+                            state.start_account_rename(rename_account.clone(), cx)
+                        });
+                    },
+                ));
+                if row.renaming.is_some()
+                    && let Some(input) = rename_input
+                {
+                    body = body.child(
+                        div()
+                            .id(SharedString::from(rename_field_id(&row.id)))
+                            .child(gpui_kit::component::input::Input::new(input)),
+                    );
+                    let save = app.clone();
+                    let cancel = app.clone();
+                    body = body
+                        .child(button("monitor-account-save", "Save", true, move |cx| {
+                            save.update(cx, |state, cx| state.save_account_rename(cx))
+                        }))
+                        .child(button(
+                            "monitor-account-cancel",
+                            "Cancel",
+                            true,
+                            move |cx| {
+                                cancel.update(cx, |state, cx| state.cancel_account_rename(cx))
+                            },
+                        ));
+                }
+                if let Some(note) = row.note.clone() {
+                    body = body.child(
+                        div()
+                            .id(SharedString::from(account_note_id(&row.id)))
+                            .child(note),
+                    );
+                }
+                let reconnect = app.clone();
+                let id = row.id.clone();
+                let choose = app.clone();
+                let picked_id = row.id.clone();
+                let service = accounts.connector.clone();
+                body = body.child(
+                    v_flex()
+                        .id(SharedString::from(account_id(&row.id)))
+                        .gap(px(4.))
+                        .child(div().text_sm().child(format!(
+                            "{}{}{}",
+                            row.label,
+                            if row.selected { " (open account)" } else { "" },
+                            if row.opening { " — Opening…" } else { "" }
+                        )))
+                        .child(button(
+                            &pick_id(&row.id),
+                            if accounts.picker.picked.as_ref() == Some(&Some(row.id.clone())) {
+                                "Selected for this Bot"
+                            } else {
+                                "Use for this Bot"
+                            },
+                            accounts.picker.live,
+                            move |cx| {
+                                choose.update(cx, |state, cx| {
+                                    state.pick_account(service.clone(), Some(picked_id.clone()), cx)
+                                });
+                            },
+                        ))
+                        .when(row.reconnects, |this| {
+                            this.child(button(
+                                &reconnect_id(&row.id),
+                                "Reconnect",
+                                row.can_reconnect,
+                                move |cx| {
+                                    reconnect.update(cx, |state, cx| {
+                                        state.reconnect_connection(id.clone(), cx)
+                                    });
+                                },
+                            ))
+                        }),
+                );
+            }
+            let ask = app.clone();
+            let connector = accounts.connector;
+            body = body.child(button(
+                PICK_ASK,
+                ASK_EACH_TIME,
+                accounts.picker.live,
+                move |cx| {
+                    ask.update(cx, |state, cx| {
+                        state.pick_account(connector.clone(), None, cx)
+                    });
+                },
+            ));
         }
         if let Some(error) = modal.error.as_ref().or(detail.error.as_ref()) {
             body = body.child(
@@ -529,6 +1491,30 @@ fn plugins_body(
                 .text_color(muted)
                 .child(plugin_status(state).join("\n")),
         );
+    for plugin in plugin_switches(state) {
+        let switch = app.clone();
+        let name = plugin.name.clone();
+        let on = plugin.on;
+        body = body
+            .child(div().child(format!("{} — {}", plugin.title, plugin.subtitle)))
+            .child(button(
+                &plugin_switch_id(&plugin.name),
+                if on { "Switch off" } else { "Switch on" },
+                plugin.live,
+                move |cx| {
+                    switch.update(cx, |state, cx| {
+                        state.switch_ceiling_tool(name.clone(), !on, cx)
+                    });
+                },
+            ));
+        if let Some(note) = plugin.note {
+            body = body.child(
+                div()
+                    .id(SharedString::from(plugin_switch_note_id(&plugin.name)))
+                    .child(note),
+            );
+        }
+    }
     for row in rows.iter() {
         let selection = row.selection.clone();
         let open = app.clone();
@@ -577,6 +1563,12 @@ fn plugins_body(
                                 PluginSelection::Skill(id) => {
                                     state.switch_bot_skill(id.clone(), *on, cx)
                                 }
+                                PluginSelection::Service(_)
+                                | PluginSelection::Plugin(_)
+                                | PluginSelection::Tool(_)
+                                | PluginSelection::NewSkill
+                                | PluginSelection::PluginSkill(..)
+                                | PluginSelection::Login(_) => {}
                             })
                         }),
                 ),
@@ -640,6 +1632,7 @@ pub(crate) mod tests {
                 loans: vec!["cw_1".into(), "cw_2".into()],
                 updated_at_ms: 1,
                 expires_at_ms: None,
+                kind: crate::opengrok::ConnectionKind::Oauth,
             },
             ConnectionView {
                 id: "conn_foreign".into(),
@@ -649,6 +1642,7 @@ pub(crate) mod tests {
                 loans: vec![],
                 updated_at_ms: 1,
                 expires_at_ms: None,
+                kind: crate::opengrok::ConnectionKind::Oauth,
             },
         ]));
         state.connections.connectors = Some(ConnectorList::Listed(
@@ -668,11 +1662,46 @@ pub(crate) mod tests {
         state
     }
 
+    /// A plugin's own account is picked per Bot, never lent (#359): its Bots page shows a Bot on
+    /// when that Bot uses it by pick, so Cloudflare's Bots page works as Gmail's does (7 Oct 2026).
+    #[test]
+    fn a_plugin_accounts_bots_are_the_bots_that_pick_it() {
+        let mut state = catalog();
+        if let Some(ConnectionList::Listed(rows)) = state.connections.list.as_mut() {
+            rows.push(ConnectionView {
+                id: "conn_tok".into(),
+                connector: "cloudflare".into(),
+                label: "work".into(),
+                owner: ConnectionOwner::User("acct_1".into()),
+                loans: vec!["cw_2".into()],
+                updated_at_ms: 1,
+                expires_at_ms: None,
+                kind: crate::opengrok::ConnectionKind::Token,
+            });
+        }
+        state.connections.pins = Some(crate::state::PinList::Listed(vec![
+            crate::opengrok::ConnectionPin {
+                coworker_id: "cw_1".into(),
+                connector: "cloudflare".into(),
+                connection_id: "conn_tok".into(),
+            },
+        ]));
+        let rows = crate::components::marketplace::bot_rows(&state, "conn_tok", "");
+        let on: Vec<_> = rows.iter().map(|r| (r.id.as_str(), r.on)).collect();
+        assert_eq!(
+            on,
+            [("cw_1", true), ("cw_2", false)],
+            "picks, not the loan list"
+        );
+    }
+
     #[test]
     fn plugins_show_only_owned_connections_and_private_skills_and_pending_switches() {
         let mut state = catalog();
         let rows = plugin_rows(&state);
-        assert_eq!(rows.len(), 2);
+        // The owned Gmail connection, your skill and your org's skill (listed under Installed
+        // since 7 Oct 2026); never another's connection.
+        assert_eq!(rows.len(), 3);
         assert_eq!(rows[0].title, "Gmail");
         assert!(rows[0].on && rows[0].live);
         assert!(!rows[1].on);
@@ -750,35 +1779,219 @@ pub(crate) mod tests {
         (state, cx)
     }
 
+    /// ⌘[ and ⌘] walk the window's pages in the app's one history: back from a detail is the
+    /// list, back from the list closes the window, forward reopens it page by page, the window's
+    /// own ‹ is the same step, and Close keeps the steps so ⌘] brings the window back
+    /// (7 Oct 2026: ⌘[ moved the page behind the window instead).
     #[gpui_kit::test]
-    fn plugins_open_a_detail_disable_extra_accounts_and_confirm_removal(
-        cx: &mut gpui_kit::TestAppContext,
-    ) {
+    fn back_and_forward_walk_the_windows_pages_in_one_history(cx: &mut gpui_kit::TestAppContext) {
+        let state = cx.new(|_| {
+            let mut state = catalog();
+            state.active_coworker_id = Some("cw_1".into());
+            state
+        });
+        let gmail = PluginSelection::Service("gmail".into());
+        let at = |cx: &mut gpui_kit::TestAppContext| {
+            state.read_with(cx, |state, _| {
+                state
+                    .monitor_modal
+                    .as_ref()
+                    .map(|m| (m.kind, m.selected.clone()))
+            })
+        };
+        state.update(cx, |state, cx| {
+            state.record_nav_for_test();
+            state.open_monitor_modal(MonitorKind::Plugins, cx);
+            state.open_market_detail(PluginSelection::Service("gmail".into()), cx);
+        });
+        assert_eq!(at(cx), Some((MonitorKind::Plugins, Some(gmail.clone()))));
+        state.update(cx, |state, cx| state.nav_back(cx));
+        assert_eq!(at(cx), Some((MonitorKind::Plugins, None)), "back: the list");
+        state.update(cx, |state, cx| state.nav_back(cx));
+        assert_eq!(at(cx), None, "back on the first page: the window closes");
+        state.update(cx, |state, cx| state.nav_forward(cx));
+        assert_eq!(
+            at(cx),
+            Some((MonitorKind::Plugins, None)),
+            "forward: it opens again"
+        );
+        state.update(cx, |state, cx| state.nav_forward(cx));
+        assert_eq!(at(cx), Some((MonitorKind::Plugins, Some(gmail.clone()))));
+        // The window's own ‹ is the same step back, so forward still leads to the detail.
+        state.update(cx, |state, cx| state.close_market_detail(cx));
+        assert_eq!(at(cx), Some((MonitorKind::Plugins, None)));
+        state.update(cx, |state, cx| state.nav_forward(cx));
+        assert_eq!(at(cx), Some((MonitorKind::Plugins, Some(gmail.clone()))));
+        // Close keeps the steps: ⌘] reopens the window, then the detail.
+        state.update(cx, |state, cx| state.close_monitor_modal(cx));
+        assert_eq!(at(cx), None);
+        state.update(cx, |state, cx| state.nav_forward(cx));
+        assert_eq!(at(cx), Some((MonitorKind::Plugins, None)));
+        state.update(cx, |state, cx| state.nav_forward(cx));
+        assert_eq!(at(cx), Some((MonitorKind::Plugins, Some(gmail))));
+    }
+
+    /// "+ New skill" opens the skill page in the same card (no sheet over it), with Upload and
+    /// Create in its pinned footer; a skill name is what is typed after a slash.
+    #[gpui_kit::test]
+    fn new_skill_is_a_page_in_the_same_card(cx: &mut gpui_kit::TestAppContext) {
         let (state, cx) = open(cx, MonitorKind::Plugins);
-        click(cx, "monitor-connection-detail-conn_1");
-        assert!(cx.debug_bounds(super::DETAIL).is_some());
+        state.update(cx, |state, cx| {
+            state.monitor_modal.as_mut().unwrap().page = super::MarketPage::Installed;
+            cx.notify();
+        });
+        click(cx, crate::components::marketplace::SKILL_NEW);
+        assert!(state.read_with(cx, |state, _| {
+            state.monitor_modal.as_ref().unwrap().selected == Some(PluginSelection::NewSkill)
+        }));
         for id in [
-            "monitor-plugin-source",
-            "monitor-plugin-transport",
-            "monitor-plugin-url",
-            "monitor-plugin-tools",
-            "monitor-plugin-accounts",
+            crate::components::marketplace::NEW_SKILL_NAME,
+            crate::components::marketplace::NEW_SKILL_INSTRUCTIONS,
+            crate::components::marketplace::NEW_SKILL_UPLOAD,
+            crate::components::marketplace::NEW_SKILL_CREATE,
+            super::BACK,
+        ] {
+            assert!(cx.debug_bounds(id).is_some(), "{id} is drawn");
+        }
+        assert!(
+            cx.debug_bounds("settings-skill-add-sheet").is_none(),
+            "no sheet over the card"
+        );
+        use crate::components::marketplace::skill_name_ok;
+        assert!(skill_name_ok("expense-report") && skill_name_ok("v2.notes"));
+        for bad in ["", "Expense", "a b", "-a", "a.", "x/y"] {
+            assert!(!skill_name_ok(bad), "{bad:?}");
+        }
+    }
+
+    /// With a search typed the caret stays in the field, after Enter or a click on a result, and
+    /// ⌘[ / ⌘] there are still Back and Forward, not the field's outdent and indent (7 Oct 2026:
+    /// Back did nothing on a tool's page reached from a search).
+    #[gpui_kit::test]
+    fn back_and_forward_keys_work_from_the_search_field(cx: &mut gpui_kit::TestAppContext) {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::components::marketplace::init(cx);
+        });
+        let backs = Arc::new(AtomicUsize::new(0));
+        let forwards = Arc::new(AtomicUsize::new(0));
+        cx.update(|cx| {
+            let b = backs.clone();
+            cx.on_action(move |_: &crate::actions::NavBack, _| {
+                b.fetch_add(1, Ordering::SeqCst);
+            });
+            let f = forwards.clone();
+            cx.on_action(move |_: &crate::actions::NavForward, _| {
+                f.fetch_add(1, Ordering::SeqCst);
+            });
+        });
+        let state = cx.new(|_| {
+            let mut state = catalog();
+            state.monitor_modal = Some(MonitorModal::new("cw_1".into(), MonitorKind::Tools));
+            state
+        });
+        let (view, cx) = cx.add_window_view({
+            let state = state.clone();
+            move |_, cx| MonitorModalView::new(state, cx)
+        });
+        cx.simulate_resize(size(px(1000.), px(800.)));
+        draw(cx);
+        let search = view.read_with(cx, |view, _| view.tools_search_input.clone().unwrap());
+        cx.update(|window, cx| search.update(cx, |input, cx| input.focus(window, cx)));
+        cx.simulate_input("shell");
+        draw(cx);
+        cx.simulate_keystrokes("cmd-[");
+        cx.simulate_keystrokes("cmd-]");
+        assert_eq!(backs.load(Ordering::SeqCst), 1, "⌘[ in the field is Back");
+        assert_eq!(
+            forwards.load(Ordering::SeqCst),
+            1,
+            "⌘] in the field is Forward"
+        );
+    }
+
+    /// A tool's pop-up opens under its button, lined up with the button's right edge, and a
+    /// choice in it sends that choice (#359: the menu once opened off to the button's left).
+    #[gpui_kit::test]
+    fn a_tools_menu_opens_under_its_button(cx: &mut gpui_kit::TestAppContext) {
+        let (state, cx) = open(cx, MonitorKind::Tools);
+        state.update(cx, |state, cx| {
+            let ceiling: crate::opengrok::CoworkerCeiling =
+                serde_json::from_value(serde_json::json!({"tools":[
+                    {"name":"routines", "kind":"builtin", "enabled":true, "label":"Routines"}
+                ], "version":1}))
+                .unwrap();
+            state.coworker_ceiling = Some(("cw_1".into(), ToolCeiling::Read(ceiling.into())));
+            state.coworker_tools = Some((
+                "cw_1".into(),
+                crate::state::ToolList::Listed(vec![crate::opengrok::CoworkerTool {
+                    name: "routines".into(),
+                    tools: vec![crate::opengrok::CoworkerTool {
+                        name: "delete_routine".into(),
+                        mode: Some("ask".into()),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }]),
+            ));
+            state.monitor_modal.as_mut().unwrap().selected =
+                Some(PluginSelection::Tool("routines".into()));
+            cx.notify();
+        });
+        click(cx, "market-tool-mode-delete_routine");
+        assert!(state.read_with(cx, |state, _| state.tool_mode_dialog.is_some()));
+        let button = cx.debug_bounds("market-tool-mode-delete_routine").unwrap();
+        let menu = cx
+            .debug_bounds("tool-mode-dialog")
+            .expect("the menu is drawn");
+        assert!(
+            menu.top() >= button.bottom(),
+            "under the button: {menu:?} {button:?}"
+        );
+        assert!(
+            (menu.right() - button.right()).abs() <= px(1.),
+            "its right edge on the button's: {menu:?} {button:?}"
+        );
+    }
+
+    #[gpui_kit::test]
+    fn plugins_open_a_services_accounts_and_confirm_removal(cx: &mut gpui_kit::TestAppContext) {
+        let (state, cx) = open(cx, MonitorKind::Plugins);
+        // Plugins is the marketplace: its search, its installed count and the service's row.
+        for id in ["market-search", "market-installed", "market-service-gmail"] {
+            assert!(cx.debug_bounds(id).is_some(), "{id}");
+        }
+        click(cx, "market-service-gmail");
+        assert!(
+            cx.debug_bounds(crate::components::marketplace::DETAIL)
+                .is_some()
+        );
+        for id in [
+            "monitor-account-row-conn_1",
+            "monitor-account-rename-conn_1",
+            "monitor-account-reconnect-conn_1",
+            "market-add-account-gmail",
+            "monitor-account-picker",
         ] {
             assert!(cx.debug_bounds(id).is_some(), "{id}");
         }
-        click(cx, super::ADD_ACCOUNT);
-        assert!(!state.read_with(cx, |state, _| {
-            state.monitor_modal.as_ref().unwrap().confirming
-        }));
-        click(cx, super::REMOVE);
+        assert!(
+            cx.debug_bounds("monitor-account-row-conn_foreign")
+                .is_none(),
+            "a Bot's own sign-in is not listed as the person's"
+        );
+        click(cx, "market-account-remove-conn_1");
         assert!(state.read_with(cx, |state, _| {
-            state.monitor_modal.as_ref().unwrap().confirming
+            let modal = state.monitor_modal.as_ref().unwrap();
+            modal.confirming && modal.removal.as_deref() == Some("conn_1")
         }));
         assert!(
             state.read_with(cx, |state, _| state.connections.changing.is_empty()),
             "the question sends nothing"
         );
-        click(cx, super::REMOVE_NO);
+        click(cx, crate::components::marketplace::REMOVE_NO);
         assert!(!state.read_with(cx, |state, _| {
             state.monitor_modal.as_ref().unwrap().confirming
         }));
@@ -791,11 +2004,35 @@ pub(crate) mod tests {
     }
 
     #[gpui_kit::test]
-    fn tools_show_the_ceiling_and_close_with_escape_the_button_and_the_backdrop(
+    fn tools_list_and_open_like_the_marketplace_and_close_with_escape_the_button_and_the_backdrop(
         cx: &mut gpui_kit::TestAppContext,
     ) {
         let (state, cx) = open(cx, MonitorKind::Tools);
-        assert!(cx.debug_bounds("agent-tools").is_some());
+        // The marketplace layout: a row per built-in tool, which opens the plugin page reused,
+        // with the tool's switch in the header; back goes to the list.
+        assert!(cx.debug_bounds("market-tool-item-shell").is_some());
+        assert!(
+            cx.debug_bounds(crate::components::marketplace::SEARCH)
+                .is_some()
+        );
+        assert!(
+            cx.debug_bounds(crate::components::marketplace::INSTALLED)
+                .is_none(),
+            "Tools has no installed count"
+        );
+        click(cx, "market-tool-item-shell");
+        assert!(state.read_with(cx, |state, _| {
+            state.monitor_modal.as_ref().unwrap().selected
+                == Some(super::PluginSelection::Tool("shell".into()))
+        }));
+        assert!(
+            cx.debug_bounds(crate::components::marketplace::DETAIL)
+                .is_some()
+        );
+        click(cx, super::BACK);
+        assert!(state.read_with(cx, |state, _| {
+            state.monitor_modal.as_ref().unwrap().selected.is_none()
+        }));
         click(cx, super::CLOSE);
         assert!(state.read_with(cx, |state, _| state.monitor_modal.is_none()));
         state.update(cx, |state, cx| {

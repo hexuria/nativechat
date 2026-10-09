@@ -217,6 +217,9 @@ impl Render for LoginsPage {
                 rows.is_empty(),
                 &theme,
                 app.clone(),
+                // A vault or import that failed is this ⚠ beside New login, and no line.
+                crate::components::faults::badge(crate::faults::Place::Logins, &app, cx),
+                app.read(cx).is_focused(crate::faults::Place::Logins),
             ))
             .child(detail::render(
                 picked.as_ref(),

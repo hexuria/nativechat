@@ -885,15 +885,25 @@ impl SidebarView {
                     })),
                 )
             })
-            .child(self.dock_item(
-                "footer-plugins",
-                collapsed,
-                NativeIcon::Plugins.path(),
-                "Plugins",
-                fg,
-                hover,
-                None,
-            ))
+            .child({
+                // The marketplace (#184): the open Bot's plugins and accounts, with or without a
+                // Computer.
+                let view = view.clone();
+                self.dock_item(
+                    "footer-plugins",
+                    collapsed,
+                    NativeIcon::Plugins.path(),
+                    "Plugins",
+                    fg,
+                    hover,
+                    Some(Box::new(move |cx: &mut App| {
+                        view.update(cx, |this, cx| {
+                            this.state
+                                .update(cx, |state, cx| state.open_plugin_market(cx));
+                        });
+                    })),
+                )
+            })
             .child({
                 let view = view.clone();
                 self.dock_item(

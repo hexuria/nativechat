@@ -73,7 +73,9 @@ actions!(
         /// The Usage modal: Escape shuts it.
         CloseUsageModal,
         /// Tools and Plugins opened from the Computer pane: Escape shuts either.
-        CloseMonitorModal
+        CloseMonitorModal,
+        /// ⌘S on your own skill's page in the Plugins window: Save.
+        SaveSkillPage
     ]
 );
 

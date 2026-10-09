@@ -11,6 +11,25 @@
 //! without opening a menu; the `sidebar.mini` action remains available to keyboard automation.
 //! `header-right-sidebar` (chat's window-level pane toggle),
 //! `header-monitor` (computer pane toggle while a bot is open),
+//! `header-notifications` (the bell, before the monitor while a Bot is open; value = the open
+//! Bot's unread notices; `selected` while its page is open), its page `notifications-pane` with
+//! `notifications-unread-count`, the toolbar's `notifications-select-all` (value none/some/all),
+//! with nothing ticked `notifications-filter-all`, `notifications-filter-unread` (`selected` on the
+//! active one), `notifications-mark-all-read`, `notifications-delete-all`, and with rows ticked
+//! `notifications-selected-count`, `notifications-mark-read`, `notifications-mark-unread`,
+//! `notifications-delete-selected` (the other set is refused); each row `notification-{id}`
+//! (value read/unread; a click opens it, `expanded`, with `notification-details-{id}` = where in
+//! the source it was caught) with `notification-select-{id}`, `notification-copy-{id}`,
+//! `notification-read-toggle-{id}` and `notification-delete-{id}`; `notifications-undo-bar` and
+//! `notifications-undo` after a delete; `notifications-empty`, or `notifications-empty-unread`
+//! with `notifications-show-all`; the toast
+//! `notification-toast` (named `<Bot> · <place>`) with `notification-toast-said`,
+//! `notification-toast-close`, `notification-toast-copy` and `notification-toast-open`. Invokes
+//! (all take `bot` as an id or a name, the open Bot by default, `none` for none): `notices.list
+//! {bot?, last?=20, all?}` → JSON rows, `notices.get {id}` → one with `copyText`, `notices.count
+//! {bot?|"all"}` → `{total, unread}`, `notices.fake {bot?, place?, said?, raw?}` (a made-up one,
+//! toast and all), `notices.copy {id}` (clipboard, and the text back), `notices.dismiss`,
+//! `notices.open {bot?}`, `notices.read {bot?}`, `notices.clear {bot}`, `notices.clear-all`.
 //! `header-coworker` (the chip at the top of the chat, while a bot is open: label = its name; a
 //! click opens the bot's settings, or, with state `goes-home` in one of its routines' threads,
 //! goes back to the bot's own chat),
@@ -33,11 +52,18 @@
 //! `computer-handoff-takeover-{key}`, `computer-handoff-done-{key}`,
 //! `computer-handoff-skip-{key}`,
 //! `save-login-{entry}`, `save-login-save-{entry}`, `save-login-skip-{entry}`,
+//! `plugin-needs-{message}` (a tagged plugin that needs a choice, an account or an install,
+//! #360) holding `plugin-needs-use-{message}-{account}` (label = the account, value = how it was
+//! added), `plugin-needs-remember-{message}`, `plugin-needs-open-{message}-{plugin}` and
+//! `plugin-needs-again-{message}`, each disabled once the card is not the thread's last turn,
 //! `user-form-use-saved-{key}-{login}` (one per saved account for the card's site; a sign-in
 //! that asks for the name and the password on two pages is two cards, each with a row per
 //! password login, and on the password page the login picked on the name page in that thread
 //! is the first row), `user-form-saved-note-{key}`, `user-form-saved-clear-{key}` (Change, on
-//! the password row, or on the name row of a name page),
+//! the password row, or on the name row of a name page), and where a saved login cannot be used
+//! for the card's Bot (checked before Touch ID) `user-form-saved-blocked-{key}` (value = the
+//! reason, `shared-computer` or `shared-bot`), `user-form-own-computer-{key}` (gives the Bot a
+//! computer of its own; not on a shared-bot card) and `user-form-by-hand-{key}`,
 //! `settings-tab-logins`, `settings-logins-search` (value = the query), `settings-login-add`,
 //! `settings-login-import`, `settings-logins-notice`, `settings-logins-error`,
 //! `settings-logins-empty`, `settings-logins-group-passwords|passkeys|codes|security` (a
@@ -194,8 +220,11 @@
 //! `monitor-plugin-source`, `monitor-plugin-transport`, `monitor-plugin-url`, `monitor-plugin-tools`
 //! and `monitor-plugin-accounts`. `monitor-plugin-back` returns to Installed. Remove asks first:
 //! `monitor-plugin-remove`, then `monitor-plugin-remove-confirm` or `monitor-plugin-remove-cancel`.
-//! `monitor-plugin-add-account` is disabled, with "Coming later". Missing connector metadata is
-//! stated as missing, until the server's catalog supplies it (opengrok-server#356).
+//! `monitor-plugin-add-account` opens sign-in for another account. Each account has
+//! `monitor-account-rename-{id}`, `monitor-account-label-{id}` while editing, and
+//! `monitor-account-reconnect-{id}` for OAuth accounts. Enter saves; Escape cancels.
+//! `monitor-account-pick-{id}` picks that account, and `monitor-account-ask` clears the pin.
+//! Missing connector metadata is stated as missing until the catalog supplies it (#184).
 //!
 //! Files (#90): `composer-file-{i}` under `composer` (label = the file's name, value `uploading`
 //! / `ready` / `failed`); `message-file-{artId}` on the chat page for each file a message in the
@@ -246,8 +275,12 @@
 //! `GET /coworkers/{id}/tools` says the bot is offered on its next turn: `2 built in · 1 from
 //! plugins`, `Asking the server…`, or why there is no list), `agent-ceiling` (value = `3 of 8
 //! allowed`, or why there are no switches; in the tree once the server has answered), and
-//! `agent-tools-toggle` (Show / Hide, only while there is something to show). Visible while the
-//! card is open: the card's own lines, `agent-ceiling-read-only` (the server's words for a 403:
+//! `agent-tools-toggle` (Show / Hide, only while there is something to show). The Tools window
+//! itself is the marketplace layout (#359): `market-tool-item-{name}` per built-in tool or group
+//! with its switch `agent-ceiling-switch-{name}`, `market-search` ("Search tools"), and on a
+//! tool's page that switch in the header, a group's tools as `market-tool-{name}` with
+//! `market-tool-mode-{name}` and `market-tool-switch-{name}`, and a lone tool's chip
+//! `market-tool-mode-{name}`. Visible while the card is open: the card's own lines, `agent-ceiling-read-only` (the server's words for a 403:
 //! every switch is dead), `agent-ceiling-wait` (why every switch is dead for now: another Bot's
 //! switch, or a read of this Bot's ceiling, is with the server) and `agent-ceiling-note` (the
 //! server's words about the last switch when no row is the one they are about, as a 409's "the
@@ -375,30 +408,46 @@
 //! heading for a moment; a refusal keeps the words in the field. The fields have no ids of their
 //! own.
 //!
-//! Connections (#2), a connection named by the server's id and a service by the name
-//! `GET /connectors` lists it under. Only the person's own connections are on either surface: a
-//! Bot's own sign-in, the whole server's, or a scope this app does not know is not theirs to
-//! lend or disconnect. `settings-tab-connections` (refused while Settings is shut); while
-//! Settings is open on it, `settings-connections-refresh`, `settings-connections` (value = how
-//! many are connected) with a `settings-connection-{id}` per connection (label = its label,
-//! value = the line under it: the service and who it is lent to, by bot name, a lend or a revoke
-//! with the server shown as asked; state `changing` while a change to it is with the server),
-//! holding `settings-connection-disconnect-{id}` (dead while changing; pressing it only asks,
-//! and while the row asks it is replaced by `settings-connection-ask-{id}`, value = "Disconnect
-//! Gmail? Ada and Bo will lose it.", with `settings-connection-confirm-{id}` to disconnect and
-//! `settings-connection-keep-{id}` to leave it) and
-//! `settings-connection-error-{id}` (why its last Disconnect did not go through);
-//! `settings-connections-empty` / `settings-connections-error` in its place when there is
-//! nothing to list or it could not be read. Then `settings-connectors` (value = how many
-//! services are on offer and not connected) with `settings-connect-{connector}` (label `Connect
-//! Gmail`, or `Opening…` with state `opening` while its sign-in page is asked for, when every
-//! Connect is dead; state `waiting` once the browser has the page, until the service is listed
-//! or ten minutes have gone) and `settings-connect-error-{connector}` (why Connect did not open
-//! the browser); `settings-connectors-empty` (the server offers none, or all are connected) /
-//! `settings-connectors-error` in its place. A click on a Connect opens the person's browser, as
-//! a person's does, once the server answers and only if the page is still on screen.
+//! Accounts are signed in to, renamed and removed in the Plugins marketplace (the `market-*` ids
+//! below); Settings has no Connections page. A connection is named by the server's id and a
+//! service by the name `GET /connectors` lists it under, and only the person's own are shown: a
+//! Bot's own sign-in, the whole server's, or a scope this app does not know is not theirs.
 //!
-//! The Connections card, likewise: `agent-connections` (value = the card's second line: `1 of 2 lent to
+//! The Plugins marketplace (#184), opened by `footer-plugins` (or `computer-plugins` from the
+//! Computer pane) inside `monitor-modal`: `market-search` (a textbox; Up and Down move the
+//! highlighted row, state `selected`, Enter opens its detail and never installs, Backspace
+//! deletes), `market-installed` (value = how many are installed) and `market-back`, one list per
+//! section (`market-section-<category>`, `market-section-apps`, `market-section-results`,
+//! `market-section-installed`), a row per plugin or app (`market-plugin-<name>`,
+//! `market-service-<connector>`; label = its name, value = its description) with its
+//! `<row id>-add` (Add, Adding…, Added or Unavailable), `market-view-all-<category>`,
+//! `market-status` and `market-empty`. On Installed, the person's private skills keep
+//! `monitor-skill-detail-<id>` and `agent-skills-switch-<id>`. A detail is `market-detail`
+//! (label = its name, value = its description) behind `monitor-plugin-back`, with
+//! `market-source`, `market-detail-action` (Add / Uninstall, which asks first:
+//! `market-uninstall-confirm` / `market-uninstall-cancel`), `market-detail-refusal`, a list per
+//! service `market-accounts-<connector>` holding per account `monitor-account-row-<id>` (value
+//! = Connected, or Needs Auth with why), `monitor-account-rename-<id>` (opens
+//! `monitor-account-label-<id>` with `monitor-account-save` / `monitor-account-cancel`),
+//! `monitor-account-reconnect-<id>` (a sign-in, or an MCP account at its plugin's own provider,
+//! #364), `market-reopen-<attempt>` and `market-dismiss-<attempt>` for a waiting sign-in,
+//! `market-replace-token-<id>`, `market-account-remove-<id>` (asks first:
+//! `market-account-remove-confirm` / `market-account-remove-cancel`),
+//! `market-account-bots-<id>` (opens the account's Bots: `market-bots-search`,
+//! `market-bot-<coworker>` checked while allowed, `market-bots-back`),
+//! `market-use-prompt-<name>` once the plugin has an account while the open Bot's switch is off
+//! (`market-use-prompt-on-<name>` switches it on, `market-use-prompt-not-now-<name>`),
+//! `market-add-account-<connector>` (a sign-in page, or `market-token-field` with
+//! `market-token-save` / `market-token-cancel` / `market-token-refusal`; the field's value is
+//! dots, never the token), `monitor-account-pick-<id>` and `monitor-account-ask`; then
+//! `market-tools` (expands its servers and tools), `monitor-plugin-switch-<name>`,
+//! `market-logins` (Plugins' first page: your saved logins, each row `market-login-<id>` with
+//! its Bots count, opening that login's Bots page with `market-login-bot-<login>-<bot>`
+//! switches), `market-plugin-skill-row-<plugin>-<skill>` (opens the skill's read-only page, Back returns to
+//! the plugin) with `market-plugin-skill-switch-<plugin>-<skill>` (on or off for the open Bot, on
+//! the plugin's page and the skill's), `market-app-*`, `market-unsupported-*` and `market-info-*`.
+//!
+//! A Bot's Connections card: `agent-connections` (value = the card's second line: `1 of 2 lent to
 //! this Bot`, `Asking the server…`, or why there is nothing to count), and per connection
 //! `agent-connection-lend-{id}` (a switch, label = its label, value = its service, checked while
 //! it shows as lent to this bot; a click asks for the other way; dead and `changing` while a
@@ -524,7 +573,7 @@
 //! before the setting is read, and Save while a read is out, saying what it waits for. The tab's
 //! pages are `settings-tab-general` (Default models, and the Relay-off fallback that Subscription
 //! Bots answer with while Relay is off, "When Relay is off, Subscription Bots use": there, unmoved),
-//! this one, `settings-tab-updates`, `settings-tab-logins`, `settings-tab-connections` and
+//! this one, `settings-tab-updates`, `settings-tab-logins` and
 //! `settings-tab-skills`. Default for new Bots is General's, above.
 //!
 //! `reply-source-{messageId}` is the badge of each reply in the open thread that wears one, as the

@@ -112,6 +112,7 @@ pub fn init(cx: &mut App) {
 pub fn chip_icon(kind: TokenKind) -> &'static str {
     match kind {
         TokenKind::Tool => "icons/wrench.svg",
+        TokenKind::Plugin => "icons/plugins.svg",
         TokenKind::Recipe => "icons/play.svg",
         TokenKind::Workflow => "icons/branch.svg",
         TokenKind::Skill => "icons/study.svg",
