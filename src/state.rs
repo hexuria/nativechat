@@ -5553,6 +5553,11 @@ pub struct AppState {
     /// The Bot being given a computer of its own from a login card, while the server makes it.
     pub own_computer_changing: Option<String>,
     /// What the server said when it could not give a Bot its own computer.
+    /// The person's "share my logins with all my Bots" switch, as the server last said; None
+    /// until read.
+    pub logins_for_all_bots: Option<bool>,
+    /// The switch is being set.
+    pub logins_for_all_bots_changing: bool,
     pub own_computer_refusal: Option<String>,
     /// The service whose "Current Bot" default-account menu is open on a plugin's page.
     pub account_menu: Option<String>,
@@ -6430,6 +6435,8 @@ impl AppState {
             login_bots: None,
             own_computer_changing: None,
             own_computer_refusal: None,
+            logins_for_all_bots: None,
+            logins_for_all_bots_changing: false,
             active_recipe: None,
             active_skill: None,
             composer_files: Vec::new(),
@@ -20977,6 +20984,7 @@ impl AppState {
                         usable: true,
                         reason: None,
                         own_computer: false,
+                        own_bots_only: false,
                     }
                 }
             };
@@ -21027,6 +21035,66 @@ impl AppState {
                             None,
                             cx,
                         );
+                        state.own_computer_refusal = Some(error.message);
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Read the person's "all my Bots" switch for the Logins page.
+    pub fn read_logins_for_all_bots(&mut self, cx: &mut Context<Self>) {
+        let Some(client) = self.opengrok.clone() else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let all = client.logins_for_all_bots().await;
+            let _ = this.update(cx, |state, cx| {
+                match all {
+                    Ok(all) => state.logins_for_all_bots = Some(all),
+                    Err(error) => log::warn!("login sharing: {}", error.message),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// "Share my logins with all my Bots", from the Logins page or a login card. Every Bot's
+    /// answer about saved logins changes with it, so each is asked again; a card that was
+    /// refused on the computer the person's Bots share gets its logins back, on that computer,
+    /// with the page it had open.
+    pub fn set_logins_for_all_bots(&mut self, all: bool, cx: &mut Context<Self>) {
+        let Some(client) = self.opengrok.clone() else {
+            return;
+        };
+        if self.logins_for_all_bots_changing {
+            return;
+        }
+        self.logins_for_all_bots_changing = true;
+        self.own_computer_refusal = None;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = client.set_logins_for_all_bots(all).await;
+            let _ = this.update(cx, |state, cx| {
+                state.logins_for_all_bots_changing = false;
+                match result {
+                    Ok(all) => {
+                        state.logins_for_all_bots = Some(all);
+                        let bots: Vec<String> = state
+                            .saved_login_checks
+                            .drain()
+                            .map(|(bot, _)| bot)
+                            .collect();
+                        for bot in bots {
+                            state.check_saved_logins(bot, None, cx);
+                        }
+                        state.read_all_login_shares(cx);
+                    }
+                    Err(error) => {
+                        state.notify_error(None, "Logins", &error.message, None, None, cx);
                         state.own_computer_refusal = Some(error.message);
                     }
                 }
@@ -46565,6 +46633,117 @@ mod tests {
                 })
             },
         );
+    }
+
+    /// On the computer only the person's own Bots use, the card offers to share every saved
+    /// login with all of them: one click, and the logins come back on the same computer, with
+    /// no computer of its own made (which would leave the page the Bot had open behind).
+    #[cfg(feature = "agent")]
+    #[gpui_kit::test]
+    fn sharing_logins_with_all_bots_brings_them_back_on_the_same_computer(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        use crate::agent::NativeChatHost;
+        use gpui_agent::AgentHost as _;
+        use gpui_agent::protocol::Op;
+        use gpui_kit::AppContext as _;
+        use wiremock::matchers::{body_json, method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        let runtime = a_runtime_for_the_relay(cx);
+        let _enter = runtime.enter();
+        let server = runtime.block_on(wiremock::MockServer::start());
+        runtime.block_on(async {
+            Mock::given(method("GET"))
+                .and(path("/coworkers/cw_1/saved-login"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "usable": false, "reason": "shared-computer",
+                    "ownComputer": false, "ownBotsOnly": true
+                })))
+                .up_to_n_times(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/coworkers/cw_1/saved-login"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "usable": true, "reason": null,
+                    "ownComputer": false, "ownBotsOnly": true
+                })))
+                .mount(&server)
+                .await;
+            Mock::given(method("PUT"))
+                .and(path("/site-logins/sharing"))
+                .and(body_json(json!({"allBots": true})))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({"allBots": true})))
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("PUT"))
+                .and(path("/coworkers/cw_1/own-computer"))
+                .respond_with(ResponseTemplate::new(200))
+                .expect(0)
+                .mount(&server)
+                .await;
+        });
+        let mut state = AppState::new();
+        state.auth_status = super::AuthStatus::SignedIn;
+        state.opengrok = Some(OpenGrokClient::new(&server.uri()).unwrap());
+        state.account =
+            serde_json::from_value(json!({"id": "acct_1", "email": "ada@example.com"})).ok();
+        state.coworkers.push(bob());
+        state.site_logins = vec![saved_login(
+            "sl_ada",
+            "google.com",
+            "ada@example.com",
+            "password",
+        )];
+        state.site_logins_ready = true;
+        let mut sign_in = message("m1", false, "");
+        sign_in.parts = vec![ChatPart::UserForm(google_card(
+            "e_login",
+            json!([
+                {"id": "email", "label": "Email", "type": "email", "required": true},
+                {"id": "password", "label": "Password", "type": "password", "required": true}
+            ]),
+        ))];
+        state.conversations.push(thread("cw_1", vec![sign_in]));
+        state.active_conversation_id = Some("cw_1".into());
+        let app = cx.new(|_| state);
+        let card = app.read_with(cx, |state, _| {
+            state
+                .conversations
+                .iter()
+                .flat_map(|c| &c.messages)
+                .flat_map(|m| &m.parts)
+                .find_map(|part| match part {
+                    ChatPart::UserForm(spec) => Some(spec.card_key().to_string()),
+                    _ => None,
+                })
+                .unwrap()
+        });
+        app.update(cx, |state, cx| {
+            state.pick_saved_login(card.clone(), "sl_ada".into(), cx)
+        });
+        wait_for(cx, "the check is answered", |cx| {
+            app.read_with(cx, |state, _| state.saved_login_checks.contains_key("cw_1"))
+        });
+        let share = crate::opengrok::user_form_all_bots_id(&card);
+        let command = app.read_with(cx, |state, _| {
+            let mut host = NativeChatHost::from_app(state);
+            assert!(host.snapshot().find(&share).is_some(), "{share} is drawn");
+            host.dispatch(&Op::click(&share)).unwrap();
+            host.take_command()
+        });
+        app.update(cx, |state, cx| command.unwrap().apply(state, cx));
+        wait_for(cx, "the logins are back on the same computer", |cx| {
+            app.read_with(cx, |state, _| {
+                state.logins_for_all_bots == Some(true)
+                    && state
+                        .saved_login_checks
+                        .get("cw_1")
+                        .is_some_and(|check| check.usable && !check.own_computer)
+            })
+        });
+        runtime.block_on(server.verify());
     }
 
     #[cfg(feature = "agent")]

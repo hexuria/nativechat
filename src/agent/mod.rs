@@ -75,8 +75,10 @@
 //! is the first row), `user-form-saved-note-{key}`, `user-form-saved-clear-{key}` (Change, on
 //! the password row, or on the name row of a name page), and where a saved login cannot be used
 //! for the card's Bot (checked before Touch ID) `user-form-saved-blocked-{key}` (value = the
-//! reason, `shared-computer` or `shared-bot`), `user-form-own-computer-{key}` (gives the Bot a
-//! computer of its own; not on a shared-bot card) and `user-form-by-hand-{key}`,
+//! reason, `shared-computer` or `shared-bot`), `user-form-all-bots-{key}` (shares every saved
+//! login with all the person's Bots; only where the computer is their Bots' alone),
+//! `user-form-own-computer-{key}` (gives the Bot a computer of its own; not on a shared-bot
+//! card) and `user-form-by-hand-{key}`,
 //! `settings-tab-logins`, `settings-logins-search` (value = the query), `settings-login-add`,
 //! `settings-login-import`, `settings-logins-notice`, `settings-logins-error`,
 //! `settings-logins-empty`, `settings-logins-group-passwords|passkeys|codes|security` (a
@@ -456,7 +458,8 @@
 //! `market-tools` (expands its servers and tools), `monitor-plugin-switch-<name>`,
 //! `market-logins` (Plugins' first page: your saved logins, each row `market-login-<id>` with
 //! its Bots count, opening that login's Bots page with `market-login-bot-<login>-<bot>`
-//! switches), `market-plugin-skill-row-<plugin>-<skill>` (opens the skill's read-only page, Back returns to
+//! switches, disabled while every login is shared with all Bots; the page itself has the
+//! `market-logins-all-bots` switch, "Share with all my Bots"), `market-plugin-skill-row-<plugin>-<skill>` (opens the skill's read-only page, Back returns to
 //! the plugin) with `market-plugin-skill-switch-<plugin>-<skill>` (on or off for the open Bot, on
 //! the plugin's page and the skill's), `market-app-*`, `market-unsupported-*` and `market-info-*`.
 //!

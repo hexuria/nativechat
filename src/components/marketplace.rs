@@ -460,6 +460,8 @@ pub(crate) fn login_rows(state: &AppState) -> Vec<MarketRow> {
 }
 
 pub(crate) const LOGINS: &str = "market-logins";
+/// "Share with all my Bots" on the Logins page: every saved login, every Bot of the person's.
+pub(crate) const LOGINS_ALL_BOTS: &str = "market-logins-all-bots";
 
 /// A login's Bots page switch for one Bot.
 pub(crate) fn login_bot_switch_id(login: &str, bot: &str) -> String {
@@ -1999,12 +2001,38 @@ pub(crate) fn browse(
     // Under the bar: the installed shortcut, on the right (the owner's call, 7 Oct 2026). The
     // page's title and its Back are in the window's bar.
     let logins_app = app.clone();
+    let all_bots_app = app.clone();
+    let all_bots = state.logins_for_all_bots;
+    let all_bots_changing = state.logins_for_all_bots_changing;
     let header = h_flex()
         .w_full()
         .h(px(28.))
         .justify_end()
         .items_center()
         .gap(px(16.))
+        // One switch shares every saved login with every Bot of the person's, the way their Bots
+        // share one computer (9 Oct 2026).
+        .when(modal.page == MarketPage::Logins && !tools, |this| {
+            this.child(
+                h_flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .text_size(px(13.))
+                    .text_color(theme.muted_foreground)
+                    .child("Share with all my Bots")
+                    .child(
+                        Switch::new(LOGINS_ALL_BOTS)
+                            .checked(all_bots == Some(true))
+                            .small()
+                            .disabled(all_bots.is_none() || all_bots_changing)
+                            .accessibility_label("Share every saved login with all my Bots")
+                            .on_click(move |on, _, cx| {
+                                all_bots_app
+                                    .update(cx, |state, cx| state.set_logins_for_all_bots(*on, cx))
+                            }),
+                    ),
+            )
+        })
         // Your saved logins and which Bots may use them, beside what is installed (8 Oct 2026).
         .when(modal.page == MarketPage::Browse && !tools, |this| {
             this.child(
@@ -2109,9 +2137,11 @@ pub(crate) fn browse(
     let top = v_flex()
         .w_full()
         .gap(px(12.))
-        .when(modal.page == MarketPage::Browse && !tools, |this| {
-            this.child(header)
-        })
+        // The Logins page draws the bar too, for its "Share with all my Bots" switch.
+        .when(
+            matches!(modal.page, MarketPage::Browse | MarketPage::Logins) && !tools,
+            |this| this.child(header),
+        )
         .child(search)
         .into_any_element();
 
@@ -3595,6 +3625,13 @@ fn login_bots_page(
             .text_color(theme.muted_foreground)
             .child("A Bot that is switched on can fill this login on its sign-in cards, after your Touch ID. It never sees the password."),
     );
+    // Under the all-Bots switch every Bot has every login: one Bot's switch would change nothing.
+    let all_bots = state.logins_for_all_bots == Some(true);
+    if all_bots {
+        body = body.child(div().text_sm().child(
+            "Shared with all your Bots. Turn that off on the Logins page to choose Bot by Bot.",
+        ));
+    }
     let mut list = card(theme);
     let bots: Vec<_> = state.coworkers.iter().collect();
     for (i, bot) in bots.iter().enumerate() {
@@ -3609,7 +3646,7 @@ fn login_bots_page(
                     Switch::new(ElementId::Name(login_bot_switch_id(id, &bot.id).into()))
                         .checked(on)
                         .small()
-                        .disabled(known.is_none())
+                        .disabled(known.is_none() || all_bots)
                         .accessibility_label(format!("Let {} use this login", bot.name))
                         .on_click(move |on, _, cx| {
                             switch.update(cx, |state, cx| {

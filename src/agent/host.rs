@@ -1115,6 +1115,14 @@ pub enum Command {
     UserFormOwnComputer {
         card_key: String,
     },
+    /// "Share my logins with all my Bots" on a login card.
+    UserFormAllBots {
+        card_key: String,
+    },
+    /// The Logins page's "Share with all my Bots" switch.
+    SetLoginsForAllBots {
+        on: bool,
+    },
     UserFormClearSaved {
         card_key: String,
     },
@@ -1577,6 +1585,8 @@ impl Command {
                     state.give_bot_own_computer(bot, cx);
                 }
             }
+            Self::UserFormAllBots { .. } => state.set_logins_for_all_bots(true, cx),
+            Self::SetLoginsForAllBots { on } => state.set_logins_for_all_bots(on, cx),
             Self::UserFormRegisterPasskey { card_key } => {
                 state.confirm_passkey_register(card_key, cx)
             }
@@ -2435,6 +2445,9 @@ struct UserFormSnap {
     /// Why a saved login cannot be used for this card's Bot, known before Touch ID: the
     /// reason (`shared-computer` or `shared-bot`) and whether its own computer is being made.
     saved_login_blocked: Option<(String, bool)>,
+    /// "Share my logins with all my Bots" is offered: refused only because the computer is the
+    /// person's Bots' and their logins are not shared with all of them.
+    saved_login_all_bots: bool,
 }
 
 #[derive(Clone)]
@@ -2844,6 +2857,12 @@ fn user_form_node(form: &UserFormSnap) -> UiNode {
             format!("user-form-saved-blocked-{key}"),
             reason.clone(),
         ));
+        if form.saved_login_all_bots {
+            card = card.with_child(UiNode::button(
+                crate::opengrok::user_form_all_bots_id(key),
+                "Share my logins with all my Bots",
+            ));
+        }
         if reason != "shared-bot" {
             card = card.with_child(
                 UiNode::button(
@@ -3684,6 +3703,8 @@ pub struct NativeChatHost {
     /// A saved login's Bots page, while one is open: the login, and each Bot as (id, name,
     /// shared, whether its shares are read yet).
     login_page: Option<(String, Vec<LoginBotSnap>)>,
+    /// The Logins page's "Share with all my Bots" switch: on, and whether it can be flipped now.
+    logins_for_all_bots: (bool, bool),
     market_status: Vec<String>,
     market_installed: usize,
     market_token: Option<MarketTokenSnap>,
@@ -4001,6 +4022,10 @@ impl NativeChatHost {
             market_sections: crate::components::marketplace::sections(state),
             market_skill: SkillPageSnap::of(state),
             plugin_skills: state.plugin_skills.clone(),
+            logins_for_all_bots: (
+                state.logins_for_all_bots == Some(true),
+                state.logins_for_all_bots.is_some() && !state.logins_for_all_bots_changing,
+            ),
             login_page: state
                 .monitor_modal
                 .as_ref()
@@ -4407,6 +4432,13 @@ impl NativeChatHost {
                     let saved_login_held = current.is_some_and(|use_| use_.ready().is_some());
                     let passkey_register = spec.challenge_kind.as_deref() == Some("passkey")
                         && spec.passkey_mode.as_deref() == Some("register");
+                    let saved_login_all_bots = state.card_coworker(&key).is_some_and(|bot| {
+                        state.saved_login_checks.get(&bot).is_some_and(|c| {
+                            !c.usable
+                                && c.own_bots_only
+                                && c.reason.as_deref() != Some("shared-bot")
+                        })
+                    }) && !state.logins_for_all_bots_changing;
                     let saved_login_blocked = state.card_coworker(&key).and_then(|bot| {
                         let check = state.saved_login_checks.get(&bot).filter(|c| !c.usable)?;
                         Some((
@@ -4416,6 +4448,7 @@ impl NativeChatHost {
                     });
                     UserFormSnap {
                         saved_login_blocked,
+                        saved_login_all_bots,
                         title: if spec.title.is_empty() {
                             "Form".into()
                         } else {
@@ -5641,6 +5674,11 @@ impl NativeChatHost {
                     card_key: key.clone(),
                 });
             }
+            if form.saved_login_all_bots && target == crate::opengrok::user_form_all_bots_id(key) {
+                return Some(Command::UserFormAllBots {
+                    card_key: key.clone(),
+                });
+            }
             if form.saved_login_held && target == user_form_saved_clear_id(key) {
                 return Some(Command::UserFormClearSaved {
                     card_key: key.clone(),
@@ -5800,6 +5838,14 @@ impl NativeChatHost {
             if modal.page == MarketPage::Browse && !tools {
                 node = node.with_child(UiNode::button(market::LOGINS, "Logins"));
             }
+            if modal.page == MarketPage::Logins && !tools {
+                let (on, live) = self.logins_for_all_bots;
+                node = node.with_child(
+                    UiNode::new(market::LOGINS_ALL_BOTS, "switch", "Share with all my Bots")
+                        .with_checked(on)
+                        .with_enabled(live),
+                );
+            }
             if modal.page != MarketPage::Installed && !tools {
                 node = node.with_child(
                     UiNode::button(
@@ -5902,7 +5948,7 @@ impl NativeChatHost {
                         name.clone(),
                     )
                     .with_checked(*on)
-                    .with_enabled(*known),
+                    .with_enabled(*known && !self.logins_for_all_bots.0),
                 );
             }
             return node
@@ -6294,7 +6340,9 @@ impl NativeChatHost {
         if let Some((login, bots)) = &self.login_page {
             for (bot, _, on, known) in bots {
                 if target == market::login_bot_switch_id(login, bot) {
-                    return Some(if *known {
+                    return Some(if self.logins_for_all_bots.0 {
+                        Err("every login is shared with all Bots; turn that off first".into())
+                    } else if *known {
                         Ok(Command::SetLoginShared {
                             login: login.clone(),
                             bot: bot.clone(),
@@ -6312,6 +6360,14 @@ impl NativeChatHost {
             }
             if target == market::LOGINS && modal.page == MarketPage::Browse {
                 return m(MarketCommand::Page(MarketPage::Logins));
+            }
+            if target == market::LOGINS_ALL_BOTS && modal.page == MarketPage::Logins {
+                let (on, live) = self.logins_for_all_bots;
+                return Some(if live {
+                    Ok(Command::SetLoginsForAllBots { on: !on })
+                } else {
+                    Err("the switch is still being read or set".into())
+                });
             }
             if target == market::INSTALLED && modal.page != MarketPage::Installed {
                 return m(MarketCommand::Page(MarketPage::Installed));
@@ -13170,6 +13226,7 @@ mod tests {
             saved_login_note: None,
             saved_login_held: false,
             saved_login_blocked: None,
+            saved_login_all_bots: false,
             passkey_register: false,
             title: "Google account".into(),
             fields: vec![
@@ -13327,6 +13384,7 @@ mod tests {
             saved_login_note: None,
             saved_login_held: false,
             saved_login_blocked: None,
+            saved_login_all_bots: false,
             passkey_register: false,
             title: "Website login".into(),
             fields: vec![UserFormFieldSnap {
@@ -13461,6 +13519,7 @@ mod tests {
             saved_login_note: None,
             saved_login_held: false,
             saved_login_blocked: None,
+            saved_login_all_bots: false,
             passkey_register: false,
             title: "Google account".into(),
             fields: Vec::new(),
