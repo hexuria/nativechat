@@ -31,6 +31,11 @@ pub const UNDO: &str = "notifications-undo";
 pub fn row_id(id: &str) -> String {
     format!("notification-{id}")
 }
+/// A fault notice's 🐞, `notification-report-<id>`.
+pub fn report_id(id: &str) -> String {
+    format!("notification-report-{id}")
+}
+
 /// A fault notice's "Go to …" link, `notification-go-<id>`.
 pub fn go_to_id(id: &str) -> String {
     format!("notification-go-{id}")
@@ -613,11 +618,30 @@ fn notice_row(
             app.update(cx, |state, cx| state.reveal_fault(&id, cx));
         })
     });
+    // 🐞: the report preview for this fault.
+    let report = notice.fault.as_ref().map(|_| {
+        let id = id.clone();
+        let app = copy.clone();
+        icon_button(
+            report_id(&id),
+            "icons/bug.svg",
+            "Report this",
+            true,
+            false,
+            theme,
+        )
+        .size(px(24.))
+        .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+            cx.stop_propagation();
+            app.update(cx, |state, cx| state.open_report(&id, cx));
+        })
+    });
     let actions = h_flex()
         .gap(px(2.))
         .opacity(0.)
         .group_hover(group.clone(), |s| s.opacity(1.))
         .children(go_to)
+        .children(report)
         .child(
             icon_button(copy_id(&id), "icons/copy.svg", "Copy", true, false, theme)
                 .size(px(24.))

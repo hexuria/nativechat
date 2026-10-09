@@ -5,6 +5,7 @@
 //! it grows to hold. The preview shows [`Report`] as it is, so what is seen is what is sent.
 
 pub mod fingerprint;
+pub mod github;
 pub mod redact;
 
 use crate::notifications::Notice;

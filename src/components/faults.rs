@@ -25,6 +25,7 @@ const WINDOW_W: f32 = 620.;
 
 pub const WINDOW_ID: &str = "fault-window";
 pub const COPY_ID: &str = "fault-copy";
+pub const REPORT_ID: &str = "fault-report";
 pub const CLOSE_ID: &str = "fault-close";
 pub const READ_ID: &str = "fault-mark-read";
 pub const NEWER_ID: &str = "fault-newer";
@@ -172,6 +173,7 @@ pub fn window(app: &Entity<AppState>, cx: &App) -> Option<AnyElement> {
         app.clone(),
         app.clone(),
     );
+    let (report, report_id) = (app.clone(), notice.id.clone());
     // The text as a code block, so it is monospace and can be selected and copied in part.
     let shown = format!("```text\n{raw}\n```");
     let line = px(18.);
@@ -180,6 +182,9 @@ pub fn window(app: &Entity<AppState>, cx: &App) -> Option<AnyElement> {
             .id("fault-backdrop")
             .absolute()
             .inset_0()
+            // Nothing under the dimmed backdrop takes the pointer or the scroll wheel: the chat
+            // must not scroll behind a window that is reading it.
+            .occlude()
             .flex()
             .items_center()
             .justify_center()
@@ -267,6 +272,14 @@ pub fn window(app: &Entity<AppState>, cx: &App) -> Option<AnyElement> {
                                     cx.write_to_clipboard(ClipboardItem::new_string(copy.clone()))
                                 },
                             ))
+                            // 🐞: the report preview, over this window, on this fault.
+                            .child(button(REPORT_ID, "🐞 Report", false, &theme).on_mouse_down(
+                                MouseButton::Left,
+                                move |_, _, cx| {
+                                    let id = report_id.clone();
+                                    report.update(cx, |s, cx| s.open_report(&id, cx))
+                                },
+                            ))
                             .child(div().flex_1())
                             .child(button(READ_ID, "Mark read", false, &theme).on_mouse_down(
                                 MouseButton::Left,
@@ -284,6 +297,167 @@ pub fn window(app: &Entity<AppState>, cx: &App) -> Option<AnyElement> {
                                 ),
                             ),
                     ),
+            )
+            .into_any_element(),
+    )
+}
+
+/// The report preview's ids, for gpui-agent.
+pub const SHEET_ID: &str = "report-sheet";
+pub const SHEET_BODY_ID: &str = "report-body";
+pub const SHEET_TEXT_ID: &str = "report-include-text";
+pub const SHEET_SEND_ID: &str = "report-open-github";
+pub const SHEET_CANCEL_ID: &str = "report-cancel";
+
+/// How many lines the preview's body box shows, always.
+const SHEET_ROWS: f32 = 12.;
+
+/// The report preview over everything, while one is open: the issue's title and body exactly
+/// as they will reach GitHub, the "include the server's own text" choice, and the button that
+/// opens GitHub's page with them filled in. The person submits there; the app sends nothing.
+pub fn report_sheet(app: &Entity<AppState>, cx: &App) -> Option<AnyElement> {
+    let state = app.read(cx);
+    let draft = state.report_draft.clone()?;
+    let report = state.report_preview()?;
+    let theme = cx.theme().clone();
+    let muted = theme.muted_foreground;
+    let title = crate::report::github::title(&report);
+    let link = crate::report::github::issue_link(&report);
+    // The body as GitHub will show it: rendered Markdown, the failure's text in its code block.
+    // The hidden fingerprint marker is GitHub's to hide; here it would show as text.
+    let shown = crate::report::github::body(&report)
+        .lines()
+        .filter(|line| !line.starts_with("<!-- fp:"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let (back, toggle, send, cancel) = (app.clone(), app.clone(), app.clone(), app.clone());
+    let tick = if draft.with_text { "☑" } else { "☐" };
+    let line = px(18.);
+    let footer = if draft.opened {
+        let note = if link.clipboard.is_some() {
+            "Opened on GitHub. The full report is on your clipboard: paste it into the body, then submit."
+        } else {
+            "Opened on GitHub. Submit it there."
+        };
+        h_flex()
+            .gap(px(8.))
+            .p(px(12.))
+            .border_t_1()
+            .border_color(theme.border)
+            .child(div().flex_1().text_xs().child(note))
+            .child(
+                button(SHEET_CANCEL_ID, "Close", true, &theme)
+                    .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                        cancel.update(cx, |s, cx| s.close_report(cx))
+                    }),
+            )
+    } else {
+        h_flex()
+            .gap(px(8.))
+            .p(px(12.))
+            .border_t_1()
+            .border_color(theme.border)
+            .child(
+                div()
+                    .flex_1()
+                    .text_xs()
+                    .text_color(muted)
+                    .child("You submit it on GitHub, signed in as you. It will be public."),
+            )
+            .child(
+                button(SHEET_CANCEL_ID, "Cancel", false, &theme)
+                    .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                        cancel.update(cx, |s, cx| s.close_report(cx))
+                    }),
+            )
+            .child(
+                button(SHEET_SEND_ID, "Open on GitHub", true, &theme)
+                    .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                        send.update(cx, |s, cx| s.send_report(cx))
+                    }),
+            )
+    };
+    Some(
+        div()
+            .id("report-backdrop")
+            .absolute()
+            .inset_0()
+            // Nothing under the dimmed backdrop takes the pointer or the scroll wheel: the chat
+            // must not scroll behind a window that is reading it.
+            .occlude()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(rgb(0x000000).opacity(0.25))
+            .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                back.update(cx, |state, cx| state.close_report(cx));
+            })
+            .child(
+                v_flex()
+                    .id(SHEET_ID)
+                    .debug_selector(|| SHEET_ID.into())
+                    .w(px(WINDOW_W))
+                    .rounded(px(14.))
+                    .bg(theme.background)
+                    .border_1()
+                    .border_color(theme.border)
+                    .shadow_lg()
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .child(
+                        v_flex()
+                            .gap(px(4.))
+                            .p(px(14.))
+                            .border_b_1()
+                            .border_color(theme.border)
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child(format!("Report to {}", crate::report::github::REPO)),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(muted)
+                                    .child("This is everything that leaves this Mac. Names, hosts, ids and secrets are already taken out."),
+                            )
+                            .child(div().pt(px(6.)).text_sm().truncate().child(title)),
+                    )
+                    .child(
+                        div()
+                            .id(SHEET_BODY_ID)
+                            .debug_selector(|| SHEET_BODY_ID.into())
+                            .h(line * SHEET_ROWS + px(20.))
+                            .overflow_y_scroll()
+                            .px(px(14.))
+                            .py(px(10.))
+                            .text_xs()
+                            .child(TextView::markdown("report-body-text", shown).selectable(true)),
+                    )
+                    .child(
+                        h_flex()
+                            .id(SHEET_TEXT_ID)
+                            .debug_selector(|| SHEET_TEXT_ID.into())
+                            .gap(px(8.))
+                            .px(px(14.))
+                            .py(px(8.))
+                            .border_t_1()
+                            .border_color(theme.border)
+                            .cursor_pointer()
+                            .text_sm()
+                            .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                                toggle.update(cx, |s, cx| s.toggle_report_text(cx))
+                            })
+                            .child(tick)
+                            .child("Include the server's own text")
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(muted)
+                                    .child("(redacted, off by default)"),
+                            ),
+                    )
+                    .child(footer),
             )
             .into_any_element(),
     )
