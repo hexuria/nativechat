@@ -1280,6 +1280,10 @@ pub enum Command {
     CopyNotice(String),
     CopyBotNotices,
     OpenFaultWindow(crate::faults::Place),
+    OpenReport(String),
+    ToggleReportText,
+    SendReport,
+    CloseReport,
     CloseFaultWindow,
     PageFaultWindow(isize),
     CopyFaultWindow,
@@ -1676,6 +1680,10 @@ impl Command {
             Self::DismissToast => state.dismiss_toast(cx),
             Self::CopyNotice(id) => state.copy_notice(&id, cx),
             Self::OpenFaultWindow(place) => state.open_fault_window(place, cx),
+            Self::OpenReport(id) => state.open_report(&id, cx),
+            Self::ToggleReportText => state.toggle_report_text(cx),
+            Self::SendReport => state.send_report(cx),
+            Self::CloseReport => state.close_report(cx),
             Self::CloseFaultWindow => state.close_fault_window(cx),
             Self::PageFaultWindow(step) => state.page_fault_window(step, cx),
             Self::CopyFaultWindow => state.copy_fault_window(cx),
@@ -3745,6 +3753,8 @@ pub struct NativeChatHost {
     /// The fault window, while open: its place, which page, how many, and the fault shown.
     /// The place a notice's 🎯 has just ringed.
     fault_focus: Option<crate::faults::Place>,
+    /// The report preview, while open: its draft and the report exactly as it would be sent.
+    report_shown: Option<(crate::state::ReportDraft, crate::report::Report)>,
     fault_shown: Option<(
         crate::faults::Place,
         usize,
@@ -4121,6 +4131,7 @@ impl NativeChatHost {
             plan_fallback_busy: state.picker_busy(PickerFor::PlanFallback),
             model_note: state.model_catalogue.note.clone(),
             fault_focus: state.fault_focus,
+            report_shown: state.report_draft.clone().zip(state.report_preview()),
             fault_shown: state
                 .fault_in_window()
                 .map(|(place, at, count, notice)| (place, at, count, notice.clone())),
@@ -9847,10 +9858,12 @@ impl NativeChatHost {
                 )
                 .with_child(UiNode::button(pane::copy_id(&n.id), "Copy"));
             if let Some(fault) = &n.fault {
-                node = node.with_child(
-                    UiNode::button(pane::go_to_id(&n.id), "Show where it happened")
-                        .with_value(fault.place.word()),
-                );
+                node = node
+                    .with_child(
+                        UiNode::button(pane::go_to_id(&n.id), "Show where it happened")
+                            .with_value(fault.place.word()),
+                    )
+                    .with_child(UiNode::button(pane::report_id(&n.id), "Report this"));
             }
             node = node
                 .with_child(UiNode::button(
@@ -9922,11 +9935,58 @@ impl NativeChatHost {
                 .with_child(UiNode::button(window::NEWER_ID, "Newer"))
                 .with_child(UiNode::button(window::OLDER_ID, "Older"))
                 .with_child(UiNode::button(window::COPY_ID, "Copy all"))
+                .with_child(UiNode::button(window::REPORT_ID, "Report"))
                 .with_child(UiNode::button(window::READ_ID, "Mark read"))
                 .with_child(UiNode::button(window::CLOSE_ID, "Close"));
             nodes.push(node);
         }
+        nodes.extend(self.report_node());
         nodes
+    }
+
+    /// A click on the report preview's controls. "Open on GitHub" opens the person's browser,
+    /// so a driver reads the link with `report.link` instead of pressing it.
+    fn report_command(&self, target: &str) -> Option<Result<Command, String>> {
+        use crate::components::faults as sheet;
+        let command = match target {
+            t if t == sheet::SHEET_TEXT_ID => Command::ToggleReportText,
+            t if t == sheet::SHEET_SEND_ID => Command::SendReport,
+            t if t == sheet::SHEET_CANCEL_ID => Command::CloseReport,
+            _ => return None,
+        };
+        if self.report_shown.is_none() {
+            return Some(Err(format!(
+                "`{target}` is in the report preview, which is closed"
+            )));
+        }
+        Some(Ok(command))
+    }
+
+    /// The report preview as nodes: the sheet, its title and body as values, and its controls.
+    fn report_node(&self) -> Option<UiNode> {
+        use crate::components::faults as sheet;
+        let (draft, report) = self.report_shown.as_ref()?;
+        let mut node = UiNode::new(
+            sheet::SHEET_ID,
+            "dialog",
+            crate::report::github::title(report),
+        )
+        .with_child(
+            UiNode::status(sheet::SHEET_BODY_ID, "Report")
+                .with_value(crate::report::github::body(report)),
+        )
+        .with_child(
+            UiNode::checkbox(sheet::SHEET_TEXT_ID, "Include the server's own text")
+                .with_checked(draft.with_text),
+        )
+        .with_child(UiNode::button(
+            sheet::SHEET_CANCEL_ID,
+            if draft.opened { "Close" } else { "Cancel" },
+        ));
+        if !draft.opened {
+            node = node.with_child(UiNode::button(sheet::SHEET_SEND_ID, "Open on GitHub"));
+        }
+        Some(node)
     }
 
     /// A click on a ⚠ badge or on the fault window's buttons.
@@ -9939,8 +9999,15 @@ impl NativeChatHost {
         {
             return Some(Ok(Command::OpenFaultWindow(*place)));
         }
+        if let Some(command) = self.report_command(target) {
+            return Some(command);
+        }
         let shown = self.fault_shown.as_ref();
         let command = match target {
+            t if t == window::REPORT_ID => {
+                let id = shown.map(|(_, _, _, notice)| notice.id.clone())?;
+                Command::OpenReport(id)
+            }
             t if t == window::CLOSE_ID => Command::CloseFaultWindow,
             t if t == window::NEWER_ID => Command::PageFaultWindow(-1),
             t if t == window::OLDER_ID => Command::PageFaultWindow(1),
@@ -10051,6 +10118,7 @@ impl NativeChatHost {
                         pane::select_id(&n.id),
                         pane::copy_id(&n.id),
                         pane::go_to_id(&n.id),
+                        pane::report_id(&n.id),
                         pane::read_toggle_id(&n.id),
                         pane::delete_id(&n.id),
                     ]
@@ -10065,6 +10133,8 @@ impl NativeChatHost {
                     Command::CopyNotice(id)
                 } else if target == pane::go_to_id(&id) {
                     Command::RevealFault(id)
+                } else if target == pane::report_id(&id) {
+                    Command::OpenReport(id)
                 } else if target == pane::read_toggle_id(&id) {
                     Command::SetNoticesRead(vec![id], !n.read)
                 } else {
@@ -10113,6 +10183,20 @@ impl NativeChatHost {
         let json =
             |n: &crate::notifications::Notice, name: &Option<String>| n.to_json(name.as_deref());
         let answer = match name {
+            // The link "Open on GitHub" would open, without opening it: a driver's check of
+            // what a report sends, that does not take the person's browser.
+            "report.link" => self
+                .report_shown
+                .as_ref()
+                .map(|(_, report)| {
+                    let link = crate::report::github::issue_link(report);
+                    DispatchResult::json(serde_json::json!({
+                        "url": link.url,
+                        "clipboard": link.clipboard.is_some(),
+                        "fingerprint": report.fingerprint,
+                    }))
+                })
+                .ok_or_else(|| "no report preview is open".to_string()),
             "notices.list" => (|| {
                 let all = args.get("all").and_then(|v| v.as_bool()).unwrap_or(false);
                 let last = args

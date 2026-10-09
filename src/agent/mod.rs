@@ -30,6 +30,17 @@
 //! {bot?|"all"}` → `{total, unread}`, `notices.fake {bot?, place?, said?, raw?}` (a made-up one,
 //! toast and all), `notices.copy {id}` (clipboard, and the text back), `notices.dismiss`,
 //! `notices.open {bot?}`, `notices.read {bot?}`, `notices.clear {bot}`, `notices.clear-all`.
+//! A fault notice's row also has `notification-go-{id}` (🎯, value = its place word: opens the
+//! Bot and the card, ringed, `fault-focus` = the place while it is) and `notification-report-{id}`
+//! (🐞). Each place with an unread fault has its ⚠ `fault-{place}` (`fault-usage`, `fault-tools`,
+//! `fault-models`, `fault-server`, …); a click opens `fault-window` (value `1 of N`) with
+//! `fault-bot`, `fault-request`, `fault-status`, `fault-raised-at`, `fault-count`, `fault-raw`
+//! (the whole text as its value), `fault-newer`, `fault-older`, `fault-copy`, `fault-report`,
+//! `fault-mark-read` and `fault-close`. 🐞 opens `report-sheet` (named by the issue's title) with
+//! `report-body` (the issue body exactly as GitHub gets it), `report-include-text` (checked when
+//! the failure's own text goes too), `report-cancel` and `report-open-github`, which opens the
+//! person's browser: `report.link` returns that link (`{url, clipboard, fingerprint}`) without
+//! opening it.
 //! `header-coworker` (the chip at the top of the chat, while a bot is open: label = its name; a
 //! click opens the bot's settings, or, with state `goes-home` in one of its routines' threads,
 //! goes back to the bot's own chat),

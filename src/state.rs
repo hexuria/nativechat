@@ -2251,6 +2251,22 @@ fn import_failure(row: usize, error: &str) -> String {
     format!("row {}: {error}", row + 1)
 }
 
+/// The report preview's state (`AppState::report_draft`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReportDraft {
+    pub notice_id: String,
+    /// "Include the server's own text": off until the person ticks it.
+    pub with_text: bool,
+    /// GitHub's page was opened for this report; the sheet says to finish it there.
+    pub opened: bool,
+}
+
+/// `https://www.facebook.com/` → `www.facebook.com`: a saved login's site as text names it.
+fn site_host(origin: &str) -> String {
+    let rest = origin.split_once("://").map_or(origin, |(_, rest)| rest);
+    rest.split(['/', ':']).next().unwrap_or(rest).to_string()
+}
+
 /// A failed read as a pane says it, and what went wrong, which only the ⚠ badge shows.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Trouble {
@@ -5518,6 +5534,9 @@ pub struct AppState {
     /// The fault window, while it is open: which place's faults it pages through, and which of
     /// them, newest first (`components::fault_window`).
     pub fault_window: Option<(crate::faults::Place, usize)>,
+    /// The report preview, while it is open: which fault, whether the failure's own text goes
+    /// with it, and whether GitHub was opened for it (`components::report_sheet`).
+    pub report_draft: Option<ReportDraft>,
     /// The place a notice's 🎯 just took the person to, ringed for a moment so the eye finds it.
     pub fault_focus: Option<crate::faults::Place>,
     fault_focus_generation: u64,
@@ -6399,6 +6418,7 @@ impl AppState {
             notice_undo: None,
             notice_undo_generation: 0,
             fault_window: None,
+            report_draft: None,
             fault_focus: None,
             fault_focus_generation: 0,
             site_login_shares: HashMap::new(),
@@ -11341,6 +11361,95 @@ impl AppState {
     /// Open the fault window on `place`'s newest fault.
     pub fn open_fault_window(&mut self, place: crate::faults::Place, cx: &mut Context<Self>) {
         self.fault_window = Some((place, 0));
+        cx.notify();
+    }
+
+    /// Everything this Mac knows the person by that a pattern cannot find, for a report's
+    /// redaction: the home directory, the account's email and name, every Bot's name, every
+    /// installed plugin's name, and every saved login's site, username and label.
+    pub fn known_names(&self) -> crate::report::redact::Known {
+        let mut names: Vec<String> = Vec::new();
+        if let Some(account) = &self.account {
+            names.push(account.email.clone());
+            names.push(account.first_name.clone());
+            names.push(account.last_name.clone());
+            names.push(format!("{} {}", account.first_name, account.last_name));
+        }
+        names.extend(self.coworkers.iter().map(|bot| bot.name.clone()));
+        if let Some(installs) = self
+            .plugin_market
+            .installations
+            .as_ref()
+            .and_then(Loaded::ready)
+        {
+            names.extend(installs.iter().map(|install| install.name.clone()));
+        }
+        for login in &self.site_logins {
+            names.push(login.origin.clone());
+            names.push(site_host(&login.origin));
+            names.push(login.username.clone());
+            names.push(login.label.clone());
+        }
+        names.retain(|name| !name.trim().is_empty());
+        names.sort();
+        names.dedup();
+        crate::report::redact::Known {
+            home: std::env::var("HOME").ok(),
+            names,
+        }
+    }
+
+    /// Open the report preview on a fault notice. A notice that is not a fault has none.
+    pub fn open_report(&mut self, notice_id: &str, cx: &mut Context<Self>) {
+        let is_fault = self
+            .notices
+            .iter()
+            .any(|n| n.id == notice_id && n.fault.is_some());
+        if is_fault {
+            self.report_draft = Some(ReportDraft {
+                notice_id: notice_id.to_string(),
+                with_text: false,
+                opened: false,
+            });
+            cx.notify();
+        }
+    }
+
+    pub fn close_report(&mut self, cx: &mut Context<Self>) {
+        self.report_draft = None;
+        cx.notify();
+    }
+
+    /// The preview's "Include the server's own text".
+    pub fn toggle_report_text(&mut self, cx: &mut Context<Self>) {
+        if let Some(draft) = self.report_draft.as_mut() {
+            draft.with_text = !draft.with_text;
+            draft.opened = false;
+            cx.notify();
+        }
+    }
+
+    /// The report the preview shows, exactly as it would be sent.
+    pub fn report_preview(&self) -> Option<crate::report::Report> {
+        let draft = self.report_draft.as_ref()?;
+        let notice = self.notices.iter().find(|n| n.id == draft.notice_id)?;
+        crate::report::Report::from_notice(notice, &self.known_names(), draft.with_text)
+    }
+
+    /// "Open on GitHub": the new-issue page in the browser, filled in, with the body on the
+    /// clipboard first when it is too long for the link. The person submits it there.
+    pub fn send_report(&mut self, cx: &mut Context<Self>) {
+        let Some(report) = self.report_preview() else {
+            return;
+        };
+        let link = crate::report::github::issue_link(&report);
+        if let Some(body) = link.clipboard {
+            cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(body));
+        }
+        cx.open_url(&link.url);
+        if let Some(draft) = self.report_draft.as_mut() {
+            draft.opened = true;
+        }
         cx.notify();
     }
 
@@ -40728,6 +40837,72 @@ mod tests {
                 }),
             }
         );
+    }
+
+    /// A report hides what this Mac knows the person by (a Bot's name, a saved login's site and
+    /// username) even where no pattern would find it; the preview shows the failure's own text
+    /// only once it is ticked; and only a fault can be reported.
+    #[test]
+    fn a_report_preview_hides_what_this_mac_knows_and_waits_for_the_tick() {
+        use crate::faults::{FaultInput, Place};
+        let mut state = AppState::new();
+        state.coworkers = vec![
+            serde_json::from_value(json!({ "id": "cw_1", "name": "Blitz Ops" }))
+                .expect("a coworker parses"),
+        ];
+        state.site_logins = vec![saved_login(
+            "sl_1",
+            "https://intranet.acme.corp",
+            "jdoe",
+            "password",
+        )];
+        state.raise_fault(
+            Place::Usage,
+            "Could not load this bot's usage.",
+            FaultInput {
+                raw: "Blitz Ops could not reach intranet.acme.corp as jdoe".into(),
+                endpoint: Some("GET /coworkers/cw_018f3a2b9c7d7e10a1b2c3d4e5f60718/usage".into()),
+                status: Some(502),
+            },
+        );
+        let id = state.notices[0].id.clone();
+        state.report_draft = Some(super::ReportDraft {
+            notice_id: id.clone(),
+            with_text: false,
+            opened: false,
+        });
+        let plain = state.report_preview().expect("a fault previews");
+        assert_eq!(
+            plain.text, None,
+            "the failure's own text waits for the tick"
+        );
+        assert_eq!(plain.said, "Could not load this bot's usage.");
+
+        state.report_draft.as_mut().expect("open").with_text = true;
+        let ticked = state.report_preview().expect("a fault previews");
+        let text = ticked.text.clone().expect("ticked, the text comes");
+        for gone in ["Blitz Ops", "acme", "jdoe"] {
+            assert!(!text.contains(gone), "{gone} in {text}");
+        }
+        let link = crate::report::github::issue_link(&ticked);
+        for gone in ["Blitz", "acme", "jdoe", "cw_018f"] {
+            assert!(!link.url.contains(gone), "{gone} in {}", link.url);
+        }
+
+        let mut not_a_fault = crate::notifications::Notice::new(
+            None,
+            "Turn",
+            "The turn failed.",
+            std::panic::Location::caller(),
+        );
+        not_a_fault.id = "ntf_turn".into();
+        state.notices.push(not_a_fault);
+        state.report_draft = Some(super::ReportDraft {
+            notice_id: "ntf_turn".into(),
+            with_text: true,
+            opened: false,
+        });
+        assert_eq!(state.report_preview(), None, "only a fault can be reported");
     }
 
     /// A login an import could not save is kept by its row, not by its username or site.
