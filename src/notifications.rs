@@ -94,8 +94,12 @@ impl Notice {
         out.push_str(&format!("Where:  {}\n", self.place));
         out.push_str(&format!("Code:   {}\n", self.code));
         out.push_str(&format!("Said:   {}\n", self.said));
-        if let Some(raw) = &self.raw {
-            out.push_str(&format!("Raw:    {raw}\n"));
+        // A one-line text stays on its label's line; a longer one (a cause chain) follows it
+        // as written, so its lines and indents survive the paste.
+        match &self.raw {
+            Some(raw) if raw.contains('\n') => out.push_str(&format!("Raw:\n{raw}\n")),
+            Some(raw) => out.push_str(&format!("Raw:    {raw}\n")),
+            None => {}
         }
         if let Some(run) = &self.run_id {
             out.push_str(&format!("Run:    {run}\n"));

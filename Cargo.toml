@@ -52,6 +52,9 @@ tokio = { version = "1.36", features = ["full"] }
 libc = "0.2"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+# Issue reports (src/report): what is sent is found by pattern and fingerprinted, never the raw text.
+regex = "1.12"
+sha2 = "0.10.9"
 schemars = "1"
 futures = "0.3"
 url = "2.5"

@@ -2244,6 +2244,13 @@ pub(crate) const SKILLS_TROUBLE: crate::faults::Place = crate::faults::Place::Sk
 pub(crate) const YOUR_SKILLS_TROUBLE: crate::faults::Place = crate::faults::Place::Skills;
 pub(crate) const SKILL_TROUBLE: crate::faults::Place = crate::faults::Place::Skill;
 
+/// One login an import could not save, as its fault keeps it: by its row in the file and the
+/// reason, never by its username or site. A fault's text can end up in an issue report, and
+/// the username and site are the person's own; the import's notice already names the file.
+fn import_failure(row: usize, error: &str) -> String {
+    format!("row {}: {error}", row + 1)
+}
+
 /// A failed read as a pane says it, and what went wrong, which only the ⚠ badge shows.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Trouble {
@@ -21252,7 +21259,7 @@ impl AppState {
             };
             let mut saved = 0;
             let mut failed = Vec::new();
-            for item in &report.items {
+            for (row, item) in report.items.iter().enumerate() {
                 match save_site_login_everywhere(
                     &vault,
                     client.as_ref(),
@@ -21267,9 +21274,7 @@ impl AppState {
                 .await
                 {
                     Ok(_) => saved += 1,
-                    Err(error) => {
-                        failed.push(format!("{} on {}: {error}", item.username, item.origin))
-                    }
+                    Err(error) => failed.push(import_failure(row, &error)),
                 }
             }
             let _ = this.update(cx, |state, cx| {
@@ -40728,6 +40733,13 @@ mod tests {
     /// A failed read is one fault notice however often it fails the same way, counted; marking
     /// it read hides the badge and unread brings it back; the newest of several shows first; a
     /// read that works resolves them; words written for a person raise none.
+    /// A login an import could not save is kept by its row, not by its username or site.
+    #[test]
+    fn an_import_failure_names_the_row_not_the_login() {
+        let line = super::import_failure(4, "keychain locked");
+        assert_eq!(line, "row 5: keychain locked");
+    }
+
     #[test]
     fn a_fault_is_a_notice_the_badge_reads() {
         use crate::faults::{FaultInput, Place};
