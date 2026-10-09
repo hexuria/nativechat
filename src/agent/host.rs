@@ -7223,7 +7223,7 @@ impl NativeChatHost {
     /// fuller. `agent-model-error`, while open: the server's words for the last change it refused,
     /// or for new Bots that nobody knows whether it was kept.
     fn picker_node(&self, which: PickerFor) -> Option<UiNode> {
-        use crate::opengrok::{ListLine, group_title, list_window, row_count};
+        use crate::opengrok::{ListLine, list_window, row_count};
         use model_picker::{MODELS_TITLE, NO_MODEL_MATCHES, SEARCH_PLACEHOLDER, active_option};
         let ids = model_picker::ids(which);
         let (pick, view, note, busy) = self.picker_snap(which);
@@ -7343,8 +7343,8 @@ impl NativeChatHost {
             }
             for line in list_window(&groups, view.list_start) {
                 list = list.with_child(match line {
-                    ListLine::Heading(source) => {
-                        UiNode::new(ids.group_id(source), "heading", group_title(source))
+                    ListLine::Heading(group) => {
+                        UiNode::new(ids.heading_id(group), "heading", group.title())
                     }
                     ListLine::Row(row) => {
                         let mut item = UiNode::listitem(

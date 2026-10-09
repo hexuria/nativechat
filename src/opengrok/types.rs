@@ -305,6 +305,17 @@ pub struct ModelEntry {
     /// listed.
     #[serde(default, rename = "ownEffort", deserialize_with = "own_effort_or_none")]
     pub own_effort: Option<String>,
+    /// For one of the gateway's models, the upstream it is served from: `anthropic`, `xai`, an
+    /// operator's endpoint such as `merge`, or `oag` for a virtual name. The picker groups the
+    /// gateway's models by it. Absent from a server before it, and from the plan's models.
+    /// Transcribed from `Model::entry` in opengrok-server's `crates/opengrok-core/src/catalogue.rs`
+    /// (gol/tools-and-skill-packs, 9 Oct 2026), which copies open-ai-gateway's `oag.provider`.
+    #[serde(default)]
+    pub provider: Option<String>,
+    /// The kind of credential a pinned row is reached through, `api` or `sub`, from the same
+    /// change (open-ai-gateway's `oag.channel`). Absent where the row pins none.
+    #[serde(default)]
+    pub channel: Option<String>,
 }
 
 impl ModelEntry {

@@ -41664,7 +41664,7 @@ mod tests {
         };
         let pick = state.model_pick().expect("a Bot is open");
         assert_eq!(pick.summary(), "GPT-6 Luna · High ⚡");
-        let groups: Vec<(&str, Vec<&str>)> = pick
+        let groups: Vec<(String, Vec<&str>)> = pick
             .groups
             .iter()
             .map(|group| {
@@ -41677,8 +41677,8 @@ mod tests {
         assert_eq!(
             groups,
             vec![
-                (SUBSCRIPTION_GROUP, vec!["gpt-6-luna"]),
-                (GATEWAY_GROUP, vec!["oag/cheap"]),
+                (SUBSCRIPTION_GROUP.to_string(), vec!["gpt-6-luna"]),
+                (GATEWAY_GROUP.to_string(), vec!["oag/cheap"]),
             ]
         );
         assert_eq!(pick.fast_blocked, None);

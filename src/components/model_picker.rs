@@ -242,9 +242,17 @@ impl PickerIds {
         format!("{}{}-{base_id}", self.row, source.word())
     }
 
-    /// A group's heading in the list, by its door's wire word.
+    /// A group's heading in the list, by its door's wire word: the id of a group no upstream
+    /// splits ([`Self::heading_id`]).
+    #[cfg(test)]
     pub(crate) fn group_id(&self, source: InferenceKind) -> String {
         format!("{}{}", self.group, source.word())
+    }
+
+    /// A group's heading in the list: its door's word, and for one of the gateway's upstreams
+    /// that upstream's word after it (`agent-model-group-gateway-anthropic`).
+    pub(crate) fn heading_id(&self, group: &crate::opengrok::ChoiceGroup) -> String {
+        format!("{}{}", self.group, group.id_word())
     }
 
     /// The heading over the model the list pins above its groups ([`ModelPick::pinned`]). It is a
@@ -1197,9 +1205,9 @@ impl Panel {
             .children(lines.into_iter().enumerate().map(|(at, line)| {
                 match line {
                     // A heading under another group's rows stands off from them.
-                    ListLine::Heading(source) => heading(
-                        ids(self.which).group_id(source),
-                        group_title(source),
+                    ListLine::Heading(group) => heading(
+                        ids(self.which).heading_id(group),
+                        group.title(),
                         at > 0,
                         theme,
                     )
@@ -1296,7 +1304,12 @@ impl Panel {
 
 /// A heading in the list, under the element id `id`: a group's, over the first of its models in
 /// the window, or the pinned model's ([`CURRENT_TITLE`]).
-fn heading(id: String, title: &'static str, stand_off: bool, theme: &Theme) -> impl IntoElement {
+fn heading(
+    id: String,
+    title: impl Into<SharedString>,
+    stand_off: bool,
+    theme: &Theme,
+) -> impl IntoElement {
     div()
         .id(SharedString::from(id.clone()))
         .debug_selector(move || id)
@@ -1304,7 +1317,7 @@ fn heading(id: String, title: &'static str, stand_off: bool, theme: &Theme) -> i
         .px(px(8.))
         .text_xs()
         .text_color(theme.muted_foreground)
-        .child(title)
+        .child(title.into())
 }
 
 /// None, the first row of Default for new Bots' list and of the Relay-off fallback's: none kept,
