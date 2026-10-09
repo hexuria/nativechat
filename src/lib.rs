@@ -20,6 +20,7 @@ pub(crate) mod private_file;
 pub mod reachability;
 pub mod relay_key;
 mod reply_preview;
+pub mod report;
 pub mod root;
 pub mod send_policy;
 pub mod services;

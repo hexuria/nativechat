@@ -91,14 +91,7 @@ pub fn badge_element(place: Place, app: Entity<AppState>) -> AnyElement {
 
 /// What "Copy all" puts on the clipboard: every fact, then the whole text.
 pub fn copy_block(state: &AppState, notice: &crate::notifications::Notice) -> String {
-    let mut out = notice.copy_text(state.notice_bot_name(notice).as_deref());
-    if let Some(raw) = &notice.raw {
-        // `copy_text` puts the raw text on one line; the full text follows as it was.
-        out.push('\n');
-        out.push_str(raw);
-        out.push('\n');
-    }
-    out
+    notice.copy_text(state.notice_bot_name(notice).as_deref())
 }
 
 fn when(ms: i64) -> String {
@@ -294,4 +287,26 @@ pub fn window(app: &Entity<AppState>, cx: &App) -> Option<AnyElement> {
             )
             .into_any_element(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::copy_block;
+    use crate::state::AppState;
+
+    /// "Copy all" carries the fault's text once, whole, with its cause chain's lines intact.
+    #[test]
+    fn copy_all_carries_the_text_once() {
+        let mut notice = crate::notifications::Notice::new(
+            None,
+            "Usage",
+            "Could not load this bot's usage.",
+            std::panic::Location::caller(),
+        );
+        let raw = "error sending request\n\nCaused by:\n    2: Connection refused (os error 61)";
+        notice.raw = Some(raw.into());
+        let copied = copy_block(&AppState::new(), &notice);
+        assert_eq!(copied.matches("Connection refused").count(), 1, "{copied}");
+        assert!(copied.contains(raw), "{copied}");
+    }
 }
