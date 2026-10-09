@@ -40730,9 +40730,6 @@ mod tests {
         );
     }
 
-    /// A failed read is one fault notice however often it fails the same way, counted; marking
-    /// it read hides the badge and unread brings it back; the newest of several shows first; a
-    /// read that works resolves them; words written for a person raise none.
     /// A login an import could not save is kept by its row, not by its username or site.
     #[test]
     fn an_import_failure_names_the_row_not_the_login() {
@@ -40740,6 +40737,9 @@ mod tests {
         assert_eq!(line, "row 5: keychain locked");
     }
 
+    /// A failed read is one fault notice however often it fails the same way, counted; marking
+    /// it read hides the badge and unread brings it back; the newest of several shows first; a
+    /// read that works resolves them; words written for a person raise none.
     #[test]
     fn a_fault_is_a_notice_the_badge_reads() {
         use crate::faults::{FaultInput, Place};
