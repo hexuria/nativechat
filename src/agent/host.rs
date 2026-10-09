@@ -1279,6 +1279,11 @@ pub enum Command {
     DismissToast,
     CopyNotice(String),
     CopyBotNotices,
+    OpenFaultWindow(crate::faults::Place),
+    CloseFaultWindow,
+    PageFaultWindow(isize),
+    CopyFaultWindow,
+    RevealFault(String),
     /// `Some(bot)` clears one Bot's notices; `None` every notice.
     ClearNotices(Option<String>),
     MarkNoticesRead(Option<String>),
@@ -1670,6 +1675,11 @@ impl Command {
             Self::OpenNotificationsFor(bot) => state.open_notifications_for(bot, cx),
             Self::DismissToast => state.dismiss_toast(cx),
             Self::CopyNotice(id) => state.copy_notice(&id, cx),
+            Self::OpenFaultWindow(place) => state.open_fault_window(place, cx),
+            Self::CloseFaultWindow => state.close_fault_window(cx),
+            Self::PageFaultWindow(step) => state.page_fault_window(step, cx),
+            Self::CopyFaultWindow => state.copy_fault_window(cx),
+            Self::RevealFault(id) => state.reveal_fault(&id, cx),
             Self::CopyBotNotices => state.copy_bot_notices(cx),
             Self::ClearNotices(bot) => state.clear_notices(bot, cx),
             Self::MarkNoticesRead(bot) => state.mark_notices_read(bot, cx),
@@ -3730,6 +3740,17 @@ pub struct NativeChatHost {
     plan_fallback_busy: bool,
     /// `GET /models`' word on why its list is not fuller, which the popover's list shows.
     model_note: Option<String>,
+    /// The places with an unread fault, whose ⚠ badges are drawn (`crate::faults`).
+    open_faults: Vec<crate::faults::Place>,
+    /// The fault window, while open: its place, which page, how many, and the fault shown.
+    /// The place a notice's 🎯 has just ringed.
+    fault_focus: Option<crate::faults::Place>,
+    fault_shown: Option<(
+        crate::faults::Place,
+        usize,
+        usize,
+        crate::notifications::Notice,
+    )>,
     /// The Recipes page, when it fills the main slot: its rows, and the recipe open in it.
     recipes_open: bool,
     recipes_filter: &'static str,
@@ -4099,6 +4120,14 @@ impl NativeChatHost {
                 .map(str::to_string),
             plan_fallback_busy: state.picker_busy(PickerFor::PlanFallback),
             model_note: state.model_catalogue.note.clone(),
+            fault_focus: state.fault_focus,
+            fault_shown: state
+                .fault_in_window()
+                .map(|(place, at, count, notice)| (place, at, count, notice.clone())),
+            open_faults: crate::faults::Place::ALL
+                .into_iter()
+                .filter(|place| state.open_fault(*place).is_some())
+                .collect(),
             computer_status: if state.computer_endpoint_missing {
                 "endpoint missing".to_string()
             } else {
@@ -4654,6 +4683,9 @@ impl NativeChatHost {
             }
             if let Some(toast) = self.toast_node() {
                 page = page.with_child(toast);
+            }
+            for node in self.fault_nodes() {
+                page = page.with_child(node);
             }
             if let Some(bot) = self.sessions.iter().find(|session| session.active) {
                 let mut chip = UiNode::button(ids::HEADER_COWORKER, bot.title.clone());
@@ -7378,8 +7410,16 @@ impl NativeChatHost {
             if let Some(line) = &pick.routines {
                 list = list.with_child(UiNode::status(ids.routines, line.clone()));
             }
+            // As the list draws it: a note written for a person is a line, and an unreachable
+            // gateway is only the heading's ⚠.
             if let Some(note) = &self.model_note {
-                list = list.with_child(UiNode::status(ids.note, note.clone()));
+                let (said, raw) = model_picker::catalogue_note_parts(note);
+                if raw.is_none() {
+                    list = list.with_child(UiNode::status(ids.note, said));
+                }
+            }
+            if self.open_faults.contains(&crate::faults::Place::Models) {
+                list = list.with_child(self.fault_badge_node(crate::faults::Place::Models));
             }
         }
         pop = pop.with_child(list);
@@ -7387,6 +7427,15 @@ impl NativeChatHost {
             pop = pop.with_child(UiNode::status(ids.error, note.clone()));
         }
         Some(trigger.with_child(pop))
+    }
+
+    /// A place's ⚠ badge: a button whose click opens the fault window.
+    fn fault_badge_node(&self, place: crate::faults::Place) -> UiNode {
+        UiNode::new(
+            place.badge_id(),
+            "button",
+            format!("{} failed · click for details", place.label()),
+        )
     }
 
     /// One computer's card as the window draws it: `settings-computer-{id}` (named by the
@@ -8743,7 +8792,9 @@ impl NativeChatHost {
     }
 
     fn click(&mut self, target: &str) -> Result<DispatchResult, String> {
-        let cmd = if let Some(cmd) = self.monitor_command(target) {
+        let cmd = if let Some(cmd) = self.fault_command(target) {
+            cmd?
+        } else if let Some(cmd) = self.monitor_command(target) {
             cmd?
         } else if target == ids::COMPUTER_RECIPES {
             if !self.computer_open || !self.computer_overview {
@@ -9794,7 +9845,14 @@ impl NativeChatHost {
                     UiNode::checkbox(pane::select_id(&n.id), "Select")
                         .with_checked(self.notice_selection.contains(&n.id)),
                 )
-                .with_child(UiNode::button(pane::copy_id(&n.id), "Copy"))
+                .with_child(UiNode::button(pane::copy_id(&n.id), "Copy"));
+            if let Some(fault) = &n.fault {
+                node = node.with_child(
+                    UiNode::button(pane::go_to_id(&n.id), "Show where it happened")
+                        .with_value(fault.place.word()),
+                );
+            }
+            node = node
                 .with_child(UiNode::button(
                     pane::read_toggle_id(&n.id),
                     if n.read { "Mark unread" } else { "Mark read" },
@@ -9802,6 +9860,103 @@ impl NativeChatHost {
                 .with_child(UiNode::button(pane::delete_id(&n.id), "Delete"));
         }
         node
+    }
+
+    /// The ⚠ badge of every place with an unread fault, and the fault window while it is open:
+    /// its facts, and its text as the box's value.
+    fn fault_nodes(&self) -> Vec<UiNode> {
+        use crate::components::faults as window;
+        let mut nodes: Vec<UiNode> = self
+            .open_faults
+            .iter()
+            .map(|place| self.fault_badge_node(*place))
+            .collect();
+        if let Some(place) = self.fault_focus {
+            nodes.push(UiNode::status("fault-focus", "Ringed").with_value(place.word()));
+        }
+        if let Some((place, at, count, notice)) = &self.fault_shown {
+            let fault = notice.fault.clone();
+            let mut node = UiNode::new(
+                window::WINDOW_ID,
+                "dialog",
+                format!("{} failed", place.label()),
+            )
+            .with_value(format!("{} of {count}", at + 1));
+            let facts = [
+                (
+                    "fault-bot",
+                    "Bot",
+                    notice.bot.clone().unwrap_or_else(|| "—".into()),
+                ),
+                (
+                    "fault-request",
+                    "Request",
+                    fault
+                        .as_ref()
+                        .and_then(|f| f.endpoint.clone())
+                        .unwrap_or_else(|| "—".into()),
+                ),
+                (
+                    "fault-status",
+                    "Status",
+                    fault
+                        .as_ref()
+                        .and_then(|f| f.status)
+                        .map_or_else(|| "—".into(), |status| status.to_string()),
+                ),
+                ("fault-raised-at", "Raised at", notice.code.clone()),
+                (
+                    "fault-count",
+                    "Times",
+                    fault.as_ref().map_or(1, |f| f.count).to_string(),
+                ),
+            ];
+            for (id, name, value) in facts {
+                node = node.with_child(UiNode::status(id, name).with_value(value));
+            }
+            node = node
+                .with_child(
+                    UiNode::status(window::RAW_ID, "What went wrong")
+                        .with_value(notice.raw.clone().unwrap_or_default()),
+                )
+                .with_child(UiNode::button(window::NEWER_ID, "Newer"))
+                .with_child(UiNode::button(window::OLDER_ID, "Older"))
+                .with_child(UiNode::button(window::COPY_ID, "Copy all"))
+                .with_child(UiNode::button(window::READ_ID, "Mark read"))
+                .with_child(UiNode::button(window::CLOSE_ID, "Close"));
+            nodes.push(node);
+        }
+        nodes
+    }
+
+    /// A click on a ⚠ badge or on the fault window's buttons.
+    fn fault_command(&self, target: &str) -> Option<Result<Command, String>> {
+        use crate::components::faults as window;
+        if let Some(place) = self
+            .open_faults
+            .iter()
+            .find(|place| place.badge_id() == target)
+        {
+            return Some(Ok(Command::OpenFaultWindow(*place)));
+        }
+        let shown = self.fault_shown.as_ref();
+        let command = match target {
+            t if t == window::CLOSE_ID => Command::CloseFaultWindow,
+            t if t == window::NEWER_ID => Command::PageFaultWindow(-1),
+            t if t == window::OLDER_ID => Command::PageFaultWindow(1),
+            t if t == window::COPY_ID => Command::CopyFaultWindow,
+            t if t == window::READ_ID => {
+                let id = shown.map(|(_, _, _, notice)| notice.id.clone())?;
+                Command::SetNoticesRead(vec![id], true)
+            }
+            _ => return None,
+        };
+        if shown.is_none() {
+            return Some(Err(format!(
+                "`{target}` is in the fault window, which is closed"
+            )));
+        }
+        Some(Ok(command))
     }
 
     /// The toast, while one shows.
@@ -9895,6 +10050,7 @@ impl NativeChatHost {
                         pane::row_id(&n.id),
                         pane::select_id(&n.id),
                         pane::copy_id(&n.id),
+                        pane::go_to_id(&n.id),
                         pane::read_toggle_id(&n.id),
                         pane::delete_id(&n.id),
                     ]
@@ -9907,6 +10063,8 @@ impl NativeChatHost {
                     Command::SelectNotice(id)
                 } else if target == pane::copy_id(&id) {
                     Command::CopyNotice(id)
+                } else if target == pane::go_to_id(&id) {
+                    Command::RevealFault(id)
                 } else if target == pane::read_toggle_id(&id) {
                     Command::SetNoticesRead(vec![id], !n.read)
                 } else {
@@ -18206,6 +18364,8 @@ mod tests {
             |_| vec!["gpt-6-luna".to_string()],
         ));
         host.model_note = catalogue.note.clone();
+        // The state raises an unreachable gateway as a Models fault; the list draws its ⚠.
+        host.open_faults = vec![crate::faults::Place::Models];
         host.agent_settings_open = true;
         host.model_picker.open = true;
         let tree = host.snapshot();
@@ -18228,9 +18388,11 @@ mod tests {
                 "agent-model-plan",
                 "agent-model-group-gateway",
                 "agent-model-row-gateway-oag/cheap",
-                "agent-model-note"
+                "fault-models"
             ]
         );
+        // An unreachable gateway is only the ⚠: no line about it in the list.
+        assert!(tree.find("agent-model-note").is_none());
         assert_eq!(
             tree.find("agent-model-plan").map(|node| node.name.as_str()),
             Some("GPT-5 Codex")

@@ -18,6 +18,7 @@ pub mod connections;
 pub mod default_models;
 pub(crate) mod effort_slider;
 pub mod emoji_picker;
+pub mod faults;
 pub mod fields;
 pub mod gen_ui;
 pub mod hidden_bots;

@@ -27,6 +27,25 @@ pub struct Notice {
     pub run_id: Option<String>,
     /// Seen in the list: the bell counts the rest.
     pub read: bool,
+    /// Set when this is a fault: a read that failed at one place, whose badge it drives
+    /// (`crate::faults`). `None` for a notice that is not one.
+    pub fault: Option<FaultFacts>,
+}
+
+/// What a fault keeps beside the notice: where it shows, the request it answered, and how often
+/// it has happened.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FaultFacts {
+    pub place: crate::faults::Place,
+    /// `GET /coworkers/cw_1/usage?window=month`, where known.
+    pub endpoint: Option<String>,
+    pub status: Option<u16>,
+    /// How many times the same failure has come back since it was first seen (`at_ms`).
+    pub count: u32,
+    /// When it last came back.
+    pub last_ms: i64,
+    /// A read at the place worked after it: it went away on its own.
+    pub resolved: bool,
 }
 
 impl Notice {
@@ -46,7 +65,15 @@ impl Notice {
             raw: None,
             run_id: None,
             read: false,
+            fault: None,
         }
+    }
+
+    /// When it was last seen: a fault's latest return, else when it was kept.
+    pub fn last_ms(&self) -> i64 {
+        self.fault
+            .as_ref()
+            .map_or(self.at_ms, |fault| fault.last_ms)
     }
 
     /// The block Copy puts on the clipboard: everything there is to trace it by, as plain text.
@@ -73,6 +100,15 @@ impl Notice {
         if let Some(run) = &self.run_id {
             out.push_str(&format!("Run:    {run}\n"));
         }
+        if let Some(fault) = &self.fault {
+            if let Some(endpoint) = &fault.endpoint {
+                out.push_str(&format!("Request: {endpoint}\n"));
+            }
+            if let Some(status) = fault.status {
+                out.push_str(&format!("Status: {status}\n"));
+            }
+            out.push_str(&format!("Times:  {}\n", fault.count));
+        }
         out
     }
 
@@ -89,6 +125,14 @@ impl Notice {
             "raw": self.raw,
             "runId": self.run_id,
             "read": self.read,
+            "fault": self.fault.as_ref().map(|fault| serde_json::json!({
+                "place": fault.place.word(),
+                "endpoint": fault.endpoint,
+                "status": fault.status,
+                "count": fault.count,
+                "lastMs": fault.last_ms,
+                "resolved": fault.resolved,
+            })),
         })
     }
 }
@@ -100,8 +144,9 @@ const KEPT_LIMIT: usize = 2000;
 /// Keep one entry.
 pub async fn save(pool: &DbPool, notice: &Notice) -> Result<(), sqlx::Error> {
     sqlx::query(
-        "INSERT OR REPLACE INTO notifications (id, at_ms, bot_id, place, code, said, raw, run_id, read) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT OR REPLACE INTO notifications (id, at_ms, bot_id, place, code, said, raw, run_id, \
+         read, fault_place, endpoint, status, count, last_ms, resolved) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&notice.id)
     .bind(notice.at_ms)
@@ -112,6 +157,27 @@ pub async fn save(pool: &DbPool, notice: &Notice) -> Result<(), sqlx::Error> {
     .bind(&notice.raw)
     .bind(&notice.run_id)
     .bind(notice.read)
+    .bind(notice.fault.as_ref().map(|fault| fault.place.word()))
+    .bind(
+        notice
+            .fault
+            .as_ref()
+            .and_then(|fault| fault.endpoint.clone()),
+    )
+    .bind(
+        notice
+            .fault
+            .as_ref()
+            .and_then(|fault| fault.status.map(i64::from)),
+    )
+    .bind(
+        notice
+            .fault
+            .as_ref()
+            .map_or(1, |fault| i64::from(fault.count)),
+    )
+    .bind(notice.fault.as_ref().map(|fault| fault.last_ms))
+    .bind(notice.fault.as_ref().is_some_and(|fault| fault.resolved))
     .execute(pool)
     .await?;
     // A Mac that never clears must not grow the table forever: only the newest are kept,
@@ -129,7 +195,8 @@ pub async fn save(pool: &DbPool, notice: &Notice) -> Result<(), sqlx::Error> {
 /// Every entry kept, newest first.
 pub async fn load(pool: &DbPool) -> Result<Vec<Notice>, sqlx::Error> {
     let rows = sqlx::query(
-        "SELECT id, at_ms, bot_id, place, code, said, raw, run_id, read FROM notifications \
+        "SELECT id, at_ms, bot_id, place, code, said, raw, run_id, read, fault_place, endpoint, \
+         status, count, last_ms, resolved FROM notifications \
          ORDER BY at_ms DESC LIMIT ?",
     )
     .bind(KEPT_LIMIT as i64)
@@ -147,9 +214,31 @@ pub async fn load(pool: &DbPool) -> Result<Vec<Notice>, sqlx::Error> {
                 raw: row.try_get("raw")?,
                 run_id: row.try_get("run_id")?,
                 read: row.try_get("read")?,
+                fault: fault_of(row)?,
             })
         })
         .collect()
+}
+
+/// A row's fault, when its place is one this app knows. A place word from a newer app reads as
+/// no fault rather than failing the whole list.
+fn fault_of(row: &sqlx::sqlite::SqliteRow) -> Result<Option<FaultFacts>, sqlx::Error> {
+    let place: Option<String> = row.try_get("fault_place")?;
+    let Some(place) = place.as_deref().and_then(crate::faults::Place::from_word) else {
+        return Ok(None);
+    };
+    let status: Option<i64> = row.try_get("status")?;
+    let count: i64 = row.try_get("count")?;
+    let last_ms: Option<i64> = row.try_get("last_ms")?;
+    let at_ms: i64 = row.try_get("at_ms")?;
+    Ok(Some(FaultFacts {
+        place,
+        endpoint: row.try_get("endpoint")?,
+        status: status.and_then(|status| u16::try_from(status).ok()),
+        count: u32::try_from(count).unwrap_or(1),
+        last_ms: last_ms.unwrap_or(at_ms),
+        resolved: row.try_get("resolved")?,
+    }))
 }
 
 /// Mark every entry of one Bot (or every entry, with `None`) as seen.

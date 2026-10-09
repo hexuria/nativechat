@@ -105,6 +105,7 @@ impl Render for UsageModalView {
         let theme = cx.theme().clone();
         let muted = theme.muted_foreground;
         let body = usage_body(&modal.report);
+        let badge = crate::components::faults::badge(crate::faults::Place::Usage, &self.state, cx);
         let close = {
             let app = self.state.clone();
             move |cx: &mut App| app.update(cx, |state, cx| state.close_usage_modal(cx))
@@ -233,6 +234,9 @@ impl Render for UsageModalView {
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .child(TITLE),
                             )
+                            .child(div().flex_1())
+                            // A failed read is this ⚠ and nothing else in the modal.
+                            .children(badge)
                             .child(
                                 div()
                                     .id(CLOSE)

@@ -410,6 +410,11 @@ impl Render for AgentSettings {
         let usage_line = usage
             .as_ref()
             .map_or_else(|| "Asking the server…".to_string(), usage_summary);
+        // The ⚠ on the card's title row while its last read failed; the line keeps the last good
+        // numbers, or "—", and never the failure's words.
+        let usage_badge =
+            crate::components::faults::badge(crate::faults::Place::Usage, &self.state, cx);
+        let usage_focused = self.state.read(cx).is_focused(crate::faults::Place::Usage);
         // Only a list of models has anything to show: the modal's rows.
         let usage_has_rows = matches!(usage.as_ref().map(usage_body), Some(UsageBody::Rows { .. }));
         let auto_review_mode = self.auto_review_mode;
@@ -630,6 +635,9 @@ impl Render for AgentSettings {
                                             .rounded(px(10.))
                                             .border_1()
                                             .border_color(theme.border)
+                                            .map(|card| {
+                                                crate::components::faults::ring(card, usage_focused)
+                                            })
                                             .child(
                                                 div()
                                                     .flex()
@@ -650,6 +658,8 @@ impl Render for AgentSettings {
                                                                     .child(usage_line),
                                                             ),
                                                     )
+                                                    .child(div().flex_1())
+                                                    .children(usage_badge)
                                                     .when(usage_has_rows, |this| {
                                                         this.child(
                                                             div()
@@ -1022,7 +1032,7 @@ pub(crate) fn used_models(
 pub(crate) fn usage_body(report: &UsageReport) -> UsageBody {
     match report {
         UsageReport::Loading => UsageBody::Asking,
-        UsageReport::Unavailable(why) => UsageBody::Said(why.clone()),
+        UsageReport::Unavailable(why) => UsageBody::Said(why.said.clone()),
         // A note means the numbers are not a measurement: the bot is not metered, or it is and
         // the gateway could not be asked, which the server answers with zero totals. Either way
         // the note is what is said, never "No requests". The note is a clause ("this coworker has
@@ -1163,7 +1173,7 @@ fn dollars(six: &str) -> Option<String> {
 pub(crate) fn tools_summary(list: &ToolList) -> String {
     match list {
         ToolList::Loading => "Asking the server…".to_string(),
-        ToolList::Unavailable(why) => why.clone(),
+        ToolList::Unavailable(why) => why.said.clone(),
         ToolList::Listed(all) if all.is_empty() => "Offered no tools on its next turn.".to_string(),
         ToolList::Listed(all) => {
             let built_in = all.iter().filter(|tool| tool.is_builtin()).count();
@@ -1721,6 +1731,8 @@ pub fn skills_card(
     let line = skills
         .as_ref()
         .map(|card| skills_summary(&card.skills, card.pending.as_ref()))?;
+    // A read that failed is this ⚠ and nothing else on the card.
+    let skills_badge = crate::components::faults::badge(crate::faults::Place::BotSkills, &app, cx);
     let muted = theme.muted_foreground;
     let danger = theme.danger;
     let (skill_rows, skill_lines) = skills
@@ -1739,6 +1751,12 @@ pub fn skills_card(
             .rounded(px(10.))
             .border_1()
             .border_color(theme.border)
+            .map(|card| {
+                crate::components::faults::ring(
+                    card,
+                    state.is_focused(crate::faults::Place::BotSkills),
+                )
+            })
             .child(
                 div()
                     .flex()
@@ -1752,6 +1770,8 @@ pub fn skills_card(
                             .child(div().text_sm().child("Skills"))
                             .child(div().text_xs().text_color(muted).child(line)),
                     )
+                    .child(div().flex_1())
+                    .children(skills_badge)
                     .when(has_skill_rows, |this| {
                         this.child(
                             div()

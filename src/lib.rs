@@ -10,6 +10,7 @@ pub mod cron_next;
 pub mod cron_spec;
 pub mod db;
 pub mod error;
+pub mod faults;
 pub mod find_text;
 pub mod icons;
 pub mod notifications;

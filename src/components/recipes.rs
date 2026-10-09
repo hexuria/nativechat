@@ -959,6 +959,12 @@ impl RecipesView {
     fn list(&self, window: &Window, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let app = self.state.clone();
         let view = cx.entity();
+        let recipes_badge =
+            crate::components::faults::badge(crate::faults::Place::Recipes, &self.state, cx);
+        let recipes_focused = self
+            .state
+            .read(cx)
+            .is_focused(crate::faults::Place::Recipes);
         let (filter, recipes, loading, error, me, last_runs, page_width) = {
             let state = self.state.read(cx);
             (
@@ -1011,6 +1017,8 @@ impl RecipesView {
                             h_flex()
                                 .id("recipes-filters")
                                 .w_full()
+                                .rounded(px(8.))
+                                .map(|row| crate::components::faults::ring(row, recipes_focused))
                                 .max_w(px(COLUMN_MAX))
                                 .gap(px(8.))
                                 // Three chips in a narrow window take a second line rather
@@ -1020,7 +1028,10 @@ impl RecipesView {
                                     RecipeFilter::ALL
                                         .into_iter()
                                         .map(|chip| filter_chip(chip, filter, app.clone())),
-                                ),
+                                )
+                                // A list read that failed is this ⚠ at the bar's far side.
+                                .child(div().flex_1())
+                                .children(recipes_badge),
                         )
                         .id("recipes-filter-bar")
                         .flex_shrink_0()
@@ -1068,6 +1079,8 @@ impl RecipesView {
     fn detail(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let app = self.state.clone();
         let view = cx.entity();
+        let recipe_badge =
+            crate::components::faults::badge(crate::faults::Place::Recipe, &self.state, cx);
         let (detail, loading, busy, error, run, me) = {
             let state = self.state.read(cx);
             (
@@ -1106,6 +1119,10 @@ impl RecipesView {
                                             .text_color(theme.danger)
                                             .child(error),
                                     )
+                                })
+                                // A read or a run that failed is this ⚠, and no line about it.
+                                .when_some(recipe_badge, |this, badge| {
+                                    this.child(h_flex().w_full().child(div().flex_1()).child(badge))
                                 })
                                 .when_some(detail, |this, detail| {
                                     this.children(self.sections(

@@ -617,6 +617,8 @@ impl Render for RootView {
             .when(monitor_modal_open, |this| {
                 this.child(self.monitor_modal.clone())
             })
+            // A ⚠ that was clicked: the fault window, over every modal it can be opened from.
+            .children(crate::components::faults::window(&self.state, cx))
             // Something just went wrong: the toast, over the window's corner (8 Oct 2026).
             .children(crate::components::notifications_pane::toast(
                 self.state.clone(),

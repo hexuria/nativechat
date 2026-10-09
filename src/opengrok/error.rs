@@ -79,6 +79,12 @@ pub struct OpenGrokError {
     by_opengrok: bool,
     /// The answer had nothing in its body: see [`Self::said_nothing`].
     said_nothing: bool,
+    /// The request this answered, `GET /coworkers/cw_1/usage?window=month`: see
+    /// [`Self::endpoint`].
+    endpoint: Option<String>,
+    /// Every cause under the message, one per line, for a failure that had any: see
+    /// [`Self::detail`].
+    chain: Option<String>,
 }
 
 impl OpenGrokError {
@@ -92,6 +98,8 @@ impl OpenGrokError {
             code: None,
             by_opengrok: false,
             said_nothing: false,
+            endpoint: None,
+            chain: None,
         }
     }
 
@@ -105,6 +113,8 @@ impl OpenGrokError {
             code: None,
             by_opengrok: false,
             said_nothing: false,
+            endpoint: None,
+            chain: None,
         }
     }
 
@@ -124,6 +134,8 @@ impl OpenGrokError {
             code: None,
             by_opengrok: false,
             said_nothing: false,
+            endpoint: None,
+            chain: None,
         }
     }
 
@@ -136,6 +148,13 @@ impl OpenGrokError {
     pub fn transport(error: &reqwest::Error) -> Self {
         let out_of_reach =
             error.is_connect() || error.is_timeout() || error.is_request() || error.is_body();
+        let mut causes = Vec::new();
+        let mut source = std::error::Error::source(error);
+        while let Some(cause) = source {
+            causes.push(format!("    {}: {cause}", causes.len()));
+            source = cause.source();
+        }
+        let chain = (!causes.is_empty()).then(|| causes.join("\n"));
         Self {
             status: None,
             message: error.to_string(),
@@ -149,6 +168,8 @@ impl OpenGrokError {
             code: None,
             by_opengrok: false,
             said_nothing: false,
+            endpoint: None,
+            chain,
         }
     }
 
@@ -177,6 +198,8 @@ impl OpenGrokError {
             code: None,
             by_opengrok: false,
             said_nothing: false,
+            endpoint: None,
+            chain: None,
         }
     }
 
@@ -202,6 +225,8 @@ impl OpenGrokError {
             code: None,
             by_opengrok: true,
             said_nothing: false,
+            endpoint: None,
+            chain: None,
         }
     }
 
@@ -253,6 +278,29 @@ impl OpenGrokError {
     /// server answered instead, because "request failed" tells nobody anything.
     pub fn said_nothing(&self) -> bool {
         self.said_nothing
+    }
+
+    /// The request this failure answered, method and path with its query, where the client
+    /// knew it: what the fault window names as the endpoint. Never a body, a header or a key.
+    pub fn endpoint(&self) -> Option<&str> {
+        self.endpoint.as_deref()
+    }
+
+    pub(crate) fn with_endpoint(mut self, endpoint: Option<String>) -> Self {
+        if self.endpoint.is_none() {
+            self.endpoint = endpoint;
+        }
+        self
+    }
+
+    /// Everything known about what went wrong, for the fault window: the message and, for a
+    /// transport failure, each cause under it ("tcp connect error", "Connection refused (os
+    /// error 61)"), which `to_string` leaves out.
+    pub fn detail(&self) -> String {
+        match &self.chain {
+            Some(chain) => format!("{}\n\nCaused by:\n{chain}", self.message),
+            None => self.message.clone(),
+        }
     }
 
     pub(super) fn with_said_nothing(mut self, said_nothing: bool) -> Self {

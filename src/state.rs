@@ -64,8 +64,8 @@ use std::time::{Duration, Instant, SystemTime};
 pub enum UsageReport {
     Loading,
     Read(crate::opengrok::CoworkerUsage),
-    /// The server would not say, in its words or the app's.
-    Unavailable(String),
+    /// The server would not say, in its words or the app's, with what went wrong behind a badge.
+    Unavailable(Trouble),
 }
 
 /// The Usage modal, open over the window: the Bot it is about, the window its chip names, and
@@ -82,8 +82,9 @@ pub struct UsageModal {
 pub enum ToolList {
     Loading,
     Listed(Vec<crate::opengrok::CoworkerTool>),
-    /// The server would not list them, in its words or the app's.
-    Unavailable(String),
+    /// The server would not list them, in its words or the app's, with what went wrong behind a
+    /// badge.
+    Unavailable(Trouble),
 }
 
 /// The person's connections, as far as Settings → Connections and a Bot's Connections card know
@@ -2230,23 +2231,105 @@ fn carries_choice_card(message: &Message) -> bool {
         .any(|part| matches!(part, ChatPart::Ui(crate::opengrok::UiSpec::Form(_))))
 }
 
+/// The places whose badges [`AppState::troubles`] keeps: a Bot's usage (its card and the Usage
+/// modal) and its tools.
+pub(crate) const USAGE_TROUBLE: crate::faults::Place = crate::faults::Place::Usage;
+pub(crate) const TOOLS_TROUBLE: crate::faults::Place = crate::faults::Place::Tools;
+/// The Recipes and Skills pages' places, one per line that says a failure.
+pub(crate) const BOT_SKILLS_TROUBLE: crate::faults::Place = crate::faults::Place::BotSkills;
+pub(crate) const LOGINS_TROUBLE: crate::faults::Place = crate::faults::Place::Logins;
+pub(crate) const RECIPES_TROUBLE: crate::faults::Place = crate::faults::Place::Recipes;
+pub(crate) const RECIPE_TROUBLE: crate::faults::Place = crate::faults::Place::Recipe;
+pub(crate) const SKILLS_TROUBLE: crate::faults::Place = crate::faults::Place::Skills;
+pub(crate) const YOUR_SKILLS_TROUBLE: crate::faults::Place = crate::faults::Place::Skills;
+pub(crate) const SKILL_TROUBLE: crate::faults::Place = crate::faults::Place::Skill;
+
+/// A failed read as a pane says it, and what went wrong, which only the ⚠ badge shows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Trouble {
+    pub said: String,
+    pub detail: Option<crate::faults::FaultInput>,
+}
+
+impl From<&str> for Trouble {
+    fn from(said: &str) -> Self {
+        Self::plain(said)
+    }
+}
+
+impl Trouble {
+    /// A failure said as `said`, with its own text behind the badge, unless it is words for a
+    /// person: a sentence OpenGrok wrote, or any refusal (a 4xx), which is a verdict on what was
+    /// asked ("no such recipe", "this bot is already playing a recipe") and is said as it is. A
+    /// server's failure, a transport error or an answer that could not be read is no verdict,
+    /// and is what the badge is for.
+    pub(crate) fn failed(said: &str, error: &OpenGrokError) -> Self {
+        let message = error.message.trim();
+        let refusal = matches!(error.status, Some(400..=499));
+        if (error.written_by_opengrok() || refusal) && !message.is_empty() {
+            return Self::plain(message);
+        }
+        Self {
+            said: said.to_string(),
+            detail: Some(crate::faults::FaultInput::from_error(error)),
+        }
+    }
+
+    /// `said`, with text no person was meant to read, a vault's or a file's, behind the badge.
+    pub(crate) fn behind(said: &str, detail: impl Into<String>) -> Self {
+        Self {
+            said: said.to_string(),
+            detail: Some(crate::faults::FaultInput::local(detail)),
+        }
+    }
+
+    /// Words the app or the server wrote for a person, with nothing behind them.
+    pub(crate) fn plain(said: impl Into<String>) -> Self {
+        Self {
+            said: said.into(),
+            detail: None,
+        }
+    }
+
+    /// A read of `what` that failed: a sentence OpenGrok wrote for a person is said as it is,
+    /// and anything else, a transport error or an upstream's answer, is "Could not load `what`."
+    /// with the failure's own text behind the badge.
+    pub(crate) fn reading(what: &str, error: &OpenGrokError) -> Self {
+        Self::failed(&format!("Could not load {what}."), error)
+    }
+}
+
+/// What a usage report becomes when a read fails. A refusal is said in its own words. A fault
+/// says nothing in the card, whose ⚠ badge is the whole of it: the numbers last read stay, or
+/// "—" where there were none, so a server that blinks does not empty the card.
+fn after_failed_read(held: Option<&UsageReport>, trouble: Trouble) -> UsageReport {
+    match (trouble.detail.is_some(), held) {
+        (true, Some(UsageReport::Read(usage))) => UsageReport::Read(usage.clone()),
+        (true, _) => UsageReport::Unavailable(Trouble::plain(NOTHING_READ)),
+        (false, _) => UsageReport::Unavailable(trouble),
+    }
+}
+
+/// What a card says where a read failed and nothing was ever read.
+pub(crate) const NOTHING_READ: &str = "—";
+
 /// Why the open bot's usage is not shown, in words for its settings.
-fn usage_unavailable(error: &OpenGrokError) -> String {
+fn usage_unavailable(error: &OpenGrokError) -> Trouble {
     match error.status {
-        Some(404) => "Only this bot's owner can see its usage.".to_string(),
-        Some(401) => "Sign in again to see this bot's usage.".to_string(),
-        _ => format!("Could not load this bot's usage: {}", error.message),
+        Some(404) => Trouble::plain("Only this bot's owner can see its usage."),
+        Some(401) => Trouble::plain("Sign in again to see this bot's usage."),
+        _ => Trouble::reading("this bot's usage", error),
     }
 }
 
 /// Why the open bot's tools are not listed, in words for its settings. A 404 is the server
 /// saying this person does not own the bot (a bot shared with the org answers it that way), and
 /// a server older than the route says the same; neither is a fault to report.
-fn tools_unavailable(error: &OpenGrokError) -> String {
+fn tools_unavailable(error: &OpenGrokError) -> Trouble {
     match error.status {
-        Some(404) => "Only this bot's owner can see its tools.".to_string(),
-        Some(401) => "Sign in again to see this bot's tools.".to_string(),
-        _ => format!("Could not load this bot's tools: {}", error.message),
+        Some(404) => Trouble::plain("Only this bot's owner can see its tools."),
+        Some(401) => Trouble::plain("Sign in again to see this bot's tools."),
+        _ => Trouble::reading("this bot's tools", error),
     }
 }
 
@@ -2480,9 +2563,16 @@ fn skills_unavailable(error: &OpenGrokError) -> String {
         Some(404) => SKILLS_NOT_ON_SERVER.to_string(),
         Some(401) => SIGN_IN_FOR_SKILLS.to_string(),
         Some(403) => error.message.clone(),
-        Some(_) => format!("Could not read this Bot's skills: {}", error.message),
+        Some(_) if error.written_by_opengrok() => {
+            format!("Could not read this Bot's skills: {}", error.message)
+        }
+        // Not a sentence OpenGrok wrote for a person: the card's ⚠ is all it says.
+        Some(_) => NOTHING_READ.to_string(),
     }
 }
+
+/// The Skills card's line when an answer no person was meant to read came back.
+pub(crate) const COULD_NOT_READ_BOT_SKILLS: &str = "Could not read this Bot's skills.";
 
 /// What the Skills card says after a switch that did not go as asked, and where it says it, by
 /// the rules [`ceiling_switch_note`] follows. A 422 that names the skill switched (`no skill
@@ -5418,6 +5508,12 @@ pub struct AppState {
     pub notice_expanded: Option<String>,
     pub notice_undo: Option<(u64, Vec<crate::notifications::Notice>, String)>,
     notice_undo_generation: u64,
+    /// The fault window, while it is open: which place's faults it pages through, and which of
+    /// them, newest first (`components::fault_window`).
+    pub fault_window: Option<(crate::faults::Place, usize)>,
+    /// The place a notice's 🎯 just took the person to, ringed for a moment so the eye finds it.
+    pub fault_focus: Option<crate::faults::Place>,
+    fault_focus_generation: u64,
     /// Each Bot's shared logins, by Bot, read with the check: a Bot's card offers these first
     /// and the rest under "Share with <Bot>" (8 Oct 2026).
     pub site_login_shares: HashMap<String, HashSet<String>>,
@@ -6295,6 +6391,9 @@ impl AppState {
             notice_expanded: None,
             notice_undo: None,
             notice_undo_generation: 0,
+            fault_window: None,
+            fault_focus: None,
+            fault_focus_generation: 0,
             site_login_shares: HashMap::new(),
             login_bots: None,
             own_computer_changing: None,
@@ -7831,7 +7930,28 @@ impl AppState {
         if result.is_ok() {
             self.models_read_at = Some(std::time::Instant::now());
         }
-        Some(result.map(|catalogue| apply_catalogue(&mut self.model_catalogue, catalogue)))
+        let taken = result.map(|catalogue| apply_catalogue(&mut self.model_catalogue, catalogue));
+        // A gateway the server could not reach is a fault on the list, its ⚠ on the list's
+        // heading; any other answer is the list as it is, and resolves one.
+        match &taken {
+            Ok(Some(note)) => {
+                if let (said, Some(raw)) =
+                    crate::components::model_picker::catalogue_note_parts(note)
+                {
+                    let input = crate::faults::FaultInput {
+                        raw,
+                        endpoint: Some("GET /models".to_string()),
+                        status: None,
+                    };
+                    self.raise_fault(crate::faults::Place::Models, &said, input);
+                } else {
+                    self.resolve_faults(crate::faults::Place::Models);
+                }
+            }
+            Ok(None) => self.resolve_faults(crate::faults::Place::Models),
+            Err(_) => {}
+        }
+        Some(taken)
     }
 
     /// Every failure the app hears about is sorted here, once, so that no call site has to guess.
@@ -7875,6 +7995,17 @@ impl AppState {
         if self.reachability.fail(what, detail) {
             cx.notify();
         }
+        // One fault for the whole spell out of reach, its text the latest failure's, behind the
+        // reconnect banner's ⚠; `came_back` resolves it.
+        let said = match what {
+            Unreachable::Server => "The server is not answering.",
+            Unreachable::Gateway => "The model gateway is not answering.",
+        };
+        self.raise_fault(
+            crate::faults::Place::Server,
+            said,
+            crate::faults::FaultInput::local(detail),
+        );
         self.start_reconnect(cx);
     }
 
@@ -7899,6 +8030,7 @@ impl AppState {
     /// asking for it asks for the catalogue too — so the model picker's list fills again without
     /// anybody going and looking at it.
     fn came_back(&mut self, cx: &mut Context<Self>) {
+        self.resolve_faults(crate::faults::Place::Server);
         self.reconnecting = false;
         self.reconnect_epoch += 1;
         if self.is_signed_in() {
@@ -7979,6 +8111,11 @@ impl AppState {
     /// The two lines the reconnecting indicator shows, or `None` while everything answers.
     pub fn reachability_indicator(&self) -> Option<(String, String)> {
         self.reachability.indicator()
+    }
+
+    /// What the reconnecting indicator's ⚠ badge holds: the failure's own words.
+    pub fn reachability_trouble(&self) -> Option<String> {
+        self.reachability.trouble()
     }
 
     /// Which machine the app cannot reach, if it is failing to reach one.
@@ -8092,7 +8229,9 @@ impl AppState {
                 .coworker_usage(&coworker_id, crate::opengrok::UsageWindow::Month)
                 .await;
             let _ = this.update(cx, |state, cx| {
-                if state.settle_coworker_usage(generation, coworker_id, result) {
+                let settled = state.settle_coworker_usage(generation, coworker_id, result);
+
+                if settled {
                     cx.notify();
                 }
             });
@@ -8115,8 +8254,20 @@ impl AppState {
             return false;
         }
         let report = match result {
-            Ok(usage) => UsageReport::Read(usage),
-            Err(error) => UsageReport::Unavailable(usage_unavailable(&error)),
+            Ok(usage) => {
+                self.clear_trouble(USAGE_TROUBLE);
+                UsageReport::Read(usage)
+            }
+            Err(error) => {
+                let trouble = usage_unavailable(&error);
+                self.keep_trouble(USAGE_TROUBLE, &trouble);
+                let held = self
+                    .coworker_usage
+                    .as_ref()
+                    .filter(|(owner, _)| *owner == coworker_id)
+                    .map(|(_, report)| report);
+                after_failed_read(held, trouble)
+            }
         };
         self.coworker_usage = Some((coworker_id, report));
         true
@@ -8152,8 +8303,26 @@ impl AppState {
                     return;
                 }
                 let list = match result {
-                    Ok(tools) => ToolList::Listed(tools),
-                    Err(error) => ToolList::Unavailable(tools_unavailable(&error)),
+                    Ok(tools) => {
+                        state.clear_trouble(TOOLS_TROUBLE);
+                        ToolList::Listed(tools)
+                    }
+                    Err(error) => {
+                        let trouble = tools_unavailable(&error);
+                        state.note_trouble(TOOLS_TROUBLE, &trouble, cx);
+                        // A fault keeps the tools last listed for this Bot, or says "—"; its
+                        // ⚠ is the whole of what is said about it.
+                        let held = state
+                            .coworker_tools
+                            .as_ref()
+                            .filter(|(owner, _)| *owner == coworker_id)
+                            .map(|(_, list)| list.clone());
+                        match (trouble.detail.is_some(), held) {
+                            (true, Some(ToolList::Listed(tools))) => ToolList::Listed(tools),
+                            (true, _) => ToolList::Unavailable(Trouble::plain(NOTHING_READ)),
+                            (false, _) => ToolList::Unavailable(trouble),
+                        }
+                    }
                 };
                 state.coworker_tools = Some((coworker_id, list));
                 cx.notify();
@@ -8460,7 +8629,9 @@ impl AppState {
         cx.spawn(async move |this, cx| {
             let result = client.coworker_skills(&coworker_id).await;
             let _ = this.update(cx, |state, cx| {
-                if state.settle_coworker_skills(generation, coworker_id, result) {
+                let settled = state.settle_coworker_skills(generation, coworker_id, result);
+
+                if settled {
                     cx.notify();
                 }
             });
@@ -8520,6 +8691,7 @@ impl AppState {
         }
         let skills = match result {
             Ok(skills) => {
+                self.clear_trouble(BOT_SKILLS_TROUBLE);
                 // A skill the server does not list is not attached.
                 let took = |skill_id: &str, attached: bool| {
                     skills
@@ -8541,7 +8713,14 @@ impl AppState {
                 }
                 BotSkills::Read(skills.into())
             }
-            Err(error) => BotSkills::Unavailable(skills_unavailable(&error)),
+            Err(error) => {
+                let said = skills_unavailable(&error);
+                if said == NOTHING_READ {
+                    let input = crate::faults::FaultInput::from_error(&error);
+                    self.raise_fault(BOT_SKILLS_TROUBLE, COULD_NOT_READ_BOT_SKILLS, input);
+                }
+                BotSkills::Unavailable(said)
+            }
         };
         self.coworker_skills = Some((coworker_id, skills));
         true
@@ -9073,7 +9252,9 @@ impl AppState {
         cx.spawn(async move |this, cx| {
             let result = client.coworker_usage(&coworker_id, window).await;
             let _ = this.update(cx, |state, cx| {
-                if state.settle_usage_modal(generation, coworker_id, window, result) {
+                let settled = state.settle_usage_modal(generation, coworker_id, window, result);
+
+                if settled {
                     cx.notify();
                 }
             });
@@ -9100,10 +9281,21 @@ impl AppState {
         {
             return false;
         }
-        modal.report = match result {
-            Ok(usage) => UsageReport::Read(usage),
-            Err(error) => UsageReport::Unavailable(usage_unavailable(&error)),
+        let report = match result {
+            Ok(usage) => {
+                self.clear_trouble(USAGE_TROUBLE);
+                UsageReport::Read(usage)
+            }
+            Err(error) => {
+                let trouble = usage_unavailable(&error);
+                self.keep_trouble(USAGE_TROUBLE, &trouble);
+                let held = self.usage_modal.as_ref().map(|modal| &modal.report);
+                after_failed_read(held, trouble)
+            }
         };
+        if let Some(modal) = self.usage_modal.as_mut() {
+            modal.report = report;
+        }
         true
     }
 
@@ -10918,6 +11110,272 @@ impl AppState {
         cx.notify();
     }
 
+    /// Keep `trouble` as a fault at `place` when it has a failure behind its words, and give back
+    /// the words. Words written for a person (a refusal) are no fault and leave the badge alone.
+    #[track_caller]
+    pub(crate) fn keep_trouble(
+        &mut self,
+        place: crate::faults::Place,
+        trouble: &Trouble,
+    ) -> String {
+        if let Some(input) = &trouble.detail {
+            self.raise_fault(place, &trouble.said, input.clone());
+        }
+        trouble.said.clone()
+    }
+
+    /// [`Self::keep_trouble`], redrawing.
+    #[track_caller]
+    pub(crate) fn note_trouble(
+        &mut self,
+        place: crate::faults::Place,
+        trouble: &Trouble,
+        cx: &mut Context<Self>,
+    ) -> String {
+        let said = self.keep_trouble(place, trouble);
+        cx.notify();
+        said
+    }
+
+    /// What a page's error line says after `trouble`: a refusal's own words, or nothing for a
+    /// fault, which is raised at `place` and shown only as the page title's ⚠.
+    #[track_caller]
+    pub(crate) fn shown_after(
+        &mut self,
+        place: crate::faults::Place,
+        trouble: &Trouble,
+    ) -> Option<String> {
+        match &trouble.detail {
+            Some(input) => {
+                self.raise_fault(place, &trouble.said, input.clone());
+                None
+            }
+            None => Some(trouble.said.clone()),
+        }
+    }
+
+    /// A read at `place` worked: its faults went away on their own.
+    pub(crate) fn clear_trouble(&mut self, place: crate::faults::Place) {
+        self.resolve_faults(place);
+    }
+
+    /// The Bot a fault at `place` belongs to: the open one for a Bot's own card, else none.
+    fn fault_bot(&self, place: crate::faults::Place) -> Option<String> {
+        place
+            .per_bot()
+            .then(|| self.active_coworker_id.clone())
+            .flatten()
+    }
+
+    /// Keep a failure at `place` as a fault notice, unread, raised at the caller's line. The same
+    /// failure again (same place, Bot, request and text) is the same notice, counted again and
+    /// unread again, so a read that fails every minute is one fault ×60.
+    #[track_caller]
+    pub(crate) fn raise_fault(
+        &mut self,
+        place: crate::faults::Place,
+        said: &str,
+        input: crate::faults::FaultInput,
+    ) {
+        let bot = self.fault_bot(place);
+        let now =
+            crate::notifications::Notice::new(None, "", "", std::panic::Location::caller()).at_ms;
+        // The server out of reach is one fault for as long as it lasts, whichever request found
+        // it out; anywhere else the same failure is the same place, Bot, request and text.
+        let one_spell = place == crate::faults::Place::Server;
+        let same = self.notices.iter_mut().find(|notice| {
+            notice.bot == bot
+                && (one_spell || notice.raw.as_deref() == Some(input.raw.as_str()))
+                && notice.fault.as_ref().is_some_and(|fault| {
+                    fault.place == place
+                        && !fault.resolved
+                        && (one_spell || fault.endpoint == input.endpoint)
+                })
+        });
+        let notice = match same {
+            Some(notice) => {
+                if let Some(fault) = notice.fault.as_mut() {
+                    fault.count += 1;
+                    fault.last_ms = now;
+                    fault.status = input.status;
+                }
+                notice.raw = Some(input.raw);
+                notice.read = false;
+                notice.clone()
+            }
+            None => {
+                let mut notice = crate::notifications::Notice::new(
+                    bot,
+                    place.label(),
+                    said,
+                    std::panic::Location::caller(),
+                );
+                notice.raw = Some(input.raw);
+                notice.fault = Some(crate::notifications::FaultFacts {
+                    place,
+                    endpoint: input.endpoint,
+                    status: input.status,
+                    count: 1,
+                    last_ms: now,
+                    resolved: false,
+                });
+                self.notices.insert(0, notice.clone());
+                self.notices.truncate(2000);
+                notice
+            }
+        };
+        self.persist_notice(notice);
+    }
+
+    /// Every open fault at `place` for the Bot it belongs to is resolved: read, and kept in the
+    /// notifications as having gone away on its own.
+    pub(crate) fn resolve_faults(&mut self, place: crate::faults::Place) {
+        let bot = self.fault_bot(place);
+        let mut changed = Vec::new();
+        for notice in &mut self.notices {
+            let Some(fault) = notice.fault.as_mut() else {
+                continue;
+            };
+            if fault.place == place && notice.bot == bot && !fault.resolved {
+                fault.resolved = true;
+                notice.read = true;
+                changed.push(notice.clone());
+            }
+        }
+        for notice in changed {
+            self.persist_notice(notice);
+        }
+    }
+
+    /// The unread faults at `place` for the Bot it belongs to, newest first: what the badge and
+    /// the fault window's pages are.
+    pub fn faults_at(&self, place: crate::faults::Place) -> Vec<&crate::notifications::Notice> {
+        let bot = self.fault_bot(place);
+        let mut open: Vec<_> = self
+            .notices
+            .iter()
+            .filter(|notice| {
+                !notice.read
+                    && notice.bot == bot
+                    && notice
+                        .fault
+                        .as_ref()
+                        .is_some_and(|fault| fault.place == place)
+            })
+            .collect();
+        open.sort_by_key(|notice| std::cmp::Reverse(notice.last_ms()));
+        open
+    }
+
+    /// The newest unread fault at `place`: the badge shows while there is one.
+    pub fn open_fault(&self, place: crate::faults::Place) -> Option<&crate::notifications::Notice> {
+        self.faults_at(place).into_iter().next()
+    }
+
+    /// A fault notice's 🎯: the Bot it belongs to, and the card or page it is on, opened as if
+    /// the person had gone there, and ringed for a moment.
+    pub fn reveal_fault(&mut self, notice_id: &str, cx: &mut Context<Self>) {
+        use crate::components::monitor_modal::MonitorKind;
+        use crate::faults::Place;
+        let Some(notice) = self.notices.iter().find(|n| n.id == notice_id) else {
+            return;
+        };
+        let Some(place) = notice.fault.as_ref().map(|fault| fault.place) else {
+            return;
+        };
+        if let Some(bot) = notice.bot.clone()
+            && self.active_coworker_id.as_deref() != Some(bot.as_str())
+        {
+            self.select_coworker(bot, cx);
+        }
+        match place {
+            Place::Usage | Place::BotSkills => self.set_right_pane(RightPane::Settings, cx),
+            Place::Models => {
+                self.set_right_pane(RightPane::Settings, cx);
+                self.set_picker_open(PickerFor::Bot, true, cx);
+            }
+            Place::Tools => self.open_monitor_modal(MonitorKind::Tools, cx),
+            Place::Skills | Place::Skill => self.open_monitor_modal(MonitorKind::Plugins, cx),
+            Place::Recipes | Place::Recipe => self.open_recipes(cx),
+            Place::Logins => self.open_app_settings(AppSettingsTab::Logins, cx),
+            Place::Server => {}
+        }
+        self.focus_place(place, cx);
+        self.record_nav();
+        cx.notify();
+    }
+
+    /// How long a place stays ringed after a 🎯.
+    const FOCUS_FOR: std::time::Duration = std::time::Duration::from_millis(2400);
+
+    /// Ring `place` for a moment: its card or page draws an amber border while it is the focus.
+    pub fn focus_place(&mut self, place: crate::faults::Place, cx: &mut Context<Self>) {
+        self.fault_focus = Some(place);
+        self.fault_focus_generation += 1;
+        let generation = self.fault_focus_generation;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(Self::FOCUS_FOR).await;
+            let _ = this.update(cx, |state, cx| {
+                if state.fault_focus_generation == generation {
+                    state.fault_focus = None;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// Whether `place` is ringed right now.
+    pub fn is_focused(&self, place: crate::faults::Place) -> bool {
+        self.fault_focus == Some(place)
+    }
+
+    /// Open the fault window on `place`'s newest fault.
+    pub fn open_fault_window(&mut self, place: crate::faults::Place, cx: &mut Context<Self>) {
+        self.fault_window = Some((place, 0));
+        cx.notify();
+    }
+
+    /// "Copy all": every fact of the fault the window shows, then its whole text.
+    pub fn copy_fault_window(&mut self, cx: &mut Context<Self>) {
+        if let Some((_, _, _, notice)) = self.fault_in_window() {
+            let text = crate::components::faults::copy_block(self, notice);
+            cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(text));
+        }
+    }
+
+    pub fn close_fault_window(&mut self, cx: &mut Context<Self>) {
+        self.fault_window = None;
+        cx.notify();
+    }
+
+    /// Page through the open faults: `step` is −1 (newer) or +1 (older).
+    pub fn page_fault_window(&mut self, step: isize, cx: &mut Context<Self>) {
+        if let Some((place, at)) = self.fault_window {
+            let count = self.faults_at(place).len();
+            let next = (at as isize + step).clamp(0, count.saturating_sub(1) as isize) as usize;
+            self.fault_window = Some((place, next));
+            cx.notify();
+        }
+    }
+
+    /// The fault the window shows, while it is open and the place still has one.
+    pub fn fault_in_window(
+        &self,
+    ) -> Option<(
+        crate::faults::Place,
+        usize,
+        usize,
+        &crate::notifications::Notice,
+    )> {
+        let (place, at) = self.fault_window?;
+        let open = self.faults_at(place);
+        let count = open.len();
+        let notice = open.get(at.min(count.saturating_sub(1))).copied()?;
+        Some((place, at.min(count - 1), count, notice))
+    }
+
     /// Something went wrong: kept in the Bot's notifications (on this Mac, until cleared) and
     /// shown in the toast. Where in the source it was caught is the caller's own file and line,
     /// so a notice can be traced back after the part of the app that raised it is gone.
@@ -11719,8 +12177,16 @@ impl AppState {
                 }
                 state.recipes_loading = false;
                 match result {
-                    Ok(recipes) => state.recipes = recipes,
-                    Err(error) => state.recipes_error = Some(error.message),
+                    Ok(recipes) => {
+                        state.clear_trouble(RECIPES_TROUBLE);
+                        state.recipes = recipes;
+                    }
+                    Err(error) => {
+                        state.recipes_error = state.shown_after(
+                            RECIPES_TROUBLE,
+                            &Trouble::failed("Could not load the recipes.", &error),
+                        )
+                    }
                 }
                 cx.notify();
             });
@@ -11761,8 +12227,16 @@ impl AppState {
                 state.recipe_loading = false;
                 state.recipe_detail_epoch += 1;
                 match result {
-                    Ok(detail) => state.set_open_recipe(detail, cx),
-                    Err(error) => state.recipe_error = Some(error.message),
+                    Ok(detail) => {
+                        state.clear_trouble(RECIPE_TROUBLE);
+                        state.set_open_recipe(detail, cx);
+                    }
+                    Err(error) => {
+                        state.recipe_error = state.shown_after(
+                            RECIPE_TROUBLE,
+                            &Trouble::failed("That did not go through.", &error),
+                        )
+                    }
                 }
                 cx.notify();
             });
@@ -11993,7 +12467,10 @@ impl AppState {
                 true
             }
             Err(error) => {
-                self.recipe_error = Some(error.message);
+                self.recipe_error = self.shown_after(
+                    RECIPE_TROUBLE,
+                    &Trouble::failed("That did not go through.", &error),
+                );
                 self.end_recipe_run(&id);
                 self.recipe_run_poll = None;
                 return false;
@@ -12066,7 +12543,12 @@ impl AppState {
                         state.set_open_recipe(detail, cx);
                         state.refresh_recipes(cx);
                     }
-                    Err(error) => state.recipe_error = Some(error.message),
+                    Err(error) => {
+                        state.recipe_error = state.shown_after(
+                            RECIPE_TROUBLE,
+                            &Trouble::failed("That did not go through.", &error),
+                        )
+                    }
                 }
                 cx.notify();
             });
@@ -12205,8 +12687,18 @@ impl AppState {
                         }
                         state.refresh_recipes(cx);
                     }
-                    Err(error) if open => state.recipe_error = Some(error.message),
-                    Err(error) => state.recipes_error = Some(error.message),
+                    Err(error) if open => {
+                        state.recipe_error = state.shown_after(
+                            RECIPE_TROUBLE,
+                            &Trouble::failed("That did not go through.", &error),
+                        )
+                    }
+                    Err(error) => {
+                        state.recipes_error = state.shown_after(
+                            RECIPES_TROUBLE,
+                            &Trouble::failed("Could not load the recipes.", &error),
+                        )
+                    }
                 }
                 cx.notify();
             });
@@ -12284,7 +12776,10 @@ impl AppState {
                 let unknown = error.status.is_none()
                     || error.unreachable().is_some()
                     || error.history_missed();
-                self.recipe_error = Some(error.message);
+                self.recipe_error = self.shown_after(
+                    RECIPE_TROUBLE,
+                    &Trouble::failed("That did not go through.", &error),
+                );
                 if unknown {
                     AfterRun::Reload
                 } else {
@@ -12337,7 +12832,12 @@ impl AppState {
                         state.close_recipe(cx);
                         state.refresh_recipes(cx);
                     }
-                    Err(error) => state.recipe_error = Some(error.message),
+                    Err(error) => {
+                        state.recipe_error = state.shown_after(
+                            RECIPE_TROUBLE,
+                            &Trouble::failed("That did not go through.", &error),
+                        )
+                    }
                 }
                 cx.notify();
             });
@@ -12465,6 +12965,7 @@ impl AppState {
         self.skills_loading = false;
         match (yours, discover) {
             (Ok(yours), Ok(discover)) => {
+                self.clear_trouble(SKILLS_TROUBLE);
                 self.skills_counts = SkillCounts {
                     yours: yours.len(),
                     discover: discover.len(),
@@ -12486,7 +12987,10 @@ impl AppState {
                 // current.
                 self.skills.clear();
                 self.skills_counts = SkillCounts::default();
-                self.skills_error = Some(error.message);
+                self.skills_error = self.shown_after(
+                    SKILLS_TROUBLE,
+                    &Trouble::failed("Could not load the skills.", &error),
+                );
             }
         }
         true
@@ -12550,7 +13054,12 @@ impl AppState {
             // listed a minute ago is as pickable as it was — the server is the authority on an
             // id either way. Emptying the list because a refresh failed would take away the one
             // thing the person opened `/` for.
-            Err(error) => self.your_skills_error = Some(error.message),
+            Err(error) => {
+                self.your_skills_error = self.shown_after(
+                    YOUR_SKILLS_TROUBLE,
+                    &Trouble::failed("Could not load your skills.", &error),
+                )
+            }
         }
         true
     }
@@ -12563,6 +13072,7 @@ impl AppState {
     fn take_your_skills(&mut self, rows: Vec<SkillSummary>) {
         self.your_skills_epoch += 1;
         self.your_skills = rows;
+        self.clear_trouble(YOUR_SKILLS_TROUBLE);
         self.your_skills_loading = false;
         self.your_skills_error = None;
         // Same as above: what this app has just done to a switch outlives a listing that was
@@ -12697,11 +13207,19 @@ impl AppState {
                     return;
                 }
                 match result {
-                    Ok(detail) => state.skill_open = Some(detail),
+                    Ok(detail) => {
+                        state.clear_trouble(SKILL_TROUBLE);
+                        state.skill_open = Some(detail);
+                    }
                     // On the pane, where the person is waiting for it. In the list's slot it
                     // would be a sentence about the library, and the pane would go on saying
                     // "Loading…" at something that is never going to arrive.
-                    Err(error) => state.skill_error = Some(error.message),
+                    Err(error) => {
+                        state.skill_error = state.shown_after(
+                            SKILL_TROUBLE,
+                            &Trouble::failed("Could not load this skill.", &error),
+                        )
+                    }
                 }
                 cx.notify();
             });
@@ -12978,7 +13496,12 @@ impl AppState {
                         state.refresh_skills(cx);
                         state.library_skill_changed(cx);
                     }
-                    Err(error) => state.skills_error = Some(error.message),
+                    Err(error) => {
+                        state.skills_error = state.shown_after(
+                            SKILLS_TROUBLE,
+                            &Trouble::failed("Could not load the skills.", &error),
+                        )
+                    }
                 }
                 cx.notify();
             });
@@ -19826,6 +20349,7 @@ impl AppState {
                         state.site_logins_with_code = with_code;
                         state.site_logins = rows;
                         state.site_login_error = None;
+                        state.clear_trouble(LOGINS_TROUBLE);
                         // Only a successful read makes the vault readable. A vault
                         // that failed to open must not read as empty: left false, the
                         // card offers nothing and the person types the login instead.
@@ -19838,7 +20362,13 @@ impl AppState {
                         }
                         state.fetch_site_login_icons(cx);
                     }
-                    Err(err) => state.site_login_error = Some(err.to_string()),
+                    Err(err) => {
+                        let trouble =
+                            Trouble::behind("Could not read your saved logins.", err.to_string());
+                        // A fault is the Logins title's ⚠, never a line on the page.
+                        state.note_trouble(LOGINS_TROUBLE, &trouble, cx);
+                        state.site_login_error = None;
+                    }
                 }
                 cx.notify();
             });
@@ -20594,10 +21124,16 @@ impl AppState {
                 match result {
                     Ok((_, notice)) => {
                         state.site_login_error = None;
+                        state.clear_trouble(LOGINS_TROUBLE);
                         state.site_login_notice = notice;
                         state.reload_site_logins(cx);
                     }
-                    Err(err) => state.site_login_error = Some(err),
+                    Err(err) => {
+                        let trouble = Trouble::behind("That did not go through.", err);
+                        // A fault is the Logins title's ⚠, never a line on the page.
+                        state.note_trouble(LOGINS_TROUBLE, &trouble, cx);
+                        state.site_login_error = None;
+                    }
                 }
                 cx.notify();
             });
@@ -20655,12 +21191,18 @@ impl AppState {
                 match result {
                     Ok((id, notice)) => {
                         state.site_login_error = None;
+                        state.clear_trouble(LOGINS_TROUBLE);
                         state.site_login_notice =
                             notice.or_else(|| Some(format!("Saved {username} on {origin}.")));
                         state.site_login_selected = Some(id);
                         state.reload_site_logins(cx);
                     }
-                    Err(err) => state.site_login_error = Some(err),
+                    Err(err) => {
+                        let trouble = Trouble::behind("That did not go through.", err);
+                        // A fault is the Logins title's ⚠, never a line on the page.
+                        state.note_trouble(LOGINS_TROUBLE, &trouble, cx);
+                        state.site_login_error = None;
+                    }
                 }
                 cx.notify();
             });
@@ -20699,7 +21241,10 @@ impl AppState {
                 Ok(read) => read,
                 Err(error) => {
                     let _ = this.update(cx, |state, cx| {
-                        state.site_login_error = Some(format!("Import failed: {error}"));
+                        let trouble = Trouble::behind("Import failed.", error.to_string());
+                        // A fault is the Logins title's ⚠, never a line on the page.
+                        state.note_trouble(LOGINS_TROUBLE, &trouble, cx);
+                        state.site_login_error = None;
                         cx.notify();
                     });
                     return;
@@ -20754,7 +21299,12 @@ impl AppState {
                 if let Some(first) = first_error {
                     errors.insert(0, first);
                 }
-                state.site_login_error = (!errors.is_empty()).then(|| errors.join("; "));
+                if !errors.is_empty() {
+                    let trouble =
+                        Trouble::behind("Some logins could not be imported.", errors.join("; "));
+                    state.note_trouble(LOGINS_TROUBLE, &trouble, cx);
+                }
+                state.site_login_error = None;
                 state.reload_site_logins(cx);
                 cx.notify();
             });
@@ -20825,9 +21375,15 @@ impl AppState {
                             state.site_login_selected = None;
                         }
                         state.site_login_error = None;
+                        state.clear_trouble(LOGINS_TROUBLE);
                         state.reload_site_logins(cx);
                     }
-                    Err(err) => state.site_login_error = Some(err),
+                    Err(err) => {
+                        let trouble = Trouble::behind("That did not go through.", err);
+                        // A fault is the Logins title's ⚠, never a line on the page.
+                        state.note_trouble(LOGINS_TROUBLE, &trouble, cx);
+                        state.site_login_error = None;
+                    }
                 }
                 cx.notify();
             });
@@ -20983,10 +21539,16 @@ impl AppState {
                 match result {
                     Ok(notice) => {
                         state.site_login_error = None;
+                        state.clear_trouble(LOGINS_TROUBLE);
                         state.site_login_notice = notice;
                         state.reload_site_logins(cx);
                     }
-                    Err(err) => state.site_login_error = Some(err),
+                    Err(err) => {
+                        let trouble = Trouble::behind("That did not go through.", err);
+                        // A fault is the Logins title's ⚠, never a line on the page.
+                        state.note_trouble(LOGINS_TROUBLE, &trouble, cx);
+                        state.site_login_error = None;
+                    }
                 }
                 cx.notify();
             });
@@ -25552,7 +26114,10 @@ mod tests {
             "rows left under a red line are rows somebody reads as current"
         );
         assert_eq!(state.skills_counts, super::SkillCounts::default());
-        assert_eq!(state.skills_error.as_deref(), Some("the gateway is down"));
+        // A fault is the page's ⚠, never a line: no words, the text behind the badge.
+        assert_eq!(state.skills_error, None);
+        let fault = state.open_fault(super::SKILLS_TROUBLE).expect("a fault");
+        assert_eq!(fault.raw.as_deref(), Some("the gateway is down"));
     }
 
     /// The rows on screen belong to the side that was open, so they go the moment it does —
@@ -36363,12 +36928,13 @@ mod tests {
             Day,
             Err(OpenGrokError::message("boom".to_string()))
         ));
-        assert_eq!(
-            state.usage_modal.as_ref().map(|modal| modal.report.clone()),
-            Some(super::UsageReport::Unavailable(
-                "Could not load this bot's usage: boom".into()
-            ))
-        );
+        // A fault keeps the numbers last read, and is the modal's ⚠ only.
+        assert!(matches!(
+            state.usage_modal.as_ref().map(|modal| &modal.report),
+            Some(super::UsageReport::Read(_))
+        ));
+        let fault = state.open_fault(super::USAGE_TROUBLE).expect("a fault");
+        assert_eq!(fault.raw.as_deref(), Some("boom"));
         state.usage_modal = None;
         assert!(
             !state.settle_usage_modal(5, "cw_1".into(), Day, answer("24h")),
@@ -39688,7 +40254,10 @@ mod tests {
         assert!(!state.take_polled_recipe(trouble));
         assert!(!waits_on(&state, "rcp_1"));
         assert_eq!(state.recipe_busy, None);
-        assert_eq!(state.recipe_error.as_deref(), Some("pool timed out"));
+        assert_eq!(state.recipe_error, None, "a fault is no line on the page");
+        let fault = state.open_fault(super::RECIPE_TROUBLE).expect("a fault");
+        assert_eq!(fault.raw.as_deref(), Some("pool timed out"));
+        assert_eq!(fault.fault.as_ref().and_then(|f| f.status), Some(500));
 
         for answer in [
             OpenGrokError::from_server(Some(404), "no such recipe"),
@@ -39967,7 +40536,15 @@ mod tests {
             let said = error.message.clone();
             let next = state.take_run_answer("rcp_1".into(), "cw_1".into(), Err(error));
             assert_eq!(next, super::AfterRun::Reload, "{said}");
-            assert_eq!(state.recipe_error.as_deref(), Some(said.as_str()));
+            // No line on the page; the answer's own text only behind the ⚠ badge.
+            assert_eq!(state.recipe_error, None, "{said}");
+            let behind = state
+                .open_fault(super::RECIPE_TROUBLE)
+                .and_then(|fault| fault.raw.clone());
+            assert!(
+                behind.is_some_and(|behind| behind.contains(&said)),
+                "{said}"
+            );
             assert_eq!(state.recipe_busy, None, "{said}");
         }
 
@@ -40118,25 +40695,109 @@ mod tests {
     }
 
     /// A bot the person does not own answers 404, and that is said as what it is, not as a
-    /// failure; anything else keeps the server's own words.
+    /// failure. Anything else says it could not load them, and the failure's own text is only
+    /// behind the ⚠ badge, never in the pane.
     #[test]
     fn a_tool_list_the_server_will_not_give_says_why() {
         let owner = crate::opengrok::OpenGrokError::status(404, "no such coworker");
         assert_eq!(
             super::tools_unavailable(&owner),
-            "Only this bot's owner can see its tools."
+            "Only this bot's owner can see its tools.".into()
         );
         assert_eq!(
             super::tools_unavailable(&crate::opengrok::OpenGrokError::status(
                 401,
                 "sign in first"
             )),
-            "Sign in again to see this bot's tools."
+            "Sign in again to see this bot's tools.".into()
         );
         let down = crate::opengrok::OpenGrokError::status(503, "busy");
         assert_eq!(
             super::tools_unavailable(&down),
-            "Could not load this bot's tools: busy"
+            super::Trouble {
+                said: "Could not load this bot's tools.".into(),
+                detail: Some(crate::faults::FaultInput {
+                    raw: "busy".into(),
+                    endpoint: None,
+                    status: Some(503),
+                }),
+            }
+        );
+    }
+
+    /// A failed read is one fault notice however often it fails the same way, counted; marking
+    /// it read hides the badge and unread brings it back; the newest of several shows first; a
+    /// read that works resolves them; words written for a person raise none.
+    #[test]
+    fn a_fault_is_a_notice_the_badge_reads() {
+        use crate::faults::{FaultInput, Place};
+        let mut state = AppState::new();
+        let down = |raw: &str| FaultInput {
+            raw: raw.into(),
+            endpoint: Some("GET /coworkers/cw_1/usage".into()),
+            status: Some(502),
+        };
+        state.raise_fault(Place::Usage, "Usage failed", down("error sending request"));
+        state.raise_fault(Place::Usage, "Usage failed", down("error sending request"));
+        let first = state.open_fault(Place::Usage).expect("a badge").clone();
+        assert_eq!(
+            first.fault.as_ref().map(|f| f.count),
+            Some(2),
+            "the same failure is one notice"
+        );
+        assert_eq!(state.notices.len(), 1);
+
+        state.notices[0].read = true;
+        assert!(
+            state.open_fault(Place::Usage).is_none(),
+            "read hides the badge"
+        );
+        state.notices[0].read = false;
+        assert!(
+            state.open_fault(Place::Usage).is_some(),
+            "unread brings it back"
+        );
+
+        state.raise_fault(Place::Usage, "Usage failed", down("pool timed out"));
+        let open = state.faults_at(Place::Usage);
+        assert_eq!(open.len(), 2);
+        assert_eq!(
+            open[0].raw.as_deref(),
+            Some("pool timed out"),
+            "newest first"
+        );
+        let newest = open[0].id.clone();
+        state
+            .notices
+            .iter_mut()
+            .find(|n| n.id == newest)
+            .unwrap()
+            .read = true;
+        assert_eq!(
+            state
+                .open_fault(Place::Usage)
+                .and_then(|n| n.raw.as_deref()),
+            Some("error sending request"),
+            "the next one shows once the newest is read"
+        );
+
+        state.clear_trouble(Place::Usage);
+        assert!(
+            state.open_fault(Place::Usage).is_none(),
+            "a read that works resolves them"
+        );
+        assert!(
+            state
+                .notices
+                .iter()
+                .all(|n| n.fault.as_ref().is_some_and(|f| f.resolved))
+        );
+
+        let plain = state.keep_trouble(Place::Usage, &"Sign in again.".into());
+        assert_eq!(plain, "Sign in again.");
+        assert!(
+            state.open_fault(Place::Usage).is_none(),
+            "a person's words raise no fault"
         );
     }
 

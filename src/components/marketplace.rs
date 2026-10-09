@@ -1251,7 +1251,7 @@ pub(crate) fn detail(state: &AppState, selection: &PluginSelection) -> Option<Ma
                         .collect::<Vec<_>>(),
                     None,
                 ),
-                Some((_, ToolList::Unavailable(why))) => (Vec::new(), Some(why.clone())),
+                Some((_, ToolList::Unavailable(why))) => (Vec::new(), Some(why.said.clone())),
                 _ => (Vec::new(), Some(connections::ASKING.to_string())),
             };
             let tools_status = tools_status.or_else(|| {
@@ -3263,7 +3263,26 @@ pub(crate) fn detail_view(
                 );
             }
         }
-        body = body.child(section_label("Tools", theme)).child(tools);
+        // A read of the tools that failed is the ⚠ at the label's far side, and no line.
+        let tools_label = h_flex()
+            .w_full()
+            .items_center()
+            .rounded(px(6.))
+            .map(|row| {
+                crate::components::faults::ring(row, state.is_focused(crate::faults::Place::Tools))
+            })
+            .child(section_label("Tools", theme))
+            .child(div().flex_1())
+            .when(
+                state.open_fault(crate::faults::Place::Tools).is_some(),
+                |row| {
+                    row.child(crate::components::faults::badge_element(
+                        crate::faults::Place::Tools,
+                        app.clone(),
+                    ))
+                },
+            );
+        body = body.child(tools_label).child(tools);
         if let Some((_, _, Some(note))) = model.bot_switch.clone() {
             let id = crate::components::monitor_modal::plugin_switch_note_id(
                 plugin.as_deref().unwrap_or_default(),
@@ -3325,6 +3344,27 @@ pub(crate) fn detail_view(
                     &bot,
                     theme,
                 )));
+        }
+        // A read of the tools that failed: the label with its ⚠, and no line about it.
+        if state.open_fault(crate::faults::Place::Tools).is_some() && model.tools.is_empty() {
+            body = body.child(
+                h_flex()
+                    .w_full()
+                    .items_center()
+                    .rounded(px(6.))
+                    .map(|row| {
+                        crate::components::faults::ring(
+                            row,
+                            state.is_focused(crate::faults::Place::Tools),
+                        )
+                    })
+                    .child(section_label("Tools", theme))
+                    .child(div().flex_1())
+                    .child(crate::components::faults::badge_element(
+                        crate::faults::Place::Tools,
+                        app.clone(),
+                    )),
+            );
         }
         if let Some(why) = model.tools_status.clone() {
             body = body.child(
@@ -3850,16 +3890,41 @@ fn skill_page(
         body = body.child(div().text_sm().text_color(theme.danger).child(note));
     }
     let Some(detail) = detail else {
-        let words = state
-            .skill_error
-            .clone()
-            .unwrap_or_else(|| "Loading…".to_string());
+        // A read that failed is "—" with the ⚠ beside it, and nothing about why.
+        let fault = state.open_fault(crate::faults::Place::Skill).is_some();
+        let words = state.skill_error.clone().unwrap_or_else(|| {
+            if fault {
+                crate::state::NOTHING_READ
+            } else {
+                "Loading…"
+            }
+            .to_string()
+        });
         return body
             .child(
-                div()
-                    .text_sm()
-                    .text_color(theme.muted_foreground)
-                    .child(words),
+                h_flex()
+                    .w_full()
+                    .items_center()
+                    .rounded(px(6.))
+                    .map(|row| {
+                        crate::components::faults::ring(
+                            row,
+                            state.is_focused(crate::faults::Place::Skill),
+                        )
+                    })
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(theme.muted_foreground)
+                            .child(words),
+                    )
+                    .child(div().flex_1())
+                    .when(fault, |row| {
+                        row.child(crate::components::faults::badge_element(
+                            crate::faults::Place::Skill,
+                            app.clone(),
+                        ))
+                    }),
             )
             .into_any_element();
     };
@@ -4139,6 +4204,7 @@ pub(crate) fn new_skill_footer(
     let saving = state.skill_saving;
     let ready = skill_name_ok(&name) && !body.trim().is_empty() && !saving;
     let refusal = state.skill_add_error.clone().or(state.skills_error.clone());
+    let skills_fault = state.open_fault(crate::faults::Place::Skills).is_some();
     let (upload, cancel, create) = (app.clone(), app.clone(), app.clone());
     let create_button = pill(
         NEW_SKILL_CREATE,
@@ -4188,6 +4254,12 @@ pub(crate) fn new_skill_footer(
                     .truncate()
                     .children(refusal),
             )
+            .when(skills_fault, |row| {
+                row.child(crate::components::faults::badge_element(
+                    crate::faults::Place::Skills,
+                    app.clone(),
+                ))
+            })
             .child(link(
                 NEW_SKILL_CANCEL,
                 "Cancel",

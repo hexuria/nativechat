@@ -365,27 +365,29 @@ impl OpenGrokClient {
             }
             req
         };
-        let mut response = build(self.access_token())
-            .send()
-            .await
-            .map_err(|e| OpenGrokError::transport(&e))?;
+        // Which request this was, for a fault the person opens: method and path, never a body.
+        let endpoint = format!("{method} {path}");
+        let failed =
+            |e: reqwest::Error| OpenGrokError::transport(&e).with_endpoint(Some(endpoint.clone()));
+        let mut response = build(self.access_token()).send().await.map_err(failed)?;
         // A 401 on a signed-in session is a token that died between checks: refresh once and
         // send again. Auth routes are exempt, or a bad password would loop here.
         if response.status() == StatusCode::UNAUTHORIZED && !path.starts_with("/auth/") {
             if self.refresh_after_unauthorized().await.is_ok() {
-                response = build(self.access_token())
-                    .send()
-                    .await
-                    .map_err(|e| OpenGrokError::transport(&e))?;
+                response = build(self.access_token()).send().await.map_err(failed)?;
             }
             // Still refused after the one thing the app can do about it on its own. The session
             // is gone, and that is decided here because here is where the route is known: the
             // same status on `/auth/login` is a wrong password, which is a verdict about what
             // somebody typed and belongs under the field they typed it in.
             if response.status() == StatusCode::UNAUTHORIZED {
-                return Err(Self::signed_out_error(response).await);
+                return Err(Self::signed_out_error(response)
+                    .await
+                    .with_endpoint(Some(endpoint)));
             }
         }
+        // Carried on the answer, so a refusal read from it later says which request it was.
+        response.extensions_mut().insert(SentAs(endpoint));
         Ok(response)
     }
 
@@ -412,8 +414,9 @@ impl OpenGrokClient {
 
     async fn read_error(response: reqwest::Response) -> OpenGrokError {
         let status = response.status().as_u16();
+        let endpoint = sent_as(&response);
         let body = response.text().await.unwrap_or_default();
-        Self::refusal(status, &body)
+        Self::refusal(status, &body).with_endpoint(endpoint)
     }
 
     /// [`Self::read_error`] on a status and a body already read. Apart from the response so the
@@ -13473,4 +13476,16 @@ mod tests {
         assert_eq!(error.status, Some(409));
         assert_eq!(error.message, "the ceiling changed");
     }
+}
+
+/// The request an answer was for, `GET /coworkers/cw_1/usage`, kept on the response by
+/// `send_json_within` so an error read from it later can name it.
+#[derive(Clone)]
+struct SentAs(String);
+
+fn sent_as(response: &reqwest::Response) -> Option<String> {
+    response
+        .extensions()
+        .get::<SentAs>()
+        .map(|sent| sent.0.clone())
 }

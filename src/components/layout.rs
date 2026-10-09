@@ -36,7 +36,7 @@ struct ShellRev {
     /// The reconnecting pill's two lines, while something cannot be reached. Part of the
     /// revision because the shell repaints only when this struct changes, and a pill that
     /// appears and disappears on its own has to be one of the things that counts as a change.
-    reconnect: Option<(String, String)>,
+    reconnect: Option<(String, String, bool)>,
     /// The signed-out banner's two lines, while the server does not know who the app is. Here
     /// for the same reason as the pill above: it appears without anybody touching the shell.
     signed_out: Option<(String, String)>,
@@ -64,7 +64,10 @@ impl ShellRev {
             signed_in: state.is_signed_in(),
             signing_in: state.auth_status == crate::state::AuthStatus::SigningIn,
             auth_error: state.auth_error.clone(),
-            reconnect: state.reachability_indicator(),
+            reconnect: state.reachability_indicator().map(|(title, detail)| {
+                let fault = state.open_fault(crate::faults::Place::Server).is_some();
+                (title, detail, fault)
+            }),
             signed_out: state.session_banner(),
             right_pane: match state.right_pane {
                 RightPane::Closed => 0,
@@ -245,7 +248,10 @@ impl Render for Layout {
         let bot_finder_open = state.bot_finder_open;
         let command_palette_open = state.command_palette_open;
         let hidden_bots_open = state.hidden_bots_open;
-        let reconnect = state.reachability_indicator();
+        let reconnect = state.reachability_indicator().map(|(title, detail)| {
+            let fault = state.open_fault(crate::faults::Place::Server).is_some();
+            (title, detail, fault)
+        });
         if !state.is_signed_in() {
             // The sign-in page gets the pill too: a server that is not answering is exactly why
             // somebody is looking at this page, and a password typed against it will not work
@@ -262,8 +268,18 @@ impl Render for Layout {
                         .min_h_0()
                         .relative()
                         .child(self.login.clone())
-                        .when_some(reconnect, |this, (title, detail)| {
-                            this.child(reconnect_banner(title, detail, &theme))
+                        .when_some(reconnect, |this, (title, detail, trouble)| {
+                            this.child(reconnect_banner(
+                                title,
+                                detail,
+                                trouble.then(|| {
+                                    crate::components::faults::badge_element(
+                                        crate::faults::Place::Server,
+                                        self.state.clone(),
+                                    )
+                                }),
+                                &theme,
+                            ))
                         })
                         .when(command_palette_open, |this| {
                             this.child(self.command_palette.clone())
@@ -482,8 +498,18 @@ impl Render for Layout {
             .when_some(banner, |this, (title, detail)| {
                 this.child(update_banner(title, detail, &theme))
             })
-            .when_some(reconnect, |this, (title, detail)| {
-                this.child(reconnect_banner(title, detail, &theme))
+            .when_some(reconnect, |this, (title, detail, trouble)| {
+                this.child(reconnect_banner(
+                    title,
+                    detail,
+                    trouble.then(|| {
+                        crate::components::faults::badge_element(
+                            crate::faults::Place::Server,
+                            self.state.clone(),
+                        )
+                    }),
+                    &theme,
+                ))
             })
             .when_some(signed_out, |this, (title, detail)| {
                 this.child(signed_out_banner(self.state.clone(), title, detail, &theme))
@@ -767,7 +793,7 @@ fn update_banner(
     detail: String,
     theme: &gpui_kit::component::Theme,
 ) -> impl IntoElement {
-    banner_pill("update-banner", title, detail, theme)
+    banner_pill("update-banner", title, detail, None, theme)
 }
 
 /// The pill over the app while something cannot be reached — which machine, and why the app
@@ -780,9 +806,10 @@ fn update_banner(
 fn reconnect_banner(
     title: String,
     detail: String,
+    badge: Option<AnyElement>,
     theme: &gpui_kit::component::Theme,
 ) -> impl IntoElement {
-    banner_pill("reconnect-banner", title, detail, theme)
+    banner_pill("reconnect-banner", title, detail, badge, theme)
 }
 
 /// The banner over the app when the server no longer knows who it is signed in as.
@@ -844,6 +871,7 @@ fn banner_pill(
     id: &'static str,
     title: String,
     detail: String,
+    badge: Option<AnyElement>,
     theme: &gpui_kit::component::Theme,
 ) -> impl IntoElement {
     div()
@@ -882,7 +910,8 @@ fn banner_pill(
                                 .text_color(theme.muted_foreground)
                                 .child(detail),
                         ),
-                ),
+                )
+                .children(badge),
         )
 }
 

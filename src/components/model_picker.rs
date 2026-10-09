@@ -340,6 +340,21 @@ const ROW_HEIGHT: f32 = 28.;
 /// How far the slider is dimmed while no level is lit ([`Panel::effort`]).
 const UNSET_SLIDER_OPACITY: f32 = 0.45;
 
+/// What the list's note says, and what only its ⚠ badge shows. The server's note is a sentence
+/// for a person ("the gateway advertises no models on this key's route…"), except when the gateway
+/// could not be reached at all: then it carries the transport's own error, which is said as that
+/// one fact and kept behind the badge (opengrok-server `crates/opengrok-server/src/models.rs`).
+pub(crate) fn catalogue_note_parts(note: &str) -> (String, Option<String>) {
+    const UNREACHED: &str = "the gateway could not be reached";
+    match note.strip_prefix(UNREACHED) {
+        Some(rest) if !rest.trim().is_empty() => (
+            "The gateway could not be reached, so this list may be out of date.".to_string(),
+            Some(note.to_string()),
+        ),
+        _ => (crate::components::agent_settings::sentence(note), None),
+    }
+}
+
 /// The card's second line: the door, by the name of its group in the list, the effort by the name
 /// of the level the slider is on, which is the model's own where the Bot chose none, and ⚡ while
 /// it is on. A model that lists no levels has no effort to name: "Subscription".
@@ -397,6 +412,10 @@ struct Snap {
     /// ([`PickerView::effort_note_for`]).
     effort_note: Option<String>,
     catalogue_note: Option<String>,
+    /// The list has an unread fault: its ⚠ shows on the list's heading.
+    models_fault: bool,
+    /// A notice's 🎯 just brought the person here: the list is ringed.
+    models_focused: bool,
     /// A change is with the server, and the picker takes none until it answers.
     busy: bool,
 }
@@ -415,6 +434,8 @@ impl Snap {
             view,
             note: state.picker_note(which).map(str::to_string),
             catalogue_note: state.model_catalogue.note.clone(),
+            models_fault: state.open_fault(crate::faults::Place::Models).is_some(),
+            models_focused: state.is_focused(crate::faults::Place::Models),
             busy: state.picker_busy(which),
         }
     }
@@ -602,6 +623,8 @@ impl Render for ModelPicker {
             note: self.snap.note.clone(),
             effort_note: self.snap.effort_note.clone(),
             catalogue_note: self.snap.catalogue_note.clone(),
+            models_fault: self.snap.models_fault,
+            models_focused: self.snap.models_focused,
             busy: self.snap.busy,
             slider,
             effort_preview: self.effort_preview,
@@ -757,6 +780,10 @@ struct Panel {
     /// The line under the slider about a pick that put the effort back on the model's own level.
     effort_note: Option<String>,
     catalogue_note: Option<String>,
+    /// The list has an unread fault: its ⚠ shows on the list's heading.
+    models_fault: bool,
+    /// A notice's 🎯 just brought the person here: the list is ringed.
+    models_focused: bool,
     /// A change is with the server: every control is drawn dimmed, and takes nothing until it
     /// answers (`AppState::picker_busy`).
     busy: bool,
@@ -1071,6 +1098,19 @@ impl Panel {
                 )
                 .child(div().text_sm().child(MODELS_TITLE))
         };
+        // The list's heading row: back to the controls, then the ⚠ at the far side while the
+        // list has a fault. Nothing about the fault is written in the list.
+        let back = h_flex()
+            .w_full()
+            .items_center()
+            .child(back)
+            .child(div().flex_1())
+            .when(self.models_fault, |row| {
+                row.child(crate::components::faults::badge_element(
+                    crate::faults::Place::Models,
+                    app.clone(),
+                ))
+            });
         let wheel = {
             let app = app.clone();
             let rest = self.scroll_rest.clone();
@@ -1086,6 +1126,8 @@ impl Panel {
         };
         v_flex()
             .gap(px(8.))
+            .rounded(px(8.))
+            .map(|list| crate::components::faults::ring(list, self.models_focused))
             .child(back)
             .child(
                 div()
@@ -1174,16 +1216,25 @@ impl Panel {
                                 .child(line),
                         )
                     })
-                    .when_some(self.catalogue_note.clone(), |this, note| {
-                        this.child(
-                            div()
-                                .id(ids.note)
-                                .px(px(8.))
-                                .text_xs()
-                                .text_color(muted)
-                                .child(note),
-                        )
-                    }),
+                    // A note written for a person stays a line under the list; an unreachable
+                    // gateway's is a fault, shown only as the heading's ⚠.
+                    .when_some(
+                        self.catalogue_note
+                            .as_deref()
+                            .map(catalogue_note_parts)
+                            .filter(|(_, raw)| raw.is_none())
+                            .map(|(said, _)| said),
+                        |this, said| {
+                            this.child(
+                                div()
+                                    .id(ids.note)
+                                    .px(px(8.))
+                                    .text_xs()
+                                    .text_color(muted)
+                                    .child(said),
+                            )
+                        },
+                    ),
             )
     }
 
@@ -1434,6 +1485,22 @@ fn account_plan(id: &'static str, plan: &AccountPlan, theme: &Theme) -> impl Int
 
 #[cfg(test)]
 mod tests {
+    /// The list's note is said as the server wrote it, except an unreachable gateway's, whose
+    /// transport error is only behind the ⚠ badge.
+    #[test]
+    fn an_unreached_gateway_s_error_is_behind_the_badge_not_in_the_list() {
+        let down = "the gateway could not be reached: error sending request for url (http://127.0.0.1:29080/v1/models)";
+        let (said, detail) = super::catalogue_note_parts(down);
+        assert_eq!(
+            said,
+            "The gateway could not be reached, so this list may be out of date."
+        );
+        assert!(!said.contains("error sending request"));
+        assert_eq!(detail.as_deref(), Some(down));
+        let none = "the gateway advertises no models on this key's route";
+        assert_eq!(super::catalogue_note_parts(none).1, None);
+    }
+
     // Item by item rather than a glob: `use super::*` would drag in gpui_kit's own `test`.
     use super::{
         BOT_IDS, ModelPicker, NEW_BOTS_IDS, NONE_HINT, PLAN_FALLBACK_IDS, active_option,
