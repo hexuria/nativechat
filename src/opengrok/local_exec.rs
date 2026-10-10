@@ -32,6 +32,10 @@ struct StoredDaemon {
     token: String,
     #[serde(default)]
     label: String,
+    /// The account this token was issued to (`sub` of the server's daemon token). A file from
+    /// before it was kept reads as empty, which is nobody's.
+    #[serde(default)]
+    account: String,
 }
 
 impl StoredDaemon {
@@ -190,7 +194,7 @@ pub async fn serve_local_exec(
                 }
                 enrolled_again = true;
                 let path = data_dir.join(CREDENTIAL_FILE);
-                match enrol(&client, &path, Some(&cred.machine_id)).await {
+                match enrol(&client, &path, Some(&cred.machine_id), &cred.account).await {
                     Ok(fresh) => {
                         cred = fresh;
                         publish(&enrolled, &cred);
@@ -240,9 +244,14 @@ fn publish(enrolled: &watch::Sender<Option<MachineCredential>>, cred: &StoredDae
     });
 }
 
-/// This Mac's credential: the one kept here while the server still lists its machine as live,
-/// and otherwise a new one, from enrolling this Mac as its own machine again, or as a new machine
-/// when it has none.
+/// This Mac's credential: the one kept here while it is the signed-in account's and the server
+/// still lists its machine as live, and otherwise a new one, from enrolling this Mac as its own
+/// machine again, or as a new machine when it has none.
+///
+/// The account is checked as well as the listing. Another account that signed in on this Mac
+/// enrolled it too, under the same machine id, and its token is the one kept here until this
+/// account enrols: kept, the relay opened its stream as that account, and this account's turns
+/// found no Mac connected while its card said it relayed.
 ///
 /// Never as another machine. The account's other machines are other Macs, and this used to enrol
 /// as the first live one listed whenever its own was not: the server gave that Mac's machine a new
@@ -253,7 +262,8 @@ async fn ensure_daemon(
 ) -> Result<StoredDaemon, OpenGrokError> {
     let path = data_dir.join(CREDENTIAL_FILE);
     let stored = load_credential(&path);
-    if let Some(stored) = stored.as_ref() {
+    let account = client.me().await?.id;
+    if let Some(stored) = stored.as_ref().filter(|stored| stored.account == account) {
         let machines = client.list_daemons().await.unwrap_or_default();
         let still_listed = machines
             .iter()
@@ -263,16 +273,18 @@ async fn ensure_daemon(
         }
     }
     let own = stored.as_ref().map(|stored| stored.machine_id.as_str());
-    enrol(client, &path, own).await
+    enrol(client, &path, own, &account).await
 }
 
 /// Enrol this Mac with the server as `machine_id`, its own machine, which gives it a new token
 /// and retires the one it held (with the streams that token opened); or, with none, as a new
-/// machine the server names. The credential is kept at `path` for the next start.
+/// machine the server names. The credential is kept at `path` for the next start, as `account`'s,
+/// the account signed in to enrol it.
 async fn enrol(
     client: &OpenGrokClient,
     path: &Path,
     machine_id: Option<&str>,
+    account: &str,
 ) -> Result<StoredDaemon, OpenGrokError> {
     let label = machine_label();
     let enrol = client.enrol_daemon(&label, machine_id).await?;
@@ -283,6 +295,7 @@ async fn enrol(
         machine_id: enrol.machine_id,
         token: enrol.token,
         label,
+        account: account.to_string(),
     };
     save_credential(path, &cred);
     Ok(cred)
@@ -540,7 +553,20 @@ mod tests {
             machine_id: "mac_1".into(),
             token: "tok_1".into(),
             label: String::new(),
+            account: "acct_1".into(),
         }
+    }
+
+    /// `GET /account` answers as `account` (`Account` in `super::types`).
+    async fn signed_in_as(server: &MockServer, account: &str) {
+        Mock::given(method("GET"))
+            .and(path("/account"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({ "id": account, "email": "dev@nativechat.local" })),
+            )
+            .mount(server)
+            .await;
     }
 
     fn exec_frame(request_id: &str, command: &str) -> Value {
@@ -577,6 +603,7 @@ mod tests {
     #[tokio::test]
     async fn enrolling_this_mac_leaves_its_mode_to_the_person() {
         let server = MockServer::start().await;
+        signed_in_as(&server, "acct_1").await;
         Mock::given(method("GET"))
             .and(path("/local-exec/daemon"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "machines": [] })))
@@ -651,6 +678,7 @@ mod tests {
     #[tokio::test]
     async fn a_mac_with_no_machine_of_its_own_enrols_as_a_new_one() {
         let server = MockServer::start().await;
+        signed_in_as(&server, "acct_1").await;
         Mock::given(method("GET"))
             .and(path("/local-exec/daemon"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -685,6 +713,7 @@ mod tests {
     #[tokio::test]
     async fn a_mac_enrols_again_as_its_own_machine_and_never_as_another() {
         let server = MockServer::start().await;
+        signed_in_as(&server, "acct_1").await;
         let dir = tempfile::tempdir().unwrap();
         save_credential(&dir.path().join(CREDENTIAL_FILE), &daemon());
         Mock::given(method("GET"))
@@ -712,6 +741,83 @@ mod tests {
         assert_eq!(enrolled_as(&server).await, [Some("mac_1".to_string())]);
         assert_eq!(machine, MachineCredential::new("mac_1", "tok_2"));
         assert_eq!(stored_machine_id(dir.path()).as_deref(), Some("mac_1"));
+    }
+
+    /// The token kept here is the account's that enrolled this Mac, not the account signed in
+    /// now. Both accounts list this Mac's machine id, so the token used to be kept: the relay then
+    /// opened its stream as the other account, and every turn on the signed-in account said this
+    /// Mac was not connected while its card said it was relaying.
+    #[tokio::test]
+    async fn a_mac_signed_in_to_another_account_enrols_again_for_it() {
+        let server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let other = StoredDaemon {
+            account: "acct_other".into(),
+            ..daemon()
+        };
+        save_credential(&dir.path().join(CREDENTIAL_FILE), &other);
+        signed_in_as(&server, "acct_now").await;
+        Mock::given(method("GET"))
+            .and(path("/local-exec/daemon"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "machines": [listed("mac_1", "NativeChat on this Mac", false)]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/local-exec/daemon"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({ "machineId": "mac_1", "token": "tok_now" })),
+            )
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+
+        let machine = enrol_this_machine(&client, dir.path()).await.unwrap();
+
+        assert_eq!(enrolled_as(&server).await, [Some("mac_1".to_string())]);
+        assert_eq!(machine, MachineCredential::new("mac_1", "tok_now"));
+        let kept = load_credential(&dir.path().join(CREDENTIAL_FILE)).unwrap();
+        assert_eq!(kept.account, "acct_now", "kept as the signed-in account's");
+
+        // Signed in as that account again, the token it now holds is kept.
+        enrol_this_machine(&client, dir.path()).await.unwrap();
+        assert_eq!(enrolled_as(&server).await.len(), 1, "no second enrolment");
+    }
+
+    /// A credential kept before it said whose it was is read, and enrolled again as this Mac's own
+    /// machine. Unreadable, it would enrol as a new machine, and the Mac would lose its id with
+    /// the mode and relay switch kept under it.
+    #[tokio::test]
+    async fn a_credential_kept_before_it_named_its_account_enrols_again_as_the_same_machine() {
+        let server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join(CREDENTIAL_FILE);
+        write_private(&file, br#"{"machine_id":"mac_1","token":"tok_1"}"#).unwrap();
+        signed_in_as(&server, "acct_1").await;
+        Mock::given(method("GET"))
+            .and(path("/local-exec/daemon"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "machines": [listed("mac_1", "NativeChat on this Mac", false)]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/local-exec/daemon"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({ "machineId": "mac_1", "token": "tok_2" })),
+            )
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+
+        let machine = enrol_this_machine(&client, dir.path()).await.unwrap();
+
+        assert_eq!(enrolled_as(&server).await, [Some("mac_1".to_string())]);
+        assert_eq!(machine, MachineCredential::new("mac_1", "tok_2"));
+        assert_eq!(load_credential(&file).unwrap().account, "acct_1");
     }
 
     /// A command that leaves the pid of something it started in `pid_file`, and waits on it.
@@ -865,6 +971,7 @@ mod tests {
     #[tokio::test]
     async fn signing_out_stops_what_this_mac_was_running() {
         let server = MockServer::start().await;
+        signed_in_as(&server, "acct_1").await;
         let dir = tempfile::tempdir().unwrap();
         let pid_file = dir.path().join("pid");
         save_credential(&dir.path().join(CREDENTIAL_FILE), &daemon());
@@ -972,6 +1079,7 @@ mod tests {
     #[tokio::test]
     async fn enrolling_again_hands_the_relay_the_new_credential() {
         let server = MockServer::start().await;
+        signed_in_as(&server, "acct_1").await;
         let dir = tempfile::tempdir().unwrap();
         save_credential(&dir.path().join(CREDENTIAL_FILE), &daemon());
         lists_this_mac(&server).await;
@@ -1029,6 +1137,10 @@ mod tests {
             (kept.machine_id.as_str(), kept.token.as_str()),
             ("mac_1", "tok_2")
         );
+        assert_eq!(
+            kept.account, "acct_1",
+            "kept as the account it was enrolled for"
+        );
     }
 
     /// The server turns this Mac's token away again after it has enrolled again: something else
@@ -1038,6 +1150,7 @@ mod tests {
     #[tokio::test]
     async fn turned_away_again_after_enrolling_again_it_stops_and_says_why() {
         let server = MockServer::start().await;
+        signed_in_as(&server, "acct_1").await;
         let dir = tempfile::tempdir().unwrap();
         save_credential(&dir.path().join(CREDENTIAL_FILE), &daemon());
         lists_this_mac(&server).await;
@@ -1086,6 +1199,7 @@ mod tests {
     #[tokio::test]
     async fn an_enrolment_that_fails_after_a_401_stops_it_and_says_why() {
         let server = MockServer::start().await;
+        signed_in_as(&server, "acct_1").await;
         let dir = tempfile::tempdir().unwrap();
         save_credential(&dir.path().join(CREDENTIAL_FILE), &daemon());
         lists_this_mac(&server).await;
