@@ -5553,12 +5553,15 @@ pub struct AppState {
     /// The Bot being given a computer of its own from a login card, while the server makes it.
     pub own_computer_changing: Option<String>,
     /// What the server said when it could not give a Bot its own computer.
+    pub own_computer_refusal: Option<String>,
     /// The person's "share my logins with all my Bots" switch, as the server last said; None
     /// until read.
     pub logins_for_all_bots: Option<bool>,
     /// The switch is being set.
     pub logins_for_all_bots_changing: bool,
-    pub own_computer_refusal: Option<String>,
+    /// Which sign-in a read or set of the switch belongs to: one that answers after the person
+    /// signed out finds a different number and is dropped, so another account never reads it.
+    logins_for_all_bots_generation: u64,
     /// The service whose "Current Bot" default-account menu is open on a plugin's page.
     pub account_menu: Option<String>,
     /// A skill's page in the Plugins window, while the person edits their own skill there.
@@ -6437,6 +6440,7 @@ impl AppState {
             own_computer_refusal: None,
             logins_for_all_bots: None,
             logins_for_all_bots_changing: false,
+            logins_for_all_bots_generation: 0,
             active_recipe: None,
             active_skill: None,
             composer_files: Vec::new(),
@@ -7798,6 +7802,10 @@ impl AppState {
         // asked for before it is opened.
         self.connections = AccountConnections::default();
         self.connections_generation += 1;
+        // The logins switch was this account's, and so is any read or set of it still out.
+        self.logins_for_all_bots = None;
+        self.logins_for_all_bots_changing = false;
+        self.logins_for_all_bots_generation += 1;
         self.connectors_generation += 1;
         self.connect_asks += 1;
         self.pins_generation += 1;
@@ -21049,9 +21057,13 @@ impl AppState {
         let Some(client) = self.opengrok.clone() else {
             return;
         };
+        let generation = self.logins_for_all_bots_generation;
         cx.spawn(async move |this, cx| {
             let all = client.logins_for_all_bots().await;
             let _ = this.update(cx, |state, cx| {
+                if state.logins_for_all_bots_generation != generation {
+                    return;
+                }
                 match all {
                     Ok(all) => state.logins_for_all_bots = Some(all),
                     Err(error) => log::warn!("login sharing: {}", error.message),
@@ -21074,11 +21086,14 @@ impl AppState {
             return;
         }
         self.logins_for_all_bots_changing = true;
-        self.own_computer_refusal = None;
         cx.notify();
+        let generation = self.logins_for_all_bots_generation;
         cx.spawn(async move |this, cx| {
             let result = client.set_logins_for_all_bots(all).await;
             let _ = this.update(cx, |state, cx| {
+                if state.logins_for_all_bots_generation != generation {
+                    return;
+                }
                 state.logins_for_all_bots_changing = false;
                 match result {
                     Ok(all) => {
@@ -21093,9 +21108,10 @@ impl AppState {
                         }
                         state.read_all_login_shares(cx);
                     }
+                    // Said in the Bot's notifications. It is not an own-computer refusal: kept
+                    // there, it showed under every blocked card's buttons, wherever it was asked.
                     Err(error) => {
                         state.notify_error(None, "Logins", &error.message, None, None, cx);
-                        state.own_computer_refusal = Some(error.message);
                     }
                 }
                 cx.notify();
@@ -36591,6 +36607,23 @@ mod tests {
             None,
             "the account's door, left to the server"
         );
+    }
+
+    /// The "share my logins with all my Bots" switch is the account's: after a sign-out the next
+    /// person does not see it on, or as being set, until the server says so for them, and an
+    /// answer asked before the sign-out is told it is no longer wanted.
+    #[test]
+    fn signing_out_forgets_the_logins_switch() {
+        let mut state = AppState::new();
+        state.logins_for_all_bots = Some(true);
+        state.logins_for_all_bots_changing = true;
+        let asked = state.logins_for_all_bots_generation;
+
+        state.forget_account();
+
+        assert_eq!(state.logins_for_all_bots, None);
+        assert!(!state.logins_for_all_bots_changing);
+        assert_ne!(state.logins_for_all_bots_generation, asked);
     }
 
     /// Only the newest read of `/models` lands. Several are asked in a row and need not answer
