@@ -801,6 +801,11 @@ struct Blocked {
     /// The server is making the Bot its own computer.
     changing: bool,
     refusal: Option<String>,
+    /// Only the person's own Bots use the computer: sharing every login with all of them lets
+    /// the login fill here, without a new computer.
+    own_bots_only: bool,
+    /// That switch is being set.
+    sharing: bool,
 }
 
 impl SavedLoginContext {
@@ -833,6 +838,8 @@ impl SavedLoginContext {
                 reason: check.reason.clone().unwrap_or_default(),
                 changing: state.own_computer_changing.as_deref() == Some(bot.as_str()),
                 refusal: state.own_computer_refusal.clone(),
+                own_bots_only: check.own_bots_only,
+                sharing: state.logins_for_all_bots_changing,
                 bot,
                 bot_name,
             })
@@ -1411,13 +1418,37 @@ fn blocked_panel(
             "{name} is shared with your org, so your saved logins can't be used with it. Type \
              the login by hand."
         )
+    } else if blocked.own_bots_only {
+        format!(
+            "{name}'s computer is shared with your other Bots, and your saved logins aren't \
+             shared with all of them. Share them with all your Bots and it fills here, on the \
+             page {name} has open."
+        )
     } else {
         format!(
-            "{name}'s computer is shared with other Bots, so a saved login can't be used on it. \
-             Give {name} a computer of its own, or type the login by hand."
+            "{name}'s computer is shared with other people, so a saved login can't be used on \
+             it. Give {name} a computer of its own, or type the login by hand."
         )
     };
     let mut buttons = h_flex().gap(px(8.)).flex_wrap();
+    if blocked.reason != "shared-bot" && blocked.own_bots_only {
+        let share = app.clone();
+        buttons = buttons.child(
+            Button::new(SharedString::from(crate::opengrok::user_form_all_bots_id(
+                card_key,
+            )))
+            .primary()
+            .small()
+            .loading(blocked.sharing)
+            .disabled(blocked.sharing || blocked.changing)
+            .label("Share my logins with all my Bots")
+            .on_click(move |_, _, cx| {
+                if let Some(app) = &share {
+                    app.update(cx, |state, cx| state.set_logins_for_all_bots(true, cx));
+                }
+            }),
+        );
+    }
     if blocked.reason != "shared-bot" {
         let own = app.clone();
         let bot = blocked.bot.clone();
@@ -1425,7 +1456,7 @@ fn blocked_panel(
             Button::new(SharedString::from(
                 crate::opengrok::user_form_own_computer_id(card_key),
             ))
-            .primary()
+            .when(!blocked.own_bots_only, |b| b.primary())
             .small()
             .loading(blocked.changing)
             .disabled(blocked.changing)
@@ -1460,7 +1491,7 @@ fn blocked_panel(
         .child(div().text_sm().child(words))
         .when(blocked.reason != "shared-bot", |this| {
             this.child(div().text_xs().text_color(theme.muted_foreground).child(
-                "It starts on a fresh computer; what it left on the shared one stays there.",
+                "A computer of its own starts fresh: the page it has open stays on the shared one.",
             ))
         })
         .child(buttons)

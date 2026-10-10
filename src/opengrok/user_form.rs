@@ -705,6 +705,11 @@ pub fn user_form_own_computer_id(card_key: &str) -> String {
     format!("user-form-own-computer-{card_key}")
 }
 
+/// "Share my logins with all my Bots", where the shared computer is only the person's Bots'.
+pub fn user_form_all_bots_id(card_key: &str) -> String {
+    format!("user-form-all-bots-{card_key}")
+}
+
 /// "Type it by hand", beside it.
 pub fn user_form_by_hand_id(card_key: &str) -> String {
     format!("user-form-by-hand-{card_key}")

@@ -466,6 +466,7 @@ impl AppState {
             .is_some_and(|m| m.page == MarketPage::Logins)
         {
             self.read_all_login_shares(cx);
+            self.read_logins_for_all_bots(cx);
         }
         self.record_window_nav();
         cx.notify();

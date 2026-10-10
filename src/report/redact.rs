@@ -112,6 +112,7 @@ const ROUTE_WORDS: &[&str] = &[
     "schedules",
     "screen",
     "share",
+    "sharing",
     "sign-in",
     "site-logins",
     "skills",

@@ -2321,6 +2321,42 @@ impl OpenGrokClient {
         Self::json_or_error::<SavedLoginCheck>(response).await
     }
 
+    /// `GET /site-logins/sharing`: whether every saved login is shared with every one of the
+    /// person's Bots (opengrok-server `sharing` in `crates/opengrok-server/src/agui/
+    /// site_logins.rs`, gol/global-login-share).
+    pub async fn logins_for_all_bots(&self) -> Result<bool, OpenGrokError> {
+        let response = self
+            .send_json_within::<()>(
+                reqwest::Method::GET,
+                "/site-logins/sharing",
+                None,
+                Some(CEILING_TIMEOUT),
+                None,
+            )
+            .await?;
+        Self::json_or_error::<AllBots>(response)
+            .await
+            .map(|a| a.all_bots)
+    }
+
+    /// `PUT /site-logins/sharing` `{allBots}` (`set_sharing`, same file): the switch, answered
+    /// with what the server now holds.
+    pub async fn set_logins_for_all_bots(&self, all: bool) -> Result<bool, OpenGrokError> {
+        let body = json!({ "allBots": all });
+        let response = self
+            .send_json_within(
+                reqwest::Method::PUT,
+                "/site-logins/sharing",
+                Some(&body),
+                Some(CEILING_TIMEOUT),
+                None,
+            )
+            .await?;
+        Self::json_or_error::<AllBots>(response)
+            .await
+            .map(|a| a.all_bots)
+    }
+
     /// `PUT /coworkers/{id}/own-computer` `{on}`: this Bot gets a computer of its own while the
     /// account's others keep sharing (opengrok-server `put_own_computer`, `agui/ceiling.rs`).
     /// Making the computer can take a while, so it is given the computer's own patience.
@@ -3874,6 +3910,13 @@ pub struct UsageTotals {
     pub cost_usd: Option<String>,
 }
 
+/// `{ "allBots": bool }`, the person's one switch over their saved logins' shares.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AllBots {
+    all_bots: bool,
+}
+
 /// Whether a saved login can be filled for a Bot, asked before Touch ID (opengrok-server
 /// `get_saved_login` in `crates/opengrok-server/src/agui/ceiling.rs`, gol/tools-and-skill-packs).
 /// `reason` is `shared-computer` or `shared-bot` when it cannot.
@@ -3885,6 +3928,11 @@ pub struct SavedLoginCheck {
     pub reason: Option<String>,
     #[serde(default)]
     pub own_computer: bool,
+    /// Only the person's own Bots use this computer, so sharing every login with all of them
+    /// would let a saved login fill here (gol/global-login-share, 9 Oct 2026). A server from
+    /// before says nothing, which reads as no.
+    #[serde(default)]
+    pub own_bots_only: bool,
 }
 
 /// One installed plugin skill and its switch for a Bot (opengrok-server `plugin_skill_rows` in
