@@ -1062,6 +1062,8 @@ pub enum Command {
     ConfirmComputerAction,
     CancelComputerConfirm,
     SetEgressTunnelEnabled(bool),
+    /// The open Bot on a screen of its own (`true`) or the shared screen (#376).
+    SetOwnScreen(bool),
     /// The open bot's computer's standing answer to the tunnel's card.
     SetEgressPolicy(crate::opengrok::LocalExecMode),
     /// The shield badge's dialog on the Computer pane: open it, close it.
@@ -1545,6 +1547,7 @@ impl Command {
             Self::ConfirmComputerAction => state.confirm_computer_action(cx),
             Self::CancelComputerConfirm => state.close_computer_confirm(cx),
             Self::SetEgressTunnelEnabled(enabled) => state.set_egress_tunnel_enabled(enabled, cx),
+            Self::SetOwnScreen(own) => state.set_own_screen(own, cx),
             Self::SetEgressPolicy(mode) => state.pick_network_policy(mode, cx),
             Self::OpenNetworkPolicy => state.open_network_policy(cx),
             Self::CloseNetworkPolicy => state.close_network_policy(cx),
@@ -3868,6 +3871,10 @@ pub struct NativeChatHost {
     route_traffic_on_bot_pane: bool,
     /// User-scope / shared box: Route traffic on Settings → Computer.
     route_traffic_in_user_settings: bool,
+    /// The open Bot's screen switch on a shared computer: `Some(on its own screen)`, `None`
+    /// when there is nothing to switch (`AppState::own_screen_offer`).
+    own_screen: Option<bool>,
+    own_screen_changing: bool,
     egress_tunnel_enabled: bool,
     /// Box `egress_tunnel.ready` when the computer JSON exposed it.
     egress_tunnel_ready: Option<bool>,
@@ -4553,6 +4560,8 @@ impl NativeChatHost {
             updates_tab: state.app_settings_tab == AppSettingsTab::Updates,
             route_traffic_on_bot_pane: state.show_route_traffic_on_bot_pane(),
             route_traffic_in_user_settings: state.show_route_traffic_in_user_settings(),
+            own_screen: state.own_screen_offer(),
+            own_screen_changing: state.own_screen_changing,
             egress_tunnel_enabled: state.egress_tunnel_enabled,
             egress_tunnel_ready: state
                 .coworker_computer
@@ -4930,17 +4939,24 @@ impl NativeChatHost {
                         "Route traffic for all your computers",
                     )
                     .with_enabled(self.route_traffic_on_bot_pane),
-                )
-                .with_child(
-                    UiNode::button(
-                        "network-policy",
-                        self.egress_policy.map_or_else(
-                            || "No network rule from the server yet".into(),
-                            |mode| format!("Use your network from this computer: {}", mode.label()),
-                        ),
-                    )
-                    .with_enabled(self.egress_policy.is_some()),
                 );
+            if let Some(own) = self.own_screen {
+                computer = computer.with_child(
+                    UiNode::new("computer-own-screen", "switch", "Use its own screen")
+                        .with_checked(own)
+                        .with_enabled(!self.own_screen_changing),
+                );
+            }
+            computer = computer.with_child(
+                UiNode::button(
+                    "network-policy",
+                    self.egress_policy.map_or_else(
+                        || "No network rule from the server yet".into(),
+                        |mode| format!("Use your network from this computer: {}", mode.label()),
+                    ),
+                )
+                .with_enabled(self.egress_policy.is_some()),
+            );
         }
         computer = computer
             .with_child(UiNode::button(
@@ -9140,6 +9156,15 @@ impl NativeChatHost {
             Command::OpenComputerConfirm(crate::state::ComputerAction::Update)
         } else if target == "computer-reset" {
             Command::OpenComputerConfirm(crate::state::ComputerAction::Reset)
+        } else if target == "computer-own-screen" {
+            match (
+                self.computer_open && self.computer_overview,
+                self.own_screen,
+            ) {
+                (true, Some(own)) if !self.own_screen_changing => Command::SetOwnScreen(!own),
+                (true, Some(_)) => return Err("the screen is being switched".to_string()),
+                _ => return Err("no screen switch is on screen to click".to_string()),
+            }
         } else if target == "route-traffic-this-computer" || target == "egress-tunnel-enabled" {
             Command::SetEgressTunnelEnabled(!self.egress_tunnel_enabled)
         } else if let Some(mode) = target
