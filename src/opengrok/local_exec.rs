@@ -786,6 +786,40 @@ mod tests {
         assert_eq!(enrolled_as(&server).await.len(), 1, "no second enrolment");
     }
 
+    /// A credential kept before it said whose it was is read, and enrolled again as this Mac's own
+    /// machine. Unreadable, it would enrol as a new machine, and the Mac would lose its id with
+    /// the mode and relay switch kept under it.
+    #[tokio::test]
+    async fn a_credential_kept_before_it_named_its_account_enrols_again_as_the_same_machine() {
+        let server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join(CREDENTIAL_FILE);
+        write_private(&file, br#"{"machine_id":"mac_1","token":"tok_1"}"#).unwrap();
+        signed_in_as(&server, "acct_1").await;
+        Mock::given(method("GET"))
+            .and(path("/local-exec/daemon"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "machines": [listed("mac_1", "NativeChat on this Mac", false)]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/local-exec/daemon"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({ "machineId": "mac_1", "token": "tok_2" })),
+            )
+            .mount(&server)
+            .await;
+        let client = OpenGrokClient::new(&server.uri()).unwrap();
+
+        let machine = enrol_this_machine(&client, dir.path()).await.unwrap();
+
+        assert_eq!(enrolled_as(&server).await, [Some("mac_1".to_string())]);
+        assert_eq!(machine, MachineCredential::new("mac_1", "tok_2"));
+        assert_eq!(load_credential(&file).unwrap().account, "acct_1");
+    }
+
     /// A command that leaves the pid of something it started in `pid_file`, and waits on it.
     /// The shell forks it rather than becoming it, which is what every real command does: the
     /// server puts a PATH preamble in front of each one, so no command is ever the shell's last.
@@ -824,7 +858,6 @@ mod tests {
     #[tokio::test]
     async fn a_cancel_frame_kills_the_command_it_names() {
         let server = MockServer::start().await;
-        signed_in_as(&server, "acct_1").await;
         Mock::given(method("POST"))
             .and(path("/local-exec/responses"))
             .respond_with(ResponseTemplate::new(200))
@@ -862,7 +895,6 @@ mod tests {
     #[tokio::test]
     async fn a_finished_command_leaves_nothing_behind_to_cancel() {
         let server = MockServer::start().await;
-        signed_in_as(&server, "acct_1").await;
         Mock::given(method("POST"))
             .and(path("/local-exec/responses"))
             .respond_with(ResponseTemplate::new(200))
@@ -910,7 +942,6 @@ mod tests {
     #[tokio::test]
     async fn an_exec_for_a_command_already_running_is_not_run_again() {
         let server = MockServer::start().await;
-        signed_in_as(&server, "acct_1").await;
         let client = OpenGrokClient::new(&server.uri()).unwrap();
         let running = Running::default();
         let dir = tempfile::tempdir().unwrap();
@@ -1105,6 +1136,10 @@ mod tests {
         assert_eq!(
             (kept.machine_id.as_str(), kept.token.as_str()),
             ("mac_1", "tok_2")
+        );
+        assert_eq!(
+            kept.account, "acct_1",
+            "kept as the account it was enrolled for"
         );
     }
 
